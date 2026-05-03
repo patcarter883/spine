@@ -1,9 +1,22 @@
 """Tests for persistence.py - human handoff protocol."""
 
 import os
+import sys
 import tempfile
 
-from spine.core.persistence import ResumeMarker, ResumeAction, create_resume_marker
+import importlib.util
+spec = importlib.util.spec_from_file_location("persistence", "spine/core/persistence.py")
+persistence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(persistence)
+
+ResumeMarker = persistence.ResumeMarker
+ResumeAction = persistence.ResumeAction
+create_resume_marker = persistence.create_resume_marker
+Checkpoint = persistence.Checkpoint
+RecoveryStrategy = persistence.RecoveryStrategy
+ExecutionPlan = persistence.ExecutionPlan
+Context = persistence.Context
+ContinuityManager = persistence.ContinuityManager
 
 
 class TestResumeMarker:
@@ -110,3 +123,98 @@ class TestResumeAction:
         assert ResumeAction.INSPECT.value == "inspect"
         assert ResumeAction.ADJUST.value == "adjust"
         assert ResumeAction.CANCEL.value == "cancel"
+
+
+class TestRecoveryStrategy:
+    def test_resume_builds_execution_plan(self):
+        checkpoint = Checkpoint(
+            checkpoint_id="test_ckpt",
+            work_item_id="feat_test",
+            phase_name="EXECUTION",
+            phase_progress=1.0,
+            state={
+                "completed_tasks": ["task_1"],
+                "failed_tasks": [],
+            },
+            dag={
+                "execution_plan": ["task_1", "task_2", "task_3"],
+                "dependencies": {
+                    "task_3": ["task_1", "task_2"]
+                },
+                "results": {
+                    "task_1": {"status": "success"}
+                }
+            },
+            swarm_state={
+                "file_reservations": {"worker-a": ["src/test.py"]},
+                "pending_gates": ["reviewer"]
+            }
+        )
+
+        strategy = RecoveryStrategy()
+        plan = strategy.resume(checkpoint)
+
+        assert "task_2" in plan.tasks
+        assert "task_3" in plan.tasks
+        assert plan.verification_needed is False
+        assert plan.file_reservations == {"worker-a": ["src/test.py"]}
+        assert plan.pending_gates == ["reviewer"]
+
+    def test_excludes_completed_tasks(self):
+        checkpoint = Checkpoint(
+            dag={
+                "execution_plan": ["a", "b", "c"],
+                "dependencies": {},
+                "results": {
+                    "a": {"status": "success"},
+                    "b": {"status": "success"}
+                }
+            },
+            state={"completed_tasks": []}
+        )
+
+        strategy = RecoveryStrategy()
+        plan = strategy.resume(checkpoint)
+
+        assert "c" in plan.tasks
+        assert "a" not in plan.tasks
+        assert "b" not in plan.tasks
+
+    def test_needs_verification_with_failed_tasks(self):
+        checkpoint = Checkpoint(
+            phase_progress=1.0,
+            state={"failed_tasks": ["task_1"]}
+        )
+
+        strategy = RecoveryStrategy()
+        plan = strategy.resume(checkpoint)
+
+        assert plan.verification_needed is True
+
+    def test_needs_verification_with_incomplete_progress(self):
+        checkpoint = Checkpoint(
+            phase_progress=0.5,
+            state={}
+        )
+
+        strategy = RecoveryStrategy()
+        plan = strategy.resume(checkpoint)
+
+        assert plan.verification_needed is True
+
+    def test_in_flight_tasks_identified(self):
+        checkpoint = Checkpoint(
+            dag={
+                "execution_plan": ["task_1", "task_2"],
+                "results": {
+                    "task_1": {"status": "running"},
+                    "task_2": {"status": "success"}
+                }
+            }
+        )
+
+        strategy = RecoveryStrategy()
+        plan = strategy.resume(checkpoint)
+
+        assert len(plan.in_flight_recovery) == 1
+        assert plan.in_flight_recovery[0]["task_id"] == "task_1"

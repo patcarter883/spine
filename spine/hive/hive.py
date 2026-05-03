@@ -5,6 +5,16 @@ import os
 from datetime import datetime
 from typing import Optional, Any
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+
+LAYER_STRUCTURE = {
+    "layer_1": {"name": "Durable Truth", "paths": ["spec/requirements.md", "spec/architecture.md"]},
+    "layer_2": {"name": "Working Memory", "paths": []},
+    "layer_3": {"name": "Judgment Cache", "paths": ["knowledge/constraints.md", "knowledge/patterns.json"]},
+    "layer_4": {"name": "Execution State", "paths": []},
+    "layer_5": {"name": "Communication Bus", "paths": []},
+}
 
 
 @dataclass
@@ -39,8 +49,39 @@ class Hive:
     def __init__(self, path: str = ".spine/state/hive"):
         self.path = path
         self._cells: dict[str, Cell] = {}
+        self.layer_structure = LAYER_STRUCTURE
         os.makedirs(path, exist_ok=True)
         self._load()
+
+    def get_layer_1_paths(self) -> list[str]:
+        """Get Layer 1 (Durable Truth) file paths."""
+        return self.layer_structure["layer_1"]["paths"]
+
+    def get_layer_3_paths(self) -> list[str]:
+        """Get Layer 3 (Judgment Cache) file paths."""
+        return self.layer_structure["layer_3"]["paths"]
+
+    def read_layer_1_durable_truth(self) -> dict[str, str]:
+        """Read Layer 1 (Durable Truth): spec/requirements.md and spec/architecture.md."""
+        content = {}
+        for path in self.get_layer_1_paths():
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    content[path] = f.read()
+        return content
+
+    def read_layer_3_judgment_cache(self) -> dict[str, Any]:
+        """Read Layer 3 (Judgment Cache): knowledge/constraints.md and knowledge/patterns.json."""
+        content = {}
+        for path in self.get_layer_3_paths():
+            if os.path.exists(path):
+                if path.endswith(".json"):
+                    with open(path, "r") as f:
+                        content[path] = json.load(f)
+                else:
+                    with open(path, "r") as f:
+                        content[path] = f.read()
+        return content
     
     def _load(self):
         """Load cells from disk."""

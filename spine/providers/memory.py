@@ -1,10 +1,23 @@
 """Memory Provider implementations."""
 
 from abc import abstractmethod
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 from .base import Provider, ProviderType
 import json
 import os
+
+
+@dataclass
+class MemoryEntry:
+    """Dataclass for memory persistence layer."""
+    key: str
+    value: Any
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+    ttl: Optional[int] = None
+    embeddings: Optional[List[float]] = None
 
 
 class MemoryProvider(Provider):

@@ -22,3 +22,14 @@ class StateStatus(str, Enum):
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
+
+
+class SubPhaseStatus(str, Enum):
+    """Status values for sub-phases during wave execution."""
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    REWORKING = "reworking"
+    CANCELLED = "cancelled"

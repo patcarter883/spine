@@ -48,6 +48,28 @@ class SwarmMail:
         self.resource_manager = resource_manager or _DefaultResourceManager()
         os.makedirs(event_path, exist_ok=True)
         self._log_file = os.path.join(event_path, "swarm.log")
+    
+    def handle_plan_for_review(self, plan: dict[str, Any], critic: Any) -> dict[str, Any]:
+        """Process a PLAN_FOR_REVIEW message and get critic review."""
+        result = critic.execute({"plan": plan}, "review")
+        return {
+            "type": "PLAN_REVIEWED",
+            "plan_id": plan.get("id"),
+            "approved": result.get("approved", False),
+            "issues": result.get("issues", []),
+            "from": self.agent_id
+        }
+    
+    def handle_task_assignment(self, task_id: str, task_data: dict[str, Any], worker: Any) -> None:
+        """Process a TASK_ASSIGNMENT message and dispatch to worker."""
+        pass
+    
+    def get_unread_messages(self, processed_ids: Optional[set] = None) -> List[Dict[str, Any]]:
+        """Get unread messages, optionally filtered by already-processed IDs."""
+        messages = self.inbox()
+        if processed_ids:
+            return [m for m in messages if m.get("id") not in processed_ids]
+        return messages
 
     def _log_event(self, event: Dict[str, Any]) -> None:
         """Append event to JSONL log file."""

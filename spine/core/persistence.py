@@ -6,6 +6,16 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional, Any, Callable
 from enum import Enum
+from pathlib import Path
+
+
+LAYER_STRUCTURE = {
+    "layer_1": {"name": "Durable Truth", "paths": ["spec/requirements.md", "spec/architecture.md"]},
+    "layer_2": {"name": "Working Memory", "paths": []},
+    "layer_3": {"name": "Judgment Cache", "paths": ["knowledge/constraints.md", "knowledge/patterns.json"]},
+    "layer_4": {"name": "Execution State", "paths": []},
+    "layer_5": {"name": "Communication Bus", "paths": []},
+}
 
 
 class ResumeAction(str, Enum):
@@ -228,12 +238,133 @@ class Context:
         return cls()
 
 
+@dataclass
+class ExecutionPlan:
+    """Optimal resume plan built from checkpoint."""
+    tasks: list[str] = field(default_factory=list)
+    in_flight_recovery: list[dict[str, Any]] = field(default_factory=list)
+    verification_needed: bool = False
+    file_reservations: dict[str, list[str]] = field(default_factory=dict)
+    pending_gates: list[str] = field(default_factory=list)
+    excluded_tasks: list[str] = field(default_factory=list)
+
+
+class RecoveryStrategy:
+    """Builds optimal resume plans from checkpoints with swarm state."""
+
+    def resume(self, checkpoint: Checkpoint) -> ExecutionPlan:
+        """Build optimal resume plan including swarm state."""
+        in_flight = self._get_in_flight_tasks(checkpoint)
+
+        completed_ids = self._get_completed_task_ids(checkpoint)
+        remaining_dag = self._rebuild_dag_excluding(
+            checkpoint.dag,
+            exclude=completed_ids
+        )
+
+        swarm_info = checkpoint.swarm_state or {}
+
+        return ExecutionPlan(
+            tasks=remaining_dag,
+            in_flight_recovery=in_flight,
+            verification_needed=self._needs_verification(checkpoint),
+            file_reservations=swarm_info.get("file_reservations", {}),
+            pending_gates=swarm_info.get("pending_gates", [])
+        )
+
+    def _get_in_flight_tasks(self, checkpoint: Checkpoint) -> list[dict[str, Any]]:
+        """Identify tasks that were running at checkpoint time."""
+        in_flight = []
+        for task_id, task_data in checkpoint.dag.get("results", {}).items():
+            if task_data.get("status") == "running":
+                in_flight.append({
+                    "task_id": task_id,
+                    "status": "running",
+                    "started_at": task_data.get("started_at")
+                })
+        return in_flight
+
+    def _get_completed_task_ids(self, checkpoint: Checkpoint) -> list[str]:
+        """Get list of completed task IDs to exclude from execution plan."""
+        completed = checkpoint.state.get("completed_tasks", [])
+        results = checkpoint.dag.get("results", {})
+        for task_id, task_data in results.items():
+            if task_data.get("status") == "success":
+                if task_id not in completed:
+                    completed.append(task_id)
+        return completed
+
+    def _rebuild_dag_excluding(
+        self,
+        dag: dict[str, Any],
+        exclude: list[str]
+    ) -> list[str]:
+        """Rebuild DAG excluding completed tasks, preserving dependency order."""
+        execution_order = dag.get("execution_plan", [])
+        dependencies = dag.get("dependencies", {})
+
+        filtered = [t for t in execution_order if t not in exclude]
+
+        ordered = []
+        visited = set()
+
+        def visit(task_id: str) -> None:
+            if task_id in visited or task_id in exclude:
+                return
+            visited.add(task_id)
+            for dep in dependencies.get(task_id, []):
+                visit(dep)
+            ordered.append(task_id)
+
+        for task in filtered:
+            visit(task)
+
+        return ordered
+
+    def _needs_verification(self, checkpoint: Checkpoint) -> bool:
+        """Check if verification is needed based on checkpoint state."""
+        failed = checkpoint.state.get("failed_tasks", [])
+        return len(failed) > 0 or checkpoint.phase_progress < 1.0
+
+
 class ContinuityManager:
     """Manages session continuity and state restoration."""
 
     def __init__(self, state_dir: str = ".spine/state"):
         self.state_dir = state_dir
         self.checkpoints_dir = os.path.join(state_dir, "checkpoints")
+        self.recovery = RecoveryStrategy()
+        self.layer_structure = LAYER_STRUCTURE
+
+    def get_layer_1_paths(self) -> list[str]:
+        """Get Layer 1 (Durable Truth) file paths."""
+        return self.layer_structure["layer_1"]["paths"]
+
+    def get_layer_3_paths(self) -> list[str]:
+        """Get Layer 3 (Judgment Cache) file paths."""
+        return self.layer_structure["layer_3"]["paths"]
+
+    def read_layer_1_durable_truth(self) -> dict[str, str]:
+        """Read Layer 1 (Durable Truth): spec/requirements.md and spec/architecture.md."""
+        content = {}
+        for path in self.get_layer_1_paths():
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    content[path] = f.read()
+        return content
+
+    def read_layer_3_judgment_cache(self) -> dict[str, Any]:
+        """Read Layer 3 (Judgment Cache): knowledge/constraints.md and knowledge/patterns.json."""
+        content = {}
+        for path in self.get_layer_3_paths():
+            if os.path.exists(path):
+                if path.endswith(".json"):
+                    with open(path, "r") as f:
+                        content[path] = json.load(f)
+                else:
+                    with open(path, "r") as f:
+                        content[path] = f.read()
+        return content
 
     def restore_session(self, work_item_id: str = None) -> Context:
         """Restore state from checkpoint with swarm state."""
@@ -314,3 +445,13 @@ class ContinuityManager:
             return {}
         with open(path, "r") as f:
             return json.load(f)
+
+    def build_resume_plan(self, checkpoint_path: str) -> ExecutionPlan:
+        """Build optimal resume plan from checkpoint."""
+        checkpoint = self._load_checkpoint(checkpoint_path)
+        return self.recovery.resume(checkpoint)
+
+    def _load_checkpoint(self, path: str) -> Checkpoint:
+        """Load checkpoint from file."""
+        data = self._load_json(path)
+        return Checkpoint.from_dict(data)
