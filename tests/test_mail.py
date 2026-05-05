@@ -10,7 +10,7 @@ import pytest
 # Ensure spine package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from spine.swarm.mail import SwarmMail, _DefaultResourceManager
+from spine.swarm.mail import SwarmMail, _DefaultResourceManager, MESSAGE_SENT, MESSAGE_BROADCAST
 
 
 # --- Fixtures ---
@@ -373,3 +373,186 @@ class TestSwarmMailIntegration:
         for agent in [agent1, agent2, agent3]:
             msgs = agent.inbox()
             assert any(m["subject"] == "system" for m in msgs)
+
+
+# --- SwarmMail Acknowledgment tests ---
+
+class TestSwarmMailAcknowledgment:
+    """Test SwarmMail acknowledgment system."""
+
+    def test_acknowledge_message(self, mail):
+        """acknowledge should record acknowledgment."""
+        event = mail.send(to="test_agent", subject="Task", body={"data": "test"})
+        message_id = event["_id"]
+
+        result = mail.acknowledge(message_id)
+        assert result["type"] == "message_acknowledged"
+        assert result["message_id"] == message_id
+        assert result["by"] == "test_agent"
+
+    def test_is_acknowledged(self, mail):
+        """is_acknowledged should return True after acknowledgment."""
+        event = mail.send(to="test_agent", subject="Task", body={})
+        message_id = event["_id"]
+
+        assert mail.is_acknowledged(message_id) is False
+        mail.acknowledge(message_id)
+        assert mail.is_acknowledged(message_id) is True
+
+    def test_get_acknowledgments(self, mail):
+        """get_acknowledgments should return set of acknowledging agents."""
+        event = mail.send(to="any_agent", subject="Task", body={})
+        message_id = event["_id"]
+
+        mail.acknowledge(message_id)
+        acks = mail.get_acknowledgments(message_id)
+        assert "test_agent" in acks
+
+    def test_acknowledged_messages_excluded_from_inbox(self, tmp_path):
+        """Messages acknowledged by receiver should be excluded from inbox by default."""
+        event_dir = str(tmp_path / "ack_test")
+        sender = SwarmMail(agent_id="sender", event_path=event_dir)
+        receiver = SwarmMail(agent_id="receiver", event_path=event_dir)
+
+        event = sender.send(to="receiver", subject="Task", body={})
+        message_id = event["_id"]
+
+        # Initially message is in inbox
+        messages = receiver.inbox()
+        assert len(messages) == 1
+
+        # After acknowledgment, not in inbox
+        receiver.acknowledge(message_id)
+        messages = receiver.inbox()
+        assert len(messages) == 0
+
+    def test_include_acknowledged_in_inbox(self, tmp_path):
+        """Inbox with include_acknowledged=True should show all messages."""
+        event_dir = str(tmp_path / "ack_test2")
+        sender = SwarmMail(agent_id="sender", event_path=event_dir)
+        receiver = SwarmMail(agent_id="receiver", event_path=event_dir)
+
+        event = sender.send(to="receiver", subject="Task", body={})
+        message_id = event["_id"]
+
+        receiver.acknowledge(message_id)
+        messages = receiver.inbox(include_acknowledged=True)
+        assert len(messages) == 1
+
+
+# --- SwarmMail Replay tests ---
+
+class TestSwarmMailReplay:
+    """Test SwarmMail replay capability."""
+
+    def test_replay_from_position(self, mail):
+        """replay_from should yield events from given position."""
+        mail.send(to="a", subject="S1", body={})
+        mail.send(to="b", subject="S2", body={})
+        mail.send(to="c", subject="S3", body={})
+
+        # Replay from position 1 (second message)
+        events = list(mail.replay_from(position=1))
+        assert len(events) == 2
+        assert events[0]["subject"] == "S2"
+
+    def test_replay_from_empty_log(self, mail):
+        """replay_from should return empty iterator for non-existent log."""
+        events = list(mail.replay_from(position=0))
+        assert events == []
+
+    def test_replay_since_timestamp(self, mail):
+        """replay_since should yield events after timestamp."""
+        import time
+        mail.send(to="a", subject="Early", body={})
+        time.sleep(0.01)  # Ensure different timestamp
+        later_ts = None
+        mail.send(to="b", subject="Later", body={})
+        # Get timestamp of "Later" message
+        events = mail.get_events()
+        later_ts = events[-1]["timestamp"]
+
+        replayed = list(mail.replay_since(timestamp=later_ts))
+        assert len(replayed) == 1
+        assert replayed[0]["subject"] == "Later"
+
+    def test_get_log_position(self, mail):
+        """get_log_position should return current line count."""
+        assert mail.get_log_position() == 0
+        mail.send(to="a", subject="S", body={})
+        assert mail.get_log_position() == 1
+        mail.send(to="b", subject="S", body={})
+        assert mail.get_log_position() == 2
+
+
+# --- SwarmMail Query tests ---
+
+class TestSwarmMailQuery:
+    """Test SwarmMail event querying APIs."""
+
+    def test_get_events_with_filters(self, mail):
+        """get_events should filter by from_agent, to_agent, subject."""
+        sender = SwarmMail(agent_id="sender", event_path=mail.event_path)
+        sender.send(to="target", subject="TestSubject", body={"key": "value"})
+
+        events = mail.get_events(to_agent="target")
+        assert len(events) == 1
+
+        events = mail.get_events(subject="TestSubject")
+        assert len(events) == 1
+
+        events = mail.get_events(from_agent="sender")
+        assert len(events) == 1
+
+    def test_query_events_advanced(self, mail):
+        """query_events should support multiple filters."""
+        mail.send(to="a", subject="S1", body={})
+        mail.send(to="b", subject="S2", body={})
+
+        events = mail.query_events(types=["message_sent"], limit=1)
+        assert len(events) == 1
+
+    def test_get_event_by_id(self, mail):
+        """get_event_by_id should return specific event."""
+        event = mail.send(to="a", subject="Test", body={})
+        message_id = event["_id"]
+
+        found = mail.get_event_by_id(message_id)
+        assert found is not None
+        assert found["subject"] == "Test"
+
+        not_found = mail.get_event_by_id("nonexistent-id")
+        assert not_found is None
+
+
+# --- SwarmMail Robust Persistence tests ---
+
+class TestSwarmMailPersistence:
+    """Test SwarmMail robust JSONL persistence."""
+
+    def test_event_has_unique_id(self, mail):
+        """Each event should have a unique _id."""
+        event1 = mail.send(to="a", subject="S1", body={})
+        event2 = mail.send(to="b", subject="S2", body={})
+
+        assert event1["_id"] != event2["_id"]
+        assert "_id" in event1
+        assert "_id" in event2
+
+    def test_multiple_agents_same_event_store(self, tmp_path):
+        """Multiple agents should share the same event store."""
+        event_dir = str(tmp_path / "shared")
+        agent1 = SwarmMail(agent_id="agent1", event_path=event_dir)
+        agent2 = SwarmMail(agent_id="agent2", event_path=event_dir)
+
+        agent1.send(to="agent2", subject="Msg", body={})
+
+        # Both agents see the same events
+        events1 = agent1.get_events()
+        events2 = agent2.get_events()
+        assert len(events1) == len(events2)
+
+    def test_event_type_constants(self):
+        """Message type constants should be defined correctly."""
+        assert MESSAGE_SENT == "message_sent"
+        assert MESSAGE_BROADCAST == "message_broadcast"

@@ -1,7 +1,12 @@
 """Swarm supervisor for coordinating multiple agents."""
 
-from typing import Any, Optional
+import asyncio
+from typing import Any, Optional, AsyncIterator
 from langgraph.graph import MessagesState
+
+from ..swarm.agents import SwarmAgent, AgentRoleValidator, InvalidAgentRoleError
+from ..swarm.gates import QualityGate, PreCheckBatch
+
 
 # Import the real langgraph_supervisor at call time to avoid import issues
 def _get_create_supervisor():
@@ -26,11 +31,16 @@ class AgentRole:
     DESIGNER = "designer"   # UI/UX specifications
 
 
-class SwarmAgent:
-    """A specialized agent in the swarm."""
+class SupervisorSwarmAgent(SwarmAgent):
+    """A specialized agent in the swarm with additional features."""
     
     def __init__(self, role: str, name: str, system_prompt: str):
-        self.role = role
+        # Validate role before initializing
+        if not AgentRoleValidator.validate(role):
+            raise InvalidAgentRoleError(
+                f"Invalid agent role: '{role}'. Valid roles: {AgentRoleValidator.get_valid_roles()}"
+            )
+        super().__init__(role, [name], None)  # Call parent with stub provider
         self.name = name
         self.system_prompt = system_prompt
         self._llm_provider = None  # Optional LLM provider
@@ -38,6 +48,29 @@ class SwarmAgent:
     def set_llm_provider(self, provider: Any) -> None:
         """Set the LLM provider for this agent."""
         self._llm_provider = provider
+        # Also set on parent for compatibility
+        super().set_llm_provider(provider)
+    
+    async def execute_streaming(self, state: dict[str, Any]) -> AsyncIterator[str]:
+        """Execute with streaming support.
+        
+        Yields chunks of the LLM response as they become available.
+        """
+        requirement = state.get("requirement", "")
+        current_output = state.get("agent_output", "")
+        
+        prompt = f"{self.system_prompt}\n\nCurrent requirement: {requirement}"
+        if current_output:
+            prompt += f"\n\nPrevious output: {current_output}"
+        
+        if self._llm_provider:
+            try:
+                async for chunk in self._llm_provider.stream(prompt):
+                    yield chunk
+            except Exception as e:
+                yield f"[Agent {self.name} error: {e}]"
+        else:
+            yield f"[{self.name} agent completed: {requirement[:100]}]"
     
     def create_node(self):
         """Create a LangGraph node from this agent that executes LLM-backed.
@@ -78,9 +111,9 @@ class SwarmAgent:
         return agent_node
 
 
-def create_explorer_agent() -> SwarmAgent:
+def create_explorer_agent() -> SupervisorSwarmAgent:
     """Create the explorer agent for requirement analysis."""
-    return SwarmAgent(
+    return SupervisorSwarmAgent(
         role=AgentRole.EXPLORER,
         name="explorer",
         system_prompt=(
@@ -91,9 +124,9 @@ def create_explorer_agent() -> SwarmAgent:
     )
 
 
-def create_sme_agent() -> SwarmAgent:
+def create_sme_agent() -> SupervisorSwarmAgent:
     """Create the SME agent for research."""
-    return SwarmAgent(
+    return SupervisorSwarmAgent(
         role=AgentRole.SME,
         name="sme",
         system_prompt=(
@@ -104,9 +137,9 @@ def create_sme_agent() -> SwarmAgent:
     )
 
 
-def create_planner_agent() -> SwarmAgent:
+def create_planner_agent() -> SupervisorSwarmAgent:
     """Create the planner agent for execution planning."""
-    return SwarmAgent(
+    return SupervisorSwarmAgent(
         role=AgentRole.PLANNER,
         name="planner",
         system_prompt=(
@@ -117,9 +150,9 @@ def create_planner_agent() -> SwarmAgent:
     )
 
 
-def create_critic_agent() -> SwarmAgent:
+def create_critic_agent() -> SupervisorSwarmAgent:
     """Create the critic agent for validation."""
-    return SwarmAgent(
+    return SupervisorSwarmAgent(
         role=AgentRole.CRITIC,
         name="critic",
         system_prompt=(
@@ -130,7 +163,7 @@ def create_critic_agent() -> SwarmAgent:
     )
 
 
-def create_supervisor(agents: list[SwarmAgent], state_schema: type = MessagesState):
+def create_supervisor(agents: list[SupervisorSwarmAgent], state_schema: type = MessagesState):
     """
     Create a supervisor that coordinates multiple swarm agents.
     
@@ -138,7 +171,7 @@ def create_supervisor(agents: list[SwarmAgent], state_schema: type = MessagesSta
     Falls back to configuration dict when langgraph_supervisor is not installed.
     
     Args:
-        agents: List of SwarmAgent instances to coordinate
+        agents: List of SupervisorSwarmAgent instances to coordinate
         state_schema: The state schema for the supervisor graph
         
     Returns:
@@ -175,22 +208,23 @@ class Supervisor:
     Coordinates parallel agents and enforces swarm gates.
     """
     
-    def __init__(self, agents: Optional[list[SwarmAgent]] = None):
+    def __init__(self, agents: Optional[list[SupervisorSwarmAgent]] = None):
         self.agents = agents or []
         self._agent_map = {a.role: a for a in self.agents}
     
-    def spawn_agent(self, role: str) -> Optional[SwarmAgent]:
+    def spawn_agent(self, role: str) -> Optional[SupervisorSwarmAgent]:
         """Spawn an agent by role."""
         return self._agent_map.get(role)
     
     def run_gates(self, gate_names: list[str], context: dict[str, Any]) -> dict[str, Any]:
-        """Run swarm gates and return results.
+        """Run swarm gates with enforcement.
         
         Executes each gate by:
-        1. Looking up the agent by gate name
+        1. Looking up the agent by gate name (or using predefined gate)
         2. Creating a LangGraph node from the agent
         3. Executing the node with the provided context
         4. Recording the result
+        5. Enforcing gate requirements (fail if required gate fails)
         
         Args:
             gate_names: List of gate names (agent roles) to execute
@@ -198,28 +232,80 @@ class Supervisor:
             
         Returns:
             Dict mapping gate names to their results and status
+            
+        Raises:
+            GateEnforcementError: When a required gate fails
         """
         results = {}
+        gate_errors = []
+        
         for gate_name in gate_names:
-            agent = self.spawn_agent(gate_name)
-            if agent:
-                # Create and execute the agent node
-                node = agent.create_node()
-                try:
-                    gate_result = node(context)
-                    results[gate_name] = {
-                        "status": "completed",
-                        "result": gate_result
-                    }
-                except Exception as e:
+            # Check if this is a predefined gate (quality, precheck_batch)
+            gate_result = self._run_named_gate(gate_name, context)
+            
+            if gate_result is None:
+                # Not a predefined gate, try to find agent
+                agent = self.spawn_agent(gate_name)
+                if agent:
+                    # Create and execute the agent node
+                    node = agent.create_node()
+                    try:
+                        gate_result = node(context)
+                        results[gate_name] = {
+                            "status": "completed",
+                            "result": gate_result
+                        }
+                    except Exception as e:
+                        results[gate_name] = {
+                            "status": "failed",
+                            "error": str(e)
+                        }
+                        gate_errors.append(gate_name)
+                else:
+                    # Gate agent not found - mark as failed
                     results[gate_name] = {
                         "status": "failed",
-                        "error": str(e)
+                        "error": f"No agent found for gate: {gate_name}"
                     }
+                    gate_errors.append(gate_name)
             else:
-                # Gate agent not found - mark as failed
-                results[gate_name] = {
-                    "status": "failed",
-                    "error": f"No agent found for gate: {gate_name}"
-                }
+                results[gate_name] = gate_result
+        
+        # Enforce gate requirements - raise error if any gate failed
+        if gate_errors:
+            failed_gate_info = {g: results[g] for g in gate_errors}
+            raise GateEnforcementError(
+                f"Gate enforcement failed for: {gate_errors}",
+                gate_results=failed_gate_info
+            )
+        
         return results
+    
+    def _run_named_gate(self, gate_name: str, context: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Run a predefined gate by name.
+        
+        Returns None if gate_name is not a predefined gate.
+        """
+        if gate_name == "quality":
+            gate = QualityGate()
+            result = gate.evaluate(context)
+            return {
+                "status": "passed" if result.get("approved", False) else "failed",
+                "result": result
+            }
+        elif gate_name == "precheck_batch":
+            gate = PreCheckBatch()
+            result = gate.evaluate(context)
+            return {
+                "status": "passed" if result.get("all_passed", False) else "failed",
+                "result": result
+            }
+        return None
+
+
+class GateEnforcementError(Exception):
+    """Raised when gate enforcement fails."""
+    
+    def __init__(self, message: str, gate_results: Optional[dict[str, Any]] = None):
+        super().__init__(message)
+        self.gate_results = gate_results or {}

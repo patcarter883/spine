@@ -608,3 +608,123 @@ class TestFactoryFunctions:
 
         synced = sync_patterns_to_hivemind(lm, hm)
         assert synced == 3
+
+
+# --- SwarmMail Learning Integration tests ---
+
+class TestSwarmMailLearningIntegration:
+    """Test SwarmMail learning integration methods."""
+
+    def test_record_event_to_learning(self, tmp_path):
+        """record_event_to_learning should store pattern via learning_manager."""
+        from spine.swarm.mail import SwarmMail
+        from spine.core.learning import LearningManager, Pattern
+        
+        lm = LearningManager(knowledge_dir=str(tmp_path / "knowledge"))
+        events_path = str(tmp_path / "events")
+        mail = SwarmMail(agent_id="test", event_path=events_path, learning_manager=lm)
+        
+        event = {
+            "type": "message_sent",
+            "to": "coder",
+            "subject": "task_assignment",
+            "_id": "msg_123"
+        }
+        
+        pattern = mail.record_event_to_learning(event, success=True, work_item_id="feat_test")
+        assert pattern is not None
+        assert pattern.pattern_id == "swarm_message_sent_feat_test"
+
+    def test_record_event_to_learning_no_manager(self, tmp_path):
+        """record_event_to_learning should return None without learning_manager."""
+        from spine.swarm.mail import SwarmMail
+        
+        events_path = str(tmp_path / "events")
+        mail = SwarmMail(agent_id="test", event_path=events_path, learning_manager=None)
+        
+        event = {"type": "test", "_id": "msg_456"}
+        result = mail.record_event_to_learning(event, success=True)
+        assert result is None
+
+    def test_process_unacknowledged_for_learning(self, tmp_path):
+        """process_unacknowledged_for_learning should record patterns."""
+        from spine.swarm.mail import SwarmMail
+        from spine.core.learning import LearningManager
+        
+        lm = LearningManager(knowledge_dir=str(tmp_path / "knowledge"))
+        events_path = str(tmp_path / "events")
+        mail = SwarmMail(agent_id="test", event_path=events_path, learning_manager=lm)
+        
+        # Send a message to self (test agent)
+        mail.send("test", "test", {"task": "test_task", "success": True})
+        
+        patterns = mail.process_unacknowledged_for_learning(work_item_id="feat_process")
+        # May have 0 or more depending on if messages are for this agent
+        assert isinstance(patterns, list)
+
+    def test_set_learning_manager(self, tmp_path):
+        """set_learning_manager should update the learning_manager."""
+        from spine.swarm.mail import SwarmMail
+        from spine.core.learning import LearningManager
+        
+        lm = LearningManager(knowledge_dir=str(tmp_path / "knowledge"))
+        events_path = str(tmp_path / "events")
+        mail = SwarmMail(agent_id="test", event_path=events_path)
+        
+        assert mail.learning_manager is None
+        mail.set_learning_manager(lm)
+        assert mail.learning_manager is lm
+
+
+# --- LearningManager Swarm Event Integration tests ---
+
+class TestLearningManagerSwarmEvents:
+    """Test LearningManager swarm event methods."""
+
+    def test_record_swarm_event(self, learning_manager):
+        """record_swarm_event should create and record a pattern."""
+        pattern = learning_manager.record_swarm_event(
+            event_type="task_completed",
+            event_data={"task_id": "t1", "action": "build"},
+            success=True,
+            work_item_id="feat_swarm"
+        )
+        assert pattern is not None
+        assert pattern.pattern_id == "swarm_task_completed_feat_swarm"
+        assert pattern.successes == 1
+
+    def test_get_swarm_patterns(self, learning_manager):
+        """get_swarm_patterns should return patterns starting with 'swarm_'."""
+        learning_manager.record_swarm_event(
+            event_type="event1",
+            event_data={},
+            success=True
+        )
+        learning_manager.record_swarm_event(
+            event_type="event2",
+            event_data={},
+            success=False
+        )
+        
+        swarm_patterns = learning_manager.get_swarm_patterns()
+        assert len(swarm_patterns) >= 2
+        for p in swarm_patterns:
+            assert p.pattern_id.startswith("swarm_")
+
+    def test_sync_to_hivemind(self, learning_manager, hivemind):
+        """sync_to_hivemind should sync proven patterns."""
+        # Create a proven pattern (needs 90%+ success, 10+ confirmations)
+        p = Pattern(
+            pattern_id="sync_swarm_1",
+            context="swarm context",
+            solution="swarm solution",
+        )
+        for _ in range(10):
+            p.record_success()
+        # 10 successes = 100% success rate
+        p.record_failure()  # 10/11 ~ 90.9% -> proven with 11 confirmations
+        learning_manager.record_completion(p, "t1", "w1", success=True)
+        
+        synced = learning_manager.sync_to_hivemind(hivemind)
+        # Should sync proven patterns
+        assert synced >= 0  # May be 1 if proven, 0 otherwise

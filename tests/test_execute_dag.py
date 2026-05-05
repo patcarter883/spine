@@ -10,7 +10,8 @@ import pytest
 from spine.core.state_machine import (
     SwarmDAGExecutor, SubPhase, Task, Phase, StateStatus
 )
-from spine.swarm.supervisor import Supervisor, SwarmAgent, AgentRole, create_supervisor
+from spine.models.dag import ResourceQuota, ExecutionProgress
+from spine.swarm.supervisor import Supervisor, SupervisorSwarmAgent, AgentRole, create_supervisor, GateEnforcementError
 from spine.providers.llm import LLMProvider
 
 
@@ -35,7 +36,7 @@ class FakeLLMProvider(LLMProvider):
     def enabled(self):
         return True
     
-    def generate(self, prompt, **kwargs):
+    def generate_sync(self, prompt, **kwargs):
         self.call_count += 1
         return self.response
     
@@ -166,11 +167,11 @@ class TestExecutePhaseWithLLM:
 
 
 class TestSupervisorCreateNode:
-    """Test SwarmAgent.create_node() with LLM integration."""
+    """Test SupervisorSwarmAgent.create_node() with LLM integration."""
     
     def test_create_node_returns_function(self):
         """create_node should return a callable node function."""
-        agent = SwarmAgent(
+        agent = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
             system_prompt="Analyze requirements"
@@ -181,7 +182,7 @@ class TestSupervisorCreateNode:
     
     def test_create_node_executes_llm_when_provider_set(self):
         """create_node should call LLM provider when available."""
-        agent = SwarmAgent(
+        agent = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
             system_prompt="Analyze requirements"
@@ -199,7 +200,7 @@ class TestSupervisorCreateNode:
     
     def test_create_node_fallback_without_llm(self):
         """create_node should produce fallback output without LLM."""
-        agent = SwarmAgent(
+        agent = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
             system_prompt="Analyze requirements"
@@ -215,7 +216,7 @@ class TestSupervisorCreateNode:
     
     def test_create_node_persists_previous_output(self):
         """create_node should include previous output in prompt."""
-        agent = SwarmAgent(
+        agent = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
             system_prompt="Analyze requirements"
@@ -238,7 +239,7 @@ class TestSupervisorRunGates:
     
     def test_run_gates_executes_agents(self):
         """run_gates should create and execute nodes for each gate agent."""
-        explorer = SwarmAgent(
+        explorer = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
             system_prompt="Analyze requirements"
@@ -256,17 +257,15 @@ class TestSupervisorRunGates:
         """run_gates should handle missing agents gracefully."""
         supervisor = Supervisor()  # No agents
         
-        results = supervisor.run_gates(["nonexistent"], {"req": "test"})
-        
-        assert "nonexistent" in results
-        assert results["nonexistent"]["status"] == "failed"
-        assert "No agent found" in results["nonexistent"]["error"]
+        # Missing agent should raise GateEnforcementError
+        with pytest.raises(GateEnforcementError):
+            supervisor.run_gates(["nonexistent"], {"req": "test"})
     
     def test_run_gates_multiple_gates(self):
         """run_gates should execute multiple gate agents."""
         agents = [
-            SwarmAgent(role=AgentRole.EXPLORER, name="explorer", system_prompt="Analyze"),
-            SwarmAgent(role=AgentRole.PLANNER, name="planner", system_prompt="Plan"),
+            SupervisorSwarmAgent(role=AgentRole.EXPLORER, name="explorer", system_prompt="Analyze"),
+            SupervisorSwarmAgent(role=AgentRole.PLANNER, name="planner", system_prompt="Plan"),
         ]
         supervisor = Supervisor(agents=agents)
         
@@ -285,7 +284,7 @@ class TestCreateSupervisorFallback:
         # Mock import failure
         with patch('spine.swarm.supervisor._get_create_supervisor', return_value=None):
             agents = [
-                SwarmAgent(role=AgentRole.EXPLORER, name="explorer", system_prompt="Analyze"),
+                SupervisorSwarmAgent(role=AgentRole.EXPLORER, name="explorer", system_prompt="Analyze"),
             ]
             result = create_supervisor(agents)
             
@@ -295,11 +294,11 @@ class TestCreateSupervisorFallback:
 
 
 class TestSwarmAgentSetLLM:
-    """Test SwarmAgent.set_llm_provider()."""
+    """Test SupervisorSwarmAgent.set_llm_provider()."""
     
     def test_set_llm_provider_stores_provider(self):
         """set_llm_provider should store the provider for create_node."""
-        agent = SwarmAgent(
+        agent = SupervisorSwarmAgent(
             role=AgentRole.CODER,
             name="coder",
             system_prompt="Write code"
@@ -311,7 +310,7 @@ class TestSwarmAgentSetLLM:
     
     def test_create_node_uses_set_provider(self):
         """create_node should use the provider set via set_llm_provider."""
-        agent = SwarmAgent(
+        agent = SupervisorSwarmAgent(
             role=AgentRole.CODER,
             name="coder",
             system_prompt="Write code"
@@ -364,3 +363,93 @@ class TestDAGExecutionIntegration:
         # All tasks succeeded
         assert result.subphase_results["ANALYZE"]["status"] == "success"
         assert result.subphase_results["PLAN"]["status"] == "success"
+
+
+class TestWaveBasedScheduling:
+    """Tests for wave-based parallel scheduling features."""
+
+    def test_resource_quota_configuration(self):
+        """Executor should accept and use ResourceQuota."""
+        quota = ResourceQuota(max_concurrent_subphases=3, max_workers=2)
+        executor = SwarmDAGExecutor(resource_quota=quota)
+        assert executor._resource_quota.max_concurrent_subphases == 3
+        assert executor._resource_quota.max_workers == 2
+
+    def test_execution_progress_initialization(self):
+        """Progress should be initialized during phase execution."""
+        executor = SwarmDAGExecutor()
+        phase = Phase(
+            name="PROGRESS_TEST",
+            subphases=[SubPhase(name="A"), SubPhase(name="B")]
+        )
+        executor.execute_phase(phase, {})
+        progress = executor.get_progress()
+        assert progress is not None
+        assert progress.total_subphases == 2
+
+    def test_cancel_callback_integration(self):
+        """Executor should support cancellation via callback."""
+        executor = SwarmDAGExecutor()
+        cancel_called = []
+
+        def cancel_cb():
+            cancel_called.append(True)
+            return True
+
+        executor.set_cancel_callback(cancel_cb)
+        # Cancel should trigger callback
+        result = executor._check_cancel_requested()
+        assert result is True
+        assert len(cancel_called) == 1
+
+    def test_cancel_method_sets_progress_state(self):
+        """Cancel method should update progress with cancellation state."""
+        executor = SwarmDAGExecutor()
+        phase = Phase(name="CANCEL_TEST", subphases=[SubPhase(name="A")])
+        executor.execute_phase(phase, {})
+        progress = executor.get_progress()
+        assert progress.cancelled is False
+        executor.cancel("test reason")
+        assert progress.cancelled is True
+        assert progress.cancel_reason == "test reason"
+
+    def test_compute_waves_with_priority_ordering(self):
+        """compute_waves should sort subphases by priority within each wave."""
+        executor = SwarmDAGExecutor()
+        subphases = [
+            SubPhase(name="Z", priority=3),
+            SubPhase(name="A", priority=1),
+            SubPhase(name="M", priority=2),
+        ]
+        waves = executor.compute_waves(subphases)
+        assert len(waves) == 1
+        assert waves[0] == ["A", "M", "Z"]  # Sorted by priority
+
+    def test_compute_waves_with_dependencies_and_priority(self):
+        """compute_waves should respect both dependencies and priority."""
+        executor = SwarmDAGExecutor()
+        subphases = [
+            SubPhase(name="FIRST", priority=5),
+            SubPhase(name="A", priority=1, dependencies=["FIRST"]),
+            SubPhase(name="B", priority=10, dependencies=["FIRST"]),
+            SubPhase(name="C", priority=3, dependencies=["FIRST"]),
+        ]
+        waves = executor.compute_waves(subphases)
+        assert waves[0] == ["FIRST"]
+        assert waves[1] == ["A", "C", "B"]  # Sorted by priority
+
+    def test_wave_size_limit_respected(self):
+        """Wave size should be limited by resource_quota.max_concurrent_subphases."""
+        quota = ResourceQuota(max_concurrent_subphases=2, max_workers=2)
+        executor = SwarmDAGExecutor(resource_quota=quota)
+        phase = Phase(
+            name="LIMIT_TEST",
+            subphases=[
+                SubPhase(name="A"),
+                SubPhase(name="B"),
+                SubPhase(name="C"),
+                SubPhase(name="D"),
+            ]
+        )
+        result = executor.execute_phase(phase, {})
+        assert len(result.subphase_results) == 4

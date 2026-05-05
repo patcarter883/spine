@@ -1,16 +1,15 @@
 """Tests for spine.swarm.supervisor - swarm coordinator with agent roles and gates."""
 
 import sys
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 # Ensure spine package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spine.swarm.supervisor import (
     AgentRole,
-    SwarmAgent,
+    SupervisorSwarmAgent,
     Supervisor,
     create_supervisor,
     create_explorer_agent,
@@ -18,6 +17,7 @@ from spine.swarm.supervisor import (
     create_planner_agent,
     create_critic_agent,
     _get_create_supervisor,
+    GateEnforcementError,
 )
 
 
@@ -27,10 +27,10 @@ from spine.swarm.supervisor import (
 def sample_agents():
     """Create a set of sample agents for testing."""
     return [
-        SwarmAgent(role=AgentRole.EXPLORER, name="explorer", system_prompt="Analyze"),
-        SwarmAgent(role=AgentRole.PLANNER, name="planner", system_prompt="Plan"),
-        SwarmAgent(role=AgentRole.CODER, name="coder", system_prompt="Code"),
-        SwarmAgent(role=AgentRole.CRITIC, name="critic", system_prompt="Review"),
+        SupervisorSwarmAgent(role=AgentRole.EXPLORER, name="explorer", system_prompt="Analyze"),
+        SupervisorSwarmAgent(role=AgentRole.PLANNER, name="planner", system_prompt="Plan"),
+        SupervisorSwarmAgent(role=AgentRole.CODER, name="coder", system_prompt="Code"),
+        SupervisorSwarmAgent(role=AgentRole.CRITIC, name="critic", system_prompt="Review"),
     ]
 
 
@@ -76,11 +76,11 @@ class TestAgentRole:
 # --- SwarmAgent tests ---
 
 class TestSwarmAgentInit:
-    """Test SwarmAgent initialization."""
+    """Test SupervisorSwarmAgent initialization."""
 
     def test_agent_basic_fields(self):
-        """SwarmAgent should store role, name, and system_prompt."""
-        agent = SwarmAgent(
+        """SupervisorSwarmAgent should store role, name, and system_prompt."""
+        agent = SupervisorSwarmAgent(
             role=AgentRole.CODER,
             name="dev",
             system_prompt="Write code"
@@ -91,34 +91,40 @@ class TestSwarmAgentInit:
         assert agent._llm_provider is None
 
     def test_agent_llm_provider_none(self):
-        """SwarmAgent should initialize with _llm_provider=None."""
-        agent = SwarmAgent(role="test", name="t", system_prompt="prompt")
+        """SupervisorSwarmAgent should initialize with _llm_provider=None."""
+        agent = SupervisorSwarmAgent(role="coder", name="c", system_prompt="code")
         assert agent._llm_provider is None
+
+    def test_invalid_role_raises_error(self):
+        """SupervisorSwarmAgent should raise InvalidAgentRoleError for invalid role."""
+        from spine.swarm.agents import InvalidAgentRoleError
+        with pytest.raises(InvalidAgentRoleError):
+            SupervisorSwarmAgent(role="invalid_role", name="x", system_prompt="test")
 
 
 class TestSwarmAgentSetLLM:
-    """Test SwarmAgent.set_llm_provider()."""
+    """Test SupervisorSwarmAgent.set_llm_provider()."""
 
     def test_set_llm_provider_stores(self):
         """set_llm_provider should store the provider."""
-        agent = SwarmAgent(role="coder", name="c", system_prompt="code")
+        agent = SupervisorSwarmAgent(role="coder", name="c", system_prompt="code")
         fake_llm = type("FakeLLM", (), {"generate": lambda self, p: "output"})()
         agent.set_llm_provider(fake_llm)
         assert agent._llm_provider == fake_llm
 
 
 class TestSwarmAgentCreateNode:
-    """Test SwarmAgent.create_node()."""
+    """Test SupervisorSwarmAgent.create_node()."""
 
     def test_create_node_returns_callable(self):
         """create_node should return a callable node function."""
-        agent = SwarmAgent(role="explorer", name="e", system_prompt="Analyze")
+        agent = SupervisorSwarmAgent(role="explorer", name="e", system_prompt="Analyze")
         node = agent.create_node()
         assert callable(node)
 
     def test_create_node_no_llm_fallback(self):
         """create_node without LLM should produce fallback output."""
-        agent = SwarmAgent(role="explorer", name="e", system_prompt="Analyze")
+        agent = SupervisorSwarmAgent(role="explorer", name="e", system_prompt="Analyze")
         node = agent.create_node()
         state = {"requirement": "Build web app"}
         result = node(state)
@@ -131,7 +137,7 @@ class TestSwarmAgentCreateNode:
 
     def test_create_node_with_llm(self):
         """create_node with LLM should call provider.generate()."""
-        agent = SwarmAgent(role="coder", name="c", system_prompt="Code")
+        agent = SupervisorSwarmAgent(role="coder", name="c", system_prompt="Code")
         fake_llm = type("FakeLLM", (), {"generate": lambda self, p: "def hello(): pass"})()
         agent.set_llm_provider(fake_llm)
         node = agent.create_node()
@@ -141,7 +147,7 @@ class TestSwarmAgentCreateNode:
 
     def test_create_node_include_previous_output(self):
         """create_node should include previous output in prompt when LLM available."""
-        agent = SwarmAgent(role="explorer", name="e", system_prompt="Analyze")
+        agent = SupervisorSwarmAgent(role="explorer", name="e", system_prompt="Analyze")
         captured_prompt = []
         def capture(prompt):
             captured_prompt.append(prompt)
@@ -160,7 +166,7 @@ class TestSwarmAgentCreateNode:
 
     def test_create_node_llm_error_handling(self):
         """create_node should handle LLM provider errors gracefully."""
-        agent = SwarmAgent(role="coder", name="c", system_prompt="Code")
+        agent = SupervisorSwarmAgent(role="coder", name="c", system_prompt="Code")
         def failing_generate(prompt):
             raise ValueError("LLM service unavailable")
         fake_llm = type("FakeLLM", (), {"generate": failing_generate})()
@@ -172,7 +178,7 @@ class TestSwarmAgentCreateNode:
 
     def test_create_node_state_keys(self):
         """create_node should return state with agent_output, agent_role, agent_name."""
-        agent = SwarmAgent(role="sme", name="researcher", system_prompt="Research")
+        agent = SupervisorSwarmAgent(role="sme", name="researcher", system_prompt="Research")
         node = agent.create_node()
         state = {"requirement": "Research topic"}
         result = node(state)
@@ -191,7 +197,7 @@ class TestAgentFactoryFunctions:
     def test_create_explorer_agent(self):
         """create_explorer_agent should return configured explorer."""
         agent = create_explorer_agent()
-        assert isinstance(agent, SwarmAgent)
+        assert isinstance(agent, SupervisorSwarmAgent)
         assert agent.role == AgentRole.EXPLORER
         assert agent.name == "explorer"
         assert "analyze" in agent.system_prompt.lower()
@@ -287,18 +293,14 @@ class TestSupervisorRunGates:
         assert results["planner"]["status"] == "completed"
 
     def test_run_gates_missing_agent(self, supervisor):
-        """run_gates should mark missing agent as failed."""
-        results = supervisor.run_gates(["nonexistent"], {})
-        assert "nonexistent" in results
-        assert results["nonexistent"]["status"] == "failed"
-        assert "No agent found" in results["nonexistent"]["error"]
+        """run_gates should mark missing agent as failed and raise."""
+        with pytest.raises(GateEnforcementError):
+            supervisor.run_gates(["nonexistent"], {})
 
     def test_run_gates_mixed_success_failure(self, supervisor):
         """run_gates should handle mix of existing and missing agents."""
-        results = supervisor.run_gates(["explorer", "ghost", "coder"], {"req": "test"})
-        assert results["explorer"]["status"] == "completed"
-        assert results["ghost"]["status"] == "failed"
-        assert results["coder"]["status"] == "completed"
+        with pytest.raises(GateEnforcementError):
+            supervisor.run_gates(["explorer", "ghost", "coder"], {"req": "test"})
 
     def test_run_gates_empty_list(self, supervisor):
         """run_gates with empty list should return empty dict."""
@@ -308,16 +310,15 @@ class TestSupervisorRunGates:
     def test_run_gates_no_agents_supervisor(self):
         """run_gates on empty supervisor should fail all gates."""
         sup = Supervisor()
-        results = sup.run_gates(["explorer"], {})
-        assert results["explorer"]["status"] == "failed"
+        with pytest.raises(GateEnforcementError):
+            sup.run_gates(["explorer"], {})
 
     def test_run_gates_agent_error_handling(self):
         """run_gates should handle agent errors gracefully."""
-        # Create agent that errors in create_node (unlikely but tests robustness)
-        agent = SwarmAgent(role="test_role", name="te", system_prompt="Test")
+        agent = SupervisorSwarmAgent(role="coder", name="te", system_prompt="Test")
         sup = Supervisor(agents=[agent])
-        results = sup.run_gates(["test_role"], {"requirement": "test"})
-        assert results["test_role"]["status"] == "completed"
+        results = sup.run_gates(["coder"], {"requirement": "test"})
+        assert results["coder"]["status"] == "completed"
 
 
 # --- create_supervisor tests ---
@@ -330,8 +331,8 @@ class TestCreateSupervisor:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("spine.swarm.supervisor._get_create_supervisor", lambda: None)
             agents = [
-                SwarmAgent(role=AgentRole.EXPLORER, name="e", system_prompt="Analyze"),
-                SwarmAgent(role=AgentRole.PLANNER, name="p", system_prompt="Plan"),
+                SupervisorSwarmAgent(role=AgentRole.EXPLORER, name="e", system_prompt="Analyze"),
+                SupervisorSwarmAgent(role=AgentRole.PLANNER, name="p", system_prompt="Plan"),
             ]
             result = create_supervisor(agents)
 
@@ -346,7 +347,7 @@ class TestCreateSupervisor:
         from langgraph.graph import MessagesState
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("spine.swarm.supervisor._get_create_supervisor", lambda: None)
-            agents = [SwarmAgent(role="a", name="a", system_prompt="x")]
+            agents = [SupervisorSwarmAgent(role=AgentRole.ANALYST, name="a", system_prompt="x")]
             result = create_supervisor(agents, state_schema=MessagesState)
         assert result["state_schema"] is MessagesState
 
@@ -392,17 +393,24 @@ class TestSupervisorIntegration:
     def test_supervisor_multiple_gate_runs(self):
         """Supervisor should support multiple gate runs."""
         agents = [
-            SwarmAgent(role="role1", name="r1", system_prompt="First"),
-            SwarmAgent(role="role2", name="r2", system_prompt="Second"),
+            SupervisorSwarmAgent(role=AgentRole.ANALYST, name="r1", system_prompt="First"),
+            SupervisorSwarmAgent(role=AgentRole.DESIGNER, name="r2", system_prompt="Second"),
         ]
         sup = Supervisor(agents=agents)
 
-        run1 = sup.run_gates(["role1"], {"step": 1})
-        assert run1["role1"]["status"] == "completed"
+        run1 = sup.run_gates(["analyst"], {"step": 1})
+        assert run1["analyst"]["status"] == "completed"
 
-        run2 = sup.run_gates(["role2"], {"step": 2})
-        assert run2["role2"]["status"] == "completed"
+        run2 = sup.run_gates(["designer"], {"step": 2})
+        assert run2["designer"]["status"] == "completed"
 
         # Agents persist across runs
-        run3 = sup.run_gates(["role1", "role2"], {"step": 3})
+        run3 = sup.run_gates(["analyst", "designer"], {"step": 3})
         assert len(run3) == 2
+    
+    def test_quality_gate_enforcement(self, supervisor):
+        """Supervisor should support quality gate."""
+        context = {"plan": {"tasks": ["task1", "task2"]}}
+        results = supervisor.run_gates(["quality"], context)
+        assert "quality" in results
+        assert results["quality"]["status"] in ["passed", "failed"]

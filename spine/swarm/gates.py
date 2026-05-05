@@ -2,9 +2,9 @@
 
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Literal
 from ..core.state_machine import SpineState
-from ..swarm.agents import CriticAgent
+from ..providers.llm import LLMProvider
 
 
 class SwarmGate:
@@ -22,27 +22,166 @@ class SwarmGate:
 class CriticGate(SwarmGate):
     """Plan review gate - must pass before execution."""
     
-    def __init__(self):
+    def __init__(self, llm_provider: LLMProvider | None = None):
         super().__init__("critic", required=True)
-        self.agent = CriticAgent()
+        self._llm_provider = llm_provider
     
     def evaluate(self, state: SpineState) -> dict[str, Any]:
         """Review the plan and return approval status."""
-        if not state.get("plan"):
+        plan = state.get("plan")
+        
+        if not plan:
             return {"approved": False, "reason": "No plan to review"}
         
-        # In production, would actually call the critic agent
+        # Use LLM for review if available
+        if self._llm_provider and self._llm_provider.enabled:
+            return self._evaluate_with_llm(plan, state)
+        
+        # Stub evaluation
         result = {
             "approved": True,
             "issues": [],
             "recommendations": []
         }
         return result
+    
+    def _evaluate_with_llm(self, plan: dict[str, Any], state: SpineState) -> dict[str, Any]:
+        """Evaluate plan using LLM."""
+        prompt = f"""You are a critic reviewing an execution plan.
+
+Requirement: {state.get('requirement', '')}
+
+Plan: {plan}
+
+Evaluate for:
+1. Completeness - Are all necessary tasks included?
+2. Correctness - Will the approach work?
+3. Safety - Any security or risk concerns?
+4. Clarity - Are the tasks well-defined?
+
+Return JSON with: approved (true/false), issues, recommendations.
+"""
+        try:
+            response = self._llm_provider.generate(prompt)
+            return self._parse_critic_response(response)
+        except Exception as e:
+            return {
+                "approved": False,
+                "reason": f"LLM evaluation error: {e}",
+                "issues": [str(e)],
+                "recommendations": []
+            }
+    
+    def _parse_critic_response(self, response: str) -> dict[str, Any]:
+        """Parse LLM critic response."""
+        import json
+        try:
+            result = json.loads(response)
+            return {
+                "approved": result.get("approved", False),
+                "issues": result.get("issues", []),
+                "recommendations": result.get("recommendations", [])
+            }
+        except json.JSONDecodeError:
+            approved = "approved" in response.lower() and "not approved" not in response.lower()
+            return {
+                "approved": approved,
+                "issues": [],
+                "recommendations": [response[:200]]
+            }
+
+
+class QualityGate(SwarmGate):
+    """Quality validation gate with full LLM-powered evaluation."""
+    
+    def __init__(self, llm_provider: LLMProvider | None = None):
+        super().__init__("quality", required=True)
+        self._llm_provider = llm_provider
+    
+    def evaluate(self, state: SpineState) -> dict[str, Any]:
+        """Evaluate quality gate and return approval status."""
+        plan = state.get("plan")
+        
+        if not plan:
+            return {
+                "approved": False,
+                "reason": "No plan provided for quality review"
+            }
+        
+        # Use LLM for thorough evaluation if available
+        if self._llm_provider and self._llm_provider.enabled:
+            return self._evaluate_with_llm(plan, state)
+        
+        # Stub evaluation - check basic plan structure
+        tasks = plan.get("tasks", [])
+        if not tasks:
+            return {
+                "approved": False,
+                "reason": "Plan has no tasks"
+            }
+        
+        return {
+            "approved": True,
+            "issues": [],
+            "recommendations": []
+        }
+    
+    def _evaluate_with_llm(self, plan: dict[str, Any], state: SpineState) -> dict[str, Any]:
+        """Evaluate using LLM for comprehensive review."""
+        prompt = self._build_quality_prompt(plan, state)
+        
+        try:
+            response = self._llm_provider.generate(prompt)
+            return self._parse_response(response)
+        except Exception as e:
+            return {
+                "approved": False,
+                "issues": [f"LLM evaluation error: {e}"],
+                "recommendations": []
+            }
+    
+    def _build_quality_prompt(self, plan: dict[str, Any], state: SpineState) -> str:
+        """Build LLM prompt for quality gate evaluation."""
+        return f"""You are a quality gate critic. Review this plan thoroughly.
+
+Requirement: {state.get('requirement', '')}
+
+Plan to review:
+{plan}
+
+Evaluate for:
+1. Completeness - All necessary tasks included?
+2. Correctness - Will the approach work?
+3. Security - Any vulnerabilities?
+4. Maintainability - Is the code well-structured?
+5. Testability - Are tests included?
+
+Return JSON:
+{{"approved": true/false, "issues": [], "recommendations": []}}
+"""
+    
+    def _parse_response(self, response: str) -> dict[str, Any]:
+        """Parse LLM response."""
+        import json
+        try:
+            result = json.loads(response)
+            return {
+                "approved": result.get("approved", False),
+                "issues": result.get("issues", []),
+                "recommendations": result.get("recommendations", [])
+            }
+        except json.JSONDecodeError:
+            approved = "approved" in response.lower() and "not approved" not in response.lower()
+            return {
+                "approved": approved,
+                "issues": [],
+                "recommendations": [response[:200]]
+            }
 
 
 class PreCheckBatch(SwarmGate):
     """Runs lint_check, secretscan, sast_scan in parallel. Fail fast on any failure."""
-
+    
     def __init__(self):
         super().__init__("precheck_batch", required=True)
         self.checks = ["lint_check", "secretscan", "sast_scan"]

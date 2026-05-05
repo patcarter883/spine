@@ -107,7 +107,11 @@ class PatternRecord:
 
 
 class LearningManager:
-    """Manages pattern learning with maturity progression."""
+    """Manages pattern learning with maturity progression.
+    
+    Enhanced with swarm event integration for automatic pattern recording
+    from swarm mail events.
+    """
 
     def __init__(self, knowledge_dir: str = ".spine/knowledge"):
         self.knowledge_dir = knowledge_dir
@@ -115,6 +119,9 @@ class LearningManager:
         self.anti_patterns_path = os.path.join(knowledge_dir, "anti_patterns.json")
         self.completions_path = os.path.join(knowledge_dir, "completions.jsonl")
         self._ensure_knowledge_dir()
+        
+        # Swarm event hooks
+        self._swarm_event_patterns: dict[str, Pattern] = {}
 
     def _ensure_knowledge_dir(self) -> None:
         """Ensure knowledge directory exists."""
@@ -243,3 +250,82 @@ class LearningManager:
         """Get all anti-patterns."""
         anti_patterns = self._load_anti_patterns()
         return [AntiPattern.from_dict(data) for data in anti_patterns.values()]
+
+    # --- Swarm Event Integration ---
+
+    def record_swarm_event(
+        self,
+        event_type: str,
+        event_data: dict[str, Any],
+        success: bool = True,
+        work_item_id: str = "",
+    ) -> Optional[Pattern]:
+        """Record a swarm event as a pattern.
+        
+        Args:
+            event_type: Type of swarm event (e.g., 'message_sent', 'task_completed')
+            event_data: Event data dictionary
+            success: Whether the event was successful
+            work_item_id: Optional work item identifier
+            
+        Returns:
+            The recorded Pattern or None
+        """
+        pattern_id = f"swarm_{event_type}_{work_item_id or 'default'}"
+        pattern = self.get_pattern(pattern_id)
+        
+        if pattern is None:
+            pattern = Pattern(
+                pattern_id=pattern_id,
+                context=f"Swarm event: {event_type}",
+                solution=str(event_data.get("solution", event_data.get("action", "executed")))
+            )
+        
+        # Record the completion
+        self.record_completion(
+            pattern=pattern,
+            task_id=event_data.get("task_id", event_type),
+            work_item_id=work_item_id or "swarm_event",
+            success=success,
+            context=event_data
+        )
+        
+        return pattern
+
+    def get_swarm_patterns(self) -> list[Pattern]:
+        """Get all patterns originating from swarm events."""
+        patterns = self._load_patterns()
+        return [
+            Pattern.from_dict(data)
+            for pid, data in patterns.items()
+            if pid.startswith("swarm_")
+        ]
+
+    def sync_to_hivemind(self, hivemind: Any) -> int:
+        """Sync proven swarm patterns to Hivemind.
+        
+        Args:
+            hivemind: Hivemind instance to sync to
+            
+        Returns:
+            Number of patterns synced
+        """
+        proven = self.get_patterns_by_status("proven")
+        swarm_patterns = [p for p in proven if p.pattern_id.startswith("swarm_")]
+        synced = 0
+        
+        for pattern in swarm_patterns:
+            hivemind.add_memory(
+                content=f"Proven swarm pattern: {pattern.context} -> {pattern.solution}",
+                context="swarm_pattern_proven",
+                tags=["pattern", "swarm", "proven"],
+                metadata={
+                    "pattern_id": pattern.pattern_id,
+                    "confidence": pattern.confidence,
+                    "successes": pattern.successes,
+                    "failures": pattern.failures
+                }
+            )
+            synced += 1
+        
+        return synced

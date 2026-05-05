@@ -328,13 +328,36 @@ class RecoveryStrategy:
 
 
 class ContinuityManager:
-    """Manages session continuity and state restoration."""
+    """Manages session continuity and state restoration.
+    
+    Enhanced with:
+    - Learning pattern storage for swarm events
+    - GitWorkflow integration for auto-commits
+    - Checkpoint creation/restoration with swarm state
+    - Resume marker persistence
+    """
 
-    def __init__(self, state_dir: str = ".spine/state"):
+    def __init__(self, state_dir: str = ".spine/state", learning_manager: Optional[Any] = None, git_workflow: Optional[Any] = None):
         self.state_dir = state_dir
         self.checkpoints_dir = os.path.join(state_dir, "checkpoints")
         self.recovery = RecoveryStrategy()
         self.layer_structure = LAYER_STRUCTURE
+        
+        # Learning integration for pattern storage
+        self.learning_manager = learning_manager
+        
+        # Git workflow for auto-commits
+        self.git_workflow = git_workflow
+        
+        # Current work item tracking
+        self.current_work_item_id: Optional[str] = None
+        
+        self._ensure_directories()
+
+    def _ensure_directories(self) -> None:
+        """Ensure all required directories exist."""
+        os.makedirs(self.state_dir, exist_ok=True)
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
 
     def get_layer_1_paths(self) -> list[str]:
         """Get Layer 1 (Durable Truth) file paths."""
@@ -455,3 +478,349 @@ class ContinuityManager:
         """Load checkpoint from file."""
         data = self._load_json(path)
         return Checkpoint.from_dict(data)
+
+    def create_checkpoint(
+        self,
+        work_item_id: str,
+        phase_name: str,
+        phase_progress: float,
+        state: dict[str, Any],
+        dag: dict[str, Any],
+        context_vars: dict[str, Any],
+        swarm_state: dict[str, Any],
+        plan_ref: str = "",
+        providers: dict[str, Any] = None,
+    ) -> Checkpoint:
+        """Create a checkpoint with full swarm state and learning patterns.
+        
+        Args:
+            work_item_id: Unique identifier for the work item
+            phase_name: Current phase name
+            phase_progress: Progress within the phase (0.0-1.0)
+            state: Current state dictionary
+            dag: DAG with execution results
+            context_vars: Context variables
+            swarm_state: Swarm coordination state (active_subphases, file_reservations, pending_gates)
+            plan_ref: Optional plan reference
+            providers: Optional providers dictionary
+            
+        Returns:
+            The created Checkpoint object
+        """
+        checkpoint = Checkpoint(
+            work_item_id=work_item_id,
+            phase_name=phase_name,
+            phase_progress=phase_progress,
+            state=state,
+            dag=dag,
+            context_vars=context_vars,
+            swarm_state=swarm_state,
+            plan_ref=plan_ref,
+            providers=providers or {},
+        )
+        
+        # Store learning patterns from swarm state
+        self._store_swarm_patterns(checkpoint)
+        
+        return checkpoint
+
+    def save_checkpoint(self, checkpoint: Checkpoint, auto_commit: bool = False) -> str:
+        """Save checkpoint to file and optionally commit via Git.
+        
+        Args:
+            checkpoint: The checkpoint to save
+            auto_commit: Whether to auto-commit via Git workflow
+            
+        Returns:
+            Path to the saved checkpoint file
+        """
+        checkpoint_path = os.path.join(self.checkpoints_dir, f"{checkpoint.checkpoint_id}.json")
+        self._save_checkpoint(checkpoint, checkpoint_path)
+        
+        # Update current work item tracking
+        self.current_work_item_id = checkpoint.work_item_id
+        self._save_current_work_item()
+        
+        # Auto-commit if Git workflow is configured
+        if auto_commit and self.git_workflow:
+            try:
+                self.git_workflow.commit(
+                    f"Checkpoint: {checkpoint.phase_name} - {checkpoint.work_item_id}",
+                    work_item=checkpoint.work_item_id
+                )
+            except Exception:
+                # Log but don't fail if git commit fails
+                pass
+        
+        return checkpoint_path
+
+    def _save_checkpoint(self, checkpoint: Checkpoint, path: str) -> None:
+        """Save checkpoint to JSON file."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(checkpoint.to_dict(), f, indent=2)
+
+    def _save_current_work_item(self) -> None:
+        """Save current work item to tracking file."""
+        if self.current_work_item_id:
+            current_work_path = os.path.join(self.state_dir, "current_work.json")
+            data = {
+                "work_item_id": self.current_work_item_id,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._write_json(current_work_path, data)
+
+    def _write_json(self, path: str, data: dict[str, Any]) -> None:
+        """Write data to JSON file."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _store_swarm_patterns(self, checkpoint: Checkpoint) -> None:
+        """Extract and store learning patterns from swarm events.
+        
+        Stores patterns from swarm state including:
+        - Active subphases
+        - File reservations
+        - Pending gates
+        """
+        if not self.learning_manager:
+            return
+            
+        swarm_state = checkpoint.swarm_state or {}
+        
+        # Store pattern for each active subphase
+        for subphase in swarm_state.get("active_subphases", []):
+            pattern_id = f"swarm_{checkpoint.work_item_id}_{subphase}"
+            pattern = self.learning_manager.get_pattern(pattern_id)
+            if pattern is None:
+                from .learning import Pattern
+                pattern = Pattern(
+                    pattern_id=pattern_id,
+                    context=f"Swarm coordination: {subphase}",
+                    solution=f"Completed subphase {subphase} in phase {checkpoint.phase_name}"
+                )
+            # Record success for this subphase completion
+            if checkpoint.phase_progress >= 1.0:
+                pattern.record_success()
+                self.learning_manager._save_pattern(pattern)
+
+    def create_resume_marker_with_checkpoint(
+        self,
+        work_item_id: str,
+        checkpoint: Checkpoint,
+        reason: str,
+    ) -> ResumeMarker:
+        """Create a resume marker linked to a checkpoint.
+        
+        Args:
+            work_item_id: The work item identifier
+            checkpoint: The checkpoint to reference
+            reason: Why the handoff is occurring
+            
+        Returns:
+            The created ResumeMarker
+        """
+        marker = ResumeMarker()
+        return marker.create_handoff(
+            work_item_id=work_item_id,
+            checkpoint_ref=f".spine/state/checkpoints/{checkpoint.checkpoint_id}.json",
+            reason=reason,
+            phase=checkpoint.phase_name,
+            active_subphases=checkpoint.swarm_state.get("active_subphases", []),
+            pending_gates=checkpoint.swarm_state.get("pending_gates", []),
+        )
+
+    def get_checkpoint_path(self, checkpoint_id: str) -> str:
+        """Get the file path for a checkpoint by ID."""
+        return os.path.join(self.checkpoints_dir, f"{checkpoint_id}.json")
+
+    def list_checkpoints(self, work_item_id: Optional[str] = None) -> list[str]:
+        """List all checkpoints, optionally filtered by work item.
+        
+        Args:
+            work_item_id: Optional work item ID to filter by
+            
+        Returns:
+            List of checkpoint file paths
+        """
+        if not os.path.exists(self.checkpoints_dir):
+            return []
+        
+        checkpoints = []
+        for f in sorted(os.listdir(self.checkpoints_dir), reverse=True):
+            if f.endswith(".json"):
+                path = os.path.join(self.checkpoints_dir, f)
+                data = self._load_json(path)
+                if work_item_id is None or data.get("work_item_id") == work_item_id:
+                    checkpoints.append(path)
+        return checkpoints
+
+
+@dataclass
+class GitWorkflowConfig:
+    """Configuration for Git workflow operations."""
+    remote_name: str = "origin"
+    branch_prefix: str = "spine-"
+    commit_template: str = "{work_item}: {message}"
+    remote_push: bool = False
+
+
+class GitWorkflow:
+    """Handles git operations: branch, commit, push, and PR creation."""
+
+    def __init__(self, config: Optional[GitWorkflowConfig] = None):
+        self.config = config or GitWorkflowConfig()
+
+    def create_branch(self, branch_name: str) -> str:
+        """Create a new branch with the configured prefix.
+
+        Args:
+            branch_name: The base name for the branch.
+
+        Returns:
+            The full branch name created.
+        """
+        full_name = f"{self.config.branch_prefix}{branch_name}"
+        return self._run_git(["checkout", "-b", full_name])
+
+    def commit(self, message: str, work_item: str = "") -> str:
+        """Stage all changes and create a commit.
+
+        Args:
+            message: The commit message.
+            work_item: Optional work item ID for template.
+
+        Returns:
+            The commit hash.
+        """
+        if work_item:
+            full_message = self.config.commit_template.format(
+                work_item=work_item, message=message
+            )
+        else:
+            full_message = message
+
+        self._run_git(["add", "-A"])
+        return self._run_git(["commit", "-m", full_message])
+
+    def push(self, branch: str, remote: Optional[str] = None) -> str:
+        """Push branch to remote.
+
+        Args:
+            branch: The branch name to push.
+            remote: Optional remote name override.
+
+        Returns:
+            The output from the push command.
+        """
+        if not self.config.remote_push:
+            raise ValueError("remote_push must be enabled in config to push")
+        target_remote = remote or self.config.remote_name
+        return self._run_git(["push", "-u", target_remote, branch])
+
+    def create_pull_request(
+        self,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_branch: str = "main",
+        token: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a GitHub PR via API.
+
+        Args:
+            title: PR title.
+            body: PR description body.
+            head_branch: Source branch.
+            base_branch: Target branch (default: main).
+            token: GitHub API token.
+
+        Returns:
+            PR creation result with URL and number.
+        """
+        import urllib.request
+        import urllib.error
+
+        if not token:
+            raise ValueError("GitHub token is required for PR creation")
+
+        # Get current branch if not specified
+        if not head_branch:
+            head_branch = self._get_current_branch()
+
+        url = "https://api.github.com/repos/{repo}/pulls"
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        if not repo:
+            raise ValueError("GITHUB_REPOSITORY environment variable not set")
+
+        data = json.dumps({
+            "title": title,
+            "body": body,
+            "head": head_branch,
+            "base": base_branch,
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            url.format(repo=repo),
+            data=data,
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                return {
+                    "number": result.get("number"),
+                    "url": result.get("html_url"),
+                    "state": result.get("state"),
+                }
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8")
+            raise RuntimeError(f"GitHub API error: {e.code} - {error_body}")
+
+    def _run_git(self, args: list[str]) -> str:
+        """Execute a git command."""
+        import subprocess
+
+        result = subprocess.run(
+            ["git"] + args,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr}")
+        return result.stdout.strip()
+
+    def _get_current_branch(self) -> str:
+        """Get the current branch name."""
+        return self._run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+
+    def auto_commit_checkpoint(
+        self,
+        checkpoint_id: str,
+        phase_name: str,
+        work_item_id: str,
+        percent_complete: float,
+    ) -> Optional[str]:
+        """Auto-commit a checkpoint with progress percentage.
+        
+        Args:
+            checkpoint_id: Unique checkpoint identifier
+            phase_name: Current phase name
+            work_item_id: Work item identifier
+            percent_complete: Progress percentage (0-100)
+            
+        Returns:
+            Commit hash or None if commit failed
+        """
+        try:
+            message = f"Checkpoint {checkpoint_id}: {phase_name} ({percent_complete:.0f}%)"
+            return self.commit(message, work_item=work_item_id)
+        except Exception:
+            return None

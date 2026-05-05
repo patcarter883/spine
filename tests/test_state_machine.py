@@ -5,8 +5,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spine.core.state_machine import (
-    SwarmDAGExecutor, SubPhase, Phase
+    SwarmDAGExecutor, SubPhase, Phase,
+    _evaluate_entry_conditions, _evaluate_exit_conditions,
+    _run_pre_execute_hooks, _run_post_execute_hooks,
+    _check_error_threshold
 )
+from spine.models.dag import ResourceQuota, ExecutionProgress
+from spine.core.constants import ErrorState
 
 
 class TestParallelExecution:
@@ -398,3 +403,331 @@ class TestSubphaseStatesReporting:
         assert isinstance(result.subphase_statuses, dict)
         assert "A" in result.subphase_statuses
         assert "B" in result.subphase_statuses
+
+
+class TestEntryPointConditions:
+    """Tests for entry condition evaluation."""
+
+    def test_evaluate_entry_conditions_all_pass(self):
+        phase = Phase(
+            name="TEST",
+            entry_conditions=[
+                lambda ctx: ctx.get("valid", False),
+                lambda ctx: len(ctx.get("items", [])) > 0
+            ]
+        )
+        context = {"valid": True, "items": [1, 2, 3]}
+        result = _evaluate_entry_conditions(phase, context)
+        assert result is True
+
+    def test_evaluate_entry_conditions_one_fails(self):
+        phase = Phase(
+            name="TEST",
+            entry_conditions=[
+                lambda ctx: ctx.get("valid", False),
+                lambda ctx: len(ctx.get("items", [])) > 0
+            ]
+        )
+        context = {"valid": True, "items": []}
+        result = _evaluate_entry_conditions(phase, context)
+        assert result is False
+
+    def test_evaluate_entry_conditions_no_conditions(self):
+        phase = Phase(name="TEST", entry_conditions=[])
+        context = {}
+        result = _evaluate_entry_conditions(phase, context)
+        assert result is True
+
+
+class TestExitPointConditions:
+    """Tests for exit condition evaluation."""
+
+    def test_evaluate_exit_conditions_all_pass(self):
+        phase = Phase(
+            name="TEST",
+            exit_criteria=[
+                lambda ctx: ctx.get("complete", False),
+                lambda ctx: ctx.get("success", False)
+            ]
+        )
+        context = {"complete": True, "success": True}
+        result = _evaluate_exit_conditions(phase, context)
+        assert result is True
+
+    def test_evaluate_exit_conditions_one_fails(self):
+        phase = Phase(
+            name="TEST",
+            exit_criteria=[
+                lambda ctx: ctx.get("complete", False),
+                lambda ctx: ctx.get("success", False)
+            ]
+        )
+        context = {"complete": True, "success": False}
+        result = _evaluate_exit_conditions(phase, context)
+        assert result is False
+
+
+class TestDAGHooks:
+    """Tests for DAG pre/post execution hooks."""
+
+    def test_run_pre_execute_hooks_modifies_context(self):
+        phase = Phase(
+            name="TEST",
+            pre_execute_hooks=[lambda ctx: {**ctx, "pre_hook_ran": True}]
+        )
+        context = {"initial": True}
+        result = _run_pre_execute_hooks(phase, context)
+        assert result.get("pre_hook_ran") is True
+        assert result.get("initial") is True
+
+    def test_run_post_execute_hooks_modifies_context(self):
+        phase = Phase(
+            name="TEST",
+            post_execute_hooks=[lambda ctx: {**ctx, "post_hook_ran": True}]
+        )
+        context = {"initial": True}
+        result = _run_post_execute_hooks(phase, context)
+        assert result.get("post_hook_ran") is True
+        assert result.get("initial") is True
+
+    def test_multiple_hooks_execute_in_order(self):
+        phase = Phase(
+            name="TEST",
+            pre_execute_hooks=[
+                lambda ctx: {**ctx, "first": True},
+                lambda ctx: {**ctx, "second": True}
+            ]
+        )
+        context = {}
+        result = _run_pre_execute_hooks(phase, context)
+        assert result.get("first") is True
+        assert result.get("second") is True
+
+
+class TestErrorThreshold:
+    """Tests for error threshold checking."""
+
+    def test_check_error_threshold_no_errors(self):
+        subphases = [
+            SubPhase(name="A"),
+            SubPhase(name="B"),
+        ]
+        error_state, failed = _check_error_threshold(subphases)
+        assert error_state == ErrorState.INIT.value
+        assert failed == []
+
+    def test_check_error_threshold_exceeded(self):
+        subphases = [
+            SubPhase(name="A"),
+        ]
+        subphases[0].error_count = 5
+        error_state, failed = _check_error_threshold(subphases, max_errors=3)
+        assert error_state == ErrorState.FATAL.value
+        assert failed == subphases
+
+
+class TestSubPhaseErrorTracking:
+    """Tests for SubPhase error state tracking."""
+
+    def test_subphase_error_count_increments_on_fail(self):
+        sp = SubPhase(name="TEST")
+        sp.fail("first error")
+        assert sp.error_count == 1
+        sp.fail("second error")
+        assert sp.error_count == 2
+
+    def test_subphase_last_error_updates(self):
+        sp = SubPhase(name="TEST")
+        sp.fail("first error")
+        assert sp.last_error == "first error"
+        sp.fail("second error")
+        assert sp.last_error == "second error"
+
+    def test_has_exceeded_error_threshold(self):
+        sp = SubPhase(name="TEST")
+        sp.error_count = 2
+        assert sp.has_exceeded_error_threshold(3) is False
+        assert sp.has_exceeded_error_threshold(2) is False
+        sp.error_count = 4
+        assert sp.has_exceeded_error_threshold(3) is True
+
+
+class TestErrorStateTransitions:
+    """Tests for error state transitions."""
+
+    def test_error_state_enum_exists(self):
+        assert hasattr(ErrorState, "INIT")
+        assert hasattr(ErrorState, "TRANSIENT")
+        assert hasattr(ErrorState, "FATAL")
+        assert hasattr(ErrorState, "HUMAN_REVIEW")
+        assert hasattr(ErrorState, "TIMEOUT")
+
+    def test_error_state_values(self):
+        assert ErrorState.TRANSIENT.value == "TRANSIENT"
+        assert ErrorState.FATAL.value == "FATAL"
+        assert ErrorState.HUMAN_REVIEW.value == "HUMAN_REVIEW"
+
+
+class TestResourceQuota:
+    """Tests for ResourceQuota configuration."""
+
+    def test_resource_quota_defaults(self):
+        quota = ResourceQuota()
+        assert quota.max_concurrent_subphases == 10
+        assert quota.max_workers == 4
+        assert quota.memory_limit_mb is None
+        assert quota.timeout_seconds is None
+
+    def test_resource_quota_custom_values(self):
+        quota = ResourceQuota(
+            max_concurrent_subphases=5,
+            max_workers=2,
+            memory_limit_mb=512,
+            timeout_seconds=60
+        )
+        assert quota.max_concurrent_subphases == 5
+        assert quota.max_workers == 2
+        assert quota.memory_limit_mb == 512
+        assert quota.timeout_seconds == 60
+
+
+class TestExecutionProgress:
+    """Tests for ExecutionProgress tracking."""
+
+    def test_execution_progress_defaults(self):
+        progress = ExecutionProgress()
+        assert progress.total_subphases == 0
+        assert progress.completed_subphases == 0
+        assert progress.percent_complete == 0.0
+
+    def test_execution_progress_percent_calculation(self):
+        progress = ExecutionProgress(total_subphases=10, completed_subphases=5)
+        assert progress.percent_complete == 50.0
+
+    def test_execution_progress_percent_zero_division(self):
+        progress = ExecutionProgress()
+        assert progress.percent_complete == 0.0
+
+    def test_execution_progress_cancelled_state(self):
+        progress = ExecutionProgress()
+        assert progress.cancelled is False
+        progress.cancelled = True
+        progress.cancel_reason = "user request"
+        assert progress.cancelled is True
+        assert progress.cancel_reason == "user request"
+
+
+class TestCancellationSupport:
+    """Tests for execution cancellation."""
+
+    def test_set_cancel_callback(self):
+        executor = SwarmDAGExecutor()
+        called = []
+        executor.set_cancel_callback(lambda: called.append(True) or True)
+        assert executor._cancel_callback is not None
+
+    def test_cancel_sets_flag(self):
+        executor = SwarmDAGExecutor()
+        assert executor._check_cancel_requested() is False
+        executor.cancel("test cancel")
+        assert executor._check_cancel_requested() is True
+
+    def test_cancel_callback_returns_true(self):
+        executor = SwarmDAGExecutor()
+        executor.set_cancel_callback(lambda: True)
+        assert executor._check_cancel_requested() is True
+
+
+class TestWaveSizeLimits:
+    """Tests for wave size limits via resource quota."""
+
+    def test_wave_size_limit_applied(self):
+        executor = SwarmDAGExecutor(resource_quota=ResourceQuota(max_concurrent_subphases=2))
+        phase = Phase(
+            name="LIMITED",
+            subphases=[
+                SubPhase(name="A"),
+                SubPhase(name="B"),
+                SubPhase(name="C"),
+                SubPhase(name="D"),
+            ]
+        )
+        # With 4 independent subphases and max 2 concurrent, waves should handle this
+        result = executor.execute_phase(phase, {})
+        assert len(result.subphase_results) == 4
+
+    def test_wave_size_limit_with_dependencies(self):
+        executor = SwarmDAGExecutor(resource_quota=ResourceQuota(max_concurrent_subphases=2))
+        phase = Phase(
+            name="ORDERED_LIMIT",
+            subphases=[
+                SubPhase(name="A"),
+                SubPhase(name="B", dependencies=["A"]),
+                SubPhase(name="C", dependencies=["A"]),
+                SubPhase(name="D", dependencies=["A"]),
+            ]
+        )
+        result = executor.execute_phase(phase, {})
+        assert len(result.subphase_results) == 4
+
+
+class TestPriorityOrdering:
+    """Tests for priority-based subphase ordering."""
+
+    def test_compute_waves_respects_priority(self):
+        executor = SwarmDAGExecutor()
+        subphases = [
+            SubPhase(name="LOW", priority=10),
+            SubPhase(name="HIGH", priority=1),
+            SubPhase(name="MEDIUM", priority=5),
+        ]
+        waves = executor.compute_waves(subphases)
+        # All three should be in first wave (no dependencies)
+        # Sorted by priority: HIGH (1), MEDIUM (5), LOW (10)
+        assert len(waves) == 1
+        assert waves[0] == ["HIGH", "MEDIUM", "LOW"]
+
+    def test_compute_waves_priority_with_deps(self):
+        executor = SwarmDAGExecutor()
+        subphases = [
+            SubPhase(name="A", priority=5),
+            SubPhase(name="B", priority=1, dependencies=["A"]),
+            SubPhase(name="C", priority=10, dependencies=["A"]),
+        ]
+        waves = executor.compute_waves(subphases)
+        # A must come first due to dependencies
+        assert waves[0] == ["A"]
+        # B and C in second wave, sorted by priority
+        assert waves[1] == ["B", "C"]
+
+
+class TestProgressTracking:
+    """Tests for progress tracking during execution."""
+
+    def test_get_progress_returns_none_before_execution(self):
+        executor = SwarmDAGExecutor()
+        assert executor.get_progress() is None
+
+    def test_get_progress_after_execution(self):
+        executor = SwarmDAGExecutor()
+        phase = Phase(name="TEST", subphases=[SubPhase(name="A")])
+        executor.execute_phase(phase, {})
+        progress = executor.get_progress()
+        assert progress is not None
+        assert progress.total_subphases == 1
+        assert progress.completed_subphases == 1
+
+    def test_progress_current_wave_tracking(self):
+        executor = SwarmDAGExecutor()
+        phase = Phase(
+            name="MULTI_WAVE",
+            subphases=[
+                SubPhase(name="A"),
+                SubPhase(name="B", dependencies=["A"]),
+            ]
+        )
+        executor.execute_phase(phase, {})
+        progress = executor.get_progress()
+        assert progress is not None
+        assert progress.total_waves == 2
+        assert progress.current_wave == 2

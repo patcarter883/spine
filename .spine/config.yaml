@@ -1,0 +1,11 @@
+# SPINE Configuration
+spine:
+  checkpoint_path: .spine/spine.db
+  
+providers:
+  llm:
+    - name: primary
+      type: openrouter
+      config:
+        api_key: ${OPENROUTER_API_KEY}
+        model: poolside/laguna-m.1:free

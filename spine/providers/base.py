@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Type
+from typing import Any, Optional, Type, AsyncIterator
 
 
 @dataclass
@@ -54,6 +54,18 @@ class Provider(ABC):
     def enabled(self) -> bool:
         """Return whether provider is enabled."""
         pass
+    
+    async def generate(self, prompt: str, **kwargs) -> str:
+        """Generate text from prompt. Default sync fallback."""
+        return self._generate_sync(prompt, **kwargs)
+    
+    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """Stream text generation. Default yields entire response."""
+        yield await self.generate(prompt, **kwargs)
+    
+    def _generate_sync(self, prompt: str, **kwargs) -> str:
+        """Sync fallback for providers that don't implement async."""
+        raise NotImplementedError("Provider must implement generate() or _generate_sync()")
 
 
 @dataclass
@@ -168,6 +180,123 @@ class PluginLoader:
         self.registry.register_factory(provider_type, factory)
 
 
+class ProviderFallbackChain:
+    """Manages multiple providers with priority-based fallback.
+    
+    Routes requests through providers in priority order, automatically
+    failing over on errors or health check failures.
+    """
+    
+    def __init__(self, providers: Optional[list[Provider]] = None, config_path: Optional[str] = None):
+        """Initialize the fallback chain.
+        
+        Args:
+            providers: List of providers, sorted by priority (highest first).
+            config_path: Optional path for async config loading.
+        """
+        self._providers: list[Provider] = []
+        self._healthy_cache: dict[str, tuple[bool, float]] = {}
+        self._cache_ttl = 30.0  # seconds
+        self._provider_type: Optional[str] = None
+        
+        if providers:
+            self.add_providers(providers)
+        
+        if config_path:
+            self._config_path = config_path
+    
+    def add_providers(self, providers: list[Provider]) -> None:
+        """Add providers to the chain, sorted by priority."""
+        for provider in providers:
+            if hasattr(provider, "priority"):
+                self._providers.append(provider)
+            else:
+                self._providers.append(provider)
+        # Sort by enabled status first, then by priority (assuming priority attr or just use order)
+        self._providers = [p for p in self._providers if getattr(p, "enabled", True)]
+    
+    @property
+    def active_provider(self) -> Optional[Provider]:
+        """Return the currently active healthy provider."""
+        import time
+        for provider in self._providers:
+            name = provider.name
+            cached = self._healthy_cache.get(name)
+            if cached and time.time() - cached[1] < self._cache_ttl:
+                if cached[0]:
+                    return provider
+            if self._check_health(provider):
+                self._healthy_cache[name] = (True, time.time())
+                return provider
+        return None
+    
+    def _check_health(self, provider: Provider) -> bool:
+        """Check if a provider is healthy."""
+        try:
+            return provider.validate()
+        except Exception:
+            return False
+    
+    async def generate(self, prompt: str, **kwargs) -> str:
+        """Generate using the best available provider with fallback."""
+        import asyncio
+        for provider in self._providers:
+            if not provider.enabled:
+                continue
+            try:
+                # Try async generate first, fall back to sync
+                if hasattr(provider, 'generate_async'):
+                    return await provider.generate_async(prompt, **kwargs)
+                # Run sync generate in executor
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, lambda: provider.generate(prompt, **kwargs))
+            except Exception as e:
+                # Mark provider as unhealthy
+                self._healthy_cache[provider.name] = (False, 0)
+                continue
+        raise RuntimeError("All providers failed to generate")
+    
+    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """Stream using the active provider."""
+        provider = self.active_provider
+        if not provider:
+            raise RuntimeError("No healthy providers available")
+        async for chunk in provider.stream(prompt, **kwargs):
+            yield chunk
+    
+    async def load_config(self, config_path: str) -> list[ProviderConfig]:
+        """Async load providers from YAML config file.
+        
+        Args:
+            config_path: Path to the YAML configuration file.
+            
+        Returns:
+            List of ProviderConfig objects.
+        """
+        import asyncio
+        path = Path(config_path)
+        
+        def _load_yaml():
+            if not path.exists():
+                return []
+            with open(path) as f:
+                config = yaml.safe_load(f) or {}
+            instances: list[ProviderConfig] = []
+            for provider_type, provider_list in config.get("providers", {}).items():
+                for instance in provider_list:
+                    cfg = ProviderConfig(
+                        name=instance["name"],
+                        type=instance["type"],
+                        enabled=instance.get("enabled", True),
+                        priority=instance.get("priority", 0),
+                        config=instance.get("config", {}),
+                    )
+                    instances.append(cfg)
+            return instances
+        
+        return await asyncio.to_thread(_load_yaml)
+
+
 @dataclass
 class ConflictResult:
     """Result from multiple providers with potentially conflicting values."""
@@ -204,12 +333,17 @@ class ConflictResolver:
         return strategies[strategy](conflict)
 
     def _confidence_weighted(self, conflict: ConflictResult) -> Any:
-        """Weight results by provider confidence scores."""
+        """Weight results by provider confidence scores.
+        
+        Returns the value with the highest weighted score, not the provider name.
+        """
         weighted = {
             name: self._compute_weight(val, conflict.confidence.get(name, 0.0))
             for name, val in conflict.values.items()
         }
-        return max(weighted.items(), key=lambda x: x[1])[0]
+        # Get the provider name with max weight, then return their value
+        winner_name = max(weighted.items(), key=lambda x: x[1])[0]
+        return conflict.values[winner_name]
 
     def _compute_weight(self, value: Any, confidence: float) -> float:
         """Compute weight for a value based on confidence."""
@@ -303,3 +437,155 @@ class DiscordNotifyProvider(NotifyProvider):
             )
         )
         raise NotImplementedError("Interactive question requires additional setup")
+
+
+class SlackNotifyProvider(NotifyProvider):
+    """Slack webhook notification provider."""
+
+    def __init__(self):
+        self._webhook_url: str | None = None
+        self._enabled_flag = True
+        self._channel: str | None = None
+
+    def configure(self, config: dict[str, Any]) -> None:
+        self._webhook_url = config.get("webhook_url")
+        self._enabled_flag = config.get("enabled", True)
+        self._channel = config.get("channel", "#general")
+
+    def validate(self) -> bool:
+        return bool(self._webhook_url)
+
+    @property
+    def name(self) -> str:
+        return "slack"
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled_flag
+
+    async def send(self, notification: Notification) -> bool:
+        import httpx
+
+        color_map = {
+            "info": "#3498db",
+            "warning": "#f39c12",
+            "error": "#e74c3c",
+            "success": "#2ecc71",
+        }
+        color = color_map.get(notification.level, "#95a5a6")
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": notification.title, "emoji": True}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": notification.message}
+            }
+        ]
+        
+        # Add detail fields
+        for key, value in notification.details.items():
+            blocks.append({
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*{key}:*"},
+                    {"type": "mrkdwn", "text": str(value)}
+                ]
+            })
+
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                self._webhook_url,
+                json={
+                    "channel": self._channel,
+                    "attachments": [{
+                        "color": color,
+                        "blocks": blocks
+                    }]
+                },
+            )
+        return True
+
+    async def ask(self, question: str, options: list[str]) -> str:
+        await self.send(
+            Notification(
+                title="Question",
+                message=question,
+                actions=[{"label": opt, "value": opt} for opt in options],
+            )
+        )
+        raise NotImplementedError("Interactive question requires Slack app configuration")
+
+
+class EmailNotifyProvider(NotifyProvider):
+    """Email notification provider via SMTP."""
+
+    def __init__(self):
+        self._smtp_host: str | None = None
+        self._smtp_port: int = 587
+        self._smtp_user: str | None = None
+        self._smtp_pass: str | None = None
+        self._from_addr: str | None = None
+        self._to_addrs: list[str] = []
+        self._enabled_flag = True
+
+    def configure(self, config: dict[str, Any]) -> None:
+        self._smtp_host = config.get("smtp_host")
+        self._smtp_port = config.get("smtp_port", 587)
+        self._smtp_user = config.get("smtp_user")
+        self._smtp_pass = config.get("smtp_pass")
+        self._from_addr = config.get("from_addr")
+        self._to_addrs = config.get("to_addrs", [])
+        self._enabled_flag = config.get("enabled", True)
+
+    def validate(self) -> bool:
+        return all([self._smtp_host, self._smtp_user, self._smtp_pass, self._from_addr, self._to_addrs])
+
+    @property
+    def name(self) -> str:
+        return "email"
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled_flag
+
+    async def send(self, notification: Notification) -> bool:
+        import aiosmtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        subject = f"[{notification.level.upper()}] {notification.title}"
+        
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = self._from_addr
+        msg["To"] = ", ".join(self._to_addrs)
+
+        # Format message body
+        body = notification.message
+        if notification.details:
+            body += "\n\nDetails:\n" + "\n".join(f"  {k}: {v}" for k, v in notification.details.items())
+
+        msg.attach(MIMEText(body, "plain"))
+
+        await aiosmtplib.send(
+            msg,
+            hostname=self._smtp_host,
+            port=self._smtp_port,
+            username=self._smtp_user,
+            password=self._smtp_pass,
+            start_tls=True,
+        )
+        return True
+
+    async def ask(self, question: str, options: list[str]) -> str:
+        await self.send(
+            Notification(
+                title="Question",
+                message=question + "\n\nReply with your choice: " + ", ".join(options),
+            )
+        )
+        # Email doesn't support interactive response - would need IMAP polling
+        raise NotImplementedError("Interactive question requires IMAP polling setup")

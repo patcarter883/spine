@@ -1,6 +1,7 @@
 """Swarm agents with role-specific capabilities and messaging."""
 
-from typing import Any, Optional
+import asyncio
+from typing import Any, Optional, AsyncIterator
 from ..core.state_machine import SpineState
 from ..providers.llm import LLMProvider
 from .mail import SwarmMail
@@ -19,10 +20,39 @@ class MessageTypes:
     STATUS_UPDATE = "STATUS_UPDATE"
 
 
+class InvalidAgentRoleError(Exception):
+    """Raised when an invalid agent role is specified."""
+    pass
+
+
+class AgentRoleValidator:
+    """Validates agent roles against allowed roles."""
+    
+    VALID_ROLES = frozenset([
+        "explorer", "sme", "planner", "critic", 
+        "coder", "reviewer", "test_engineer", "analyst", "designer"
+    ])
+    
+    @classmethod
+    def validate(cls, role: str) -> bool:
+        """Check if a role is valid."""
+        return role in cls.VALID_ROLES
+    
+    @classmethod
+    def get_valid_roles(cls) -> list[str]:
+        """Return list of valid agent roles."""
+        return sorted(cls.VALID_ROLES)
+
+
 class SwarmAgent:
     """Base class for swarm agents with role-specific capabilities."""
 
     def __init__(self, role: str, capabilities: list[str], llm_provider: Optional[LLMProvider] = None):
+        # Validate role
+        if not AgentRoleValidator.validate(role):
+            raise InvalidAgentRoleError(
+                f"Invalid agent role: '{role}'. Valid roles: {AgentRoleValidator.get_valid_roles()}"
+            )
         self.role = role
         self.capabilities = capabilities
         self._llm_provider = llm_provider
@@ -48,7 +78,30 @@ class SwarmAgent:
             response = self._llm_provider.generate(prompt)
             return self._parse_response(response, capability)
         return self._execute_stub(state, capability, **kwargs)
-
+    
+    async def execute_streaming(self, state: SpineState, capability: str, **kwargs) -> AsyncIterator[str]:
+        """Execute a capability with streaming support.
+        
+        Yields chunks of the LLM response as they become available.
+        Falls back to non-streaming execution if LLM doesn't support streaming.
+        """
+        if self._llm_provider:
+            prompt = self._build_prompt(state, capability, **kwargs)
+            try:
+                if hasattr(self._llm_provider, 'stream'):
+                    async for chunk in self._llm_provider.stream(prompt):
+                        yield chunk
+                else:
+                    # Fallback to non-streaming
+                    response = self._llm_provider.generate(prompt)
+                    yield response
+            except Exception as e:
+                yield f"[Agent {self.role} streaming error: {e}]"
+        else:
+            # No LLM provider - return stub result
+            result = self._execute_stub(state, capability, **kwargs)
+            yield str(result)
+    
     def _build_prompt(self, state: SpineState, capability: str, **kwargs) -> str:
         """Build LLM prompt for capability execution."""
         return f"""You are a {self.role} agent with capabilities: {self.capabilities}.
@@ -110,6 +163,10 @@ Provide your response:"""
             self._learning.record_pattern_completion(
                 pattern, task_id, work_item_id, success, context
             )
+    
+    def evaluate_gate(self, gate_type: str, context: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate a gate for quality control. Override in subclasses."""
+        return {"status": "not_implemented", "gate_type": gate_type}
 
 
 class ExplorerAgent(SwarmAgent):
@@ -167,10 +224,11 @@ class PlannerAgent(SwarmAgent):
 
 
 class CriticAgent(SwarmAgent):
-    """Reviews plans and implementations."""
+    """Reviews plans and implementations with LLM-powered evaluation."""
 
     def __init__(self, llm_provider: Optional[LLMProvider] = None):
         super().__init__("critic", ["review", "verify_drift", "scan_placeholders"], llm_provider)
+        self.gate_name = "quality"
 
     def _execute_stub(self, state: SpineState, capability: str, **kwargs) -> dict[str, Any]:
         if capability == "review":
@@ -180,3 +238,98 @@ class CriticAgent(SwarmAgent):
                 "issues": []
             }
         return {}
+    
+    def evaluate_gate(self, gate_type: str, context: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate quality gate with proper gate result.
+        
+        Args:
+            gate_type: Type of gate (e.g., "quality", "critic")
+            context: Context containing plan and variables
+            
+        Returns:
+            Gate evaluation result with approval status
+        """
+        plan = context.get("plan", {})
+        
+        if not plan:
+            return {
+                "status": "failed",
+                "approved": False,
+                "reason": "No plan provided for review"
+            }
+        
+        if self._llm_provider and self._llm_provider.enabled:
+            try:
+                prompt = self._build_critic_prompt(plan, context)
+                response = self._llm_provider.generate(prompt)
+                return self._parse_critic_response(response)
+            except Exception as e:
+                return {
+                    "status": "failed",
+                    "approved": False,
+                    "reason": f"LLM evaluation error: {e}"
+                }
+        else:
+            # Stub evaluation - check basic plan structure
+            tasks = plan.get("tasks", [])
+            if not tasks:
+                return {
+                    "status": "failed",
+                    "approved": False,
+                    "reason": "Plan has no tasks"
+                }
+            return {
+                "status": "passed",
+                "approved": True,
+                "issues": [],
+                "recommendations": []
+            }
+    
+    def _build_critic_prompt(self, plan: dict[str, Any], context: dict[str, Any]) -> str:
+        """Build LLM prompt for critic gate evaluation."""
+        requirement = context.get("requirement", "")
+        variables = context.get("variables", {})
+        
+        return f"""You are a critic agent reviewing an execution plan.
+
+Requirement: {requirement}
+
+Plan:
+{plan}
+
+Variables:
+{variables}
+
+Evaluate the plan for:
+1. Completeness - Are all necessary tasks included?
+2. Correctness - Will the approach work?
+3. Safety - Any security or risk concerns?
+4. Clarity - Are the tasks well-defined?
+
+Return JSON with:
+- approved: true/false
+- issues: list of problems found
+- recommendations: list of improvements
+
+Response:"""
+    
+    def _parse_critic_response(self, response: str) -> dict[str, Any]:
+        """Parse LLM critic response into structured result."""
+        import json
+        try:
+            result = json.loads(response)
+            return {
+                "status": "passed" if result.get("approved", False) else "failed",
+                "approved": result.get("approved", False),
+                "issues": result.get("issues", []),
+                "recommendations": result.get("recommendations", [])
+            }
+        except json.JSONDecodeError:
+            # Non-JSON response - try to extract meaning
+            approved = "approved" in response.lower() and "not approved" not in response.lower()
+            return {
+                "status": "passed" if approved else "failed",
+                "approved": approved,
+                "issues": [],
+                "recommendations": [response[:200]]
+            }
