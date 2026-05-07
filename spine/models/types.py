@@ -1,7 +1,8 @@
 """SPINE data model types."""
 
 from dataclasses import dataclass, field
-from typing import TypedDict, Literal, Optional, Any, Callable, Dict
+from enum import Enum
+from typing import TypedDict, Literal, Optional, Any, Callable, Dict, List
 
 from .enums import PhaseName, StateStatus, SubPhaseStatus
 
@@ -156,6 +157,157 @@ class SpineState(TypedDict):
     error_history: list[dict[str, Any]]  # Track error occurrences
 
 
+# ── Ralph Loop Hierarchy Types ─────────────────────────────────────
+
+
+class HierarchyLevel(Enum):
+    """Levels in the Ralph Loop hierarchy."""
+    PROJECT = "project"
+    PHASE = "phase"
+    SUBPHASE = "subphase"
+    TASK = "task"
+
+
+class NodeStatus(Enum):
+    """Status values for hierarchy nodes."""
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    REWORKING = "reworking"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class HierarchyNode:
+    """Base node for the Ralph Loop hierarchical automation tree.
+    
+    Supports nested automation, progress tracking, and state transitions.
+    All levels (Project, Phase, Subphase, Task) inherit from this base.
+    """
+    id: str
+    name: str
+    level: HierarchyLevel = HierarchyLevel.TASK
+    status: NodeStatus = NodeStatus.PENDING
+    progress: float = 0.0  # 0.0 to 100.0
+    children: List['HierarchyNode'] = field(default_factory=list)
+    parent: Optional['HierarchyNode'] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def is_terminal(self) -> bool:
+        """Check if node is in a terminal state."""
+        return self.status in (NodeStatus.SUCCESS, NodeStatus.CANCELLED)
+
+    def is_active(self) -> bool:
+        """Check if node is actively processing."""
+        return self.status in (NodeStatus.RUNNING, NodeStatus.REWORKING)
+
+    def is_blocked_or_failed(self) -> bool:
+        """Check if node is blocked or failed."""
+        return self.status in (NodeStatus.BLOCKED, NodeStatus.FAILED)
+
+
+@dataclass
+class ProjectNode:
+    """Ralph Loop project node — top-level container.
+    
+    Holds phases as its children. Aggregates progress from all phases.
+    """
+    id: str
+    name: str
+    level: HierarchyLevel = HierarchyLevel.PROJECT
+    status: NodeStatus = NodeStatus.PENDING
+    progress: float = 0.0
+    phases: List['PhaseNode'] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PhaseNode:
+    """Ralph Loop phase node — groups related subphases.
+    
+    Maps to the existing Phase model for integration.
+    """
+    id: str
+    name: str
+    parent_id: str = ""
+    level: HierarchyLevel = HierarchyLevel.PHASE
+    status: NodeStatus = NodeStatus.PENDING
+    progress: float = 0.0
+    subphases: List['SubPhaseNode'] = field(default_factory=list)
+    phase_model: Optional[Phase] = None  # Reference to original Phase model
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SubPhaseNode:
+    """Ralph Loop subphase node — holds tasks.
+    
+    Maps to the existing SubPhase model for integration.
+    Supports parallel execution of tasks.
+    """
+    id: str
+    name: str
+    parent_id: str
+    level: HierarchyLevel = HierarchyLevel.SUBPHASE
+    status: NodeStatus = NodeStatus.PENDING
+    progress: float = 0.0
+    parallel: bool = True
+    tasks: List['TaskNode'] = field(default_factory=list)
+    subphase_model: Optional[SubPhase] = None  # Reference to original SubPhase model
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TaskNode:
+    """Ralph Loop task node — atomic unit of work.
+    
+    Maps to the existing Task model for integration.
+    """
+    id: str
+    name: str
+    parent_id: str
+    level: HierarchyLevel = HierarchyLevel.TASK
+    status: NodeStatus = NodeStatus.PENDING
+    progress: float = 0.0
+    result: Optional[str] = None
+    error: Optional[str] = None
+    task_model: Optional[Task] = None  # Reference to original Task model
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HierarchyProgress:
+    """Aggregated progress across a hierarchy subtree."""
+    total_tasks: int = 0
+    completed_tasks: int = 0
+    failed_tasks: int = 0
+    blocked_tasks: int = 0
+    running_tasks: int = 0
+    pending_tasks: int = 0
+
+    @property
+    def in_progress_tasks(self) -> int:
+        """Tasks currently being executed (running + reworking)."""
+        return self.running_tasks
+
+    @property
+    def percent_complete(self) -> float:
+        """Percentage of tasks completed."""
+        if self.total_tasks == 0:
+            return 0.0
+        return (self.completed_tasks / self.total_tasks) * 100.0
+
+
+@dataclass
+class ValidationResult:
+    """Result of a hierarchy validation check."""
+    is_valid: bool
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
 __all__ = [
     "Task",
     "SubPhase", 
@@ -163,4 +315,13 @@ __all__ = [
     "PhaseResult",
     "SubPhaseResult",
     "SpineState",
+    "HierarchyLevel",
+    "NodeStatus",
+    "HierarchyNode",
+    "ProjectNode",
+    "PhaseNode",
+    "SubPhaseNode",
+    "TaskNode",
+    "HierarchyProgress",
+    "ValidationResult",
 ]

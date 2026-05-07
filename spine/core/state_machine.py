@@ -1,6 +1,6 @@
 """Core state machine implementation using LangGraph."""
 
-from typing import Literal, Optional, Any, Iterator, Dict, List, Callable
+from typing import Literal, Optional, Any, Iterator, Dict, List, Callable, TYPE_CHECKING, TYPE_CHECKING
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.base import SerializerProtocol
@@ -957,3 +957,37 @@ class SpineStateMachine:
         )
         resolver = ConflictResolver()
         return resolver.resolve(conflict, strategy)
+
+    # --- Ralph Loop Integration ---
+
+    def create_hierarchy_engine(self) -> "RalphLoopEngine":
+        """Create a RalphLoopEngine attached to this state machine.
+        
+        The engine provides hierarchical Project→Phase→Subphase→Task
+        tracking with progress roll-up, state transitions, and
+        nested automation support.
+        
+        Returns:
+            A RalphLoopEngine configured with this state machine.
+        """
+        from .hierarchy import RalphLoopEngine
+        engine = RalphLoopEngine()
+        engine.attach_state_machine(self)
+        return engine
+
+    # --- Ralph Loop Integration ---
+
+    def create_hierarchy_engine(self) -> "RalphLoopEngine":
+        """Create a RalphLoopEngine attached to this state machine.
+        
+        The engine provides hierarchical Project→Phase→Subphase→Task
+        tracking with progress roll-up, state transitions, and
+        nested automation support.
+        
+        Returns:
+            A RalphLoopEngine configured with this state machine.
+        """
+        from .hierarchy import RalphLoopEngine
+        engine = RalphLoopEngine()
+        engine.attach_state_machine(self)
+        return engine
