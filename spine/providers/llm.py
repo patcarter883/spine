@@ -22,30 +22,65 @@ class LLMProvider(Provider):
     provider_type = ProviderType.LLM
     
     @abstractmethod
-    def generate_sync(self, prompt: str, **kwargs) -> str:
-        """Generate text from prompt (sync implementation)."""
+    def generate_sync(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        """Generate text from prompt (sync implementation).
+
+        Args:
+            prompt: The prompt to generate text from.
+            reasoning_effort: Reasoning effort level for extended thinking models
+                (e.g., o1, o3, o4). Valid values: 'low', 'medium', 'high', or None.
+            **kwargs: Additional provider-specific parameters.
+        """
         pass
     
     @abstractmethod
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream text generation."""
+    async def stream(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> AsyncIterator[str]:
+        """Stream text generation.
+
+        Args:
+            prompt: The prompt to stream text from.
+            reasoning_effort: Reasoning effort level for extended thinking models
+                (e.g., o1, o3, o4). Valid values: 'low', 'medium', 'high', or None.
+            **kwargs: Additional provider-specific parameters.
+        """
         pass
     
-    def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text from prompt (sync - calls generate_sync)."""
-        return self.generate_sync(prompt, **kwargs)
+    def generate(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        """Generate text from prompt (sync - calls generate_sync).
+
+        Args:
+            prompt: The prompt to generate text from.
+            reasoning_effort: Reasoning effort level for extended thinking models.
+                Valid values: 'low', 'medium', 'high', or None.
+            **kwargs: Additional provider-specific parameters.
+        """
+        return self.generate_sync(prompt, reasoning_effort=reasoning_effort, **kwargs)
     
-    async def generate_async(self, prompt: str, **kwargs) -> str:
-        """Async generate - runs sync in thread pool by default."""
+    async def generate_async(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        """Async generate - runs sync in thread pool by default.
+
+        Args:
+            prompt: The prompt to generate text from.
+            reasoning_effort: Reasoning effort level for extended thinking models.
+                Valid values: 'low', 'medium', 'high', or None.
+            **kwargs: Additional provider-specific parameters.
+        """
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self.generate_sync(prompt, **kwargs))
+        return await loop.run_in_executor(None, lambda: self.generate_sync(prompt, reasoning_effort=reasoning_effort, **kwargs))
     
     async def generate_with_confidence(
-        self, prompt: str, **kwargs
+        self, prompt: str, reasoning_effort: str | None = None, **kwargs
     ) -> Tuple[LLMResponse, float]:
-        """Return response with self-reported confidence. Override in subclasses."""
+        """Return response with self-reported confidence. Override in subclasses.
+
+        Args:
+            prompt: The prompt to generate text from.
+            reasoning_effort: Reasoning effort level for extended thinking models.
+                Valid values: 'low', 'medium', 'high', or None.
+            **kwargs: Additional provider-specific parameters.
+        """
         response = LLMResponse(
-            content=self.generate_sync(prompt, **kwargs),
+            content=self.generate_sync(prompt, reasoning_effort=reasoning_effort, **kwargs),
             usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             finish_reason="stop",
             model="unknown",
@@ -79,6 +114,7 @@ class OpenAIProvider(LLMProvider):
         import openai
         self._client = openai.OpenAI(api_key=config.get("api_key", self._api_key))
         self._model = config.get("model", self._model)
+        self._reasoning_effort = config.get("reasoning_effort", None)
     
     def validate(self) -> bool:
         try:
@@ -95,19 +131,23 @@ class OpenAIProvider(LLMProvider):
     def enabled(self) -> bool:
         return self._client is not None
     
-    def generate_sync(self, prompt: str, **kwargs) -> str:
+    def generate_sync(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        effort = reasoning_effort if reasoning_effort is not None else self._reasoning_effort
         response = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
+            reasoning_effort=effort,
             **kwargs
         )
         return response.choices[0].message.content
     
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+    async def stream(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> AsyncIterator[str]:
+        effort = reasoning_effort if reasoning_effort is not None else self._reasoning_effort
         stream = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
             stream=True,
+            reasoning_effort=effort,
             **kwargs
         )
         for chunk in stream:
@@ -143,7 +183,8 @@ class OllamaProvider(LLMProvider):
     def enabled(self) -> bool:
         return self._client is not None
     
-    def generate_sync(self, prompt: str, **kwargs) -> str:
+    def generate_sync(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        # reasoning_effort is OpenAI-specific; Ollama ignores it
         response = self._client.chat(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
@@ -151,7 +192,8 @@ class OllamaProvider(LLMProvider):
         )
         return response["message"]["content"]
     
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+    async def stream(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> AsyncIterator[str]:
+        # reasoning_effort is OpenAI-specific; Ollama ignores it
         stream = self._client.chat(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
@@ -186,35 +228,40 @@ class OpenRouterProvider(LLMProvider):
             base_url=config.get("base_url", self._base_url)
         )
         self._model = config.get("model", self._model)
-    
+        self._reasoning_effort = config.get("reasoning_effort", None)
+
     def validate(self) -> bool:
         try:
             self._client.models.list()
             return True
         except Exception:
             return False
-    
+
     @property
     def name(self) -> str:
         return f"openrouter:{self._model}"
-    
+
     @property
     def enabled(self) -> bool:
         return self._client is not None
-    
-    def generate_sync(self, prompt: str, **kwargs) -> str:
+
+    def generate_sync(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        effort = reasoning_effort if reasoning_effort is not None else self._reasoning_effort
         response = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
+            reasoning_effort=effort,
             **kwargs
         )
         return response.choices[0].message.content
-    
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+
+    async def stream(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> AsyncIterator[str]:
+        effort = reasoning_effort if reasoning_effort is not None else self._reasoning_effort
         stream = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
             stream=True,
+            reasoning_effort=effort,
             **kwargs
         )
         for chunk in stream:
@@ -246,35 +293,40 @@ class LocalOpenAIProvider(LLMProvider):
             base_url=config.get("base_url", self._base_url)
         )
         self._model = config.get("model", self._model)
-    
+        self._reasoning_effort = config.get("reasoning_effort", None)
+
     def validate(self) -> bool:
         try:
             self._client.models.list()
             return True
         except Exception:
             return False
-    
+
     @property
     def name(self) -> str:
         return f"local-openai:{self._model}"
-    
+
     @property
     def enabled(self) -> bool:
         return self._client is not None
-    
-    def generate_sync(self, prompt: str, **kwargs) -> str:
+
+    def generate_sync(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> str:
+        effort = reasoning_effort if reasoning_effort is not None else self._reasoning_effort
         response = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
+            reasoning_effort=effort,
             **kwargs
         )
         return response.choices[0].message.content
-    
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+
+    async def stream(self, prompt: str, reasoning_effort: str | None = None, **kwargs) -> AsyncIterator[str]:
+        effort = reasoning_effort if reasoning_effort is not None else self._reasoning_effort
         stream = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
             stream=True,
+            reasoning_effort=effort,
             **kwargs
         )
         for chunk in stream:
