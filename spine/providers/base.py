@@ -59,8 +59,14 @@ class Provider(ABC):
         """Generate text from prompt. Default sync fallback."""
         return self._generate_sync(prompt, **kwargs)
     
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream text generation. Default yields entire response."""
+    async def stream(self, prompt: str, ttfb_timeout: float = 30.0, **kwargs) -> AsyncIterator[str]:
+        """Stream text generation. Default yields entire response.
+        
+        Args:
+            prompt: Text prompt to generate from.
+            ttfb_timeout: Timeout in seconds for the first chunk.
+            **kwargs: Additional provider-specific arguments.
+        """
         yield await self.generate(prompt, **kwargs)
     
     def _generate_sync(self, prompt: str, **kwargs) -> str:
@@ -250,14 +256,18 @@ class ProviderFallbackChain:
                 # Run sync generate in executor
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(None, lambda: provider.generate(prompt, **kwargs))
-            except Exception as e:
+            except Exception:
                 # Mark provider as unhealthy
                 self._healthy_cache[provider.name] = (False, 0)
                 continue
         raise RuntimeError("All providers failed to generate")
     
     async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream using the active provider."""
+        """Stream using the active provider.
+
+        Passes through all kwargs (including *ttfb_timeout*) to the
+        underlying provider's ``stream()`` method.
+        """
         provider = self.active_provider
         if not provider:
             raise RuntimeError("No healthy providers available")
