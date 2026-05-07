@@ -93,8 +93,13 @@ class SupervisorSwarmAgent(SwarmAgent):
             
             # Call LLM provider if available
             if self._llm_provider:
+                import inspect
                 try:
-                    llm_output = self._llm_provider.generate(prompt)
+                    sig = inspect.signature(self._llm_provider.generate)
+                    if "timeout" in sig.parameters:
+                        llm_output = self._llm_provider.generate(prompt, timeout=30.0)
+                    else:
+                        llm_output = self._llm_provider.generate(prompt)
                     output = llm_output
                 except Exception as e:
                     output = f"[Agent {self.name} error: {e}]"

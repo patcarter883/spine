@@ -1,11 +1,21 @@
 # SPINE Configuration
 spine:
   checkpoint_path: .spine/spine.db
-  
+
 providers:
   llm:
-    - name: primary
+    - name: cloud
       type: openrouter
+      enabled: true
+      priority: 1
       config:
         api_key: ${OPENROUTER_API_KEY}
         model: poolside/laguna-m.1:free
+    - name: local
+      type: local-openai
+      enabled: true
+      priority: 0
+      config:
+        base_url: http://localhost:8000/v1
+        model: model
+        reasoning_effort: low

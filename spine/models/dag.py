@@ -3,15 +3,189 @@
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Any, Literal, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from .types import Phase, PhaseResult, SubPhase, SubPhaseResult
+from .types import Phase, PhaseResult, SubPhase, SubPhaseResult, Task
 from ..providers.llm import LLMProvider
 from ..providers.memory import MemoryProvider
 from ..providers.storage import StorageProvider, FileWriteGuard
 from ..providers.tools import ToolsProvider
 from ..core.persistence import GitWorkflow
-from ..models.enums import PhaseName, SubPhaseStatus
+from ..models.enums import SubPhaseStatus
+
+
+def _extract_components(requirement: str) -> list[str]:
+    """Extract component hints from a requirement string.
+
+    Splits on common connectors and heuristics to identify distinct
+    components or features mentioned in the requirement.
+    """
+    # Normalize and split on common connectors
+    text = requirement.lower()
+    separators = [" and ", " with ", " including ", " plus ", ", "]
+    parts = [text.strip()]
+    for sep in separators:
+        new_parts = []
+        for p in parts:
+            if sep in p:
+                new_parts.extend(s.strip() for s in p.split(sep) if s.strip())
+            else:
+                new_parts.append(p)
+        parts = new_parts
+
+    # Filter out very short fragments and deduplicate
+    seen: set[str] = set()
+    components: list[str] = []
+    for p in parts:
+        if len(p) > 5 and p not in seen:
+            seen.add(p)
+            components.append(p)
+
+    return components if components else [requirement[:120]]
+
+
+def _extract_requirements(requirement: str) -> list[str]:
+    """Extract key requirement items from a requirement string."""
+    # Heuristic: split on semicolons, newlines, or bullet-like patterns
+    text = requirement.strip()
+    items = re.split(r"[;\n]|\b(?:•|-\s+)\s*", text)
+    items = [i.strip() for i in items if i.strip() and len(i.strip()) > 5]
+    return items if items else [requirement[:200]]
+
+
+def _estimate_complexity(requirement: str) -> str:
+    """Estimate project complexity from the requirement text.
+
+    Returns one of: 'low', 'medium', 'high'.
+    """
+    text = requirement.lower()
+    high_keywords = [
+        "microservice", "distributed", "scalable", "high-throughput",
+        "real-time", "production-grade", "enterprise", "multi-tenant",
+        "kubernetes", "cluster", "load-balanc", "failover", "disaster",
+    ]
+    medium_keywords = [
+        "api", "web", "full-stack", "database", "auth", "authentication",
+        "rest", "graphql", "frontend", "backend", "integration",
+    ]
+
+    high_count = sum(1 for kw in high_keywords if kw in text)
+    medium_count = sum(1 for kw in medium_keywords if kw in text)
+    word_count = len(text.split())
+
+    if high_count >= 2 or word_count > 60:
+        return "high"
+    if high_count >= 1 or medium_count >= 2 or word_count > 30:
+        return "medium"
+    return "low"
+
+
+def _get_synthesis_tasks(phases: list[str]) -> list[tuple[str, list[str]]]:
+    """Generate task descriptions and dependencies for synthesis phases."""
+    task_map: dict[str, list[tuple[str, list[str]]]] = {
+        "SETUP": [
+            ("Initialize project structure and dependencies", []),
+            ("Configure development environment", []),
+        ],
+        "CORE_IMPLEMENTATION": [
+            ("Implement core data models", ["SETUP"]),
+            ("Implement core business logic", ["SETUP"]),
+        ],
+        "FEATURE_DEVELOPMENT": [
+            ("Implement feature module A", ["CORE_IMPLEMENTATION"]),
+            ("Implement feature module B", ["CORE_IMPLEMENTATION"]),
+            ("Implement feature module C", ["CORE_IMPLEMENTATION"]),
+            ("Integrate feature modules", ["CORE_IMPLEMENTATION"]),
+        ],
+        "INTEGRATION": [
+            ("Set up API layer / routes", ["CORE_IMPLEMENTATION"]),
+            ("Integrate frontend with backend", ["FEATURE_DEVELOPMENT"]),
+        ],
+        "VERIFICATION": [
+            ("Write unit tests", ["CORE_IMPLEMENTATION"]),
+            ("Write integration tests", ["INTEGRATION"]),
+            ("Run end-to-end tests", ["INTEGRATION"]),
+            ("Performance and security review", ["INTEGRATION"]),
+        ],
+    }
+    tasks: list[tuple[str, list[str]]] = []
+    for phase in phases:
+        tasks.extend(task_map.get(phase, [(f"Implement {phase}", [])]))
+    return tasks
+
+
+def _generate_backend_file_structure(requirement: str) -> dict[str, list[str]]:
+    """Generate a backend file structure based on the requirement."""
+    complexity = _estimate_complexity(requirement)
+
+    structure: dict[str, list[str]] = {
+        "models": ["models/__init__.py", "models/base.py"],
+        "routes": ["routes/__init__.py", "routes/main.py"],
+        "services": ["services/__init__.py", "services/core.py"],
+        "tests": ["tests/__init__.py", "tests/test_core.py"],
+    }
+
+    if complexity in ("high", "medium"):
+        structure["models"].extend(["models/schema.py", "models/validators.py"])
+        structure["routes"].extend(["routes/auth.py", "routes/api.py"])
+        structure["services"].extend(["services/auth.py", "services/utils.py"])
+        structure["tests"].extend(["tests/test_auth.py", "tests/test_api.py"])
+
+    if complexity == "high":
+        structure["models"].extend(["models/migrations.py", "models/enums.py"])
+        structure["services"].extend(["services/cache.py", "services/queue.py"])
+        structure["tests"].extend(["tests/test_integration.py", "tests/conftest.py"])
+
+    return structure
+
+
+def _generate_frontend_file_structure(requirement: str) -> dict[str, list[str]]:
+    """Generate a frontend file structure based on the requirement."""
+    complexity = _estimate_complexity(requirement)
+
+    structure: dict[str, list[str]] = {
+        "components": ["components/__init__.py", "components/Layout.py"],
+        "pages": ["pages/__init__.py", "pages/Home.py"],
+        "styles": ["styles/__init__.py", "styles/main.css"],
+        "tests": ["tests/__init__.py", "tests/test_layout.py"],
+    }
+
+    if complexity in ("high", "medium"):
+        structure["components"].extend([
+            "components/Button.py",
+            "components/Form.py",
+            "components/Header.py",
+        ])
+        structure["pages"].extend([
+            "pages/Dashboard.py",
+            "pages/Settings.py",
+        ])
+        structure["styles"].extend([
+            "styles/theme.py",
+            "styles/responsive.css",
+        ])
+        structure["tests"].extend([
+            "tests/test_button.py",
+            "tests/test_dashboard.py",
+        ])
+
+    if complexity == "high":
+        structure["components"].extend([
+            "components/Modal.py",
+            "components/Table.py",
+            "components/Chart.py",
+        ])
+        structure["pages"].extend([
+            "pages/Analytics.py",
+            "pages/Profile.py",
+        ])
+        structure["tests"].extend([
+            "tests/test_modal.py",
+            "tests/test_analytics.py",
+            "tests/conftest.py",
+        ])
+
+    return structure
 
 
 @dataclass
@@ -75,6 +249,8 @@ class SwarmDAGExecutor:
         self._git_workflow = git_workflow
         # Resource configuration
         self._resource_quota = resource_quota or ResourceQuota()
+        # Register stub templates
+        self._register_stub_templates()
         # SubPhase lookup for execute_dag to access tasks
         self._current_subphases: dict[str, SubPhase] = {}
         self._current_phase_context: dict[str, Any] = {}
@@ -83,6 +259,20 @@ class SwarmDAGExecutor:
         # Cancellation support
         self._cancel_requested: bool = False
         self._cancel_callback: Optional[Callable[[], bool]] = None
+
+    def _register_stub_templates(self) -> None:
+        """Register subphase-specific stub template functions.
+
+        Maps uppercase subphase names to their template functions.
+        """
+        self._stub_templates = {
+            "ANALYZE": self._stub_analyze,
+            "TECH_RESEARCH": self._stub_tech_research,
+            "RISK_ASSESSMENT": self._stub_risk_assessment,
+            "SYNTHESIZE": self._stub_synthesize,
+            "BACKEND": self._stub_backend,
+            "FRONTEND": self._stub_frontend,
+        }
 
     def execute_phase(self, phase: Phase, context: dict[str, Any]) -> PhaseResult:
         """Execute a phase with parallel sub-phase wave execution.
@@ -391,8 +581,10 @@ class SwarmDAGExecutor:
         Returns:
             Dict with task execution results, including status and error info.
         """
-        from .enums import PhaseName, StateStatus
-        from .types import Task
+        from .enums import StateStatus
+        
+        # Get timeout from context or use default
+        timeout = context.get("llm_timeout", 30.0) if context else 30.0
         
         # Backwards compat: if called with string name, run stub
         if isinstance(dag_or_name, str):
@@ -415,9 +607,14 @@ class SwarmDAGExecutor:
                 # Build task-specific prompt using agent role and task info
                 prompt = self._build_task_prompt(task, subphase, context)
                 
-                # Execute using LLM provider if available
+                # Execute using LLM provider if available (with timeout)
                 if self._llm_provider and self._llm_provider.enabled:
-                    result = self._llm_provider.generate(prompt)
+                    import inspect
+                    sig = inspect.signature(self._llm_provider.generate)
+                    if "timeout" in sig.parameters:
+                        result = self._llm_provider.generate(prompt, timeout=timeout)
+                    else:
+                        result = self._llm_provider.generate(prompt)
                     task.result = result
                     task.status = StateStatus.SUCCESS
                 else:
@@ -475,12 +672,382 @@ class SwarmDAGExecutor:
         )
 
     def _execute_stub_task(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Stub task execution for when no LLM provider is available."""
+        """Stub task execution for when no LLM provider is available.
+
+        Produces structured, meaningful output based on the subphase type and
+        task description. Each subphase template returns a dict with keys:
+        - output: human-readable summary
+        - agent_role: the subphase agent role
+        - subphase: the subphase name
+        - status: execution status
+        - structured_data: parseable dict for downstream phases
+
+        Returns:
+            Dict with task execution results including structured_data.
+        """
+        subphase_name = subphase.name.upper()
+
+        # Dispatch to subphase-specific template
+        template_fn = self._stub_templates.get(subphase_name)
+        if template_fn:
+            result = template_fn(task, subphase, context)
+        else:
+            # Generic fallback for unknown subphases
+            result = self._stub_generic(task, subphase, context)
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  Stub template registry                                             #
+    # ------------------------------------------------------------------ #
+    _stub_templates: dict[str, Callable] = {}
+
+    # ------------------------------------------------------------------ #
+    #  ANALYZE template                                                   #
+    # ------------------------------------------------------------------ #
+    def _stub_analyze(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generate a requirement breakdown for the ANALYZE subphase."""
+        requirement = context.get("requirement", "No requirement provided")
+        # Simple keyword-based component extraction
+        components = _extract_components(requirement)
+        key_requirements = _extract_requirements(requirement)
+        complexity = _estimate_complexity(requirement)
+
+        structured_data = {
+            "requirement": requirement,
+            "components": components,
+            "key_requirements": key_requirements,
+            "estimated_complexity": complexity,
+            "analysis_notes": (
+                f"Stub analysis of '{task.description}'. "
+                f"Identified {len(components)} component(s) from requirement."
+            ),
+        }
+
         return {
-            "output": f"[{subphase.name}] Task '{task.id}' ({task.description}) completed.",
+            "output": (
+                f"[ANALYZE] Requirement parsed: {len(components)} components identified. "
+                f"Complexity: {complexity}."
+            ),
             "agent_role": subphase.agent_role,
             "subphase": subphase.name,
-            "status": "completed"
+            "status": "completed",
+            "structured_data": structured_data,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  TECH_RESEARCH template                                             #
+    # ------------------------------------------------------------------ #
+    def _stub_tech_research(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generate technology recommendations for the TECH_RESEARCH subphase."""
+        requirement = context.get("requirement", "No requirement provided")
+        complexity = _estimate_complexity(requirement)
+
+        # Generic tech recommendations based on complexity
+        if complexity == "high":
+            stack = {
+                "backend": ["Python/FastAPI", "PostgreSQL", "Redis"],
+                "frontend": ["React/Next.js", "TypeScript", "Tailwind CSS"],
+                "infra": ["Docker", "Kubernetes", "CI/CD pipeline"],
+            }
+            rationale = "High-complexity projects benefit from mature, well-supported stacks."
+        elif complexity == "medium":
+            stack = {
+                "backend": ["Python/FastAPI", "SQLite/PostgreSQL"],
+                "frontend": ["Vue.js", "Vite", "CSS modules"],
+                "infra": ["Docker", "GitHub Actions"],
+            }
+            rationale = "Medium-complexity projects balance simplicity with scalability."
+        else:
+            stack = {
+                "backend": ["Python/FastAPI", "SQLite"],
+                "frontend": ["Static HTML/JS", "CSS"],
+                "infra": ["Simple deployment (e.g., static host)"],
+            }
+            rationale = "Low-complexity projects should prioritize simplicity."
+
+        structured_data = {
+            "requirement": requirement,
+            "recommended_stack": stack,
+            "rationale": rationale,
+            "complexity": complexity,
+            "recommendations": [
+                {
+                    "category": cat,
+                    "technologies": techs,
+                    "priority": "high" if complexity in ("high", "medium") else "medium",
+                }
+                for cat, techs in stack.items()
+            ],
+            "research_notes": (
+                f"Stub tech research for '{task.description}'. "
+                f"Recommended stack based on {complexity} complexity."
+            ),
+        }
+
+        return {
+            "output": (
+                f"[TECH_RESEARCH] Technology stack recommended for {complexity} complexity. "
+                f"Backend: {', '.join(stack['backend'])}."
+            ),
+            "agent_role": subphase.agent_role,
+            "subphase": subphase.name,
+            "status": "completed",
+            "structured_data": structured_data,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  RISK_ASSESSMENT template                                           #
+    # ------------------------------------------------------------------ #
+
+    def _stub_risk_assessment(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generate a risk analysis for the RISK_ASSESSMENT subphase."""
+        requirement = context.get("requirement", "No requirement provided")
+        complexity = _estimate_complexity(requirement)
+
+        # Generic risks based on complexity
+        base_risks = [
+            {
+                "id": "R001",
+                "description": "Requirement ambiguity leading to rework",
+                "severity": "high" if complexity == "high" else "medium",
+                "mitigation": "Conduct requirement clarification sessions early.",
+            },
+            {
+                "id": "R002",
+                "description": "Integration complexity with existing systems",
+                "severity": "high",
+                "mitigation": "Early integration spikes and interface contracts.",
+            },
+            {
+                "id": "R003",
+                "description": "Scope creep during implementation",
+                "severity": "medium",
+                "mitigation": "Strict change control and MVP scoping.",
+            },
+        ]
+
+        # Add complexity-specific risks
+        if complexity == "high":
+            base_risks.extend([
+                {
+                    "id": "R004",
+                    "description": "Performance bottlenecks under load",
+                    "severity": "high",
+                    "mitigation": "Load testing early in verification phase.",
+                },
+                {
+                    "id": "R005",
+                    "description": "Security vulnerabilities in complex architecture",
+                    "severity": "high",
+                    "mitigation": "Security review at each phase gate.",
+                },
+            ])
+        elif complexity == "medium":
+            base_risks.append({
+                "id": "R004",
+                "description": "Data consistency across services",
+                "severity": "medium",
+                "mitigation": "Use transactions and idempotent operations.",
+            })
+        else:
+            base_risks.append({
+                "id": "R004",
+                "description": "Minimal risk for simple projects",
+                "severity": "low",
+                "mitigation": "Standard development practices.",
+            })
+
+        # Compute severity summary
+        severity_counts = {"high": 0, "medium": 0, "low": 0}
+        for r in base_risks:
+            severity_counts[r["severity"]] += 1
+
+        structured_data = {
+            "requirement": requirement,
+            "risks": base_risks,
+            "severity_summary": severity_counts,
+            "overall_risk_level": (
+                "high" if severity_counts["high"] > 1
+                else "medium" if severity_counts["high"] > 0 or severity_counts["medium"] > 1
+                else "low"
+            ),
+            "assessment_notes": (
+                f"Stub risk assessment for '{task.description}'. "
+                f"Identified {len(base_risks)} risk(s): "
+                f"{severity_counts['high']} high, {severity_counts['medium']} medium, "
+                f"{severity_counts['low']} low."
+            ),
+        }
+
+        return {
+            "output": (
+                f"[RISK_ASSESSMENT] {len(base_risks)} risks identified. "
+                f"Overall risk level: {structured_data['overall_risk_level']}."
+            ),
+            "agent_role": subphase.agent_role,
+            "subphase": subphase.name,
+            "status": "completed",
+            "structured_data": structured_data,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  SYNTHESIZE template                                                #
+    # ------------------------------------------------------------------ #
+
+    def _stub_synthesize(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generate a structured execution plan for the SYNTHESIZE subphase."""
+        requirement = context.get("requirement", "No requirement provided")
+        complexity = _estimate_complexity(requirement)
+
+        if complexity == "high":
+            phases = ["SETUP", "CORE_IMPLEMENTATION", "FEATURE_DEVELOPMENT", "INTEGRATION", "VERIFICATION"]
+            task_count = 12
+        elif complexity == "medium":
+            phases = ["SETUP", "IMPLEMENTATION", "INTEGRATION", "VERIFICATION"]
+            task_count = 8
+        else:
+            phases = ["SETUP", "IMPLEMENTATION", "VERIFICATION"]
+            task_count = 5
+
+        tasks = [
+            {
+                "id": f"T{i:03d}",
+                "description": desc,
+                "depends_on": deps,
+                "estimated_effort": "medium",
+            }
+            for i, (desc, deps) in enumerate(_get_synthesis_tasks(phases), start=1)
+        ]
+
+        structured_data = {
+            "requirement": requirement,
+            "phases": phases,
+            "tasks": tasks,
+            "estimated_task_count": task_count,
+            "estimated_complexity": complexity,
+            "synthesis_notes": (
+                f"Stub execution plan for '{task.description}'. "
+                f"{len(phases)} phases, {task_count} tasks."
+            ),
+        }
+
+        return {
+            "output": (
+                f"[SYNTHESIZE] Execution plan drafted: {len(phases)} phases, "
+                f"{task_count} tasks for {complexity} complexity."
+            ),
+            "agent_role": subphase.agent_role,
+            "subphase": subphase.name,
+            "status": "completed",
+            "structured_data": structured_data,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  BACKEND template                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _stub_backend(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generate implementation outline for the BACKEND subphase."""
+        requirement = context.get("requirement", "No requirement provided")
+        plan = context.get("plan")
+        plan_tasks = []
+        if plan and isinstance(plan, dict):
+            plan_tasks = plan.get("tasks", [])
+
+        file_structure = _generate_backend_file_structure(requirement)
+
+        structured_data = {
+            "requirement": requirement,
+            "file_structure": file_structure,
+            "implementation_phases": [
+                {"phase": "models", "description": "Data models and schemas", "files": file_structure["models"]},
+                {"phase": "routes", "description": "API routes and handlers", "files": file_structure["routes"]},
+                {"phase": "services", "description": "Business logic services", "files": file_structure["services"]},
+                {"phase": "tests", "description": "Backend tests", "files": file_structure["tests"]},
+            ],
+            "planned_tasks": plan_tasks,
+            "implementation_notes": (
+                f"Stub backend implementation outline for '{task.description}'. "
+                f"Generated {sum(len(v) for v in file_structure.values())} file(s) across "
+                f"{len(file_structure)} module(s)."
+            ),
+        }
+
+        return {
+            "output": (
+                f"[BACKEND] Implementation outline generated: "
+                f"{sum(len(v) for v in file_structure.values())} file(s) across "
+                f"{len(file_structure)} module(s)."
+            ),
+            "agent_role": subphase.agent_role,
+            "subphase": subphase.name,
+            "status": "completed",
+            "structured_data": structured_data,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  FRONTEND template                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _stub_frontend(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generate implementation outline for the FRONTEND subphase."""
+        requirement = context.get("requirement", "No requirement provided")
+        file_structure = _generate_frontend_file_structure(requirement)
+
+        structured_data = {
+            "requirement": requirement,
+            "file_structure": file_structure,
+            "implementation_phases": [
+                {"phase": "components", "description": "UI components", "files": file_structure["components"]},
+                {"phase": "pages", "description": "Page routes/views", "files": file_structure["pages"]},
+                {"phase": "styles", "description": "Styles and theming", "files": file_structure["styles"]},
+                {"phase": "tests", "description": "Frontend tests", "files": file_structure["tests"]},
+            ],
+            "implementation_notes": (
+                f"Stub frontend implementation outline for '{task.description}'. "
+                f"Generated {sum(len(v) for v in file_structure.values())} file(s) across "
+                f"{len(file_structure)} module(s)."
+            ),
+        }
+
+        return {
+            "output": (
+                f"[FRONTEND] Implementation outline generated: "
+                f"{sum(len(v) for v in file_structure.values())} file(s) across "
+                f"{len(file_structure)} module(s)."
+            ),
+            "agent_role": subphase.agent_role,
+            "subphase": subphase.name,
+            "status": "completed",
+            "structured_data": structured_data,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Generic fallback                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _stub_generic(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
+        """Generic stub for unknown subphases."""
+        structured_data = {
+            "task_id": task.id,
+            "task_description": task.description,
+            "subphase": subphase.name,
+            "agent_role": subphase.agent_role,
+            "context_keys": list(context.keys()),
+            "execution_mode": "stub",
+            "notes": (
+                f"Stub execution for unknown subphase '{subphase.name}'. "
+                f"Task: {task.description}"
+            ),
+        }
+
+        return {
+            "output": f"[{subphase.name}] Task '{task.id}' ({task.description}) completed (stub).",
+            "agent_role": subphase.agent_role,
+            "subphase": subphase.name,
+            "status": "completed",
+            "structured_data": structured_data,
         }
 
     def run_swarm_gates(self, gates: list[str], context: dict) -> dict[str, Any]:
