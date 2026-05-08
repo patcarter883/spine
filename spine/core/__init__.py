@@ -13,6 +13,12 @@ from .state_machine import (
 )
 from .learning import Pattern, AntiPattern, PatternRecord, LearningManager
 from .hivemind import Memory, Hivemind
+from .hierarchy import (
+    RalphLoopEngine,
+    ProgressAggregator,
+    TransitionManager,
+    HierarchyValidator,
+)
 
 __all__ = [
     "SpineState",
@@ -30,4 +36,8 @@ __all__ = [
     "LearningManager",
     "Memory",
     "Hivemind",
+    "RalphLoopEngine",
+    "ProgressAggregator",
+    "TransitionManager",
+    "HierarchyValidator",
 ]
