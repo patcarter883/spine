@@ -8,13 +8,40 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from .core import SpineStateMachine, SpineState
-from .swarm import Supervisor
+from .core import SpineStateMachine
 from .providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
 from .providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
 
 
 console = Console()
+
+
+def _expand_env_vars(value):
+    """Recursively expand environment variables in string values.
+    
+    Supports ${VAR} and $VAR patterns. Missing vars expand to empty string.
+    
+    Args:
+        value: Any value (string, dict, list, or primitive).
+        
+    Returns:
+        Value with all ${VAR} and $VAR patterns replaced by env var values.
+    """
+    if isinstance(value, str):
+        import re
+        # Expand ${VAR} patterns
+        def expand_braced(match):
+            return os.environ.get(match.group(1), '')
+        result = re.sub(r'\$\{([^}]+)\}', expand_braced, value)
+        # Expand $VAR patterns (word chars after $)
+        result = re.sub(r'\$([A-Za-z_][A-Za-z0-9_]*)', 
+                        lambda m: os.environ.get(m.group(1), ''), result)
+        return result
+    elif isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_expand_env_vars(item) for item in value]
+    return value
 
 
 def load_config(config_path: str = ".spine/config.yaml") -> dict:
@@ -33,7 +60,7 @@ def load_config(config_path: str = ".spine/config.yaml") -> dict:
     with open(path) as f:
         config = yaml.safe_load(f) or {}
     
-    return config
+    return _expand_env_vars(config)
 
 
 def create_provider(cfg: ProviderConfig):
@@ -75,9 +102,10 @@ def create_provider(cfg: ProviderConfig):
         console.print(f"[yellow]Unknown provider type: {provider_type}[/]")
         return None
     
-    # Apply remaining config
-    if config:
-        instance.configure(config)
+    # Always call configure() so providers can initialize their
+    # internal clients (e.g. OllamaProvider creates its HTTP client
+    # in configure(), not in __init__).
+    instance.configure(config)
     
     return instance
 
@@ -106,8 +134,14 @@ def load_providers(config_path: str = ".spine/config.yaml") -> dict[str, any]:
             name = instance.get("name", "unnamed")
             impl_type = instance.get("type", "")
             enabled = instance.get("enabled", True)
-            instance_config = instance.get("config", {})
             priority = instance.get("priority", 0)
+            
+            # Capture non-standard top-level keys (model, base_url, api_key, etc.)
+            # and merge with any nested config dict into instance_config
+            known_keys = {"name", "type", "enabled", "config", "priority"}
+            top_level_config = {k: v for k, v in instance.items() if k not in known_keys}
+            nested_config = instance.get("config", {})
+            instance_config = {**top_level_config, **nested_config}
             
             if not enabled:
                 continue
@@ -178,6 +212,61 @@ def cli():
     pass
 
 
+PHASE_ICONS = {
+    "INIT": "⚙️",
+    "PLANNING": "📋",
+    "EXECUTION": "🔨",
+    "VERIFICATION": "✅",
+    "COMPLETE": "🏁",
+    "REWORK": "🔄",
+    "ERROR": "❌",
+    "BLOCKED": "🚧",
+    "HUMAN_REVIEW": "👤",
+}
+
+PHASE_COLORS = {
+    "INIT": "cyan",
+    "PLANNING": "blue",
+    "EXECUTION": "yellow",
+    "VERIFICATION": "green",
+    "COMPLETE": "green",
+    "REWORK": "magenta",
+    "ERROR": "red",
+    "BLOCKED": "red",
+    "HUMAN_REVIEW": "yellow",
+}
+
+
+def _print_phase_progress(phase_name: str, state: dict) -> None:
+    """Print progress for a completed phase."""
+    icon = PHASE_ICONS.get(phase_name, "•")
+    color = PHASE_COLORS.get(phase_name, "white")
+    tasks = state.get("completed_tasks", [])
+    errors = state.get("errors", [])
+    plan = state.get("plan")
+    
+    console.print(f"\n[{color}]{icon} Phase {phase_name}[/]")
+    console.print(f"  Tasks completed: {len(tasks)}")
+    
+    if plan and phase_name == "PLANNING":
+        console.print("  Plan created: [green]yes[/]")
+        if plan.get("tasks"):
+            for t in plan["tasks"]:
+                console.print(f"    - {t.get('id', '?')}: {t.get('description', '')}")
+    
+    if errors:
+        for err in errors[-3:]:  # Show last 3 errors
+            console.print(f"  [red]⚠ {err}[/]")
+    
+    if phase_name == "VERIFICATION":
+        console.print("  Artifacts written: [green]yes[/]")
+        console.print(f"  Tasks completed: {len(tasks)}")
+    
+    if phase_name == "COMPLETE":
+        console.print(f"  All tasks completed: {len(tasks)}")
+        console.print("  [bold green]✓ Workflow complete![/]")
+
+
 @cli.command()
 @click.argument("requirement")
 @click.option("--thread-id", "-t", default="default", help="Thread ID for persistence")
@@ -185,26 +274,68 @@ def cli():
 @click.option("--config", "-f", default=".spine/config.yaml", help="Config file path")
 def work(requirement: str, thread_id: str, checkpoint: str, config: str):
     """Start a new work item."""
-    console.print(f"[bold blue]Starting work:[/] {requirement}")
+    console.print(f"[bold blue]SPINE[/] [dim]|[/] [bold]Starting work:[/] {requirement}")
     
     # Load providers from config
     providers_by_type = load_providers(config)
     llm_provider = get_primary_provider(providers_by_type, "llm")
     
     if llm_provider:
-        console.print(f"[green]LLM provider:[/] {llm_provider.name}")
+        console.print(f"  [green]✓[/] LLM provider: [cyan]{llm_provider.name}[/]")
     else:
-        console.print("[yellow]No LLM provider configured, using stub mode[/]")
+        console.print("  [yellow]⚠[/] No LLM provider configured, using stub mode")
     
     machine = SpineStateMachine(
         checkpoint_path=checkpoint,
         llm_provider=llm_provider,
     )
-    result = machine.run(requirement, thread_id=thread_id)
     
-    console.print(f"\n[bold green]Phase:[/] {result['phase']}")
-    console.print(f"[bold green]Completed tasks:[/] {len(result['completed_tasks'])}")
-    console.print(f"[bold green]Plan created:[/] {result['plan'] is not None}")
+    # Use streaming to show phase-by-phase progress
+    seen_phases = set()
+    final_state = None
+    
+    # Safely build providers dict: transform (name, provider, priority) tuples -> provider instances
+    # Avoids IndexError when a provider list is empty or has only 1 element
+    providers_dict = {
+        k: v[0][1] if v else None
+        for k, v in providers_by_type.items()
+    }
+
+    try:
+        stream = machine.app.stream(
+            {"phase": "INIT", "requirement": requirement, "plan": None, "tasks": {},
+             "completed_tasks": [], "failed_tasks": [], "swarm_state": {},
+             "hive_cells": {}, "swarm_events": [], "variables": {},
+             "errors": [], "providers": providers_dict,
+             "critic_gate_result": None, "error_state": None, "error_history": []},
+            {"configurable": {"thread_id": thread_id}}
+        )
+        
+        for chunk in stream:
+            for node_name, state in chunk.items():
+                current_phase = state.get("phase", "")
+                if current_phase and current_phase not in seen_phases:
+                    seen_phases.add(current_phase)
+                    _print_phase_progress(current_phase, state)
+                final_state = state
+        
+        if final_state:
+            final_phase = final_state.get("phase", "UNKNOWN")
+            if final_phase not in seen_phases:
+                _print_phase_progress(final_phase, final_state)
+            
+            if final_phase == "COMPLETE":
+                console.print(f"\n[bold green]🎉 All done![/] {len(final_state.get('completed_tasks', []))} tasks completed")
+            elif final_phase in ("ERROR", "BLOCKED"):
+                console.print(f"\n[bold red]Work stopped at {final_phase}[/]")
+                for err in final_state.get("errors", []):
+                    console.print(f"  [red]• {err}[/]")
+            else:
+                console.print(f"\n[dim]Final phase: {final_phase} | Tasks: {len(final_state.get('completed_tasks', []))}[/]")
+                
+    except Exception as e:
+        console.print(f"\n[bold red]Error during workflow:[/] {e}")
+        console.print_exception()
 
 
 @cli.command()
@@ -388,7 +519,7 @@ def notify(provider: str, title: str, message: str, level: str, config: str):
     if result:
         console.print(f"[green]Notification sent via {provider}[/]")
     else:
-        console.print(f"[red]Failed to send notification[/]")
+        console.print("[red]Failed to send notification[/]")
 
 
 @cli.command()

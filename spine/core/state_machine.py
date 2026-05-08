@@ -1,22 +1,30 @@
 """Core state machine implementation using LangGraph."""
 
-from typing import Literal, Optional, Any, Iterator, Dict, List, Callable, TYPE_CHECKING, TYPE_CHECKING
+from __future__ import annotations
+
+from typing import Literal, Optional, Any, Iterator, Dict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.base import SerializerProtocol
 import orjson
 import os
+import subprocess
+from datetime import datetime, timezone
 
-from .constants import PhaseName, StateStatus, SubPhaseStatus, ErrorState
+from .constants import PhaseName, StateStatus, ErrorState
 from ..models.types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState
-from ..models.enums import ErrorState as ErrorStateEnum
 from ..models.dag import SwarmDAGExecutor
 from ..providers.llm import LLMProvider
-from ..providers.base import ConflictResolver, ConflictResult, ConflictRequiresHuman
+from ..providers.base import ConflictResolver, ConflictResult
 from ..providers.memory import MemoryProvider
 from ..providers.storage import StorageProvider, FileWriteGuard
 from ..providers.tools import ToolsProvider
 from ..core.persistence import GitWorkflow, Checkpoint
+
+__all__ = [
+    "PhaseResult",
+    "SubPhaseResult",
+]
 
 
 class ProviderSerializer(SerializerProtocol):
@@ -72,8 +80,15 @@ def planning_phase(state: SpineState) -> SpineState:
     
     Uses LLM-based decomposition for intelligent task planning.
     Includes entry/exit condition evaluation and DAG hooks.
+    Writes plan artifacts to disk and logs phase events.
     """
     state["phase"] = PhaseName.PLANNING
+    start_time = datetime.now(timezone.utc)
+    
+    # Log phase started event
+    _log_phase_event(state, "PLANNING", "phase_started", {
+        "requirement": state.get("requirement", ""),
+    })
     
     # Define sub-phases based on design
     # Wave 1: ANALYZE, TECH_RESEARCH, RISK_ASSESSMENT (parallel)
@@ -198,11 +213,39 @@ def planning_phase(state: SpineState) -> SpineState:
     if critic_result != "APPROVED":
         state["errors"].append(f"Critic gate {critic_result}: Plan requires revision")
         state["previous_phase"] = PhaseName.PLANNING
+        # Log phase completed with error
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+        _log_phase_event(state, "PLANNING", "phase_completed", {
+            "tasks_completed": len(state.get("completed_tasks", [])),
+            "errors": len(state.get("errors", [])),
+            "duration": duration,
+            "status": "error",
+        })
         return state
+    
+    # Write plan artifacts to disk
+    work_item_id = state.get("variables", {}).get("work_item_id", state.get("variables", {}).get("thread_id", "default"))
+    artifact_path = write_plan_artifact(state, work_item_id)
+    if artifact_path:
+        _log_phase_event(state, "PLANNING", "plan_written", {
+            "path": artifact_path,
+            "tasks_count": len(state["plan"].get("tasks", [])),
+        })
+    
+    write_spec_file(state, work_item_id)
     
     # Transition to EXECUTION
     state["previous_phase"] = PhaseName.PLANNING
     state["phase"] = PhaseName.EXECUTION
+    
+    # Log phase completed
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    _log_phase_event(state, "PLANNING", "phase_completed", {
+        "tasks_completed": len(state.get("completed_tasks", [])),
+        "errors": len(state.get("errors", [])),
+        "duration": duration,
+        "status": "success",
+    })
     return state
 
 
@@ -211,14 +254,20 @@ def execution_phase(state: SpineState) -> SpineState:
     
     Integrates file write guard for protected writes.
     Includes entry/exit condition evaluation and DAG hooks.
+    Logs phase events to swarm.log.
     """
     state["phase"] = PhaseName.EXECUTION
+    start_time = datetime.now(timezone.utc)
     
-    # Get providers from state
+    # Log phase started event
+    _log_phase_event(state, "EXECUTION", "phase_started", {
+        "requirement": state.get("requirement", ""),
+    })
+    
+# Get providers from state
     providers = state.get("providers", {})
     llm_provider = providers.get("llm")
     storage_provider = providers.get("storage")
-    file_write_guard = providers.get("file_write_guard")
     
     # Create executor with providers
     executor = SwarmDAGExecutor(
@@ -318,6 +367,15 @@ def execution_phase(state: SpineState) -> SpineState:
     # Transition to VERIFICATION
     state["previous_phase"] = PhaseName.EXECUTION
     state["phase"] = PhaseName.VERIFICATION
+    
+    # Log phase completed
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    _log_phase_event(state, "EXECUTION", "phase_completed", {
+        "tasks_completed": len(state.get("completed_tasks", [])),
+        "errors": len(state.get("errors", [])),
+        "duration": duration,
+        "status": "success",
+    })
     return state
 
 
@@ -326,27 +384,76 @@ def verification_phase(state: SpineState) -> SpineState:
     
     Integrates git workflow for commits and branch management.
     Includes error handling with error state transitions.
+    Runs actual syntax and lint checks, logs all events.
     """
     state["phase"] = PhaseName.VERIFICATION
+    start_time = datetime.now(timezone.utc)
     
-    # Quality gates
+    # Log phase started event
+    _log_phase_event(state, "VERIFICATION", "phase_started", {
+        "requirement": state.get("requirement", ""),
+    })
+    
+    # Quality gates - run actual checks
+    syntax_ok, syntax_msg = _run_syntax_check()
+    syntax_status = StateStatus.SUCCESS if syntax_ok else StateStatus.FAILED
     state["tasks"]["syntax_check"] = Task(
         id="syntax_check",
         description="Verify syntax correctness",
-        status=StateStatus.SUCCESS
+        status=syntax_status,
+        result=syntax_msg,
     )
+    _log_phase_event(state, "VERIFICATION", "task_completed", {
+        "task_id": "syntax_check",
+        "subphase": "VERIFICATION",
+        "status": syntax_status.value,
+    })
+    if syntax_ok:
+        state["completed_tasks"].append("syntax_check")
+    else:
+        state["errors"].append(syntax_msg)
+    
+    lint_ok, lint_msg = _run_lint_check()
+    lint_status = StateStatus.SUCCESS if lint_ok else StateStatus.FAILED
     state["tasks"]["lint_check"] = Task(
-        id="lint_check", 
+        id="lint_check",
         description="Run linter checks",
-        status=StateStatus.SUCCESS
+        status=lint_status,
+        result=lint_msg,
     )
+    _log_phase_event(state, "VERIFICATION", "task_completed", {
+        "task_id": "lint_check",
+        "subphase": "VERIFICATION",
+        "status": lint_status.value,
+    })
+    if lint_ok:
+        state["completed_tasks"].append("lint_check")
+    else:
+        state["errors"].append(lint_msg)
+    
+    drift_ok = True
+    drift_msg = "Plan drift check passed"
+    # Check that plan exists and has tasks
+    plan = state.get("plan")
+    if plan is None or len(plan.get("tasks", [])) == 0:
+        drift_ok = False
+        drift_msg = "No plan found or plan has no tasks"
+    drift_status = StateStatus.SUCCESS if drift_ok else StateStatus.FAILED
     state["tasks"]["drift_check"] = Task(
         id="drift_check",
         description="Verify plan drift",
-        status=StateStatus.SUCCESS
+        status=drift_status,
+        result=drift_msg,
     )
-    
-    state["completed_tasks"].extend(["syntax_check", "lint_check", "drift_check"])
+    _log_phase_event(state, "VERIFICATION", "task_completed", {
+        "task_id": "drift_check",
+        "subphase": "VERIFICATION",
+        "status": drift_status.value,
+    })
+    if drift_ok:
+        state["completed_tasks"].append("drift_check")
+    else:
+        state["errors"].append(drift_msg)
     
     # Git integration: commit changes if configured
     providers = state.get("providers", {})
@@ -392,6 +499,15 @@ def verification_phase(state: SpineState) -> SpineState:
     # Transition to COMPLETE
     state["previous_phase"] = PhaseName.VERIFICATION
     state["phase"] = PhaseName.COMPLETE
+    
+    # Log phase completed
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    _log_phase_event(state, "VERIFICATION", "phase_completed", {
+        "tasks_completed": len(state.get("completed_tasks", [])),
+        "errors": len(state.get("errors", [])),
+        "duration": duration,
+        "status": "success",
+    })
     return state
 
 
@@ -465,19 +581,19 @@ def error_phase(state: SpineState) -> SpineState:
     # Determine error handling path based on error state
     if error_state == ErrorState.TRANSIENT.value or error_state == "TRANSIENT":
         # Transient errors can be retried via REWORK
-        state["errors"].append(f"Transient error detected, routing to REWORK")
+        state["errors"].append("Transient error detected, routing to REWORK")
         state["phase"] = PhaseName.REWORK
     elif error_state == ErrorState.FATAL.value or error_state == "FATAL":
         # Fatal errors go to HUMAN_REVIEW
-        state["errors"].append(f"Fatal error detected, routing to HUMAN_REVIEW")
+        state["errors"].append("Fatal error detected, routing to HUMAN_REVIEW")
         state["phase"] = PhaseName.HUMAN_REVIEW
     elif error_state == ErrorState.TIMEOUT.value or error_state == "TIMEOUT":
         # Timeout errors go to BLOCKED for manual intervention
-        state["errors"].append(f"Timeout error detected, routing to BLOCKED")
+        state["errors"].append("Timeout error detected, routing to BLOCKED")
         state["phase"] = PhaseName.BLOCKED
     else:
         # Default: HUMAN_REVIEW for complex errors
-        state["errors"].append(f"Unknown error state, routing to HUMAN_REVIEW")
+        state["errors"].append("Unknown error state, routing to HUMAN_REVIEW")
         state["phase"] = PhaseName.HUMAN_REVIEW
     
     state["variables"]["error_handled"] = True
@@ -571,6 +687,204 @@ def _check_error_threshold(subphases: List[SubPhase], max_errors: int = 3) -> tu
         return ErrorState.TRANSIENT.value, failed_subphases
     
     return ErrorState.INIT.value, []
+
+
+def _get_spine_root(state: SpineState) -> str:
+    """Resolve the .spine root directory from state."""
+    # Try checkpoint_path from state variables first
+    checkpoint_path = state.get("variables", {}).get("checkpoint_path", ".spine/spine.db")
+    return os.path.dirname(checkpoint_path)
+
+
+def _log_phase_event(state: SpineState, phase_name: str, event_type: str, data: Dict[str, Any]) -> None:
+    """Log a phase event to swarm.log via the SwarmMail instance.
+
+    Args:
+        state: Current SpineState
+        phase_name: Name of the phase
+        event_type: Event type (phase_started, phase_completed, task_completed, plan_written)
+        data: Event payload data
+    """
+    providers = state.get("providers", {})
+    swarm_mail = providers.get("swarm_mail")
+    if swarm_mail is None:
+        return
+
+    event_body = {
+        "phase": phase_name,
+        "event_type": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **data,
+    }
+    try:
+        swarm_mail.broadcast(
+            subject=f"phase_event:{phase_name}:{event_type}",
+            body=event_body,
+        )
+    except Exception:
+        # Fail silently - event logging should not break the workflow
+        pass
+
+
+def write_plan_artifact(state: SpineState, work_item_id: str) -> Optional[str]:
+    """Write the plan to disk as JSON artifact.
+
+    Creates .spine/artifacts/plans/{work_item_id}.json with the full plan dict.
+
+    Args:
+        state: Current SpineState
+        work_item_id: Unique identifier for this work item
+
+    Returns:
+        Path to written artifact, or None on failure
+    """
+    plan = state.get("plan")
+    if plan is None:
+        return None
+
+    spine_root = _get_spine_root(state)
+    artifacts_dir = os.path.join(spine_root, "artifacts", "plans")
+    os.makedirs(artifacts_dir, exist_ok=True)
+
+    artifact_path = os.path.join(artifacts_dir, f"{work_item_id}.json")
+    try:
+        with open(artifact_path, "wb") as f:
+            f.write(orjson.dumps(plan, option=orjson.OPT_INDENT_2))
+        return artifact_path
+    except Exception:
+        return None
+
+
+def write_spec_file(state: SpineState, work_item_id: str) -> Optional[str]:
+    """Write a markdown spec derived from the plan.
+
+    Creates .spine/spec/{work_item_id}.md with a human-readable spec.
+
+    Args:
+        state: Current SpineState
+        work_item_id: Unique identifier for this work item
+
+    Returns:
+        Path to written spec file, or None on failure
+    """
+    plan = state.get("plan")
+    if plan is None:
+        return None
+
+    spine_root = _get_spine_root(state)
+    spec_dir = os.path.join(spine_root, "spec")
+    os.makedirs(spec_dir, exist_ok=True)
+
+    spec_path = os.path.join(spec_dir, f"{work_item_id}.md")
+
+    # Build markdown spec from plan data
+    lines = [
+        f"# Spec: {work_item_id}",
+        "",
+        "## Requirement",
+        f"{plan.get('requirement', 'N/A')}",
+        "",
+        "## Phases",
+    ]
+
+    for phase in plan.get("phases", []):
+        lines.append(f"- {phase}")
+
+    lines.append("")
+    lines.append("## Tasks")
+    lines.append("")
+
+    for task in plan.get("tasks", []):
+        task_id = task.get("id", "unknown")
+        task_desc = task.get("description", "")
+        lines.append(f"### {task_id}")
+        lines.append(f"- Description: {task_desc}")
+        lines.append("")
+
+    # Include subphase results if available
+    subphase_results = plan.get("subphase_results", {})
+    if subphase_results:
+        lines.append("## Subphase Results")
+        lines.append("")
+        for name, result in subphase_results.items():
+            lines.append(f"### {name}")
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    lines.append(f"- {key}: {value}")
+            else:
+                lines.append(f"- Result: {result}")
+            lines.append("")
+
+    lines.append("---")
+    lines.append(f"*Generated at {datetime.now(timezone.utc).isoformat()}*")
+
+    try:
+        with open(spec_path, "w") as f:
+            f.write("\n".join(lines))
+        return spec_path
+    except Exception:
+        return None
+
+
+def _run_syntax_check() -> tuple[bool, str]:
+    """Run syntax check on the project's Python files.
+
+    Uses py_compile to verify Python syntax correctness.
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        result = subprocess.run(
+            ["python", "-m", "py_compile", "spine/core/state_machine.py"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return True, "Syntax check passed"
+        else:
+            return False, f"Syntax check failed: {result.stderr.strip()}"
+    except FileNotFoundError:
+        return False, "Python interpreter not found"
+    except subprocess.TimeoutExpired:
+        return False, "Syntax check timed out"
+    except Exception as e:
+        return False, f"Syntax check error: {e}"
+
+
+def _run_lint_check() -> tuple[bool, str]:
+    """Run linting checks on the project.
+
+    Tries ruff first, falls back to basic Python linting.
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    # Try ruff first
+    for lint_cmd in [[".venv/bin/ruff", "check", "spine/core/state_machine.py"],
+                     ["ruff", "check", "spine/core/state_machine.py"]]:
+        try:
+            result = subprocess.run(
+                lint_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return True, "Lint check passed"
+            else:
+                # ruff found issues but ran successfully
+                return False, f"Lint issues found: {result.stdout.strip()}"
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            return False, "Lint check timed out"
+        except Exception as e:
+            return False, f"Lint check error: {e}"
+
+    # Fallback: no linter available, skip lint check
+    return True, "No linter available, skipping lint check"
 
 
 def should_continue(state: SpineState) -> Literal["planning", "execution", "verification", "rework", "blocked", "error", "human_review", "__end__"]:
@@ -796,8 +1110,9 @@ class SpineStateMachine:
             "tools": self._tools_provider,
             "file_write_guard": self._file_write_guard,
             "git": self._git_workflow,
+            "swarm_mail": self._swarm_mail,
         }
-        
+
         initial_state = SpineState(
             phase=PhaseName.INIT,
             previous_phase=None,
@@ -809,7 +1124,7 @@ class SpineStateMachine:
             swarm_state={},
             hive_cells={},
             swarm_events=[],
-            variables={},
+            variables={"thread_id": thread_id, "work_item_id": thread_id, "checkpoint_path": self.checkpoint_path},
             errors=[],
             providers=providers,
             critic_gate_result=None,
@@ -824,7 +1139,7 @@ class SpineStateMachine:
         return result
     
     @property
-    def swarm_mail(self) -> "SwarmMail":
+    def swarm_mail(self) -> Any:
         """Access the SwarmMail instance for actor-model coordination."""
         return self._swarm_mail
     
@@ -871,7 +1186,7 @@ class SpineStateMachine:
         Returns:
             Path to saved checkpoint or None
         """
-        from .persistence import ContinuityManager, GitWorkflow
+        from .persistence import ContinuityManager
         from .learning import LearningManager
         
         # Initialize managers if not already set

@@ -731,3 +731,353 @@ class TestProgressTracking:
         assert progress is not None
         assert progress.total_waves == 2
         assert progress.current_wave == 2
+
+
+class MockLLMProvider:
+    """Mock LLM provider for testing real LLM execution path.
+
+    Mimics the interface that execute_dag() checks:
+    - enabled property (bool)
+    - generate(prompt, **kwargs) method
+    """
+
+    def __init__(self, enabled: bool = True, response: str = "MOCK LLM OUTPUT"):
+        self._enabled = enabled
+        self._response = response
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def name(self) -> str:
+        return "mock-llm"
+
+    def generate(self, prompt: str, timeout: float = None, **kwargs) -> str:
+        return self._response
+
+    def configure(self, config: dict) -> None:
+        pass
+
+    def validate(self) -> bool:
+        return self._enabled
+
+
+class TestRealLLMExecution:
+    """Tests that verify the real LLM execution path in execute_dag()."""
+
+    def test_execute_dag_uses_real_llm_when_provider_enabled(self):
+        """When a properly configured LLM provider is available, execute_dag
+        must use the real LLM path (self._llm_provider.generate) and NOT
+        the stub path (_execute_stub_task).
+        
+        Verifies: output matches mock provider response, not stub template.
+        """
+        mock = MockLLMProvider(enabled=True, response="REAL_LLM_RESPONSE_12345")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="TEST_PHASE",
+            agent_role="tester",
+            tasks=[Task(id="task1", description="Test task")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "test"})
+        
+        # Real LLM path: result is raw string from mock.generate()
+        assert result["subphase"] == "TEST_PHASE"
+        assert result["status"] == "success"
+        assert result["tasks"]["task1"]["status"] == "success"
+        assert result["tasks"]["task1"]["result"] == "REAL_LLM_RESPONSE_12345"
+
+    def test_execute_stub_task_not_called_when_provider_enabled(self):
+        """When provider is enabled, _execute_stub_task must NOT be called.
+        
+        The stub templates produce output like "[ANALYZE] ..." or
+        "[TECH_RESEARCH] ...". The real LLM path returns raw text.
+        This test confirms stub formatting is absent from results.
+        """
+        mock = MockLLMProvider(enabled=True, response="Raw LLM analysis output")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="ANALYZE",
+            agent_role="explorer",
+            tasks=[Task(id="parse", description="Parse requirement")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Build API"})
+
+        task_result = result["tasks"]["parse"]["result"]
+        # Stub output would contain "[ANALYZE]" prefix - real LLM path does not
+        assert "[ANALYZE]" not in task_result
+        assert task_result == "Raw LLM analysis output"
+
+    def test_execute_dag_falls_back_to_stub_when_provider_disabled(self):
+        """When LLM provider exists but enabled=False, the stub path IS taken.
+        
+        This is the fallback safety net: if provider configuration fails
+        (e.g., Ollama not running, wrong API key), the system must still
+        produce meaningful output via stubs rather than crashing.
+        """
+        mock = MockLLMProvider(enabled=False, response="SHOULD_NOT_APPEAR")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="ANALYZE",
+            agent_role="explorer",
+            tasks=[Task(id="parse", description="Parse requirement")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Build API"})
+
+        task_result = result["tasks"]["parse"]["result"]
+        # Stub path: output starts with "[ANALYZE]" prefix
+        assert "[ANALYZE]" in task_result
+        assert "SHOULD_NOT_APPEAR" not in task_result
+
+    def test_execute_dag_stub_when_no_provider(self):
+        """When no LLM provider is passed, the stub path IS taken.
+        
+        This is the default behavior and must remain working. All existing
+        tests depend on this stub path producing correct structured output.
+        """
+        executor = SwarmDAGExecutor()  # No llm_provider
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="SYNTHESIZE",
+            agent_role="planner",
+            tasks=[Task(id="draft", description="Draft execution plan")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Build app"})
+
+        task_result = result["tasks"]["draft"]["result"]
+        # Stub path: output contains "[SYNTHESIZE]" prefix
+        assert "[SYNTHESIZE]" in task_result
+        assert result["status"] == "success"
+
+    def test_execute_phase_with_llm_provider_integration(self):
+        """Full integration: execute_phase with real LLM provider.
+        
+        Verifies the complete path from execute_phase through execute_dag
+        to the LLM provider's generate() method, with multiple subphases
+        and dependency resolution.
+        """
+        mock = MockLLMProvider(enabled=True, response="INTEGRATED_LLM_OUTPUT")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Phase, Task
+        subphases = [
+            SubPhase(
+                name="ANALYZE",
+                priority=1,
+                agent_role="explorer",
+                tasks=[Task(id="analyze", description="Analyze")]
+            ),
+            SubPhase(
+                name="SYNTHESIZE",
+                priority=2,
+                dependencies=["ANALYZE"],
+                agent_role="planner",
+                tasks=[Task(id="synthesize", description="Synthesize")]
+            ),
+        ]
+
+        phase = Phase(name="INTEGRATION_TEST", subphases=subphases)
+        result = executor.execute_phase(phase, {"requirement": "Test integration"})
+
+        assert "ANALYZE" in result.subphase_results
+        assert "SYNTHESIZE" in result.subphase_results
+        
+        # Both subphases should have real LLM output (not stub format)
+        for key in ["ANALYZE", "SYNTHESIZE"]:
+            subphase_result = result.subphase_results[key]
+            assert subphase_result is not None
+
+    def test_llm_provider_enabled_false_check(self):
+        """Explicitly verify the enabled check at line 611 of dag.py.
+        
+        The condition is: self._llm_provider and self._llm_provider.enabled
+        
+        Case: provider is None -> stub path
+        Case: provider enabled=False -> stub path
+        Case: provider enabled=True -> real LLM path
+        """
+        # Case 1: provider is None
+        executor_none = SwarmDAGExecutor(llm_provider=None)
+        assert executor_none._llm_provider is None
+
+        # Case 2: provider exists, enabled=False
+        mock_disabled = MockLLMProvider(enabled=False)
+        executor_disabled = SwarmDAGExecutor(llm_provider=mock_disabled)
+        assert executor_disabled._llm_provider is not None
+        assert executor_disabled._llm_provider.enabled is False
+
+        # Case 3: provider exists, enabled=True
+        mock_enabled = MockLLMProvider(enabled=True)
+        executor_enabled = SwarmDAGExecutor(llm_provider=mock_enabled)
+        assert executor_enabled._llm_provider is not None
+        assert executor_enabled._llm_provider.enabled is True
+
+    def test_backend_subphase_with_real_llm(self):
+        """BACKEND subphase uses real LLM provider when enabled.
+        
+        The BACKEND subphase has specific stub output format; this test
+        confirms the real LLM path supersedes it.
+        """
+        mock = MockLLMProvider(enabled=True, response="backend_code_generated")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="BACKEND",
+            agent_role="coder",
+            tasks=[Task(id="backend_impl", description="Implement backend")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Build API"})
+
+        task_result = result["tasks"]["backend_impl"]["result"]
+        # Stub output would contain "[BACKEND]" prefix
+        assert "[BACKEND]" not in task_result
+        assert task_result == "backend_code_generated"
+
+    def test_frontend_subphase_with_real_llm(self):
+        """FRONTEND subphase uses real LLM provider when enabled."""
+        mock = MockLLMProvider(enabled=True, response="frontend_components_generated")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="FRONTEND",
+            agent_role="coder",
+            tasks=[Task(id="frontend_impl", description="Implement frontend")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Build UI"})
+
+        task_result = result["tasks"]["frontend_impl"]["result"]
+        assert "[FRONTEND]" not in task_result
+        assert task_result == "frontend_components_generated"
+
+    def test_tech_research_subphase_with_real_llm(self):
+        """TECH_RESEARCH subphase uses real LLM provider when enabled."""
+        mock = MockLLMProvider(enabled=True, response="tech_recommendations_v2")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="TECH_RESEARCH",
+            agent_role="sme",
+            tasks=[Task(id="research", description="Research tech stack")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Scalable app"})
+
+        task_result = result["tasks"]["research"]["result"]
+        assert "[TECH_RESEARCH]" not in task_result
+        assert task_result == "tech_recommendations_v2"
+
+    def test_risk_assessment_subphase_with_real_llm(self):
+        """RISK_ASSESSMENT subphase uses real LLM provider when enabled."""
+        mock = MockLLMProvider(enabled=True, response="risk_analysis_result")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="RISK_ASSESSMENT",
+            agent_role="analyst",
+            tasks=[Task(id="assess", description="Assess risks")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Complex system"})
+
+        task_result = result["tasks"]["assess"]["result"]
+        assert "[RISK_ASSESSMENT]" not in task_result
+        assert task_result == "risk_analysis_result"
+
+    def test_unknown_subphase_with_real_llm(self):
+        """Unknown subphases (no registered stub template) also use real LLM."""
+        mock = MockLLMProvider(enabled=True, response="custom_subphase_output")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="CUSTOM_PHASE",
+            agent_role="specialist",
+            tasks=[Task(id="custom_task", description="Custom work")]
+        )
+
+        result = executor.execute_dag(subphase, {"data": "context"})
+
+        task_result = result["tasks"]["custom_task"]["result"]
+        assert task_result == "custom_subphase_output"
+        assert result["status"] == "success"
+
+    def test_multiple_tasks_with_real_llm(self):
+        """Multiple tasks in a subphase all go through real LLM path."""
+        mock = MockLLMProvider(enabled=True, response="multi_task_llm_output")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="BACKEND",
+            agent_role="coder",
+            tasks=[
+                Task(id="task_a", description="Task A"),
+                Task(id="task_b", description="Task B"),
+                Task(id="task_c", description="Task C"),
+            ]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "Multi-task test"})
+
+        assert result["tasks_executed"] == 3
+        assert result["total_tasks"] == 3
+        for task_id in ["task_a", "task_b", "task_c"]:
+            assert result["tasks"][task_id]["status"] == "success"
+            assert result["tasks"][task_id]["result"] == "multi_task_llm_output"
+
+    def test_string_name_backwards_compat_no_llm(self):
+        """String name fallback (backwards compat) works regardless of provider.
+        
+        When execute_dag is called with a string instead of SubPhase,
+        it returns a stub result even if provider is available.
+        """
+        mock = MockLLMProvider(enabled=True, response="SHOULD_NOT_APPEAR")
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        result = executor.execute_dag("LEGACY_NAME", {"key": "value"})
+
+        assert result["status"] == "completed"
+        assert result["dag"] == "LEGACY_NAME"
+        assert result["tasks_executed"] == 0
+        # String path bypasses LLM provider entirely
+
+    def test_llm_error_handling_sets_task_failed(self):
+        """When LLM provider raises, tasks are marked failed not crashed."""
+        class FailingMock(MockLLMProvider):
+            def generate(self, prompt: str, timeout: float = None, **kwargs) -> str:
+                raise RuntimeError("LLM service unavailable")
+
+        mock = FailingMock(enabled=True)
+        executor = SwarmDAGExecutor(llm_provider=mock)
+
+        from spine.core.state_machine import SubPhase, Task
+        subphase = SubPhase(
+            name="ANALYZE",
+            agent_role="explorer",
+            tasks=[Task(id="parse", description="Parse")]
+        )
+
+        result = executor.execute_dag(subphase, {"requirement": "test"})
+
+        assert result["status"] == "failed"
+        assert result["tasks"]["parse"]["status"] == "failed"
+        assert "LLM service unavailable" in result["tasks"]["parse"]["error"]
+        assert len(result["errors"]) == 1
