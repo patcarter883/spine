@@ -281,8 +281,10 @@ class OpenCodeAgentProvider(AgentProvider):
         if auto_approve:
             cmd.append("--dangerously-skip-permissions")
 
-        # JSON output for structured parsing
-        cmd.extend(["--format", "json"])
+        # Use default format for reliable agent execution
+        # JSON mode causes timeouts with local models due to different
+        # internal processing; default mode uses efficient streaming
+        cmd.extend(["--format", "default"])
 
         # File attachments
         if files:

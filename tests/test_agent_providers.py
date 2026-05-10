@@ -87,7 +87,7 @@ class TestOpenCodeAgentProvider:
         assert cmd[0] == "opencode"
         assert cmd[1] == "run"
         assert "--format" in cmd
-        assert "json" in cmd
+        assert "default" in cmd
         assert "--dangerously-skip-permissions" in cmd
         assert cmd[-1] == "Fix the bug"
 
