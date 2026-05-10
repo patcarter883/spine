@@ -12,7 +12,15 @@ providers:
   - name: local
     type: local-openai
     model: model
-    api_key: ''
+    api_key: 'vllm'
     base_url: http://localhost:8000/v1
     priority: 0
     enabled: true
+  agent:
+        - name: default
+          type: opencode
+          config:
+            mode: run
+            model: vllm/model
+            auto_approve: true
+

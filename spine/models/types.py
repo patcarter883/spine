@@ -148,6 +148,7 @@ class SpineState(TypedDict):
     
     # Provider state
     providers: dict[str, Any]
+    agent_provider: Optional[dict[str, Any]]
     
     # Critic gate state
     critic_gate_result: Optional[Literal["APPROVED", "NEEDS_REVISION", "REJECTED"]]
@@ -308,9 +309,56 @@ class ValidationResult:
     warnings: List[str] = field(default_factory=list)
 
 
+@dataclass
+class FeatureSlice:
+    """A unit of work at feature granularity for agent delegation.
+
+    The planner produces FeatureSlices -- not micro-tasks.  Each slice
+    represents an independent work unit that a coding agent (OpenCode, Codex,
+    Claude Code) can execute autonomously.  The agent owns the internal
+    decomposition (which files to touch, in what order).
+
+    Attributes:
+        id: Unique identifier (e.g. "auth-jwt-middleware").
+        description: What to build, at feature granularity.
+        scope: Modules/directories the agent should work within.
+        depends_on: IDs of slices that must complete before this one.
+        agent_role: Which swarm role handles this (coder, test_engineer, reviewer).
+        acceptance: What "done" looks like -- gate criteria for verification.
+    """
+
+    id: str
+    description: str
+    scope: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    agent_role: str = "coder"
+    acceptance: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "description": self.description,
+            "scope": self.scope,
+            "depends_on": self.depends_on,
+            "agent_role": self.agent_role,
+            "acceptance": self.acceptance,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FeatureSlice":
+        return cls(
+            id=data["id"],
+            description=data["description"],
+            scope=data.get("scope", []),
+            depends_on=data.get("depends_on", []),
+            agent_role=data.get("agent_role", "coder"),
+            acceptance=data.get("acceptance", []),
+        )
+
+
 __all__ = [
     "Task",
-    "SubPhase", 
+    "SubPhase",
     "Phase",
     "PhaseResult",
     "SubPhaseResult",
@@ -324,4 +372,5 @@ __all__ = [
     "TaskNode",
     "HierarchyProgress",
     "ValidationResult",
+    "FeatureSlice",
 ]

@@ -28,6 +28,7 @@ class ProviderType(str, Enum):
     TOOLS = "tools"
     STORAGE = "storage"
     NOTIFY = "notify"
+    AGENT = "agent"
 
 
 class Provider(ABC):

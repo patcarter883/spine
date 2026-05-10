@@ -252,6 +252,10 @@ def planning_phase(state: SpineState) -> SpineState:
 def execution_phase(state: SpineState) -> SpineState:
     """Execute the EXECUTION phase with parallel sub-phases.
     
+    When FeatureSlices are present in the plan, creates one SubPhase per
+    slice and delegates to agent_provider when available.  Falls back to
+    the hardcoded BACKEND/FRONTEND pattern when no slices exist.
+    
     Integrates file write guard for protected writes.
     Includes entry/exit condition evaluation and DAG hooks.
     Logs phase events to swarm.log.
@@ -264,49 +268,72 @@ def execution_phase(state: SpineState) -> SpineState:
         "requirement": state.get("requirement", ""),
     })
     
-# Get providers from state
+    # Get providers from state
     providers = state.get("providers", {})
     llm_provider = providers.get("llm")
     storage_provider = providers.get("storage")
+    agent_provider = state.get("agent_provider")
     
     # Create executor with providers
     executor = SwarmDAGExecutor(
         llm_provider=llm_provider,
-        storage_provider=storage_provider
+        storage_provider=storage_provider,
     )
     
-    # Define execution sub-phases
-    subphases = [
-        SubPhase(
-            name="BACKEND",
-            priority=1,
-            parallel=True,
-            agent_role="coder",
-            tasks=[
-                Task(id="backend_impl", description="Implement backend logic"),
-                Task(id="backend_tests", description="Write backend tests")
-            ]
-        ),
-        SubPhase(
-            name="FRONTEND",
-            priority=1,
-            parallel=True,
-            agent_role="coder",
-            tasks=[
-                Task(id="frontend_impl", description="Implement frontend"),
-                Task(id="frontend_tests", description="Write frontend tests")
-            ]
-        ),
-    ]
+    # ── Build subphases from FeatureSlices (or fallback) ──────────
+    plan = state.get("plan") or {}
+    raw_slices = plan.get("feature_slices", [])
     
-    state["swarm_state"]["active_subphases"] = ["BACKEND", "FRONTEND"]
+    if raw_slices:
+        from ..models.types import FeatureSlice
+        feature_slices = [FeatureSlice.from_dict(s) for s in raw_slices]
+        subphases = []
+        active_names = []
+        for s in feature_slices:
+            tasks = [
+                Task(id=f"{s.id}-exec", description=s.description),
+            ]
+            subphases.append(SubPhase(
+                name=s.id.upper().replace("-", "_"),
+                priority=1,
+                parallel=len(s.depends_on) == 0,
+                agent_role=s.agent_role,
+                tasks=tasks,
+            ))
+            active_names.append(s.id.upper().replace("-", "_"))
+        state["swarm_state"]["active_subphases"] = active_names
+    else:
+        # Fallback: hardcoded BACKEND/FRONTEND pattern
+        subphases = [
+            SubPhase(
+                name="BACKEND",
+                priority=1,
+                parallel=True,
+                agent_role="coder",
+                tasks=[
+                    Task(id="backend_impl", description="Implement backend logic"),
+                    Task(id="backend_tests", description="Write backend tests"),
+                ],
+            ),
+            SubPhase(
+                name="FRONTEND",
+                priority=1,
+                parallel=True,
+                agent_role="coder",
+                tasks=[
+                    Task(id="frontend_impl", description="Implement frontend"),
+                    Task(id="frontend_tests", description="Write frontend tests"),
+                ],
+            ),
+        ]
+        state["swarm_state"]["active_subphases"] = ["BACKEND", "FRONTEND"]
     
     # Build phase with hooks and conditions
     execution_phase_obj = Phase(
         name=PhaseName.EXECUTION,
         subphases=subphases,
         pre_execute_hooks=[lambda ctx: {**ctx, "execution_started": True}],
-        post_execute_hooks=[lambda ctx: {**ctx, "execution_completed": True}]
+        post_execute_hooks=[lambda ctx: {**ctx, "execution_completed": True}],
     )
     
     # Run pre-execute hooks

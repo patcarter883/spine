@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Optional, AsyncIterator
 from ..core.state_machine import SpineState
 from ..providers.llm import LLMProvider
+from ..providers.agents import AgentProvider, AgentResult
 from .mail import SwarmMail
 from .learning import LearningIntegration
 
@@ -47,7 +48,16 @@ class AgentRoleValidator:
 class SwarmAgent:
     """Base class for swarm agents with role-specific capabilities."""
 
-    def __init__(self, role: str, capabilities: list[str], llm_provider: Optional[LLMProvider] = None):
+    # Roles that use AgentProvider (implementation) vs LLMProvider (decision-making)
+    IMPLEMENTATION_ROLES = frozenset(["coder", "test_engineer", "reviewer"])
+
+    def __init__(
+        self,
+        role: str,
+        capabilities: list[str],
+        llm_provider: Optional[LLMProvider] = None,
+        agent_provider: Optional[AgentProvider] = None,
+    ):
         # Validate role
         if not AgentRoleValidator.validate(role):
             raise InvalidAgentRoleError(
@@ -56,12 +66,23 @@ class SwarmAgent:
         self.role = role
         self.capabilities = capabilities
         self._llm_provider = llm_provider
+        self._agent_provider = agent_provider
         self._mail: Optional[SwarmMail] = None
         self._learning: Optional[LearningIntegration] = None
 
     def set_llm_provider(self, provider: LLMProvider) -> None:
         """Set the LLM provider for this agent."""
         self._llm_provider = provider
+
+    def set_agent_provider(self, provider: AgentProvider) -> None:
+        """Set the agent provider for this agent.
+
+        Agent providers delegate implementation work to external coding
+        agents (OpenCode, Codex CLI, Claude Code).  Only implementation
+        roles (coder, test_engineer, reviewer) use agent providers.
+        Decision-making roles (planner, critic, explorer) use LLM directly.
+        """
+        self._agent_provider = provider
 
     def set_mail(self, mail: SwarmMail) -> None:
         """Set the SwarmMail instance for this agent."""
@@ -72,7 +93,24 @@ class SwarmAgent:
         self._learning = learning
     
     def execute(self, state: SpineState, capability: str, **kwargs) -> dict[str, Any]:
-        """Execute a capability within the given state context using LLM if available."""
+        """Execute a capability within the given state context.
+
+        For implementation roles (coder, test_engineer, reviewer) with an
+        agent_provider set, delegates to the external agent.  Otherwise uses
+        the LLM provider for decision-making tasks.
+        """
+        # Implementation roles with agent provider: delegate to external agent
+        if (self._agent_provider
+                and self.role in self.IMPLEMENTATION_ROLES
+                and self._agent_provider.enabled):
+            prompt = self._build_prompt(state, capability, **kwargs)
+            workdir = kwargs.pop("workdir", None) or state.get("variables", {}).get("workdir")
+            agent_result: AgentResult = self._agent_provider.execute(
+                prompt, workdir=workdir, **kwargs,
+            )
+            return self._parse_agent_result(agent_result, capability)
+
+        # Decision-making roles or no agent provider: use LLM directly
         if self._llm_provider:
             prompt = self._build_prompt(state, capability, **kwargs)
             response = self._llm_provider.generate(prompt)
@@ -115,6 +153,19 @@ Provide your response:"""
     def _parse_response(self, response: str, capability: str) -> dict[str, Any]:
         """Parse LLM response into structured result."""
         return {"type": capability, "result": response, "from_role": self.role}
+
+    def _parse_agent_result(self, result: AgentResult, capability: str) -> dict[str, Any]:
+        """Parse AgentResult into the standard swarm result dict."""
+        return {
+            "type": capability,
+            "result": result.output,
+            "from_role": self.role,
+            "success": result.success,
+            "exit_code": result.exit_code,
+            "files_changed": result.files_changed,
+            "error": result.error,
+            "metadata": result.metadata,
+        }
 
     def _execute_stub(self, state: SpineState, capability: str, **kwargs) -> dict[str, Any]:
         """Fallback stub execution when no LLM is available."""

@@ -644,18 +644,19 @@ class TestSDDWorkflow:
         assert len(plan_phase.subphases) == 2
 
     def test_sdd_implement_phase_details(self):
-        """IMPLEMENT phase has core + integration subphases."""
+        """IMPLEMENT phase creates subphases from FeatureSlices."""
         sdd = SDDWorkflow()
         sdd.create_project("sdd-proj", "Test")
         sdd.execute()
         impl_phase = sdd.hierarchy_engine.find_node(sdd.project, "implement")
         assert impl_phase is not None
         assert impl_phase.name == "Implementation"
-        assert len(impl_phase.subphases) == 2
+        # Low complexity "Test" produces 2 heuristic slices
+        assert len(impl_phase.subphases) >= 1
 
-        core_sp = impl_phase.subphases[0]
-        assert core_sp.name == "Core Implementation"
-        assert core_sp.parallel  # parallel-capable
+        # Each subphase is a FeatureSlice (id starts with impl-)
+        for sp in impl_phase.subphases:
+            assert sp.id.startswith("impl-")
 
     def test_sdd_review_phase_details(self):
         """REVIEW phase has code review + gate execution."""
@@ -787,7 +788,7 @@ class TestQuickWorkflow:
         assert progress.percent_complete == 100.0
 
     def test_qw_plan_phase(self):
-        """Quick Plan phase has single subphase with 3 tasks."""
+        """Quick Plan phase has single subphase with 2 tasks (assess + slice)."""
         qw = QuickWorkflow()
         qw.create_project("qw-proj", "Test")
         qw.execute()
@@ -798,7 +799,7 @@ class TestQuickWorkflow:
 
         sp = plan_phase.subphases[0]
         assert sp.name == "Planning"
-        assert len(sp.tasks) == 3
+        assert len(sp.tasks) == 2
 
     def test_qw_implement_phase(self):
         """Quick Implement phase has single subphase."""

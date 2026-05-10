@@ -19,12 +19,14 @@ from ..models.types import (
     SubPhaseNode,
     TaskNode,
     HierarchyProgress,
+    FeatureSlice,
 )
 from ..core.hierarchy import (
     RalphLoopEngine,
     HierarchyValidator,
 )
 from ..core.constants import PhaseName
+from ..providers.agents import AgentProvider
 
 if TYPE_CHECKING:
     from ..core.state_machine import SpineStateMachine
@@ -194,6 +196,7 @@ class WorkflowEngine:
         state_machine: Optional["SpineStateMachine"] = None,
         worktree_manager: Optional["WorktreeManager"] = None,
         gates: Optional[List["SwarmGate"]] = None,
+        agent_provider: Optional[Any] = None,
     ):
         """Initialize the workflow engine.
 
@@ -201,6 +204,8 @@ class WorkflowEngine:
             state_machine: Optional SpineStateMachine for persistence.
             worktree_manager: Optional WorktreeManager for parallel execution.
             gates: Optional list of swarm gates for verification.
+            agent_provider: Optional AgentProvider for delegating implementation
+                work to external coding agents (OpenCode, Codex, Claude Code).
         """
         self.hierarchy_engine = RalphLoopEngine()
         self.transition_manager = self.hierarchy_engine.transition_manager
@@ -210,6 +215,7 @@ class WorkflowEngine:
         self._state_machine = state_machine
         self._worktree_manager = worktree_manager
         self._gates = gates or []
+        self._agent_provider = agent_provider
         self._context = WorkflowContext()
         self._project: Optional[ProjectNode] = None
         self._phases: List[str] = list(self.DEFAULT_PHASES)
@@ -589,6 +595,7 @@ class WorkflowEngine:
                 variables=self._context.variables,
                 errors=list(self._errors),
                 providers={},
+                agent_provider=None,
                 critic_gate_result=None,
                 error_state=None,
                 error_history=[],

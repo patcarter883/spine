@@ -17,6 +17,7 @@ Integrates:
 
 from __future__ import annotations
 
+import os
 from typing import Optional, List, TYPE_CHECKING
 
 from .engine import (
@@ -230,57 +231,66 @@ class SDDWorkflow(WorkflowEngine):
     def _build_plan_phase(self) -> PhaseNode:
         """Build and execute the PLAN phase.
 
-        PLAN phase tasks:
-        - Task decomposition into SubPhaseNodes with TaskNodes
-        - Dependency mapping between tasks
-        - Task priority and assignment
+        Produces FeatureSlice objects -- architectural boundaries for
+        agent delegation.  The agent owns implementation details within
+        each slice; the planner owns the dependency DAG.
         """
+        from ..models.types import FeatureSlice
+        from ..models.dag import synthesize_slices
+
         phase = self.create_phase_node(
             WorkflowPhase.PLAN, "Planning",
         )
         self.start_phase(WorkflowPhase.PLAN)
 
-        # Subphase: Decomposition
+        # Subphase: Decomposition into FeatureSlices
         sp_decomp = self.create_subphase_node(
-            "plan-decomposition", "Task Decomposition",
+            "plan-decomposition", "Feature Decomposition",
             parent_phase=phase, parallel=False,
         )
 
-        tasks_decomp = [
-            ("plan-breakdown", "Break down work into tasks"),
-            ("plan-dependencies", "Map task dependencies"),
-            ("plan-priorities", "Assign task priorities"),
-        ]
-        for tid, tname in tasks_decomp:
-            self.create_task_node(tid, tname, parent_subphase=sp_decomp)
+        # Use synthesize_slices to produce feature-scope work units
+        context_dict = self._context.to_dict()
+        slices = synthesize_slices(
+            self._context.requirement,
+            context_dict,
+            llm_provider=None,  # TODO: wire LLM provider
+        )
 
-        # Subphase: Resource Planning
-        sp_resources = self.create_subphase_node(
-            "plan-resources", "Resource Planning",
+        # Create a task node per slice for hierarchy tracking
+        for s in slices:
+            self.create_task_node(
+                f"plan-{s.id}",
+                f"Plan slice: {s.description}",
+                parent_subphase=sp_decomp,
+            )
+
+        # Subphase: Dependency Validation
+        sp_deps = self.create_subphase_node(
+            "plan-dependencies", "Dependency Validation",
             parent_phase=phase, parallel=False,
         )
 
-        tasks_res = [
-            ("plan-estimate", "Estimate task effort"),
-            ("plan-assign", "Assign tasks to implementation subphases"),
-            ("plan-schedule", "Create execution schedule"),
+        tasks_deps = [
+            ("plan-validate-deps", "Validate slice dependency DAG"),
+            ("plan-priorities", "Assign execution priorities"),
         ]
-        for tid, tname in tasks_res:
-            self.create_task_node(tid, tname, parent_subphase=sp_resources)
+        for tid, tname in tasks_deps:
+            self.create_task_node(tid, tname, parent_subphase=sp_deps)
 
         # Execute all tasks
         self._execute_subphase_tasks(sp_decomp)
-        self._execute_subphase_tasks(sp_resources)
+        self._execute_subphase_tasks(sp_deps)
         self.check_and_auto_complete_subphases(phase)
         self.auto_complete(phase)
 
-        # Build the implementation plan with concrete tasks
+        # Store both feature_slices and implementation_tasks in plan
+        # (implementation_tasks kept for backward compatibility)
         if self._context.plan:
+            self._context.plan["feature_slices"] = [s.to_dict() for s in slices]
             self._context.plan["implementation_tasks"] = [
-                {"id": "impl-core", "description": "Implement core logic"},
-                {"id": "impl-models", "description": "Implement data models"},
-                {"id": "impl-errors", "description": "Implement error handling"},
-                {"id": "impl-edge", "description": "Implement edge cases"},
+                {"id": s.id, "description": s.description}
+                for s in slices
             ]
 
         return phase
@@ -290,54 +300,67 @@ class SDDWorkflow(WorkflowEngine):
     def _build_implement_phase(self) -> PhaseNode:
         """Build and execute the IMPLEMENT phase.
 
-        IMPLEMENT phase tasks:
-        - Execute tasks in parallel worktrees
-        - Coordinate worktree creation and cleanup
-        - Track implementation progress
+        Creates one SubPhaseNode per FeatureSlice (from the plan).
+        When agent_provider is available, delegates implementation to
+        the external coding agent.  Otherwise falls back to stub execution.
         """
+        from ..models.types import FeatureSlice
+
         phase = self.create_phase_node(
             WorkflowPhase.IMPLEMENT, "Implementation",
         )
         self.start_phase(WorkflowPhase.IMPLEMENT)
 
-        # Subphase: Core Implementation (parallel capable)
-        sp_core = self.create_subphase_node(
-            "implement-core", "Core Implementation",
-            parent_phase=phase, parallel=True,
-        )
+        # Get FeatureSlices from plan (or fall back to implementation_tasks)
+        feature_slices = []
+        if self._context.plan:
+            raw_slices = self._context.plan.get("feature_slices", [])
+            if raw_slices:
+                feature_slices = [FeatureSlice.from_dict(s) for s in raw_slices]
 
-        impl_tasks = self._context.plan.get("implementation_tasks", []) if self._context.plan else []
-        if not impl_tasks:
-            impl_tasks = [
-                {"id": "impl-core", "description": "Implement core logic"},
-                {"id": "impl-models", "description": "Implement data models"},
+        # If no feature slices, create a default one from the requirement
+        if not feature_slices:
+            feature_slices = [
+                FeatureSlice(
+                    id="impl-default",
+                    description=self._context.requirement,
+                    scope=["."],
+                    agent_role="coder",
+                    acceptance=["Implementation matches requirement"],
+                ),
             ]
 
-        for task_def in impl_tasks:
+        # Create one SubPhaseNode per FeatureSlice
+        for s in feature_slices:
+            sp = self.create_subphase_node(
+                f"impl-{s.id}",
+                s.description,
+                parent_phase=phase,
+                parallel=len(s.depends_on) == 0,  # Independent slices can be parallel
+            )
+            # Create a single task for the slice -- the agent decomposes internally
             self.create_task_node(
-                task_def["id"], task_def["description"],
-                parent_subphase=sp_core,
+                f"impl-{s.id}-exec",
+                s.description,
+                parent_subphase=sp,
             )
 
-        # Subphase: Integration
-        sp_integration = self.create_subphase_node(
-            "implement-integration", "Integration",
-            parent_phase=phase, parallel=False,
-        )
+        # Execute: delegate to agent_provider when available
+        for s in feature_slices:
+            sp_node = None
+            for ph in phase.subphases if hasattr(phase, 'subphases') else []:
+                if ph.id == f"impl-{s.id}":
+                    sp_node = ph
+                    break
 
-        tasks_int = [
-            ("impl-integrate", "Integrate all components"),
-            ("impl-wire", "Wire dependencies and configurations"),
-        ]
-        for tid, tname in tasks_int:
-            self.create_task_node(tid, tname, parent_subphase=sp_integration)
-
-        # Execute tasks - core tasks in worktrees if available
-        if self._worktree_manager:
-            self._execute_tasks_in_worktrees(sp_core)
-        else:
-            self._execute_subphase_tasks(sp_core)
-        self._execute_subphase_tasks(sp_integration)
+            if self._agent_provider and self._agent_provider.enabled:
+                self._execute_feature_slice(s, sp_node)
+            elif self._worktree_manager:
+                if sp_node:
+                    self._execute_tasks_in_worktrees(sp_node)
+            else:
+                if sp_node:
+                    self._execute_subphase_tasks(sp_node)
 
         self.check_and_auto_complete_subphases(phase)
         self.auto_complete(phase)
@@ -456,7 +479,7 @@ class SDDWorkflow(WorkflowEngine):
     def _execute_subphase_tasks(self, sp: SubPhaseNode) -> None:
         """Execute all tasks in a subphase (synchronous stub).
 
-        Transitions each task from PENDING → RUNNING → SUCCESS.
+        Transitions each task from PENDING -> RUNNING -> SUCCESS.
 
         Args:
             sp: The subphase whose tasks to execute.
@@ -468,6 +491,81 @@ class SDDWorkflow(WorkflowEngine):
             task.result = f"Completed: {task.name}"
             self.transition_node(task, NodeStatus.SUCCESS)
         self.auto_complete(sp)
+
+    def _execute_feature_slice(
+        self,
+        slice: "FeatureSlice",
+        sp_node: Optional[SubPhaseNode] = None,
+    ) -> None:
+        """Execute a FeatureSlice using the agent_provider.
+
+        Delegates the full slice description to the external coding agent
+        (OpenCode, Codex, Claude Code).  The agent owns the internal
+        decomposition -- which files to touch, in what order.
+
+        Args:
+            slice: The FeatureSlice to execute.
+            sp_node: Optional SubPhaseNode for hierarchy tracking.
+        """
+        from ..models.types import FeatureSlice
+
+        if sp_node:
+            self.transition_node(sp_node, NodeStatus.RUNNING)
+
+        # Build the agent prompt from the full slice context
+        prompt_parts = [
+            f"Implement the following feature:\n\n{slice.description}",
+        ]
+        if slice.scope:
+            prompt_parts.append(
+                f"\nScope (work within these directories): {', '.join(slice.scope)}"
+            )
+        if slice.acceptance:
+            prompt_parts.append(
+                f"\nAcceptance criteria:\n"
+                + "\n".join(f"  - {c}" for c in slice.acceptance)
+            )
+        if slice.depends_on:
+            prompt_parts.append(
+                f"\nThis depends on: {', '.join(slice.depends_on)}"
+            )
+
+        prompt = "\n".join(prompt_parts)
+
+        # Execute via agent provider
+        try:
+            result = self._agent_provider.execute(
+                prompt,
+                workdir=os.getcwd() if self._worktree_manager is None else None,
+                files=slice.scope if slice.scope else None,
+                timeout=300,
+            )
+
+            # Update hierarchy nodes
+            if sp_node:
+                for task in sp_node.tasks:
+                    self.transition_node(task, NodeStatus.RUNNING)
+                    task.progress = 100.0
+                    task.result = result.output[:500] if result.output else "Completed"
+                    if result.success:
+                        self.transition_node(task, NodeStatus.SUCCESS)
+                    else:
+                        task.error = result.error
+                        self.transition_node(task, NodeStatus.FAILED)
+
+                if result.success:
+                    self.auto_complete(sp_node)
+                else:
+                    self._errors.append(
+                        f"Slice {slice.id} failed: {result.error}"
+                    )
+
+        except Exception as e:
+            self._errors.append(f"Slice {slice.id} agent error: {e}")
+            if sp_node:
+                for task in sp_node.tasks:
+                    task.error = str(e)
+                    self.transition_node(task, NodeStatus.FAILED)
 
     def _execute_tasks_in_worktrees(self, sp: SubPhaseNode) -> None:
         """Execute tasks using parallel worktrees.

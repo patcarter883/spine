@@ -102,10 +102,11 @@ class QuickWorkflow(WorkflowEngine):
     def _build_plan_phase(self) -> PhaseNode:
         """Build and execute the Quick PLAN phase.
 
-        Quick planning:
-        - Single subphase with minimal planning tasks
-        - Direct task list creation
+        Quick planning produces a single FeatureSlice for the whole
+        requirement -- the agent handles internal decomposition.
         """
+        from ..models.types import FeatureSlice
+
         phase = self.create_phase_node(
             WorkflowPhase.PLAN, "Quick Plan",
         )
@@ -118,8 +119,7 @@ class QuickWorkflow(WorkflowEngine):
 
         tasks = [
             ("quick-assess", "Quickly assess the requirement"),
-            ("quick-breakdown", "Break down into minimal tasks"),
-            ("quick-plan-done", "Confirm plan completeness"),
+            ("quick-slice", "Define feature slice for implementation"),
         ]
         for tid, tname in tasks:
             self.create_task_node(tid, tname, parent_subphase=sp)
@@ -127,13 +127,22 @@ class QuickWorkflow(WorkflowEngine):
         self._execute_subphase_tasks(sp)
         self.auto_complete(phase)
 
-        # Build quick plan
+        # Build quick plan with a single feature slice
+        default_slice = FeatureSlice(
+            id="quick-impl",
+            description=self._context.requirement,
+            scope=["."],
+            agent_role="coder",
+            acceptance=["Feature works as described"],
+        )
+
         self._context.plan = {
             "requirement": self._context.requirement,
             "approach": "quick-work",
             "phases": ["PLAN", "IMPLEMENT", "VERIFY"],
+            "feature_slices": [default_slice.to_dict()],
             "implementation_tasks": [
-                {"id": "quick-impl", "description": "Implement required changes"},
+                {"id": default_slice.id, "description": default_slice.description},
             ],
         }
 
@@ -144,31 +153,48 @@ class QuickWorkflow(WorkflowEngine):
     def _build_implement_phase(self) -> PhaseNode:
         """Build and execute the Quick IMPLEMENT phase.
 
-        Single subphase with direct task execution.
+        Single FeatureSlice execution.  When agent_provider is available,
+        delegates to the external coding agent.
         """
+        from ..models.types import FeatureSlice
+
         phase = self.create_phase_node(
             WorkflowPhase.IMPLEMENT, "Quick Implementation",
         )
         self.start_phase(WorkflowPhase.IMPLEMENT)
 
+        # Get feature slice from plan
+        feature_slice = None
+        if self._context.plan:
+            raw_slices = self._context.plan.get("feature_slices", [])
+            if raw_slices:
+                feature_slice = FeatureSlice.from_dict(raw_slices[0])
+
+        if not feature_slice:
+            feature_slice = FeatureSlice(
+                id="quick-impl",
+                description=self._context.requirement,
+                scope=["."],
+                agent_role="coder",
+                acceptance=["Implementation matches requirement"],
+            )
+
         sp = self.create_subphase_node(
-            "quick-impl-tasks", "Implementation",
+            f"impl-{feature_slice.id}", "Implementation",
             parent_phase=phase, parallel=False,
         )
 
-        impl_tasks = self._context.plan.get("implementation_tasks", []) if self._context.plan else []
-        if not impl_tasks:
-            impl_tasks = [
-                {"id": "quick-impl", "description": "Implement required changes"},
-            ]
+        self.create_task_node(
+            f"impl-{feature_slice.id}-exec",
+            feature_slice.description,
+            parent_subphase=sp,
+        )
 
-        for task_def in impl_tasks:
-            self.create_task_node(
-                task_def["id"], task_def["description"],
-                parent_subphase=sp,
-            )
-
-        self._execute_subphase_tasks(sp)
+        # Execute via agent_provider when available
+        if self._agent_provider and self._agent_provider.enabled:
+            self._execute_feature_slice(feature_slice, sp)
+        else:
+            self._execute_subphase_tasks(sp)
         self.auto_complete(phase)
 
         return phase
@@ -224,6 +250,60 @@ class QuickWorkflow(WorkflowEngine):
             task.result = f"Completed: {task.name}"
             self.transition_node(task, NodeStatus.SUCCESS)
         self.auto_complete(sp)
+
+    def _execute_feature_slice(
+        self,
+        slice: "FeatureSlice",
+        sp_node: Optional[SubPhaseNode] = None,
+    ) -> None:
+        """Execute a FeatureSlice using the agent_provider.
+
+        Args:
+            slice: The FeatureSlice to execute.
+            sp_node: Optional SubPhaseNode for hierarchy tracking.
+        """
+        import os
+        from ..models.types import FeatureSlice
+
+        if sp_node:
+            self.transition_node(sp_node, NodeStatus.RUNNING)
+
+        prompt = f"Implement the following feature:\n\n{slice.description}"
+        if slice.scope:
+            prompt += f"\n\nScope: {', '.join(slice.scope)}"
+        if slice.acceptance:
+            prompt += "\n\nAcceptance criteria:\n" + "\n".join(f"  - {c}" for c in slice.acceptance)
+
+        try:
+            result = self._agent_provider.execute(
+                prompt,
+                workdir=os.getcwd(),
+                files=slice.scope if slice.scope else None,
+                timeout=300,
+            )
+
+            if sp_node:
+                for task in sp_node.tasks:
+                    self.transition_node(task, NodeStatus.RUNNING)
+                    task.progress = 100.0
+                    task.result = result.output[:500] if result.output else "Completed"
+                    if result.success:
+                        self.transition_node(task, NodeStatus.SUCCESS)
+                    else:
+                        task.error = result.error
+                        self.transition_node(task, NodeStatus.FAILED)
+
+                if result.success:
+                    self.auto_complete(sp_node)
+                else:
+                    self._errors.append(f"Slice {slice.id} failed: {result.error}")
+
+        except Exception as e:
+            self._errors.append(f"Slice {slice.id} agent error: {e}")
+            if sp_node:
+                for task in sp_node.tasks:
+                    task.error = str(e)
+                    self.transition_node(task, NodeStatus.FAILED)
 
 
 __all__ = [
