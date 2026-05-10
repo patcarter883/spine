@@ -1338,7 +1338,7 @@ class SpineStateMachine:
         
         return workflow.compile(checkpointer=self._checkpointer)
     
-    def run(self, requirement: str, thread_id: str = "default") -> SpineState:
+    def run(self, requirement: str, thread_id: str) -> SpineState:
         """Execute the full SPINE workflow."""
         # Build providers dict for state
         providers = {
@@ -1389,7 +1389,7 @@ class SpineStateMachine:
         """Replay swarm events from a given position."""
         return self._swarm_mail.replay_from(position=position, **kwargs)
     
-    def resume(self, thread_id: str = "default") -> Optional[SpineState]:
+    def resume(self, thread_id: str) -> Optional[SpineState]:
         """Resume a previous workflow."""
         state = self.app.get_state({"configurable": {"thread_id": thread_id}})
         if state and "values" in state:

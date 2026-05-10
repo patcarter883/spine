@@ -2,19 +2,19 @@
 
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import click
 import yaml
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
-from rich.table import Table
 
-from .core import SpineStateMachine
-from .providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
-from .providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
-from . import __version__
-from .providers.agents import create_agent_provider
+from spine.core import SpineStateMachine
+from spine.providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
+from spine.providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
+from spine import __version__
+from spine.providers.agents import create_agent_provider
 
 
 console = Console()
@@ -278,12 +278,14 @@ def _print_phase_progress(phase_name: str, state: dict) -> None:
 
 @cli.command()
 @click.argument("requirement")
-@click.option("--thread-id", "-t", default="default", help="Thread ID for persistence")
+@click.option("--thread-id", "-t", default=None, help="Thread ID for persistence (auto-generated UUID if omitted)")
 @click.option("--checkpoint", "-c", default=".spine/spine.db", help="Checkpoint database path")
 @click.option("--config", "-f", default=".spine/config.yaml", help="Config file path")
 @click.option("--debug-prompts", "-d", is_flag=True, help="Print prompts sent to agents to console")
-def work(requirement: str, thread_id: str, checkpoint: str, config: str, debug_prompts: bool):
+def work(requirement: str, thread_id: str | None, checkpoint: str, config: str, debug_prompts: bool):
     """Start a new work item."""
+    if thread_id is None:
+        thread_id = str(uuid.uuid4())
     console.print(f"[bold blue]SPINE[/] [dim]|[/] [bold]Starting work:[/] {requirement}")
     
     # Load providers from config
@@ -382,11 +384,20 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str, debug_p
 
 
 @cli.command()
-@click.option("--thread-id", "-t", default="default", help="Thread ID to resume")
+@click.option("--thread-id", "-t", default=None, help="Thread ID to resume")
 @click.option("--checkpoint", "-c", default=".spine/spine.db", help="Checkpoint database path")
 @click.option("--config", "-f", default=".spine/config.yaml", help="Config file path")
-def resume(thread_id: str, checkpoint: str, config: str):
+def resume(thread_id: str | None, checkpoint: str, config: str):
     """Resume a previous work item."""
+    if thread_id is None:
+        from spine.ui.utils import get_active_work_items
+        items = get_active_work_items(checkpoint_path=checkpoint)
+        if not items:
+            console.print("[yellow]No active workflows found to resume.[/]")
+            return
+        thread_id = items[0]["thread_id"]
+        console.print(f"[dim]Resuming most recent workflow: {thread_id}[/]")
+    
     # Load providers from config
     providers_by_type = load_providers(config)
     llm_provider = get_primary_provider(providers_by_type, "llm")
@@ -398,7 +409,7 @@ def resume(thread_id: str, checkpoint: str, config: str):
     state = machine.resume(thread_id)
     
     if state:
-        console.print(f"[bold green]Resumed phase:[/] {state['phase']}")
+        console.print(f"[bold green]Resumed phase:[/] {state.get('phase', 'UNKNOWN')}")
         console.print(f"[bold green]Completed tasks:[/] {len(state.get('completed_tasks', []))}")
     else:
         console.print("[yellow]No state found to resume.[/]")
@@ -410,15 +421,11 @@ def status(checkpoint: str):
     """Show current workflow status."""
     console.print("[bold]SPINE Status[/]")
     
-    # In production, would query checkpoint database
-    table = Table(title="Active Workflows")
-    table.add_column("Thread ID", style="cyan")
-    table.add_column("Phase", style="green")
-    table.add_column("Tasks", style="yellow")
+    from .commands.status import get_threads
+    from .renderers.status_renderer import render_threads
     
-    table.add_row("default", "COMPLETE", "10")
-    
-    console.print(table)
+    threads = get_threads(checkpoint)
+    render_threads(threads, console)
 
 
 @cli.command()
@@ -627,7 +634,7 @@ def plugins(config: str):
     
     Discovers providers from spine-plugin.yaml manifests in plugin directories.
     """
-    from .providers.base import PluginLoader
+    from spine.providers.base import PluginLoader
     
     loader = PluginLoader()
     loader.discover_plugins()
@@ -647,7 +654,7 @@ def plugins(config: str):
 @cli.command()
 def hello():
     """Print a greeting with the current SPINE version."""
-    from . import __version__
+    from spine import __version__
     console.print(f"[bold green]Hello! Welcome to Spine v{__version__}[/]")
 
 

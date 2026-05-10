@@ -4,7 +4,7 @@ providers:
   llm:
   - name: cloud
     type: openrouter
-    model: inclusionai/ring-2.6-1t:free
+    model: openrouter/free
     api_key: ${OPENROUTER_API_KEY}
     base_url: https://openrouter.ai/api/v1
     priority: 0
@@ -21,6 +21,6 @@ providers:
           type: opencode
           config:
             mode: acp
-            model: openrouter/inclusionai/ring-2.6-1t:free
+            model: vllm/model
             auto_approve: true
 

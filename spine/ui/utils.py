@@ -130,27 +130,21 @@ def _get_langgraph_thread_ids(checkpoint_path: Path) -> list[str]:
         checkpoint_path: Path to the checkpoint SQLite database.
 
     Returns:
-        List of thread ID strings.
+        List of thread ID strings (empty list if none found).
     """
     if not checkpoint_path.exists():
-        return ["default"]
+        return []
 
     thread_ids: list[str] = []
     try:
         conn = sqlite3.connect(str(checkpoint_path))
         cursor = conn.cursor()
 
-        # LangGraph stores data in tables like:
-        # - checkpoint_blobs: stores state blobs keyed by thread_id, ts
-        # - checkpoint_writes: stores intermediate writes
-        # - checkpoints: stores checkpoint metadata
-        # - metadata: stores table metadata
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in cursor.fetchall()]
 
         for table in tables:
             try:
-                # Try to find thread_id column
                 cursor.execute(f"PRAGMA table_info({table})")
                 columns = [col[1] for col in cursor.fetchall()]
                 if "thread_id" in columns:
@@ -166,17 +160,17 @@ def _get_langgraph_thread_ids(checkpoint_path: Path) -> list[str]:
     except Exception:
         pass
 
-    return thread_ids if thread_ids else ["default"]
+    return thread_ids
 
 
 def get_latest_checkpoint(
-    thread_id: str = "default",
+    thread_id: str,
     checkpoint_path: Optional[str] = None,
 ) -> Optional[dict]:
     """Read the latest checkpoint for a thread from the LangGraph checkpoint store.
 
     Args:
-        thread_id: Thread ID to read.
+        thread_id: Thread ID to read (required).
         checkpoint_path: Explicit checkpoint path, or None to read from config.
 
     Returns:
@@ -291,13 +285,13 @@ def get_active_work_items(checkpoint_path: Optional[str] = None) -> list[dict]:
 
 
 def get_work_item_detail(
-    thread_id: str = "default",
+    thread_id: str,
     checkpoint_path: Optional[str] = None,
 ) -> Optional[dict]:
     """Load full state from the latest checkpoint for a work item.
 
     Args:
-        thread_id: Thread ID to read.
+        thread_id: Thread ID to read (required).
         checkpoint_path: Explicit checkpoint path, or None to read from config.
 
     Returns:

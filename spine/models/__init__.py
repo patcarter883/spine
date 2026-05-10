@@ -25,6 +25,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4"
 from .enums import PhaseName, StateStatus, SubPhaseStatus
 from .types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState
 from .dag import SwarmDAGExecutor
+from .thread import Thread, generate_thread_id
 
 __all__ = [
     # LLM models
@@ -45,4 +46,7 @@ __all__ = [
     "SpineState",
     # Data models - dag
     "SwarmDAGExecutor",
+    # Data models - thread
+    "Thread",
+    "generate_thread_id",
 ]
