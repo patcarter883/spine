@@ -4,17 +4,17 @@ providers:
   llm:
   - name: cloud
     type: openrouter
-    model: qwen3:32b
-    api_key: ''
+    model: inclusionai/ring-2.6-1t:free
+    api_key: ${OPENROUTER_API_KEY}
     base_url: https://openrouter.ai/api/v1
-    priority: 1
+    priority: 0
     enabled: true
   - name: local
     type: local-openai
     model: model
     api_key: 'vllm'
     base_url: http://localhost:8000/v1
-    priority: 0
+    priority: 1
     enabled: true
   agent:
         - name: default
