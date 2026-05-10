@@ -10,3 +10,5 @@ __pycahche__/
 *.egg-info/
 dist/
 build/
+*.db-shm
+*.db-wal
