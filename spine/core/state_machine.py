@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Literal, Optional, Any, Iterator, Dict, List
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+import sqlite3
+
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.serde.base import SerializerProtocol
 import orjson
 import os
@@ -1164,9 +1166,10 @@ def should_continue(state: SpineState) -> Literal["planning", "execution", "veri
 
 def create_spine_workflow(checkpoint_path: str = ".spine/spine.db"):
     """Create the SPINE workflow with LangGraph StateGraph."""
-    # Use MemorySaver with custom serializer for provider objects
+    # Use SqliteSaver with custom serializer for provider objects
     serializer = ProviderSerializer()
-    memory = MemorySaver(serde=serializer)
+    conn = sqlite3.connect(checkpoint_path)
+    memory = SqliteSaver(conn=conn, serde=serializer)
     
     # Build the state graph
     workflow = StateGraph(SpineState)
@@ -1243,9 +1246,12 @@ class SpineStateMachine:
         """
         import os
         from ..swarm.mail import SwarmMail, ResourceManager
-        
+
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        self._checkpointer = MemorySaver(serde=ProviderSerializer())
+        self._checkpointer = SqliteSaver(
+            conn=sqlite3.connect(str(checkpoint_path)),
+            serde=ProviderSerializer(),
+        )
         self.checkpoint_path = checkpoint_path
         
         # Store providers

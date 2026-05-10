@@ -4,6 +4,7 @@ import os
 import json
 import sqlite3
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -429,6 +430,9 @@ def start_work(
         if provider_list:
             providers_dict[category] = provider_list[0][1]
 
+    thread_id = str(uuid.uuid4())
+    checkpoint_path_str = checkpoint_path or ".spine/spine.db"
+
     initial_state = {
         "phase": "INIT",
         "previous_phase": None,
@@ -441,9 +445,9 @@ def start_work(
         "hive_cells": {},
         "swarm_events": [],
         "variables": {
-            "thread_id": "default",
-            "work_item_id": "default",
-            "checkpoint_path": checkpoint_path or ".spine/spine.db",
+            "thread_id": thread_id,
+            "work_item_id": thread_id,
+            "checkpoint_path": checkpoint_path_str,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
         "errors": [],
@@ -456,9 +460,9 @@ def start_work(
     try:
         result = machine.app.invoke(
             initial_state,
-            {"configurable": {"thread_id": "default"}},
+            {"configurable": {"thread_id": thread_id}},
         )
-        return {"thread_id": "default"}
+        return {"thread_id": thread_id}
     except Exception as e:
         print(f"[spine.ui.utils] Failed to start work: {e}")
         return None
