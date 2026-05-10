@@ -10,6 +10,7 @@ from ..providers.llm import LLMProvider
 from ..providers.memory import MemoryProvider
 from ..providers.storage import StorageProvider, FileWriteGuard
 from ..providers.tools import ToolsProvider
+from ..providers.agents import AgentProvider
 from ..core.persistence import GitWorkflow
 from ..models.enums import SubPhaseStatus
 
@@ -316,6 +317,7 @@ class SwarmDAGExecutor:
         tools_provider: Optional[ToolsProvider] = None,
         file_write_guard: Optional[FileWriteGuard] = None,
         git_workflow: Optional[GitWorkflow] = None,
+        agent_provider: Optional[AgentProvider] = None,
         resource_quota: Optional[ResourceQuota] = None,
     ):
         """Initialize with optional providers for agent execution.
@@ -328,6 +330,7 @@ class SwarmDAGExecutor:
             tools_provider: Tools provider for agent capabilities.
             file_write_guard: Guard for protected file writes.
             git_workflow: Git workflow for version control operations.
+            agent_provider: Agent provider for code execution (coder, test_engineer, reviewer).
             resource_quota: Resource limits for wave execution (optional).
         """
         self._llm_provider = llm_provider
@@ -336,6 +339,7 @@ class SwarmDAGExecutor:
         self._tools_provider = tools_provider
         self._file_write_guard = file_write_guard
         self._git_workflow = git_workflow
+        self._agent_provider = agent_provider
         # Resource configuration
         self._resource_quota = resource_quota or ResourceQuota()
         # Register stub templates
@@ -660,8 +664,12 @@ class SwarmDAGExecutor:
         """Execute a DAG by running its subphase tasks.
         
         When called with a SubPhase object, executes all tasks in that subphase
-        using the LLM provider chain. When called with a string (backwards compat),
-        returns a stub result.
+        using the LLM provider or agent provider chain. When called with a string 
+        (backwards compat), returns a stub result.
+
+        For implementation roles (coder, test_engineer, reviewer), delegates to 
+        agent_provider for actual code writing. For decision-making roles 
+        (explorer, sme, analyst, planner), uses LLM for analysis.
 
         Args:
             dag_or_name: A SubPhase object or a string subphase name
@@ -671,6 +679,10 @@ class SwarmDAGExecutor:
             Dict with task execution results, including status and error info.
         """
         from .enums import StateStatus
+        import os
+        
+        # Implementation roles that should use agent_provider for code writing
+        IMPLEMENTATION_ROLES = {"coder", "test_engineer", "reviewer"}
         
         # Get timeout from context or use default
         timeout = context.get("llm_timeout", 300.0) if context else 300.0
@@ -696,8 +708,29 @@ class SwarmDAGExecutor:
                 # Build task-specific prompt using agent role and task info
                 prompt = self._build_task_prompt(task, subphase, context)
                 
-                # Execute using LLM provider if available (with timeout)
-                if self._llm_provider and self._llm_provider.enabled:
+                # Determine if we should use agent_provider (for implementation roles)
+                is_implementation_role = subphase.agent_role in IMPLEMENTATION_ROLES
+                
+                if is_implementation_role and self._agent_provider and self._agent_provider.enabled:
+                    # Delegate to agent provider for actual code writing
+                    workdir = os.getcwd()
+                    agent_result = self._agent_provider.execute(prompt, workdir=workdir, timeout=timeout)
+                    
+                    # Store AgentResult metadata in task.result
+                    task.result = {
+                        "output": agent_result.output,
+                        "exit_code": agent_result.exit_code,
+                        "files_changed": agent_result.files_changed,
+                        "error": agent_result.error,
+                        "success": agent_result.success,
+                    }
+                    task.status = StateStatus.SUCCESS if agent_result.success else StateStatus.FAILED
+                    if not agent_result.success:
+                        task.error = agent_result.error or "Agent execution failed"
+                        errors.append(f"Task {task.id} agent failed: {agent_result.error}")
+                        all_succeeded = False
+                elif self._llm_provider and self._llm_provider.enabled:
+                    # Use LLM provider for decision-making roles or when no agent available
                     import inspect
                     sig = inspect.signature(self._llm_provider.generate)
                     if "timeout" in sig.parameters:
@@ -713,7 +746,7 @@ class SwarmDAGExecutor:
                     task.status = StateStatus.SUCCESS
                 
                 task_results[task.id] = {
-                    "status": "success",
+                    "status": "success" if task.status == StateStatus.SUCCESS else "failed",
                     "result": task.result
                 }
             except Exception as e:

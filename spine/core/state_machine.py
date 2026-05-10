@@ -278,6 +278,7 @@ def execution_phase(state: SpineState) -> SpineState:
     executor = SwarmDAGExecutor(
         llm_provider=llm_provider,
         storage_provider=storage_provider,
+        agent_provider=agent_provider,
     )
     
     # ── Build subphases from FeatureSlices (or fallback) ──────────

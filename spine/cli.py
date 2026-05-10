@@ -11,6 +11,7 @@ from rich.table import Table
 from .core import SpineStateMachine
 from .providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
 from .providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
+from .providers.agents import create_agent_provider
 
 
 console = Console()
@@ -74,6 +75,12 @@ def create_provider(cfg: ProviderConfig):
     """
     provider_type = cfg.type.lower()
     config = cfg.config.copy()
+    
+    # Agent Providers
+    if provider_type in ("opencode", "codex", "claude-code"):
+        instance = create_agent_provider(provider_type, config)
+        # Already configured by create_agent_provider, return early
+        return instance
     
     # LLM Providers
     if provider_type == "ollama":
@@ -279,11 +286,17 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str):
     # Load providers from config
     providers_by_type = load_providers(config)
     llm_provider = get_primary_provider(providers_by_type, "llm")
+    agent_provider = get_primary_provider(providers_by_type, "agent")
     
     if llm_provider:
         console.print(f"  [green]✓[/] LLM provider: [cyan]{llm_provider.name}[/]")
     else:
         console.print("  [yellow]⚠[/] No LLM provider configured, using stub mode")
+    
+    if agent_provider:
+        console.print(f"  [green]✓[/] Agent provider: [cyan]{agent_provider.name}[/]")
+    else:
+        console.print("  [yellow]⚠[/] No agent provider configured, using LLM for execution")
     
     machine = SpineStateMachine(
         checkpoint_path=checkpoint,
@@ -306,7 +319,7 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str):
             {"phase": "INIT", "requirement": requirement, "plan": None, "tasks": {},
              "completed_tasks": [], "failed_tasks": [], "swarm_state": {},
              "hive_cells": {}, "swarm_events": [], "variables": {},
-             "errors": [], "providers": providers_dict,
+             "errors": [], "providers": providers_dict, "agent_provider": agent_provider,
              "critic_gate_result": None, "error_state": None, "error_history": []},
             {"configurable": {"thread_id": thread_id}}
         )
