@@ -11,6 +11,7 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 import orjson
 import os
 import subprocess
+import ormsgpack
 from datetime import datetime, timezone
 
 from .constants import PhaseName, StateStatus, ErrorState
@@ -30,11 +31,22 @@ __all__ = [
 
 
 class ProviderSerializer(SerializerProtocol):
-    """Custom serializer that handles non-serializable provider objects."""
-    
+    """Custom serializer that handles non-serializable provider objects.
+
+    Extends the LangGraph JsonPlusSerializer format so that checkpoints
+    written by SqliteSaver (msgpack) can be read back correctly, while
+    still sanitising non-serialisable provider objects on write.
+    """
+
     def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
+        if obj is None:
+            return "null", b""
+        if isinstance(obj, bytes):
+            return "bytes", obj
+        if isinstance(obj, bytearray):
+            return "bytearray", obj
         try:
-            return "json", orjson.dumps(obj)
+            return "msgpack", ormsgpack.packb(obj)
         except TypeError:
             # Replace non-serializable objects with their string representation
             def sanitize(o):
@@ -45,12 +57,25 @@ class ProviderSerializer(SerializerProtocol):
                 elif isinstance(o, (list, tuple)):
                     return [sanitize(item) for item in o]
                 return o
-            return "json", orjson.dumps(sanitize(obj))
-    
+            return "msgpack", ormsgpack.packb(sanitize(obj))
+
     def loads_typed(self, b: tuple[str, bytes]) -> Any:
         fmt, data = b
+        if fmt == "null":
+            return None
+        if fmt == "bytes":
+            return data
+        if fmt == "bytearray":
+            return bytearray(data)
         if fmt == "json":
             return orjson.loads(data)
+        if fmt == "msgpack":
+            try:
+                return ormsgpack.unpackb(data)
+            except Exception:
+                # Fallback: old checkpoints may have been written with JSON
+                # but mislabeled as "msgpack" (a known agent-introduced bug)
+                return orjson.loads(data)
         raise ValueError(f"Unknown format: {fmt}")
 
 
@@ -1249,7 +1274,10 @@ class SpineStateMachine:
 
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         self._checkpointer = SqliteSaver(
-            conn=sqlite3.connect(str(checkpoint_path)),
+            conn=sqlite3.connect(
+                str(checkpoint_path),
+                check_same_thread=False,
+            ),
             serde=ProviderSerializer(),
         )
         self.checkpoint_path = checkpoint_path
@@ -1505,19 +1533,3 @@ class SpineStateMachine:
         engine.attach_state_machine(self)
         return engine
 
-    # --- Ralph Loop Integration ---
-
-    def create_hierarchy_engine(self) -> "RalphLoopEngine":
-        """Create a RalphLoopEngine attached to this state machine.
-        
-        The engine provides hierarchical Project→Phase→Subphase→Task
-        tracking with progress roll-up, state transitions, and
-        nested automation support.
-        
-        Returns:
-            A RalphLoopEngine configured with this state machine.
-        """
-        from .hierarchy import RalphLoopEngine
-        engine = RalphLoopEngine()
-        engine.attach_state_machine(self)
-        return engine
