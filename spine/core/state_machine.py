@@ -929,6 +929,14 @@ def should_continue(state: SpineState) -> Literal["planning", "execution", "veri
         else:
             return "planning"  # Return to PLANNING for revision
     elif phase == PhaseName.EXECUTION:
+        # If the execution phase just completed (previous_phase == EXECUTION or
+        # phase was set to VERIFICATION by the execution phase itself), go to
+        # verification. But if the planning phase just set phase=EXECUTION to
+        # signal that execution should run next, go to execution.
+        previous = state.get("previous_phase")
+        if previous == PhaseName.PLANNING:
+            # Planning phase just finished and signalled EXECUTION
+            return "execution"
         return "verification"
     elif phase == PhaseName.VERIFICATION:
         # Check if rework is needed due to failed tasks
