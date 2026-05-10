@@ -777,7 +777,40 @@ class SwarmDAGExecutor:
         }
 
     def _build_task_prompt(self, task: "Task", subphase: "SubPhase", context: dict) -> str:
-        """Build LLM prompt for task execution."""
+        """Build prompt for task execution.
+        
+        For implementation roles (coder, test_engineer, reviewer), the prompt is
+        a direct instruction suitable for an agent like opencode/codex.
+        For decision-making roles (explorer, sme, analyst, planner), the prompt
+        includes structured context for LLM text analysis.
+        """
+        requirement = context.get("requirement", "")
+        plan = context.get("plan", {})
+        plan_summary = ""
+        if isinstance(plan, dict):
+            # Extract task list from plan for context
+            plan_tasks = plan.get("tasks", [])
+            if plan_tasks:
+                task_descs = [f"  - {t.get('id', '?')}: {t.get('description', '?')}" for t in plan_tasks[:10]]
+                plan_summary = "\n".join(task_descs)
+        
+        # For implementation roles: direct, actionable instruction
+        if subphase.agent_role in ("coder", "test_engineer", "reviewer"):
+            parts = [f"You are a {subphase.agent_role} agent. Implement the following requirement:"]
+            if requirement:
+                parts.append(f"\n## Requirement\n{requirement}")
+            if task.description and task.description != requirement:
+                parts.append(f"\n## Specific Task\n{task.description}")
+            if plan_summary:
+                parts.append(f"\n## Plan Context\n{plan_summary}")
+            parts.append("\n## Instructions")
+            parts.append("- Read the relevant source files first to understand the existing code")
+            parts.append("- Make the minimal, focused changes needed to fulfill the requirement")
+            parts.append("- Follow the existing code style and patterns")
+            parts.append("- Write or update tests if applicable")
+            return "\n".join(parts)
+        
+        # For decision-making roles: structured context for LLM analysis
         dep_context_parts = []
         if context:
             for key, value in context.items():
