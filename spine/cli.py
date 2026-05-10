@@ -1,16 +1,19 @@
 """SPINE CLI - Command line interface."""
 
 import os
+import sys
 from pathlib import Path
 
 import click
 import yaml
 from rich.console import Console
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .core import SpineStateMachine
 from .providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
 from .providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
+from . import __version__
 from .providers.agents import create_agent_provider
 
 
@@ -396,8 +399,47 @@ def status(checkpoint: str):
 
 
 @cli.command()
-def init():
+@click.option("--force", "-f", is_flag=True, help="Reinitialise completely without prompting.")
+@click.option("--keep-config", "-k", is_flag=True, help="Reinitialise keeping existing config.yaml.")
+def init(force: bool, keep_config: bool):
     """Initialize SPINE in the current directory."""
+    spine_dir = Path(".spine")
+    
+    if spine_dir.exists():
+        if force:
+            console.print("[yellow].spine/ directory exists. Reinitialising completely (--force).[/]")
+            import shutil
+            shutil.rmtree(".spine")
+        elif keep_config:
+            console.print("[yellow].spine/ directory exists. Reinitialising keeping config (--keep-config).[/]")
+            config_backup = Path(".spine/config.yaml")
+            if config_backup.exists():
+                config_data = config_backup.read_text()
+            else:
+                config_data = None
+            import shutil
+            shutil.rmtree(".spine")
+        else:
+            console.print("[red].spine/ directory already exists.[/]")
+            choice = Prompt.ask(
+                "Choose an option",
+                choices=["reinit", "keep-config", "abort"],
+                default="abort",
+            )
+            if choice == "abort":
+                console.print("[dim]Aborted.[/]")
+                return
+            elif choice == "keep-config":
+                if config_backup.exists():
+                    config_data = config_backup.read_text()
+                else:
+                    config_data = None
+                import shutil
+                shutil.rmtree(".spine")
+            else:
+                import shutil
+                shutil.rmtree(".spine")
+    
     dirs = [
         ".spine",
         ".spine/spec",
@@ -412,6 +454,14 @@ def init():
     
     for d in dirs:
         os.makedirs(d, exist_ok=True)
+    
+    # Restore config if keep_config was used
+    if 'config_data' in locals() and config_data is not None:
+        with open(".spine/config.yaml", "w") as f:
+            f.write(config_data)
+        console.print("[bold green]SPINE reinitialised (config kept)![/]")
+        console.print("Directories recreated, existing config preserved")
+        return
     
     # Create default config
     config = """# SPINE Configuration
@@ -561,6 +611,13 @@ def plugins(config: str):
             console.print(f"  - {p}")
     else:
         console.print("[yellow]No plugins discovered[/]")
+
+
+@cli.command()
+def hello():
+    """Print a greeting with the current SPINE version."""
+    from . import __version__
+    console.print(f"[bold green]Hello! Welcome to Spine v{__version__}[/]")
 
 
 @cli.command()

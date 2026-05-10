@@ -20,7 +20,7 @@ providers:
         - name: default
           type: opencode
           config:
-            mode: run
-            model: vllm/model
+            mode: acp
+            model: openrouter/inclusionai/ring-2.6-1t:free
             auto_approve: true
 
