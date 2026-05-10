@@ -11,7 +11,6 @@ from rich.table import Table
 from .core import SpineStateMachine
 from .providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
 from .providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
-from .providers.agents import create_agent_provider
 
 
 console = Console()
@@ -75,12 +74,6 @@ def create_provider(cfg: ProviderConfig):
     """
     provider_type = cfg.type.lower()
     config = cfg.config.copy()
-    
-    # Agent Providers
-    if provider_type in ("opencode", "codex", "claude-code"):
-        instance = create_agent_provider(provider_type, config)
-        # Already configured by create_agent_provider, return early
-        return instance
     
     # LLM Providers
     if provider_type == "ollama":
@@ -286,17 +279,11 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str):
     # Load providers from config
     providers_by_type = load_providers(config)
     llm_provider = get_primary_provider(providers_by_type, "llm")
-    agent_provider = get_primary_provider(providers_by_type, "agent")
     
     if llm_provider:
         console.print(f"  [green]✓[/] LLM provider: [cyan]{llm_provider.name}[/]")
     else:
         console.print("  [yellow]⚠[/] No LLM provider configured, using stub mode")
-    
-    if agent_provider:
-        console.print(f"  [green]✓[/] Agent provider: [cyan]{agent_provider.name}[/]")
-    else:
-        console.print("  [yellow]⚠[/] No agent provider configured, using LLM for execution")
     
     machine = SpineStateMachine(
         checkpoint_path=checkpoint,
@@ -319,7 +306,7 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str):
             {"phase": "INIT", "requirement": requirement, "plan": None, "tasks": {},
              "completed_tasks": [], "failed_tasks": [], "swarm_state": {},
              "hive_cells": {}, "swarm_events": [], "variables": {},
-             "errors": [], "providers": providers_dict, "agent_provider": agent_provider,
+             "errors": [], "providers": providers_dict,
              "critic_gate_result": None, "error_state": None, "error_history": []},
             {"configurable": {"thread_id": thread_id}}
         )
@@ -392,59 +379,8 @@ def status(checkpoint: str):
 
 
 @cli.command()
-@click.option("--force", is_flag=True, help="Completely reinitialise Spine (overwrite everything)")
-@click.option("--keep-config", is_flag=True, help="Reinitialise but keep existing configuration settings")
-@click.option("--abort", is_flag=True, help="Do nothing and exit (no changes made)")
-def init(force: bool, keep_config: bool, abort: bool):
+def init():
     """Initialize SPINE in the current directory."""
-    spine_dir = Path(".spine")
-    already_initialised = spine_dir.is_dir()
-
-    # --- Non-interactive safeguard ---
-    if already_initialised and not sys.stdout.isatty():
-        console.print("[yellow]Spine is already initialised in this repository.[/]")
-        console.print("[yellow]Not a TTY — running non-interactively.[/]")
-        console.print("  Use [bold]--force[/]   to completely reinitialise")
-        console.print("  Use [bold]--keep-config[/] to reinitialise while preserving configuration")
-        console.print("  Use [bold]--abort[/]      to do nothing and exit")
-        raise SystemExit(10)
-
-    # --- Existing setup detection ---
-    if already_initialised:
-        console.print("[yellow]Spine is already initialised in this repository.[/]")
-
-        if abort:
-            console.print("[dim]No changes made.[/]")
-            raise SystemExit(0)
-
-        if force or keep_config:
-            # Flag-based path — proceed silently
-            pass
-        elif sys.stdout.isatty():
-            # Interactive TTY path — prompt user
-            console.print()
-            console.print("  How would you like to proceed?")
-            console.print("    [bold]1[/]  Completely reinitialise Spine (overwrite everything)")
-            console.print("    [bold]2[/]  Reinitialise but keep existing configuration settings")
-            console.print("    [bold]3[/]  Do nothing (exit)")
-            try:
-                choice = input("  Enter choice [1/2/3]: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                console.print("[dim]No changes made.[/]")
-                raise SystemExit(0)
-
-            if choice in ("1", ""):
-                force = True
-            elif choice == "2":
-                keep_config = True
-            else:
-                console.print("[dim]No changes made.[/]")
-                raise SystemExit(0)
-        else:
-            console.print("[yellow]Not a TTY — use --force, --keep-config, or --abort.[/]")
-            raise SystemExit(10)
-
-    # --- Build directory tree ---
     dirs = [
         ".spine",
         ".spine/spec",
@@ -456,88 +392,27 @@ def init(force: bool, keep_config: bool, abort: bool):
         ".spine/artifacts",
         ".spine/artifacts/plans",
     ]
-
+    
     for d in dirs:
         os.makedirs(d, exist_ok=True)
-
-    # --- Backup & wipe (if reinitialising) ---
-    if already_initialised:
-        backup_dir = _create_backup()
-        if force:
-            # Full wipe: remove everything in .spine except the backup
-            _wipe_spine_dir()
-            console.print(f"[dim]Backup created at {backup_dir}/[/]")
-            console.print("[bold green]Completely reinitialised.[/]")
-        elif keep_config:
-            # Preserve config.yaml: copy it, wipe, then restore
-            config_path = spine_dir / "config.yaml"
-            if config_path.exists():
-                config_data = config_path.read_text()
-            else:
-                config_data = ""
-            _wipe_spine_dir()
-            # Rewrite directories (they were wiped too)
-            for d in dirs:
-                os.makedirs(d, exist_ok=True)
-            # Restore config
-            with open(".spine/config.yaml", "w") as f:
-                f.write(config_data)
-            console.print(f"[dim]Backup created at {backup_dir}/[/]")
-            console.print("[bold green]Preserved existing configuration.[/]")
-        else:
-            console.print("[bold green]SPINE initialized![/]")
-    elif force:
-        # --force on a clean repo: just proceed normally
-        console.print("[bold green]SPINE initialized![/]")
-    else:
-        console.print("[bold green]SPINE initialized![/]")
-        console.print("Created directories and default configuration")
-
-    # --- Write default config (unless config was preserved) ---
-    if not (already_initialised and keep_config):
-        default_config = """# SPINE Configuration
+    
+    # Create default config
+    config = """# SPINE Configuration
 spine:
   checkpoint_path: .spine/spine.db
-
+  
 providers:
   llm:
     - name: primary
       type: ollama
       model: qwen3:32b
 """
-        with open(".spine/config.yaml", "w") as f:
-            f.write(default_config)
-
-    # --- Write default spec/plan if missing ---
-    spec_path = spine_dir / "spec" / "default.md"
-    plans_dir = spine_dir / "artifacts" / "plans"
-    if not spec_path.exists():
-        spec_path.write_text("# Default Spec\n")
-    if not (plans_dir / "default.json").exists():
-        (plans_dir / "default.json").write_text("{}")
-
-
-def _create_backup() -> Path:
-    """Create a timestamped backup of .spine/ and return the backup path."""
-    import shutil
-    import datetime
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_dir = Path(f".spine_backup_{timestamp}")
-    shutil.copytree(".spine", str(backup_dir), dirs_exist_ok=True)
-    return backup_dir
-
-
-def _wipe_spine_dir() -> None:
-    """Remove all contents inside .spine/ (keeps the directory itself)."""
-    import shutil
-
-    spine_dir = Path(".spine")
-    for child in spine_dir.iterdir():
-        if child.is_dir():
-            shutil.rmtree(str(child))
-        else:
-            child.unlink()
+    
+    with open(".spine/config.yaml", "w") as f:
+        f.write(config)
+    
+    console.print("[bold green]SPINE initialized![/]")
+    console.print("Created directories and default configuration")
 
 
 @cli.command()
