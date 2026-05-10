@@ -781,11 +781,16 @@ class SwarmDAGExecutor:
         
         For implementation roles (coder, test_engineer, reviewer), the prompt is
         a direct instruction suitable for an agent like opencode/codex.
+        Includes planning analysis, tech research, risk assessment, and spec
+        content when available — so the agent doesn't have to redo planning.
         For decision-making roles (explorer, sme, analyst, planner), the prompt
         includes structured context for LLM text analysis.
         """
         requirement = context.get("requirement", "")
         plan = context.get("plan", {})
+        planning_context = context.get("planning_context", {})
+        spec_content = context.get("spec_content", "")
+        
         plan_summary = ""
         if isinstance(plan, dict):
             # Extract task list from plan for context
@@ -794,7 +799,7 @@ class SwarmDAGExecutor:
                 task_descs = [f"  - {t.get('id', '?')}: {t.get('description', '?')}" for t in plan_tasks[:10]]
                 plan_summary = "\n".join(task_descs)
         
-        # For implementation roles: direct, actionable instruction
+        # For implementation roles: direct, actionable instruction with planning context
         if subphase.agent_role in ("coder", "test_engineer", "reviewer"):
             parts = [f"You are a {subphase.agent_role} agent. Implement the following requirement:"]
             if requirement:
@@ -803,6 +808,55 @@ class SwarmDAGExecutor:
                 parts.append(f"\n## Specific Task\n{task.description}")
             if plan_summary:
                 parts.append(f"\n## Plan Context\n{plan_summary}")
+            
+            # ── Planning Analysis ── Critical: pass planning results to the agent
+            if planning_context:
+                analysis = planning_context.get("analysis", {})
+                if analysis:
+                    parts.append("\n## Requirement Analysis")
+                    if isinstance(analysis, dict):
+                        for key, val in analysis.items():
+                            if key in ("components", "key_requirements", "estimated_complexity"):
+                                parts.append(f"- {key}: {val}")
+                    else:
+                        parts.append(str(analysis))
+                
+                tech = planning_context.get("tech_research", {})
+                if tech:
+                    parts.append("\n## Technology Research")
+                    if isinstance(tech, dict):
+                        for key, val in tech.items():
+                            if key in ("stack", "recommendations", "notes", "structured_data"):
+                                parts.append(f"- {key}: {val}")
+                    else:
+                        parts.append(str(tech))
+                
+                risk = planning_context.get("risk_assessment", {})
+                if risk:
+                    parts.append("\n## Risk Assessment")
+                    if isinstance(risk, dict):
+                        for key, val in risk.items():
+                            if key in ("risks", "mitigations", "level", "structured_data"):
+                                parts.append(f"- {key}: {val}")
+                    else:
+                        parts.append(str(risk))
+                
+                synthesis = planning_context.get("synthesis", {})
+                if synthesis:
+                    parts.append("\n## Plan Synthesis")
+                    if isinstance(synthesis, dict):
+                        for key, val in synthesis.items():
+                            if key not in ("task_outputs",):
+                                parts.append(f"- {key}: {val}")
+                    else:
+                        parts.append(str(synthesis))
+            
+            # ── Spec Content ── The distilled planning spec from disk
+            if spec_content:
+                # Trim very long specs to avoid overloading the agent context
+                trimmed = spec_content[:4000] if len(spec_content) > 4000 else spec_content
+                parts.append(f"\n## Planning Spec\n{trimmed}")
+            
             parts.append("\n## Instructions")
             parts.append("- Read the relevant source files first to understand the existing code")
             parts.append("- Make the minimal, focused changes needed to fulfill the requirement")

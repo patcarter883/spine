@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from .constants import PhaseName, StateStatus, ErrorState
 from ..models.types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState
-from ..models.dag import SwarmDAGExecutor
+from ..models.dag import SwarmDAGExecutor, synthesize_slices
 from ..providers.llm import LLMProvider
 from ..providers.base import ConflictResolver, ConflictResult
 from ..providers.memory import MemoryProvider
@@ -186,21 +186,40 @@ def planning_phase(state: SpineState) -> SpineState:
         state["phase"] = PhaseName.ERROR
         return state
     
-    # Generate plan from execution results
+    # Generate plan from execution results — derive tasks from subphase output
+    subphase_results = phase_result.subphase_results
+    subphase_statuses = phase_result.subphase_statuses
+
+    # Build a rich planning context for downstream slice synthesis
+    planning_context = _extract_planning_context(subphase_results)
+
+    # Use LLM to decompose into FeatureSlices when possible
+    feature_slices = synthesize_slices(
+        requirement=state["requirement"],
+        context=planning_context,
+        llm_provider=llm_provider,
+    )
+
+    # Derive plan tasks from subphase results (not hardcoded)
+    plan_tasks = _derive_plan_tasks(subphase_results, state["requirement"])
+
     state["plan"] = {
         "requirement": state["requirement"],
         "phases": ["PLANNING", "EXECUTION", "VERIFICATION"],
-        "tasks": [
-            {"id": "setup", "description": "Setup environment"},
-            {"id": "implement", "description": "Implement core features"},
-        ],
-        "subphase_results": phase_result.subphase_results,
-        "subphase_statuses": phase_result.subphase_statuses,
-        "created_at": "2024-01-01T00:00:00Z"
+        "tasks": plan_tasks,
+        "feature_slices": [s.to_dict() for s in feature_slices],
+        "planning_context": planning_context,
+        "subphase_results": subphase_results,
+        "subphase_statuses": subphase_statuses,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    
-    # Mark planning tasks complete based on execution results
-    state["completed_tasks"].extend(["analyze_requirement", "research_stack", "assess_risks", "draft_plan"])
+
+    # Mark planning tasks complete — use actual task IDs from subphases
+    completed_ids = []
+    for sp in subphases:
+        for t in sp.tasks:
+            completed_ids.append(t.id)
+    state["completed_tasks"].extend(completed_ids)
     
     # Run post-execute hooks
     context = _run_post_execute_hooks(planning_phase_obj, exit_context)
@@ -233,6 +252,11 @@ def planning_phase(state: SpineState) -> SpineState:
         })
     
     write_spec_file(state, work_item_id)
+    
+    # Store artifact/spec paths in variables so execution phase can reference them
+    spine_root = _get_spine_root(state)
+    state["variables"]["spec_path"] = os.path.join(spine_root, "spec", f"{work_item_id}.md")
+    state["variables"]["artifact_path"] = os.path.join(spine_root, "artifacts", "plans", f"{work_item_id}.json")
     
     # Transition to EXECUTION
     state["previous_phase"] = PhaseName.PLANNING
@@ -284,6 +308,17 @@ def execution_phase(state: SpineState) -> SpineState:
     # ── Build subphases from FeatureSlices (or fallback) ──────────
     plan = state.get("plan") or {}
     raw_slices = plan.get("feature_slices", [])
+    planning_context = plan.get("planning_context", {})
+    
+    # Read spec file content for execution context (written by planning phase)
+    spec_content = ""
+    spec_path = state.get("variables", {}).get("spec_path", "")
+    if spec_path and os.path.isfile(spec_path):
+        try:
+            with open(spec_path, "r") as f:
+                spec_content = f.read()
+        except Exception:
+            pass  # Non-fatal: spec is supplementary context
     
     if raw_slices:
         from ..models.types import FeatureSlice
@@ -291,8 +326,14 @@ def execution_phase(state: SpineState) -> SpineState:
         subphases = []
         active_names = []
         for s in feature_slices:
+            # Build task description with scope and acceptance criteria
+            task_desc = s.description
+            if s.scope:
+                task_desc += f"\nScope: {', '.join(s.scope)}"
+            if s.acceptance:
+                task_desc += f"\nAcceptance criteria: {'; '.join(s.acceptance)}"
             tasks = [
-                Task(id=f"{s.id}-exec", description=s.description),
+                Task(id=f"{s.id}-exec", description=task_desc),
             ]
             subphases.append(SubPhase(
                 name=s.id.upper().replace("-", "_"),
@@ -304,22 +345,40 @@ def execution_phase(state: SpineState) -> SpineState:
             active_names.append(s.id.upper().replace("-", "_"))
         state["swarm_state"]["active_subphases"] = active_names
     else:
-        # Fallback: create a single IMPLEMENTATION subphase from the requirement
-        # This delegates the entire requirement to the agent provider.
-        # Using a single subphase avoids GPU contention from parallel agent calls.
-        requirement_text = state.get("requirement", "")
-        subphases = [
-            SubPhase(
-                name="IMPLEMENTATION",
-                priority=1,
-                parallel=False,
-                agent_role="coder",
-                tasks=[
-                    Task(id="implement", description=requirement_text),
-                ],
-            ),
-        ]
-        state["swarm_state"]["active_subphases"] = ["IMPLEMENTATION"]
+        # Fallback: create subphases from plan tasks (not the raw requirement).
+        # Each plan task becomes its own subphase so the agent gets focused
+        # instructions derived from planning, not the raw user request.
+        plan_tasks = plan.get("tasks", [])
+        if plan_tasks and len(plan_tasks) > 1:
+            subphases = []
+            active_names = []
+            for i, pt in enumerate(plan_tasks):
+                tid = pt.get("id", f"task-{i+1}")
+                tdesc = pt.get("description", tid)
+                subphases.append(SubPhase(
+                    name=tid.upper().replace("-", "_"),
+                    priority=i + 1,
+                    parallel=False,  # Sequential to avoid GPU contention
+                    agent_role="coder",
+                    tasks=[Task(id=tid, description=tdesc)],
+                ))
+                active_names.append(tid.upper().replace("-", "_"))
+            state["swarm_state"]["active_subphases"] = active_names
+        else:
+            # Single IMPLEMENTATION subphase — but with planning context, not raw requirement
+            requirement_text = state.get("requirement", "")
+            subphases = [
+                SubPhase(
+                    name="IMPLEMENTATION",
+                    priority=1,
+                    parallel=False,
+                    agent_role="coder",
+                    tasks=[
+                        Task(id="implement", description=requirement_text),
+                    ],
+                ),
+            ]
+            state["swarm_state"]["active_subphases"] = ["IMPLEMENTATION"]
     
     # Build phase with hooks and conditions
     execution_phase_obj = Phase(
@@ -333,6 +392,8 @@ def execution_phase(state: SpineState) -> SpineState:
     context = {
         "requirement": state["requirement"],
         "plan": state.get("plan"),
+        "planning_context": planning_context,
+        "spec_content": spec_content,
         "variables": state.get("variables", {})
     }
     context = _run_pre_execute_hooks(execution_phase_obj, context)
@@ -349,6 +410,8 @@ def execution_phase(state: SpineState) -> SpineState:
     context = {
         "requirement": state["requirement"],
         "plan": state.get("plan"),
+        "planning_context": planning_context,
+        "spec_content": spec_content,
         "variables": state.get("variables", {})
     }
     phase_result = executor.execute_phase(Phase(name="EXECUTION", subphases=subphases), context)
@@ -707,6 +770,124 @@ def _check_error_threshold(subphases: List[SubPhase], max_errors: int = 3) -> tu
         return ErrorState.TRANSIENT.value, failed_subphases
     
     return ErrorState.INIT.value, []
+
+
+def _extract_planning_context(subphase_results: dict[str, Any]) -> dict[str, Any]:
+    """Extract structured planning context from subphase results.
+
+    Distills the raw subphase output into a context dict suitable for
+    synthesize_slices and for inclusion in the execution prompt.
+
+    Args:
+        subphase_results: Dict mapping subphase name -> result data.
+
+    Returns:
+        Dict with keys: analysis, tech_research, risk_assessment, synthesis.
+    """
+    context: dict[str, Any] = {}
+
+    for name, result in subphase_results.items():
+        if not isinstance(result, dict):
+            context[name.lower()] = str(result)
+            continue
+
+        # Extract the structured_data if present (from stub templates)
+        structured = result.get("structured_data", {})
+        output = result.get("output", "")
+        tasks_info = result.get("tasks", {})
+
+        # Flatten task results if available
+        task_outputs = []
+        if isinstance(tasks_info, dict):
+            for tid, tdata in tasks_info.items():
+                if isinstance(tdata, dict):
+                    task_outputs.append(tdata.get("result", tdata.get("output", str(tdata))))
+                else:
+                    task_outputs.append(str(tdata))
+
+        # Combine: prefer structured_data, then task outputs, then raw output
+        combined = {}
+        if structured:
+            combined.update(structured)
+        if task_outputs:
+            combined["task_outputs"] = task_outputs
+        if output and not structured:
+            combined["output"] = output
+
+        # Map subphase names to canonical context keys
+        key = name.upper()
+        if key == "ANALYZE":
+            context["analysis"] = combined
+        elif key == "TECH_RESEARCH":
+            context["tech_research"] = combined
+        elif key == "RISK_ASSESSMENT":
+            context["risk_assessment"] = combined
+        elif key == "SYNTHESIZE":
+            context["synthesis"] = combined
+        else:
+            context[name.lower()] = combined
+
+    return context
+
+
+def _derive_plan_tasks(subphase_results: dict[str, Any], requirement: str) -> list[dict[str, str]]:
+    """Derive execution plan tasks from planning subphase results.
+
+    Instead of hardcoding "setup"/"implement", extracts actionable task
+    descriptions from the SYNTHESIZE subphase output. Falls back to
+    extracting components from the requirement if synthesis is empty.
+
+    Args:
+        subphase_results: Dict mapping subphase name -> result data.
+        requirement: Original requirement text (for fallback).
+
+    Returns:
+        List of dicts with 'id' and 'description' keys.
+    """
+    # Try to get tasks from SYNTHESIZE output first
+    synth = subphase_results.get("SYNTHESIZE", {})
+    if isinstance(synth, dict):
+        # Check for structured_data with task list
+        structured = synth.get("structured_data", {})
+        if isinstance(structured, dict):
+            task_list = structured.get("tasks", structured.get("plan_tasks", []))
+            if isinstance(task_list, list) and task_list:
+                tasks = []
+                for i, t in enumerate(task_list):
+                    if isinstance(t, dict):
+                        tid = t.get("id", f"task-{i+1}")
+                        desc = t.get("description", t.get("name", str(t)))
+                        tasks.append({"id": tid, "description": desc})
+                    elif isinstance(t, str):
+                        tasks.append({"id": f"task-{i+1}", "description": t})
+                if tasks:
+                    return tasks
+
+        # Check for task results from the SYNTHESIZE subphase
+        # Skip review/critic tasks — they are not execution tasks
+        REVIEW_TASK_IDS = {"critic_review", "review", "critic_gate"}
+        tasks_info = synth.get("tasks", {})
+        if isinstance(tasks_info, dict):
+            tasks = []
+            for tid, tdata in tasks_info.items():
+                # Skip review/critic tasks — they produce verdicts, not work items
+                if tid in REVIEW_TASK_IDS or "critic" in tid.lower() or "review" in tid.lower():
+                    continue
+                if isinstance(tdata, dict):
+                    desc = tdata.get("result", tdata.get("output", tid))
+                    # Trim long LLM outputs to actionable descriptions
+                    if isinstance(desc, str) and len(desc) > 300:
+                        desc = desc[:300].rsplit(".", 1)[0] + "."
+                    tasks.append({"id": tid, "description": desc})
+            if tasks:
+                return tasks
+
+    # Fallback: extract components from requirement using dag helpers
+    from ..models.dag import _extract_components
+    components = _extract_components(requirement)
+    tasks = [{"id": f"implement-{i+1}", "description": f"Implement {c}"}
+             for i, c in enumerate(components)]
+    return tasks if tasks else [{"id": "implement", "description": requirement}]
 
 
 def _get_spine_root(state: SpineState) -> str:
