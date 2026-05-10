@@ -1,7 +1,10 @@
 """Swarm agents with role-specific capabilities and messaging."""
 
+from __future__ import annotations
+
 import asyncio
 from typing import Any, Optional, AsyncIterator
+
 from ..core.state_machine import SpineState
 from ..providers.llm import LLMProvider
 from ..providers.agents import AgentProvider, AgentResult
@@ -46,7 +49,17 @@ class AgentRoleValidator:
 
 
 class SwarmAgent:
-    """Base class for swarm agents with role-specific capabilities."""
+    """Base class for swarm agents with role-specific capabilities.
+
+    Uses structured prompts from the spine.prompts module for consistent,
+    instructional prompts that follow DeepAgents/LangChain best practices.
+    
+    Key features:
+    - Role-specific structured prompts with process guidance
+    - Tool instructions for available capabilities
+    - Output format specifications for structured responses
+    - Workflow context injection for agent coordination
+    """
 
     # Roles that use AgentProvider (implementation) vs LLMProvider (decision-making)
     IMPLEMENTATION_ROLES = frozenset(["coder", "test_engineer", "reviewer"])
@@ -57,6 +70,7 @@ class SwarmAgent:
         capabilities: list[str],
         llm_provider: Optional[LLMProvider] = None,
         agent_provider: Optional[AgentProvider] = None,
+        prompt_config: Optional[Any] = None,  # PromptConfig, avoid circular import
     ):
         # Validate role
         if not AgentRoleValidator.validate(role):
@@ -69,6 +83,16 @@ class SwarmAgent:
         self._agent_provider = agent_provider
         self._mail: Optional[SwarmMail] = None
         self._learning: Optional[LearningIntegration] = None
+        self._prompt_config = prompt_config
+        self._prompt_builder: Optional[Any] = None  # PromptBuilder, lazy init
+
+    def _get_prompt_builder(self):
+        """Get or create the PromptBuilder for this agent."""
+        if self._prompt_builder is None:
+            from ..prompts import PromptBuilder, PromptConfig
+            config = self._prompt_config or PromptConfig()
+            self._prompt_builder = PromptBuilder(role=self.role, config=config)
+        return self._prompt_builder
 
     def set_llm_provider(self, provider: LLMProvider) -> None:
         """Set the LLM provider for this agent."""
@@ -141,17 +165,59 @@ class SwarmAgent:
             yield str(result)
     
     def _build_prompt(self, state: SpineState, capability: str, **kwargs) -> str:
-        """Build LLM prompt for capability execution."""
-        return f"""You are a {self.role} agent with capabilities: {self.capabilities}.
-Current task: {state.get('requirement', 'Unknown')}
-Capability: {capability}
-State: {state}
-Additional context: {kwargs}
+        """Build LLM prompt for capability execution.
 
-Provide your response:"""
+        Uses the PromptBuilder to compose a structured prompt with:
+        - Role-specific instructions
+        - Tool instructions (if applicable)
+        - Workflow context
+        - Output format specification
+        - Task-specific context
+        """
+        builder = self._get_prompt_builder()
+        
+        # Determine available tools based on role and providers
+        tools = self._get_available_tools()
+        
+        # Get previous outputs for workflow context
+        previous_outputs = kwargs.pop("previous_outputs", None)
+        
+        # Build the complete prompt
+        return builder.build(
+            state=dict(state) if hasattr(state, '__iter__') else state,
+            capability=capability,
+            tools=tools,
+            previous_outputs=previous_outputs,
+            **kwargs,
+        )
+    
+    def _get_available_tools(self) -> list[str]:
+        """Determine which tools are available for this agent."""
+        tools = []
+        
+        # All agents potentially have filesystem access
+        tools.append("filesystem")
+        
+        # Implementation roles with agent provider have external agent access
+        if self.role in self.IMPLEMENTATION_ROLES and self._agent_provider:
+            tools.append("agent_provider")
+        
+        return tools
 
     def _parse_response(self, response: str, capability: str) -> dict[str, Any]:
         """Parse LLM response into structured result."""
+        # Try to parse as JSON first
+        import json
+        try:
+            parsed = json.loads(response)
+            if isinstance(parsed, dict):
+                parsed["from_role"] = self.role
+                parsed["type"] = capability
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        
+        # Fall back to wrapping in result
         return {"type": capability, "result": response, "from_role": self.role}
 
     def _parse_agent_result(self, result: AgentResult, capability: str) -> dict[str, Any]:
@@ -214,7 +280,7 @@ Provide your response:"""
             self._learning.record_pattern_completion(
                 pattern, task_id, work_item_id, success, context
             )
-    
+
     def evaluate_gate(self, gate_type: str, context: dict[str, Any]) -> dict[str, Any]:
         """Evaluate a gate for quality control. Override in subclasses."""
         return {"status": "not_implemented", "gate_type": gate_type}
@@ -293,6 +359,9 @@ class CriticAgent(SwarmAgent):
     def evaluate_gate(self, gate_type: str, context: dict[str, Any]) -> dict[str, Any]:
         """Evaluate quality gate with proper gate result.
         
+        Uses structured prompts from the prompts module for consistent
+        review behavior.
+        
         Args:
             gate_type: Type of gate (e.g., "quality", "critic")
             context: Context containing plan and variables
@@ -311,7 +380,17 @@ class CriticAgent(SwarmAgent):
         
         if self._llm_provider and self._llm_provider.enabled:
             try:
-                prompt = self._build_critic_prompt(plan, context)
+                # Use the prompt builder for structured review
+                state = {
+                    "requirement": context.get("requirement", ""),
+                    "current_phase": "REVIEW",
+                    "variables": context.get("variables", {}),
+                }
+                prompt = self._build_prompt(
+                    state, 
+                    capability="review",
+                    extra_context=f"Plan to review:\n{plan}",
+                )
                 response = self._llm_provider.generate(prompt)
                 return self._parse_critic_response(response)
             except Exception as e:
@@ -335,34 +414,6 @@ class CriticAgent(SwarmAgent):
                 "issues": [],
                 "recommendations": []
             }
-    
-    def _build_critic_prompt(self, plan: dict[str, Any], context: dict[str, Any]) -> str:
-        """Build LLM prompt for critic gate evaluation."""
-        requirement = context.get("requirement", "")
-        variables = context.get("variables", {})
-        
-        return f"""You are a critic agent reviewing an execution plan.
-
-Requirement: {requirement}
-
-Plan:
-{plan}
-
-Variables:
-{variables}
-
-Evaluate the plan for:
-1. Completeness - Are all necessary tasks included?
-2. Correctness - Will the approach work?
-3. Safety - Any security or risk concerns?
-4. Clarity - Are the tasks well-defined?
-
-Return JSON with:
-- approved: true/false
-- issues: list of problems found
-- recommendations: list of improvements
-
-Response:"""
     
     def _parse_critic_response(self, response: str) -> dict[str, Any]:
         """Parse LLM critic response into structured result."""

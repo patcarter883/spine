@@ -1,7 +1,11 @@
 """Dashboard page — list of all work items with status and progress."""
 
+import time
+from datetime import datetime, timezone
+
 import streamlit as st
 
+from spine.config import dashboard_config
 from spine.ui.utils import (
     get_active_work_items,
     format_phase_icon,
@@ -13,11 +17,34 @@ def render_dashboard() -> None:
     """Render the main dashboard page showing all work items."""
     st.title("📊 SPINE Dashboard")
 
-    # Auto-refresh toggle
-    auto_refresh = st.toggle("Auto-refresh", value=True)
+    # ── Polling / auto-refresh controls ──
+    col_poll, col_status, _ = st.columns([2, 2, 4])
+
+    with col_poll:
+        auto_refresh = st.toggle("Auto-refresh", value=True)
+        raw_interval_s = st.select_slider(
+            "Poll interval",
+            options=[1, 2, 5, 10, 30],
+            value=2,
+            disabled=not auto_refresh,
+            label_visibility="collapsed",
+            help="How often to check for status updates (seconds).",
+        )
+        cfg = dashboard_config(raw_interval_s)
+        poll_interval_s = cfg["poll_interval_s"]
+
+    with col_status:
+        if "dashboard_last_refresh" not in st.session_state:
+            st.session_state.dashboard_last_refresh = datetime.now(timezone.utc)
+        if auto_refresh:
+            st.caption(
+                f"🔄 Polling every {poll_interval_s}s "
+                f"(last: {st.session_state.dashboard_last_refresh.strftime('%H:%M:%S')})"
+            )
 
     # Fetch work items
     work_items = get_active_work_items()
+    st.session_state.dashboard_last_refresh = datetime.now(timezone.utc)
 
     # Summary metrics
     active = sum(1 for w in work_items if w["phase"] not in ("COMPLETE", "ERROR", "BLOCKED"))
@@ -43,6 +70,9 @@ def render_dashboard() -> None:
                 "multi-agent workflows through a state machine. It supports "
                 "parallel execution, critic gates, and file reservations."
             )
+        if auto_refresh:
+            time.sleep(poll_interval_s)
+            st.rerun()
         return
 
     # Work item cards
@@ -62,8 +92,10 @@ def render_dashboard() -> None:
             col_title.write(f"**{item['requirement']}**")
             col_phase.write(f"[{color}]**{item['phase']}**[/]")
 
-            progress_key = f"progress_{item['thread_id']}"
-            col_progress.progress(progress)
+            col_progress.progress(
+                progress,
+                text=f"{item['completed_tasks']}/{item.get('total_tasks', 1)} tasks",
+            )
 
             if col_actions.button("View", key=f"view_{item['thread_id']}"):
                 st.session_state.selected_work_id = item["thread_id"]
@@ -77,3 +109,10 @@ def render_dashboard() -> None:
         f"Click 'View' to see details • "
         f"Auto-refresh is {'on' if auto_refresh else 'off'}"
     )
+
+    # Auto-refresh polling loop
+    if auto_refresh and any(
+        w["phase"] not in ("COMPLETE", "ERROR") for w in work_items
+    ):
+        time.sleep(poll_interval_s)
+        st.rerun()

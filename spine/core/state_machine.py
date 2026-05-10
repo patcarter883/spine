@@ -325,12 +325,16 @@ def execution_phase(state: SpineState) -> SpineState:
     storage_provider = providers.get("storage")
     agent_provider = state.get("agent_provider")
     
+    debug_prompts = state.get("variables", {}).get("debug_prompts", False)
+    
     # Create executor with providers
     executor = SwarmDAGExecutor(
         llm_provider=llm_provider,
         storage_provider=storage_provider,
         agent_provider=agent_provider,
     )
+    
+    # Forward debug_prompts into context so the prompt builder can use it
     
     # ── Build subphases from FeatureSlices (or fallback) ──────────
     plan = state.get("plan") or {}
@@ -1029,19 +1033,10 @@ def write_spec_file(state: SpineState, work_item_id: str) -> Optional[str]:
         lines.append(f"- Description: {task_desc}")
         lines.append("")
 
-    # Include subphase results if available
-    subphase_results = plan.get("subphase_results", {})
-    if subphase_results:
-        lines.append("## Subphase Results")
-        lines.append("")
-        for name, result in subphase_results.items():
-            lines.append(f"### {name}")
-            if isinstance(result, dict):
-                for key, value in result.items():
-                    lines.append(f"- {key}: {value}")
-            else:
-                lines.append(f"- Result: {result}")
-            lines.append("")
+    # Subphase results live in state, not the spec file.  Writing raw
+    # structured_data dicts (huge markdown tables, full analysis outputs)
+    # into the spec creates a polluted context that gets fed back to the
+    # execution agent.  Skip this section entirely.
 
     lines.append("---")
     lines.append(f"*Generated at {datetime.now(timezone.utc).isoformat()}*")

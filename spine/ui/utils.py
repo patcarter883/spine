@@ -402,10 +402,14 @@ def start_work(
     llm_provider: str = "qwen3:32b (Ollama)",
     parallel_agents: int = 3,
     checkpoint_path: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Optional[dict]:
-    """Start a new work item via the backend state machine.
+    """Start a new work item via the task queue.
 
-    Creates a new LangGraph thread and returns the thread_id.
+    Enqueues the work for background processing and returns immediately
+    with the thread_id and task_id. A separate worker process picks up
+    the task and executes the LangGraph workflow asynchronously.
+    Uses an idempotency key to prevent duplicate submissions.
 
     Args:
         requirement: The requirement text for the work item.
@@ -414,15 +418,29 @@ def start_work(
         llm_provider: LLM provider name.
         parallel_agents: Maximum parallel agents within a phase.
         checkpoint_path: Explicit checkpoint path.
+        idempotency_key: UUIDv4 for duplicate detection. Generated if not provided.
 
     Returns:
-        Dict with 'thread_id' on success, or None on failure.
+        Dict with 'thread_id', 'task_id', and 'idempotency_key' on success,
+        or dict with 'error' message on failure.
     """
-    from ..core.state_machine import SpineStateMachine
+    from ..config.queue import TaskQueue
 
-    machine = SpineStateMachine(checkpoint_path=checkpoint_path or ".spine/spine.db")
+    # Generate idempotency key if not provided
+    key = idempotency_key or str(uuid.uuid4())
 
-    # Build a minimal providers dict from config
+    # Check if this key was already processed (dedup)
+    _idempotency_path = Path(".spine/idempotency")
+    _idempotency_path.mkdir(parents=True, exist_ok=True)
+    dedup_file = _idempotency_path / f"{key}.json"
+    if dedup_file.exists():
+        try:
+            existing = json.loads(dedup_file.read_text())
+            return existing
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Build providers dict from config
     config = load_config()
     providers_by_type = _load_providers_from_config(config)
     providers_dict = {}
@@ -433,39 +451,79 @@ def start_work(
     thread_id = str(uuid.uuid4())
     checkpoint_path_str = checkpoint_path or ".spine/spine.db"
 
-    initial_state = {
-        "phase": "INIT",
-        "previous_phase": None,
-        "requirement": requirement,
-        "plan": None,
-        "tasks": {},
-        "completed_tasks": [],
-        "failed_tasks": [],
-        "swarm_state": {"active_subphases": [], "file_reservations": {}, "pending_gates": []},
-        "hive_cells": {},
-        "swarm_events": [],
-        "variables": {
-            "thread_id": thread_id,
-            "work_item_id": thread_id,
-            "checkpoint_path": checkpoint_path_str,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-        "errors": [],
-        "providers": providers_dict,
-        "critic_gate_result": None,
-        "error_state": None,
-        "error_history": [],
+    # Detect project context
+    project_root = os.getcwd()
+    project_name = Path(project_root).name
+    project_config = config.get("project", {})
+    project_context = {
+        "name": project_config.get("name", project_name),
+        "root": project_config.get("root", project_root),
+        "description": project_config.get("description", ""),
+        "tech_stack": project_config.get("tech_stack", []),
     }
 
+    # Enqueue work for background processing
     try:
-        result = machine.app.invoke(
-            initial_state,
-            {"configurable": {"thread_id": thread_id}},
-        )
-        return {"thread_id": thread_id}
+        queue = TaskQueue(db_path=".spine/queue.db")
+        task_id = queue.enqueue("work", {
+            "requirement": requirement,
+            "thread_id": thread_id,
+            "checkpoint_path": checkpoint_path_str,
+            "method": method,
+            "project_type": project_type,
+            "providers": providers_dict,
+            "variables": {
+                "thread_id": thread_id,
+                "work_item_id": thread_id,
+                "checkpoint_path": checkpoint_path_str,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "idempotency_key": key,
+            },
+            "project_context": project_context,
+        })
+        payload = {
+            "thread_id": thread_id,
+            "task_id": task_id,
+            "idempotency_key": key,
+        }
+        dedup_file.write_text(json.dumps(payload))
+        return payload
     except Exception as e:
-        print(f"[spine.ui.utils] Failed to start work: {e}")
-        return None
+        error_msg = str(e)
+        print(f"[spine.ui.utils] Failed to enqueue work: {error_msg}")
+        return {"error": error_msg, "idempotency_key": key}
+
+
+def _rollback_work(
+    thread_id: str,
+    checkpoint_path: Optional[str] = None,
+) -> None:
+    """Roll back a failed work submission by removing its checkpoint data.
+
+    Args:
+        thread_id: The thread ID to clean up.
+        checkpoint_path: Explicit checkpoint path.
+    """
+    cp_path = get_checkpoint_path(checkpoint_path)
+    if not cp_path.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(cp_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        for table in tables:
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = [col[1] for col in cursor.fetchall()]
+                if "thread_id" in columns:
+                    cursor.execute(f"DELETE FROM {table} WHERE thread_id=?", (thread_id,))
+            except Exception:
+                continue
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def approve_gate(thread_id: str) -> bool:

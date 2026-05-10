@@ -14,6 +14,9 @@ from ..providers.agents import AgentProvider
 from ..core.persistence import GitWorkflow
 from ..models.enums import SubPhaseStatus
 
+# Import prompt system
+from ..prompts import PromptBuilder, PromptConfig, Role as PromptRole
+
 
 def _extract_components(requirement: str) -> list[str]:
     """Extract component hints from a requirement string.
@@ -352,6 +355,30 @@ class SwarmDAGExecutor:
         # Cancellation support
         self._cancel_requested: bool = False
         self._cancel_callback: Optional[Callable[[], bool]] = None
+        # Prompt builders cache (per role)
+        self._prompt_builders: dict[str, PromptBuilder] = {}
+    
+    def _get_prompt_builder(self, role: str) -> PromptBuilder:
+        """Get or create a PromptBuilder for the given role.
+        
+        Caches builders per role to avoid re-creating on every task.
+        """
+        if role not in self._prompt_builders:
+            # Map role string to PromptRole enum
+            role_mapping = {
+                "explorer": PromptRole.EXPLORER,
+                "sme": PromptRole.SME,
+                "planner": PromptRole.PLANNER,
+                "critic": PromptRole.CRITIC,
+                "coder": PromptRole.CODER,
+                "reviewer": PromptRole.REVIEWER,
+                "test_engineer": PromptRole.TEST_ENGINEER,
+                "analyst": PromptRole.ANALYST,
+                "designer": PromptRole.DESIGNER,
+            }
+            prompt_role = role_mapping.get(role.lower(), PromptRole.EXPLORER)
+            self._prompt_builders[role] = PromptBuilder(role=prompt_role)
+        return self._prompt_builders[role]
 
     def _register_stub_templates(self) -> None:
         """Register subphase-specific stub template functions.
@@ -779,106 +806,196 @@ class SwarmDAGExecutor:
     def _build_task_prompt(self, task: "Task", subphase: "SubPhase", context: dict) -> str:
         """Build prompt for task execution.
         
-        For implementation roles (coder, test_engineer, reviewer), the prompt is
-        a direct instruction suitable for an agent like opencode/codex.
-        Includes planning analysis, tech research, risk assessment, and spec
-        content when available — so the agent doesn't have to redo planning.
-        For decision-making roles (explorer, sme, analyst, planner), the prompt
-        includes structured context for LLM text analysis.
+        Uses the PromptBuilder from spine.prompts for structured, instructional
+        prompts that follow DeepAgents/LangChain best practices.
+        
+        For implementation roles (coder, test_engineer, reviewer), combines
+        the role prompt with task-specific context for agent delegation.
+        For decision-making roles (explorer, sme, analyst, planner), uses
+        the full structured prompt from PromptBuilder.
         """
+        import os
+        debug_prompts = context.get("variables", {}).get("debug_prompts", False)
         requirement = context.get("requirement", "")
         plan = context.get("plan", {})
-        planning_context = context.get("planning_context", {})
         spec_content = context.get("spec_content", "")
         
-        plan_summary = ""
-        if isinstance(plan, dict):
-            # Extract task list from plan for context
-            plan_tasks = plan.get("tasks", [])
-            if plan_tasks:
-                task_descs = [f"  - {t.get('id', '?')}: {t.get('description', '?')}" for t in plan_tasks[:10]]
-                plan_summary = "\n".join(task_descs)
+        # Get the prompt builder for this role
+        builder = self._get_prompt_builder(subphase.agent_role)
         
-        # For implementation roles: direct, actionable instruction with planning context
+        # Get project context
+        project_ctx = context.get("project_context", {})
+        
+        # Build state for prompt builder
+        state = {
+            "requirement": requirement,
+            "current_phase": subphase.name,
+            "completed_phases": [],
+            "variables": context.get("variables", {}),
+            "project_name": project_ctx.get("name", "unknown-project"),
+            "project_root": project_ctx.get("root", os.getcwd()),
+            "tech_stack": project_ctx.get("tech_stack", []),
+        }
+        
+        # ── Implementation roles ────────────────────────────────────────
         if subphase.agent_role in ("coder", "test_engineer", "reviewer"):
-            parts = [f"You are a {subphase.agent_role} agent. Implement the following requirement:"]
+            # For implementation roles, we use a hybrid approach:
+            # 1. Get the role-specific prompt section from PromptBuilder
+            # 2. Add project context
+            # 3. Add task-specific context (spec, plan, scope)
+            # 4. Add concrete instructions
+            
+            from ..prompts.roles import get_role_prompt
+            
+            parts: list[str] = []
+            
+            # Get project context
+            project_ctx = context.get("project_context", {})
+            project_name = project_ctx.get("name", "unknown-project")
+            project_root = project_ctx.get("root", os.getcwd())
+            project_desc = project_ctx.get("description", "")
+            tech_stack = project_ctx.get("tech_stack", [])
+            
+            # Role + project context
+            role_titles = {
+                "coder": "Coder Agent",
+                "test_engineer": "Test Engineer Agent",
+                "reviewer": "Code Reviewer Agent",
+            }
+            role_title = role_titles.get(subphase.agent_role, f"{subphase.agent_role} agent")
+            parts.append(f"# {role_title}\n")
+            
+            parts.append(f"## Project Context")
+            parts.append(f"- **Project**: {project_name}")
+            parts.append(f"- **Root**: {project_root}")
+            if project_desc:
+                parts.append(f"- **Description**: {project_desc}")
+            if tech_stack:
+                parts.append(f"- **Tech Stack**: {', '.join(tech_stack)}")
+            parts.append("")
+            
+            # Requirement (the original user request)
             if requirement:
-                parts.append(f"\n## Requirement\n{requirement}")
-            if task.description and task.description != requirement:
-                parts.append(f"\n## Specific Task\n{task.description}")
-            if plan_summary:
-                parts.append(f"\n## Plan Context\n{plan_summary}")
-            
-            # ── Planning Analysis ── Critical: pass planning results to the agent
-            if planning_context:
-                analysis = planning_context.get("analysis", {})
-                if analysis:
-                    parts.append("\n## Requirement Analysis")
-                    if isinstance(analysis, dict):
-                        for key, val in analysis.items():
-                            if key in ("components", "key_requirements", "estimated_complexity"):
-                                parts.append(f"- {key}: {val}")
-                    else:
-                        parts.append(str(analysis))
-                
-                tech = planning_context.get("tech_research", {})
-                if tech:
-                    parts.append("\n## Technology Research")
-                    if isinstance(tech, dict):
-                        for key, val in tech.items():
-                            if key in ("stack", "recommendations", "notes", "structured_data"):
-                                parts.append(f"- {key}: {val}")
-                    else:
-                        parts.append(str(tech))
-                
-                risk = planning_context.get("risk_assessment", {})
-                if risk:
-                    parts.append("\n## Risk Assessment")
-                    if isinstance(risk, dict):
-                        for key, val in risk.items():
-                            if key in ("risks", "mitigations", "level", "structured_data"):
-                                parts.append(f"- {key}: {val}")
-                    else:
-                        parts.append(str(risk))
-                
-                synthesis = planning_context.get("synthesis", {})
-                if synthesis:
-                    parts.append("\n## Plan Synthesis")
-                    if isinstance(synthesis, dict):
-                        for key, val in synthesis.items():
-                            if key not in ("task_outputs",):
-                                parts.append(f"- {key}: {val}")
-                    else:
-                        parts.append(str(synthesis))
-            
-            # ── Spec Content ── The distilled planning spec from disk
+                parts.append(f"## Requirement\n{requirement}\n")
+
+            # Specific task this subphase should carry out
+            task_desc = None
+            if task.description and task.description.strip():
+                # Strip trailing scope/acceptance suffixes that are already
+                # passed separately — keep the core instruction.
+                raw = task.description.strip()
+                for sep in ("\nScope:", "\nAcceptance criteria:"):
+                    idx = raw.find(sep)
+                    if idx != -1:
+                        raw = raw[:idx].strip()
+                if raw and raw != requirement.strip():
+                    task_desc = raw
+
+            if task_desc:
+                parts.append(f"## Task\n{task_desc}\n")
+
+            # Scope from the task description (extracted if present)
+            task_scope = []
+            task_acceptance = []
+            if task.description:
+                for line in task.description.splitlines():
+                    if line.startswith("Scope:") or line.startswith("Scope:, "):
+                        task_scope.append(line)
+                    elif line.startswith("Acceptance criteria:"):
+                        task_acceptance.append(line)
+            if task_scope:
+                parts.append("## Scope")
+                parts.extend(task_scope)
+                parts.append("")
+            if task_acceptance:
+                parts.append("## Acceptance Criteria")
+                parts.extend(task_acceptance)
+                parts.append("")
+
+            # Plan overview — concise list of planned tasks from planning phase
+            if isinstance(plan, dict):
+                plan_tasks = plan.get("tasks", [])
+                if plan_tasks:
+                    parts.append("## Planned Tasks (overview)")
+                    for t in plan_tasks:
+                        tid = t.get("id", "?")
+                        raw_desc = str(t.get("description", ""))
+                        # Strip table markdown, trailing noise — keep a short label
+                        short = raw_desc.split("\n")[0].strip().strip("|").strip()
+                        if len(short) > 120:
+                            short = short[:117] + "..."
+                        if not short:
+                            short = tid
+                        parts.append(f"- **{tid}**: {short}")
+                    parts.append("")
+
+            # Distilled spec from planning — single consolidated source of truth
             if spec_content:
-                # Trim very long specs to avoid overloading the agent context
-                trimmed = spec_content[:4000] if len(spec_content) > 4000 else spec_content
-                parts.append(f"\n## Planning Spec\n{trimmed}")
+                trimmed = spec_content[:6000] if len(spec_content) > 6000 else spec_content
+                parts.append(f"## Planning Spec\n{trimmed}\n")
+
+            # Get tool instructions for agent provider
+            from ..prompts.tools import AGENT_PROVIDER_INSTRUCTIONS
+            parts.append(AGENT_PROVIDER_INSTRUCTIONS)
             
-            parts.append("\n## Instructions")
-            parts.append("- Read the relevant source files first to understand the existing code")
-            parts.append("- Make the minimal, focused changes needed to fulfill the requirement")
-            parts.append("- Follow the existing code style and patterns")
-            parts.append("- Write or update tests if applicable")
-            return "\n".join(parts)
+            # Concrete instructions (from role prompt)
+            parts.append(
+                "\n## Instructions\n"
+                "1. Read the relevant source files first to understand the existing code.\n"
+                "2. Make the minimal, focused changes needed to fulfill the requirement.\n"
+                "3. Follow the existing code style and patterns.\n"
+                "4. Write or update tests if applicable.\n"
+                "5. Ensure the changes integrate cleanly — no regressions, no dead code.\n"
+                "6. Return a JSON object with: status, summary, files_changed, tests, notes."
+            )
+            prompt = "\n".join(parts)
+
+            if debug_prompts:
+                self._print_debug_prompt(prompt, task, subphase)
+
+            return prompt
         
-        # For decision-making roles: structured context for LLM analysis
-        dep_context_parts = []
-        if context:
-            for key, value in context.items():
-                dep_context_parts.append(f"  {key}: {value}")
-        dep_context = "\n".join(dep_context_parts)
+        # ── Decision-making roles: use full PromptBuilder ───────────────
+        # Build previous outputs from completed phases
+        previous_outputs = {}
+        if "completed_phases" in context:
+            for phase_name in context.get("completed_phases", []):
+                phase_result = context.get("phase_results", {}).get(phase_name)
+                if phase_result:
+                    previous_outputs[phase_name] = phase_result
         
-        return (
-            f"Agent Role: {subphase.agent_role}\n"
-            f"SubPhase: {subphase.name}\n"
-            f"Task: {task.id}\n"
-            f"Description: {task.description}\n"
-            f"Dependencies context:\n{dep_context}\n"
-            f"\nPerform the requested task. Provide structured, actionable output."
+        # Determine capability based on subphase name
+        capability_map = {
+            "ANALYZE": "analyze",
+            "TECH_RESEARCH": "research",
+            "RISK_ASSESSMENT": "analyze",
+            "SYNTHESIZE": "plan",
+            "PLANNING": "plan",
+        }
+        capability = capability_map.get(subphase.name.upper(), "analyze")
+        
+        # Build the prompt using PromptBuilder
+        prompt = builder.build(
+            state=state,
+            capability=capability,
+            tools=["filesystem"],  # Decision-making roles have filesystem access
+            previous_outputs=previous_outputs if previous_outputs else None,
+            extra_context=f"Task: {task.description}" if task.description else None,
         )
+
+        if debug_prompts:
+            self._print_debug_prompt(prompt, task, subphase)
+
+        return prompt
+
+    def _print_debug_prompt(self, prompt: str, task: "Task", subphase: "SubPhase") -> None:
+        """Print a prompt to the console for debugging."""
+        divider = "=" * 72
+        print(f"\n{divider}")
+        print(f" [PROMPT] SubPhase={subphase.name}  Role={subphase.agent_role}  Task={task.id}")
+        print(divider)
+        print(prompt)
+        print(f"\n{'─' * 72}\n")
 
     def _execute_stub_task(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
         """Stub task execution for when no LLM provider is available.

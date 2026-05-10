@@ -117,54 +117,72 @@ class SupervisorSwarmAgent(SwarmAgent):
 
 
 def create_explorer_agent() -> SupervisorSwarmAgent:
-    """Create the explorer agent for requirement analysis."""
+    """Create the explorer agent for requirement analysis.
+    
+    Uses structured prompts from spine.prompts.roles for comprehensive
+    requirement analysis instructions.
+    """
+    from ..prompts.roles import EXPLORER_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.EXPLORER,
         name="explorer",
-        system_prompt=(
-            "You analyze user requirements and extract key information. "
-            "Identify the core problem, constraints, and success criteria. "
-            "Output should be structured and actionable."
-        )
+        system_prompt=EXPLORER_PROMPT,
     )
 
 
 def create_sme_agent() -> SupervisorSwarmAgent:
-    """Create the SME agent for research."""
+    """Create the SME agent for research.
+    
+    Uses structured prompts from spine.prompts.roles for research
+    and best practices synthesis.
+    """
+    from ..prompts.roles import SME_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.SME,
         name="sme",
-        system_prompt=(
-            "You are a subject matter expert. Research best practices, "
-            "existing solutions, and technical patterns. Synthesize findings "
-            "into actionable recommendations."
-        )
+        system_prompt=SME_PROMPT,
     )
 
 
 def create_planner_agent() -> SupervisorSwarmAgent:
-    """Create the planner agent for execution planning."""
+    """Create the planner agent for execution planning.
+    
+    Uses structured prompts from spine.prompts.roles for detailed
+    execution planning instructions.
+    """
+    from ..prompts.roles import PLANNER_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.PLANNER,
         name="planner",
-        system_prompt=(
-            "You create detailed execution plans from requirements and research. "
-            "Break down work into discrete tasks with clear dependencies. "
-            "Include testing and verification considerations."
-        )
+        system_prompt=PLANNER_PROMPT,
     )
 
 
 def create_critic_agent() -> SupervisorSwarmAgent:
-    """Create the critic agent for validation."""
+    """Create the critic agent for validation.
+    
+    Uses structured prompts from spine.prompts.roles for comprehensive
+    review and validation instructions.
+    """
+    from ..prompts.roles import CRITIC_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.CRITIC,
         name="critic",
-        system_prompt=(
-            "You review plans and implementations for correctness, security, and completeness. "
-            "Identify potential issues, gaps, and improvement opportunities. "
-            "Be thorough but constructive."
-        )
+        system_prompt=CRITIC_PROMPT,
+    )
+
+
+def create_coder_agent() -> SupervisorSwarmAgent:
+    """Create the coder agent for implementation.
+    
+    Uses structured prompts from spine.prompts.roles for implementation
+    instructions with tool usage guidance.
+    """
+    from ..prompts.roles import CODER_PROMPT
+    return SupervisorSwarmAgent(
+        role=AgentRole.CODER,
+        name="coder",
+        system_prompt=CODER_PROMPT,
     )
 
 

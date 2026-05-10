@@ -10,9 +10,7 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
-
-from ..core.state_machine import SpineStateMachine
+from typing import Optional
 
 
 class UIApi:
@@ -84,6 +82,7 @@ class UIApi:
         project_type: str = "Greenfield",
         llm_provider: str = "ollama",
         parallel_agents: int = 3,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Start a new work item. Returns thread_id on success.
 
@@ -93,9 +92,10 @@ class UIApi:
             project_type: Environment type ("Greenfield" or "Brownfield").
             llm_provider: LLM provider name.
             parallel_agents: Maximum parallel agents within a phase.
+            idempotency_key: UUIDv4 for duplicate detection.
 
         Returns:
-            Dict with 'thread_id' on success, empty dict on failure.
+            Dict with 'thread_id' on success, or with 'error' on failure.
         """
         from ..ui.utils import start_work
 
@@ -107,8 +107,9 @@ class UIApi:
                 llm_provider=llm_provider,
                 parallel_agents=parallel_agents,
                 checkpoint_path=self._checkpoint_path,
+                idempotency_key=idempotency_key,
             )
-            return result or {}
+            return result or {"error": "start_work returned no result"}
 
     def approve_gate(self, thread_id: str) -> bool:
         """Approve the critic gate for a work item.

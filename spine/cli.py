@@ -281,7 +281,8 @@ def _print_phase_progress(phase_name: str, state: dict) -> None:
 @click.option("--thread-id", "-t", default="default", help="Thread ID for persistence")
 @click.option("--checkpoint", "-c", default=".spine/spine.db", help="Checkpoint database path")
 @click.option("--config", "-f", default=".spine/config.yaml", help="Config file path")
-def work(requirement: str, thread_id: str, checkpoint: str, config: str):
+@click.option("--debug-prompts", "-d", is_flag=True, help="Print prompts sent to agents to console")
+def work(requirement: str, thread_id: str, checkpoint: str, config: str, debug_prompts: bool):
     """Start a new work item."""
     console.print(f"[bold blue]SPINE[/] [dim]|[/] [bold]Starting work:[/] {requirement}")
     
@@ -300,10 +301,16 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str):
     else:
         console.print("  [yellow]⚠[/] No agent provider configured, using LLM for execution")
     
+    if debug_prompts:
+        console.print("  [bold magenta]📝[bold] Debug prompts enabled — prompts will be printed below")
+    
     machine = SpineStateMachine(
         checkpoint_path=checkpoint,
         llm_provider=llm_provider,
     )
+    
+    # Stash the debug flag so the executor can use it
+    machine._debug_prompts = debug_prompts
     
     # Use streaming to show phase-by-phase progress
     seen_phases = set()
@@ -320,14 +327,30 @@ def work(requirement: str, thread_id: str, checkpoint: str, config: str):
     import re
     work_slug = re.sub(r'[^a-z0-9]+', '-', requirement.lower().strip())[:50].strip('-') or 'work'
     
+    # Detect project context
+    project_root = os.getcwd()
+    project_name = Path(project_root).name
+    
+    # Try to load project context from config
+    config_data = load_config(config)
+    project_config = config_data.get("project", {})
+    
+    project_context = {
+        "name": project_config.get("name", project_name),
+        "root": project_config.get("root", project_root),
+        "description": project_config.get("description", ""),
+        "tech_stack": project_config.get("tech_stack", []),
+    }
+    
     try:
         stream = machine.app.stream(
             {"phase": "INIT", "requirement": requirement, "plan": None, "tasks": {},
              "completed_tasks": [], "failed_tasks": [], "swarm_state": {},
              "hive_cells": {}, "swarm_events": [],
-             "variables": {"work_item_id": work_slug, "thread_id": thread_id},
+             "variables": {"work_item_id": work_slug, "thread_id": thread_id, "debug_prompts": debug_prompts},
              "errors": [], "providers": providers_dict, "agent_provider": agent_provider,
-             "critic_gate_result": None, "error_state": None, "error_history": []},
+             "critic_gate_result": None, "error_state": None, "error_history": [],
+             "project_context": project_context},
             {"configurable": {"thread_id": thread_id}}
         )
         
@@ -467,6 +490,14 @@ def init(force: bool, keep_config: bool):
     config = """# SPINE Configuration
 spine:
   checkpoint_path: .spine/spine.db
+
+# Project context (optional - auto-detected if not specified)
+project:
+  name: spine  # Override project name (default: directory name)
+  # description: "A deterministic AI-agent execution harness"  # Optional
+  # tech_stack:  # Optional - helps agents understand the codebase
+  #   - Python
+  #   - LangGraph
   
 providers:
   llm:
