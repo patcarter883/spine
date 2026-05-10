@@ -97,7 +97,7 @@ class SupervisorSwarmAgent(SwarmAgent):
                 try:
                     sig = inspect.signature(self._llm_provider.generate)
                     if "timeout" in sig.parameters:
-                        llm_output = self._llm_provider.generate(prompt, timeout=30.0)
+                        llm_output = self._llm_provider.generate(prompt, timeout=300.0)
                     else:
                         llm_output = self._llm_provider.generate(prompt)
                     output = llm_output

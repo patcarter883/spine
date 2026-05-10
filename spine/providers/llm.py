@@ -11,7 +11,7 @@ from .base import Provider, ProviderType
 logger = logging.getLogger(__name__)
 
 # Default timeout for LLM HTTP calls (connect, read) in seconds
-DEFAULT_TIMEOUT = (10, 30)  # (connect_timeout, read_timeout)
+DEFAULT_TIMEOUT = (10, 300)  # (connect_timeout, read_timeout)
 
 # Streaming-specific timeouts
 # Per-chunk read timeout for streaming: set high so long-running completions

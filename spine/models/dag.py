@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Any, Literal, Callable
 from dataclasses import dataclass
 
-from .types import Phase, PhaseResult, SubPhase, SubPhaseResult, Task
+from .types import Phase, PhaseResult, SubPhase, SubPhaseResult, Task, FeatureSlice
 from ..providers.llm import LLMProvider
 from ..providers.memory import MemoryProvider
 from ..providers.storage import StorageProvider, FileWriteGuard
@@ -80,112 +80,201 @@ def _estimate_complexity(requirement: str) -> str:
     return "low"
 
 
-def _get_synthesis_tasks(phases: list[str]) -> list[tuple[str, list[str]]]:
-    """Generate task descriptions and dependencies for synthesis phases."""
-    task_map: dict[str, list[tuple[str, list[str]]]] = {
-        "SETUP": [
-            ("Initialize project structure and dependencies", []),
-            ("Configure development environment", []),
-        ],
-        "CORE_IMPLEMENTATION": [
-            ("Implement core data models", ["SETUP"]),
-            ("Implement core business logic", ["SETUP"]),
-        ],
-        "FEATURE_DEVELOPMENT": [
-            ("Implement feature module A", ["CORE_IMPLEMENTATION"]),
-            ("Implement feature module B", ["CORE_IMPLEMENTATION"]),
-            ("Implement feature module C", ["CORE_IMPLEMENTATION"]),
-            ("Integrate feature modules", ["CORE_IMPLEMENTATION"]),
-        ],
-        "INTEGRATION": [
-            ("Set up API layer / routes", ["CORE_IMPLEMENTATION"]),
-            ("Integrate frontend with backend", ["FEATURE_DEVELOPMENT"]),
-        ],
-        "VERIFICATION": [
-            ("Write unit tests", ["CORE_IMPLEMENTATION"]),
-            ("Write integration tests", ["INTEGRATION"]),
-            ("Run end-to-end tests", ["INTEGRATION"]),
-            ("Performance and security review", ["INTEGRATION"]),
-        ],
-    }
-    tasks: list[tuple[str, list[str]]] = []
-    for phase in phases:
-        tasks.extend(task_map.get(phase, [(f"Implement {phase}", [])]))
-    return tasks
+def synthesize_slices(
+    requirement: str,
+    context: dict[str, Any],
+    llm_provider: Optional[LLMProvider] = None,
+) -> list["FeatureSlice"]:
+    """Produce FeatureSlice objects from requirement + context.
+
+    Uses LLM when available for intelligent decomposition.  Falls back to a
+    heuristic slicer that produces 2-6 slices based on complexity.
+
+    Args:
+        requirement: The original requirement text.
+        context: Execution context (analysis results, tech research, etc.).
+        llm_provider: Optional LLM provider for LLM-based decomposition.
+
+    Returns:
+        List of FeatureSlice objects with dependency edges.
+    """
+    from .types import FeatureSlice
+
+    # ── LLM path ──────────────────────────────────────────────────
+    if llm_provider and llm_provider.enabled:
+        try:
+            prompt = _build_slice_synthesis_prompt(requirement, context)
+            raw = llm_provider.generate(prompt)
+            return _parse_llm_slices(raw)
+        except Exception:
+            pass  # fall through to heuristic
+
+    # ── Heuristic path ────────────────────────────────────────────
+    return _heuristic_slices(requirement, context)
 
 
-def _generate_backend_file_structure(requirement: str) -> dict[str, list[str]]:
-    """Generate a backend file structure based on the requirement."""
+def _build_slice_synthesis_prompt(requirement: str, context: dict[str, Any]) -> str:
+    """Build a prompt asking the LLM to decompose into FeatureSlices."""
+    analysis = context.get("requirement", requirement)
+    tech = context.get("tech_research", "Not available")
+    risk = context.get("risk_assessment", "Not available")
+
+    return f"""You are a software architect decomposing a project into feature slices.
+
+REQUIREMENT:
+{requirement}
+
+ANALYSIS:
+{analysis}
+
+TECH RESEARCH:
+{tech}
+
+RISK ASSESSMENT:
+{risk}
+
+Decompose this into 2-6 independent feature slices. Each slice should be a
+cohesive unit of work that a single developer could implement in a focused
+session without coordinating with others working in parallel.
+
+Output JSON array. Each element:
+{{
+  "id": "short-kebab-id",
+  "description": "What to build at feature granularity (NOT file-level)",
+  "scope": ["module/dir1/", "module/dir2/"],
+  "depends_on": ["other-slice-id"],
+  "agent_role": "coder|test_engineer|reviewer",
+  "acceptance": ["Criterion 1", "Criterion 2"]
+}}
+
+Rules:
+- Slices must be independently implementable (one developer, one session)
+- If you need to read source files to decompose, the slice is too small
+- depends_on captures the DAG edges — the real architectural dependencies
+- Prefer fewer, richer slices over many micro-tasks
+
+JSON:"""
+
+
+def _parse_llm_slices(raw: str) -> list["FeatureSlice"]:
+    """Parse LLM response into FeatureSlice objects."""
+    import json
+    from .types import FeatureSlice
+
+    # Strip markdown fences if present
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1])
+
+    try:
+        items = json.loads(text)
+        if not isinstance(items, list):
+            items = [items]
+        return [
+            FeatureSlice.from_dict(item)
+            for item in items
+            if isinstance(item, dict) and "id" in item and "description" in item
+        ]
+    except json.JSONDecodeError:
+        return _heuristic_slices("parsed from LLM", {})
+
+
+def _heuristic_slices(requirement: str, context: dict[str, Any]) -> list["FeatureSlice"]:
+    """Fallback heuristic slicer — produces slices from requirement keywords."""
+    from .types import FeatureSlice
+
     complexity = _estimate_complexity(requirement)
-
-    structure: dict[str, list[str]] = {
-        "models": ["models/__init__.py", "models/base.py"],
-        "routes": ["routes/__init__.py", "routes/main.py"],
-        "services": ["services/__init__.py", "services/core.py"],
-        "tests": ["tests/__init__.py", "tests/test_core.py"],
-    }
-
-    if complexity in ("high", "medium"):
-        structure["models"].extend(["models/schema.py", "models/validators.py"])
-        structure["routes"].extend(["routes/auth.py", "routes/api.py"])
-        structure["services"].extend(["services/auth.py", "services/utils.py"])
-        structure["tests"].extend(["tests/test_auth.py", "tests/test_api.py"])
+    components = _extract_components(requirement)
 
     if complexity == "high":
-        structure["models"].extend(["models/migrations.py", "models/enums.py"])
-        structure["services"].extend(["services/cache.py", "services/queue.py"])
-        structure["tests"].extend(["tests/test_integration.py", "tests/conftest.py"])
+        # 4-6 slices: core, each major component, integration, tests
+        slices = [
+            FeatureSlice(
+                id="core-foundation",
+                description="Implement core data models, configuration, and shared utilities",
+                scope=["core/", "models/", "config/"],
+                depends_on=[],
+                agent_role="coder",
+                acceptance=["Core models compile and import correctly", "Config loads without errors"],
+            ),
+        ]
+        for i, comp in enumerate(components[:4]):
+            slug = comp.replace(" ", "-")[:30]
+            slices.append(FeatureSlice(
+                id=f"feature-{slug}",
+                description=f"Implement {comp} module with full business logic",
+                scope=[f"{comp.split()[0]}/"],
+                depends_on=["core-foundation"],
+                agent_role="coder",
+                acceptance=[f"{comp} module works end-to-end", "No lint errors"],
+            ))
+        slices.append(FeatureSlice(
+            id="integration-wiring",
+            description="Wire all feature modules together, add API layer and cross-cutting concerns",
+            scope=["api/", "routes/", "middleware/"],
+            depends_on=[s.id for s in slices if s.id != "core-foundation"],
+            agent_role="coder",
+            acceptance=["All modules importable from main entrypoint", "API routes respond"],
+        ))
+        slices.append(FeatureSlice(
+            id="test-coverage",
+            description="Write unit and integration tests for all modules",
+            scope=["tests/"],
+            depends_on=["integration-wiring"],
+            agent_role="test_engineer",
+            acceptance=["All tests pass", "No regressions"],
+        ))
 
-    return structure
+    elif complexity == "medium":
+        slices = [
+            FeatureSlice(
+                id="core-impl",
+                description="Implement core models and primary business logic",
+                scope=["models/", "services/"],
+                depends_on=[],
+                agent_role="coder",
+                acceptance=["Models serialize/deserialize correctly", "Core logic passes basic validation"],
+            ),
+            FeatureSlice(
+                id="feature-modules",
+                description="Implement feature modules and API layer",
+                scope=["routes/", "api/"],
+                depends_on=["core-impl"],
+                agent_role="coder",
+                acceptance=["API endpoints respond", "Feature modules integrate with core"],
+            ),
+            FeatureSlice(
+                id="tests",
+                description="Write unit and integration tests",
+                scope=["tests/"],
+                depends_on=["feature-modules"],
+                agent_role="test_engineer",
+                acceptance=["All tests pass", "No regressions"],
+            ),
+        ]
 
+    else:  # low
+        slices = [
+            FeatureSlice(
+                id="implementation",
+                description="Implement the required feature end-to-end",
+                scope=["."],
+                depends_on=[],
+                agent_role="coder",
+                acceptance=["Feature works as described in requirement"],
+            ),
+            FeatureSlice(
+                id="verification",
+                description="Write tests and validate the implementation",
+                scope=["tests/"],
+                depends_on=["implementation"],
+                agent_role="test_engineer",
+                acceptance=["Tests pass", "Implementation matches requirement"],
+            ),
+        ]
 
-def _generate_frontend_file_structure(requirement: str) -> dict[str, list[str]]:
-    """Generate a frontend file structure based on the requirement."""
-    complexity = _estimate_complexity(requirement)
-
-    structure: dict[str, list[str]] = {
-        "components": ["components/__init__.py", "components/Layout.py"],
-        "pages": ["pages/__init__.py", "pages/Home.py"],
-        "styles": ["styles/__init__.py", "styles/main.css"],
-        "tests": ["tests/__init__.py", "tests/test_layout.py"],
-    }
-
-    if complexity in ("high", "medium"):
-        structure["components"].extend([
-            "components/Button.py",
-            "components/Form.py",
-            "components/Header.py",
-        ])
-        structure["pages"].extend([
-            "pages/Dashboard.py",
-            "pages/Settings.py",
-        ])
-        structure["styles"].extend([
-            "styles/theme.py",
-            "styles/responsive.css",
-        ])
-        structure["tests"].extend([
-            "tests/test_button.py",
-            "tests/test_dashboard.py",
-        ])
-
-    if complexity == "high":
-        structure["components"].extend([
-            "components/Modal.py",
-            "components/Table.py",
-            "components/Chart.py",
-        ])
-        structure["pages"].extend([
-            "pages/Analytics.py",
-            "pages/Profile.py",
-        ])
-        structure["tests"].extend([
-            "tests/test_modal.py",
-            "tests/test_analytics.py",
-            "tests/conftest.py",
-        ])
-
-    return structure
+    return slices
 
 
 @dataclass
@@ -584,7 +673,7 @@ class SwarmDAGExecutor:
         from .enums import StateStatus
         
         # Get timeout from context or use default
-        timeout = context.get("llm_timeout", 30.0) if context else 30.0
+        timeout = context.get("llm_timeout", 300.0) if context else 300.0
         
         # Backwards compat: if called with string name, run stub
         if isinstance(dag_or_name, str):
@@ -896,46 +985,29 @@ class SwarmDAGExecutor:
     # ------------------------------------------------------------------ #
 
     def _stub_synthesize(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate a structured execution plan for the SYNTHESIZE subphase."""
+        """Generate FeatureSlices for the SYNTHESIZE subphase."""
         requirement = context.get("requirement", "No requirement provided")
-        complexity = _estimate_complexity(requirement)
-
-        if complexity == "high":
-            phases = ["SETUP", "CORE_IMPLEMENTATION", "FEATURE_DEVELOPMENT", "INTEGRATION", "VERIFICATION"]
-            task_count = 12
-        elif complexity == "medium":
-            phases = ["SETUP", "IMPLEMENTATION", "INTEGRATION", "VERIFICATION"]
-            task_count = 8
-        else:
-            phases = ["SETUP", "IMPLEMENTATION", "VERIFICATION"]
-            task_count = 5
-
-        tasks = [
-            {
-                "id": f"T{i:03d}",
-                "description": desc,
-                "depends_on": deps,
-                "estimated_effort": "medium",
-            }
-            for i, (desc, deps) in enumerate(_get_synthesis_tasks(phases), start=1)
-        ]
+        slices = synthesize_slices(requirement, context, self._llm_provider)
 
         structured_data = {
             "requirement": requirement,
-            "phases": phases,
-            "tasks": tasks,
-            "estimated_task_count": task_count,
-            "estimated_complexity": complexity,
+            "feature_slices": [s.to_dict() for s in slices],
+            "implementation_tasks": [
+                {"id": s.id, "description": s.description}
+                for s in slices
+            ],
+            "estimated_slice_count": len(slices),
+            "estimated_complexity": _estimate_complexity(requirement),
             "synthesis_notes": (
                 f"Stub execution plan for '{task.description}'. "
-                f"{len(phases)} phases, {task_count} tasks."
+                f"{len(slices)} feature slice(s)."
             ),
         }
 
         return {
             "output": (
-                f"[SYNTHESIZE] Execution plan drafted: {len(phases)} phases, "
-                f"{task_count} tasks for {complexity} complexity."
+                f"[SYNTHESIZE] Execution plan drafted: "
+                f"{len(slices)} feature slice(s) for {_estimate_complexity(requirement)} complexity."
             ),
             "agent_role": subphase.agent_role,
             "subphase": subphase.name,
@@ -948,37 +1020,24 @@ class SwarmDAGExecutor:
     # ------------------------------------------------------------------ #
 
     def _stub_backend(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate implementation outline for the BACKEND subphase."""
+        """Generate feature-slice-based output for the BACKEND subphase."""
         requirement = context.get("requirement", "No requirement provided")
-        plan = context.get("plan")
-        plan_tasks = []
-        if plan and isinstance(plan, dict):
-            plan_tasks = plan.get("tasks", [])
-
-        file_structure = _generate_backend_file_structure(requirement)
+        complexity = _estimate_complexity(requirement)
 
         structured_data = {
             "requirement": requirement,
-            "file_structure": file_structure,
-            "implementation_phases": [
-                {"phase": "models", "description": "Data models and schemas", "files": file_structure["models"]},
-                {"phase": "routes", "description": "API routes and handlers", "files": file_structure["routes"]},
-                {"phase": "services", "description": "Business logic services", "files": file_structure["services"]},
-                {"phase": "tests", "description": "Backend tests", "files": file_structure["tests"]},
-            ],
-            "planned_tasks": plan_tasks,
+            "complexity": complexity,
+            "agent_role": subphase.agent_role,
             "implementation_notes": (
-                f"Stub backend implementation outline for '{task.description}'. "
-                f"Generated {sum(len(v) for v in file_structure.values())} file(s) across "
-                f"{len(file_structure)} module(s)."
+                f"Stub backend output for '{task.description}'. "
+                f"Agent will decompose at implementation time."
             ),
         }
 
         return {
             "output": (
-                f"[BACKEND] Implementation outline generated: "
-                f"{sum(len(v) for v in file_structure.values())} file(s) across "
-                f"{len(file_structure)} module(s)."
+                f"[BACKEND] Feature slice executed: {task.description} "
+                f"(complexity: {complexity})"
             ),
             "agent_role": subphase.agent_role,
             "subphase": subphase.name,
@@ -991,31 +1050,24 @@ class SwarmDAGExecutor:
     # ------------------------------------------------------------------ #
 
     def _stub_frontend(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate implementation outline for the FRONTEND subphase."""
+        """Generate feature-slice-based output for the FRONTEND subphase."""
         requirement = context.get("requirement", "No requirement provided")
-        file_structure = _generate_frontend_file_structure(requirement)
+        complexity = _estimate_complexity(requirement)
 
         structured_data = {
             "requirement": requirement,
-            "file_structure": file_structure,
-            "implementation_phases": [
-                {"phase": "components", "description": "UI components", "files": file_structure["components"]},
-                {"phase": "pages", "description": "Page routes/views", "files": file_structure["pages"]},
-                {"phase": "styles", "description": "Styles and theming", "files": file_structure["styles"]},
-                {"phase": "tests", "description": "Frontend tests", "files": file_structure["tests"]},
-            ],
+            "complexity": complexity,
+            "agent_role": subphase.agent_role,
             "implementation_notes": (
-                f"Stub frontend implementation outline for '{task.description}'. "
-                f"Generated {sum(len(v) for v in file_structure.values())} file(s) across "
-                f"{len(file_structure)} module(s)."
+                f"Stub frontend output for '{task.description}'. "
+                f"Agent will decompose at implementation time."
             ),
         }
 
         return {
             "output": (
-                f"[FRONTEND] Implementation outline generated: "
-                f"{sum(len(v) for v in file_structure.values())} file(s) across "
-                f"{len(file_structure)} module(s)."
+                f"[FRONTEND] Feature slice executed: {task.description} "
+                f"(complexity: {complexity})"
             ),
             "agent_role": subphase.agent_role,
             "subphase": subphase.name,
