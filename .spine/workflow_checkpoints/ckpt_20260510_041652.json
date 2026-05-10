@@ -1,0 +1,22 @@
+{
+  "phase_name": "plan",
+  "phase_progress": 0.5,
+  "context": {
+    "requirement": "req",
+    "spec": null,
+    "design": null,
+    "plan": null,
+    "variables": {},
+    "gate_results": {},
+    "started_at": "2026-05-10T04:16:52.172225+00:00",
+    "completed_at": ""
+  },
+  "errors": [],
+  "current_phase": null,
+  "phases": [
+    "plan",
+    "implement",
+    "verify"
+  ],
+  "project_id": "p1"
+}

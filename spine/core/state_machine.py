@@ -304,30 +304,22 @@ def execution_phase(state: SpineState) -> SpineState:
             active_names.append(s.id.upper().replace("-", "_"))
         state["swarm_state"]["active_subphases"] = active_names
     else:
-        # Fallback: hardcoded BACKEND/FRONTEND pattern
+        # Fallback: create a single IMPLEMENTATION subphase from the requirement
+        # This delegates the entire requirement to the agent provider.
+        # Using a single subphase avoids GPU contention from parallel agent calls.
+        requirement_text = state.get("requirement", "")
         subphases = [
             SubPhase(
-                name="BACKEND",
+                name="IMPLEMENTATION",
                 priority=1,
-                parallel=True,
+                parallel=False,
                 agent_role="coder",
                 tasks=[
-                    Task(id="backend_impl", description="Implement backend logic"),
-                    Task(id="backend_tests", description="Write backend tests"),
-                ],
-            ),
-            SubPhase(
-                name="FRONTEND",
-                priority=1,
-                parallel=True,
-                agent_role="coder",
-                tasks=[
-                    Task(id="frontend_impl", description="Implement frontend"),
-                    Task(id="frontend_tests", description="Write frontend tests"),
+                    Task(id="implement", description=requirement_text),
                 ],
             ),
         ]
-        state["swarm_state"]["active_subphases"] = ["BACKEND", "FRONTEND"]
+        state["swarm_state"]["active_subphases"] = ["IMPLEMENTATION"]
     
     # Build phase with hooks and conditions
     execution_phase_obj = Phase(
