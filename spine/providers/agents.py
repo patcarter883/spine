@@ -9,9 +9,9 @@ Codex CLI (OpenAI-only) and Claude Code (Anthropic-only) are available as
 optional providers that users opt into via spine.yaml.
 
 Integration modes for OpenCode:
-  - ``run``  -- subprocess ``opencode run "prompt"`` (default, simplest)
+  - ``run``  -- subprocess ``opencode run "prompt"`` (simplest)
   - ``serve`` -- HTTP API via ``opencode serve`` (production, parallel)
-  - ``acp``  -- JSON-RPC over stdio via ``opencode acp`` (future)
+  - ``acp``  -- JSON-RPC over stdio via ``opencode acp`` (recommended)
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -364,7 +365,7 @@ class OpenCodeAgentProvider(AgentProvider):
                 metadata={"mode": "serve"},
             )
 
-    # -- ACP mode (JSON-RPC over stdio, future) --------------------------
+    # -- ACP mode (JSON-RPC over stdio) ------------------------------------
 
     def _execute_acp(
         self,
@@ -376,14 +377,246 @@ class OpenCodeAgentProvider(AgentProvider):
     ) -> AgentResult:
         """ACP mode — structured agent-to-agent communication.
 
-        This is a forward-looking integration using OpenCode's Agent Client
-        Protocol (JSON-RPC over stdio).  It provides the richest structured
-        output but requires opencode >= 0.5.0 with ACP support.
-
-        Currently falls back to run mode with a warning.
+        Uses OpenCode's Agent Client Protocol (JSON-RPC over stdio).
+        More reliable than ``opencode run`` subprocess mode because it
+        uses a persistent connection with proper event streaming.
         """
-        logger.warning("ACP mode not yet implemented, falling back to run mode")
-        return self._execute_run(prompt, workdir, files, timeout, **kwargs)
+        cwd = str(workdir) if workdir else os.getcwd()
+        if not os.path.isabs(cwd):
+            cwd = os.path.abspath(cwd)
+
+        model = kwargs.get("model") or self._config.get("model")
+
+        proc = None
+        session_id = None
+        try:
+            cmd = ["opencode", "acp"]
+            env = {**os.environ, "TERM": "dumb"}
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
+
+            # 1. Initialize
+            init_resp = self._acp_send_and_recv(proc, 1, "initialize", {
+                "protocolVersion": 1,
+                "capabilities": {},
+                "clientInfo": {"name": "spine", "version": "0.1.0"},
+            })
+            if "error" in init_resp:
+                return AgentResult(
+                    output="", exit_code=-1,
+                    error=f"ACP initialize failed: {init_resp['error']}",
+                    metadata={"mode": "acp"},
+                )
+
+            # 2. Initialized notification (no response expected)
+            self._acp_send(proc, "notifications/initialized", {})
+
+            # 3. Create session
+            sess_resp = self._acp_send_and_recv(proc, 2, "session/new", {
+                "cwd": cwd, "mcpServers": [],
+            })
+            if "error" in sess_resp:
+                return AgentResult(
+                    output="", exit_code=-1,
+                    error=f"ACP session/new failed: {sess_resp['error']}",
+                    metadata={"mode": "acp"},
+                )
+            session_id = sess_resp.get("result", {}).get("sessionId")
+            if not session_id:
+                return AgentResult(
+                    output="", exit_code=-1,
+                    error="ACP session/new returned no session ID",
+                    metadata={"mode": "acp"},
+                )
+            logger.info("ACP session created: %s", session_id)
+
+            # 4. Build prompt params with model option
+            prompt_parts = [{"type": "text", "text": prompt}]
+            if files:
+                for f in files:
+                    try:
+                        with open(f, "r") as fh:
+                            content = fh.read()
+                        prompt_parts.append({
+                            "type": "resource",
+                            "resource": {
+                                "uri": f"file://{os.path.abspath(f)}",
+                                "mimeType": "text/plain",
+                                "text": content,
+                            },
+                        })
+                    except Exception:
+                        pass
+
+            prompt_params: dict[str, Any] = {
+                "sessionId": session_id,
+                "prompt": prompt_parts,
+            }
+            if model:
+                prompt_params["options"] = {"model": model}
+
+            prompt_id = 3
+            self._acp_send(proc, "session/prompt", prompt_params, id=prompt_id)
+
+            # 5. Collect streaming events until prompt completes or timeout
+            text_parts = []
+            deadline = time.monotonic() + timeout
+            completed = False
+            error_msg = None
+
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                line = self._acp_readline(proc, timeout=max(1, int(remaining)))
+                if line is None:
+                    if proc.poll() is not None:
+                        error_msg = f"ACP process exited with code {proc.returncode}"
+                        break
+                    continue
+
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Prompt response (matches request id) = completion
+                if msg.get("id") == prompt_id:
+                    if "error" in msg:
+                        error_msg = f"ACP prompt error: {msg['error']}"
+                    completed = True
+                    break
+
+                # Process session/update notifications
+                method = msg.get("method", "")
+                if method == "session/update":
+                    update = msg.get("params", {}).get("update", {})
+                    su = update.get("sessionUpdate", "")
+
+                    if su == "agent_message_chunk":
+                        content = update.get("content", {})
+                        if content.get("type") == "text":
+                            text = content.get("text", "")
+                            if text:
+                                text_parts.append(text)
+                    elif su == "tool_call":
+                        logger.debug(
+                            "ACP tool_call: %s", update.get("title", "?"))
+                    # Skip: agent_thought_chunk, usage_update,
+                    # available_commands_update, tool_call_update
+
+            # 6. Close session
+            if session_id:
+                try:
+                    self._acp_send(proc, "session/close",
+                                   {"sessionId": session_id}, id=99)
+                except Exception:
+                    pass
+
+            # Determine result
+            changed = _git_changed_files(cwd)
+            output = "".join(text_parts).strip()
+
+            if error_msg:
+                return AgentResult(
+                    output=output, exit_code=1,
+                    error=error_msg,
+                    files_changed=changed,
+                    metadata={"mode": "acp", "session": session_id},
+                )
+
+            if not completed and time.monotonic() >= deadline:
+                return AgentResult(
+                    output=output, exit_code=-1,
+                    error=f"ACP timed out after {timeout}s",
+                    files_changed=changed,
+                    metadata={"mode": "acp", "session": session_id,
+                              "timeout": True},
+                )
+
+            return AgentResult(
+                output=output, exit_code=0,
+                files_changed=changed,
+                metadata={"mode": "acp", "session": session_id},
+            )
+
+        except Exception as exc:
+            return AgentResult(
+                output="", exit_code=-1,
+                error=f"ACP execution error: {exc}",
+                metadata={"mode": "acp"},
+            )
+        finally:
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+    def _acp_send(
+        self,
+        proc: subprocess.Popen,
+        method: str,
+        params: dict,
+        id: int | None = None,
+    ) -> None:
+        """Send a JSON-RPC message to the ACP subprocess."""
+        msg: dict = {"jsonrpc": "2.0", "method": method, "params": params}
+        if id is not None:
+            msg["id"] = id
+        data = json.dumps(msg) + "\n"
+        proc.stdin.write(data.encode())
+        proc.stdin.flush()
+
+    def _acp_send_and_recv(
+        self,
+        proc: subprocess.Popen,
+        id: int,
+        method: str,
+        params: dict,
+    ) -> dict:
+        """Send a JSON-RPC request and wait for its response."""
+        self._acp_send(proc, method, params, id=id)
+        while True:
+            line = self._acp_readline(proc, timeout=30)
+            if line is None:
+                raise RuntimeError("ACP subprocess closed while waiting for response")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == id:
+                return msg
+            # Skip notifications — they'll be processed during prompt streaming
+
+    def _acp_readline(
+        self,
+        proc: subprocess.Popen,
+        timeout: int = 30,
+    ) -> str | None:
+        """Read one line from ACP subprocess stdout with timeout."""
+        import select
+        if proc.stdout is None:
+            return None
+        fd = proc.stdout.fileno()
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return None
+        line = proc.stdout.readline()
+        if not line:
+            return None
+        return line.decode().strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════
