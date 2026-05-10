@@ -19,6 +19,7 @@ dependencies = [
     "click>=8.0",
     "rich>=13.0",
     "sqlite-utils>=3.36",
+    "streamlit>=1.30.0",
 ]
 
 [project.optional-dependencies]

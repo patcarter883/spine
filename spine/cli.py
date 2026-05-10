@@ -546,6 +546,27 @@ def plugins(config: str):
         console.print("[yellow]No plugins discovered[/]")
 
 
+@cli.command()
+def ui():
+    """Start the SPINE web dashboard."""
+    import subprocess
+    import sys
+
+    console.print("[bold blue]Starting SPINE Dashboard...[/]")
+    console.print("[dim]Open http://localhost:8501 in your browser[/]")
+
+    env = os.environ.copy()
+    env["STREAMLIT_SERVER_HEADLESS"] = "true"
+    
+    project_root = str(Path(__file__).resolve().parent.parent)
+    subprocess.run([
+        sys.executable, "-m", "streamlit", "run",
+        "--browser.serverAddress", "localhost",
+        "--server.port", "8501",
+        "spine/ui/app.py",
+    ], cwd=project_root, env=env)
+
+
 def main():
     """Entry point for CLI."""
     cli()
