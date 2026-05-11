@@ -394,6 +394,9 @@ def get_work_item_detail(
                     "error_history": [],
                     "variables": {},
                     "errors": [err] if err else [],
+                    "error_message": err,
+                    "status": status or "queued",
+                    "total_tasks": total or 0,
                     "started_at": "",
                 }
     except Exception:
@@ -757,15 +760,159 @@ def reject_gate(thread_id: str, feedback: str) -> bool:
 def resume_work(thread_id: str, checkpoint_path: Optional[str] = None) -> bool:
     """Resume a paused work item from its last checkpoint.
 
+    Loads the checkpointed state and runs the state machine forward from
+    where it left off, in a background thread so the UI stays responsive.
+
     Args:
         thread_id: Thread ID to resume.
         checkpoint_path: Explicit checkpoint path.
 
     Returns:
-        True on success, False if no state found.
+        True if a checkpoint was found and a resume thread was kicked
+        off, False if no state exists for this thread_id.
     """
     from ..core.state_machine import SpineStateMachine
+    from ..work.dispatcher import record_work_item
 
+    cp_path = str(get_checkpoint_path(checkpoint_path))
+
+    # Load existing state to verify the checkpoint exists and to get the
+    # original requirement for the work_items record.
+    machine = SpineStateMachine(checkpoint_path=cp_path)
+    try:
+        existing_state = machine.resume(thread_id)
+    except Exception as e:
+        print(f"[spine.ui.utils] resume_work: failed to read state: {e}")
+        return False
+
+    if existing_state is None:
+        return False
+
+    requirement = existing_state.get("requirement", "")
+
+    # Load providers from config so the resumed run actually has an LLM /
+    # agent attached. Without these the workflow runs in stub mode again.
+    try:
+        from ..cli import load_providers, get_primary_provider, load_config
+        providers_by_type = load_providers(".spine/config.yaml")
+        providers = {}
+        for category in providers_by_type:
+            primary = get_primary_provider(providers_by_type, category)
+            if primary is not None:
+                providers[category] = primary
+        config = load_config(".spine/config.yaml")
+        project_config = config.get("project", {})
+        project_root = os.getcwd()
+        project_context = {
+            "name": project_config.get("name", Path(project_root).name),
+            "root": project_config.get("root", project_root),
+            "description": project_config.get("description", ""),
+            "tech_stack": project_config.get("tech_stack", []),
+        }
+    except Exception as e:
+        print(f"[spine.ui.utils] resume_work: failed to load providers: {e}")
+        return False
+
+    # Mark as running and run forward in a background thread.
+    record_work_item(cp_path, thread_id, requirement,
+                     status="running", phase=str(existing_state.get("phase", "INIT")))
+
+    def _run_forward():
+        try:
+            machine_local = SpineStateMachine(
+                checkpoint_path=cp_path,
+                llm_provider=providers.get("llm"),
+            )
+            cfg = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "providers": providers,
+                }
+            }
+            # Passing None as input tells LangGraph to continue from the
+            # last checkpoint instead of starting fresh.
+            result_state = machine_local.app.invoke(None, cfg)
+            final_phase = str(result_state.get("phase", "UNKNOWN"))
+            success = final_phase == "PhaseName.COMPLETE" or final_phase.endswith("COMPLETE")
+            plan = result_state.get("plan") or {}
+            total = len(plan.get("tasks", [])) if isinstance(plan, dict) else 0
+            record_work_item(
+                cp_path, thread_id, requirement,
+                status="completed" if success else "failed",
+                phase=final_phase,
+                completed_tasks=len(result_state.get("completed_tasks", [])),
+                total_tasks=total,
+                error_message=None if success else "Resume completed with issues",
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            record_work_item(cp_path, thread_id, requirement,
+                             status="failed", phase="ERROR",
+                             error_message=f"Resume failed: {exc}")
+
+    threading.Thread(target=_run_forward, daemon=True).start()
+    return True
+
+
+def rerun_work(thread_id: str, checkpoint_path: Optional[str] = None) -> Optional[dict]:
+    """Re-run a work item by submitting a fresh job with the same requirement.
+
+    Reads the original requirement from the existing checkpoint, then submits
+    a brand new work item (new thread_id) using the same submission path as
+    the "New Work" form. This is the right primitive when a previous run
+    completed (successfully or not) and the user wants to try again — as
+    opposed to ``resume_work`` which continues an in-progress run.
+
+    Args:
+        thread_id: Thread ID of the work item to re-run.
+        checkpoint_path: Explicit checkpoint path.
+
+    Returns:
+        Same shape as ``start_work``: dict with ``thread_id``, ``task_id``
+        and ``idempotency_key`` on success, or ``{"error": ...}`` on failure.
+    """
+    cp_path = get_checkpoint_path(checkpoint_path)
+    requirement: Optional[str] = None
+
+    # Prefer the work_items table (cheap, definitive), fall back to
+    # reading the checkpointed state.
+    try:
+        if cp_path.exists():
+            with sqlite3.connect(str(cp_path)) as conn:
+                cur = conn.execute(
+                    "SELECT requirement FROM work_items WHERE thread_id=?",
+                    (thread_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    requirement = row[0]
+    except Exception:
+        pass
+
+    if not requirement:
+        try:
+            from ..core.state_machine import SpineStateMachine
+            machine = SpineStateMachine(checkpoint_path=str(cp_path))
+            state = machine.resume(thread_id)
+            if state:
+                requirement = state.get("requirement", "")
+        except Exception:
+            pass
+
+    if not requirement:
+        return {"error": f"Could not find requirement for {thread_id}"}
+
+    # Fresh submission — new thread_id, new idempotency_key.
+    return start_work(
+        requirement=requirement,
+        checkpoint_path=str(cp_path) if cp_path else None,
+    )
+
+
+def _legacy_resume_state_only(thread_id: str, checkpoint_path: Optional[str] = None) -> bool:
+    """Read-only state lookup (kept for callers that just want to check existence)."""
+    from ..core.state_machine import SpineStateMachine
     machine = SpineStateMachine(checkpoint_path=checkpoint_path or ".spine/spine.db")
     try:
         state = machine.resume(thread_id)

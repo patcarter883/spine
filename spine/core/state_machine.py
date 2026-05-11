@@ -348,7 +348,15 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
     providers = _get_providers(state, config)
     llm_provider = providers.get("llm")
     storage_provider = providers.get("storage")
-    agent_provider = state.get("agent_provider")
+    # Read agent_provider from config-resolved providers first; fall back to
+    # state only when it's a real instance (LangGraph serialization will turn
+    # provider objects into plain dicts, which would break downstream .execute()
+    # calls — `_get_providers` filters those out).
+    agent_provider = providers.get("agent")
+    if agent_provider is None:
+        state_ap = state.get("agent_provider")
+        if state_ap is not None and not isinstance(state_ap, dict):
+            agent_provider = state_ap
     
     debug_prompts = state.get("variables", {}).get("debug_prompts", False)
     

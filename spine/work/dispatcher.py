@@ -108,6 +108,17 @@ def run_workflow(
     from ..core.state_machine import SpineStateMachine
 
     llm_provider = providers.get("llm")
+    # Agent provider can be supplied explicitly OR included in providers dict
+    # under the "agent" key. The latter is what submit_work() does so that all
+    # provider categories travel together through config (avoiding LangGraph
+    # checkpoint serialization that turns objects into plain dicts).
+    if agent_provider is None:
+        agent_provider = providers.get("agent")
+    elif "agent" not in providers:
+        # Mirror it into providers so config["configurable"]["providers"]
+        # carries it through to phase nodes that look it up there.
+        providers = {**providers, "agent": agent_provider}
+
     machine = SpineStateMachine(
         checkpoint_path=checkpoint_path,
         llm_provider=llm_provider,
@@ -136,7 +147,11 @@ def run_workflow(
         },
         "errors": [],
         "providers": {},  # Empty in state - providers go through config
-        "agent_provider": agent_provider,
+        # NOTE: do NOT put agent_provider in state — LangGraph's checkpointer
+        # serializes state between nodes and converts provider instances into
+        # plain dicts, breaking downstream `.execute()` calls. Pass it via
+        # config["configurable"]["providers"]["agent"] instead.
+        "agent_provider": None,
         "critic_gate_result": None,
         "error_state": None,
         "error_history": [],
@@ -166,15 +181,24 @@ def run_workflow(
         final_phase = result_state.get("phase", "UNKNOWN")
         success = final_phase == "COMPLETE"
 
-        # Get total tasks from plan if available
+        # Get total tasks from plan if available. The state's
+        # ``completed_tasks`` list grows across PLANNING + EXECUTION +
+        # VERIFICATION subphases, so it can exceed the plan's task count.
+        # We want a stable "X of Y" denominator that won't display "10/1"
+        # in the UI. Use the larger of (plan tasks, completed) so the bar
+        # reads sensibly when subphase tasks dominate.
         plan = result_state.get("plan") or {}
-        plan_tasks = plan.get("tasks", [])
-        total_tasks = len(plan_tasks) if plan_tasks else len(result_state.get("completed_tasks", []))
+        plan_tasks = plan.get("tasks", []) if isinstance(plan, dict) else []
+        completed_count = len(result_state.get("completed_tasks", []))
+        if plan_tasks:
+            total_tasks = max(len(plan_tasks), completed_count)
+        else:
+            total_tasks = max(completed_count, 1)
 
         return {
             "status": "success" if success else "completed_with_issues",
             "phase": final_phase,
-            "completed_tasks": len(result_state.get("completed_tasks", [])),
+            "completed_tasks": completed_count,
             "total_tasks": total_tasks,
             "errors": result_state.get("errors", []),
             "thread_id": thread_id,
@@ -204,6 +228,7 @@ def submit_work(
     background: bool = False,
     stream_callback: Optional[Callable[[dict], None]] = None,
     on_complete: Optional[Callable[[dict], None]] = None,
+    warnings: Optional[list[str]] = None,
 ) -> dict:
     """Submit a new work item for execution.
 
@@ -229,18 +254,28 @@ def submit_work(
     checkpoint_path = checkpoint_path or ".spine/spine.db"
     providers = providers or {}
     project_context = project_context or {}
+    warnings = warnings or []
 
-    # Record the work item as queued
+    # Record the work item as queued. If we have warnings (e.g. agent
+    # provider configured but binary missing), surface them in the
+    # error_message field so the UI shows the user *why* execution may
+    # behave oddly — this is the difference between "silent stub" and
+    # "user knows what's going on".
+    queued_warning = "; ".join(warnings) if warnings else None
     record_work_item(
         checkpoint_path, thread_id, requirement,
-        status="queued", phase="INIT"
+        status="queued", phase="INIT",
+        error_message=queued_warning,
     )
 
     def _execute_and_record():
         """Run workflow and update status."""
+        # Preserve any queued warnings (e.g. agent provider unavailable)
+        # in the running record so the UI can keep showing them.
         record_work_item(
             checkpoint_path, thread_id, requirement,
-            status="running", phase="INIT"
+            status="running", phase="INIT",
+            error_message=queued_warning,
         )
 
         result = run_workflow(
@@ -254,19 +289,27 @@ def submit_work(
             stream_callback=stream_callback,
         )
 
-        # Update final status
+        # Update final status. Always carry the queued_warning forward so
+        # users keep seeing "agent unavailable" even after success — that's
+        # the whole point: success without the configured agent means stub-y
+        # success, which is the user-confusing behavior we're documenting.
         if result.get("status") == "success":
+            final_msg = queued_warning
             record_work_item(
                 checkpoint_path, thread_id, requirement,
                 status="completed", phase="COMPLETE",
                 completed_tasks=result.get("completed_tasks", 0),
                 total_tasks=result.get("total_tasks", 0),
+                error_message=final_msg,
             )
         else:
+            err_text = result.get("error", "Unknown error")
+            if queued_warning:
+                err_text = f"{queued_warning} | {err_text}"
             record_work_item(
                 checkpoint_path, thread_id, requirement,
                 status="failed", phase=result.get("phase", "ERROR"),
-                error_message=result.get("error", "Unknown error")
+                error_message=err_text,
             )
 
         if on_complete:
@@ -282,6 +325,7 @@ def submit_work(
             "thread_id": thread_id,
             "status": "queued",
             "message": "Work submitted to background queue",
+            "warnings": list(warnings or []),
         }
     else:
         # Run synchronously (CLI mode)
@@ -331,9 +375,21 @@ def submit_work_from_config(
     # Load providers
     providers_by_type = load_providers(config_path)
     providers = {}
+    agent_warnings: list[str] = []
     for category in providers_by_type:
         primary = get_primary_provider(providers_by_type, category)
         if primary is not None:
+            # For agent providers, verify the underlying CLI binary is actually
+            # installed. A configured-but-unavailable agent would otherwise
+            # silently fall back to LLM-only execution that produces text but
+            # no real code changes — making work appear to "complete instantly".
+            if category == "agent" and not primary.enabled:
+                provider_name = getattr(primary, "name", type(primary).__name__)
+                agent_warnings.append(
+                    f"Agent provider '{provider_name}' is configured but not "
+                    f"available (binary missing or disabled). Install it or "
+                    f"remove the agent provider from config to silence this warning."
+                )
             providers[category] = primary
 
     # Load project context from config
@@ -367,6 +423,7 @@ def submit_work_from_config(
         background=background,
         stream_callback=stream_callback,
         on_complete=on_complete,
+        warnings=agent_warnings,
     )
 
 

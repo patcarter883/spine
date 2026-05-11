@@ -10,6 +10,7 @@ from spine.ui.utils import (
     approve_gate,
     reject_gate,
     resume_work,
+    rerun_work,
     delete_work,
     go_back,
 )
@@ -53,6 +54,14 @@ def render_work_detail() -> None:
 
     st.write(f"**Requirement:** {detail.get('requirement', 'Unknown')}")
 
+    # Surface configuration warnings (e.g. agent provider configured but
+    # binary missing). Without this, users see "completed" instantly with
+    # no work done and no clue why.
+    warning_msg = detail.get("error_message")
+    if warning_msg and detail.get("status") in ("queued", "running", "completed"):
+        if "configured but not available" in str(warning_msg) or "Agent provider" in str(warning_msg):
+            st.warning(f"⚠ {warning_msg}")
+
     # Action buttons
     col1, col2, col3, col4 = st.columns(4)
     if col1.button("▶ Resume", key=f"resume_{thread_id}"):
@@ -62,7 +71,16 @@ def render_work_detail() -> None:
         else:
             st.error("Failed to resume work item.")
     if col2.button("🔄 Re-run", key=f"rerun_{thread_id}"):
-        st.warning("Re-run not yet implemented. Use CLI: `spine work`")
+        result = rerun_work(thread_id)
+        if result and not result.get("error"):
+            new_id = result.get("thread_id")
+            st.success(f"Re-run submitted as new work item: {new_id}")
+            if new_id:
+                st.session_state.selected_work_id = new_id
+            st.rerun()
+        else:
+            err = (result or {}).get("error", "Re-run failed (unknown error).")
+            st.error(f"Re-run failed: {err}")
     if col3.button("🗑 Delete", key=f"delete_{thread_id}"):
         st.session_state.delete_confirm = thread_id
     if col4.button("← Back", key=f"back_{thread_id}"):
