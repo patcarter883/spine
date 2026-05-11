@@ -246,6 +246,7 @@ def create_planning_agent(
     providers: dict[str, Any],
     backend: Any | None = None,
     max_steps: int = 50,
+    root_dir: str | None = None,
 ) -> Any:
     """Construct a DA agent for the PLANNING phase.
 
@@ -257,6 +258,8 @@ def create_planning_agent(
         providers: Provider dict from config (must include "llm").
         backend: DA backend (defaults to LocalShellBackend for planning).
         max_steps: Maximum model call steps before wrap-up notification.
+        root_dir: Project root directory for filesystem backends.
+            Defaults to cwd if not provided; passed through to get_backend().
 
     Returns:
         A compiled LangGraph StateGraph (DA agent) ready to invoke.
@@ -265,7 +268,7 @@ def create_planning_agent(
     if chat_model is None:
         raise ValueError("No LLM provider configured — cannot create planning agent")
 
-    backend = backend or get_backend(phase=PhaseName.PLANNING)
+    backend = backend or get_backend(phase=PhaseName.PLANNING, root_dir=root_dir)
 
     subagents = [
         SubAgent(
@@ -328,6 +331,7 @@ def create_execution_agent(
     spec_content: str = "",
     backend: Any | None = None,
     max_steps: int = 100,
+    root_dir: str | None = None,
 ) -> Any:
     """Construct a DA agent for the EXECUTION phase.
 
@@ -342,6 +346,8 @@ def create_execution_agent(
         spec_content: Content of the spec file (from disk).
         backend: DA backend (defaults to LocalShellBackend).
         max_steps: Maximum model call steps.
+        root_dir: Project root directory for filesystem backends.
+            Defaults to cwd if not provided; passed through to get_backend().
 
     Returns:
         A compiled DA agent ready to invoke.
@@ -350,7 +356,7 @@ def create_execution_agent(
     if chat_model is None:
         raise ValueError("No LLM provider configured — cannot create execution agent")
 
-    backend = backend or get_backend(phase=PhaseName.EXECUTION)
+    backend = backend or get_backend(phase=PhaseName.EXECUTION, root_dir=root_dir)
 
     # Build SubAgent specs from FeatureSlices
     subagents = []
@@ -412,6 +418,7 @@ def create_verification_agent(
     providers: dict[str, Any],
     backend: Any | None = None,
     max_steps: int = 50,
+    root_dir: str | None = None,
 ) -> Any:
     """Construct a DA agent for the VERIFICATION phase.
 
@@ -422,6 +429,8 @@ def create_verification_agent(
         providers: Provider dict from config.
         backend: DA backend (defaults to LocalShellBackend).
         max_steps: Maximum model call steps.
+        root_dir: Project root directory for filesystem backends.
+            Defaults to cwd if not provided; passed through to get_backend().
 
     Returns:
         A compiled DA agent ready to invoke.
@@ -430,7 +439,7 @@ def create_verification_agent(
     if chat_model is None:
         raise ValueError("No LLM provider configured — cannot create verification agent")
 
-    backend = backend or get_backend(phase=PhaseName.VERIFICATION)
+    backend = backend or get_backend(phase=PhaseName.VERIFICATION, root_dir=root_dir)
 
     subagents = [
         SubAgent(

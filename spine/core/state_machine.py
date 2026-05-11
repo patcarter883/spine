@@ -194,11 +194,14 @@ def _planning_phase_da(
     debug_prompts = state.get("variables", {}).get("debug_prompts", False)
     max_steps = int(os.environ.get("SPINE_PLANNING_STEPS", "50"))
 
+    project_root = _get_project_root(state)
+
     try:
         planning_agent = create_planning_agent(
             requirement=state["requirement"],
             providers=providers,
             max_steps=max_steps,
+            root_dir=project_root,
         )
     except ValueError as e:
         state["errors"].append(f"DA planning agent creation failed: {e}")
@@ -603,10 +606,11 @@ def _execution_phase_da(
             acceptance=["Feature works as described"],
         )]
 
+    project_root = _get_project_root(state)
     max_steps = int(os.environ.get("SPINE_EXECUTION_STEPS", "100"))
 
     try:
-        backend = get_backend(phase=PhaseName.EXECUTION)
+        backend = get_backend(phase=PhaseName.EXECUTION, root_dir=project_root)
         execution_agent = create_execution_agent(
             requirement=state["requirement"],
             providers=providers,
@@ -615,6 +619,7 @@ def _execution_phase_da(
             spec_content=spec_content,
             backend=backend,
             max_steps=max_steps,
+            root_dir=project_root,
         )
     except ValueError as e:
         state["errors"].append(f"DA execution agent creation failed: {e}")
@@ -880,11 +885,14 @@ def _verification_phase_da(
     debug_prompts = state.get("variables", {}).get("debug_prompts", False)
     max_steps = int(os.environ.get("SPINE_VERIFICATION_STEPS", "50"))
 
+    project_root = _get_project_root(state)
+
     try:
         verification_agent = create_verification_agent(
             requirement=state["requirement"],
             providers=providers,
             max_steps=max_steps,
+            root_dir=project_root,
         )
     except ValueError as e:
         state["errors"].append(f"DA verification agent creation failed: {e}")
@@ -1459,6 +1467,23 @@ def _get_spine_root(state: SpineState) -> str:
     # Try checkpoint_path from state variables first
     checkpoint_path = state.get("variables", {}).get("checkpoint_path", ".spine/spine.db")
     return os.path.dirname(checkpoint_path)
+
+
+def _get_project_root(state: SpineState) -> str:
+    """Resolve the project root directory (parent of .spine/) from state.
+
+    The DA planning agent's explorer/sme/analyst subagents need to run
+    inside the actual project root so they can ls, grep, and read source
+    files.  get_backend() uses this as root_dir for LocalShellBackend.
+    """
+    checkpoint_path = state.get("variables", {}).get("checkpoint_path", ".spine/spine.db")
+    abs_checkpoint = os.path.abspath(checkpoint_path)
+    # checkpoint_path = <project_root>/.spine/spine.db  (or .spine/spine.db relative)
+    # dirname once → <project_root>/.spine
+    # dirname twice → <project_root>
+    spine_root = os.path.dirname(abs_checkpoint)
+    project_root = os.path.dirname(spine_root)
+    return project_root
 
 
 def _log_phase_event(state: SpineState, phase_name: str, event_type: str, data: Dict[str, Any], config: Optional[RunnableConfig] = None) -> None:
