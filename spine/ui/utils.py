@@ -1049,6 +1049,629 @@ def format_bytes(size: int) -> str:
     return f"{size:.1f} TB"
 
 
+# ── Artifact Helpers ─────────────────────────────────────────
+
+def get_work_item_artifacts(thread_id: str) -> list[dict]:
+    """Find and read all artifact files for a work item.
+
+    Scans .spine/artifacts/ and .spine/spec/ for files matching
+    the thread_id. Returns list of dicts with filename, content,
+    and path for rendering in the UI.
+
+    Args:
+        thread_id: Work item thread ID.
+
+    Returns:
+        List of artifact dicts: {filename, content, path, category}.
+    """
+    artifacts: list[dict] = []
+
+    # Artifact directories to scan
+    artifact_dirs = [
+        (".spine/artifacts/plans", "Plan"),
+        (".spine/artifacts/reports", "Report"),
+        (".spine/spec", "Specification"),
+    ]
+
+    for dir_path, category in artifact_dirs:
+        p = Path(dir_path)
+        if not p.exists():
+            continue
+        for f in p.iterdir():
+            # Match files that contain the thread_id in the filename
+            if thread_id in f.name or f.stem == thread_id:
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                    artifacts.append({
+                        "filename": f.name,
+                        "content": content,
+                        "path": str(f),
+                        "category": category,
+                    })
+                except Exception:
+                    pass
+
+    # Also check for spec/artifact paths stored in state variables
+    return artifacts
+
+
+def get_feature_slice_outcomes(detail: dict) -> list[dict]:
+    """Extract FeatureSlice outcome data from work item detail.
+
+    Args:
+        detail: Work item detail dict from get_work_item_detail().
+
+    Returns:
+        List of slice outcome dicts with id, description, status,
+        scope, acceptance, and agent_role.
+    """
+    plan = detail.get("plan")
+    if not plan or not isinstance(plan, dict):
+        return []
+
+    raw_slices = plan.get("feature_slices", [])
+    if not raw_slices:
+        return []
+
+    completed_tasks = set(detail.get("completed_tasks", []))
+    failed_tasks = set(detail.get("failed_tasks", []))
+
+    outcomes: list[dict] = []
+    for s in raw_slices:
+        if isinstance(s, dict):
+            slice_id = s.get("id", "unknown")
+            # Determine status based on whether slice tasks appear in
+            # completed/failed lists
+            status = "pending"
+            slice_task_ids = [
+                f"impl-{slice_id}-exec",
+                f"plan-{slice_id}",
+                slice_id,
+            ]
+            for tid in slice_task_ids:
+                if tid in completed_tasks:
+                    status = "completed"
+                    break
+                if tid in failed_tasks:
+                    status = "failed"
+                    break
+
+            outcomes.append({
+                "id": slice_id,
+                "description": s.get("description", ""),
+                "status": status,
+                "scope": s.get("scope", []),
+                "acceptance": s.get("acceptance", []),
+                "agent_role": s.get("agent_role", "coder"),
+                "depends_on": s.get("depends_on", []),
+            })
+
+    return outcomes
+
+
+# ── Queue Helpers ────────────────────────────────────────────
+
+def get_queue_status() -> dict[str, int]:
+    """Get summary counts from the task queue.
+
+    Returns:
+        Dict with pending, running, success, failed, cancelled counts.
+    """
+    from ..config.queue import SqliteQueueBackend
+
+    try:
+        backend = SqliteQueueBackend()
+        conn = sqlite3.connect(backend._db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, COUNT(*) FROM queue_tasks GROUP BY status"
+        )
+        counts: dict[str, int] = {
+            "pending": 0, "running": 0, "success": 0,
+            "failed": 0, "cancelled": 0,
+        }
+        for row in cursor.fetchall():
+            status = row[0]
+            count = row[1]
+            if status in counts:
+                counts[status] = count
+        conn.close()
+        return counts
+    except Exception:
+        return {"pending": 0, "running": 0, "success": 0, "failed": 0, "cancelled": 0}
+
+
+def get_queue_items(status: Optional[str] = None) -> list[dict]:
+    """Get queue items, optionally filtered by status.
+
+    Args:
+        status: Optional status filter (pending, running, success, failed).
+
+    Returns:
+        List of queue item dicts.
+    """
+    from ..config.queue import SqliteQueueBackend
+
+    try:
+        backend = SqliteQueueBackend()
+        conn = sqlite3.connect(backend._db_path)
+        cursor = conn.cursor()
+
+        if status:
+            cursor.execute(
+                "SELECT id, status, task_type, payload, created_at, "
+                "started_at, completed_at, result, error, attempts "
+                "FROM queue_tasks WHERE status = ? ORDER BY created_at DESC",
+                (status,),
+            )
+        else:
+            cursor.execute(
+                "SELECT id, status, task_type, payload, created_at, "
+                "started_at, completed_at, result, error, attempts "
+                "FROM queue_tasks ORDER BY created_at DESC",
+            )
+
+        items: list[dict] = []
+        for row in cursor.fetchall():
+            payload = json.loads(row[3]) if row[3] else {}
+            result = json.loads(row[7]) if row[7] else None
+            items.append({
+                "id": row[0],
+                "status": row[1],
+                "task_type": row[2],
+                "payload": payload,
+                "created_at": row[4],
+                "started_at": row[5],
+                "completed_at": row[6],
+                "result": result,
+                "error": row[8],
+                "attempts": row[9],
+            })
+        conn.close()
+        return items
+    except Exception:
+        return []
+
+
+def enqueue_task(requirement: str, method: str = "Quick Work",
+                 priority: int = 0) -> Optional[str]:
+    """Enqueue a task for Ralph Loop processing.
+
+    Uses the same TaskQueue that the CLI uses.
+
+    Args:
+        requirement: The work requirement text.
+        method: Automation level.
+        priority: Task priority (higher = processed sooner).
+
+    Returns:
+        Task ID on success, None on failure.
+    """
+    from ..config.queue import TaskQueue
+
+    try:
+        queue = TaskQueue()
+        task_id = queue.enqueue(
+            task_type="spine_work",
+            payload={
+                "requirement": requirement,
+                "method": method,
+                "priority": priority,
+            },
+        )
+        return task_id
+    except Exception:
+        return None
+
+
+def retry_queue_task(task_id: str) -> bool:
+    """Re-enqueue a failed task with the same payload.
+
+    Args:
+        task_id: The failed task ID to retry.
+
+    Returns:
+        True on success, False on failure.
+    """
+    from ..config.queue import TaskQueue
+
+    try:
+        queue = TaskQueue()
+        # Read the failed task's payload
+        items = get_queue_items(status="failed")
+        task = next((t for t in items if t["id"] == task_id), None)
+        if not task:
+            return False
+
+        # Re-enqueue with same payload
+        new_id = queue.enqueue(
+            task_type=task["task_type"],
+            payload=task["payload"],
+        )
+        return new_id is not None
+    except Exception:
+        return False
+
+
+def clear_completed_queue_tasks() -> int:
+    """Remove all acknowledged (success) items from the queue.
+
+    Returns:
+        Number of items removed.
+    """
+    from ..config.queue import SqliteQueueBackend
+
+    try:
+        backend = SqliteQueueBackend()
+        conn = sqlite3.connect(backend._db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM queue_tasks WHERE status = 'success'")
+        removed = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return removed
+    except Exception:
+        return 0
+
+
+# ── Agent Resource Helpers ───────────────────────────────────
+
+# Known resource file paths and their categories
+AGENT_RESOURCE_PATHS: dict[str, dict[str, str]] = {
+    "agents_md": {
+        "label": "AGENTS.md",
+        "path": "AGENTS.md",
+        "category": "Agent Memory",
+        "description": "Agent memory and instructions read by Deep Agents",
+    },
+    "cursorrules": {
+        "label": ".cursorrules",
+        "path": ".cursorrules",
+        "category": "Project Rules",
+        "description": "Coding rules for Cursor/agent-based editing",
+    },
+    "claude_md": {
+        "label": "CLAUDE.md",
+        "path": "CLAUDE.md",
+        "category": "Project Rules",
+        "description": "Instructions for Claude-based agents",
+    },
+    "editorconfig": {
+        "label": ".editorconfig",
+        "path": ".editorconfig",
+        "category": "Coding Style",
+        "description": "Editor formatting rules",
+    },
+    "constraints": {
+        "label": "constraints.md",
+        "path": ".spine/knowledge/constraints.md",
+        "category": "Knowledge Base",
+        "description": "Learned constraints and anti-patterns",
+    },
+    "antipatterns": {
+        "label": "anti-patterns.md",
+        "path": ".spine/knowledge/anti-patterns.md",
+        "category": "Knowledge Base",
+        "description": "Documented failure patterns to avoid",
+    },
+    "mcp_config": {
+        "label": "MCP Servers",
+        "path": ".spine/config.yaml",
+        "category": "MCP Servers",
+        "description": "Tool server configurations (providers.tools section)",
+    },
+}
+
+
+def get_agent_resources() -> list[dict]:
+    """Read all agent resource files and return their content.
+
+    Returns:
+        List of resource dicts: {key, label, path, category, description,
+        content, exists}.
+    """
+    resources: list[dict] = []
+
+    for key, meta in AGENT_RESOURCE_PATHS.items():
+        path = Path(meta["path"])
+        content = ""
+        exists = False
+
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+                exists = True
+            except Exception:
+                pass
+
+        # For config.yaml, extract only the tools section for MCP display
+        if key == "mcp_config" and exists:
+            try:
+                config = yaml.safe_load(content) or {}
+                tools = config.get("providers", {}).get("tools", [])
+                content = yaml.dump({"providers": {"tools": tools}},
+                                    default_flow_style=False, sort_keys=False)
+                if not tools:
+                    content = "# No MCP servers configured yet"
+            except Exception:
+                pass
+
+        resources.append({
+            "key": key,
+            "label": meta["label"],
+            "path": meta["path"],
+            "category": meta["category"],
+            "description": meta["description"],
+            "content": content,
+            "exists": exists,
+        })
+
+    return resources
+
+
+def save_agent_resource(key: str, content: str) -> bool:
+    """Save content to an agent resource file.
+
+    Args:
+        key: Resource key from AGENT_RESOURCE_PATHS.
+        content: New content to write.
+
+    Returns:
+        True on success, False on failure.
+    """
+    meta = AGENT_RESOURCE_PATHS.get(key)
+    if not meta:
+        return False
+
+    path = Path(meta["path"])
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def regenerate_agent_resource(key: str) -> Optional[str]:
+    """Regenerate an agent resource from project analysis.
+
+    Uses spine/discovery/ modules to analyze the project and produce
+    a fresh resource file.
+
+    Args:
+        key: Resource key from AGENT_RESOURCE_PATHS.
+
+    Returns:
+        Generated content on success, None on failure.
+    """
+    try:
+        if key == "agents_md":
+            from ..discovery.analyzer import CodebaseAnalyzer
+            analyzer = CodebaseAnalyzer()
+            analysis = analyzer.analyze(".")
+            return _generate_agents_md(analysis)
+        elif key in ("constraints", "antipatterns"):
+            # These are accumulated over time; provide a template
+            return _generate_knowledge_template(key)
+        else:
+            return None
+    except Exception:
+        return None
+
+
+def _generate_agents_md(analysis: dict) -> str:
+    """Generate AGENTS.md content from project analysis.
+
+    Args:
+        analysis: Analysis results from CodebaseAnalyzer.
+
+    Returns:
+        Markdown content for AGENTS.md.
+    """
+    lines = ["# Project Agents", ""]
+
+    name = analysis.get("project_name", Path(".").resolve().name)
+    lines.append(f"## {name}")
+    lines.append("")
+
+    tech_stack = analysis.get("tech_stack", [])
+    if tech_stack:
+        lines.append("## Technology Stack")
+        for tech in tech_stack:
+            lines.append(f"- {tech}")
+        lines.append("")
+
+    structure = analysis.get("structure", {})
+    if structure:
+        lines.append("## Project Structure")
+        for key, value in structure.items():
+            lines.append(f"- **{key}**: {value}")
+        lines.append("")
+
+    lines.append("## Constraints")
+    lines.append("- [Add project-specific constraints here]")
+    lines.append("")
+    lines.append("## Conventions")
+    lines.append("- [Add coding conventions here]")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _generate_knowledge_template(key: str) -> str:
+    """Generate a template for knowledge base files.
+
+    Args:
+        key: Resource key (constraints or antipatterns).
+
+    Returns:
+        Markdown template content.
+    """
+    if key == "constraints":
+        return (
+            "# Project Constraints\n\n"
+            "## Architecture\n"
+            "- [Document architectural constraints here]\n\n"
+            "## Security\n"
+            "- [Document security constraints here]\n\n"
+            "## Performance\n"
+            "- [Document performance constraints here]\n"
+        )
+    elif key == "antipatterns":
+        return (
+            "# Anti-Patterns\n\n"
+            "## Failed Approaches\n"
+            "- [Document approaches that failed and why]\n\n"
+            "## Common Pitfalls\n"
+            "- [Document common mistakes in this project]\n\n"
+            "## Rejected Patterns\n"
+            "- [Document patterns that were considered but rejected]\n"
+        )
+    return ""
+
+
+# ── SDD Helpers ──────────────────────────────────────────────
+
+SDD_PHASES = ["SPEC", "DESIGN", "PLAN", "IMPLEMENT", "REVIEW", "VERIFY"]
+
+SDD_PHASE_ICONS: dict[str, str] = {
+    "SPEC": "📝",
+    "DESIGN": "🎨",
+    "PLAN": "📋",
+    "IMPLEMENT": "🔨",
+    "REVIEW": "🔍",
+    "VERIFY": "✅",
+}
+
+
+def get_sdd_projects() -> list[dict]:
+    """Get all SDD projects from the persistence layer.
+
+    Returns:
+        List of project dicts with id, name, status, current_phase.
+    """
+    projects: list[dict] = []
+    projects_dir = Path(".spine/sdd/projects")
+    if not projects_dir.exists():
+        return projects
+
+    for f in projects_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            projects.append({
+                "id": data.get("id", f.stem),
+                "name": data.get("name", f.stem),
+                "status": data.get("status", "unknown"),
+                "current_phase": data.get("current_phase", "SPEC"),
+                "requirement": data.get("requirement", ""),
+                "created_at": data.get("created_at", ""),
+                "phases": data.get("phases", {}),
+            })
+        except Exception:
+            pass
+
+    return projects
+
+
+def start_sdd_project(
+    name: str,
+    requirement: str,
+    method: str = "Full Spec Project",
+    project_type: str = "Greenfield",
+    llm_provider: str = "",
+    use_worktrees: bool = False,
+) -> Optional[dict]:
+    """Start a new SDD project using the same code path as CLI.
+
+    Creates an SDDWorkflow and executes it in a background thread.
+
+    Args:
+        name: Project name.
+        requirement: The work requirement text.
+        method: Automation level.
+        project_type: Environment type.
+        llm_provider: LLM provider name.
+        use_worktrees: Whether to use git worktrees for parallel impl.
+
+    Returns:
+        Dict with project_id on success, or with 'error' on failure.
+    """
+    import uuid as _uuid
+    from ..workflows.sdd import SDDWorkflow
+    from ..work.dispatcher import submit_work_from_config
+
+    project_id = str(_uuid.uuid4())
+
+    # Save project metadata
+    projects_dir = Path(".spine/sdd/projects")
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    project_file = projects_dir / f"{project_id}.json"
+
+    project_data = {
+        "id": project_id,
+        "name": name,
+        "requirement": requirement,
+        "method": method,
+        "project_type": project_type,
+        "status": "running",
+        "current_phase": "SPEC",
+        "use_worktrees": use_worktrees,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "phases": {},
+    }
+    project_file.write_text(json.dumps(project_data, indent=2))
+
+    # Submit work using the unified entry point (same as CLI)
+    try:
+        result = submit_work_from_config(
+            requirement=requirement,
+            thread_id=project_id,
+            background=True,
+        )
+        return {
+            "project_id": project_id,
+            "thread_id": result.get("thread_id", project_id),
+            "status": result.get("status", "queued"),
+        }
+    except Exception as e:
+        # Update project status to failed
+        project_data["status"] = "failed"
+        project_data["error"] = str(e)
+        project_file.write_text(json.dumps(project_data, indent=2))
+        return {"error": str(e), "project_id": project_id}
+
+
+def update_sdd_project_phase(project_id: str, phase: str, status: str) -> None:
+    """Update the current phase status of an SDD project.
+
+    Args:
+        project_id: Project ID.
+        phase: Phase name (SPEC, DESIGN, etc.).
+        status: Phase status (running, success, failed).
+    """
+    project_file = Path(f".spine/sdd/projects/{project_id}.json")
+    if not project_file.exists():
+        return
+
+    try:
+        data = json.loads(project_file.read_text())
+        data["current_phase"] = phase
+        data["phases"][phase] = {
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if status == "success":
+            # Find next phase
+            idx = SDD_PHASES.index(phase) if phase in SDD_PHASES else -1
+            if idx < len(SDD_PHASES) - 1:
+                data["current_phase"] = SDD_PHASES[idx + 1]
+        elif status == "failed":
+            data["status"] = "failed"
+        project_file.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
 # ── Navigation ───────────────────────────────────────────────
 
 def navigate_to_work(thread_id: str) -> None:

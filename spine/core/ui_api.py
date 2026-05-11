@@ -205,3 +205,193 @@ class UIApi:
         """
         from ..ui.utils import load_config
         return load_config(".spine/config.yaml")
+
+    # ── Queue Operations ───────────────────────────────────────
+
+    def get_queue_status(self) -> dict[str, int]:
+        """Get summary counts from the task queue.
+
+        Returns:
+            Dict with pending, running, success, failed, cancelled counts.
+        """
+        from ..ui.utils import get_queue_status
+        return get_queue_status()
+
+    def get_queue_items(self, status: Optional[str] = None) -> list[dict]:
+        """Get queue items, optionally filtered by status.
+
+        Args:
+            status: Optional status filter (pending, running, success, failed).
+
+        Returns:
+            List of queue item dicts.
+        """
+        from ..ui.utils import get_queue_items
+        return get_queue_items(status)
+
+    def enqueue_task(self, requirement: str, method: str = "Quick Work",
+                     priority: int = 0) -> Optional[str]:
+        """Enqueue a task for Ralph Loop processing.
+
+        Args:
+            requirement: The work requirement text.
+            method: Automation level.
+            priority: Task priority.
+
+        Returns:
+            Task ID on success, None on failure.
+        """
+        from ..ui.utils import enqueue_task
+        return enqueue_task(requirement, method, priority)
+
+    def retry_queue_task(self, task_id: str) -> bool:
+        """Re-enqueue a failed task with the same payload.
+
+        Args:
+            task_id: The failed task ID.
+
+        Returns:
+            True on success, False on failure.
+        """
+        from ..ui.utils import retry_queue_task
+        return retry_queue_task(task_id)
+
+    def clear_completed_queue_tasks(self) -> int:
+        """Remove all acknowledged items from the queue.
+
+        Returns:
+            Number of items removed.
+        """
+        from ..ui.utils import clear_completed_queue_tasks
+        return clear_completed_queue_tasks()
+
+    def get_worker_status(self) -> dict:
+        """Get the current Ralph Loop worker status.
+
+        Returns:
+            Worker status dict.
+        """
+        from ..work.ralph_worker import get_worker
+        worker = get_worker()
+        return worker.status
+
+    def start_worker(self) -> None:
+        """Start the Ralph Loop worker."""
+        from ..work.ralph_worker import get_worker
+        worker = get_worker()
+        worker.start()
+
+    def pause_worker(self) -> None:
+        """Pause the Ralph Loop worker."""
+        from ..work.ralph_worker import get_worker
+        worker = get_worker()
+        worker.pause()
+
+    # ── Artifact Operations ────────────────────────────────────
+
+    def get_work_item_artifacts(self, thread_id: str) -> list[dict]:
+        """Get all artifact files for a work item.
+
+        Args:
+            thread_id: Work item thread ID.
+
+        Returns:
+            List of artifact dicts.
+        """
+        from ..ui.utils import get_work_item_artifacts
+        return get_work_item_artifacts(thread_id)
+
+    def get_feature_slice_outcomes(self, detail: dict) -> list[dict]:
+        """Extract FeatureSlice outcome data from work item detail.
+
+        Args:
+            detail: Work item detail dict.
+
+        Returns:
+            List of slice outcome dicts.
+        """
+        from ..ui.utils import get_feature_slice_outcomes
+        return get_feature_slice_outcomes(detail)
+
+    # ── Agent Resource Operations ──────────────────────────────
+
+    def get_agent_resources(self) -> list[dict]:
+        """Read all agent resource files.
+
+        Returns:
+            List of resource dicts.
+        """
+        from ..ui.utils import get_agent_resources
+        return get_agent_resources()
+
+    def save_agent_resource(self, key: str, content: str) -> bool:
+        """Save content to an agent resource file.
+
+        Args:
+            key: Resource key.
+            content: New content.
+
+        Returns:
+            True on success.
+        """
+        from ..ui.utils import save_agent_resource
+        return save_agent_resource(key, content)
+
+    def regenerate_agent_resource(self, key: str) -> Optional[str]:
+        """Regenerate an agent resource from project analysis.
+
+        Args:
+            key: Resource key.
+
+        Returns:
+            Generated content or None.
+        """
+        from ..ui.utils import regenerate_agent_resource
+        return regenerate_agent_resource(key)
+
+    # ── SDD Operations ─────────────────────────────────────────
+
+    def get_sdd_projects(self) -> list[dict]:
+        """Get all SDD projects.
+
+        Returns:
+            List of project dicts.
+        """
+        from ..ui.utils import get_sdd_projects
+        return get_sdd_projects()
+
+    def start_sdd_project(self, name: str, requirement: str,
+                          method: str = "Full Spec Project",
+                          project_type: str = "Greenfield",
+                          llm_provider: str = "",
+                          use_worktrees: bool = False) -> Optional[dict]:
+        """Start a new SDD project.
+
+        Args:
+            name: Project name.
+            requirement: The work requirement.
+            method: Automation level.
+            project_type: Environment type.
+            llm_provider: LLM provider name.
+            use_worktrees: Whether to use git worktrees.
+
+        Returns:
+            Dict with project_id on success.
+        """
+        from ..ui.utils import start_sdd_project
+        return start_sdd_project(
+            name, requirement, method, project_type,
+            llm_provider, use_worktrees,
+        )
+
+    def update_sdd_project_phase(self, project_id: str, phase: str,
+                                  status: str) -> None:
+        """Update the phase status of an SDD project.
+
+        Args:
+            project_id: Project ID.
+            phase: Phase name.
+            status: Phase status.
+        """
+        from ..ui.utils import update_sdd_project_phase
+        update_sdd_project_phase(project_id, phase, status)

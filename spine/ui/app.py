@@ -7,12 +7,21 @@ from spine.ui.work_detail import render_work_detail
 from spine.ui.work_new import render_new_work
 from spine.ui.providers_config import render_providers_config
 from spine.ui.settings import render_settings
+from spine.ui.task_queue import render_task_queue
+from spine.ui.agent_resources import render_agent_resources
+from spine.ui.sdd import render_sdd
 
-PAGE_NAMES = ["Dashboard", "New Work", "Work Detail", "Providers", "Settings"]
+PAGE_NAMES = [
+    "Dashboard", "New Work", "Work Detail", "Task Queue",
+    "Agent Resources", "SDD", "Providers", "Settings",
+]
 PAGE_ICONS = {
     "Dashboard": "📊",
     "New Work": "➕",
     "Work Detail": "🔍",
+    "Task Queue": "⏳",
+    "Agent Resources": "🔧",
+    "SDD": "📐",
     "Providers": "🔌",
     "Settings": "⚙️",
 }
@@ -67,6 +76,12 @@ def main():
         render_new_work()
     elif page == "Work Detail":
         render_work_detail()
+    elif page == "Task Queue":
+        render_task_queue()
+    elif page == "Agent Resources":
+        render_agent_resources()
+    elif page == "SDD":
+        render_sdd()
     elif page == "Providers":
         render_providers_config()
     elif page == "Settings":

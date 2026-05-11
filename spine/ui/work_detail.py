@@ -13,6 +13,8 @@ from spine.ui.utils import (
     rerun_work,
     delete_work,
     go_back,
+    get_work_item_artifacts,
+    get_feature_slice_outcomes,
 )
 
 
@@ -105,22 +107,42 @@ def render_work_detail() -> None:
 
     st.divider()
 
-    # ── Tabs ──
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["State Machine", "Sub-Phases", "Agent Outputs", "Swarm Events"]
-    )
+    # ── Outcome Summary ──
+    _render_outcome_summary(detail)
 
-    with tab1:
+    # ── Tabs ──
+    # Include artifacts tab if any exist
+    artifacts = get_work_item_artifacts(thread_id)
+    slice_outcomes = get_feature_slice_outcomes(detail)
+
+    tab_names = ["State Machine", "Sub-Phases", "Agent Outputs", "Swarm Events"]
+    if artifacts:
+        tab_names.append("Artifacts")
+    if slice_outcomes:
+        tab_names.append("Feature Slices")
+
+    tabs = st.tabs(tab_names)
+
+    with tabs[0]:
         render_state_machine(detail)
 
-    with tab2:
+    with tabs[1]:
         render_subphases(detail)
 
-    with tab3:
+    with tabs[2]:
         render_agent_outputs(detail)
 
-    with tab4:
+    with tabs[3]:
         render_swarm_events(detail)
+
+    tab_idx = 4
+    if artifacts:
+        with tabs[tab_idx]:
+            render_artifacts(artifacts)
+        tab_idx += 1
+    if slice_outcomes:
+        with tabs[tab_idx]:
+            render_feature_slices(slice_outcomes)
 
 
 def render_state_machine(detail: dict) -> None:
@@ -360,3 +382,153 @@ def render_swarm_events(detail: dict) -> None:
             expanded=False,
         ):
             st.json(e)
+
+
+def _render_outcome_summary(detail: dict) -> None:
+    """Render a concise outcome summary at the top of the detail page.
+
+    Answers: What was done? Why? What was the result?
+    """
+    phase = detail.get("phase", "INIT")
+    completed = len(detail.get("completed_tasks", []))
+    failed = len(detail.get("failed_tasks", []))
+    errors = len(detail.get("errors", []))
+    requirement = detail.get("requirement", "")
+    critic = detail.get("critic_gate_result")
+
+    # Determine overall outcome
+    if phase == "COMPLETE":
+        outcome_icon = "✅"
+        outcome_text = "Complete"
+        outcome_color = "success"
+    elif phase == "ERROR":
+        outcome_icon = "❌"
+        outcome_text = "Failed"
+        outcome_color = "error"
+    elif phase == "BLOCKED":
+        outcome_icon = "🚧"
+        outcome_text = "Blocked"
+        outcome_color = "warning"
+    elif phase == "HUMAN_REVIEW":
+        outcome_icon = "👤"
+        outcome_text = "Awaiting Review"
+        outcome_color = "warning"
+    else:
+        outcome_icon = "🟡"
+        outcome_text = "In Progress"
+        outcome_color = "info"
+
+    # Plan info
+    plan = detail.get("plan")
+    slice_count = 0
+    if plan and isinstance(plan, dict):
+        slices = plan.get("feature_slices", [])
+        slice_count = len(slices) if slices else 0
+
+    # Render outcome box
+    if outcome_color == "success":
+        st.success(f"**OUTCOME: {outcome_icon} {outcome_text}**")
+    elif outcome_color == "error":
+        st.error(f"**OUTCOME: {outcome_icon} {outcome_text}**")
+    elif outcome_color == "warning":
+        st.warning(f"**OUTCOME: {outcome_icon} {outcome_text}**")
+    else:
+        st.info(f"**OUTCOME: {outcome_icon} {outcome_text}**")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Tasks Done", completed)
+    col2.metric("Tasks Failed", failed)
+    col3.metric("Feature Slices", slice_count)
+    col4.metric("Errors", errors)
+
+    if critic:
+        critic_display = "Approved" if critic == "APPROVED" else critic
+        st.write(f"**Critic Gate:** {critic_display}")
+
+    st.write(f"**Requirement:** {requirement}")
+    st.divider()
+
+
+def render_artifacts(artifacts: list[dict]) -> None:
+    """Render markdown artifact files produced during the workflow.
+
+    Each artifact is shown as a tab with rendered markdown content
+    and a download button.
+    """
+    st.subheader("Workflow Artifacts")
+
+    if not artifacts:
+        st.info("No artifacts produced yet. Artifacts appear after planning and execution phases.")
+        return
+
+    for artifact in artifacts:
+        category = artifact.get("category", "Document")
+        filename = artifact.get("filename", "unknown")
+        path = artifact.get("path", "")
+        content = artifact.get("content", "")
+
+        with st.expander(f"📄 {category}: {filename}", expanded=False):
+            st.caption(f"Path: `{path}`")
+
+            # Render markdown content
+            if content.strip():
+                st.markdown(content)
+            else:
+                st.info("Artifact file is empty.")
+
+            # Download button
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                st.download_button(
+                    label="📥 Download",
+                    data=content,
+                    file_name=filename,
+                    mime="text/markdown",
+                    key=f"dl_{filename}",
+                )
+
+
+def render_feature_slices(slices: list[dict]) -> None:
+    """Render FeatureSlice outcomes with status and acceptance criteria."""
+    st.subheader("Feature Slice Outcomes")
+
+    if not slices:
+        st.info("No feature slices defined. Slices appear after the planning phase.")
+        return
+
+    for s in slices:
+        slice_id = s.get("id", "unknown")
+        description = s.get("description", "")
+        status = s.get("status", "pending")
+        scope = s.get("scope", [])
+        acceptance = s.get("acceptance", [])
+        agent_role = s.get("agent_role", "coder")
+        depends_on = s.get("depends_on", [])
+
+        status_icons = {
+            "completed": "✅",
+            "running": "🟡",
+            "pending": "⚪",
+            "failed": "❌",
+        }
+        icon = status_icons.get(status, "⚪")
+
+        with st.container():
+            col1, col2, col3 = st.columns([1, 4, 2])
+            col1.write(f"{icon}")
+            col2.write(f"**{slice_id}**: {description}")
+            col3.write(f"Role: {agent_role} | Status: {status}")
+
+            if scope:
+                st.caption(f"Scope: {', '.join(scope)}")
+
+            if depends_on:
+                st.caption(f"Depends on: {', '.join(depends_on)}")
+
+            if acceptance:
+                with st.expander("Acceptance Criteria"):
+                    for criterion in acceptance:
+                        check = "✓" if status == "completed" else "○"
+                        st.write(f"  {check} {criterion}")
+
+            st.divider()

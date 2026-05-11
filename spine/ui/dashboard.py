@@ -52,14 +52,56 @@ def render_dashboard() -> None:
     blocked = sum(1 for w in work_items if w["phase"] == "BLOCKED")
     errors = sum(1 for w in work_items if w["phase"] == "ERROR")
 
-    col1, col2, col3, col4 = st.columns(4)
+    # Pending review = HUMAN_REVIEW or critic gate pending
+    pending_review = sum(
+        1 for w in work_items
+        if w["phase"] == "HUMAN_REVIEW" or w.get("critic_gate_result") == "NEEDS_REVISION"
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Active", active)
     col2.metric("Complete", complete)
     col3.metric("Blocked", blocked)
+    col4.metric("Needs Review", pending_review)
     if errors > 0:
-        col4.metric("Errors", errors, delta=None, help=f"{errors} work items in error state")
+        col5.metric("Errors", errors, delta=None, help=f"{errors} work items in error state")
     else:
-        col4.metric("Errors", 0)
+        col5.metric("Errors", 0)
+
+    # ── Phase Distribution Chart ──
+    if work_items:
+        phase_counts: dict[str, int] = {}
+        for w in work_items:
+            p = w.get("phase", "INIT")
+            phase_counts[p] = phase_counts.get(p, 0) + 1
+
+        if len(phase_counts) > 1:
+            st.subheader("Phase Distribution")
+            chart_data = {
+                "Phase": list(phase_counts.keys()),
+                "Count": list(phase_counts.values()),
+            }
+            st.bar_chart(chart_data, x="Phase", y="Count", use_container_width=True)
+
+    # ── Quick Actions ──
+    st.markdown("---")
+    qa1, qa2, qa3 = st.columns(3)
+    if qa1.button("➕ Start New Work", key="qa_new_work", use_container_width=True):
+        st.session_state.page = "New Work"
+        st.rerun()
+    if qa2.button("⏳ View Queue", key="qa_queue", use_container_width=True):
+        st.session_state.page = "Task Queue"
+        st.rerun()
+    if pending_review > 0 and qa3.button(
+        f"👤 Review Pending ({pending_review})", key="qa_review", use_container_width=True
+    ):
+        # Navigate to first item needing review
+        for w in work_items:
+            if w["phase"] == "HUMAN_REVIEW" or w.get("critic_gate_result") == "NEEDS_REVISION":
+                st.session_state.selected_work_id = w["thread_id"]
+                st.session_state.page = "Work Detail"
+                st.rerun()
+                break
 
     if not work_items:
         st.info("No work items yet. Click **New Work** to get started.")
