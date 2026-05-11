@@ -166,10 +166,16 @@ def run_workflow(
         final_phase = result_state.get("phase", "UNKNOWN")
         success = final_phase == "COMPLETE"
 
+        # Get total tasks from plan if available
+        plan = result_state.get("plan") or {}
+        plan_tasks = plan.get("tasks", [])
+        total_tasks = len(plan_tasks) if plan_tasks else len(result_state.get("completed_tasks", []))
+
         return {
             "status": "success" if success else "completed_with_issues",
             "phase": final_phase,
             "completed_tasks": len(result_state.get("completed_tasks", [])),
+            "total_tasks": total_tasks,
             "errors": result_state.get("errors", []),
             "thread_id": thread_id,
         }
@@ -253,7 +259,8 @@ def submit_work(
             record_work_item(
                 checkpoint_path, thread_id, requirement,
                 status="completed", phase="COMPLETE",
-                completed_tasks=result.get("completed_tasks", 0)
+                completed_tasks=result.get("completed_tasks", 0),
+                total_tasks=result.get("total_tasks", 0),
             )
         else:
             record_work_item(

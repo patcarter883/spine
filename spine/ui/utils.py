@@ -599,7 +599,8 @@ def _dispatch_work_background(
         if result.get("status") == "success":
             _upsert_work_item(checkpoint_path, thread_id, requirement,
                               status="completed", phase="COMPLETE",
-                              completed_tasks=result.get("completed_tasks", 0))
+                              completed_tasks=result.get("completed_tasks", 0),
+                              total_tasks=result.get("total_tasks", 0))
         else:
             _upsert_work_item(checkpoint_path, thread_id, requirement,
                               status="failed", phase="ERROR",

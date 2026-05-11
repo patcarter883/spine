@@ -79,7 +79,7 @@ def render_dashboard() -> None:
     st.subheader("Active Work Items")
 
     for item in work_items:
-        progress = item["completed_tasks"] / max(1, item.get("total_tasks", 1))
+        progress = min(1.0, item["completed_tasks"] / max(1, item.get("total_tasks", 1)))
         icon = format_phase_icon(item["phase"])
         color = format_phase_color(item["phase"])
 
