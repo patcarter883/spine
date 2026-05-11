@@ -350,9 +350,25 @@ class FeatureSlice:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FeatureSlice":
+        # The DA agent sometimes returns description as a structured dict
+        # (e.g. {'output': '...', 'exit_code': 0}).  Coerce to string so that
+        # downstream code (spec writer, UI) never encounters a raw dict.
+        raw_desc = data["description"]
+        if isinstance(raw_desc, dict):
+            desc = (
+                raw_desc.get("output")
+                or raw_desc.get("result")
+                or raw_desc.get("name")
+                or str(raw_desc)
+            )
+            # Trim overly long agent outputs to a readable summary
+            if len(desc) > 300:
+                desc = desc[:300].rsplit(".", 1)[0] + "."
+        else:
+            desc = str(raw_desc)
         return cls(
             id=data["id"],
-            description=data["description"],
+            description=desc,
             scope=data.get("scope", []),
             depends_on=data.get("depends_on", []),
             agent_role=data.get("agent_role", "coder"),

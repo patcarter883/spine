@@ -1,6 +1,17 @@
 spine:
   checkpoint_path: .spine/spine.db
+
 providers:
+  llm:
+    - name: local-vllm
+      type: deepagents-model
+      config:
+        model: "openai:model"
+        base_url: "http://localhost:8000/v1"
+        api_key: "dummy"
+        temperature: 0.3
+        max_tokens: 8192
+
   agent:
     - name: default
       type: opencode

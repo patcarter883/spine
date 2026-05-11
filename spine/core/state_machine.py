@@ -1396,7 +1396,19 @@ def _derive_plan_tasks(subphase_results: dict[str, Any], requirement: str) -> li
                 for i, t in enumerate(task_list):
                     if isinstance(t, dict):
                         tid = t.get("id", f"task-{i+1}")
-                        desc = t.get("description", t.get("name", str(t)))
+                        raw_desc = t.get("description", t.get("name", str(t)))
+                        # Coerce dict descriptions to readable strings
+                        if isinstance(raw_desc, dict):
+                            desc = (
+                                raw_desc.get("output")
+                                or raw_desc.get("result")
+                                or raw_desc.get("name")
+                                or str(raw_desc)
+                            )
+                        else:
+                            desc = str(raw_desc)
+                        if len(desc) > 300:
+                            desc = desc[:300].rsplit(".", 1)[0] + "."
                         tasks.append({"id": tid, "description": desc})
                     elif isinstance(t, str):
                         tasks.append({"id": f"task-{i+1}", "description": t})
@@ -1414,7 +1426,19 @@ def _derive_plan_tasks(subphase_results: dict[str, Any], requirement: str) -> li
                 if tid in REVIEW_TASK_IDS or "critic" in tid.lower() or "review" in tid.lower():
                     continue
                 if isinstance(tdata, dict):
-                    desc = tdata.get("result", tdata.get("output", tid))
+                    # Agent result dicts have structured output like
+                    # {'output': '...', 'exit_code': 0, 'success': True}.
+                    # Extract the string content, never store the raw dict.
+                    raw_result = tdata.get("result", tdata.get("output", tid))
+                    if isinstance(raw_result, dict):
+                        desc = (
+                            raw_result.get("output")
+                            or raw_result.get("result")
+                            or raw_result.get("name")
+                            or str(raw_result)
+                        )
+                    else:
+                        desc = str(raw_result)
                     # Trim long LLM outputs to actionable descriptions
                     if isinstance(desc, str) and len(desc) > 300:
                         desc = desc[:300].rsplit(".", 1)[0] + "."
@@ -1539,8 +1563,27 @@ def write_spec_file(state: SpineState, work_item_id: str) -> Optional[str]:
     for task in plan.get("tasks", []):
         task_id = task.get("id", "unknown")
         task_desc = task.get("description", "")
+        # Defensive: task descriptions can be dicts (raw agent output).
+        # Coerce to a readable string before writing.
+        if isinstance(task_desc, dict):
+            task_desc = (
+                task_desc.get("output")
+                or task_desc.get("result")
+                or task_desc.get("name")
+                or str(task_desc)
+            )
+        task_desc = str(task_desc)
+        if len(task_desc) > 300:
+            task_desc = task_desc[:300].rsplit(".", 1)[0] + "."
         lines.append(f"### {task_id}")
         lines.append(f"- Description: {task_desc}")
+        # Include scope and acceptance criteria if available
+        scope = task.get("scope")
+        if scope:
+            lines.append(f"- Scope: {scope}")
+        acceptance = task.get("acceptance")
+        if acceptance:
+            lines.append(f"- Acceptance: {acceptance}")
         lines.append("")
 
     # Subphase results live in state, not the spec file.  Writing raw
@@ -1719,29 +1762,70 @@ def create_spine_workflow(checkpoint_path: str = ".spine/spine.db"):
     workflow.add_conditional_edges(
         "planning",
         should_continue,
-        {"planning": "planning", "execution": "execution", "verification": "verification", "rework": "rework", "blocked": "blocked", "error": "error", "__end__": END}
+        {
+            "planning": "planning",
+            "execution": "execution",
+            "verification": "verification",
+            "rework": "rework",
+            "blocked": "blocked",
+            "error": "error",
+            "human_review": "human_review",
+            "__end__": END,
+        }
     )
     workflow.add_edge("execution", "verification")
     workflow.add_conditional_edges(
         "verification",
         should_continue,
-        {"rework": "rework", "blocked": "blocked", "error": "error", "__end__": END}
+        {
+            "rework": "rework",
+            "blocked": "blocked",
+            "error": "error",
+            "planning": "planning",
+            "execution": "execution",
+            "verification": "verification",
+            "human_review": "human_review",
+            "__end__": END,
+        }
     )
     workflow.add_conditional_edges(
         "rework",
         should_continue,
-        {"planning": "planning", "execution": "execution", "verification": "verification", "error": "error", "human_review": "human_review", "__end__": END}
+        {
+            "planning": "planning",
+            "execution": "execution",
+            "verification": "verification",
+            "rework": "rework",
+            "error": "error",
+            "human_review": "human_review",
+            "__end__": END,
+        }
     )
     workflow.add_edge("blocked", "blocked")
     workflow.add_conditional_edges(
         "error",
         should_continue,
-        {"rework": "rework", "blocked": "blocked", "human_review": "human_review", "__end__": END}
+        {
+            "rework": "rework",
+            "blocked": "blocked",
+            "planning": "planning",
+            "execution": "execution",
+            "verification": "verification",
+            "human_review": "human_review",
+            "__end__": END,
+        }
     )
     workflow.add_conditional_edges(
         "human_review",
         should_continue,
-        {"rework": "rework", "planning": "planning", "execution": "execution", "verification": "verification", "__end__": END}
+        {
+            "rework": "rework",
+            "planning": "planning",
+            "execution": "execution",
+            "verification": "verification",
+            "error": "error",
+            "__end__": END,
+        }
     )
     
     # Set entry point
@@ -1820,29 +1904,70 @@ class SpineStateMachine:
         workflow.add_conditional_edges(
             "planning",
             should_continue,
-            {"planning": "planning", "execution": "execution", "verification": "verification", "rework": "rework", "blocked": "blocked", "error": "error", "__end__": END}
+            {
+                "planning": "planning",
+                "execution": "execution",
+                "verification": "verification",
+                "rework": "rework",
+                "blocked": "blocked",
+                "error": "error",
+                "human_review": "human_review",
+                "__end__": END,
+            }
         )
         workflow.add_edge("execution", "verification")
         workflow.add_conditional_edges(
             "verification",
             should_continue,
-            {"rework": "rework", "blocked": "blocked", "error": "error", "__end__": END}
+            {
+                "rework": "rework",
+                "blocked": "blocked",
+                "error": "error",
+                "planning": "planning",
+                "execution": "execution",
+                "verification": "verification",
+                "human_review": "human_review",
+                "__end__": END,
+            }
         )
         workflow.add_conditional_edges(
             "rework",
             should_continue,
-            {"planning": "planning", "execution": "execution", "verification": "verification", "error": "error", "human_review": "human_review", "__end__": END}
+            {
+                "planning": "planning",
+                "execution": "execution",
+                "verification": "verification",
+                "rework": "rework",
+                "error": "error",
+                "human_review": "human_review",
+                "__end__": END,
+            }
         )
         workflow.add_edge("blocked", "blocked")
         workflow.add_conditional_edges(
             "error",
             should_continue,
-            {"rework": "rework", "blocked": "blocked", "human_review": "human_review", "__end__": END}
+            {
+                "rework": "rework",
+                "blocked": "blocked",
+                "planning": "planning",
+                "execution": "execution",
+                "verification": "verification",
+                "human_review": "human_review",
+                "__end__": END,
+            }
         )
         workflow.add_conditional_edges(
             "human_review",
             should_continue,
-            {"rework": "rework", "planning": "planning", "execution": "execution", "verification": "verification", "__end__": END}
+            {
+                "rework": "rework",
+                "planning": "planning",
+                "execution": "execution",
+                "verification": "verification",
+                "error": "error",
+                "__end__": END,
+            }
         )
         workflow.set_entry_point("init")
         

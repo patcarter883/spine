@@ -22,7 +22,7 @@ import logging
 from typing import Any
 
 from deepagents import create_deep_agent, SubAgent
-from deepagents.backends import StateBackend, LocalShellBackend
+from deepagents.backends import LocalShellBackend
 
 from ..middleware.critic_gate import CriticGateMiddleware
 from ..middleware.step_limit import StepLimitMiddleware
@@ -184,8 +184,12 @@ def get_backend(
     root_dir = root_dir or os.getcwd()
 
     if phase == PhaseName.PLANNING:
-        # Planning is read-only — use ephemeral state backend
-        return StateBackend()
+        # Planning needs read access to the real codebase so explorer/sme/analyst
+        # subagents can ls, glob, grep, and read files.  StateBackend operates on
+        # an in-memory files channel that starts empty, so the subagents find
+        # nothing.  LocalShellBackend gives real filesystem access; the planning
+        # prompts already instruct agents to use read-only tools.
+        return LocalShellBackend(root_dir=root_dir, virtual_mode=False)
 
     # Execution and verification need real filesystem access
     return LocalShellBackend(root_dir=root_dir, virtual_mode=False)
@@ -251,7 +255,7 @@ def create_planning_agent(
     Args:
         requirement: The user's requirement text.
         providers: Provider dict from config (must include "llm").
-        backend: DA backend (defaults to StateBackend for planning).
+        backend: DA backend (defaults to LocalShellBackend for planning).
         max_steps: Maximum model call steps before wrap-up notification.
 
     Returns:
@@ -290,12 +294,24 @@ def create_planning_agent(
         MessageQueueMiddleware(),
     ]
 
+    # Planning is read-only: deny writes anywhere, allow reads under project root.
+    # First-match-wins, so the deny-write rule must come before any broader allows.
+    from deepagents import FilesystemPermission
+    permissions = [
+        FilesystemPermission(
+            operations=["write"],
+            paths=["/**"],
+            mode="deny",
+        ),
+    ]
+
     agent = create_deep_agent(
         model=chat_model,
         system_prompt=PLANNING_SYSTEM_PROMPT,
         subagents=subagents,
         middleware=middleware,
         backend=backend,
+        permissions=permissions,
         name="spine-planning",
     )
 
