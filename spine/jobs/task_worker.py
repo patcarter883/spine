@@ -48,6 +48,14 @@ def get_provider_from_config(config: dict, provider_type: str = "llm"):
             model=pconfig.get("model", "local-model"),
             base_url=pconfig.get("base_url", "http://localhost:8000/v1"),
         )
+    elif ptype == "openrouter":
+        from ..providers.llm import OpenRouterProvider
+        provider = OpenRouterProvider(
+            api_key=pconfig.get("api_key", ""),
+            model=pconfig.get("model", "openai/gpt-4"),
+            base_url=pconfig.get("base_url", OpenRouterProvider.DEFAULT_BASE_URL),
+        )
+        return provider
     return None
 
 
@@ -94,9 +102,18 @@ def execute_work_task(payload: dict) -> dict:
     )
 
     try:
+        # Build real providers dict with actual provider objects (not the
+        # deserialized dicts from the payload).  Passing them through
+        # config["configurable"] avoids LangGraph's checkpoint serialization
+        # which would turn them back into plain dicts.
+        real_providers = {
+            "llm": llm_provider,
+        }
+
         result = machine.app.invoke(
             {
                 "phase": "INIT",
+                "previous_phase": None,
                 "requirement": requirement,
                 "plan": None,
                 "tasks": {},
@@ -118,7 +135,7 @@ def execute_work_task(payload: dict) -> dict:
                 "error_history": [],
                 "project_context": project_context,
             },
-            {"configurable": {"thread_id": thread_id}},
+            {"configurable": {"thread_id": thread_id, "providers": real_providers}},
         )
 
         final_phase = result.get("phase", "UNKNOWN")
