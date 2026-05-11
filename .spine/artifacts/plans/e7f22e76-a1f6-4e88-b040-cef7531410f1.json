@@ -1,0 +1,80 @@
+{
+  "requirement": "UI dashboard page view button should go direct to work detail.",
+  "phases": [
+    "PLANNING",
+    "EXECUTION",
+    "VERIFICATION"
+  ],
+  "tasks": [
+    {
+      "id": "verify-work-detail-route",
+      "description": "Ensure the work detail page/route exists and accepts a work ID parameter. If it doesn't exist, create it with the correct route (e.g., /works/:id) and a component that renders work details fetched by ID."
+    },
+    {
+      "id": "wire-dashboard-view-button-to-work-detail",
+      "description": "Update the View button on the dashboard work item cards to navigate to the work detail page. Pass the correct work ID from the dashboard item to the detail route. Replace any existing placeholder behavior (e.g., no-op, alert, modal) with proper navigation."
+    },
+    {
+      "id": "add-e2e-verification",
+      "description": "Add a test (unit or integration) that verifies the dashboard View button navigates to the correct work detail page. Mock or stub the work data as needed."
+    }
+  ],
+  "feature_slices": [
+    {
+      "id": "verify-work-detail-route",
+      "description": "Ensure the work detail page/route exists and accepts a work ID parameter. If it doesn't exist, create it with the correct route (e.g., /works/:id) and a component that renders work details fetched by ID.",
+      "scope": [
+        "routes/",
+        "pages/works/",
+        "components/work-detail/"
+      ],
+      "depends_on": [],
+      "agent_role": "coder",
+      "acceptance": [
+        "Work detail route is defined and accessible at /works/:id",
+        "Detail page fetches and displays work data using the ID from the URL parameter",
+        "404 or loading state handled when work ID is invalid or data is loading"
+      ]
+    },
+    {
+      "id": "wire-dashboard-view-button-to-work-detail",
+      "description": "Update the View button on the dashboard work item cards to navigate to the work detail page. Pass the correct work ID from the dashboard item to the detail route. Replace any existing placeholder behavior (e.g., no-op, alert, modal) with proper navigation.",
+      "scope": [
+        "components/dashboard/",
+        "pages/dashboard/"
+      ],
+      "depends_on": [
+        "verify-work-detail-route"
+      ],
+      "agent_role": "coder",
+      "acceptance": [
+        "Clicking View on a dashboard work item navigates to /works/:id with the correct ID",
+        "Navigation uses the project's routing library (react-router, next/navigation, etc.)",
+        "No console errors or warnings after clicking View"
+      ]
+    },
+    {
+      "id": "add-e2e-verification",
+      "description": "Add a test (unit or integration) that verifies the dashboard View button navigates to the correct work detail page. Mock or stub the work data as needed.",
+      "scope": [
+        "tests/",
+        "__tests__/",
+        "cypress/",
+        "playwright/"
+      ],
+      "depends_on": [
+        "wire-dashboard-view-button-to-work-detail"
+      ],
+      "agent_role": "test_engineer",
+      "acceptance": [
+        "Test clicks the View button on a dashboard work item",
+        "Test asserts navigation to the correct work detail URL",
+        "Test asserts the work detail page receives the correct ID"
+      ]
+    }
+  ],
+  "planning_context": {
+    "analysis": "\n\n## Analysis Summary: No Codebase Found\n\nAfter an exhaustive search of the entire filesystem, **no codebase exists** at the root (`/`) or any standard location (`/app`, `/home`, `/workspace`, `/src`, `/tmp`, `/var`).\n\n### What I Searched\n\n| Search Method | Result |\n|---|---|\n| `ls /` (root directory) | Empty — no files or directories |\n| `glob **/*` (recursive wildcard) | No matches |\n| `glob **/*.{js,jsx,ts,tsx}` (source files) | No matches |\n| `glob **/package.json` (project manifests) | No matches |\n| `glob **/*dashboard*` (dashboard files) | No matches |\n| `grep` for \"dashboard\", \"View\", \"work\" | No matches |\n\n### What This Means\n\nThere is **no existing codebase** to analyze. I cannot provide findings on:\n\n1. **Dashboard page component** — No dashboard component exists\n2. **View button implementation** — No View button exists\n3. **Work detail page/route** — No work detail page exists\n4. **Routing setup** — No routing framework is installed\n5. **Types/interfaces for work items** — No types exist\n\n### Next Steps\n\nTo proceed, I would need:\n\n- **A codebase to explore** — Please provide the project files (e.g., via a mounted volume, cloned repository, or by specifying the correct root path)\n- **Clarification of the project root** — If the codebase lives at a non-standard path, please share the correct location\n\nOnce the codebase is available, I can provide a detailed analysis of the dashboard, View button, work detail page, routing, and related types as requested."
+  },
+  "created_at": "2026-05-11T22:34:26.246239+00:00"
+}

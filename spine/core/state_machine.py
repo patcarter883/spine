@@ -1476,14 +1476,26 @@ def _get_project_root(state: SpineState) -> str:
     inside the actual project root so they can ls, grep, and read source
     files.  get_backend() uses this as root_dir for LocalShellBackend.
     """
-    checkpoint_path = state.get("variables", {}).get("checkpoint_path", ".spine/spine.db")
-    abs_checkpoint = os.path.abspath(checkpoint_path)
-    # checkpoint_path = <project_root>/.spine/spine.db  (or .spine/spine.db relative)
-    # dirname once → <project_root>/.spine
-    # dirname twice → <project_root>
-    spine_root = os.path.dirname(abs_checkpoint)
-    project_root = os.path.dirname(spine_root)
-    return project_root
+    checkpoint_path = state.get("variables", {}).get("checkpoint_path")
+    if checkpoint_path:
+        abs_checkpoint = os.path.abspath(checkpoint_path)
+        # checkpoint_path = <project_root>/.spine/spine.db
+        # dirname once → <project_root>/.spine
+        # dirname twice → <project_root>
+        return os.path.dirname(os.path.dirname(abs_checkpoint))
+
+    # Fallback: walk up from cwd to find a .spine/ directory
+    cur = os.getcwd()
+    for _ in range(20):  # safety limit
+        if os.path.isdir(os.path.join(cur, ".spine")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    # Last resort: assume cwd is the project root
+    return os.getcwd()
 
 
 def _log_phase_event(state: SpineState, phase_name: str, event_type: str, data: Dict[str, Any], config: Optional[RunnableConfig] = None) -> None:

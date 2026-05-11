@@ -125,6 +125,7 @@ def execute_work_task(payload: dict) -> dict:
                 "variables": {
                     "work_item_id": thread_id,
                     "thread_id": thread_id,
+                    "checkpoint_path": checkpoint_path,
                     **variables,
                 },
                 "errors": [],

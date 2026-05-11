@@ -142,6 +142,7 @@ def run_workflow(
             "work_item_id": thread_id,
             "thread_id": thread_id,
             "debug_prompts": debug_prompts,
+            "checkpoint_path": checkpoint_path,
             **variables,
         },
         "errors": [],
