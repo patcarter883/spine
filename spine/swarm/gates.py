@@ -1,10 +1,10 @@
 """Swarm gates for validation and quality control."""
 
+import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 from ..core.state_machine import SpineState
-from ..providers.llm import LLMProvider
 
 
 class SwarmGate:
@@ -22,9 +22,9 @@ class SwarmGate:
 class CriticGate(SwarmGate):
     """Plan review gate - must pass before execution."""
     
-    def __init__(self, llm_provider: LLMProvider | None = None):
+    def __init__(self, agent_provider: Any | None = None):
         super().__init__("critic", required=True)
-        self._llm_provider = llm_provider
+        self._agent_provider = agent_provider
     
     def evaluate(self, state: SpineState) -> dict[str, Any]:
         """Review the plan and return approval status."""
@@ -33,11 +33,11 @@ class CriticGate(SwarmGate):
         if not plan:
             return {"approved": False, "reason": "No plan to review"}
         
-        # Use LLM for review if available
-        if self._llm_provider and self._llm_provider.enabled:
-            return self._evaluate_with_llm(plan, state)
+        # Use agent for review if available
+        if self._agent_provider and not isinstance(self._agent_provider, dict) and self._agent_provider.enabled:
+            return self._evaluate_with_agent(plan, state)
         
-        # Stub evaluation
+        # Auto-approve when no agent (plan was already agent-generated)
         result = {
             "approved": True,
             "issues": [],
@@ -45,9 +45,9 @@ class CriticGate(SwarmGate):
         }
         return result
     
-    def _evaluate_with_llm(self, plan: dict[str, Any], state: SpineState) -> dict[str, Any]:
-        """Evaluate plan using LLM."""
-        prompt = f"""You are a critic reviewing an execution plan.
+    def _evaluate_with_agent(self, plan: dict[str, Any], state: SpineState) -> dict[str, Any]:
+        """Evaluate plan using agent provider."""
+        prompt = f"""Review this execution plan for correctness and completeness.
 
 Requirement: {state.get('requirement', '')}
 
@@ -62,12 +62,12 @@ Evaluate for:
 Return JSON with: approved (true/false), issues, recommendations.
 """
         try:
-            response = self._llm_provider.generate(prompt)
-            return self._parse_critic_response(response)
+            result = self._agent_provider.execute(prompt, workdir=os.getcwd(), timeout=120)
+            return self._parse_critic_response(result.output or "")
         except Exception as e:
             return {
                 "approved": False,
-                "reason": f"LLM evaluation error: {e}",
+                "reason": f"Agent evaluation error: {e}",
                 "issues": [str(e)],
                 "recommendations": []
             }
@@ -92,11 +92,11 @@ Return JSON with: approved (true/false), issues, recommendations.
 
 
 class QualityGate(SwarmGate):
-    """Quality validation gate with full LLM-powered evaluation."""
+    """Quality validation gate with agent-powered evaluation."""
     
-    def __init__(self, llm_provider: LLMProvider | None = None):
+    def __init__(self, agent_provider: Any | None = None):
         super().__init__("quality", required=True)
-        self._llm_provider = llm_provider
+        self._agent_provider = agent_provider
     
     def evaluate(self, state: SpineState) -> dict[str, Any]:
         """Evaluate quality gate and return approval status."""
@@ -108,11 +108,11 @@ class QualityGate(SwarmGate):
                 "reason": "No plan provided for quality review"
             }
         
-        # Use LLM for thorough evaluation if available
-        if self._llm_provider and self._llm_provider.enabled:
-            return self._evaluate_with_llm(plan, state)
+        # Use agent for thorough evaluation if available
+        if self._agent_provider and not isinstance(self._agent_provider, dict) and self._agent_provider.enabled:
+            return self._evaluate_with_agent(plan, state)
         
-        # Stub evaluation - check basic plan structure
+        # Auto-approve when no agent
         tasks = plan.get("tasks", [])
         if not tasks:
             return {
@@ -126,17 +126,17 @@ class QualityGate(SwarmGate):
             "recommendations": []
         }
     
-    def _evaluate_with_llm(self, plan: dict[str, Any], state: SpineState) -> dict[str, Any]:
-        """Evaluate using LLM for comprehensive review."""
+    def _evaluate_with_agent(self, plan: dict[str, Any], state: SpineState) -> dict[str, Any]:
+        """Evaluate using agent provider for comprehensive review."""
         prompt = self._build_quality_prompt(plan, state)
         
         try:
-            response = self._llm_provider.generate(prompt)
-            return self._parse_response(response)
+            result = self._agent_provider.execute(prompt, workdir=os.getcwd(), timeout=120)
+            return self._parse_response(result.output or "")
         except Exception as e:
             return {
                 "approved": False,
-                "issues": [f"LLM evaluation error: {e}"],
+                "issues": [f"Agent evaluation error: {e}"],
                 "recommendations": []
             }
     

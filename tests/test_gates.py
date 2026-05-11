@@ -59,18 +59,20 @@ class TestCriticGate:
         result = gate.evaluate(state)
         assert result["approved"] is True
 
-    def test_evaluate_with_llm_provider(self):
-        """CriticGate should use LLM when available."""
-        fake_llm = MagicMock()
-        fake_llm.generate.return_value = '{"approved": true, "issues": [], "recommendations": []}'
-        fake_llm.enabled = True
+    def test_evaluate_with_agent_provider(self):
+        """CriticGate should use agent when available."""
+        fake_agent = MagicMock()
+        fake_result = MagicMock()
+        fake_result.output = '{"approved": true, "issues": [], "recommendations": []}'
+        fake_agent.execute.return_value = fake_result
+        fake_agent.enabled = True
         
-        gate = CriticGate(llm_provider=fake_llm)
+        gate = CriticGate(agent_provider=fake_agent)
         state = {"plan": {"tasks": ["task1"]}, "requirement": "Build API"}
         result = gate.evaluate(state)
         
         assert result["approved"] is True
-        fake_llm.generate.assert_called_once()
+        fake_agent.execute.assert_called_once()
 
 
 class TestQualityGate:
@@ -107,13 +109,15 @@ class TestQualityGate:
         result = gate.evaluate(state)
         assert result["approved"] is True
 
-    def test_evaluate_with_llm_provider(self):
-        """QualityGate should use LLM when available."""
-        fake_llm = MagicMock()
-        fake_llm.generate.return_value = '{"approved": true, "issues": [], "recommendations": ["Add tests"]}'
-        fake_llm.enabled = True
+    def test_evaluate_with_agent_provider(self):
+        """QualityGate should use agent when available."""
+        fake_agent = MagicMock()
+        fake_result = MagicMock()
+        fake_result.output = '{"approved": true, "issues": [], "recommendations": ["Add tests"]}'
+        fake_agent.execute.return_value = fake_result
+        fake_agent.enabled = True
         
-        gate = QualityGate(llm_provider=fake_llm)
+        gate = QualityGate(agent_provider=fake_agent)
         state: SpineState = {
             "requirement": "Build API",
             "plan": {"tasks": []},
@@ -133,7 +137,7 @@ class TestQualityGate:
         
         assert result["approved"] is True
         assert "Add tests" in result["recommendations"]
-        fake_llm.generate.assert_called_once()
+        fake_agent.execute.assert_called_once()
 
     def test_evaluate_plan_without_tasks(self):
         """QualityGate should fail for empty task list."""

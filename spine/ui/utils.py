@@ -4,6 +4,7 @@ import os
 import json
 import sqlite3
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -246,7 +247,12 @@ def get_latest_checkpoint(
 
 
 def get_active_work_items(checkpoint_path: Optional[str] = None) -> list[dict]:
-    """Read checkpoint store and return all work items with their latest status.
+    """Return all work items with their latest status.
+
+    Reads from the work_items table (the single source of truth)
+    rather than trying to parse LangGraph's internal checkpoint
+    format, which uses msgpack serialization that is not reliably
+    decodable from raw SQL.
 
     Args:
         checkpoint_path: Explicit checkpoint path, or None to read from config.
@@ -255,31 +261,79 @@ def get_active_work_items(checkpoint_path: Optional[str] = None) -> list[dict]:
         List of work item dicts with thread_id, requirement, phase, progress, etc.
     """
     cp_path = get_checkpoint_path(checkpoint_path)
-    thread_ids = _get_langgraph_thread_ids(cp_path)
-    items = []
+    if not cp_path.exists():
+        return []
 
-    for tid in thread_ids:
-        detail = get_work_item_detail(tid, checkpoint_path)
-        if detail:
-            phase = detail.get("phase", "INIT")
-            completed = len(detail.get("completed_tasks", []))
-            failed = len(detail.get("failed_tasks", []))
-            total = max(1, completed + failed)
+    items: list[dict] = []
+    try:
+        conn = sqlite3.connect(str(cp_path))
+        cursor = conn.cursor()
 
+        # Check if work_items table exists (it may not if only CLI was used)
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='work_items'"
+        )
+        has_work_items = cursor.fetchone() is not None
+
+        if has_work_items:
+            cursor.execute(
+                "SELECT thread_id, requirement, status, phase, "
+                "completed_tasks, total_tasks, error_message "
+                "FROM work_items ORDER BY updated_at DESC"
+            )
+            rows = cursor.fetchall()
+            if rows:
+                # Get real-time phase from checkpoints for running items
+                from spine.cli.commands.status import get_threads
+                conn.close()
+                threads = get_threads(str(cp_path))
+                thread_phases = {t["thread_id"]: t.get("phase") for t in threads}
+                
+                for row in rows:
+                    tid, req, status, phase, comp, total, err = row
+                    # Use real-time phase from checkpoint for running items
+                    if status == "running" and tid in thread_phases:
+                        phase = thread_phases[tid] or phase
+                    items.append({
+                        "thread_id": tid,
+                        "requirement": req or "Untitled",
+                        "phase": phase or status.upper(),
+                        "status": status,
+                        "progress": (comp or 0) / max(1, total or 1),
+                        "completed_tasks": comp or 0,
+                        "failed_tasks": 0,
+                        "total_tasks": total or 1,
+                        "started_at": "",
+                        "errors": [err] if err else [],
+                        "error_state": None,
+                        "critic_gate_result": None,
+                    })
+                return items
+            # Table exists but is empty — fall through to checkpoint fallback
+
+        # Fallback: read from LangGraph checkpoint tables directly
+        # Use the same logic as the CLI status command
+        from spine.cli.commands.status import get_threads
+        conn.close()  # Close our connection before get_threads opens its own
+        threads = get_threads(str(cp_path))
+        for t in threads:
+            phase = t.get("phase", "UNKNOWN")
             items.append({
-                "thread_id": tid,
-                "requirement": detail.get("requirement", "Untitled"),
+                "thread_id": t["thread_id"],
+                "requirement": t.get("requirement") or "Unknown (no work_items table)",
                 "phase": phase,
-                "status": phase,
-                "progress": completed / total,
-                "completed_tasks": completed,
-                "failed_tasks": failed,
-                "total_tasks": total,
-                "started_at": detail.get("variables", {}).get("timestamp", ""),
-                "errors": detail.get("errors", []),
-                "error_state": detail.get("error_state"),
-                "critic_gate_result": detail.get("critic_gate_result"),
+                "status": phase.lower(),
+                "progress": t.get("completed_tasks", 0) / max(1, t.get("completed_tasks", 0) or 1),
+                "completed_tasks": t.get("completed_tasks", 0),
+                "failed_tasks": 0,
+                "total_tasks": max(1, t.get("completed_tasks", 0) or 1),
+                "started_at": "",
+                "errors": [],
+                "error_state": None,
+                "critic_gate_result": None,
             })
+    except Exception:
+        pass
 
     return items
 
@@ -290,6 +344,10 @@ def get_work_item_detail(
 ) -> Optional[dict]:
     """Load full state from the latest checkpoint for a work item.
 
+    Uses the SpineStateMachine's checkpointer (LangGraph SqliteSaver)
+    to deserialize the checkpoint properly, rather than trying to
+    parse the raw SQLite blob (which is msgpack-encoded).
+
     Args:
         thread_id: Thread ID to read (required).
         checkpoint_path: Explicit checkpoint path, or None to read from config.
@@ -297,29 +355,82 @@ def get_work_item_detail(
     Returns:
         Full state dict or None if not found.
     """
-    checkpoint = get_latest_checkpoint(thread_id, checkpoint_path)
-    if not checkpoint:
+    cp_path = get_checkpoint_path(checkpoint_path)
+    if not cp_path.exists():
         return None
 
-    return {
-        "thread_id": thread_id,
-        "phase": checkpoint.get("phase", "INIT"),
-        "previous_phase": checkpoint.get("previous_phase"),
-        "requirement": checkpoint.get("requirement", ""),
-        "plan": checkpoint.get("plan"),
-        "tasks": checkpoint.get("tasks", {}),
-        "completed_tasks": checkpoint.get("completed_tasks", []),
-        "failed_tasks": checkpoint.get("failed_tasks", []),
-        "swarm_state": checkpoint.get("swarm_state", {}),
-        "hive_cells": checkpoint.get("hive_cells", {}),
-        "swarm_events": checkpoint.get("swarm_events", []),
-        "critic_gate_result": checkpoint.get("critic_gate_result"),
-        "error_state": checkpoint.get("error_state"),
-        "error_history": checkpoint.get("error_history", []),
-        "variables": checkpoint.get("variables", {}),
-        "errors": checkpoint.get("errors", []),
-        "started_at": checkpoint.get("variables", {}).get("timestamp", ""),
-    }
+    # Try reading from the work_items table first (single source of truth)
+    try:
+        conn = sqlite3.connect(str(cp_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='work_items'"
+        )
+        has_work_items = cursor.fetchone() is not None
+        if has_work_items:
+            cursor.execute(
+                "SELECT requirement, status, phase, completed_tasks, "
+                "total_tasks, error_message FROM work_items WHERE thread_id = ?",
+                (thread_id,),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                req, status, phase, comp, total, err = row
+                return {
+                    "thread_id": thread_id,
+                    "phase": phase or "INIT",
+                    "previous_phase": None,
+                    "requirement": req or "",
+                    "plan": None,
+                    "tasks": {},
+                    "completed_tasks": list(range(comp or 0)),
+                    "failed_tasks": [],
+                    "swarm_state": {},
+                    "hive_cells": {},
+                    "swarm_events": [],
+                    "critic_gate_result": None,
+                    "error_state": None,
+                    "error_history": [],
+                    "variables": {},
+                    "errors": [err] if err else [],
+                    "error_message": err,
+                    "status": status or "queued",
+                    "total_tasks": total or 0,
+                    "started_at": "",
+                }
+    except Exception:
+        pass
+
+    # Fallback: use SpineStateMachine to read the checkpoint via LangGraph
+    try:
+        from ..core.state_machine import SpineStateMachine
+        machine = SpineStateMachine(checkpoint_path=str(cp_path))
+        state = machine.resume(thread_id)
+        if state is not None:
+            return {
+                "thread_id": thread_id,
+                "phase": state.get("phase", "INIT"),
+                "previous_phase": state.get("previous_phase"),
+                "requirement": state.get("requirement", ""),
+                "plan": state.get("plan"),
+                "tasks": state.get("tasks", {}),
+                "completed_tasks": state.get("completed_tasks", []),
+                "failed_tasks": state.get("failed_tasks", []),
+                "swarm_state": state.get("swarm_state", {}),
+                "hive_cells": state.get("hive_cells", {}),
+                "swarm_events": state.get("swarm_events", []),
+                "critic_gate_result": state.get("critic_gate_result"),
+                "error_state": state.get("error_state"),
+                "error_history": state.get("error_history", []),
+                "variables": state.get("variables", {}),
+                "errors": state.get("errors", []),
+                "started_at": state.get("variables", {}).get("timestamp", ""),
+            }
+    except Exception:
+        pass
+
+    return None
 
 
 def get_checkpoints(
@@ -389,6 +500,119 @@ def get_checkpoints(
 
 # ── Work Item Actions ────────────────────────────────────────
 
+# ── Work Items Table (single source of truth) ─────────────────
+
+
+def _init_work_items_table(db_path: str) -> None:
+    """Ensure the work_items tracking table exists in spine.db.
+
+    This table is the single source of truth that both the status
+    command and the UI read from.  It records every work item that
+    has been created so that even queued/pending items are visible.
+    """
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS work_items (
+                thread_id TEXT PRIMARY KEY,
+                requirement TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                phase TEXT NOT NULL DEFAULT 'INIT',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_tasks INTEGER DEFAULT 0,
+                total_tasks INTEGER DEFAULT 0,
+                error_message TEXT
+            )
+        """)
+        conn.commit()
+
+
+def _upsert_work_item(
+    db_path: str,
+    thread_id: str,
+    requirement: str,
+    status: str = "queued",
+    phase: str = "INIT",
+    completed_tasks: int = 0,
+    total_tasks: int = 0,
+    error_message: Optional[str] = None,
+) -> None:
+    """Insert or update a work item record."""
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO work_items
+               (thread_id, requirement, status, phase, created_at, updated_at,
+                completed_tasks, total_tasks, error_message)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(thread_id) DO UPDATE SET
+               status=excluded.status, phase=excluded.phase,
+               updated_at=excluded.updated_at,
+               completed_tasks=excluded.completed_tasks,
+               total_tasks=excluded.total_tasks,
+               error_message=excluded.error_message""",
+            (thread_id, requirement, status, phase, now, now,
+             completed_tasks, total_tasks, error_message),
+        )
+        conn.commit()
+
+
+def _dispatch_work_background(
+    requirement: str,
+    thread_id: str,
+    checkpoint_path: str,
+    providers_dict: dict,
+    project_context: dict,
+    idempotency_key: str,
+) -> None:
+    """Run the state machine workflow in a daemon background thread.
+
+    Writes checkpoints to spine.db as it progresses so that
+    'spine status' reflects real-time state.
+
+    providers_dict must contain **real provider instances** (e.g.
+    LLMProvider), NOT raw config dicts.  Raw dicts cause
+    AttributeError: 'dict' object has no attribute 'enabled' when
+    the state machine tries to use them after deserialization.
+    """
+    from ..jobs.task_worker import execute_work_task
+
+    def _run():
+        payload = {
+            "requirement": requirement,
+            "thread_id": thread_id,
+            "checkpoint_path": checkpoint_path,
+            # Pass empty dict for providers in the payload — the real
+            # provider objects are delivered through the LangGraph
+            # config below, bypassing checkpoint serialization.
+            "providers": {},
+            "variables": {
+                "thread_id": thread_id,
+                "work_item_id": thread_id,
+                "checkpoint_path": checkpoint_path,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "idempotency_key": idempotency_key,
+            },
+            "project_context": project_context,
+        }
+        _upsert_work_item(checkpoint_path, thread_id, requirement,
+                          status="running", phase="INIT")
+        result = execute_work_task(payload)
+        if result.get("status") == "success":
+            _upsert_work_item(checkpoint_path, thread_id, requirement,
+                              status="completed", phase="COMPLETE",
+                              completed_tasks=result.get("completed_tasks", 0),
+                              total_tasks=result.get("total_tasks", 0))
+        else:
+            _upsert_work_item(checkpoint_path, thread_id, requirement,
+                              status="failed", phase="ERROR",
+                              error_message=result.get("error", "Unknown error"))
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+
 def start_work(
     requirement: str,
     method: str = "Quick Work",
@@ -398,12 +622,10 @@ def start_work(
     checkpoint_path: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> Optional[dict]:
-    """Start a new work item via the task queue.
+    """Start a new work item and dispatch it for background processing.
 
-    Enqueues the work for background processing and returns immediately
-    with the thread_id and task_id. A separate worker process picks up
-    the task and executes the LangGraph workflow asynchronously.
-    Uses an idempotency key to prevent duplicate submissions.
+    Uses the unified submit_work_from_config function which records
+    to the work_items table and runs the workflow in a background thread.
 
     Args:
         requirement: The requirement text for the work item.
@@ -418,9 +640,8 @@ def start_work(
         Dict with 'thread_id', 'task_id', and 'idempotency_key' on success,
         or dict with 'error' message on failure.
     """
-    from ..config.queue import TaskQueue
-
-    # Generate idempotency key if not provided
+    from ..work import submit_work_from_config
+    
     key = idempotency_key or str(uuid.uuid4())
 
     # Check if this key was already processed (dedup)
@@ -434,57 +655,32 @@ def start_work(
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Build providers dict from config
-    config = load_config()
-    providers_by_type = _load_providers_from_config(config)
-    providers_dict = {}
-    for category, provider_list in providers_by_type.items():
-        if provider_list:
-            providers_dict[category] = provider_list[0][1]
-
-    thread_id = str(uuid.uuid4())
-    checkpoint_path_str = checkpoint_path or ".spine/spine.db"
-
-    # Detect project context
-    project_root = os.getcwd()
-    project_name = Path(project_root).name
-    project_config = config.get("project", {})
-    project_context = {
-        "name": project_config.get("name", project_name),
-        "root": project_config.get("root", project_root),
-        "description": project_config.get("description", ""),
-        "tech_stack": project_config.get("tech_stack", []),
-    }
-
-    # Enqueue work for background processing
     try:
-        queue = TaskQueue(db_path=".spine/queue.db")
-        task_id = queue.enqueue("work", {
-            "requirement": requirement,
-            "thread_id": thread_id,
-            "checkpoint_path": checkpoint_path_str,
-            "method": method,
-            "project_type": project_type,
-            "providers": providers_dict,
-            "variables": {
+        # Use unified submission - this handles everything:
+        # - Loading providers from config
+        # - Recording to work_items table
+        # - Running in background thread
+        result = submit_work_from_config(
+            requirement=requirement,
+            checkpoint_path=checkpoint_path,
+            background=True,  # Run in background thread
+        )
+        
+        if result.get("status") == "queued":
+            thread_id = result["thread_id"]
+            payload = {
                 "thread_id": thread_id,
-                "work_item_id": thread_id,
-                "checkpoint_path": checkpoint_path_str,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "task_id": thread_id,
                 "idempotency_key": key,
-            },
-            "project_context": project_context,
-        })
-        payload = {
-            "thread_id": thread_id,
-            "task_id": task_id,
-            "idempotency_key": key,
-        }
-        dedup_file.write_text(json.dumps(payload))
-        return payload
+            }
+            dedup_file.write_text(json.dumps(payload))
+            return payload
+        else:
+            return {"error": result.get("error", "Unknown error"), "idempotency_key": key}
+
     except Exception as e:
         error_msg = str(e)
-        print(f"[spine.ui.utils] Failed to enqueue work: {error_msg}")
+        print(f"[spine.ui.utils] Failed to start work: {error_msg}")
         return {"error": error_msg, "idempotency_key": key}
 
 
@@ -564,15 +760,159 @@ def reject_gate(thread_id: str, feedback: str) -> bool:
 def resume_work(thread_id: str, checkpoint_path: Optional[str] = None) -> bool:
     """Resume a paused work item from its last checkpoint.
 
+    Loads the checkpointed state and runs the state machine forward from
+    where it left off, in a background thread so the UI stays responsive.
+
     Args:
         thread_id: Thread ID to resume.
         checkpoint_path: Explicit checkpoint path.
 
     Returns:
-        True on success, False if no state found.
+        True if a checkpoint was found and a resume thread was kicked
+        off, False if no state exists for this thread_id.
     """
     from ..core.state_machine import SpineStateMachine
+    from ..work.dispatcher import record_work_item
 
+    cp_path = str(get_checkpoint_path(checkpoint_path))
+
+    # Load existing state to verify the checkpoint exists and to get the
+    # original requirement for the work_items record.
+    machine = SpineStateMachine(checkpoint_path=cp_path)
+    try:
+        existing_state = machine.resume(thread_id)
+    except Exception as e:
+        print(f"[spine.ui.utils] resume_work: failed to read state: {e}")
+        return False
+
+    if existing_state is None:
+        return False
+
+    requirement = existing_state.get("requirement", "")
+
+    # Load providers from config so the resumed run actually has an LLM /
+    # agent attached. Without these the workflow runs in stub mode again.
+    try:
+        from ..cli import load_providers, get_primary_provider, load_config
+        providers_by_type = load_providers(".spine/config.yaml")
+        providers = {}
+        for category in providers_by_type:
+            primary = get_primary_provider(providers_by_type, category)
+            if primary is not None:
+                providers[category] = primary
+        config = load_config(".spine/config.yaml")
+        project_config = config.get("project", {})
+        project_root = os.getcwd()
+        project_context = {
+            "name": project_config.get("name", Path(project_root).name),
+            "root": project_config.get("root", project_root),
+            "description": project_config.get("description", ""),
+            "tech_stack": project_config.get("tech_stack", []),
+        }
+    except Exception as e:
+        print(f"[spine.ui.utils] resume_work: failed to load providers: {e}")
+        return False
+
+    # Mark as running and run forward in a background thread.
+    record_work_item(cp_path, thread_id, requirement,
+                     status="running", phase=str(existing_state.get("phase", "INIT")))
+
+    def _run_forward():
+        try:
+            machine_local = SpineStateMachine(
+                checkpoint_path=cp_path,
+                llm_provider=providers.get("llm"),
+            )
+            cfg = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "providers": providers,
+                }
+            }
+            # Passing None as input tells LangGraph to continue from the
+            # last checkpoint instead of starting fresh.
+            result_state = machine_local.app.invoke(None, cfg)
+            final_phase = str(result_state.get("phase", "UNKNOWN"))
+            success = final_phase == "PhaseName.COMPLETE" or final_phase.endswith("COMPLETE")
+            plan = result_state.get("plan") or {}
+            total = len(plan.get("tasks", [])) if isinstance(plan, dict) else 0
+            record_work_item(
+                cp_path, thread_id, requirement,
+                status="completed" if success else "failed",
+                phase=final_phase,
+                completed_tasks=len(result_state.get("completed_tasks", [])),
+                total_tasks=total,
+                error_message=None if success else "Resume completed with issues",
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            record_work_item(cp_path, thread_id, requirement,
+                             status="failed", phase="ERROR",
+                             error_message=f"Resume failed: {exc}")
+
+    threading.Thread(target=_run_forward, daemon=True).start()
+    return True
+
+
+def rerun_work(thread_id: str, checkpoint_path: Optional[str] = None) -> Optional[dict]:
+    """Re-run a work item by submitting a fresh job with the same requirement.
+
+    Reads the original requirement from the existing checkpoint, then submits
+    a brand new work item (new thread_id) using the same submission path as
+    the "New Work" form. This is the right primitive when a previous run
+    completed (successfully or not) and the user wants to try again — as
+    opposed to ``resume_work`` which continues an in-progress run.
+
+    Args:
+        thread_id: Thread ID of the work item to re-run.
+        checkpoint_path: Explicit checkpoint path.
+
+    Returns:
+        Same shape as ``start_work``: dict with ``thread_id``, ``task_id``
+        and ``idempotency_key`` on success, or ``{"error": ...}`` on failure.
+    """
+    cp_path = get_checkpoint_path(checkpoint_path)
+    requirement: Optional[str] = None
+
+    # Prefer the work_items table (cheap, definitive), fall back to
+    # reading the checkpointed state.
+    try:
+        if cp_path.exists():
+            with sqlite3.connect(str(cp_path)) as conn:
+                cur = conn.execute(
+                    "SELECT requirement FROM work_items WHERE thread_id=?",
+                    (thread_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    requirement = row[0]
+    except Exception:
+        pass
+
+    if not requirement:
+        try:
+            from ..core.state_machine import SpineStateMachine
+            machine = SpineStateMachine(checkpoint_path=str(cp_path))
+            state = machine.resume(thread_id)
+            if state:
+                requirement = state.get("requirement", "")
+        except Exception:
+            pass
+
+    if not requirement:
+        return {"error": f"Could not find requirement for {thread_id}"}
+
+    # Fresh submission — new thread_id, new idempotency_key.
+    return start_work(
+        requirement=requirement,
+        checkpoint_path=str(cp_path) if cp_path else None,
+    )
+
+
+def _legacy_resume_state_only(thread_id: str, checkpoint_path: Optional[str] = None) -> bool:
+    """Read-only state lookup (kept for callers that just want to check existence)."""
+    from ..core.state_machine import SpineStateMachine
     machine = SpineStateMachine(checkpoint_path=checkpoint_path or ".spine/spine.db")
     try:
         state = machine.resume(thread_id)

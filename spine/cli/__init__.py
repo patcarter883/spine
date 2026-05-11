@@ -279,16 +279,16 @@ def _print_phase_progress(phase_name: str, state: dict) -> None:
 @cli.command()
 @click.argument("requirement")
 @click.option("--thread-id", "-t", default=None, help="Thread ID for persistence (auto-generated UUID if omitted)")
-@click.option("--checkpoint", "-c", default=".spine/spine.db", help="Checkpoint database path")
+@click.option("--checkpoint", "-c", default=None, help="Checkpoint database path (reads from config if not specified)")
 @click.option("--config", "-f", default=".spine/config.yaml", help="Config file path")
 @click.option("--debug-prompts", "-d", is_flag=True, help="Print prompts sent to agents to console")
-def work(requirement: str, thread_id: str | None, checkpoint: str, config: str, debug_prompts: bool):
+def work(requirement: str, thread_id: str | None, checkpoint: str | None, config: str, debug_prompts: bool):
     """Start a new work item."""
-    if thread_id is None:
-        thread_id = str(uuid.uuid4())
+    from ..work import submit_work_from_config
+    
     console.print(f"[bold blue]SPINE[/] [dim]|[/] [bold]Starting work:[/] {requirement}")
     
-    # Load providers from config
+    # Load providers to show which ones are configured
     providers_by_type = load_providers(config)
     llm_provider = get_primary_provider(providers_by_type, "llm")
     agent_provider = get_primary_provider(providers_by_type, "agent")
@@ -306,81 +306,36 @@ def work(requirement: str, thread_id: str | None, checkpoint: str, config: str, 
     if debug_prompts:
         console.print("  [bold magenta]📝[bold] Debug prompts enabled — prompts will be printed below")
     
-    machine = SpineStateMachine(
+    seen_phases = set()
+    
+    def stream_callback(state: dict) -> None:
+        """Print phase progress as the workflow runs."""
+        current_phase = state.get("phase", "")
+        if current_phase and current_phase not in seen_phases:
+            seen_phases.add(current_phase)
+            _print_phase_progress(current_phase, state)
+    
+    # Use unified submission
+    result = submit_work_from_config(
+        requirement=requirement,
+        config_path=config,
+        thread_id=thread_id,
         checkpoint_path=checkpoint,
-        llm_provider=llm_provider,
+        debug_prompts=debug_prompts,
+        background=False,
+        stream_callback=stream_callback,
     )
     
-    # Stash the debug flag so the executor can use it
-    machine._debug_prompts = debug_prompts
-    
-    # Use streaming to show phase-by-phase progress
-    seen_phases = set()
-    final_state = None
-    
-    # Safely build providers dict: transform (name, provider, priority) tuples -> provider instances
-    # Avoids IndexError when a provider list is empty or has only 1 element
-    providers_dict = {
-        k: v[0][1] if v else None
-        for k, v in providers_by_type.items()
-    }
-
-    # Generate a work item ID from the requirement
-    import re
-    work_slug = re.sub(r'[^a-z0-9]+', '-', requirement.lower().strip())[:50].strip('-') or 'work'
-    
-    # Detect project context
-    project_root = os.getcwd()
-    project_name = Path(project_root).name
-    
-    # Try to load project context from config
-    config_data = load_config(config)
-    project_config = config_data.get("project", {})
-    
-    project_context = {
-        "name": project_config.get("name", project_name),
-        "root": project_config.get("root", project_root),
-        "description": project_config.get("description", ""),
-        "tech_stack": project_config.get("tech_stack", []),
-    }
-    
-    try:
-        stream = machine.app.stream(
-            {"phase": "INIT", "requirement": requirement, "plan": None, "tasks": {},
-             "completed_tasks": [], "failed_tasks": [], "swarm_state": {},
-             "hive_cells": {}, "swarm_events": [],
-             "variables": {"work_item_id": work_slug, "thread_id": thread_id, "debug_prompts": debug_prompts},
-             "errors": [], "providers": providers_dict, "agent_provider": agent_provider,
-             "critic_gate_result": None, "error_state": None, "error_history": [],
-             "project_context": project_context},
-            {"configurable": {"thread_id": thread_id}}
-        )
-        
-        for chunk in stream:
-            for node_name, state in chunk.items():
-                current_phase = state.get("phase", "")
-                if current_phase and current_phase not in seen_phases:
-                    seen_phases.add(current_phase)
-                    _print_phase_progress(current_phase, state)
-                final_state = state
-        
-        if final_state:
-            final_phase = final_state.get("phase", "UNKNOWN")
-            if final_phase not in seen_phases:
-                _print_phase_progress(final_phase, final_state)
-            
-            if final_phase == "COMPLETE":
-                console.print(f"\n[bold green]🎉 All done![/] {len(final_state.get('completed_tasks', []))} tasks completed")
-            elif final_phase in ("ERROR", "BLOCKED"):
-                console.print(f"\n[bold red]Work stopped at {final_phase}[/]")
-                for err in final_state.get("errors", []):
-                    console.print(f"  [red]• {err}[/]")
-            else:
-                console.print(f"\n[dim]Final phase: {final_phase} | Tasks: {len(final_state.get('completed_tasks', []))}[/]")
-                
-    except Exception as e:
-        console.print(f"\n[bold red]Error during workflow:[/] {e}")
-        console.print_exception()
+    if result.get("status") == "success":
+        console.print(f"\n[bold green]🎉 All done![/] {result.get('completed_tasks', 0)} tasks completed")
+    elif result.get("status") == "failed":
+        console.print(f"\n[bold red]Work failed:[/] {result.get('error', 'Unknown error')}")
+    elif result.get("phase") in ("ERROR", "BLOCKED"):
+        console.print(f"\n[bold red]Work stopped at {result.get('phase')}[/]")
+        for err in result.get("errors", []):
+            console.print(f"  [red]• {err}[/]")
+    else:
+        console.print(f"\n[dim]Final phase: {result.get('phase')} | Tasks: {result.get('completed_tasks', 0)}[/]")
 
 
 @cli.command()
@@ -670,7 +625,7 @@ def ui():
     env = os.environ.copy()
     env["STREAMLIT_SERVER_HEADLESS"] = "true"
     
-    project_root = str(Path(__file__).resolve().parent.parent)
+    project_root = str(Path(__file__).resolve().parent.parent.parent)
     subprocess.run([
         sys.executable, "-m", "streamlit", "run",
         "--browser.serverAddress", "localhost",
