@@ -1017,6 +1017,19 @@ def format_phase_color(phase: str) -> str:
     return PHASE_COLORS.get(phase, "white")
 
 
+def colored_html(text: str, color: str) -> str:
+    """Return an HTML span with bold+colored text for use with st.markdown(unsafe_allow_html=True).
+
+    Args:
+        text: The text to render.
+        color: A CSS color name or hex value (e.g. "green", "#00ff00").
+
+    Returns:
+        HTML fragment that renders as bold colored text.
+    """
+    return f'<span style="color:{color}"><strong>{text}</strong></span>'
+
+
 def format_duration(seconds: float) -> str:
     """Format seconds into human-readable duration.
 

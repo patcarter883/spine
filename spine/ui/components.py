@@ -2,23 +2,21 @@
 
 import streamlit as st
 
-from spine.ui.utils import format_phase_icon, format_phase_color
+from spine.ui.utils import format_phase_icon, format_phase_color, colored_html
 
 
 def phase_badge(phase: str) -> str:
-    """Return a colored badge for a phase.
-
-    Uses Streamlit's colored text syntax for display.
+    """Return HTML for a colored phase badge.
 
     Args:
         phase: Phase name (e.g., "PLANNING", "COMPLETE").
 
     Returns:
-        Formatted string with color and phase name.
+        HTML fragment with colored icon and phase name.
     """
     icon = format_phase_icon(phase)
     color = format_phase_color(phase)
-    return f"[{color}]**{icon} {phase}**[/]"
+    return colored_html(f"{icon} {phase}", color)
 
 
 def phase_progress_bar(progress: float, label: str = "") -> None:
@@ -34,13 +32,13 @@ def phase_progress_bar(progress: float, label: str = "") -> None:
 
 
 def status_badge(status: str) -> str:
-    """Return a colored status badge.
+    """Return HTML for a colored status badge.
 
     Args:
         status: Status string (e.g., "success", "failed", "running").
 
     Returns:
-        Formatted string with color and status.
+        HTML fragment with colored status text.
     """
     color_map: dict[str, str] = {
         "success": "green",
@@ -51,7 +49,7 @@ def status_badge(status: str) -> str:
         "error": "red",
     }
     color = color_map.get(status.lower(), "gray")
-    return f"[{color}]**{status}**[/]"
+    return colored_html(status, color)
 
 
 def empty_state(message: str, icon: str = "ℹ️") -> None:
@@ -82,7 +80,7 @@ def work_item_card(item: dict) -> None:
 
         col_icon.write(icon)
         col_title.write(f"**{item.get('requirement', 'Untitled')}**")
-        col_phase.write(f"[{color}]**{item.get('phase', '')}**[/]")
+        col_phase.markdown(colored_html(item.get("phase", ""), color), unsafe_allow_html=True)
 
         progress = item.get("progress", 0)
         col_progress.progress(progress)

@@ -10,6 +10,7 @@ from spine.ui.utils import (
     get_active_work_items,
     format_phase_icon,
     format_phase_color,
+    colored_html,
 )
 
 
@@ -132,7 +133,7 @@ def render_dashboard() -> None:
 
             col_icon.write(icon)
             col_title.write(f"**{item['requirement']}**")
-            col_phase.write(f"[{color}]**{item['phase']}**[/]")
+            col_phase.markdown(colored_html(item["phase"], color), unsafe_allow_html=True)
 
             col_progress.progress(
                 progress,
