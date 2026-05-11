@@ -80,15 +80,20 @@ def _dispatch_work(job: Job) -> None:
     """Run work in a background thread and update job status."""
     try:
         from spine.core.state_machine import SpineStateMachine
+        from spine.cli import load_providers, get_primary_provider
 
         machine = SpineStateMachine(checkpoint_path=".spine/spine.db")
 
-        config = load_config()
-        providers_by_type = _load_providers_from_config(config)
-        providers_dict = {}
-        for category, provider_list in providers_by_type.items():
-            if provider_list:
-                providers_dict[category] = provider_list[0][1]
+        # Instantiate real provider objects (not raw config dicts).
+        # Raw config dicts would hit the AttributeError: 'dict' object has
+        # no attribute 'enabled' when the state machine tries to use them.
+        providers_by_type = load_providers()
+        llm_provider = get_primary_provider(providers_by_type, "llm")
+
+        # Build a providers dict with real provider instances.  These go
+        # through config["configurable"]["providers"] to survive LangGraph's
+        # checkpoint serialization (which would turn them back into dicts).
+        real_providers = {"llm": llm_provider}
 
         thread_id = str(uuid.uuid4())
 
@@ -110,17 +115,18 @@ def _dispatch_work(job: Job) -> None:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
             "errors": [],
-            "providers": providers_dict,
+            "providers": {},
             "critic_gate_result": None,
             "error_state": None,
             "error_history": [],
+            "project_context": {},
         }
 
         job_store.update_status(job.job_id, JobStatus.RUNNING, thread_id=thread_id)
 
         result = machine.app.invoke(
             initial_state,
-            {"configurable": {"thread_id": thread_id}},
+            {"configurable": {"thread_id": thread_id, "providers": real_providers}},
         )
 
         job_store.update_status(job.job_id, JobStatus.COMPLETED)

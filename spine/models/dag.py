@@ -105,7 +105,10 @@ def synthesize_slices(
     from .types import FeatureSlice
 
     # ── LLM path ──────────────────────────────────────────────────
-    if llm_provider and llm_provider.enabled:
+    # Guard against deserialized providers: LangGraph's checkpointer
+    # may turn provider objects into plain dicts.  A dict is not usable
+    # as an LLMProvider, so fall through to the heuristic path.
+    if llm_provider and not isinstance(llm_provider, dict) and llm_provider.enabled:
         try:
             prompt = _build_slice_synthesis_prompt(requirement, context)
             raw = llm_provider.generate(prompt)

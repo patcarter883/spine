@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional, Any, Iterator, Dict, List
 from langgraph.graph import StateGraph, END
+from langchain_core.runnables import RunnableConfig
 import sqlite3
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -79,6 +80,30 @@ class ProviderSerializer(SerializerProtocol):
         raise ValueError(f"Unknown format: {fmt}")
 
 
+def _get_providers(state: SpineState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+    """Resolve providers from config (non-serialized) first, then state (may contain deserialized dicts).
+
+    LangGraph's checkpointer serializes state between steps, turning provider
+    objects into plain dicts.  Passing providers through ``config["configurable"]``
+    avoids this problem because config is never persisted.
+    """
+    # Config path — real provider objects (not serialized)
+    if config:
+        cfg_providers = config.get("configurable", {}).get("providers")
+        if cfg_providers and isinstance(cfg_providers, dict):
+            return cfg_providers
+
+    # State path — may contain deserialized dicts; filter those out so
+    # callers only ever see real Provider instances or None
+    state_providers = state.get("providers", {})
+    if isinstance(state_providers, dict):
+        return {
+            k: v for k, v in state_providers.items()
+            if v is not None and not isinstance(v, dict)
+        }
+    return {}
+
+
 def init_phase(state: SpineState) -> SpineState:
     """Initialize the workflow from user requirement."""
     state["phase"] = PhaseName.INIT
@@ -102,7 +127,7 @@ def init_phase(state: SpineState) -> SpineState:
     return state
 
 
-def planning_phase(state: SpineState) -> SpineState:
+def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
     """Execute the PLANNING phase with parallel sub-phases.
     
     Uses LLM-based decomposition for intelligent task planning.
@@ -115,7 +140,7 @@ def planning_phase(state: SpineState) -> SpineState:
     # Log phase started event
     _log_phase_event(state, "PLANNING", "phase_started", {
         "requirement": state.get("requirement", ""),
-    })
+    }, config=config)
     
     # Define sub-phases based on design
     # Wave 1: ANALYZE, TECH_RESEARCH, RISK_ASSESSMENT (parallel)
@@ -181,8 +206,8 @@ def planning_phase(state: SpineState) -> SpineState:
         state["phase"] = PhaseName.ERROR
         return state
     
-    # Get providers from state
-    providers = state.get("providers", {})
+    # Get providers from config (preferred) or state
+    providers = _get_providers(state, config)
     llm_provider = providers.get("llm")
     executor = SwarmDAGExecutor(llm_provider=llm_provider)
     
@@ -266,7 +291,7 @@ def planning_phase(state: SpineState) -> SpineState:
             "errors": len(state.get("errors", [])),
             "duration": duration,
             "status": "error",
-        })
+        }, config=config)
         return state
     
     # Write plan artifacts to disk
@@ -276,7 +301,7 @@ def planning_phase(state: SpineState) -> SpineState:
         _log_phase_event(state, "PLANNING", "plan_written", {
             "path": artifact_path,
             "tasks_count": len(state["plan"].get("tasks", [])),
-        })
+        }, config=config)
     
     write_spec_file(state, work_item_id)
     
@@ -296,11 +321,11 @@ def planning_phase(state: SpineState) -> SpineState:
         "errors": len(state.get("errors", [])),
         "duration": duration,
         "status": "success",
-    })
+    }, config=config)
     return state
 
 
-def execution_phase(state: SpineState) -> SpineState:
+def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
     """Execute the EXECUTION phase with parallel sub-phases.
     
     When FeatureSlices are present in the plan, creates one SubPhase per
@@ -317,10 +342,10 @@ def execution_phase(state: SpineState) -> SpineState:
     # Log phase started event
     _log_phase_event(state, "EXECUTION", "phase_started", {
         "requirement": state.get("requirement", ""),
-    })
+    }, config=config)
     
-    # Get providers from state
-    providers = state.get("providers", {})
+    # Get providers from config (preferred) or state
+    providers = _get_providers(state, config)
     llm_provider = providers.get("llm")
     storage_provider = providers.get("storage")
     agent_provider = state.get("agent_provider")
@@ -489,11 +514,11 @@ def execution_phase(state: SpineState) -> SpineState:
         "errors": len(state.get("errors", [])),
         "duration": duration,
         "status": "success",
-    })
+    }, config=config)
     return state
 
 
-def verification_phase(state: SpineState) -> SpineState:
+def verification_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
     """Execute the VERIFICATION phase.
     
     Integrates git workflow for commits and branch management.
@@ -506,7 +531,7 @@ def verification_phase(state: SpineState) -> SpineState:
     # Log phase started event
     _log_phase_event(state, "VERIFICATION", "phase_started", {
         "requirement": state.get("requirement", ""),
-    })
+    }, config=config)
     
     # Quality gates - run actual checks
     syntax_ok, syntax_msg = _run_syntax_check()
@@ -521,7 +546,7 @@ def verification_phase(state: SpineState) -> SpineState:
         "task_id": "syntax_check",
         "subphase": "VERIFICATION",
         "status": syntax_status.value,
-    })
+    }, config=config)
     if syntax_ok:
         state["completed_tasks"].append("syntax_check")
     else:
@@ -539,7 +564,7 @@ def verification_phase(state: SpineState) -> SpineState:
         "task_id": "lint_check",
         "subphase": "VERIFICATION",
         "status": lint_status.value,
-    })
+    }, config=config)
     if lint_ok:
         state["completed_tasks"].append("lint_check")
     else:
@@ -563,14 +588,14 @@ def verification_phase(state: SpineState) -> SpineState:
         "task_id": "drift_check",
         "subphase": "VERIFICATION",
         "status": drift_status.value,
-    })
+    }, config=config)
     if drift_ok:
         state["completed_tasks"].append("drift_check")
     else:
         state["errors"].append(drift_msg)
     
     # Git integration: commit changes if configured
-    providers = state.get("providers", {})
+    providers = _get_providers(state, config)
     git_workflow = providers.get("git")
     
     if git_workflow:
@@ -621,7 +646,7 @@ def verification_phase(state: SpineState) -> SpineState:
         "errors": len(state.get("errors", [])),
         "duration": duration,
         "status": "success",
-    })
+    }, config=config)
     return state
 
 
@@ -928,7 +953,7 @@ def _get_spine_root(state: SpineState) -> str:
     return os.path.dirname(checkpoint_path)
 
 
-def _log_phase_event(state: SpineState, phase_name: str, event_type: str, data: Dict[str, Any]) -> None:
+def _log_phase_event(state: SpineState, phase_name: str, event_type: str, data: Dict[str, Any], config: Optional[RunnableConfig] = None) -> None:
     """Log a phase event to swarm.log via the SwarmMail instance.
 
     Args:
@@ -936,8 +961,9 @@ def _log_phase_event(state: SpineState, phase_name: str, event_type: str, data: 
         phase_name: Name of the phase
         event_type: Event type (phase_started, phase_completed, task_completed, plan_written)
         data: Event payload data
+        config: Optional RunnableConfig with non-serialized providers
     """
-    providers = state.get("providers", {})
+    providers = _get_providers(state, config)
     swarm_mail = providers.get("swarm_mail")
     if swarm_mail is None:
         return
@@ -1340,7 +1366,8 @@ class SpineStateMachine:
     
     def run(self, requirement: str, thread_id: str) -> SpineState:
         """Execute the full SPINE workflow."""
-        # Build providers dict for state
+        # Build providers dict — passed through config so it survives
+        # LangGraph's checkpoint serialization (config is never persisted).
         providers = {
             "llm": self._llm_provider,
             "memory": self._memory_provider,
@@ -1372,7 +1399,7 @@ class SpineStateMachine:
         
         result = self.app.invoke(
             initial_state,
-            {"configurable": {"thread_id": thread_id}}
+            {"configurable": {"thread_id": thread_id, "providers": providers}}
         )
         return result
     
@@ -1390,10 +1417,18 @@ class SpineStateMachine:
         return self._swarm_mail.replay_from(position=position, **kwargs)
     
     def resume(self, thread_id: str) -> Optional[SpineState]:
-        """Resume a previous workflow."""
-        state = self.app.get_state({"configurable": {"thread_id": thread_id}})
-        if state and "values" in state:
-            return state["values"]
+        """Resume a previous workflow.
+
+        Returns the latest state dict for the given thread_id,
+        or None if no checkpoint exists.
+        """
+        snapshot = self.app.get_state({"configurable": {"thread_id": thread_id}})
+        if snapshot is None:
+            return None
+        # StateSnapshot.values contains the current state dict
+        values = getattr(snapshot, "values", None)
+        if values is not None:
+            return dict(values)
         return None
 
     # --- ContinuityManager Integration ---
