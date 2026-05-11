@@ -26,6 +26,7 @@ from .enums import PhaseName, StateStatus, SubPhaseStatus
 from .types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState
 from .dag import SwarmDAGExecutor
 from .thread import Thread, generate_thread_id
+from .work_entry import WorkEntry
 
 __all__ = [
     # LLM models
@@ -49,4 +50,7 @@ __all__ = [
     # Data models - thread
     "Thread",
     "generate_thread_id",
+    # Data models - work entry
+    "Base",
+    "WorkEntry",
 ]

@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.status import HTTP_400_BAD_REQUEST
 
-from .routes import work_router, status_router
+from .routes import work_router, status_router, audit_router
 
 
 def create_app() -> FastAPI:
@@ -34,6 +34,7 @@ def create_app() -> FastAPI:
 
     app.include_router(work_router)
     app.include_router(status_router)
+    app.include_router(audit_router)
 
     @app.get("/health")
     async def health():
