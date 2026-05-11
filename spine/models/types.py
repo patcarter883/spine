@@ -156,6 +156,10 @@ class SpineState(TypedDict):
     # Error state tracking
     error_state: Optional[str]  # Current error state (HUMAN_REVIEW, TRANSIENT, FATAL)
     error_history: list[dict[str, Any]]  # Track error occurrences
+    
+    # Deep Agents integration state
+    pending_messages: list[dict[str, Any]]  # Message queue for mid-run injection
+    model_call_count: int  # Step counter for DA agents
 
 
 # ── Ralph Loop Hierarchy Types ─────────────────────────────────────

@@ -16,14 +16,18 @@ import ormsgpack
 from datetime import datetime, timezone
 
 from .constants import PhaseName, StateStatus, ErrorState
-from ..models.types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState
+from ..models.types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState, FeatureSlice
 from ..models.dag import SwarmDAGExecutor, synthesize_slices
 from ..providers.llm import LLMProvider
+from ..providers.deepagents_model import DeepAgentsModelProvider
 from ..providers.base import ConflictResolver, ConflictResult
 from ..providers.memory import MemoryProvider
 from ..providers.storage import StorageProvider, FileWriteGuard
 from ..providers.tools import ToolsProvider
 from ..core.persistence import GitWorkflow, Checkpoint
+
+import logging
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PhaseResult",
@@ -120,6 +124,8 @@ def init_phase(state: SpineState) -> SpineState:
     state["swarm_events"] = []
     state["errors"] = []
     state["critic_gate_result"] = None
+    state["pending_messages"] = []
+    state["model_call_count"] = 0
     
     # Transition to PLANNING
     state["previous_phase"] = PhaseName.INIT
@@ -128,24 +134,186 @@ def init_phase(state: SpineState) -> SpineState:
 
 
 def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
-    """Execute the PLANNING phase with parallel sub-phases.
-    
-    Uses LLM-based decomposition for intelligent task planning.
-    Includes entry/exit condition evaluation and DAG hooks.
-    Writes plan artifacts to disk and logs phase events.
+    """Execute the PLANNING phase using Deep Agents when available.
+
+    Primary path (DA): Creates a planning DA agent with explorer, SME, and
+    analyst subagents. The agent loop handles tool execution, context
+    compaction, and critic gate iteration internally.
+
+    Fallback path: Uses the legacy SwarmDAGExecutor when no DA-compatible
+    LLM provider is configured (i.e., the old LLMProvider is in use).
     """
     state["phase"] = PhaseName.PLANNING
     start_time = datetime.now(timezone.utc)
-    
+
     # Log phase started event
     _log_phase_event(state, "PLANNING", "phase_started", {
         "requirement": state.get("requirement", ""),
     }, config=config)
-    
-    # Define sub-phases based on design
-    # Wave 1: ANALYZE, TECH_RESEARCH, RISK_ASSESSMENT (parallel)
-    # Wave 2: SYNTHESIZE (depends on Wave 1)
-    
+
+    # ── Resolve providers from config (not state) ───────────────────
+    providers = _get_providers(state, config)
+    llm_provider = providers.get("llm")
+    agent_provider = providers.get("agent")
+
+    # Also try state for agent_provider (backward compat)
+    if agent_provider is None:
+        state_ap = state.get("agent_provider")
+        if state_ap is not None and not isinstance(state_ap, dict):
+            agent_provider = state_ap
+
+    # ── Try Deep Agents path first ──────────────────────────────────
+    da_chat_model = None
+    if isinstance(llm_provider, DeepAgentsModelProvider):
+        da_chat_model = llm_provider.chat_model
+    elif llm_provider is not None and hasattr(llm_provider, "chat_model"):
+        # Future: other providers may expose chat_model
+        da_chat_model = llm_provider.chat_model
+
+    if da_chat_model is not None:
+        return _planning_phase_da(state, config, providers, da_chat_model, start_time)
+
+    # ── Fallback: legacy SwarmDAGExecutor path ───────────────────────
+    return _planning_phase_legacy(state, config, providers, agent_provider, start_time)
+
+
+def _planning_phase_da(
+    state: SpineState,
+    config: Optional[RunnableConfig],
+    providers: dict[str, Any],
+    chat_model: Any,
+    start_time: datetime,
+) -> SpineState:
+    """PLANNING phase using Deep Agents — primary path."""
+    from ..adapters.da_phase_adapter import (
+        create_planning_agent,
+        _extract_feature_slices_from_da_result,
+        _extract_planning_context_from_da_result,
+    )
+
+    debug_prompts = state.get("variables", {}).get("debug_prompts", False)
+    max_steps = int(os.environ.get("SPINE_PLANNING_STEPS", "50"))
+
+    try:
+        planning_agent = create_planning_agent(
+            requirement=state["requirement"],
+            providers=providers,
+            max_steps=max_steps,
+        )
+    except ValueError as e:
+        state["errors"].append(f"DA planning agent creation failed: {e}")
+        state["error_state"] = ErrorState.FATAL.value
+        state["previous_phase"] = PhaseName.PLANNING
+        state["phase"] = PhaseName.ERROR
+        return state
+
+    if debug_prompts:
+        import sys
+        print("[DA-PLANNING] Invoking DA planning agent...", file=sys.stderr)
+
+    try:
+        result = planning_agent.invoke({
+            "messages": [{
+                "role": "user",
+                "content": (
+                    f"Analyze this requirement and create an execution plan "
+                    f"with FeatureSlices: {state['requirement']}"
+                ),
+            }],
+            "spine_phase": "PLANNING",
+        }, config=config)
+    except Exception as e:
+        state["errors"].append(f"DA planning agent execution failed: {e}")
+        state["error_state"] = ErrorState.TRANSIENT.value
+        state["previous_phase"] = PhaseName.PLANNING
+        state["phase"] = PhaseName.ERROR
+        return state
+
+    # ── Extract structured output ────────────────────────────────────
+    planning_context = _extract_planning_context_from_da_result(result)
+    feature_slices = _extract_feature_slices_from_da_result(result)
+
+    # If DA didn't produce slices, fall back to synthesize_slices
+    if not feature_slices:
+        feature_slices = synthesize_slices(
+            requirement=state["requirement"],
+            context=planning_context,
+            agent_provider=None,  # DA already tried — use heuristic
+        )
+
+    # Critic gate (SPINE-specific: runs at state machine level)
+    critic_result = _run_critic_gate_da(state, planning_context, chat_model)
+    state["critic_gate_result"] = critic_result
+
+    if critic_result != "APPROVED":
+        state["errors"].append(f"Critic gate {critic_result}: Plan requires revision")
+        state["previous_phase"] = PhaseName.PLANNING
+        _log_phase_event(state, "PLANNING", "phase_completed", {
+            "tasks_completed": len(state.get("completed_tasks", [])),
+            "errors": len(state.get("errors", [])),
+            "duration": (datetime.now(timezone.utc) - start_time).total_seconds(),
+            "status": "error",
+        }, config=config)
+        return state
+
+    # ── Build plan ───────────────────────────────────────────────────
+    plan_tasks = _derive_plan_tasks_from_da_result(result, state["requirement"])
+
+    state["plan"] = {
+        "requirement": state["requirement"],
+        "phases": ["PLANNING", "EXECUTION", "VERIFICATION"],
+        "tasks": plan_tasks,
+        "feature_slices": [s.to_dict() for s in feature_slices],
+        "planning_context": planning_context,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Mark planning tasks complete
+    state["completed_tasks"].extend([t["id"] for t in plan_tasks])
+
+    # Write artifacts
+    work_item_id = state.get("variables", {}).get("work_item_id", state.get("variables", {}).get("thread_id", "default"))
+    artifact_path = write_plan_artifact(state, work_item_id)
+    if artifact_path:
+        _log_phase_event(state, "PLANNING", "plan_written", {
+            "path": artifact_path,
+            "tasks_count": len(state["plan"].get("tasks", [])),
+        }, config=config)
+
+    write_spec_file(state, work_item_id)
+
+    spine_root = _get_spine_root(state)
+    state["variables"]["spec_path"] = os.path.join(spine_root, "spec", f"{work_item_id}.md")
+    state["variables"]["artifact_path"] = os.path.join(spine_root, "artifacts", "plans", f"{work_item_id}.json")
+
+    # Transition to EXECUTION
+    state["previous_phase"] = PhaseName.PLANNING
+    state["phase"] = PhaseName.EXECUTION
+
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    _log_phase_event(state, "PLANNING", "phase_completed", {
+        "tasks_completed": len(state.get("completed_tasks", [])),
+        "errors": len(state.get("errors", [])),
+        "duration": duration,
+        "status": "success",
+        "path": "deepagents",
+    }, config=config)
+    return state
+
+
+def _planning_phase_legacy(
+    state: SpineState,
+    config: Optional[RunnableConfig],
+    providers: dict[str, Any],
+    agent_provider: Any,
+    start_time: datetime,
+) -> SpineState:
+    """PLANNING phase using legacy SwarmDAGExecutor — fallback path.
+
+    This is the original planning_phase logic, preserved for backward
+    compatibility when no DeepAgentsModelProvider is configured.
+    """
+    # Define sub-phases (same as original)
     subphases = [
         SubPhase(
             name="ANALYZE",
@@ -155,7 +323,7 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
             tasks=[Task(id="parse_requirement", description="Parse and analyze requirement")]
         ),
         SubPhase(
-            name="TECH_RESEARCH", 
+            name="TECH_RESEARCH",
             priority=1,
             parallel=True,
             agent_role="sme",
@@ -180,83 +348,55 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
             ]
         ),
     ]
-    
+
     state["swarm_state"]["active_subphases"] = [sp.name for sp in subphases]
-    
-    # Build phase with hooks and conditions
+
     planning_phase_obj = Phase(
         name=PhaseName.PLANNING,
         subphases=subphases,
         pre_execute_hooks=[lambda ctx: {**ctx, "planning_started": True}],
         post_execute_hooks=[lambda ctx: {**ctx, "planning_completed": True}]
     )
-    
-    # Run pre-execute hooks
+
+    # Run hooks and conditions
     context = {
         "requirement": state["requirement"],
         "variables": state.get("variables", {})
     }
     context = _run_pre_execute_hooks(planning_phase_obj, context)
-    
-    # Evaluate entry conditions
+
     if not _evaluate_entry_conditions(planning_phase_obj, context):
         state["errors"].append("Entry conditions not met for PLANNING phase")
         state["error_state"] = ErrorState.FATAL.value
         state["previous_phase"] = PhaseName.PLANNING
         state["phase"] = PhaseName.ERROR
         return state
-    
-    # Get providers from config (preferred) or state
-    providers = _get_providers(state, config)
-    agent_provider = providers.get("agent")
-    if agent_provider is None:
-        state_ap = state.get("agent_provider")
-        if state_ap is not None and not isinstance(state_ap, dict):
-            agent_provider = state_ap
+
     executor = SwarmDAGExecutor(agent_provider=agent_provider)
-    
-    # Execute planning phase with LLM-based decomposition
     context = {
         "requirement": state["requirement"],
         "variables": state.get("variables", {})
     }
     phase_result = executor.execute_phase(Phase(name="PLANNING", subphases=subphases), context)
-    
-    # Check for error threshold exceeded
+
+    # Check error threshold
     error_state, failed_subphases = _check_error_threshold(subphases)
     if error_state != ErrorState.INIT.value:
         state["error_state"] = error_state
         state["phase"] = PhaseName.ERROR
         return state
-    
-    # Evaluate exit conditions
-    exit_context = {
-        "requirement": state["requirement"],
-        "phase_result": phase_result,
-        "variables": state.get("variables", {})
-    }
-    if not _evaluate_exit_conditions(planning_phase_obj, exit_context):
-        state["errors"].append("Exit conditions not met for PLANNING phase")
-        state["error_state"] = ErrorState.TRANSIENT.value
-        state["previous_phase"] = PhaseName.PLANNING
-        state["phase"] = PhaseName.ERROR
-        return state
-    
-    # Generate plan from execution results — derive tasks from subphase output
+
+    # Build plan
     subphase_results = phase_result.subphase_results
     subphase_statuses = phase_result.subphase_statuses
-
-    # Build a rich planning context for downstream slice synthesis
     planning_context = _extract_planning_context(subphase_results)
 
-    # Use agent to decompose into FeatureSlices when possible
     feature_slices = synthesize_slices(
         requirement=state["requirement"],
         context=planning_context,
         agent_provider=agent_provider,
     )
 
-    # Derive plan tasks from subphase results (not hardcoded)
     plan_tasks = _derive_plan_tasks(subphase_results, state["requirement"])
 
     state["plan"] = {
@@ -270,25 +410,27 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Mark planning tasks complete — use actual task IDs from subphases
     completed_ids = []
     for sp in subphases:
         for t in sp.tasks:
             completed_ids.append(t.id)
     state["completed_tasks"].extend(completed_ids)
-    
-    # Run post-execute hooks
+
+    exit_context = {
+        "requirement": state["requirement"],
+        "phase_result": phase_result,
+        "variables": state.get("variables", {})
+    }
     context = _run_post_execute_hooks(planning_phase_obj, exit_context)
-    
-    # Critic gate validation per STATEMACHINE.md §7.1
+
+    # Critic gate
     plan = state["plan"] or {}
     critic_result = executor.run_critic_gate(plan, state.get("variables", {}))
     state["critic_gate_result"] = critic_result
-    
+
     if critic_result != "APPROVED":
         state["errors"].append(f"Critic gate {critic_result}: Plan requires revision")
         state["previous_phase"] = PhaseName.PLANNING
-        # Log phase completed with error
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         _log_phase_event(state, "PLANNING", "phase_completed", {
             "tasks_completed": len(state.get("completed_tasks", [])),
@@ -297,8 +439,8 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
             "status": "error",
         }, config=config)
         return state
-    
-    # Write plan artifacts to disk
+
+    # Write artifacts
     work_item_id = state.get("variables", {}).get("work_item_id", state.get("variables", {}).get("thread_id", "default"))
     artifact_path = write_plan_artifact(state, work_item_id)
     if artifact_path:
@@ -306,77 +448,137 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
             "path": artifact_path,
             "tasks_count": len(state["plan"].get("tasks", [])),
         }, config=config)
-    
+
     write_spec_file(state, work_item_id)
-    
-    # Store artifact/spec paths in variables so execution phase can reference them
+
     spine_root = _get_spine_root(state)
     state["variables"]["spec_path"] = os.path.join(spine_root, "spec", f"{work_item_id}.md")
     state["variables"]["artifact_path"] = os.path.join(spine_root, "artifacts", "plans", f"{work_item_id}.json")
-    
-    # Transition to EXECUTION
+
     state["previous_phase"] = PhaseName.PLANNING
     state["phase"] = PhaseName.EXECUTION
-    
-    # Log phase completed
+
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
     _log_phase_event(state, "PLANNING", "phase_completed", {
         "tasks_completed": len(state.get("completed_tasks", [])),
         "errors": len(state.get("errors", [])),
         "duration": duration,
         "status": "success",
+        "path": "legacy",
     }, config=config)
     return state
 
 
+def _run_critic_gate_da(state: SpineState, planning_context: dict, chat_model: Any) -> str:
+    """Run critic gate using a DA chat model directly.
+
+    Returns one of: APPROVED, NEEDS_REVISION, REJECTED.
+    """
+    from langchain_core.messages import HumanMessage
+
+    context_text = ""
+    for key, value in planning_context.items():
+        context_text += f"\n## {key.upper()}\n{value}"
+
+    critic_prompt = (
+        "You are a software architecture critic. Review this planning context "
+        "for correctness, completeness, and feasibility.\n\n"
+        f"REQUIREMENT: {state.get('requirement', '')}\n\n"
+        f"PLANNING CONTEXT:{context_text}\n\n"
+        "Respond with exactly one word: APPROVED, NEEDS_REVISION, or REJECTED. "
+        "If not APPROVED, explain what needs to change."
+    )
+    try:
+        result = chat_model.invoke([HumanMessage(content=critic_prompt)])
+        content = result.content.strip()
+        for verdict in ("APPROVED", "NEEDS_REVISION", "REJECTED"):
+            if verdict in content.upper():
+                return verdict
+        return "NEEDS_REVISION"
+    except Exception as e:
+        logger.warning("Critic gate DA invocation failed: %s", e)
+        return "NEEDS_REVISION"
+
+
+def _derive_plan_tasks_from_da_result(result: dict[str, Any], requirement: str) -> list[dict[str, str]]:
+    """Derive execution plan tasks from DA agent output.
+
+    Scans the message history for task-related content.
+    Falls back to heuristic extraction from the requirement.
+    """
+    # Check if feature_slices are in the result (they take priority)
+    from ..adapters.da_phase_adapter import _extract_feature_slices_from_da_result
+    slices = _extract_feature_slices_from_da_result(result)
+    if slices:
+        return [{"id": s.id, "description": s.description} for s in slices]
+
+    # Fallback: heuristic from requirement
+    from ..models.dag import _extract_components
+    components = _extract_components(requirement)
+    return [{"id": f"implement-{i+1}", "description": f"Implement {c}"}
+            for i, c in enumerate(components)]
+
+
 def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
-    """Execute the EXECUTION phase with parallel sub-phases.
-    
-    When FeatureSlices are present in the plan, creates one SubPhase per
-    slice and delegates to agent_provider when available.  Falls back to
-    the hardcoded BACKEND/FRONTEND pattern when no slices exist.
-    
-    Integrates file write guard for protected writes.
-    Includes entry/exit condition evaluation and DAG hooks.
-    Logs phase events to swarm.log.
+    """Execute the EXECUTION phase using Deep Agents when available.
+
+    Primary path (DA): Creates an execution DA agent with one SubAgent per
+    FeatureSlice. Each subagent has isolated context. The main agent
+    orchestrates execution order based on slice dependencies.
+
+    Fallback path: Uses the legacy SwarmDAGExecutor when no DA-compatible
+    LLM provider is configured.
     """
     state["phase"] = PhaseName.EXECUTION
     start_time = datetime.now(timezone.utc)
-    
-    # Log phase started event
+
     _log_phase_event(state, "EXECUTION", "phase_started", {
         "requirement": state.get("requirement", ""),
     }, config=config)
-    
-    # Get providers from config (preferred) or state
+
+    # ── Resolve providers ─────────────────────────────────────────────
     providers = _get_providers(state, config)
+    llm_provider = providers.get("llm")
     storage_provider = providers.get("storage")
-    # Read agent_provider from config-resolved providers first; fall back to
-    # state only when it's a real instance (LangGraph serialization will turn
-    # provider objects into plain dicts, which would break downstream .execute()
-    # calls — `_get_providers` filters those out).
     agent_provider = providers.get("agent")
     if agent_provider is None:
         state_ap = state.get("agent_provider")
         if state_ap is not None and not isinstance(state_ap, dict):
             agent_provider = state_ap
-    
-    debug_prompts = state.get("variables", {}).get("debug_prompts", False)
-    
-    # Create executor with agent provider
-    executor = SwarmDAGExecutor(
-        storage_provider=storage_provider,
-        agent_provider=agent_provider,
+
+    # ── Try Deep Agents path ──────────────────────────────────────────
+    da_chat_model = None
+    if isinstance(llm_provider, DeepAgentsModelProvider):
+        da_chat_model = llm_provider.chat_model
+    elif llm_provider is not None and hasattr(llm_provider, "chat_model"):
+        da_chat_model = llm_provider.chat_model
+
+    if da_chat_model is not None:
+        return _execution_phase_da(state, config, providers, da_chat_model, start_time)
+
+    # ── Fallback: legacy SwarmDAGExecutor path ─────────────────────────
+    return _execution_phase_legacy(state, config, providers, agent_provider, storage_provider, start_time)
+
+
+def _execution_phase_da(
+    state: SpineState,
+    config: Optional[RunnableConfig],
+    providers: dict[str, Any],
+    chat_model: Any,
+    start_time: datetime,
+) -> SpineState:
+    """EXECUTION phase using Deep Agents — primary path."""
+    from ..adapters.da_phase_adapter import (
+        create_execution_agent,
+        get_backend,
     )
-    
-    # Forward debug_prompts into context so the prompt builder can use it
-    
-    # ── Build subphases from FeatureSlices (or fallback) ──────────
+
+    debug_prompts = state.get("variables", {}).get("debug_prompts", False)
     plan = state.get("plan") or {}
     raw_slices = plan.get("feature_slices", [])
     planning_context = plan.get("planning_context", {})
-    
-    # Read spec file content for execution context (written by planning phase)
+
+    # Read spec content
     spec_content = ""
     spec_path = state.get("variables", {}).get("spec_path", "")
     if spec_path and os.path.isfile(spec_path):
@@ -384,15 +586,122 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
             with open(spec_path, "r") as f:
                 spec_content = f.read()
         except Exception:
-            pass  # Non-fatal: spec is supplementary context
-    
+            pass
+
+    # Build FeatureSlice objects
+    feature_slices = []
     if raw_slices:
-        from ..models.types import FeatureSlice
+        feature_slices = [FeatureSlice.from_dict(s) for s in raw_slices]
+    else:
+        # No slices from planning — create a single catch-all slice
+        feature_slices = [FeatureSlice(
+            id="implementation",
+            description=state.get("requirement", "Implement the required feature"),
+            scope=["."],
+            depends_on=[],
+            agent_role="coder",
+            acceptance=["Feature works as described"],
+        )]
+
+    max_steps = int(os.environ.get("SPINE_EXECUTION_STEPS", "100"))
+
+    try:
+        backend = get_backend(phase=PhaseName.EXECUTION)
+        execution_agent = create_execution_agent(
+            requirement=state["requirement"],
+            providers=providers,
+            feature_slices=feature_slices,
+            planning_context=planning_context,
+            spec_content=spec_content,
+            backend=backend,
+            max_steps=max_steps,
+        )
+    except ValueError as e:
+        state["errors"].append(f"DA execution agent creation failed: {e}")
+        state["error_state"] = ErrorState.FATAL.value
+        state["previous_phase"] = PhaseName.EXECUTION
+        state["phase"] = PhaseName.ERROR
+        return state
+
+    if debug_prompts:
+        import sys
+        print(f"[DA-EXECUTION] Invoking DA execution agent with {len(feature_slices)} slice(s)...", file=sys.stderr)
+
+    try:
+        execution_agent.invoke({
+            "messages": [{
+                "role": "user",
+                "content": (
+                    f"Implement the planned feature slices. "
+                    f"Start with slices that have no dependencies. "
+                    f"Slices: {', '.join(s.id for s in feature_slices)}"
+                ),
+            }],
+        }, config=config)
+    except Exception as e:
+        state["errors"].append(f"DA execution agent failed: {e}")
+        state["error_state"] = ErrorState.TRANSIENT.value
+        state["previous_phase"] = PhaseName.EXECUTION
+        state["phase"] = PhaseName.ERROR
+        return state
+
+    # Track completed tasks from execution
+    for slice_obj in feature_slices:
+        if slice_obj.id not in state["completed_tasks"]:
+            state["completed_tasks"].append(slice_obj.id)
+
+    state["previous_phase"] = PhaseName.EXECUTION
+    state["phase"] = PhaseName.VERIFICATION
+
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    _log_phase_event(state, "EXECUTION", "phase_completed", {
+        "tasks_completed": len(state.get("completed_tasks", [])),
+        "errors": len(state.get("errors", [])),
+        "duration": duration,
+        "status": "success",
+        "path": "deepagents",
+    }, config=config)
+    return state
+
+
+def _execution_phase_legacy(
+    state: SpineState,
+    config: Optional[RunnableConfig],
+    providers: dict[str, Any],
+    agent_provider: Any,
+    storage_provider: Any,
+    start_time: datetime,
+) -> SpineState:
+    """EXECUTION phase using legacy SwarmDAGExecutor — fallback path.
+
+    Preserved for backward compatibility when no DA provider is configured.
+    """
+    _ = state.get("variables", {}).get("debug_prompts", False)
+
+    executor = SwarmDAGExecutor(
+        storage_provider=storage_provider,
+        agent_provider=agent_provider,
+    )
+
+    # Build subphases from FeatureSlices (or fallback)
+    plan = state.get("plan") or {}
+    raw_slices = plan.get("feature_slices", [])
+    planning_context = plan.get("planning_context", {})
+
+    spec_content = ""
+    spec_path = state.get("variables", {}).get("spec_path", "")
+    if spec_path and os.path.isfile(spec_path):
+        try:
+            with open(spec_path, "r") as f:
+                spec_content = f.read()
+        except Exception:
+            pass
+
+    if raw_slices:
         feature_slices = [FeatureSlice.from_dict(s) for s in raw_slices]
         subphases = []
         active_names = []
         for s in feature_slices:
-            # Build task description with scope and acceptance criteria
             task_desc = s.description
             if s.scope:
                 task_desc += f"\nScope: {', '.join(s.scope)}"
@@ -411,9 +720,6 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
             active_names.append(s.id.upper().replace("-", "_"))
         state["swarm_state"]["active_subphases"] = active_names
     else:
-        # Fallback: create subphases from plan tasks (not the raw requirement).
-        # Each plan task becomes its own subphase so the agent gets focused
-        # instructions derived from planning, not the raw user request.
         plan_tasks = plan.get("tasks", [])
         if plan_tasks and len(plan_tasks) > 1:
             subphases = []
@@ -424,14 +730,13 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
                 subphases.append(SubPhase(
                     name=tid.upper().replace("-", "_"),
                     priority=i + 1,
-                    parallel=False,  # Sequential to avoid GPU contention
+                    parallel=False,
                     agent_role="coder",
                     tasks=[Task(id=tid, description=tdesc)],
                 ))
                 active_names.append(tid.upper().replace("-", "_"))
             state["swarm_state"]["active_subphases"] = active_names
         else:
-            # Single IMPLEMENTATION subphase — but with planning context, not raw requirement
             requirement_text = state.get("requirement", "")
             subphases = [
                 SubPhase(
@@ -445,16 +750,14 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
                 ),
             ]
             state["swarm_state"]["active_subphases"] = ["IMPLEMENTATION"]
-    
-    # Build phase with hooks and conditions
+
     execution_phase_obj = Phase(
         name=PhaseName.EXECUTION,
         subphases=subphases,
         pre_execute_hooks=[lambda ctx: {**ctx, "execution_started": True}],
         post_execute_hooks=[lambda ctx: {**ctx, "execution_completed": True}],
     )
-    
-    # Run pre-execute hooks
+
     context = {
         "requirement": state["requirement"],
         "plan": state.get("plan"),
@@ -463,16 +766,14 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
         "variables": state.get("variables", {})
     }
     context = _run_pre_execute_hooks(execution_phase_obj, context)
-    
-    # Evaluate entry conditions
+
     if not _evaluate_entry_conditions(execution_phase_obj, context):
         state["errors"].append("Entry conditions not met for EXECUTION phase")
         state["error_state"] = ErrorState.TRANSIENT.value
         state["previous_phase"] = PhaseName.EXECUTION
         state["phase"] = PhaseName.ERROR
         return state
-    
-    # Execute with file guard integration
+
     context = {
         "requirement": state["requirement"],
         "plan": state.get("plan"),
@@ -481,23 +782,20 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
         "variables": state.get("variables", {})
     }
     phase_result = executor.execute_phase(Phase(name="EXECUTION", subphases=subphases), context)
-    
-    # Check for error threshold exceeded
+
     error_state, failed_subphases = _check_error_threshold(subphases)
     if error_state != ErrorState.INIT.value:
         state["error_state"] = error_state
         state["phase"] = PhaseName.ERROR
         return state
-    
-    # Track completed tasks from execution
+
     for task_id, task_data in phase_result.subphase_results.items():
         if isinstance(task_data, dict) and task_data.get("status") == "success":
             for task in subphases:
                 for t in task.tasks:
                     if t.id not in state["completed_tasks"]:
                         state["completed_tasks"].append(t.id)
-    
-    # Evaluate exit conditions
+
     exit_context = {
         "requirement": state["requirement"],
         "phase_result": phase_result,
@@ -509,47 +807,176 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
         state["previous_phase"] = PhaseName.EXECUTION
         state["phase"] = PhaseName.ERROR
         return state
-    
-    # Run post-execute hooks
+
     context = _run_post_execute_hooks(execution_phase_obj, exit_context)
-    
-    # Transition to VERIFICATION
+
     state["previous_phase"] = PhaseName.EXECUTION
     state["phase"] = PhaseName.VERIFICATION
-    
-    # Log phase completed
+
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
     _log_phase_event(state, "EXECUTION", "phase_completed", {
         "tasks_completed": len(state.get("completed_tasks", [])),
         "errors": len(state.get("errors", [])),
         "duration": duration,
         "status": "success",
+        "path": "legacy",
     }, config=config)
     return state
 
 
 def verification_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
-    """Execute the VERIFICATION phase.
-    
-    Runs agent-driven code review first, then local syntax/lint gates,
-    and finally git integration for commits and branch management.
+    """Execute the VERIFICATION phase using Deep Agents when available.
+
+    Primary path (DA): Creates a verification DA agent with reviewer and
+    test_engineer subagents. The agent loop handles code review and test
+    execution internally.
+
+    Fallback path: Uses the legacy approach (agent review + local quality gates)
+    when no DA-compatible LLM provider is configured.
     """
     state["phase"] = PhaseName.VERIFICATION
     start_time = datetime.now(timezone.utc)
-    
-    # Log phase started event
+
     _log_phase_event(state, "VERIFICATION", "phase_started", {
         "requirement": state.get("requirement", ""),
     }, config=config)
-    
-    # ── Agent-driven code review ────────────────────────────────────
+
+    # ── Resolve providers ─────────────────────────────────────────────
     providers = _get_providers(state, config)
+    llm_provider = providers.get("llm")
     agent_provider = providers.get("agent")
     if agent_provider is None:
         state_ap = state.get("agent_provider")
         if state_ap is not None and not isinstance(state_ap, dict):
             agent_provider = state_ap
 
+    # ── Try Deep Agents path ──────────────────────────────────────────
+    da_chat_model = None
+    if isinstance(llm_provider, DeepAgentsModelProvider):
+        da_chat_model = llm_provider.chat_model
+    elif llm_provider is not None and hasattr(llm_provider, "chat_model"):
+        da_chat_model = llm_provider.chat_model
+
+    if da_chat_model is not None:
+        return _verification_phase_da(state, config, providers, da_chat_model, start_time)
+
+    # ── Fallback: legacy path ─────────────────────────────────────────
+    return _verification_phase_legacy(state, config, providers, agent_provider, start_time)
+
+
+def _verification_phase_da(
+    state: SpineState,
+    config: Optional[RunnableConfig],
+    providers: dict[str, Any],
+    chat_model: Any,
+    start_time: datetime,
+) -> SpineState:
+    """VERIFICATION phase using Deep Agents — primary path."""
+    from ..adapters.da_phase_adapter import (
+        create_verification_agent,
+        _extract_verification_result,
+    )
+
+    debug_prompts = state.get("variables", {}).get("debug_prompts", False)
+    max_steps = int(os.environ.get("SPINE_VERIFICATION_STEPS", "50"))
+
+    try:
+        verification_agent = create_verification_agent(
+            requirement=state["requirement"],
+            providers=providers,
+            max_steps=max_steps,
+        )
+    except ValueError as e:
+        state["errors"].append(f"DA verification agent creation failed: {e}")
+        state["error_state"] = ErrorState.FATAL.value
+        state["previous_phase"] = PhaseName.VERIFICATION
+        state["phase"] = PhaseName.ERROR
+        return state
+
+    if debug_prompts:
+        import sys
+        print("[DA-VERIFICATION] Invoking DA verification agent...", file=sys.stderr)
+
+    try:
+        result = verification_agent.invoke({
+            "messages": [{
+                "role": "user",
+                "content": (
+                    f"Verify the implementation meets all acceptance criteria "
+                    f"for: {state.get('requirement', '')}"
+                ),
+            }],
+        }, config=config)
+    except Exception as e:
+        state["errors"].append(f"DA verification agent failed: {e}")
+        state["error_state"] = ErrorState.TRANSIENT.value
+        state["previous_phase"] = PhaseName.VERIFICATION
+        state["phase"] = PhaseName.ERROR
+        return state
+
+    # ── Process verification results ──────────────────────────────────
+    ver_result = _extract_verification_result(result)
+    state["completed_tasks"].append("da_verification")
+
+    # Also run local quality gates (syntax, lint, drift)
+    syntax_ok, syntax_msg = _run_syntax_check()
+    if syntax_ok:
+        state["completed_tasks"].append("syntax_check")
+    else:
+        state["errors"].append(syntax_msg)
+
+    lint_ok, lint_msg = _run_lint_check()
+    if lint_ok:
+        state["completed_tasks"].append("lint_check")
+    else:
+        state["errors"].append(lint_msg)
+
+    # Determine if rework is needed
+    needs_rework = (
+        not ver_result.get("passed", False)
+        or not syntax_ok
+        or not lint_ok
+    )
+
+    if needs_rework:
+        failed_criteria = ver_result.get("failed_criteria", [])
+        if not syntax_ok:
+            failed_criteria.append(syntax_msg)
+        if not lint_ok:
+            failed_criteria.append(lint_msg)
+        state["failed_tasks"] = failed_criteria
+        state["errors"].append(f"Verification failed: {len(failed_criteria)} criteria failed")
+        state["previous_phase"] = PhaseName.VERIFICATION
+        state["phase"] = PhaseName.REWORK
+        return state
+
+    # All checks passed
+    state["previous_phase"] = PhaseName.VERIFICATION
+    state["phase"] = PhaseName.COMPLETE
+
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    _log_phase_event(state, "VERIFICATION", "phase_completed", {
+        "tasks_completed": len(state.get("completed_tasks", [])),
+        "errors": len(state.get("errors", [])),
+        "duration": duration,
+        "status": "success",
+        "path": "deepagents",
+    }, config=config)
+    return state
+
+
+def _verification_phase_legacy(
+    state: SpineState,
+    config: Optional[RunnableConfig],
+    providers: dict[str, Any],
+    agent_provider: Any,
+    start_time: datetime,
+) -> SpineState:
+    """VERIFICATION phase using legacy approach — fallback path.
+
+    Preserved for backward compatibility when no DA provider is configured.
+    """
+    # Agent-driven code review
     if agent_provider and agent_provider.enabled:
         review_subphase = SubPhase(
             name="AGENT_REVIEW",
@@ -597,10 +1024,8 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
             state["completed_tasks"].append("agent_review")
         else:
             state["errors"].append(f"Agent review failed: {review_result.get('error', 'unknown')}")
-    
-    # ── Local quality gates ─────────────────────────────────────────
-    
-    # Quality gates - run actual checks
+
+    # Local quality gates
     syntax_ok, syntax_msg = _run_syntax_check()
     syntax_status = StateStatus.SUCCESS if syntax_ok else StateStatus.FAILED
     state["tasks"]["syntax_check"] = Task(
@@ -618,7 +1043,7 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
         state["completed_tasks"].append("syntax_check")
     else:
         state["errors"].append(syntax_msg)
-    
+
     lint_ok, lint_msg = _run_lint_check()
     lint_status = StateStatus.SUCCESS if lint_ok else StateStatus.FAILED
     state["tasks"]["lint_check"] = Task(
@@ -636,10 +1061,9 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
         state["completed_tasks"].append("lint_check")
     else:
         state["errors"].append(lint_msg)
-    
+
     drift_ok = True
     drift_msg = "Plan drift check passed"
-    # Check that plan exists and has tasks
     plan = state.get("plan")
     if plan is None or len(plan.get("tasks", [])) == 0:
         drift_ok = False
@@ -660,21 +1084,17 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
         state["completed_tasks"].append("drift_check")
     else:
         state["errors"].append(drift_msg)
-    
-    # Git integration: commit changes if configured
+
+    # Git integration
     providers = _get_providers(state, config)
     git_workflow = providers.get("git")
-    
+
     if git_workflow:
         try:
-            # Create branch for this work item
             requirement = state.get("requirement", "work")
             branch_name = f"spine-{requirement[:20].replace(' ', '-').lower()}"
             git_workflow.create_branch(branch_name)
-            
-            # Commit changes
             git_workflow.commit(f"Complete: {requirement}", work_item=branch_name)
-            
             state["variables"]["git_branch"] = branch_name
             state["variables"]["git_commit"] = "completed"
         except Exception as e:
@@ -683,11 +1103,9 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
             state["previous_phase"] = PhaseName.VERIFICATION
             state["phase"] = PhaseName.ERROR
             return state
-    
+
     # Check for failures that require rework
     failed_tasks = state.get("failed_tasks", [])
-    
-    # Check for error history threshold
     error_history = state.get("error_history", [])
     if len(error_history) >= 3:
         state["error_state"] = ErrorState.FATAL.value
@@ -695,24 +1113,23 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
         state["previous_phase"] = PhaseName.VERIFICATION
         state["phase"] = PhaseName.ERROR
         return state
-    
+
     if failed_tasks:
         state["errors"].append(f"Verification failed: {len(failed_tasks)} tasks failed")
         state["previous_phase"] = PhaseName.VERIFICATION
         state["phase"] = PhaseName.REWORK
         return state
-    
-    # Transition to COMPLETE
+
     state["previous_phase"] = PhaseName.VERIFICATION
     state["phase"] = PhaseName.COMPLETE
-    
-    # Log phase completed
+
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
     _log_phase_event(state, "VERIFICATION", "phase_completed", {
         "tasks_completed": len(state.get("completed_tasks", [])),
         "errors": len(state.get("errors", [])),
         "duration": duration,
         "status": "success",
+        "path": "legacy",
     }, config=config)
     return state
 

@@ -9,7 +9,6 @@ used by both the CLI and UI. It handles:
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import threading
 import uuid
@@ -149,13 +148,15 @@ def run_workflow(
         "providers": {},  # Empty in state - providers go through config
         # NOTE: do NOT put agent_provider in state — LangGraph's checkpointer
         # serializes state between nodes and converts provider instances into
-        # plain dicts, breaking downstream `.execute()` calls. Pass it via
+        # plain dicts, breaking downstream .execute() calls. Pass it via
         # config["configurable"]["providers"]["agent"] instead.
         "agent_provider": None,
         "critic_gate_result": None,
         "error_state": None,
         "error_history": [],
         "project_context": project_context,
+        "pending_messages": [],
+        "model_call_count": 0,
     }
 
     config = {

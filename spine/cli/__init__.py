@@ -1,19 +1,16 @@
 """SPINE CLI - Command line interface."""
 
 import os
-import sys
-import uuid
 from pathlib import Path
 
 import click
 import yaml
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 
 from spine.core import SpineStateMachine
 from spine.providers.base import ProviderConfig, ProviderFallbackChain, ConflictResolver, ConflictResult, DiscordNotifyProvider, SlackNotifyProvider, EmailNotifyProvider, Notification
 from spine.providers.llm import OllamaProvider, OpenAIProvider, OpenRouterProvider, LocalOpenAIProvider
-from spine import __version__
 from spine.providers.agents import create_agent_provider
 
 
@@ -82,6 +79,13 @@ def create_provider(cfg: ProviderConfig):
     # Agent Providers
     if provider_type in ("opencode", "codex", "claude-code"):
         instance = create_agent_provider(provider_type, config)
+        return instance
+    
+    # Deep Agents Model Provider (direct LangChain chat model)
+    if provider_type == "deepagents-model":
+        from ..providers.deepagents_model import DeepAgentsModelProvider
+        instance = DeepAgentsModelProvider()
+        instance.configure(config)
         return instance
     
     # LLM Providers

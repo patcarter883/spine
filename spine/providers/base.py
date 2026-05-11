@@ -29,6 +29,7 @@ class ProviderType(str, Enum):
     STORAGE = "storage"
     NOTIFY = "notify"
     AGENT = "agent"
+    DEEPAGENTS_MODEL = "deepagents-model"
 
 
 class Provider(ABC):

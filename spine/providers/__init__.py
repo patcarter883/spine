@@ -2,6 +2,7 @@
 
 from .base import Provider, ProviderType, ProviderFallbackChain, ProviderConfig
 from .llm import LLMProvider, OpenAIProvider, OllamaProvider, OpenRouterProvider, LocalOpenAIProvider, TTFBTimeoutError
+from .deepagents_model import DeepAgentsModelProvider
 from .agents import (
     AgentResult,
     AgentProvider,
@@ -24,6 +25,7 @@ __all__ = [
     "OpenRouterProvider",
     "LocalOpenAIProvider",
     "TTFBTimeoutError",
+    "DeepAgentsModelProvider",
     "MemoryProvider",
     "SQLiteProvider",
     "ToolsProvider",
