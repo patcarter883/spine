@@ -111,7 +111,7 @@ class SwarmAgent:
         """Execute a capability within the given state context.
 
         Delegates to the agent provider. Fails with a clear error if no
-        agent provider is configured.
+        agent provider is configured. Catches agent errors gracefully.
         """
         if not self._agent_provider or not self._agent_provider.enabled:
             return {
@@ -123,10 +123,22 @@ class SwarmAgent:
 
         prompt = self._build_prompt(state, capability, **kwargs)
         workdir = kwargs.pop("workdir", None) or state.get("variables", {}).get("workdir")
-        agent_result: AgentResult = self._agent_provider.execute(
-            prompt, workdir=workdir, **kwargs,
-        )
-        return self._parse_agent_result(agent_result, capability)
+        try:
+            agent_result: AgentResult = self._agent_provider.execute(
+                prompt, workdir=workdir, **kwargs,
+            )
+            return self._parse_agent_result(agent_result, capability)
+        except Exception as exc:
+            return {
+                "type": capability,
+                "result": f"{self.role} agent error: {exc}",
+                "from_role": self.role,
+                "success": False,
+                "exit_code": -1,
+                "files_changed": [],
+                "error": str(exc),
+                "metadata": {},
+            }
     
     async def execute_streaming(self, state: SpineState, capability: str, **kwargs) -> AsyncIterator[str]:
         """Execute a capability with streaming support.
