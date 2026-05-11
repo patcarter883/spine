@@ -1,26 +1,10 @@
 spine:
   checkpoint_path: .spine/spine.db
 providers:
-  llm:
-  - name: cloud
-    type: openrouter
-    model: openrouter/free
-    api_key: ${OPENROUTER_API_KEY}
-    base_url: https://openrouter.ai/api/v1
-    priority: 0
-    enabled: true
-  - name: local
-    type: local-openai
-    model: model
-    api_key: 'vllm'
-    base_url: http://localhost:8000/v1
-    priority: 1
-    enabled: true
   agent:
-        - name: default
-          type: opencode
-          config:
-            mode: acp
-            model: openrouter/qwen/qwen3.6-35b-a3b
-            auto_approve: true
-
+    - name: default
+      type: opencode
+      config:
+        mode: acp
+        model: openrouter/minimax/minimax-m2.7
+        auto_approve: true

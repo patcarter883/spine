@@ -254,7 +254,7 @@ class SDDWorkflow(WorkflowEngine):
         slices = synthesize_slices(
             self._context.requirement,
             context_dict,
-            llm_provider=None,  # TODO: wire LLM provider
+            agent_provider=None,  # TODO: wire agent provider
         )
 
         # Create a task node per slice for hierarchy tracking

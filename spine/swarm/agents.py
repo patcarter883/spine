@@ -61,14 +61,16 @@ class SwarmAgent:
     - Workflow context injection for agent coordination
     """
 
-    # Roles that use AgentProvider (implementation) vs LLMProvider (decision-making)
-    IMPLEMENTATION_ROLES = frozenset(["coder", "test_engineer", "reviewer"])
+    # All roles delegate to the agent provider — no LLM/stub fallbacks.
+    IMPLEMENTATION_ROLES = frozenset([
+        "coder", "test_engineer", "reviewer",
+        "explorer", "sme", "analyst", "planner",
+    ])
 
     def __init__(
         self,
         role: str,
         capabilities: list[str],
-        llm_provider: Optional[LLMProvider] = None,
         agent_provider: Optional[AgentProvider] = None,
         prompt_config: Optional[Any] = None,  # PromptConfig, avoid circular import
     ):
@@ -79,7 +81,6 @@ class SwarmAgent:
             )
         self.role = role
         self.capabilities = capabilities
-        self._llm_provider = llm_provider
         self._agent_provider = agent_provider
         self._mail: Optional[SwarmMail] = None
         self._learning: Optional[LearningIntegration] = None
@@ -94,18 +95,8 @@ class SwarmAgent:
             self._prompt_builder = PromptBuilder(role=self.role, config=config)
         return self._prompt_builder
 
-    def set_llm_provider(self, provider: LLMProvider) -> None:
-        """Set the LLM provider for this agent."""
-        self._llm_provider = provider
-
     def set_agent_provider(self, provider: AgentProvider) -> None:
-        """Set the agent provider for this agent.
-
-        Agent providers delegate implementation work to external coding
-        agents (OpenCode, Codex CLI, Claude Code).  Only implementation
-        roles (coder, test_engineer, reviewer) use agent providers.
-        Decision-making roles (planner, critic, explorer) use LLM directly.
-        """
+        """Set the agent provider for this agent."""
         self._agent_provider = provider
 
     def set_mail(self, mail: SwarmMail) -> None:
@@ -119,50 +110,34 @@ class SwarmAgent:
     def execute(self, state: SpineState, capability: str, **kwargs) -> dict[str, Any]:
         """Execute a capability within the given state context.
 
-        For implementation roles (coder, test_engineer, reviewer) with an
-        agent_provider set, delegates to the external agent.  Otherwise uses
-        the LLM provider for decision-making tasks.
+        Delegates to the agent provider. Fails with a clear error if no
+        agent provider is configured.
         """
-        # Implementation roles with agent provider: delegate to external agent
-        if (self._agent_provider
-                and self.role in self.IMPLEMENTATION_ROLES
-                and self._agent_provider.enabled):
-            prompt = self._build_prompt(state, capability, **kwargs)
-            workdir = kwargs.pop("workdir", None) or state.get("variables", {}).get("workdir")
-            agent_result: AgentResult = self._agent_provider.execute(
-                prompt, workdir=workdir, **kwargs,
-            )
-            return self._parse_agent_result(agent_result, capability)
+        if not self._agent_provider or not self._agent_provider.enabled:
+            return {
+                "status": "error",
+                "error": f"No agent provider available for role '{self.role}'. Configure one in .spine/config.yaml",
+                "from_role": self.role,
+                "type": capability,
+            }
 
-        # Decision-making roles or no agent provider: use LLM directly
-        if self._llm_provider:
-            prompt = self._build_prompt(state, capability, **kwargs)
-            response = self._llm_provider.generate(prompt)
-            return self._parse_response(response, capability)
-        return self._execute_stub(state, capability, **kwargs)
+        prompt = self._build_prompt(state, capability, **kwargs)
+        workdir = kwargs.pop("workdir", None) or state.get("variables", {}).get("workdir")
+        agent_result: AgentResult = self._agent_provider.execute(
+            prompt, workdir=workdir, **kwargs,
+        )
+        return self._parse_agent_result(agent_result, capability)
     
     async def execute_streaming(self, state: SpineState, capability: str, **kwargs) -> AsyncIterator[str]:
         """Execute a capability with streaming support.
-        
-        Yields chunks of the LLM response as they become available.
-        Falls back to non-streaming execution if LLM doesn't support streaming.
+
+        Delegates to agent provider and yields the output text.
         """
-        if self._llm_provider:
-            prompt = self._build_prompt(state, capability, **kwargs)
-            try:
-                if hasattr(self._llm_provider, 'stream'):
-                    async for chunk in self._llm_provider.stream(prompt):
-                        yield chunk
-                else:
-                    # Fallback to non-streaming
-                    response = self._llm_provider.generate(prompt)
-                    yield response
-            except Exception as e:
-                yield f"[Agent {self.role} streaming error: {e}]"
+        result = self.execute(state, capability, **kwargs)
+        if "error" in result:
+            yield result["error"]
         else:
-            # No LLM provider - return stub result
-            result = self._execute_stub(state, capability, **kwargs)
-            yield str(result)
+            yield str(result.get("output", result))
     
     def _build_prompt(self, state: SpineState, capability: str, **kwargs) -> str:
         """Build LLM prompt for capability execution.
@@ -193,15 +168,9 @@ class SwarmAgent:
     
     def _get_available_tools(self) -> list[str]:
         """Determine which tools are available for this agent."""
-        tools = []
-        
-        # All agents potentially have filesystem access
-        tools.append("filesystem")
-        
-        # Implementation roles with agent provider have external agent access
-        if self.role in self.IMPLEMENTATION_ROLES and self._agent_provider:
+        tools = ["filesystem"]
+        if self._agent_provider:
             tools.append("agent_provider")
-        
         return tools
 
     def _parse_response(self, response: str, capability: str) -> dict[str, Any]:

@@ -208,8 +208,12 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
     
     # Get providers from config (preferred) or state
     providers = _get_providers(state, config)
-    llm_provider = providers.get("llm")
-    executor = SwarmDAGExecutor(llm_provider=llm_provider)
+    agent_provider = providers.get("agent")
+    if agent_provider is None:
+        state_ap = state.get("agent_provider")
+        if state_ap is not None and not isinstance(state_ap, dict):
+            agent_provider = state_ap
+    executor = SwarmDAGExecutor(agent_provider=agent_provider)
     
     # Execute planning phase with LLM-based decomposition
     context = {
@@ -245,11 +249,11 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
     # Build a rich planning context for downstream slice synthesis
     planning_context = _extract_planning_context(subphase_results)
 
-    # Use LLM to decompose into FeatureSlices when possible
+    # Use agent to decompose into FeatureSlices when possible
     feature_slices = synthesize_slices(
         requirement=state["requirement"],
         context=planning_context,
-        llm_provider=llm_provider,
+        agent_provider=agent_provider,
     )
 
     # Derive plan tasks from subphase results (not hardcoded)
@@ -346,7 +350,6 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
     
     # Get providers from config (preferred) or state
     providers = _get_providers(state, config)
-    llm_provider = providers.get("llm")
     storage_provider = providers.get("storage")
     # Read agent_provider from config-resolved providers first; fall back to
     # state only when it's a real instance (LangGraph serialization will turn
@@ -360,9 +363,8 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
     
     debug_prompts = state.get("variables", {}).get("debug_prompts", False)
     
-    # Create executor with providers
+    # Create executor with agent provider
     executor = SwarmDAGExecutor(
-        llm_provider=llm_provider,
         storage_provider=storage_provider,
         agent_provider=agent_provider,
     )
@@ -529,9 +531,8 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
 def verification_phase(state: SpineState, config: Optional[RunnableConfig] = None) -> SpineState:
     """Execute the VERIFICATION phase.
     
-    Integrates git workflow for commits and branch management.
-    Includes error handling with error state transitions.
-    Runs actual syntax and lint checks, logs all events.
+    Runs agent-driven code review first, then local syntax/lint gates,
+    and finally git integration for commits and branch management.
     """
     state["phase"] = PhaseName.VERIFICATION
     start_time = datetime.now(timezone.utc)
@@ -540,6 +541,64 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
     _log_phase_event(state, "VERIFICATION", "phase_started", {
         "requirement": state.get("requirement", ""),
     }, config=config)
+    
+    # ── Agent-driven code review ────────────────────────────────────
+    providers = _get_providers(state, config)
+    agent_provider = providers.get("agent")
+    if agent_provider is None:
+        state_ap = state.get("agent_provider")
+        if state_ap is not None and not isinstance(state_ap, dict):
+            agent_provider = state_ap
+
+    if agent_provider and agent_provider.enabled:
+        review_subphase = SubPhase(
+            name="AGENT_REVIEW",
+            priority=1,
+            parallel=False,
+            agent_role="reviewer",
+            tasks=[
+                Task(
+                    id="agent_review",
+                    description=(
+                        f"Review the code changes for: {state.get('requirement', '')}\n"
+                        "Check for bugs, style issues, missing tests, and regressions.\n"
+                        "Report: issues found (if any) and overall assessment."
+                    ),
+                ),
+            ],
+        )
+        spec_content = ""
+        spec_path = state.get("variables", {}).get("spec_path", "")
+        if spec_path and os.path.isfile(spec_path):
+            try:
+                with open(spec_path, "r") as f:
+                    spec_content = f.read()
+            except Exception:
+                pass
+        executor = SwarmDAGExecutor(agent_provider=agent_provider)
+        context = {
+            "requirement": state.get("requirement", ""),
+            "plan": state.get("plan"),
+            "spec_content": spec_content,
+            "variables": state.get("variables", {}),
+        }
+        phase_result = executor.execute_phase(
+            Phase(name="VERIFICATION", subphases=[review_subphase]),
+            context,
+        )
+        review_result = phase_result.subphase_results.get("AGENT_REVIEW", {})
+        review_ok = review_result.get("status") == "success"
+        _log_phase_event(state, "VERIFICATION", "task_completed", {
+            "task_id": "agent_review",
+            "subphase": "VERIFICATION",
+            "status": "success" if review_ok else "failed",
+        }, config=config)
+        if review_ok:
+            state["completed_tasks"].append("agent_review")
+        else:
+            state["errors"].append(f"Agent review failed: {review_result.get('error', 'unknown')}")
+    
+    # ── Local quality gates ─────────────────────────────────────────
     
     # Quality gates - run actual checks
     syntax_ok, syntax_msg = _run_syntax_check()

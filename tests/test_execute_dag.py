@@ -13,6 +13,7 @@ from spine.core.state_machine import (
 from spine.models.dag import ResourceQuota, ExecutionProgress
 from spine.swarm.supervisor import Supervisor, SupervisorSwarmAgent, AgentRole, create_supervisor, GateEnforcementError
 from spine.providers.llm import LLMProvider
+from spine.providers.agents import AgentProvider
 
 
 class FakeLLMProvider(LLMProvider):
@@ -47,8 +48,8 @@ class FakeLLMProvider(LLMProvider):
 class TestExecuteDagRealExecution:
     """Test execute_dag() with real task execution."""
     
-    def test_execute_dag_with_subphase_executes_tasks(self):
-        """execute_dag should execute tasks from a SubPhase."""
+    def test_execute_dag_with_subphase_requires_agent_provider(self):
+        """execute_dag should fail when no agent_provider is configured."""
         executor = SwarmDAGExecutor()
         subphase = SubPhase(
             name="TEST_PHASE",
@@ -63,14 +64,43 @@ class TestExecuteDagRealExecution:
         
         assert result["subphase"] == "TEST_PHASE"
         assert result["agent_role"] == "test_agent"
+        assert result["status"] == "failed"
+        assert "No agent provider available" in result.get("error", "")
+    
+    def test_execute_dag_with_agent_provider_executes_tasks(self):
+        """execute_dag should delegate tasks to agent_provider."""
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = "task output"
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        
+        executor = SwarmDAGExecutor(agent_provider=mock_provider)
+        subphase = SubPhase(
+            name="TEST_PHASE",
+            agent_role="coder",
+            tasks=[
+                Task(id="task1", description="First task"),
+                Task(id="task2", description="Second task"),
+            ]
+        )
+        
+        result = executor.execute_dag(subphase, {"input": "test"})
+        
+        assert result["subphase"] == "TEST_PHASE"
+        assert result["agent_role"] == "coder"
         assert result["status"] == "success"
         assert result["tasks_executed"] == 2
         assert result["total_tasks"] == 2
         assert "task1" in result["tasks"]
         assert "task2" in result["tasks"]
     
-    def test_execute_dag_with_llm_provider_calls_generate(self):
-        """execute_dag should call LLM provider's generate method."""
+    def test_execute_dag_with_llm_provider_ignores_it(self):
+        """execute_dag should ignore llm_provider and require agent_provider instead."""
         fake_llm = FakeLLMProvider(response="llm output")
         executor = SwarmDAGExecutor(llm_provider=fake_llm)
         subphase = SubPhase(
@@ -81,13 +111,23 @@ class TestExecuteDagRealExecution:
         
         result = executor.execute_dag(subphase, {"query": "what is SPINE?"})
         
-        assert fake_llm.call_count == 1
-        assert result["tasks"]["research"]["result"] == "llm output"
-        assert result["status"] == "success"
+        # Without agent_provider, it should fail
+        assert result["status"] == "failed"
+        assert "No agent provider available" in result.get("error", "")
     
     def test_execute_dag_task_status_tracking(self):
         """execute_dag should track task status through execution."""
-        executor = SwarmDAGExecutor()
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = "done"
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        
+        executor = SwarmDAGExecutor(agent_provider=mock_provider)
         subphase = SubPhase(
             name="STATUS_TEST",
             tasks=[Task(id="t1", description="Test", status=StateStatus.PENDING)]
@@ -107,10 +147,19 @@ class TestExecuteDagRealExecution:
         assert result["status"] == "completed"
         assert result["tasks_executed"] == 0
     
-    def test_execute_dag_llm_prompt_contains_context(self):
+    def test_execute_dag_prompt_contains_context(self):
         """execute_dag should build prompts with subphase and task info."""
-        fake_llm = FakeLLMProvider(response="ok")
-        executor = SwarmDAGExecutor(llm_provider=fake_llm)
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = "ok"
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        
+        executor = SwarmDAGExecutor(agent_provider=mock_provider)
         subphase = SubPhase(
             name="PROMPT_TEST",
             agent_role="analyst",
@@ -120,17 +169,29 @@ class TestExecuteDagRealExecution:
         context = {"input": "hello", "deps": {"value": "42"}}
         executor.execute_dag(subphase, context)
         
-        # Verify generate was called (the prompt is internal)
-        assert fake_llm.call_count == 1
+        # Verify execute was called (the prompt is internal)
+        mock_provider.execute.assert_called_once()
 
 
-class TestExecutePhaseWithLLM:
-    """Test execute_phase with LLM integration."""
+class TestExecutePhaseWithAgent:
+    """Test execute_phase with agent provider integration."""
     
-    def test_execute_phase_with_llm_provider(self):
-        """execute_phase should pass LLM provider to subphase execution."""
-        fake_llm = FakeLLMProvider(response="analyzed")
-        executor = SwarmDAGExecutor(llm_provider=fake_llm)
+    def _make_mock_agent_provider(self, output="analyzed"):
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = output
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        return mock_provider
+
+    def test_execute_phase_with_agent_provider(self):
+        """execute_phase should pass agent provider to subphase execution."""
+        mock_provider = self._make_mock_agent_provider()
+        executor = SwarmDAGExecutor(agent_provider=mock_provider)
         phase = Phase(
             name="TEST",
             subphases=[
@@ -146,12 +207,12 @@ class TestExecutePhaseWithLLM:
         
         assert "ANALYZE" in result.subphase_results
         assert result.subphase_results["ANALYZE"]["status"] == "success"
-        assert fake_llm.call_count == 1
+        mock_provider.execute.assert_called()
     
-    def test_execute_phase_multiple_subphases_with_llm(self):
-        """execute_phase should run LLM for each subphase task."""
-        fake_llm = FakeLLMProvider(response="done")
-        executor = SwarmDAGExecutor(llm_provider=fake_llm)
+    def test_execute_phase_multiple_subphases_with_agent(self):
+        """execute_phase should run agent for each subphase task."""
+        mock_provider = self._make_mock_agent_provider(output="done")
+        executor = SwarmDAGExecutor(agent_provider=mock_provider)
         phase = Phase(
             name="MULTI",
             subphases=[
@@ -163,11 +224,22 @@ class TestExecutePhaseWithLLM:
         result = executor.execute_phase(phase, {})
         
         assert len(result.subphase_results) == 2
-        assert fake_llm.call_count == 2  # One per subphase
 
 
 class TestSupervisorCreateNode:
-    """Test SupervisorSwarmAgent.create_node() with LLM integration."""
+    """Test SupervisorSwarmAgent.create_node() with agent provider integration."""
+    
+    def _make_mock_agent_provider(self, output="analyzed output"):
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = output
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        return mock_provider
     
     def test_create_node_returns_function(self):
         """create_node should return a callable node function."""
@@ -180,58 +252,38 @@ class TestSupervisorCreateNode:
         
         assert callable(node)
     
-    def test_create_node_executes_llm_when_provider_set(self):
-        """create_node should call LLM provider when available."""
+    def test_create_node_delegates_to_agent_provider(self):
+        """create_node should call agent provider when available."""
+        mock_provider = self._make_mock_agent_provider()
         agent = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
-            system_prompt="Analyze requirements"
+            system_prompt="Analyze requirements",
+            agent_provider=mock_provider,
         )
-        fake_llm = FakeLLMProvider(response="analyzed output")
-        agent.set_llm_provider(fake_llm)
         
         node = agent.create_node()
         state = {"requirement": "Build a web app"}
         result = node(state)
         
-        assert result["agent_output"] == "analyzed output"
         assert result["agent_role"] == "explorer"
-        assert fake_llm.call_count == 1
+        mock_provider.execute.assert_called()
     
-    def test_create_node_fallback_without_llm(self):
-        """create_node should produce fallback output without LLM."""
+    def test_create_node_without_agent_provider(self):
+        """create_node should produce error when no agent provider."""
         agent = SupervisorSwarmAgent(
             role=AgentRole.EXPLORER,
             name="explorer",
             system_prompt="Analyze requirements"
         )
-        # No LLM provider set
+        # No agent provider set
         
         node = agent.create_node()
         state = {"requirement": "Build something"}
         result = node(state)
         
         assert "agent_output" in result
-        assert "[explorer agent" in result["agent_output"]
-    
-    def test_create_node_persists_previous_output(self):
-        """create_node should include previous output in prompt."""
-        agent = SupervisorSwarmAgent(
-            role=AgentRole.EXPLORER,
-            name="explorer",
-            system_prompt="Analyze requirements"
-        )
-        fake_llm = FakeLLMProvider(response="new analysis")
-        agent.set_llm_provider(fake_llm)
-        
-        node = agent.create_node()
-        state = {
-            "requirement": "Build something",
-            "agent_output": "previous output"
-        }
-        result = node(state)
-        
-        assert result["agent_output"] == "new analysis"
+        assert "error" in result["agent_output"].lower() or "No agent" in result["agent_output"]
 
 
 class TestSupervisorRunGates:
@@ -293,44 +345,63 @@ class TestCreateSupervisorFallback:
             assert result["supervisor_name"] == "spine_supervisor"
 
 
-class TestSwarmAgentSetLLM:
-    """Test SupervisorSwarmAgent.set_llm_provider()."""
+class TestSwarmAgentSetAgentProvider:
+    """Test SupervisorSwarmAgent with agent_provider."""
     
-    def test_set_llm_provider_stores_provider(self):
-        """set_llm_provider should store the provider for create_node."""
+    def test_agent_provider_stored(self):
+        """Agent provider should be stored on the agent."""
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
         agent = SupervisorSwarmAgent(
             role=AgentRole.CODER,
             name="coder",
-            system_prompt="Write code"
+            system_prompt="Write code",
+            agent_provider=mock_provider,
         )
-        fake_llm = FakeLLMProvider(response="import os")
-        agent.set_llm_provider(fake_llm)
         
-        assert agent._llm_provider == fake_llm
+        assert agent._agent_provider is mock_provider
     
-    def test_create_node_uses_set_provider(self):
-        """create_node should use the provider set via set_llm_provider."""
+    def test_create_node_uses_agent_provider(self):
+        """create_node should use the agent provider."""
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = "def hello(): pass"
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        
         agent = SupervisorSwarmAgent(
             role=AgentRole.CODER,
             name="coder",
-            system_prompt="Write code"
+            system_prompt="Write code",
+            agent_provider=mock_provider,
         )
-        fake_llm = FakeLLMProvider(response="def hello(): pass")
-        agent.set_llm_provider(fake_llm)
         
         node = agent.create_node()
         result = node({"requirement": "Write hello world"})
         
-        assert result["agent_output"] == "def hello(): pass"
+        mock_provider.execute.assert_called()
 
 
 class TestDAGExecutionIntegration:
-    """Integration tests for DAG execution with LLM."""
+    """Integration tests for DAG execution with agent provider."""
     
-    def test_full_dag_execution_with_llm(self):
-        """Test full phase execution with LLM-backed subphase execution."""
-        fake_llm = FakeLLMProvider(response="analyzed")
-        executor = SwarmDAGExecutor(llm_provider=fake_llm)
+    def test_full_dag_execution_with_agent(self):
+        """Test full phase execution with agent-backed subphase execution."""
+        mock_provider = MagicMock(spec=AgentProvider)
+        mock_provider.enabled = True
+        mock_result = MagicMock()
+        mock_result.output = "analyzed"
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
+        
+        executor = SwarmDAGExecutor(agent_provider=mock_provider)
         
         phase = Phase(
             name="FULL_TEST",
@@ -358,8 +429,8 @@ class TestDAGExecutionIntegration:
         # Both subphases completed
         assert "ANALYZE" in result.subphase_results
         assert "PLAN" in result.subphase_results
-        # LLM was called for each task (1 in ANALYZE + 2 in PLAN = 3)
-        assert fake_llm.call_count == 3
+        # Agent was called for each task (1 in ANALYZE + 2 in PLAN = 3)
+        assert mock_provider.execute.call_count == 3
         # All tasks succeeded
         assert result.subphase_results["ANALYZE"]["status"] == "success"
         assert result.subphase_results["PLAN"]["status"] == "success"

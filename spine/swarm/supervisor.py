@@ -34,80 +34,34 @@ class AgentRole:
 class SupervisorSwarmAgent(SwarmAgent):
     """A specialized agent in the swarm with additional features."""
     
-    def __init__(self, role: str, name: str, system_prompt: str):
+    def __init__(self, role: str, name: str, system_prompt: str, agent_provider: Any | None = None):
         # Validate role before initializing
         if not AgentRoleValidator.validate(role):
             raise InvalidAgentRoleError(
                 f"Invalid agent role: '{role}'. Valid roles: {AgentRoleValidator.get_valid_roles()}"
             )
-        super().__init__(role, [name], None)  # Call parent with stub provider
+        super().__init__(role, [name], agent_provider=agent_provider)
         self.name = name
         self.system_prompt = system_prompt
-        self._llm_provider = None  # Optional LLM provider
-    
-    def set_llm_provider(self, provider: Any) -> None:
-        """Set the LLM provider for this agent."""
-        self._llm_provider = provider
-        # Also set on parent for compatibility
-        super().set_llm_provider(provider)
     
     async def execute_streaming(self, state: dict[str, Any]) -> AsyncIterator[str]:
-        """Execute with streaming support.
-        
-        Yields chunks of the LLM response as they become available.
-        """
-        requirement = state.get("requirement", "")
-        current_output = state.get("agent_output", "")
-        
-        prompt = f"{self.system_prompt}\n\nCurrent requirement: {requirement}"
-        if current_output:
-            prompt += f"\n\nPrevious output: {current_output}"
-        
-        if self._llm_provider:
-            try:
-                async for chunk in self._llm_provider.stream(prompt):
-                    yield chunk
-            except Exception as e:
-                yield f"[Agent {self.name} error: {e}]"
+        """Execute with streaming support."""
+        result = self.execute(state, "analyze")
+        if "error" in result:
+            yield result["error"]
         else:
-            yield f"[{self.name} agent completed: {requirement[:100]}]"
+            yield str(result.get("output", result))
     
     def create_node(self):
-        """Create a LangGraph node from this agent that executes LLM-backed.
+        """Create a LangGraph node from this agent.
         
-        Returns a node function that:
-        1. Extracts the requirement/context from state
-        2. Builds a prompt using the agent's system prompt and current state
-        3. Calls the LLM provider if available
-        4. Returns updated state with agent output
+        Returns a node function that delegates to the agent provider.
         """
         def agent_node(state: dict[str, Any]) -> dict[str, Any]:
-            # Extract the requirement and context from state
-            requirement = state.get("requirement", "")
-            current_output = state.get("agent_output", "")
-            
-            # Build the prompt
-            prompt = f"{self.system_prompt}\n\nCurrent requirement: {requirement}"
-            if current_output:
-                prompt += f"\n\nPrevious output: {current_output}"
-            
-            # Call LLM provider if available
-            if self._llm_provider:
-                import inspect
-                try:
-                    sig = inspect.signature(self._llm_provider.generate)
-                    if "timeout" in sig.parameters:
-                        llm_output = self._llm_provider.generate(prompt, timeout=300.0)
-                    else:
-                        llm_output = self._llm_provider.generate(prompt)
-                    output = llm_output
-                except Exception as e:
-                    output = f"[Agent {self.name} error: {e}]"
-            else:
-                # Fallback stub output
-                output = f"[{self.name} agent completed: {requirement[:100]}]"
-            
-            # Return updated state with agent output
+            # Use the parent execute method
+            result = self.execute(state, "analyze")
+            # execute() returns dict with 'result' key from _parse_agent_result
+            output = result.get("result", result.get("output", str(result)))
             return {
                 "agent_output": output,
                 "agent_role": self.role,
@@ -116,45 +70,36 @@ class SupervisorSwarmAgent(SwarmAgent):
         return agent_node
 
 
-def create_explorer_agent() -> SupervisorSwarmAgent:
-    """Create the explorer agent for requirement analysis.
-    
-    Uses structured prompts from spine.prompts.roles for comprehensive
-    requirement analysis instructions.
-    """
+def create_explorer_agent(agent_provider: Any | None = None) -> SupervisorSwarmAgent:
+    """Create the explorer agent for requirement analysis."""
     from ..prompts.roles import EXPLORER_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.EXPLORER,
         name="explorer",
         system_prompt=EXPLORER_PROMPT,
+        agent_provider=agent_provider,
     )
 
 
-def create_sme_agent() -> SupervisorSwarmAgent:
-    """Create the SME agent for research.
-    
-    Uses structured prompts from spine.prompts.roles for research
-    and best practices synthesis.
-    """
+def create_sme_agent(agent_provider: Any | None = None) -> SupervisorSwarmAgent:
+    """Create the SME agent for research."""
     from ..prompts.roles import SME_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.SME,
         name="sme",
         system_prompt=SME_PROMPT,
+        agent_provider=agent_provider,
     )
 
 
-def create_planner_agent() -> SupervisorSwarmAgent:
-    """Create the planner agent for execution planning.
-    
-    Uses structured prompts from spine.prompts.roles for detailed
-    execution planning instructions.
-    """
+def create_planner_agent(agent_provider: Any | None = None) -> SupervisorSwarmAgent:
+    """Create the planner agent for execution planning."""
     from ..prompts.roles import PLANNER_PROMPT
     return SupervisorSwarmAgent(
         role=AgentRole.PLANNER,
         name="planner",
         system_prompt=PLANNER_PROMPT,
+        agent_provider=agent_provider,
     )
 
 

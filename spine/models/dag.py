@@ -1,5 +1,6 @@
 """SPINE DAG execution module."""
 
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Any, Literal, Callable
@@ -87,32 +88,30 @@ def _estimate_complexity(requirement: str) -> str:
 def synthesize_slices(
     requirement: str,
     context: dict[str, Any],
-    llm_provider: Optional[LLMProvider] = None,
+    agent_provider: Optional[Any] = None,
 ) -> list["FeatureSlice"]:
     """Produce FeatureSlice objects from requirement + context.
 
-    Uses LLM when available for intelligent decomposition.  Falls back to a
-    heuristic slicer that produces 2-6 slices based on complexity.
+    Uses the agent provider when available for intelligent decomposition.
+    Falls back to a heuristic slicer that produces 2-6 slices.
 
     Args:
         requirement: The original requirement text.
         context: Execution context (analysis results, tech research, etc.).
-        llm_provider: Optional LLM provider for LLM-based decomposition.
+        agent_provider: Optional agent provider for decomposition.
 
     Returns:
         List of FeatureSlice objects with dependency edges.
     """
     from .types import FeatureSlice
 
-    # ── LLM path ──────────────────────────────────────────────────
-    # Guard against deserialized providers: LangGraph's checkpointer
-    # may turn provider objects into plain dicts.  A dict is not usable
-    # as an LLMProvider, so fall through to the heuristic path.
-    if llm_provider and not isinstance(llm_provider, dict) and llm_provider.enabled:
+    # ── Agent path ─────────────────────────────────────────────────
+    if agent_provider and not isinstance(agent_provider, dict) and agent_provider.enabled:
         try:
             prompt = _build_slice_synthesis_prompt(requirement, context)
-            raw = llm_provider.generate(prompt)
-            return _parse_llm_slices(raw)
+            result = agent_provider.execute(prompt, workdir=os.getcwd(), timeout=120)
+            if result.success and result.output:
+                return _parse_llm_slices(result.output)
         except Exception:
             pass  # fall through to heuristic
 
@@ -317,7 +316,7 @@ class SwarmDAGExecutor:
 
     def __init__(
         self,
-        llm_provider: Optional[LLMProvider] = None,
+        llm_provider: Optional[LLMProvider] = None,  # Deprecated — kept for backward compat
         memory_provider: Optional[MemoryProvider] = None,
         storage_provider: Optional[StorageProvider] = None,
         tools_provider: Optional[ToolsProvider] = None,
@@ -329,17 +328,16 @@ class SwarmDAGExecutor:
         """Initialize with optional providers for agent execution.
         
         Args:
-            llm_provider: An LLMProvider instance (must have generate(prompt) method)
-                          or None for stub/fallback execution.
+            llm_provider: Deprecated. Kept for backward compatibility — no longer used.
             memory_provider: Memory provider for persistent storage.
             storage_provider: Storage provider for file operations.
             tools_provider: Tools provider for agent capabilities.
             file_write_guard: Guard for protected file writes.
             git_workflow: Git workflow for version control operations.
-            agent_provider: Agent provider for code execution (coder, test_engineer, reviewer).
+            agent_provider: Agent provider for all task execution.
             resource_quota: Resource limits for wave execution (optional).
         """
-        self._llm_provider = llm_provider
+        self._llm_provider = None  # Deprecated — no longer used
         self._memory_provider = memory_provider
         self._storage_provider = storage_provider
         self._tools_provider = tools_provider
@@ -348,8 +346,6 @@ class SwarmDAGExecutor:
         self._agent_provider = agent_provider
         # Resource configuration
         self._resource_quota = resource_quota or ResourceQuota()
-        # Register stub templates
-        self._register_stub_templates()
         # SubPhase lookup for execute_dag to access tasks
         self._current_subphases: dict[str, SubPhase] = {}
         self._current_phase_context: dict[str, Any] = {}
@@ -383,23 +379,9 @@ class SwarmDAGExecutor:
             self._prompt_builders[role] = PromptBuilder(role=prompt_role)
         return self._prompt_builders[role]
 
-    def _register_stub_templates(self) -> None:
-        """Register subphase-specific stub template functions.
-
-        Maps uppercase subphase names to their template functions.
-        """
-        self._stub_templates = {
-            "ANALYZE": self._stub_analyze,
-            "TECH_RESEARCH": self._stub_tech_research,
-            "RISK_ASSESSMENT": self._stub_risk_assessment,
-            "SYNTHESIZE": self._stub_synthesize,
-            "BACKEND": self._stub_backend,
-            "FRONTEND": self._stub_frontend,
-        }
-
     def execute_phase(self, phase: Phase, context: dict[str, Any]) -> PhaseResult:
         """Execute a phase with parallel sub-phase wave execution.
-        
+
         Handles:
         - Wave-based execution with dependency ordering
         - Wave size limits via resource_quota.max_concurrent_subphases
@@ -691,33 +673,26 @@ class SwarmDAGExecutor:
         return resolve_value(context)
 
     def execute_dag(self, dag_or_name: Any, context: dict) -> Any:
-        """Execute a DAG by running its subphase tasks.
-        
-        When called with a SubPhase object, executes all tasks in that subphase
-        using the LLM provider or agent provider chain. When called with a string 
-        (backwards compat), returns a stub result.
+        """Execute a DAG by running its subphase tasks via the agent provider.
 
-        For implementation roles (coder, test_engineer, reviewer), delegates to 
-        agent_provider for actual code writing. For decision-making roles 
-        (explorer, sme, analyst, planner), uses LLM for analysis.
+        All tasks are delegated to the configured agent_provider. There is no
+        LLM or stub fallback — if the agent provider is unavailable, the task
+        fails with a clear error.
 
         Args:
             dag_or_name: A SubPhase object or a string subphase name
             context: Execution context (may contain dependency templates)
-            
+
         Returns:
             Dict with task execution results, including status and error info.
         """
         from .enums import StateStatus
         import os
-        
-        # Implementation roles that should use agent_provider for code writing
-        IMPLEMENTATION_ROLES = {"coder", "test_engineer", "reviewer"}
-        
+
         # Get timeout from context or use default
         timeout = context.get("llm_timeout", 300.0) if context else 300.0
-        
-        # Backwards compat: if called with string name, run stub
+
+        # Backwards compat: if called with string name, return stub
         if isinstance(dag_or_name, str):
             return {
                 "status": "completed",
@@ -725,56 +700,50 @@ class SwarmDAGExecutor:
                 "context_keys": list(context.keys()),
                 "tasks_executed": 0
             }
-        
+
+        # Require agent_provider
+        if not self._agent_provider or not self._agent_provider.enabled:
+            return {
+                "subphase": getattr(dag_or_name, "name", str(dag_or_name)),
+                "agent_role": getattr(dag_or_name, "agent_role", ""),
+                "status": "failed",
+                "tasks": {},
+                "tasks_executed": 0,
+                "total_tasks": len(getattr(dag_or_name, "tasks", [])),
+                "errors": ["No agent provider available. Configure an agent provider (e.g. opencode) in .spine/config.yaml"],
+                "error": "No agent provider available. Configure an agent provider (e.g. opencode) in .spine/config.yaml",
+            }
+
         # Real execution with SubPhase object
         subphase = dag_or_name
         task_results = {}
         all_succeeded = True
         errors = []
+        workdir = os.getcwd()
 
         for task in subphase.tasks:
             task.status = StateStatus.RUNNING
             try:
-                # Build task-specific prompt using agent role and task info
+                # Build task-specific prompt
                 prompt = self._build_task_prompt(task, subphase, context)
-                
-                # Determine if we should use agent_provider (for implementation roles)
-                is_implementation_role = subphase.agent_role in IMPLEMENTATION_ROLES
-                
-                if is_implementation_role and self._agent_provider and self._agent_provider.enabled:
-                    # Delegate to agent provider for actual code writing
-                    workdir = os.getcwd()
-                    agent_result = self._agent_provider.execute(prompt, workdir=workdir, timeout=timeout)
-                    
-                    # Store AgentResult metadata in task.result
-                    task.result = {
-                        "output": agent_result.output,
-                        "exit_code": agent_result.exit_code,
-                        "files_changed": agent_result.files_changed,
-                        "error": agent_result.error,
-                        "success": agent_result.success,
-                    }
-                    task.status = StateStatus.SUCCESS if agent_result.success else StateStatus.FAILED
-                    if not agent_result.success:
-                        task.error = agent_result.error or "Agent execution failed"
-                        errors.append(f"Task {task.id} agent failed: {agent_result.error}")
-                        all_succeeded = False
-                elif self._llm_provider and self._llm_provider.enabled:
-                    # Use LLM provider for decision-making roles or when no agent available
-                    import inspect
-                    sig = inspect.signature(self._llm_provider.generate)
-                    if "timeout" in sig.parameters:
-                        result = self._llm_provider.generate(prompt, timeout=timeout)
-                    else:
-                        result = self._llm_provider.generate(prompt)
-                    task.result = result
-                    task.status = StateStatus.SUCCESS
-                else:
-                    # Fallback: stub execution based on agent role
-                    result = self._execute_stub_task(task, subphase, context)
-                    task.result = result.get("output", "")
-                    task.status = StateStatus.SUCCESS
-                
+
+                # Delegate to agent provider
+                agent_result = self._agent_provider.execute(prompt, workdir=workdir, timeout=timeout)
+
+                # Store AgentResult metadata in task.result
+                task.result = {
+                    "output": agent_result.output,
+                    "exit_code": agent_result.exit_code,
+                    "files_changed": agent_result.files_changed,
+                    "error": agent_result.error,
+                    "success": agent_result.success,
+                }
+                task.status = StateStatus.SUCCESS if agent_result.success else StateStatus.FAILED
+                if not agent_result.success:
+                    task.error = agent_result.error or "Agent execution failed"
+                    errors.append(f"Task {task.id} agent failed: {agent_result.error}")
+                    all_succeeded = False
+
                 task_results[task.id] = {
                     "status": "success" if task.status == StateStatus.SUCCESS else "failed",
                     "result": task.result
@@ -807,184 +776,156 @@ class SwarmDAGExecutor:
         }
 
     def _build_task_prompt(self, task: "Task", subphase: "SubPhase", context: dict) -> str:
-        """Build prompt for task execution.
-        
-        Uses the PromptBuilder from spine.prompts for structured, instructional
-        prompts that follow DeepAgents/LangChain best practices.
-        
-        For implementation roles (coder, test_engineer, reviewer), combines
-        the role prompt with task-specific context for agent delegation.
-        For decision-making roles (explorer, sme, analyst, planner), uses
-        the full structured prompt from PromptBuilder.
+        """Build a focused prompt for agent delegation.
+
+        Produces a concise, task-oriented prompt that includes:
+        - Role and task description
+        - Original requirement
+        - Phase-specific context (planning results, spec, etc.)
+        - Scope and acceptance criteria when available
         """
         import os
         debug_prompts = context.get("variables", {}).get("debug_prompts", False)
         requirement = context.get("requirement", "")
         plan = context.get("plan", {})
         spec_content = context.get("spec_content", "")
-        
-        # Get the prompt builder for this role
-        builder = self._get_prompt_builder(subphase.agent_role)
-        
-        # Get project context
         project_ctx = context.get("project_context", {})
-        
-        # Build state for prompt builder
-        state = {
-            "requirement": requirement,
-            "current_phase": subphase.name,
-            "completed_phases": [],
-            "variables": context.get("variables", {}),
-            "project_name": project_ctx.get("name", "unknown-project"),
-            "project_root": project_ctx.get("root", os.getcwd()),
-            "tech_stack": project_ctx.get("tech_stack", []),
+
+        parts: list[str] = []
+
+        # Role title
+        role_titles = {
+            "explorer": "Requirements Analyst",
+            "sme": "Technical Researcher",
+            "analyst": "Risk Analyst",
+            "planner": "Planning Architect",
+            "coder": "Implementation Engineer",
+            "test_engineer": "Test Engineer",
+            "reviewer": "Code Reviewer",
         }
-        
-        # ── Implementation roles ────────────────────────────────────────
-        if subphase.agent_role in ("coder", "test_engineer", "reviewer"):
-            # For implementation roles, we use a hybrid approach:
-            # 1. Get the role-specific prompt section from PromptBuilder
-            # 2. Add project context
-            # 3. Add task-specific context (spec, plan, scope)
-            # 4. Add concrete instructions
-            
-            from ..prompts.roles import get_role_prompt
-            
-            parts: list[str] = []
-            
-            # Get project context
-            project_ctx = context.get("project_context", {})
-            project_name = project_ctx.get("name", "unknown-project")
-            project_root = project_ctx.get("root", os.getcwd())
-            project_desc = project_ctx.get("description", "")
-            tech_stack = project_ctx.get("tech_stack", [])
-            
-            # Role + project context
-            role_titles = {
-                "coder": "Coder Agent",
-                "test_engineer": "Test Engineer Agent",
-                "reviewer": "Code Reviewer Agent",
-            }
-            role_title = role_titles.get(subphase.agent_role, f"{subphase.agent_role} agent")
-            parts.append(f"# {role_title}\n")
-            
-            parts.append(f"## Project Context")
-            parts.append(f"- **Project**: {project_name}")
-            parts.append(f"- **Root**: {project_root}")
-            if project_desc:
-                parts.append(f"- **Description**: {project_desc}")
-            if tech_stack:
-                parts.append(f"- **Tech Stack**: {', '.join(tech_stack)}")
-            parts.append("")
-            
-            # Requirement (the original user request)
-            if requirement:
-                parts.append(f"## Requirement\n{requirement}\n")
+        role_title = role_titles.get(subphase.agent_role, subphase.agent_role)
+        parts.append(f"# {role_title}")
 
-            # Specific task this subphase should carry out
-            task_desc = None
-            if task.description and task.description.strip():
-                # Strip trailing scope/acceptance suffixes that are already
-                # passed separately — keep the core instruction.
-                raw = task.description.strip()
-                for sep in ("\nScope:", "\nAcceptance criteria:"):
-                    idx = raw.find(sep)
-                    if idx != -1:
-                        raw = raw[:idx].strip()
-                if raw and raw != requirement.strip():
-                    task_desc = raw
+        # Project context — brief
+        project_name = project_ctx.get("name", "")
+        project_root = project_ctx.get("root", "")
+        if project_name or project_root:
+            line = f"Project: {project_name}" if project_name else ""
+            if project_root:
+                line += f" (root: {project_root})" if line else f"Root: {project_root}"
+            parts.append(line)
 
-            if task_desc:
-                parts.append(f"## Task\n{task_desc}\n")
+        # Requirement
+        if requirement:
+            parts.append(f"\n## Requirement\n{requirement}")
 
-            # Scope from the task description (extracted if present)
-            task_scope = []
-            task_acceptance = []
-            if task.description:
-                for line in task.description.splitlines():
-                    if line.startswith("Scope:") or line.startswith("Scope:, "):
-                        task_scope.append(line)
-                    elif line.startswith("Acceptance criteria:"):
-                        task_acceptance.append(line)
-            if task_scope:
-                parts.append("## Scope")
-                parts.extend(task_scope)
-                parts.append("")
-            if task_acceptance:
-                parts.append("## Acceptance Criteria")
-                parts.extend(task_acceptance)
-                parts.append("")
+        # Task description — the specific thing this subphase should do
+        task_desc = None
+        if task.description and task.description.strip():
+            raw = task.description.strip()
+            for sep in ("\nScope:", "\nAcceptance criteria:"):
+                idx = raw.find(sep)
+                if idx != -1:
+                    raw = raw[:idx].strip()
+            if raw:
+                task_desc = raw
+        if task_desc:
+            parts.append(f"\n## Task\n{task_desc}")
 
-            # Plan overview — concise list of planned tasks from planning phase
-            if isinstance(plan, dict):
-                plan_tasks = plan.get("tasks", [])
-                if plan_tasks:
-                    parts.append("## Planned Tasks (overview)")
-                    for t in plan_tasks:
-                        tid = t.get("id", "?")
-                        raw_desc = str(t.get("description", ""))
-                        # Strip table markdown, trailing noise — keep a short label
-                        short = raw_desc.split("\n")[0].strip().strip("|").strip()
-                        if len(short) > 120:
-                            short = short[:117] + "..."
-                        if not short:
-                            short = tid
-                        parts.append(f"- **{tid}**: {short}")
-                    parts.append("")
+        # Scope and acceptance criteria (extracted from task description)
+        task_scope = []
+        task_acceptance = []
+        if task.description:
+            for line in task.description.splitlines():
+                if line.startswith("Scope:") or line.startswith("Scope:, "):
+                    task_scope.append(line)
+                elif line.startswith("Acceptance criteria:"):
+                    task_acceptance.append(line)
+        if task_scope:
+            parts.append("\n## Scope")
+            parts.extend(task_scope)
+        if task_acceptance:
+            parts.append("\n## Acceptance Criteria")
+            parts.extend(task_acceptance)
 
-            # Distilled spec from planning — single consolidated source of truth
-            if spec_content:
-                trimmed = spec_content[:6000] if len(spec_content) > 6000 else spec_content
-                parts.append(f"## Planning Spec\n{trimmed}\n")
+        # Planning context — concise task list from planning phase
+        if isinstance(plan, dict):
+            plan_tasks = plan.get("tasks", [])
+            if plan_tasks:
+                parts.append("\n## Planned Tasks")
+                for t in plan_tasks:
+                    tid = t.get("id", "?")
+                    raw_desc = str(t.get("description", ""))
+                    short = raw_desc.split("\n")[0].strip().strip("|").strip()
+                    if len(short) > 120:
+                        short = short[:117] + "..."
+                    if not short:
+                        short = tid
+                    parts.append(f"- {tid}: {short}")
 
-            # Get tool instructions for agent provider
-            from ..prompts.tools import AGENT_PROVIDER_INSTRUCTIONS
-            parts.append(AGENT_PROVIDER_INSTRUCTIONS)
-            
-            # Concrete instructions (from role prompt)
-            parts.append(
+        # Spec from planning — trimmed to keep prompt manageable
+        if spec_content:
+            trimmed = spec_content[:4000] if len(spec_content) > 4000 else spec_content
+            parts.append(f"\n## Spec\n{trimmed}")
+
+        # Phase-specific instructions based on role
+        role_instructions = {
+            "explorer": (
                 "\n## Instructions\n"
-                "1. Read the relevant source files first to understand the existing code.\n"
-                "2. Make the minimal, focused changes needed to fulfill the requirement.\n"
+                "1. Read relevant source files to understand the project structure.\n"
+                "2. Identify the components, modules, and dependencies relevant to the requirement.\n"
+                "3. List key requirements, constraints, and integration points.\n"
+                "4. Report findings concisely."
+            ),
+            "sme": (
+                "\n## Instructions\n"
+                "1. Research the technology stack and patterns used in this project.\n"
+                "2. Identify relevant libraries, APIs, and conventions.\n"
+                "3. Note any compatibility concerns or version requirements.\n"
+                "4. Report findings concisely."
+            ),
+            "analyst": (
+                "\n## Instructions\n"
+                "1. Identify risks, edge cases, and potential failure modes.\n"
+                "2. Consider security, performance, and maintainability.\n"
+                "3. Assess complexity and recommend approach.\n"
+                "4. Report findings concisely."
+            ),
+            "planner": (
+                "\n## Instructions\n"
+                "1. Based on the analysis and research, create an execution plan.\n"
+                "2. Break the work into focused, ordered tasks.\n"
+                "3. Each task should be independently implementable.\n"
+                "4. Specify scope and acceptance criteria for each task."
+            ),
+            "coder": (
+                "\n## Instructions\n"
+                "1. Read the relevant source files first.\n"
+                "2. Make the minimal, focused changes needed.\n"
                 "3. Follow the existing code style and patterns.\n"
                 "4. Write or update tests if applicable.\n"
-                "5. Ensure the changes integrate cleanly — no regressions, no dead code.\n"
-                "6. Return a JSON object with: status, summary, files_changed, tests, notes."
-            )
-            prompt = "\n".join(parts)
-
-            if debug_prompts:
-                self._print_debug_prompt(prompt, task, subphase)
-
-            return prompt
-        
-        # ── Decision-making roles: use full PromptBuilder ───────────────
-        # Build previous outputs from completed phases
-        previous_outputs = {}
-        if "completed_phases" in context:
-            for phase_name in context.get("completed_phases", []):
-                phase_result = context.get("phase_results", {}).get(phase_name)
-                if phase_result:
-                    previous_outputs[phase_name] = phase_result
-        
-        # Determine capability based on subphase name
-        capability_map = {
-            "ANALYZE": "analyze",
-            "TECH_RESEARCH": "research",
-            "RISK_ASSESSMENT": "analyze",
-            "SYNTHESIZE": "plan",
-            "PLANNING": "plan",
+                "5. Ensure changes integrate cleanly."
+            ),
+            "test_engineer": (
+                "\n## Instructions\n"
+                "1. Read the relevant source files and existing tests.\n"
+                "2. Write tests covering the requirement and acceptance criteria.\n"
+                "3. Include edge cases and error conditions.\n"
+                "4. Follow the existing test patterns and conventions."
+            ),
+            "reviewer": (
+                "\n## Instructions\n"
+                "1. Review the changed files for bugs, style issues, and regressions.\n"
+                "2. Check that the implementation matches the requirement.\n"
+                "3. Verify tests cover the key scenarios.\n"
+                "4. Report: issues found (if any) and overall assessment."
+            ),
         }
-        capability = capability_map.get(subphase.name.upper(), "analyze")
-        
-        # Build the prompt using PromptBuilder
-        prompt = builder.build(
-            state=state,
-            capability=capability,
-            tools=["filesystem"],  # Decision-making roles have filesystem access
-            previous_outputs=previous_outputs if previous_outputs else None,
-            extra_context=f"Task: {task.description}" if task.description else None,
-        )
+        instruction = role_instructions.get(subphase.agent_role)
+        if instruction:
+            parts.append(instruction)
+
+        prompt = "\n".join(parts)
 
         if debug_prompts:
             self._print_debug_prompt(prompt, task, subphase)
@@ -999,348 +940,6 @@ class SwarmDAGExecutor:
         print(divider)
         print(prompt)
         print(f"\n{'─' * 72}\n")
-
-    def _execute_stub_task(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Stub task execution for when no LLM provider is available.
-
-        Produces structured, meaningful output based on the subphase type and
-        task description. Each subphase template returns a dict with keys:
-        - output: human-readable summary
-        - agent_role: the subphase agent role
-        - subphase: the subphase name
-        - status: execution status
-        - structured_data: parseable dict for downstream phases
-
-        Returns:
-            Dict with task execution results including structured_data.
-        """
-        subphase_name = subphase.name.upper()
-
-        # Dispatch to subphase-specific template
-        template_fn = self._stub_templates.get(subphase_name)
-        if template_fn:
-            result = template_fn(task, subphase, context)
-        else:
-            # Generic fallback for unknown subphases
-            result = self._stub_generic(task, subphase, context)
-
-        return result
-
-    # ------------------------------------------------------------------ #
-    #  Stub template registry                                             #
-    # ------------------------------------------------------------------ #
-    _stub_templates: dict[str, Callable] = {}
-
-    # ------------------------------------------------------------------ #
-    #  ANALYZE template                                                   #
-    # ------------------------------------------------------------------ #
-    def _stub_analyze(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate a requirement breakdown for the ANALYZE subphase."""
-        requirement = context.get("requirement", "No requirement provided")
-        # Simple keyword-based component extraction
-        components = _extract_components(requirement)
-        key_requirements = _extract_requirements(requirement)
-        complexity = _estimate_complexity(requirement)
-
-        structured_data = {
-            "requirement": requirement,
-            "components": components,
-            "key_requirements": key_requirements,
-            "estimated_complexity": complexity,
-            "analysis_notes": (
-                f"Stub analysis of '{task.description}'. "
-                f"Identified {len(components)} component(s) from requirement."
-            ),
-        }
-
-        return {
-            "output": (
-                f"[ANALYZE] Requirement parsed: {len(components)} components identified. "
-                f"Complexity: {complexity}."
-            ),
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  TECH_RESEARCH template                                             #
-    # ------------------------------------------------------------------ #
-    def _stub_tech_research(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate technology recommendations for the TECH_RESEARCH subphase."""
-        requirement = context.get("requirement", "No requirement provided")
-        complexity = _estimate_complexity(requirement)
-
-        # Generic tech recommendations based on complexity
-        if complexity == "high":
-            stack = {
-                "backend": ["Python/FastAPI", "PostgreSQL", "Redis"],
-                "frontend": ["React/Next.js", "TypeScript", "Tailwind CSS"],
-                "infra": ["Docker", "Kubernetes", "CI/CD pipeline"],
-            }
-            rationale = "High-complexity projects benefit from mature, well-supported stacks."
-        elif complexity == "medium":
-            stack = {
-                "backend": ["Python/FastAPI", "SQLite/PostgreSQL"],
-                "frontend": ["Vue.js", "Vite", "CSS modules"],
-                "infra": ["Docker", "GitHub Actions"],
-            }
-            rationale = "Medium-complexity projects balance simplicity with scalability."
-        else:
-            stack = {
-                "backend": ["Python/FastAPI", "SQLite"],
-                "frontend": ["Static HTML/JS", "CSS"],
-                "infra": ["Simple deployment (e.g., static host)"],
-            }
-            rationale = "Low-complexity projects should prioritize simplicity."
-
-        structured_data = {
-            "requirement": requirement,
-            "recommended_stack": stack,
-            "rationale": rationale,
-            "complexity": complexity,
-            "recommendations": [
-                {
-                    "category": cat,
-                    "technologies": techs,
-                    "priority": "high" if complexity in ("high", "medium") else "medium",
-                }
-                for cat, techs in stack.items()
-            ],
-            "research_notes": (
-                f"Stub tech research for '{task.description}'. "
-                f"Recommended stack based on {complexity} complexity."
-            ),
-        }
-
-        return {
-            "output": (
-                f"[TECH_RESEARCH] Technology stack recommended for {complexity} complexity. "
-                f"Backend: {', '.join(stack['backend'])}."
-            ),
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  RISK_ASSESSMENT template                                           #
-    # ------------------------------------------------------------------ #
-
-    def _stub_risk_assessment(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate a risk analysis for the RISK_ASSESSMENT subphase."""
-        requirement = context.get("requirement", "No requirement provided")
-        complexity = _estimate_complexity(requirement)
-
-        # Generic risks based on complexity
-        base_risks = [
-            {
-                "id": "R001",
-                "description": "Requirement ambiguity leading to rework",
-                "severity": "high" if complexity == "high" else "medium",
-                "mitigation": "Conduct requirement clarification sessions early.",
-            },
-            {
-                "id": "R002",
-                "description": "Integration complexity with existing systems",
-                "severity": "high",
-                "mitigation": "Early integration spikes and interface contracts.",
-            },
-            {
-                "id": "R003",
-                "description": "Scope creep during implementation",
-                "severity": "medium",
-                "mitigation": "Strict change control and MVP scoping.",
-            },
-        ]
-
-        # Add complexity-specific risks
-        if complexity == "high":
-            base_risks.extend([
-                {
-                    "id": "R004",
-                    "description": "Performance bottlenecks under load",
-                    "severity": "high",
-                    "mitigation": "Load testing early in verification phase.",
-                },
-                {
-                    "id": "R005",
-                    "description": "Security vulnerabilities in complex architecture",
-                    "severity": "high",
-                    "mitigation": "Security review at each phase gate.",
-                },
-            ])
-        elif complexity == "medium":
-            base_risks.append({
-                "id": "R004",
-                "description": "Data consistency across services",
-                "severity": "medium",
-                "mitigation": "Use transactions and idempotent operations.",
-            })
-        else:
-            base_risks.append({
-                "id": "R004",
-                "description": "Minimal risk for simple projects",
-                "severity": "low",
-                "mitigation": "Standard development practices.",
-            })
-
-        # Compute severity summary
-        severity_counts = {"high": 0, "medium": 0, "low": 0}
-        for r in base_risks:
-            severity_counts[r["severity"]] += 1
-
-        structured_data = {
-            "requirement": requirement,
-            "risks": base_risks,
-            "severity_summary": severity_counts,
-            "overall_risk_level": (
-                "high" if severity_counts["high"] > 1
-                else "medium" if severity_counts["high"] > 0 or severity_counts["medium"] > 1
-                else "low"
-            ),
-            "assessment_notes": (
-                f"Stub risk assessment for '{task.description}'. "
-                f"Identified {len(base_risks)} risk(s): "
-                f"{severity_counts['high']} high, {severity_counts['medium']} medium, "
-                f"{severity_counts['low']} low."
-            ),
-        }
-
-        return {
-            "output": (
-                f"[RISK_ASSESSMENT] {len(base_risks)} risks identified. "
-                f"Overall risk level: {structured_data['overall_risk_level']}."
-            ),
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  SYNTHESIZE template                                                #
-    # ------------------------------------------------------------------ #
-
-    def _stub_synthesize(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate FeatureSlices for the SYNTHESIZE subphase."""
-        requirement = context.get("requirement", "No requirement provided")
-        slices = synthesize_slices(requirement, context, self._llm_provider)
-
-        structured_data = {
-            "requirement": requirement,
-            "feature_slices": [s.to_dict() for s in slices],
-            "implementation_tasks": [
-                {"id": s.id, "description": s.description}
-                for s in slices
-            ],
-            "estimated_slice_count": len(slices),
-            "estimated_complexity": _estimate_complexity(requirement),
-            "synthesis_notes": (
-                f"Stub execution plan for '{task.description}'. "
-                f"{len(slices)} feature slice(s)."
-            ),
-        }
-
-        return {
-            "output": (
-                f"[SYNTHESIZE] Execution plan drafted: "
-                f"{len(slices)} feature slice(s) for {_estimate_complexity(requirement)} complexity."
-            ),
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  BACKEND template                                                   #
-    # ------------------------------------------------------------------ #
-
-    def _stub_backend(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate feature-slice-based output for the BACKEND subphase."""
-        requirement = context.get("requirement", "No requirement provided")
-        complexity = _estimate_complexity(requirement)
-
-        structured_data = {
-            "requirement": requirement,
-            "complexity": complexity,
-            "agent_role": subphase.agent_role,
-            "implementation_notes": (
-                f"Stub backend output for '{task.description}'. "
-                f"Agent will decompose at implementation time."
-            ),
-        }
-
-        return {
-            "output": (
-                f"[BACKEND] Feature slice executed: {task.description} "
-                f"(complexity: {complexity})"
-            ),
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  FRONTEND template                                                  #
-    # ------------------------------------------------------------------ #
-
-    def _stub_frontend(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generate feature-slice-based output for the FRONTEND subphase."""
-        requirement = context.get("requirement", "No requirement provided")
-        complexity = _estimate_complexity(requirement)
-
-        structured_data = {
-            "requirement": requirement,
-            "complexity": complexity,
-            "agent_role": subphase.agent_role,
-            "implementation_notes": (
-                f"Stub frontend output for '{task.description}'. "
-                f"Agent will decompose at implementation time."
-            ),
-        }
-
-        return {
-            "output": (
-                f"[FRONTEND] Feature slice executed: {task.description} "
-                f"(complexity: {complexity})"
-            ),
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  Generic fallback                                                   #
-    # ------------------------------------------------------------------ #
-
-    def _stub_generic(self, task: "Task", subphase: "SubPhase", context: dict) -> dict:
-        """Generic stub for unknown subphases."""
-        structured_data = {
-            "task_id": task.id,
-            "task_description": task.description,
-            "subphase": subphase.name,
-            "agent_role": subphase.agent_role,
-            "context_keys": list(context.keys()),
-            "execution_mode": "stub",
-            "notes": (
-                f"Stub execution for unknown subphase '{subphase.name}'. "
-                f"Task: {task.description}"
-            ),
-        }
-
-        return {
-            "output": f"[{subphase.name}] Task '{task.id}' ({task.description}) completed (stub).",
-            "agent_role": subphase.agent_role,
-            "subphase": subphase.name,
-            "status": "completed",
-            "structured_data": structured_data,
-        }
 
     def run_swarm_gates(self, gates: list[str], context: dict) -> dict[str, Any]:
         """Run swarm-specific gates."""

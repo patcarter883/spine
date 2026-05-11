@@ -414,23 +414,26 @@ class TestSwarmAgentIntegration:
         assert result["files_changed"] == ["main.py"]
         assert result["success"] is True
 
-    def test_planner_ignores_agent_provider(self):
-        """Decision-making roles should NOT use agent_provider."""
+    def test_planner_uses_agent_provider(self):
+        """All roles now use agent_provider."""
         from spine.swarm.agents import SwarmAgent
 
         mock_provider = MagicMock(spec=AgentProvider)
         mock_provider.enabled = True
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = "plan created"
+        mock_result = MagicMock()
+        mock_result.output = "plan created"
+        mock_result.success = True
+        mock_result.exit_code = 0
+        mock_result.files_changed = []
+        mock_result.error = None
+        mock_provider.execute.return_value = mock_result
 
-        agent = SwarmAgent("planner", ["draft"], llm_provider=mock_llm, agent_provider=mock_provider)
+        agent = SwarmAgent("planner", ["draft"], agent_provider=mock_provider)
         state = {"requirement": "Plan the project", "phase": "PLANNING", "variables": {}}
 
         result = agent.execute(state, "draft")
-        # Should use LLM, not agent provider
-        mock_provider.execute.assert_not_called()
-        mock_llm.generate.assert_called_once()
-        assert result["result"] == "plan created"
+        # Should use agent provider
+        mock_provider.execute.assert_called_once()
 
     def test_set_agent_provider(self):
         from spine.swarm.agents import SwarmAgent
@@ -442,14 +445,16 @@ class TestSwarmAgentIntegration:
         agent.set_agent_provider(mock_provider)
         assert agent._agent_provider is mock_provider
 
-    def test_implementation_roles_constant(self):
+    def test_all_roles_in_implementation_roles(self):
         from spine.swarm.agents import SwarmAgent
 
+        # All roles are now in IMPLEMENTATION_ROLES since we removed the LLM fallback
         assert "coder" in SwarmAgent.IMPLEMENTATION_ROLES
         assert "test_engineer" in SwarmAgent.IMPLEMENTATION_ROLES
         assert "reviewer" in SwarmAgent.IMPLEMENTATION_ROLES
-        assert "planner" not in SwarmAgent.IMPLEMENTATION_ROLES
-        assert "critic" not in SwarmAgent.IMPLEMENTATION_ROLES
+        assert "planner" in SwarmAgent.IMPLEMENTATION_ROLES
+        assert "explorer" in SwarmAgent.IMPLEMENTATION_ROLES
+        assert "sme" in SwarmAgent.IMPLEMENTATION_ROLES
 
 
 # ── git changed files helper ─────────────────────────────────────────
