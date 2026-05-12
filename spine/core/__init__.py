@@ -4,13 +4,12 @@ from .state_machine import (
     SpineState,
     SpineStateMachine,
     Phase,
-    Task,
     SubPhase,
     PhaseResult,
     SubPhaseResult,
-    SwarmDAGExecutor,
     create_spine_workflow,
 )
+from ..models.types import Task
 from .learning import Pattern, AntiPattern, PatternRecord, LearningManager
 from .hivemind import Memory, Hivemind
 from .hierarchy import (
@@ -28,7 +27,6 @@ __all__ = [
     "SubPhase",
     "PhaseResult",
     "SubPhaseResult",
-    "SwarmDAGExecutor",
     "create_spine_workflow",
     "Pattern",
     "AntiPattern",

@@ -2,7 +2,7 @@
 
 from .core import (
     SpineState, SpineStateMachine, Phase, Task, SubPhase,
-    PhaseResult, SubPhaseResult, SwarmDAGExecutor, create_spine_workflow
+    PhaseResult, SubPhaseResult, create_spine_workflow
 )
 from .models import PhaseName, StateStatus, SubPhaseStatus
 from . import providers
@@ -19,7 +19,6 @@ __all__ = [
     "SubPhase",
     "PhaseResult",
     "SubPhaseResult",
-    "SwarmDAGExecutor",
     "create_spine_workflow",
     "PhaseName",
     "StateStatus",

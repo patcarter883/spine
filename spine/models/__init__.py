@@ -24,7 +24,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4"
 # Import data models
 from .enums import PhaseName, StateStatus, SubPhaseStatus
 from .types import Task, SubPhase, Phase, PhaseResult, SubPhaseResult, SpineState
-from .dag import SwarmDAGExecutor
+from .dag import synthesize_slices
 from .thread import Thread, generate_thread_id
 from .work_entry import WorkEntry
 
@@ -45,8 +45,8 @@ __all__ = [
     "PhaseResult",
     "SubPhaseResult",
     "SpineState",
-    # Data models - dag
-    "SwarmDAGExecutor",
+    # FeatureSlice synthesis
+    "synthesize_slices",
     # Data models - thread
     "Thread",
     "generate_thread_id",
