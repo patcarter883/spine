@@ -5,7 +5,5 @@ providers:
   - name: openrouter-da
     type: deepagents-model
     model: openrouter:z-ai/glm-4.5-air:free
-    api_key: ''
-    base_url: ''
     priority: 0
     enabled: true
