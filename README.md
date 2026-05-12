@@ -23,9 +23,9 @@ spine ui
 ## Features
 
 - **State Machine Workflow** — Structured lifecycle: INIT → PLANNING → EXECUTION → VERIFICATION → COMPLETE, with checkpoints and resume support.
-- **Hybrid Agent Architecture** — Deep Agents (DA) as the primary execution path with a fallback to the legacy SwarmDAGExecutor for compatibility.
+- **Deep Agent Architecture** — Deep Agents (DA) as the sole execution path, providing structured subagent delegation, critic gates, and context compaction per phase.
 - **Deep Agents Integration** — `create_deep_agent()` powered phases: planning, execution (with subagent decomposition), and verification. Providers resolved through LangGraph config to avoid serialization issues.
-- **DAG-based Parallel Execution** — SwarmDAGExecutor handles parallel feature slices with dependency resolution and supervisor oversight.
+- **FeatureSlice Decomposition** — `synthesize_slices()` decomposes requirements into parallelizable feature slices with dependency edges, used by both planning and SDD workflows.
 - **Streamlit Dashboard** — 8-page UI: Dashboard, New Work, Work Detail, Task Queue, Agent Resources, Spec-Driven Development (SDD), Providers, Settings. Zero-duplication architecture — UI and CLI share the same code paths.
 - **Ralph Loop Worker** — Background queue processor that autonomously dequeues and executes tasks.
 - **Spec-Driven Development (SDD)** — Write specs upfront, let the agents plan and execute against them.
@@ -68,11 +68,6 @@ Each phase is a LangGraph node with SQLite-backed checkpoints. The state machine
 - FeatureSlices from the planning phase map to SubAgents for parallel execution
 - Middleware hooks (after_model, before_model) for cross-cutting concerns
 - Providers injected via LangGraph config (not state) to avoid serialization
-
-**SwarmDAGExecutor Path (Fallback):**
-- DAG-based parallel sub-phase execution
-- Supervisor agent with critic gate for quality assurance
-- FeatureSlices executed in parallel where dependencies allow
 
 ### Provider System
 

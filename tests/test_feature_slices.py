@@ -1,8 +1,7 @@
 """Tests for feature-slice decomposition and agent delegation."""
 
 import json
-import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from spine.models.types import FeatureSlice
 from spine.models.dag import (
@@ -10,10 +9,7 @@ from spine.models.dag import (
     _build_slice_synthesis_prompt,
     _parse_llm_slices,
     _heuristic_slices,
-    _estimate_complexity,
-    _extract_components,
 )
-from spine.providers.agents import AgentProvider
 
 
 # ── FeatureSlice dataclass ─────────────────────────────────────────
@@ -267,61 +263,6 @@ class TestHeuristicSlices:
             assert s.id
             assert s.description
             assert len(s.description) > 5
-
-
-# ── Integration: SwarmDAGExecutor SYNTHESIZE stub ──────────────────
-
-
-class TestSynthesizeStub:
-    """SwarmDAGExecutor SYNTHESIZE stub produces FeatureSlices."""
-
-    def test_synthesize_stub_returns_slices(self):
-        from unittest.mock import MagicMock
-        from spine.models.dag import SwarmDAGExecutor
-        from spine.core.state_machine import SubPhase, Task
-
-        mock_provider = MagicMock()
-        mock_provider.enabled = True
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.output = "Feature slice analysis: identified 2 feature slices for the API."
-        mock_provider.execute.return_value = mock_result
-
-        executor = SwarmDAGExecutor(agent_provider=mock_provider)
-        subphase = SubPhase(
-            name="SYNTHESIZE",
-            agent_role="planner",
-            tasks=[Task(id="draft", description="Draft plan")],
-        )
-        result = executor.execute_dag(subphase, {"requirement": "Build API"})
-        task_result = result["tasks"]["draft"]["result"]
-        assert "feature slice" in task_result["output"].lower()
-
-    def test_synthesize_stub_feature_slices_shape(self):
-        from unittest.mock import MagicMock
-        from spine.models.dag import SwarmDAGExecutor
-        from spine.core.state_machine import SubPhase, Task
-
-        mock_provider = MagicMock()
-        mock_provider.enabled = True
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.output = '{"feature_slices": [{"id": "fs-1", "description": "API endpoints"}]}'
-        mock_provider.execute.return_value = mock_result
-
-        executor = SwarmDAGExecutor(agent_provider=mock_provider)
-        subphase = SubPhase(
-            name="SYNTHESIZE",
-            agent_role="planner",
-            tasks=[Task(id="draft", description="Draft plan")],
-        )
-        result = executor.execute_dag(subphase, {"requirement": "Build API"})
-        data = result["tasks"]["draft"].get("structured_data", {})
-        if "feature_slices" in data:
-            assert isinstance(data["feature_slices"], list)
-            for fs in data["feature_slices"]:
-                assert "id" in fs
-                assert "description" in fs
 
 
 # ── Integration: SDD + QuickWork FeatureSlice propagation ──────────
