@@ -56,6 +56,11 @@ def get_provider_from_config(config: dict, provider_type: str = "llm"):
             base_url=pconfig.get("base_url", OpenRouterProvider.DEFAULT_BASE_URL),
         )
         return provider
+    elif ptype == "deepagents-model":
+        from ..providers.deepagents_model import DeepAgentsModelProvider
+        provider = DeepAgentsModelProvider()
+        provider.configure(pconfig)
+        return provider
     return None
 
 
@@ -135,6 +140,7 @@ def execute_work_task(payload: dict) -> dict:
                 "error_state": None,
                 "error_history": [],
                 "project_context": project_context,
+                "planning_retry_count": 0,
             },
             {"configurable": {"thread_id": thread_id, "providers": real_providers}},
         )

@@ -1,6 +1,6 @@
 """Deep Agents model provider for direct LangChain chat model integration.
 
-Replaces OpenCodeAgentProvider for local models (vLLM, Ollama) where the
+Replaces OpenCodeAgentProvider for local and cloud models where the
 subprocess wrapper adds latency and protocol fragility. Uses LangChain's
 init_chat_model() to construct a BaseChatModel that Deep Agents can consume
 directly via create_deep_agent(model=...).
@@ -9,6 +9,16 @@ Configuration (spine.yaml)::
 
     providers:
       llm:
+        # OpenRouter — api_key falls back to OPENROUTER_API_KEY env var
+        - name: openrouter-da
+          type: deepagents-model
+          config:
+            model: "openrouter:anthropic/claude-sonnet-4-5"
+            # api_key: omitted → reads OPENROUTER_API_KEY from env
+            temperature: 0.3
+            max_tokens: 8192
+
+        # Local vLLM / Ollama (openai-compatible endpoint)
         - name: local-vllm
           type: deepagents-model
           config:
@@ -17,11 +27,27 @@ Configuration (spine.yaml)::
             api_key: "dummy"
             temperature: 0.3
             max_tokens: 8192
+
+The ``model`` key uses LangChain's ``provider:model`` format:
+  - ``openrouter:``   → langchain-openrouter (ChatOpenRouter)
+  - ``openai:``       → langchain-openai   (ChatOpenAI)
+  - ``anthropic:``    → langchain-anthropic (ChatAnthropic)
+  - ``ollama:``       → langchain-ollama    (ChatOllama)
+
+Any LangChain-supported provider prefix works; just ensure the
+corresponding langchain-* integration package is installed.
+
+Debug logging:
+    Set ``SPINE_DEBUG_MODEL_IO=1`` to log all model input/output
+    to ``.spine/debug/model_io/``. Each invoke() call produces a pair
+    of JSON files (``_in.json`` / ``_out.json``) with timestamps,
+    phase context, and full message content.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from langchain.chat_models import init_chat_model
@@ -58,19 +84,45 @@ class DeepAgentsModelProvider(Provider):
     def name(self) -> str:
         return "deepagents-model"
 
+    # Map of provider prefix → env var that holds the API key.
+    # LangChain providers read these automatically when api_key is
+    # not passed explicitly, but we resolve them here so that a
+    # single ``api_key`` config key (or its absence) works across
+    # all backends.
+    _PROVIDER_ENV_KEYS: dict[str, str] = {
+        "openrouter": "OPENROUTER_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "google_genai": "GOOGLE_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "mistralai": "MISTRAL_API_KEY",
+        "xai": "XAI_API_KEY",
+    }
+
     def configure(self, config: dict[str, Any]) -> None:
         """Initialise the LangChain chat model from config.
 
         Expected keys (all optional except ``model``):
-            model      – provider:model string (e.g. "openai:Qwen/Qwen3-32B")
-            base_url   – OpenAI-compatible endpoint
-            api_key    – API key (use "dummy" for local vLLM)
+            model      – provider:model string (e.g. "openrouter:anthropic/claude-sonnet-4-5")
+            api_key    – API key; falls back to provider-specific env var
+                         (OPENROUTER_API_KEY, OPENAI_API_KEY, etc.)
+            base_url   – custom endpoint override
             temperature, max_tokens, top_p, reasoning – forwarded as-is
         """
         self._config = config.copy()
         model_str = config.get("model", "openai:gpt-4")
         base_url = config.get("base_url")
-        api_key = config.get("api_key", "dummy")
+
+        # Resolve api_key: explicit config > env var for provider > not set.
+        # When api_key is not set at all, LangChain's own init_chat_model
+        # will read the provider's default env var automatically.
+        api_key = config.get("api_key")
+        if api_key is None:
+            provider_prefix = model_str.split(":")[0] if ":" in model_str else ""
+            env_var = self._PROVIDER_ENV_KEYS.get(provider_prefix)
+            if env_var:
+                api_key = os.environ.get(env_var)
 
         kwargs: dict[str, Any] = {}
         if base_url:
@@ -91,7 +143,20 @@ class DeepAgentsModelProvider(Provider):
 
     @property
     def chat_model(self) -> BaseChatModel | None:
-        """Return the initialised LangChain chat model."""
+        """Return the initialised LangChain chat model.
+
+        When ``SPINE_DEBUG_MODEL_IO=1``, the model is wrapped with
+        :class:`ModelIOLogger` which logs every invoke() call to
+        ``.spine/debug/model_io/``.
+        """
+        if self._chat_model is None:
+            return None
+
+        # Wrap with debug logger if enabled
+        from ..debug.model_io import ModelIOLogger, is_debug_enabled
+        if is_debug_enabled():
+            return ModelIOLogger.wrap_if_enabled(self._chat_model)
+
         return self._chat_model
 
     def validate(self) -> bool:

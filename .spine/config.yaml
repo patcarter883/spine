@@ -1,21 +1,11 @@
 spine:
   checkpoint_path: .spine/spine.db
-
 providers:
   llm:
-    - name: local-vllm
-      type: deepagents-model
-      config:
-        model: "openai:model"
-        base_url: "http://localhost:8000/v1"
-        api_key: "dummy"
-        temperature: 0.3
-        max_tokens: 8192
-
-  agent:
-    - name: default
-      type: opencode
-      config:
-        mode: acp
-        model: openrouter/minimax/minimax-m2.7
-        auto_approve: true
+  - name: openrouter-da
+    type: deepagents-model
+    model: openrouter:z-ai/glm-4.5-air:free
+    api_key: ''
+    base_url: ''
+    priority: 0
+    enabled: true

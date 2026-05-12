@@ -291,21 +291,12 @@ def create_planning_agent(
         ),
     ]
 
+    max_critic_revisions = int(os.environ.get("SPINE_CRITIC_MAX_REVISIONS", "3"))
+
     middleware = [
-        CriticGateMiddleware(llm_provider=providers.get("llm")),
+        CriticGateMiddleware(llm_provider=providers.get("llm"), max_revisions=max_critic_revisions),
         StepLimitMiddleware(max_steps=max_steps),
         MessageQueueMiddleware(),
-    ]
-
-    # Planning is read-only: deny writes anywhere, allow reads under project root.
-    # First-match-wins, so the deny-write rule must come before any broader allows.
-    from deepagents import FilesystemPermission
-    permissions = [
-        FilesystemPermission(
-            operations=["write"],
-            paths=["/**"],
-            mode="deny",
-        ),
     ]
 
     agent = create_deep_agent(
@@ -314,7 +305,6 @@ def create_planning_agent(
         subagents=subagents,
         middleware=middleware,
         backend=backend,
-        permissions=permissions,
         name="spine-planning",
     )
 

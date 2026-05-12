@@ -5,7 +5,7 @@ import streamlit as st
 from spine.ui.utils import get_llm_providers, set_llm_providers
 
 
-LLM_TYPES = ["openai", "ollama", "openrouter", "local-openai"]
+LLM_TYPES = ["deepagents-model", "openai", "ollama", "openrouter", "local-openai"]
 
 
 def render_providers_config() -> None:
@@ -66,8 +66,9 @@ def render_llm_providers_tab() -> None:
             )
             model = st.text_input(
                 "Model",
-                value=provider.get("model", "qwen3:32b"),
+                value=provider.get("model", _default_model(ltype)),
                 key=f"llm_model_{i}",
+                help="For deepagents-model, use provider:model format (e.g. openrouter:openai/gpt-4, openai:gpt-4, anthropic:claude-sonnet-4-5)",
             )
             api_key = st.text_input(
                 "API Key",
@@ -147,6 +148,18 @@ def render_notify_tab() -> None:
                 st.json(provider)
 
     st.info("Notification providers (Discord, Slack, Email) are configured via .spine/config.yaml.")
+
+
+def _default_model(provider_type: str) -> str:
+    """Get the default model string for a provider type."""
+    defaults = {
+        "deepagents-model": "openrouter:openai/gpt-4",
+        "ollama": "qwen3:32b",
+        "openai": "gpt-4",
+        "openrouter": "openai/gpt-4",
+        "local-openai": "local-model",
+    }
+    return defaults.get(provider_type, "")
 
 
 def _default_base_url(provider_type: str) -> str:

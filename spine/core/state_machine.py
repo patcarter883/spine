@@ -126,6 +126,7 @@ def init_phase(state: SpineState) -> SpineState:
     state["critic_gate_result"] = None
     state["pending_messages"] = []
     state["model_call_count"] = 0
+    state["planning_retry_count"] = 0
     
     # Transition to PLANNING
     state["previous_phase"] = PhaseName.INIT
@@ -143,7 +144,50 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
     Fallback path: Uses the legacy SwarmDAGExecutor when no DA-compatible
     LLM provider is configured (i.e., the old LLMProvider is in use).
     """
+    from ..debug.model_io import set_debug_phase
+    set_debug_phase("PLANNING")
+
     state["phase"] = PhaseName.PLANNING
+
+    # Track planning retries to prevent infinite loops
+    retry_count = state.get("planning_retry_count", 0) + 1
+    state["planning_retry_count"] = retry_count
+    max_planning_retries = int(os.environ.get("SPINE_MAX_PLANNING_RETRIES", "3"))
+
+    if retry_count > max_planning_retries:
+        logger.error(
+            "PLANNING retry limit reached (%d/%d) — flagging for human review",
+            retry_count, max_planning_retries,
+        )
+        # Write whatever plan exists as a draft, then route to human review.
+        # Critic gates are quality checkpoints: we don't auto-approve.
+        if state.get("plan") is None:
+            state["plan"] = {
+                "requirement": state.get("requirement", ""),
+                "phases": ["PLANNING", "EXECUTION", "VERIFICATION"],
+                "tasks": [{"id": "implement", "description": state.get("requirement", "")}],
+                "feature_slices": [],
+                "planning_context": {},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        # Write artifacts so the human reviewer has something to look at
+        work_item_id = state.get("variables", {}).get(
+            "work_item_id",
+            state.get("variables", {}).get("thread_id", "default"),
+        )
+        write_plan_artifact(state, work_item_id)
+        write_spec_file(state, work_item_id)
+
+        state["critic_gate_result"] = "NEEDS_HUMAN_REVIEW"
+        state["errors"].append(
+            f"Planning retry limit reached ({retry_count}/{max_planning_retries})"
+        )
+        state["previous_phase"] = PhaseName.PLANNING
+        state["phase"] = PhaseName.HUMAN_REVIEW
+        # Flag for human review so should_continue keeps us here
+        state.setdefault("variables", {})["waiting_for_human"] = True
+        state["variables"]["resume_phase"] = "planning"
+        return state
     start_time = datetime.now(timezone.utc)
 
     # Log phase started event
@@ -244,22 +288,7 @@ def _planning_phase_da(
             agent_provider=None,  # DA already tried — use heuristic
         )
 
-    # Critic gate (SPINE-specific: runs at state machine level)
-    critic_result = _run_critic_gate_da(state, planning_context, chat_model)
-    state["critic_gate_result"] = critic_result
-
-    if critic_result != "APPROVED":
-        state["errors"].append(f"Critic gate {critic_result}: Plan requires revision")
-        state["previous_phase"] = PhaseName.PLANNING
-        _log_phase_event(state, "PLANNING", "phase_completed", {
-            "tasks_completed": len(state.get("completed_tasks", [])),
-            "errors": len(state.get("errors", [])),
-            "duration": (datetime.now(timezone.utc) - start_time).total_seconds(),
-            "status": "error",
-        }, config=config)
-        return state
-
-    # ── Build plan ───────────────────────────────────────────────────
+    # ── Build plan (before critic gate — so drafts exist even if rejected) ──
     plan_tasks = _derive_plan_tasks_from_da_result(result, state["requirement"])
 
     state["plan"] = {
@@ -274,7 +303,8 @@ def _planning_phase_da(
     # Mark planning tasks complete
     state["completed_tasks"].extend([t["id"] for t in plan_tasks])
 
-    # Write artifacts
+    # Write artifacts BEFORE critic gate — ensures draft plan/spec exist
+    # even when the critic rejects and the phase is retried.
     work_item_id = state.get("variables", {}).get("work_item_id", state.get("variables", {}).get("thread_id", "default"))
     artifact_path = write_plan_artifact(state, work_item_id)
     if artifact_path:
@@ -288,6 +318,39 @@ def _planning_phase_da(
     spine_root = _get_spine_root(state)
     state["variables"]["spec_path"] = os.path.join(spine_root, "spec", f"{work_item_id}.md")
     state["variables"]["artifact_path"] = os.path.join(spine_root, "artifacts", "plans", f"{work_item_id}.json")
+
+    # Critic gate (SPINE-specific: runs at state machine level)
+    critic_result = _run_critic_gate_da(state, planning_context, chat_model)
+    state["critic_gate_result"] = critic_result
+
+    if critic_result != "APPROVED":
+        state["errors"].append(f"Critic gate {critic_result}: Plan requires revision")
+        state["previous_phase"] = PhaseName.PLANNING
+
+        if critic_result == "NEEDS_REVISION":
+            # Soft rejection — allow retry.  planning_phase enforces the
+            # retry limit via planning_retry_count, preventing infinite loops.
+            state["phase"] = PhaseName.PLANNING
+            logger.info(
+                "Critic gate NEEDS_REVISION — will retry planning "
+                "(attempt %d)", state.get("planning_retry_count", 1),
+            )
+        else:
+            # Hard reject (REJECTED) or middleware exhausted (NEEDS_HUMAN_REVIEW)
+            # — route to human review.  Critic gates are quality checkpoints:
+            # these outcomes must not auto-approve or silently retry.
+            state["phase"] = PhaseName.HUMAN_REVIEW
+            state.setdefault("variables", {})["waiting_for_human"] = True
+            state["variables"]["resume_phase"] = "planning"
+
+        _log_phase_event(state, "PLANNING", "phase_completed", {
+            "tasks_completed": len(state.get("completed_tasks", [])),
+            "errors": len(state.get("errors", [])),
+            "duration": (datetime.now(timezone.utc) - start_time).total_seconds(),
+            "status": "critic_rejected",
+            "critic_result": critic_result,
+        }, config=config)
+        return state
 
     # Transition to EXECUTION
     state["previous_phase"] = PhaseName.PLANNING
@@ -434,12 +497,30 @@ def _planning_phase_legacy(
     if critic_result != "APPROVED":
         state["errors"].append(f"Critic gate {critic_result}: Plan requires revision")
         state["previous_phase"] = PhaseName.PLANNING
+
+        if critic_result == "NEEDS_REVISION":
+            # Soft rejection — allow retry.  planning_phase enforces the
+            # retry limit via planning_retry_count, preventing infinite loops.
+            state["phase"] = PhaseName.PLANNING
+            logger.info(
+                "Critic gate NEEDS_REVISION — will retry planning "
+                "(attempt %d)", state.get("planning_retry_count", 1),
+            )
+        else:
+            # Hard reject (REJECTED) or middleware exhausted (NEEDS_HUMAN_REVIEW)
+            # — route to human review.  Critic gates are quality checkpoints:
+            # these outcomes must not auto-approve or silently retry.
+            state["phase"] = PhaseName.HUMAN_REVIEW
+            state.setdefault("variables", {})["waiting_for_human"] = True
+            state["variables"]["resume_phase"] = "planning"
+
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         _log_phase_event(state, "PLANNING", "phase_completed", {
             "tasks_completed": len(state.get("completed_tasks", [])),
             "errors": len(state.get("errors", [])),
             "duration": duration,
-            "status": "error",
+            "status": "critic_rejected",
+            "critic_result": critic_result,
         }, config=config)
         return state
 
@@ -532,6 +613,9 @@ def execution_phase(state: SpineState, config: Optional[RunnableConfig] = None) 
     Fallback path: Uses the legacy SwarmDAGExecutor when no DA-compatible
     LLM provider is configured.
     """
+    from ..debug.model_io import set_debug_phase
+    set_debug_phase("EXECUTION")
+
     state["phase"] = PhaseName.EXECUTION
     start_time = datetime.now(timezone.utc)
 
@@ -839,6 +923,9 @@ def verification_phase(state: SpineState, config: Optional[RunnableConfig] = Non
     Fallback path: Uses the legacy approach (agent review + local quality gates)
     when no DA-compatible LLM provider is configured.
     """
+    from ..debug.model_io import set_debug_phase
+    set_debug_phase("VERIFICATION")
+
     state["phase"] = PhaseName.VERIFICATION
     start_time = datetime.now(timezone.utc)
 
@@ -1709,10 +1796,19 @@ def should_continue(state: SpineState) -> Literal["planning", "execution", "veri
     elif phase == PhaseName.PLANNING:
         # Check critic gate before EXECUTION
         critic_result = state.get("critic_gate_result")
+        if critic_result is None:
+            # No critic result yet — planning phase hasn't completed.
+            # Route to planning so it can actually run.
+            return "planning"
         if critic_result == "APPROVED":
             return "execution"
-        else:
-            return "planning"  # Return to PLANNING for revision
+        if critic_result == "NEEDS_REVISION":
+            # Soft rejection — allow retry; planning_phase enforces
+            # the retry limit via planning_retry_count.
+            return "planning"
+        # Hard outcomes (REJECTED, NEEDS_HUMAN_REVIEW):
+        # Route to human review.  Critic gates are quality checkpoints.
+        return "human_review"
     elif phase == PhaseName.EXECUTION:
         # If the execution phase just completed (previous_phase == EXECUTION or
         # phase was set to VERIFICATION by the execution phase itself), go to
@@ -1861,6 +1957,7 @@ def create_spine_workflow(checkpoint_path: str = ".spine/spine.db"):
             "execution": "execution",
             "verification": "verification",
             "error": "error",
+            "human_review": "human_review",
             "__end__": END,
         }
     )
@@ -2003,6 +2100,7 @@ class SpineStateMachine:
                 "execution": "execution",
                 "verification": "verification",
                 "error": "error",
+                "human_review": "human_review",
                 "__end__": END,
             }
         )
@@ -2041,6 +2139,7 @@ class SpineStateMachine:
             critic_gate_result=None,
             error_state=None,
             error_history=[],
+            planning_retry_count=0,
         )
         
         result = self.app.invoke(

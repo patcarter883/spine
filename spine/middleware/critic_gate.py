@@ -8,6 +8,11 @@ SPINE's critic gate runs at two levels:
 
 This middleware enables fast iterative refinement within a single planning
 invocation, while the state machine provides the structural guarantee.
+
+IMPORTANT: A max_revision_count prevents infinite critic revision loops.
+When the agent exceeds the allowed revisions, the critic gate flags the
+plan as NEEDS_HUMAN_REVIEW so the state machine routes to human review
+rather than auto-approving or silently retrying.
 """
 
 from __future__ import annotations
@@ -27,16 +32,34 @@ class CriticGateMiddleware(AgentMiddleware):
     If the agent signals plan completion, runs critic review. Returns
     a state update to inject revision feedback if the plan is rejected.
 
+    After ``max_revisions`` rejections, the plan is flagged as
+    ``NEEDS_HUMAN_REVIEW`` so the state machine routes the work item
+    to human review rather than auto-approving or silently retrying.
+
     Usage::
 
-        middleware = [CriticGateMiddleware(llm_provider=llm)]
+        middleware = [CriticGateMiddleware(llm_provider=llm, max_revisions=3)]
         agent = create_deep_agent(model=model, middleware=middleware, ...)
     """
 
     name = "CriticGateMiddleware"
 
-    def __init__(self, llm_provider: Any = None) -> None:
+    def __init__(
+        self,
+        llm_provider: Any = None,
+        max_revisions: int = 3,
+    ) -> None:
+        """Initialize the critic gate middleware.
+
+        Args:
+            llm_provider: LLM provider for critic review (must have .chat_model).
+            max_revisions: Maximum number of revision cycles before flagging
+                for human review. Set to 0 to skip in-agent revisions and
+                flag immediately on first rejection. Defaults to 3.
+        """
         self._llm = llm_provider
+        self._max_revisions = max_revisions
+        self._revision_count = 0
 
     def after_model(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
         """Inspect model output after each call during PLANNING phase.
@@ -47,7 +70,8 @@ class CriticGateMiddleware(AgentMiddleware):
 
         If the agent signals plan completion (PLAN_COMPLETE marker),
         runs critic review. If the critic rejects, injects revision
-        feedback as a new user message.
+        feedback as a new user message — unless max_revisions has been
+        reached, in which case the plan is flagged NEEDS_HUMAN_REVIEW.
         """
         # Only run critic during PLANNING phase
         spine_phase = state.get("spine_phase", "")
@@ -72,19 +96,38 @@ class CriticGateMiddleware(AgentMiddleware):
         if "PLAN_COMPLETE" not in content:
             return None
 
+        # ── Max revision guard — flag for human review ─────────────────
+        if self._revision_count >= self._max_revisions:
+            logger.warning(
+                "Critic gate: max revisions (%d) reached — flagging for human review",
+                self._max_revisions,
+            )
+            return {"critic_gate_result": "NEEDS_HUMAN_REVIEW"}
+
         # Run critic review
         critic_result = self._run_critic(content)
-        logger.info("Critic gate result: %s", critic_result)
+        logger.info(
+            "Critic gate result: %s (revision %d/%d)",
+            critic_result,
+            self._revision_count + 1,
+            self._max_revisions,
+        )
 
         if critic_result == "APPROVED":
             # Store result in state for state machine to read
             return {"critic_gate_result": "APPROVED"}
 
+        # Track the revision
+        self._revision_count += 1
+
         # Inject critic feedback for revision
         feedback_msg = {
             "role": "user",
-            "content": f"Critic feedback: {critic_result}. Please revise the plan. "
-                       f"Address the specific issues raised and resubmit with PLAN_COMPLETE.",
+            "content": (
+                f"Critic feedback: {critic_result}. Please revise the plan. "
+                f"Address the specific issues raised and resubmit with PLAN_COMPLETE. "
+                f"(Revision {self._revision_count}/{self._max_revisions})"
+            ),
         }
         new_messages = list(messages) + [feedback_msg]
         return {"messages": new_messages, "critic_gate_result": critic_result}

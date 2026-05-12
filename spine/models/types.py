@@ -151,7 +151,7 @@ class SpineState(TypedDict):
     agent_provider: Optional[dict[str, Any]]
     
     # Critic gate state
-    critic_gate_result: Optional[Literal["APPROVED", "NEEDS_REVISION", "REJECTED"]]
+    critic_gate_result: Optional[Literal["APPROVED", "NEEDS_REVISION", "REJECTED", "NEEDS_HUMAN_REVIEW"]]
     
     # Error state tracking
     error_state: Optional[str]  # Current error state (HUMAN_REVIEW, TRANSIENT, FATAL)
@@ -160,6 +160,9 @@ class SpineState(TypedDict):
     # Deep Agents integration state
     pending_messages: list[dict[str, Any]]  # Message queue for mid-run injection
     model_call_count: int  # Step counter for DA agents
+
+    # Planning retry tracking (prevents infinite PLANNING loops)
+    planning_retry_count: int  # How many times PLANNING has been re-entered
 
 
 # ── Ralph Loop Hierarchy Types ─────────────────────────────────────

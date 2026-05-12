@@ -10,6 +10,9 @@ authors = [
 ]
 
 dependencies = [
+    "langchain>=1.0.0",
+    "langchain-openai>=1.2.1",
+    "langchain-openrouter>=0.2.3",
     "langgraph>=0.4.0",
     "langgraph-checkpoint-sqlite>=3.0.0",
     "langgraph-supervisor>=0.0.13",
@@ -26,15 +29,6 @@ dependencies = [
     "alembic>=1.13.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "black>=24.0",
-    "ruff>=0.4.0",
-    "mypy>=1.10",
-]
-
 [project.scripts]
 spine = "spine.cli:main"
 
@@ -44,6 +38,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["spine"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "black>=24.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10",
+]
 
 [tool.ruff]
 target-version = "py311"
