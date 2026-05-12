@@ -117,7 +117,9 @@ class DeepAgentsModelProvider(Provider):
         # Resolve api_key: explicit config > env var for provider > not set.
         # When api_key is not set at all, LangChain's own init_chat_model
         # will read the provider's default env var automatically.
-        api_key = config.get("api_key")
+        # Treat empty string the same as missing — both should fall back
+        # to the provider-specific env var.
+        api_key = config.get("api_key") or None
         if api_key is None:
             provider_prefix = model_str.split(":")[0] if ":" in model_str else ""
             env_var = self._PROVIDER_ENV_KEYS.get(provider_prefix)

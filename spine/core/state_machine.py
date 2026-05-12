@@ -149,14 +149,22 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
 
     state["phase"] = PhaseName.PLANNING
 
-    # Track planning retries to prevent infinite loops
-    retry_count = state.get("planning_retry_count", 0) + 1
+    # Track planning retries to prevent infinite loops.
+    # Only increment when re-entering from a CRITIC GATE rejection
+    # (NEEDS_REVISION), NOT from error recovery loops (ERROR→REWORK→PLANNING).
+    # The previous_phase tells us how we got here:
+    #   - PLANNING  → critic rejected and routed back (genuine retry)
+    #   - INIT      → first entry (not a retry)
+    #   - ERROR/REWORK → error recovery (not a planning retry)
+    previous = state.get("previous_phase")
+    is_critic_retry = previous == PhaseName.PLANNING
+    retry_count = state.get("planning_retry_count", 0) + (1 if is_critic_retry else 0)
     state["planning_retry_count"] = retry_count
     max_planning_retries = int(os.environ.get("SPINE_MAX_PLANNING_RETRIES", "3"))
 
     if retry_count > max_planning_retries:
         logger.error(
-            "PLANNING retry limit reached (%d/%d) — flagging for human review",
+            "PLANNING critic retry limit reached (%d/%d) — flagging for human review",
             retry_count, max_planning_retries,
         )
         # Write whatever plan exists as a draft, then route to human review.
@@ -180,7 +188,7 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
 
         state["critic_gate_result"] = "NEEDS_HUMAN_REVIEW"
         state["errors"].append(
-            f"Planning retry limit reached ({retry_count}/{max_planning_retries})"
+            f"Planning critic retry limit reached ({retry_count}/{max_planning_retries})"
         )
         state["previous_phase"] = PhaseName.PLANNING
         state["phase"] = PhaseName.HUMAN_REVIEW
@@ -188,6 +196,36 @@ def planning_phase(state: SpineState, config: Optional[RunnableConfig] = None) -
         state.setdefault("variables", {})["waiting_for_human"] = True
         state["variables"]["resume_phase"] = "planning"
         return state
+
+    # ── Guard: break error-recovery loops ─────────────────────────────
+    # If planning_phase keeps re-entering from ERROR/REWORK without the
+    # critic gate ever running, the underlying issue is persistent (e.g.
+    # misconfigured provider).  After 3 consecutive error-recovery re-entries
+    # with zero progress, escalate to FATAL so the graph routes to
+    # HUMAN_REVIEW instead of looping forever.
+    error_entry_count = state.get("variables", {}).get("_planning_error_entry_count", 0)
+    if previous in (PhaseName.ERROR, PhaseName.REWORK):
+        error_entry_count += 1
+        state.setdefault("variables", {})["_planning_error_entry_count"] = error_entry_count
+        if error_entry_count >= 3:
+            logger.error(
+                "PLANNING error-recovery loop detected (%d re-entries from ERROR/REWORK "
+                "with no progress) — escalating to FATAL",
+                error_entry_count,
+            )
+            state["error_state"] = ErrorState.FATAL.value
+            state["errors"].append(
+                f"Planning failed repeatedly ({error_entry_count}x) — "
+                f"likely a provider configuration issue. "
+                f"Last error: {state.get('errors', ['unknown'])[-1] if state.get('errors') else 'unknown'}"
+            )
+            state["previous_phase"] = PhaseName.PLANNING
+            state["phase"] = PhaseName.ERROR
+            return state
+    else:
+        # Reset on non-error re-entry (e.g. from INIT or from critic gate)
+        if error_entry_count > 0:
+            state.setdefault("variables", {})["_planning_error_entry_count"] = 0
     start_time = datetime.now(timezone.utc)
 
     # Log phase started event

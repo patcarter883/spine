@@ -301,13 +301,14 @@ class TestPlanningRetryLimit:
     """Tests for the planning_retry_count mechanism in planning_phase."""
 
     def test_retry_count_incremented(self):
-        """Each call to planning_phase increments planning_retry_count."""
+        """planning_retry_count only increments on critic gate re-entry (previous_phase=PLANNING)."""
         from spine.core.state_machine import planning_phase
         from spine.models.types import SpineState
 
+        # From INIT (first entry) — counter should NOT increment
         state = SpineState(
             phase="PLANNING",
-            previous_phase=None,
+            previous_phase="INIT",
             requirement="test",
             plan=None,
             tasks={},
@@ -328,17 +329,76 @@ class TestPlanningRetryLimit:
 
         with patch("spine.core.state_machine._get_providers", return_value={}):
             result = planning_phase(state)
-            assert result.get("planning_retry_count", 0) >= 1
+            # From INIT, retry_count stays at 0 (not a retry)
+            assert result.get("planning_retry_count", 0) == 0
+
+        # From PLANNING (critic rejected) — counter SHOULD increment
+        state2 = SpineState(
+            phase="PLANNING",
+            previous_phase="PLANNING",
+            requirement="test",
+            plan=None,
+            tasks={},
+            completed_tasks=[],
+            failed_tasks=[],
+            swarm_state={},
+            hive_cells={},
+            swarm_events=[],
+            variables={"debug_prompts": False},
+            errors=[],
+            providers={},
+            agent_provider=None,
+            critic_gate_result=None,
+            error_state=None,
+            error_history=[],
+            planning_retry_count=0,
+        )
+
+        with patch("spine.core.state_machine._get_providers", return_value={}):
+            result2 = planning_phase(state2)
+            assert result2.get("planning_retry_count", 0) >= 1
+
+    def test_error_recovery_does_not_increment_retry(self):
+        """Re-entry from ERROR/REWORK should NOT inflate planning_retry_count."""
+        from spine.core.state_machine import planning_phase
+        from spine.models.types import SpineState
+
+        state = SpineState(
+            phase="PLANNING",
+            previous_phase="ERROR",
+            requirement="test",
+            plan=None,
+            tasks={},
+            completed_tasks=[],
+            failed_tasks=[],
+            swarm_state={},
+            hive_cells={},
+            swarm_events=[],
+            variables={"debug_prompts": False},
+            errors=[],
+            providers={},
+            agent_provider=None,
+            critic_gate_result=None,
+            error_state=None,
+            error_history=[],
+            planning_retry_count=0,
+        )
+
+        with patch("spine.core.state_machine._get_providers", return_value={}):
+            result = planning_phase(state)
+            # From ERROR, retry_count stays at 0 (error recovery, not a critic retry)
+            assert result.get("planning_retry_count", 0) == 0
 
     def test_retry_limit_routes_to_human_review(self):
         """When retry_count exceeds max, route to HUMAN_REVIEW, not EXECUTION."""
         from spine.core.state_machine import planning_phase
         from spine.models.types import SpineState
 
-        # Set retry count above the default max (3)
+        # Set retry count above the default max (3) and previous_phase=PLANNING
+        # so the counter increments to 4 > 3
         state = SpineState(
             phase="PLANNING",
-            previous_phase=None,
+            previous_phase="PLANNING",  # Must be PLANNING so counter increments
             requirement="test requirement",
             plan=None,
             tasks={},
@@ -470,7 +530,7 @@ class TestPlanningPhaseCriticRouting:
 
         state = SpineState(
             phase="PLANNING",
-            previous_phase=None,
+            previous_phase="PLANNING",  # Must be PLANNING so counter increments
             requirement="test requirement",
             plan=None,
             tasks={},
