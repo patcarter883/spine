@@ -113,13 +113,13 @@ class TestSpineConfig:
         """Test that ensure_dirs creates necessary directories."""
         config = SpineConfig()
         config.checkpoint_path = str(temp_dir / "checkpoints" / "test.db")
-        config.artifact_path = str(temp_dir / "artifacts")
+        config.artifact_path = str(temp_dir / "artifacts" / "subdir")
         config.queue_path = str(temp_dir / "queue" / "queue.db")
         
         config.ensure_dirs()
         
         assert Path(config.checkpoint_path).parent.exists()
-        assert Path(config.artifact_path).exists()
+        assert Path(config.artifact_path).parent.exists()
         assert Path(config.queue_path).parent.exists()
 
     def test_config_nonexistent_file(self, temp_dir: Path) -> None:

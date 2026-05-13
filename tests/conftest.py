@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Generator
 
 import pytest
-from pytest_asyncio import asyncio_fixture
+from pytest_asyncio import fixture as asyncio_fixture
 
 from spine.config import SpineConfig
 from spine.models.types import Task, Artifact, ReviewFeedback, PromptRequest

@@ -38,8 +38,12 @@ class SpineConfig:
         """
         config = {}
         if os.path.exists(path):
-            with open(path) as f:
-                config = yaml.safe_load(f) or {}
+            try:
+                with open(path) as f:
+                    config = yaml.safe_load(f) or {}
+            except (yaml.parser.ParserError, yaml.scanner.ScannerError):
+                # If YAML is invalid, fall back to empty config (defaults will be used)
+                config = {}
 
         spine = config.get("spine", {})
 
