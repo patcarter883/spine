@@ -58,6 +58,8 @@ SPINE STATE MACHINE (LangGraph StateGraph)
 | `spine/models/types.py` | SpineState (TypedDict), Task, SubPhase, Phase, FeatureSlice |
 | `spine/models/enums.py` | PhaseName, StateStatus, SubPhaseStatus, ErrorState |
 | `spine/models/dag.py` | `synthesize_slices()` — heuristic and agent-based FeatureSlice decomposition |
+| `spine/agents/helpers.py` | `resolve_model()`, `debug_enabled()`, `extract_response()` — shared agent utilities |
+| `spine/agents/profile.py` | SPINE HarnessProfile — replaces DA base prompt with phase-executor framing |
 | `spine/adapters/da_phase_adapter.py` | Bridge: SPINE phases → `create_deep_agent()` instances |
 | `spine/middleware/` | CriticGateMiddleware, StepLimitMiddleware, MessageQueueMiddleware |
 | `spine/providers/base.py` | Provider ABC, ProviderRegistry, ProviderFallbackChain, PluginLoader |
@@ -169,6 +171,14 @@ The critic gate enforces that PLANNING cannot transition to EXECUTION without `A
 ### 6. Wave-Based DAG Execution
 
 FeatureSlices with no pending dependencies execute in parallel via Deep Agents' SubAgent `task` tool. The DA runtime handles dependency ordering and concurrent delegation.
+
+### 6. SPINE Base Prompt Replaces DA Default
+
+`spine/agents/profile.py` registers `HarnessProfile(base_system_prompt=SPINE_BASE_PROMPT)` for `openrouter`, `openai`, and `anthropic` providers. This replaces the DA `BASE_AGENT_PROMPT` (which frames the agent as a conversational assistant) with a phase-executor framing appropriate for SPINE's deterministic workflow model. The prompt assembly order is: `USER` (phase system_prompt) → `CUSTOM` (SPINE_BASE_PROMPT) → `SUFFIX` (none).
+
+### 7. OpenRouter Session Tracking
+
+`resolve_model(config, session_id=work_id)` in `spine/agents/helpers.py` returns a pre-built `ChatOpenRouter` instance with `session_id` set when the model is OpenRouter and a work_id is provided. This groups all LLM requests for a work item into a single session on the OpenRouter dashboard. For non-OpenRouter providers (or when no session_id is given), the model string is returned for DA's built-in resolution.
 
 ---
 
@@ -311,6 +321,7 @@ queue:
 - **TypedDict state keys** — `SpineState` is a TypedDict. New keys must be added to the type definition or LangGraph will silently drop them.
 - **Error threshold on sub-phases** — Default `max_errors=3`. A sub-phase is marked FATAL after exceeding this, not at the threshold. Off-by-one: `error_count > max_errors`.
 - **`from __future__ import annotations`** — Required in files using `str | None` or forward references, but can break Pydantic models at runtime. Use with care in model files.
+- **Pre-built ChatOpenRouter must apply ProviderProfile kwargs** — When `resolve_model` returns a `ChatOpenRouter` instance (OpenRouter + session_id), the DA `ProviderProfile` factory chain is skipped. `_build_openrouter_model()` calls `apply_provider_profile()` to preserve `app_url`/`app_title`/`openrouter_provider` defaults. If you add new kwargs to the OpenRouter ProviderProfile, verify they're also handled here.
 
 ---
 

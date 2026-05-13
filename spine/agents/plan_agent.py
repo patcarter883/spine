@@ -31,7 +31,7 @@ def build_plan_agent(
 
     from spine.agents.backend import build_backend
 
-    model = resolve_model(config)
+    model = resolve_model(config, session_id=state.get("work_id"))
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
 
