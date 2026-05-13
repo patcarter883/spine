@@ -31,9 +31,8 @@ if os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes"):
 PAGES = {
     "Dashboard": "spine.ui._pages.dashboard",
     "Submit Work": "spine.ui._pages.work_submit",
-    "Work Status": "spine.ui._pages.work_status",
+    "Work Details": "spine.ui._pages.work_detail",
     "Work History": "spine.ui._pages.work_history",
-    "Artifacts": "spine.ui._pages.artifacts",
     "Config": "spine.ui._pages.config_view",
     "Audit Log": "spine.ui._pages.audit_log",
     "Human Review": "spine.ui._pages.human_review",

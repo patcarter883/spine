@@ -1,13 +1,15 @@
 spine:
   checkpoint_path: .spine/spine.db
   workspace_root: /home/pat/Projects/spine
+  interpreter_enabled: true
+
 providers:
   llm:
-  - name: openrouter-da
-    type: deepagents-model
-    model: openrouter:z-ai/glm-4.5-air:free
-    priority: 1
-    enabled: true
+  # - name: openrouter-da
+  #   type: deepagents-model
+  #   model: openrouter:z-ai/glm-4.5-air:free
+  #   priority: 1
+  #   enabled: true
   - name: local-da
     type: deepagents-model
     model: model

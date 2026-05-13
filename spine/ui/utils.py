@@ -47,3 +47,46 @@ def truncate(text: str, max_len: int = 100) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+# ── Navigation helpers ──
+
+def create_work_link(work_id: str, text: str | None = None) -> str:
+    """Create a clickable link to the work detail page for a specific work ID.
+    
+    Args:
+        work_id: The work item ID.
+        text: Optional display text. If None, uses the work_id.
+        
+    Returns:
+        Markdown formatted link string.
+    """
+    display_text = text or work_id
+    return f"[{display_text}](?work_id={work_id})"
+
+
+def get_work_id_from_params() -> str | None:
+    """Extract work ID from URL query parameters.
+    
+    Returns:
+        Work ID if found in query params, otherwise None.
+    """
+    import streamlit as st
+    return st.query_params.get("work_id")
+
+
+def set_work_id_param(work_id: str) -> None:
+    """Set work ID in URL query parameters.
+    
+    Args:
+        work_id: The work item ID to set.
+    """
+    import streamlit as st
+    st.query_params["work_id"] = work_id
+
+
+def clear_work_id_param() -> None:
+    """Clear work ID from URL query parameters."""
+    import streamlit as st
+    if "work_id" in st.query_params:
+        del st.query_params["work_id"]

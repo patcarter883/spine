@@ -5,7 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from spine.ui_api import UIApi
-from spine.ui.utils import format_timestamp, status_icon, truncate
+from spine.ui.utils import format_timestamp, status_icon, truncate, create_work_link
 
 
 def render(api: UIApi) -> None:
@@ -32,11 +32,12 @@ def render(api: UIApi) -> None:
     st.subheader(f"{len(items)} Work Items")
 
     for item in items:
+        work_id = item.get("id", "N/A")
         status = item.get("status", "unknown")
         icon = status_icon(status)
 
         with st.expander(
-            f"{icon} {item.get('id', 'N/A')} — {truncate(item.get('description', ''), 60)}"
+            f"{icon} {create_work_link(work_id, work_id)} — {truncate(item.get('description', ''), 60)}"
         ):
             col1, col2 = st.columns(2)
             col1.write(f"**Status:** {status}")

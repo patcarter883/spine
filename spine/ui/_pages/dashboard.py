@@ -5,7 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from spine.ui_api import UIApi
-from spine.ui.utils import status_icon, truncate
+from spine.ui.utils import status_icon, truncate, create_work_link
 
 
 def render(api: UIApi) -> None:
@@ -43,6 +43,7 @@ def render(api: UIApi) -> None:
         return
 
     for item in all_work:
+        work_id = item.get("id", "")
         status = item.get("status", "unknown")
         icon = status_icon(status)
         phase = item.get("current_phase", "")
@@ -51,7 +52,12 @@ def render(api: UIApi) -> None:
         with st.container():
             col1, col2, col3 = st.columns([1, 4, 2])
             col1.write(f"{icon}")
-            col2.write(f"**{item.get('id', '')}** — {desc}")
+            
+            # Make work ID clickable
+            col2.markdown(
+                f"**{create_work_link(work_id, work_id)}** — {desc}",
+                help=f"Click to view details for {work_id}"
+            )
             col3.write(f"{phase or status}")
 
     # ── Worker status ──
