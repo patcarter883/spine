@@ -20,9 +20,9 @@ Prompt assembly order (per DA docs)::
 
     USER (phase system_prompt) → CUSTOM (SPINE_BASE_PROMPT) → SUFFIX (none)
 
-With the profile in place, every ``create_deep_agent()`` call from a SPINE
-agent builder will compose the phase-specific prompt + SPINE base prompt
-instead of the DA conversational default.
+RLM/interpreter guidance has been moved to the ``rlm-pattern`` skill for
+progressive disclosure — it's loaded only when the interpreter is available,
+saving ~500 tokens per agent on phases that don't need it.
 
 Call :func:`ensure_spine_profiles` once at startup (from
 ``spine.agents.__init__`` or the CLI entry point) to activate.
@@ -62,29 +62,22 @@ these to inspect and modify the workspace.
 - **Task**: delegate to subagents for parallel work on independent slices.
 - **Eval** *(when enabled)*: a QuickJS interpreter for code-first orchestration \
 — composing tool calls, transforming structured data, and managing intermediate \
-state outside the model context.
+state outside the model context. See the RLM pattern skill for details.
 
 Use them. Do not speculate about file contents — read the files. Do not \
 guess test outcomes — run the tests.
 
-## Interpreter Workspace (RLM Pattern)
+## Cross-Work Memory
 
-When the `eval` tool is available, you have a programmable workspace for the \
-Recursive Language Model (RLM) pattern. The interpreter runs JavaScript \
-(QuickJS) and can:
+When the ``/memories/`` directory is available in your filesystem, you can \
+persist project knowledge there that will survive across work items. Use it for:
 
-- **Inspect large inputs** — store codebase content in variables, search and \
-  filter without loading everything into the model context.
-- **Orchestrate subagents** — call `tools.task(...)` from code via \
-  programmatic tool calling (PTC) for loops, parallel batches, and \
-  conditional logic.
-- **Transform structured data** — sort, group, validate, score, or aggregate \
-  results deterministically before returning a compact synthesis.
+- Project-specific conventions discovered during execution
+- Frequently referenced file paths and module locations
+- Patterns and gotchas worth remembering
 
-The interpreter is the **orchestration brain**. Filesystem writes, shell \
-commands, and test runs still go through the backend tools — those are \
-language-agnostic regardless of the target project being TypeScript, PHP, \
-Python, or anything else.
+Write to ``/memories/`` using filesystem tools. Read from it when starting \
+a new task to leverage prior discoveries.
 
 ## Workflow Context
 

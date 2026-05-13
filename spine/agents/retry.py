@@ -8,6 +8,9 @@ failing the entire workflow immediately.
 This module provides ``invoke_with_retry()`` which wraps
 ``agent.invoke()`` with configurable retry logic. It classifies errors
 as transient (retryable) or permanent (raise immediately).
+
+Updated to support DA's ``context=`` kwarg for passing SpineContext
+at invoke time.
 """
 
 from __future__ import annotations
@@ -111,12 +114,14 @@ def invoke_with_retry(
     max_delay: float = DEFAULT_MAX_DELAY,
     phase_name: str = "",
     work_id: str = "",
+    context: Any = None,
 ) -> dict[str, Any]:
     """Invoke a Deep Agent with exponential backoff retry for transient errors.
 
-    Calls ``agent.invoke(input_)`` and retries on transient API errors
-    (5xx, 429, OpenRouter validation errors) with exponential backoff
-    and jitter. Permanent errors (4xx, auth, logic bugs) raise immediately.
+    Calls ``agent.invoke(input_, context=context)`` and retries on transient
+    API errors (5xx, 429, OpenRouter validation errors) with exponential
+    backoff and jitter. Permanent errors (4xx, auth, logic bugs) raise
+    immediately.
 
     Args:
         agent: A compiled Deep Agent (result of ``create_deep_agent()``).
@@ -126,6 +131,8 @@ def invoke_with_retry(
         max_delay: Maximum delay cap in seconds (default 60).
         phase_name: Phase name for logging context.
         work_id: Work ID for logging context.
+        context: Optional SpineContext to pass via DA's context= kwarg.
+            Propagates to subagents automatically.
 
     Returns:
         The agent's result dict.
@@ -137,10 +144,15 @@ def invoke_with_retry(
     prefix = f"[{work_id}]" if work_id else ""
     phase_label = f" {phase_name}" if phase_name else ""
 
+    # Build invoke kwargs — only add context if provided
+    invoke_kwargs: dict[str, Any] = {}
+    if context is not None:
+        invoke_kwargs["context"] = context
+
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return agent.invoke(input_)
+            return agent.invoke(input_, **invoke_kwargs)
         except Exception as exc:
             last_exc = exc
 

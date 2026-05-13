@@ -5,15 +5,16 @@ spine:
 
 providers:
   llm:
-  # - name: openrouter-da
-  #   type: deepagents-model
-  #   model: openrouter:z-ai/glm-4.5-air:free
-  #   priority: 1
-  #   enabled: true
-  - name: local-da
+  - name: openrouter-da
     type: deepagents-model
-    model: model
-    base_url: 'http://localhost:8000/v1'
-    priority: 0
+    model: openrouter:poolside/laguna-m.1:free
+    priority: 1
     enabled: true
+  # - name: local-da
+  #   type: deepagents-model
+  #   model: openai:model
+  #   base_url: 'http://localhost:8000/v1'
+  #   api_key: 'vllm'
+  #   priority: 0
+  #   enabled: true
   

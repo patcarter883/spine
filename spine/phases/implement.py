@@ -1,12 +1,11 @@
 """SPINE IMPLEMENT phase — generate code to implement feature slices.
 
-The implement Deep Agent reads the tasks/feature slices and generates
-code to implement each one. It uses subagents for parallel implementation
-of independent slices.
+The implement Deep Agent reads the tasks/feature slices (on disk) and
+generates code to implement each one. Prior artifacts are NOT inlined —
+the agent reads them on demand from the filesystem.
 
-Outputs:
-    - Artifacts: implemented code files
-    - Prompt Request: if human input is needed during implementation
+Context engineering: summarization middleware enabled for long-running
+multi-slice implementation.
 """
 
 from __future__ import annotations
@@ -23,6 +22,8 @@ from spine.models.state import WorkflowState
 from spine.agents.implement_agent import build_implement_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
+from spine.agents.context import build_context
+from spine.agents.artifacts import materialize_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -45,27 +46,28 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
     work_id = state.get("work_id", "unknown")
     retry_count = state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0)
     feedback = state.get("feedback", [])
-    artifacts = state.get("artifacts", {})
-    tasks_doc = artifacts.get(PhaseName.TASKS.value, {}).get("tasks.md", "")
-    plan = artifacts.get(PhaseName.PLAN.value, {}).get("plan.md", "")
-    spec = artifacts.get(PhaseName.SPECIFY.value, {}).get("specification.md", "")
+    workspace_root = state.get("workspace_root", ".")
 
     logger.info(f"[{work_id}] IMPLEMENT phase starting (retry={retry_count})")
 
     try:
         agent = build_implement_agent(state, config)
 
+        # Materialize prior artifacts to disk
+        materialize_artifacts(state, workspace_root)
+
+        # Build prompt — all prior artifacts are on disk, NOT inlined
         prompt = (
             f"Implement the feature slices described below. Write clean, "
             f"production-quality code for each slice.\n\n"
             f"## Work Description\n{description}\n\n"
+            "Prior artifacts are available on disk — read them as needed:\n"
+            "- Specification: `.spine/artifacts/specify/specification.md`\n"
+            "- Plan: `.spine/artifacts/plan/plan.md`\n"
+            "- Feature Slices: `.spine/artifacts/tasks/tasks.md`\n\n"
+            "Use `read_file` and `grep` to inspect them. Do NOT load "
+            "everything into context at once.\n\n"
         )
-        if spec:
-            prompt += f"## Specification\n{spec}\n\n"
-        if plan:
-            prompt += f"## Plan\n{plan}\n\n"
-        if tasks_doc:
-            prompt += f"## Feature Slices\n{tasks_doc}\n\n"
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
@@ -74,11 +76,14 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
             )
             prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
+        ctx = build_context(state, PhaseName.IMPLEMENT)
+
         result = invoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.IMPLEMENT.value,
             work_id=work_id,
+            context=ctx,
         )
 
         impl_content = extract_response(result)

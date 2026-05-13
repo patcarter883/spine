@@ -1,4 +1,13 @@
-"""SPINE agents package — one agent builder per file."""
+"""SPINE agents package — one agent builder per file.
+
+Context engineering modules:
+- ``context`` — SpineContext dataclass for per-run runtime context
+- ``artifacts`` — Materialize artifacts to disk, reference by path
+- ``factory`` — Shared build_phase_agent() with memory, skills, context
+- ``skills_resolver`` — Locate skill directories for progressive disclosure
+- ``backend_memory`` — CompositeBackend with StoreBackend for cross-work memory
+- ``profile`` — SPINE HarnessProfile (replaces DA BASE_AGENT_PROMPT)
+"""
 
 from __future__ import annotations
 

@@ -1,12 +1,8 @@
 """SPINE PLAN phase — define the technical architecture.
 
 This phase takes a specification and produces a technical plan document.
-It delegates to the plan Deep Agent which designs the architecture,
-identifies components, and defines interfaces.
-
-Outputs:
-    - Artifacts: technical plan document
-    - Prompt Request: if human input is needed during planning
+Context engineering: specification is on disk (not inlined). SpineContext
+passed at invoke time.
 """
 
 from __future__ import annotations
@@ -23,6 +19,8 @@ from spine.models.state import WorkflowState
 from spine.agents.plan_agent import build_plan_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
+from spine.agents.context import build_context
+from spine.agents.artifacts import materialize_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -45,20 +43,24 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
     work_id = state.get("work_id", "unknown")
     retry_count = state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
     feedback = state.get("feedback", [])
-    artifacts = state.get("artifacts", {})
-    spec = artifacts.get(PhaseName.SPECIFY.value, {}).get("specification.md", "")
+    workspace_root = state.get("workspace_root", ".")
 
     logger.info(f"[{work_id}] PLAN phase starting (retry={retry_count})")
 
     try:
         agent = build_plan_agent(state, config)
 
+        # Materialize prior artifacts to disk
+        materialize_artifacts(state, workspace_root)
+
+        # Build prompt — specification is on disk at .spine/artifacts/specify/
         prompt = (
-            f"Create a detailed technical plan based on the following specification.\n\n"
+            f"Create a detailed technical plan based on the specification.\n\n"
             f"## Work Description\n{description}\n\n"
+            "The full specification is available on disk at "
+            "`.spine/artifacts/specify/specification.md` — read it with "
+            "`read_file` before planning.\n\n"
         )
-        if spec:
-            prompt += f"## Specification\n{spec}\n\n"
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
@@ -67,11 +69,14 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
             )
             prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
+        ctx = build_context(state, PhaseName.PLAN)
+
         result = invoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.PLAN.value,
             work_id=work_id,
+            context=ctx,
         )
 
         plan_content = extract_response(result)

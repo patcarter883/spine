@@ -7,6 +7,10 @@ The critic has two tiers:
    Agent exceptions → rework, not crash.
 
 Feedback is tagged by tier so the reworking phase knows what to address.
+
+Context engineering: artifact content is on disk. The critic gets a short
+preview inline with paths to full files, rather than inlining everything.
+SpineContext is passed at invoke time.
 """
 
 from __future__ import annotations
@@ -102,6 +106,10 @@ def agent_critic_check(
     Delegates to the critic Deep Agent for a thorough review.
     If the agent raises an exception, returns NEEDS_REVISION rather than crashing.
 
+    Context engineering: artifacts are materialized to disk and referenced
+    by path. The critic gets a short preview inline (first 2000 chars) with
+    the path to the full file, so it can read details on demand.
+
     Args:
         state: The current workflow state.
         reviewed_phase: The phase being reviewed.
@@ -126,34 +134,38 @@ def agent_critic_check(
 
         # Build the critic agent and invoke it with retry
         from spine.agents.retry import invoke_with_retry
+        from spine.agents.context import build_context
+        from spine.agents.artifacts import materialize_artifacts, build_inline_artifact_prompt
 
         critic_agent = critic_def.build_agent_fn(state, config)
-        artifacts = state.get("artifacts", {})
-        phase_artifacts = artifacts.get(reviewed_phase, {})
+
+        # Materialize artifacts to disk so the critic can read them
+        workspace_root = state.get("workspace_root", ".")
+        materialize_artifacts(state, workspace_root)
+
+        # Build a compact preview with paths to full files
+        artifact_preview = build_inline_artifact_prompt(state, reviewed_phase)
 
         # Format the review request
-        artifact_summary = "\n".join(
-            f"--- {name} ---\n{content[:2000]}" for name, content in phase_artifacts.items()
+        prompt = (
+            f"Review the output of the {reviewed_phase} phase.\n\n"
+            f"Work description: {state.get('description', '')}\n\n"
+            f"{artifact_preview}"
+            f"Full artifact content is available on disk at "
+            f"`.spine/artifacts/{reviewed_phase}/` — use `read_file` to "
+            f"inspect details.\n\n"
+            f"Provide a review: PASSED, NEEDS_REVISION, or NEEDS_REVIEW.\n"
+            f"Include specific reasons and suggestions for improvement."
         )
+
+        ctx = build_context(state, PhaseName.CRITIC)
 
         result = invoke_with_retry(
             critic_agent,
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Review the output of the {reviewed_phase} phase.\n\n"
-                            f"Work description: {state.get('description', '')}\n\n"
-                            f"Artifacts:\n{artifact_summary}\n\n"
-                            f"Provide a review: PASSED, NEEDS_REVISION, or NEEDS_REVIEW.\n"
-                            f"Include specific reasons and suggestions for improvement."
-                        ),
-                    }
-                ]
-            },
+            {"messages": [{"role": "user", "content": prompt}]},
             phase_name=f"critic/{reviewed_phase}",
             work_id=state.get("work_id", "unknown"),
+            context=ctx,
         )
 
         # Parse the agent's response for the review status

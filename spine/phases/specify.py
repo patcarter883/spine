@@ -4,9 +4,8 @@ This phase takes a work description and produces a specification document.
 It delegates to the specify Deep Agent which uses subagents for research
 and documentation.
 
-Outputs:
-    - Artifacts: specification document
-    - Prompt Request: if human input is needed during specification
+Context engineering: prior artifacts are on disk (not inlined). SpineContext
+is passed at invoke time for typed per-run context.
 """
 
 from __future__ import annotations
@@ -23,6 +22,8 @@ from spine.models.state import WorkflowState
 from spine.agents.specify_agent import build_specify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
+from spine.agents.context import build_context
+from spine.agents.artifacts import materialize_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -46,13 +47,17 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
     work_id = state.get("work_id", "unknown")
     retry_count = state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0)
     feedback = state.get("feedback", [])
+    workspace_root = state.get("workspace_root", ".")
 
     logger.info(f"[{work_id}] SPECIFY phase starting (retry={retry_count})")
 
     try:
         agent = build_specify_agent(state, config)
 
-        # Build the prompt, including feedback if reworking
+        # Materialize prior artifacts to disk so the agent can read them
+        materialize_artifacts(state, workspace_root)
+
+        # Build the prompt — prior artifacts are on disk, not inlined
         prompt = f"Create a detailed specification for the following work:\n\n{description}"
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
@@ -62,11 +67,15 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
             )
             prompt += f"\n\nPrevious review feedback (please address):\n{feedback_text}"
 
+        # Build runtime context for the agent
+        ctx = build_context(state, PhaseName.SPECIFY)
+
         result = invoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.SPECIFY.value,
             work_id=work_id,
+            context=ctx,
         )
 
         # Extract the specification from the agent's response

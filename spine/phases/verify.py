@@ -1,13 +1,11 @@
 """SPINE VERIFY phase — confirm implementation meets requirements.
 
 The verify Deep Agent reviews the implementation against the specification,
-plan, and tasks. It confirms that feature slices have been correctly
-implemented and the original requirements are satisfied.
+plan, and tasks. All prior artifacts are on disk (not inlined) — the agent
+reads them on demand with filesystem tools.
 
-Outputs:
-    - Artifacts: verification report
-    - Workflow Feedback: PASSED / NOT VERIFIED
-    - Prompt Request: if human input is needed during verification
+Context engineering: summarization middleware enabled for long-running
+multi-slice verification.
 """
 
 from __future__ import annotations
@@ -24,6 +22,8 @@ from spine.models.state import WorkflowState
 from spine.agents.verify_agent import build_verify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
+from spine.agents.context import build_context
+from spine.agents.artifacts import materialize_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -44,37 +44,42 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
     """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
-    artifacts = state.get("artifacts", {})
-    spec = artifacts.get(PhaseName.SPECIFY.value, {}).get("specification.md", "")
-    plan = artifacts.get(PhaseName.PLAN.value, {}).get("plan.md", "")
-    tasks_doc = artifacts.get(PhaseName.TASKS.value, {}).get("tasks.md", "")
-    impl = artifacts.get(PhaseName.IMPLEMENT.value, {}).get("implementation.md", "")
+    workspace_root = state.get("workspace_root", ".")
 
     logger.info(f"[{work_id}] VERIFY phase starting")
 
     try:
         agent = build_verify_agent(state, config)
 
+        # Materialize prior artifacts to disk
+        materialize_artifacts(state, workspace_root)
+
+        # Build prompt — all prior artifacts are on disk, NOT inlined
         prompt = (
             f"Verify that the implementation meets the requirements. "
             f"Check that all feature slices are implemented correctly, "
             f"the plan was followed, and the original task is complete.\n\n"
             f"## Original Requirements\n{description}\n\n"
+            "Prior artifacts are available on disk — read them as needed:\n"
+            "- Specification: `.spine/artifacts/specify/specification.md`\n"
+            "- Plan: `.spine/artifacts/plan/plan.md`\n"
+            "- Feature Slices: `.spine/artifacts/tasks/tasks.md`\n"
+            "- Implementation: `.spine/artifacts/implement/implementation.md`\n\n"
+            "Use `read_file` and `grep` to inspect them. Do NOT load "
+            "everything into context at once.\n\n"
+            "Also inspect the actual code files on disk using `ls` and "
+            "`read_file` — the implementation summary may not reflect "
+            "the actual state of the code."
         )
-        if spec:
-            prompt += f"## Specification\n{spec}\n\n"
-        if plan:
-            prompt += f"## Plan\n{plan}\n\n"
-        if tasks_doc:
-            prompt += f"## Feature Slices\n{tasks_doc}\n\n"
-        if impl:
-            prompt += f"## Implementation\n{impl}\n\n"
+
+        ctx = build_context(state, PhaseName.VERIFY)
 
         result = invoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.VERIFY.value,
             work_id=work_id,
+            context=ctx,
         )
 
         verify_content = extract_response(result)
