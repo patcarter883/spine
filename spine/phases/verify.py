@@ -22,6 +22,8 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.verify_agent import build_verify_agent
+from spine.agents.helpers import extract_response
+from spine.agents.retry import invoke_with_retry
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -68,9 +70,14 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         if impl:
             prompt += f"## Implementation\n{impl}\n\n"
 
-        result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        result = invoke_with_retry(
+            agent,
+            {"messages": [{"role": "user", "content": prompt}]},
+            phase_name=PhaseName.VERIFY.value,
+            work_id=work_id,
+        )
 
-        verify_content = _extract_response(result)
+        verify_content = extract_response(result)
 
         # Provide a fallback if the agent returned nothing useful
         if not verify_content or len(verify_content.strip()) < 20:
@@ -109,15 +116,6 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
                 "phase": PhaseName.VERIFY.value,
             },
         }
-
-
-def _extract_response(result: Any) -> str:
-    """Extract the text content from the agent's last message."""
-    messages = result.get("messages", [])
-    if messages:
-        last = messages[-1]
-        return getattr(last, "content", str(last))
-    return ""
 
 
 # ── Self-register on import ──

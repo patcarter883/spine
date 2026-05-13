@@ -34,3 +34,16 @@ class AgentUnavailableError(SpineError):
 
 class ConfigurationError(SpineError):
     """Invalid or missing configuration."""
+
+
+class TransientAPIError(SpineError):
+    """A transient (retryable) LLM API error — 5xx, 429, or provider error.
+
+    Used internally by ``invoke_with_retry()`` to signal that an error
+    was classified as transient. Not raised to callers by default
+    (retries exhaust first), but useful for logging and testing.
+    """
+
+    def __init__(self, original: Exception) -> None:
+        self.original = original
+        super().__init__(f"Transient API error: {type(original).__name__}: {original}")

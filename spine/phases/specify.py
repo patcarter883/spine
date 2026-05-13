@@ -21,6 +21,8 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.specify_agent import build_specify_agent
+from spine.agents.helpers import extract_response
+from spine.agents.retry import invoke_with_retry
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -60,10 +62,15 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
             )
             prompt += f"\n\nPrevious review feedback (please address):\n{feedback_text}"
 
-        result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        result = invoke_with_retry(
+            agent,
+            {"messages": [{"role": "user", "content": prompt}]},
+            phase_name=PhaseName.SPECIFY.value,
+            work_id=work_id,
+        )
 
         # Extract the specification from the agent's response
-        spec_content = _extract_response(result)
+        spec_content = extract_response(result)
 
         return {
             "artifacts": {PhaseName.SPECIFY.value: {"specification.md": spec_content}},
@@ -82,15 +89,6 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
                 "phase": PhaseName.SPECIFY.value,
             },
         }
-
-
-def _extract_response(result: Any) -> str:
-    """Extract the text content from the agent's last message."""
-    messages = result.get("messages", [])
-    if messages:
-        last = messages[-1]
-        return getattr(last, "content", str(last))
-    return ""
 
 
 # ── Self-register on import ──

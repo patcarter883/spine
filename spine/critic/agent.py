@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
+
 from spine.models.state import WorkflowState
+from spine.agents.helpers import resolve_model, debug_enabled
 
 
-def build_critic_agent(state: WorkflowState) -> Any:
+def build_critic_agent(
+    state: WorkflowState,
+    config: RunnableConfig | None = None,
+) -> Any:
     """Build the Deep Agent for the CRITIC phase.
 
     Creates a deep agent configured for quality review of phase outputs.
@@ -18,6 +24,7 @@ def build_critic_agent(state: WorkflowState) -> Any:
 
     Args:
         state: The current workflow state.
+        config: LangGraph runtime config (may contain provider settings).
 
     Returns:
         A compiled Deep Agent ready for invocation.
@@ -25,9 +32,8 @@ def build_critic_agent(state: WorkflowState) -> Any:
     from deepagents import create_deep_agent
 
     from spine.agents.backend import build_backend
-    from spine.config import SpineConfig
 
-    model = SpineConfig.load().resolve_model()
+    model = resolve_model(config)
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
 
@@ -35,6 +41,7 @@ def build_critic_agent(state: WorkflowState) -> Any:
         name="spine-critic",
         model=model,
         backend=backend,
+        debug=debug_enabled(),
         system_prompt=(
             "You are a quality reviewer. Review the output of a workflow "
             "phase and determine if it meets quality standards.\n\n"

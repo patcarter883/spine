@@ -1,0 +1,176 @@
+"""SPINE agent retry — exponential backoff for transient LLM API errors.
+
+When an LLM provider returns a transient error (HTTP 5xx, rate limit 429,
+or an OpenRouter ``ResponseValidationError`` from an error body), the
+agent invocation should be retried with exponential backoff rather than
+failing the entire workflow immediately.
+
+This module provides ``invoke_with_retry()`` which wraps
+``agent.invoke()`` with configurable retry logic. It classifies errors
+as transient (retryable) or permanent (raise immediately).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ── Default retry configuration ──
+
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BASE_DELAY = 2.0  # seconds
+DEFAULT_MAX_DELAY = 60.0  # seconds
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Classify an exception as transient (retryable) or permanent.
+
+    Transient errors include:
+    - OpenRouter ``ResponseValidationError`` (error body instead of response)
+    - HTTP 5xx server errors
+    - Rate limit 429
+    - Connection errors (transient network issues)
+    - Timeouts
+
+    Permanent errors include:
+    - Authentication errors (401/403)
+    - Invalid request errors (400)
+    - Model not found (404)
+    - Any non-API Python exception (logic bugs, etc.)
+
+    Args:
+        exc: The exception to classify.
+
+    Returns:
+        True if the error is transient and should be retried.
+    """
+    exc_type_name = type(exc).__name__
+    exc_module = type(exc).__module__
+
+    # ── OpenRouter ResponseValidationError ──
+    # The openrouter SDK raises this when the response body is an error
+    # object (e.g. {'error': {'message': '...', 'code': 520}}) instead
+    # of a valid ChatCompletion. This is always transient — it means the
+    # upstream provider returned an error.
+    if "ResponseValidationError" in exc_type_name:
+        return True
+
+    # ── LangChain / OpenAI error classes ──
+    # Check for error type names from langchain, openai, and httpx
+    transient_names = {
+        "RateLimitError",
+        "APIConnectionError",
+        "APITimeoutError",
+        "InternalServerError",
+        "ServiceUnavailableError",
+        "BadGatewayError",
+        "GatewayTimeoutError",
+        "TimeoutError",
+        "ConnectionError",
+    }
+    if exc_type_name in transient_names:
+        return True
+
+    # ── Check HTTP status codes on exception attributes ──
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        # Some exceptions use .http_status or .code
+        status_code = getattr(exc, "http_status", None) or getattr(exc, "code", None)
+
+    if isinstance(status_code, int):
+        # 5xx = server errors, 429 = rate limit → retryable
+        if 500 <= status_code < 600 or status_code == 429:
+            return True
+        # 4xx (except 429) = client errors → permanent
+        if 400 <= status_code < 500:
+            return False
+
+    # ── Check the error message for HTTP status codes ──
+    exc_str = str(exc).lower()
+    for code in (520, 502, 503, 504, 500, 429):
+        if str(code) in exc_str:
+            return True
+
+    # ── httpx transport errors ──
+    if "httpx" in exc_module and "transport" in exc_type_name.lower():
+        return True
+
+    # Default: not transient — don't retry logic bugs or auth errors
+    return False
+
+
+def invoke_with_retry(
+    agent: Any,
+    input_: dict[str, Any],
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    max_delay: float = DEFAULT_MAX_DELAY,
+    phase_name: str = "",
+    work_id: str = "",
+) -> dict[str, Any]:
+    """Invoke a Deep Agent with exponential backoff retry for transient errors.
+
+    Calls ``agent.invoke(input_)`` and retries on transient API errors
+    (5xx, 429, OpenRouter validation errors) with exponential backoff
+    and jitter. Permanent errors (4xx, auth, logic bugs) raise immediately.
+
+    Args:
+        agent: A compiled Deep Agent (result of ``create_deep_agent()``).
+        input_: The input dict (typically ``{"messages": [...]}``).
+        max_retries: Maximum number of retry attempts (default 3).
+        base_delay: Initial delay between retries in seconds (default 2).
+        max_delay: Maximum delay cap in seconds (default 60).
+        phase_name: Phase name for logging context.
+        work_id: Work ID for logging context.
+
+    Returns:
+        The agent's result dict.
+
+    Raises:
+        Exception: The last exception if all retries are exhausted, or
+            immediately if the error is permanent (non-transient).
+    """
+    prefix = f"[{work_id}]" if work_id else ""
+    phase_label = f" {phase_name}" if phase_name else ""
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return agent.invoke(input_)
+        except Exception as exc:
+            last_exc = exc
+
+            if not _is_transient_error(exc):
+                logger.error(
+                    f"{prefix}{phase_label} permanent error (attempt {attempt + 1}): {exc}"
+                )
+                raise
+
+            if attempt >= max_retries:
+                logger.error(
+                    f"{prefix}{phase_label} exhausted {max_retries} retries for transient error: {exc}"
+                )
+                raise
+
+            # Exponential backoff with jitter
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            jitter = delay * 0.1  # ±10% jitter
+            import random
+
+            sleep_time = delay + random.uniform(-jitter, jitter)
+            sleep_time = max(sleep_time, 0.5)  # floor at 0.5s
+
+            logger.warning(
+                f"{prefix}{phase_label} transient error (attempt {attempt + 1}/{max_retries + 1}), "
+                f"retrying in {sleep_time:.1f}s: {type(exc).__name__}: {exc}"
+            )
+            time.sleep(sleep_time)
+
+    # Should never reach here, but satisfy the type checker
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("invoke_with_retry: unexpected state")

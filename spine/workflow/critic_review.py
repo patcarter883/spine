@@ -92,7 +92,11 @@ def structural_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[s
     }
 
 
-def agent_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[str, Any]:
+def agent_critic_check(
+    state: WorkflowState,
+    reviewed_phase: str,
+    config: Any | None = None,
+) -> dict[str, Any]:
     """Deep, LLM-based quality review by the critic agent.
 
     Delegates to the critic Deep Agent for a thorough review.
@@ -101,6 +105,7 @@ def agent_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[str, A
     Args:
         state: The current workflow state.
         reviewed_phase: The phase being reviewed.
+        config: LangGraph runtime config (passed to the agent builder).
 
     Returns:
         A dict with keys: ``status``, ``tier``, ``reason``, ``suggestions``.
@@ -119,8 +124,10 @@ def agent_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[str, A
                 "suggestions": [],
             }
 
-        # Build the critic agent and invoke it
-        critic_agent = critic_def.build_agent_fn(state)
+        # Build the critic agent and invoke it with retry
+        from spine.agents.retry import invoke_with_retry
+
+        critic_agent = critic_def.build_agent_fn(state, config)
         artifacts = state.get("artifacts", {})
         phase_artifacts = artifacts.get(reviewed_phase, {})
 
@@ -129,7 +136,8 @@ def agent_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[str, A
             f"--- {name} ---\n{content[:2000]}" for name, content in phase_artifacts.items()
         )
 
-        result = critic_agent.invoke(
+        result = invoke_with_retry(
+            critic_agent,
             {
                 "messages": [
                     {
@@ -143,7 +151,9 @@ def agent_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[str, A
                         ),
                     }
                 ]
-            }
+            },
+            phase_name=f"critic/{reviewed_phase}",
+            work_id=state.get("work_id", "unknown"),
         )
 
         # Parse the agent's response for the review status
@@ -186,7 +196,7 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
     return {
         "status": status,
         "tier": "agent",
-        "reason": f"Agent review of {reviewed_phase}: {content[:500]}",
+        "reason": f"Agent review of {reviewed_phase}: {content}",
         "suggestions": [],
     }
 
@@ -194,29 +204,40 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
 def critic_router(state: WorkflowState) -> str:
     """Conditional edge function for critic nodes.
 
-    Runs two-tier review (structural then agent) and returns the routing key:
+    Reads the feedback that ``call_critic`` already wrote into state and
+    returns the routing key.  Does NOT re-run the review — that would
+    duplicate every LLM call.
+
+    Routing:
     - ``"passed"`` → proceed to next phase
     - ``"needs_revision"`` → rework the previous phase (if retries remain)
     - ``"needs_review"`` → flag for human review (stop workflow)
 
-    Also manages retry counting: increments per phase, caps at max_retries.
-
     Args:
-        state: The current workflow state.
+        state: The current workflow state (already updated by call_critic).
 
     Returns:
         A routing key string for the conditional edge.
     """
     reviewed_phase = _get_reviewed_phase(state)
 
-    # ── Tier 1: Structural check ──
-    structural_result = structural_critic_check(state, reviewed_phase)
-    if structural_result["status"] != ReviewStatus.PASSED.value:
-        return _handle_review_outcome(state, reviewed_phase, structural_result)
+    # The last feedback entry was written by call_critic — use it directly.
+    feedback = state.get("feedback", [])
+    if not feedback:
+        # No feedback at all is unexpected — treat as needs_revision.
+        logger.warning("critic_router: no feedback in state, routing needs_revision")
+        return "needs_revision"
 
-    # ── Tier 2: Agent check ──
-    agent_result = agent_critic_check(state, reviewed_phase)
-    return _handle_review_outcome(state, reviewed_phase, agent_result)
+    last_review = feedback[-1] if isinstance(feedback[-1], dict) else {}
+    review_status = last_review.get("status", ReviewStatus.NEEDS_REVISION.value)
+
+    review = {
+        "status": review_status,
+        "tier": last_review.get("tier", "unknown"),
+        "reason": last_review.get("reason", ""),
+        "suggestions": last_review.get("suggestions", []),
+    }
+    return _handle_review_outcome(state, reviewed_phase, review)
 
 
 def _handle_review_outcome(

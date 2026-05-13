@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.models.state import WorkflowState
+from spine.agents.helpers import resolve_model, debug_enabled
 
 
 def build_implement_agent(
@@ -33,7 +34,7 @@ def build_implement_agent(
 
     from spine.agents.backend import build_backend
 
-    model = _resolve_model(config)
+    model = resolve_model(config)
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
 
@@ -41,6 +42,7 @@ def build_implement_agent(
         name="spine-implement",
         model=model,
         backend=backend,
+        debug=debug_enabled(),
         system_prompt=(
             "You are an implementation engineer. Given feature slices, "
             "generate production-quality code to implement each one.\n\n"
@@ -61,12 +63,3 @@ def build_implement_agent(
     )
 
     return agent
-
-
-def _resolve_model(config: RunnableConfig | None) -> str:
-    """Resolve the model identifier from config or SpineConfig."""
-    if config and config.get("configurable", {}).get("model"):
-        return config["configurable"]["model"]
-    from spine.config import SpineConfig
-
-    return SpineConfig.load().resolve_model()

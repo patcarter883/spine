@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.models.state import WorkflowState
+from spine.agents.helpers import resolve_model, debug_enabled
 
 
 def build_specify_agent(
@@ -15,13 +16,12 @@ def build_specify_agent(
 ) -> Any:
     """Build the Deep Agent for the SPECIFY phase.
 
-    Creates a deep agent configured for specification generation with
-    filesystem tools and research capabilities. Uses a LocalShellBackend
-    so the agent can inspect existing project files when writing specs.
+    Creates a deep agent configured for specification generation. Uses
+    subagents for research and documentation tasks.
 
     Args:
         state: The current workflow state.
-        config: LangGraph runtime config (may contain provider settings).
+        config: LangGraph runtime config.
 
     Returns:
         A compiled Deep Agent ready for invocation.
@@ -30,7 +30,7 @@ def build_specify_agent(
 
     from spine.agents.backend import build_backend
 
-    model = _resolve_model(config)
+    model = resolve_model(config)
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
 
@@ -38,28 +38,19 @@ def build_specify_agent(
         name="spine-specify",
         model=model,
         backend=backend,
+        debug=debug_enabled(),
         system_prompt=(
-            "You are a specification writer. Given a work description, "
-            "create a detailed, actionable specification document.\n\n"
+            "You are a technical specification writer. Given a work description, "
+            "produce a detailed specification document.\n\n"
             f"Your workspace root is: {workspace_root}\n\n"
             "The specification should include:\n"
-            "1. Overview and objectives\n"
-            "2. Requirements (functional and non-functional)\n"
-            "3. Constraints and assumptions\n"
-            "4. Success criteria\n"
-            "5. Dependencies and risks\n\n"
-            "Write clear, specific, and testable requirements. "
-            "Avoid vague language. Structure the document with clear headers."
+            "1. Overview — summary of what needs to be built\n"
+            "2. Requirements — functional and non-functional requirements\n"
+            "3. Architecture — high-level design decisions\n"
+            "4. Interfaces — API endpoints, data models, contracts\n"
+            "5. Success criteria — measurable outcomes\n\n"
+            "Be specific and technical. Avoid vague language."
         ),
     )
 
     return agent
-
-
-def _resolve_model(config: RunnableConfig | None) -> str:
-    """Resolve the model identifier from config or SpineConfig."""
-    if config and config.get("configurable", {}).get("model"):
-        return config["configurable"]["model"]
-    from spine.config import SpineConfig
-
-    return SpineConfig.load().resolve_model()

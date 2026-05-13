@@ -21,6 +21,8 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.tasks_agent import build_tasks_agent
+from spine.agents.helpers import extract_response
+from spine.agents.retry import invoke_with_retry
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -69,9 +71,14 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
             )
             prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
-        result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        result = invoke_with_retry(
+            agent,
+            {"messages": [{"role": "user", "content": prompt}]},
+            phase_name=PhaseName.TASKS.value,
+            work_id=work_id,
+        )
 
-        tasks_content = _extract_response(result)
+        tasks_content = extract_response(result)
 
         return {
             "artifacts": {PhaseName.TASKS.value: {"tasks.md": tasks_content}},
@@ -90,15 +97,6 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
                 "phase": PhaseName.TASKS.value,
             },
         }
-
-
-def _extract_response(result: Any) -> str:
-    """Extract the text content from the agent's last message."""
-    messages = result.get("messages", [])
-    if messages:
-        last = messages[-1]
-        return getattr(last, "content", str(last))
-    return ""
 
 
 # ── Self-register on import ──

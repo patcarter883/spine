@@ -66,7 +66,7 @@ def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         }
 
     # ── Tier 2: Agent check ──
-    agent_result = agent_critic_check(state, reviewed_phase)
+    agent_result = agent_critic_check(state, reviewed_phase, config=config)
     logger.info(f"[{work_id}] Agent check for {reviewed_phase}: {agent_result['status']}")
 
     # Increment retry count if needs revision
@@ -82,11 +82,11 @@ def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -
     }
 
 
-def _build_critic_agent(state: WorkflowState) -> Any:
+def _build_critic_agent(state: WorkflowState, config: Optional[RunnableConfig] = None) -> Any:
     """Build a critic Deep Agent. Used by the registry as build_agent_fn."""
     from spine.critic.agent import build_critic_agent
 
-    return build_critic_agent(state)
+    return build_critic_agent(state, config)
 
 
 # ── Self-register on import ──

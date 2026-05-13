@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.models.state import WorkflowState
+from spine.agents.helpers import resolve_model, debug_enabled
 
 
 def build_tasks_agent(
@@ -30,7 +31,7 @@ def build_tasks_agent(
 
     from spine.agents.backend import build_backend
 
-    model = _resolve_model(config)
+    model = resolve_model(config)
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
 
@@ -38,6 +39,7 @@ def build_tasks_agent(
         name="spine-tasks",
         model=model,
         backend=backend,
+        debug=debug_enabled(),
         system_prompt=(
             "You are a task decomposition specialist. Given a plan, "
             "break it into smaller, executable feature slices.\n\n"
@@ -56,12 +58,3 @@ def build_tasks_agent(
     )
 
     return agent
-
-
-def _resolve_model(config: RunnableConfig | None) -> str:
-    """Resolve the model identifier from config or SpineConfig."""
-    if config and config.get("configurable", {}).get("model"):
-        return config["configurable"]["model"]
-    from spine.config import SpineConfig
-
-    return SpineConfig.load().resolve_model()
