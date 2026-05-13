@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import streamlit as st
 
 from spine.ui_api import UIApi
@@ -18,6 +20,12 @@ if "api" not in st.session_state:
     st.session_state.api = UIApi()
 
 api: UIApi = st.session_state.api
+
+# ── LLM debug logging ──
+if os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes"):
+    from spine.agents.debug_callback import install_global
+
+    install_global()
 
 # ── Navigation ──
 PAGES = {

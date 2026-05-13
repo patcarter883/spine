@@ -37,11 +37,25 @@ def main() -> None:
     default=".spine/config.yaml",
     help="Path to config file.",
 )
-def run(description: str, work_type: str, config_path: str) -> None:
+@click.option(
+    "--debug-llm",
+    is_flag=True,
+    default=False,
+    help="Log all chat model messages (sent and received) to the console.",
+)
+def run(description: str, work_type: str, config_path: str, debug_llm: bool) -> None:
     """Submit a new work item and run the workflow.
 
     DESCRIPTION is the work prompt for the agent.
     """
+    import os
+
+    if debug_llm:
+        os.environ["SPINE_DEBUG_LLM"] = "1"
+        from spine.agents.debug_callback import install_global
+
+        install_global()
+
     config = SpineConfig.load(path=config_path)
     console.print(f"[bold blue]Submitting work:[/bold blue] {description[:100]}")
     console.print(f"[dim]Work type: {work_type}[/dim]")
@@ -237,7 +251,13 @@ def worker(config_path: str) -> None:
     default=".spine/config.yaml",
     help="Path to config file.",
 )
-def ui(port: int, config_path: str) -> None:
+@click.option(
+    "--debug-llm",
+    is_flag=True,
+    default=False,
+    help="Log all chat model messages (sent and received) to the console.",
+)
+def ui(port: int, config_path: str, debug_llm: bool) -> None:
     """Start the SPINE Streamlit dashboard."""
     import subprocess
     import sys
@@ -250,9 +270,18 @@ def ui(port: int, config_path: str) -> None:
 
     app_path = str(pathlib.Path(spine.__file__).parent / "ui" / "app.py")
     console.print(f"[bold blue]Starting SPINE UI on http://localhost:{port}[/bold blue]")
+    if debug_llm:
+        console.print("[dim]LLM debug logging: ON (chat messages will appear on console)[/dim]")
     console.print("[dim]Press Ctrl+C to stop.[/dim]")
+
+    env = None
+    if debug_llm:
+        import os
+
+        env = {**os.environ, "SPINE_DEBUG_LLM": "1"}
 
     result = subprocess.run(
         [sys.executable, "-m", "streamlit", "run", app_path, "--server.port", str(port)],
+        env=env,
     )
     sys.exit(result.returncode)
