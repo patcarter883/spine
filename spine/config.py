@@ -25,6 +25,7 @@ class SpineConfig:
     queue_backend: str = "sqlite"
     queue_path: str = ".spine/queue.db"
     workspace_root: str = ""
+    interpreter_enabled: bool = False
 
     @classmethod
     def load(cls, path: str = ".spine/config.yaml") -> SpineConfig:
@@ -72,6 +73,9 @@ class SpineConfig:
             queue_backend=os.getenv("SPINE_QUEUE_BACKEND", spine.get("queue_backend", "sqlite")),
             queue_path=os.getenv("SPINE_QUEUE_PATH", spine.get("queue_path", ".spine/queue.db")),
             workspace_root=resolved_root,
+            interpreter_enabled=os.getenv(
+                "SPINE_INTERPRETER", str(spine.get("interpreter_enabled", False)).lower()
+            ) in ("1", "true", "yes"),
         )
 
     def resolve_model(self) -> str:
