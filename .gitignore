@@ -1,5 +1,5 @@
 .venv/
-__pycahche__/
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -12,3 +12,16 @@ dist/
 build/
 *.db-shm
 *.db-wal
+
+# SPINE runtime data
+.spine/artifacts/
+.spine/spine.db
+.spine/queue.db
+.spine/work_entries.db
+.spine/jobs.db
+.spine/state/
+.spine/audit.db
+
+# Debug / scratch files
+llm_debug.txt
+test_root.py

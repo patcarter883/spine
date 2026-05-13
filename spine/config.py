@@ -47,6 +47,16 @@ class SpineConfig:
 
         spine = config.get("spine", {})
 
+        # Resolve workspace_root: use Path.resolve() to get the canonical
+        # (case-correct) absolute path.  On case-sensitive Linux, a typo
+        # like /home/pat/projects vs /home/pat/Projects would silently
+        # point at a different (or non-existent) directory, causing the
+        # deep agent to write files to the wrong place.
+        raw_root = os.getenv(
+            "SPINE_WORKSPACE_ROOT", spine.get("workspace_root", os.getcwd())
+        )
+        resolved_root = str(Path(raw_root).resolve())
+
         return cls(
             checkpoint_path=os.getenv(
                 "SPINE_CHECKPOINT_PATH", spine.get("checkpoint_path", ".spine/spine.db")
@@ -61,9 +71,7 @@ class SpineConfig:
             providers=config.get("providers", {}),
             queue_backend=os.getenv("SPINE_QUEUE_BACKEND", spine.get("queue_backend", "sqlite")),
             queue_path=os.getenv("SPINE_QUEUE_PATH", spine.get("queue_path", ".spine/queue.db")),
-            workspace_root=os.getenv(
-                "SPINE_WORKSPACE_ROOT", spine.get("workspace_root", os.getcwd())
-            ),
+            workspace_root=resolved_root,
         )
 
     def resolve_model(self) -> str:
