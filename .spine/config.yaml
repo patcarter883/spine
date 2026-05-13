@@ -1,5 +1,6 @@
 spine:
   checkpoint_path: .spine/spine.db
+  workspace_root: /home/pat/projects/spine
 providers:
   llm:
   - name: openrouter-da
