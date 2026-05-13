@@ -12,10 +12,17 @@ def render(api: UIApi) -> None:
     """Render the dashboard page."""
     st.title("🦴 SPINE Dashboard")
 
+    # Auto-refresh if any work is running
+    running = api.list_work(status="running", limit=100)
+    if running:
+        st.markdown(
+            '<meta http-equiv="refresh" content="10">',
+            unsafe_allow_html=True,
+        )
+
     # ── Quick stats ──
     col1, col2, col3, col4 = st.columns(4)
 
-    running = api.list_work(status="running", limit=100)
     completed = api.list_work(status="completed", limit=100)
     needs_review = api.list_work(status="needs_review", limit=100)
     failed = api.list_work(status="failed", limit=100)

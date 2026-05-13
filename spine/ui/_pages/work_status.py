@@ -18,10 +18,17 @@ def render(api: UIApi) -> None:
         st.info("Enter a work item ID to view its status.")
         return
 
+    # Auto-refresh while work is running so the user sees phase progress
     entry = api.get_work(work_id)
     if entry is None:
         st.error(f"Work item '{work_id}' not found.")
         return
+
+    if entry.get("status") == "running":
+        st.markdown(
+            '<meta http-equiv="refresh" content="5">',
+            unsafe_allow_html=True,
+        )
 
     # ── Status display ──
     status = entry.get("status", "unknown")
