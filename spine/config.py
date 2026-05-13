@@ -88,14 +88,10 @@ class SpineConfig:
 
         Returns:
             A model string like ``openrouter:z-ai/glm-4.5-air:free``.
-
-        Raises:
-            ValueError: If no model is configured and ``SPINE_MODEL`` is unset.
         """
-        llm_providers = self.providers.get("llm", [])
-        for provider in llm_providers:
-            if provider.get("enabled", True) and provider.get("model"):
-                return provider["model"]
+        provider = self.resolve_active_provider()
+        if provider:
+            return provider["model"]
 
         env_model = os.getenv("SPINE_MODEL")
         if env_model:
@@ -105,6 +101,22 @@ class SpineConfig:
             "No LLM model configured. Set 'providers.llm[].model' in "
             ".spine/config.yaml or set the SPINE_MODEL environment variable."
         )
+
+    def resolve_active_provider(self) -> dict | None:
+        """Return the full config dict for the first enabled LLM provider.
+
+        This exposes ``base_url``, ``api_key``, ``temperature``, and other
+        provider-specific fields that ``resolve_model()`` alone discards.
+        Returns ``None`` when no enabled provider is found.
+
+        Returns:
+            The provider config dict, or ``None``.
+        """
+        llm_providers = self.providers.get("llm", [])
+        for provider in llm_providers:
+            if provider.get("enabled", True) and provider.get("model"):
+                return provider
+        return None
 
     def ensure_dirs(self) -> None:
         """Create all necessary directories if they don't exist."""
