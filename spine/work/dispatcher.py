@@ -57,6 +57,37 @@ def _get_work_db(config: SpineConfig) -> sqlite_utils.Database:
     return db
 
 
+def _update_work_progress(
+    db: sqlite_utils.Database,
+    work_id: str,
+    current_phase: str,
+    status: str,
+) -> None:
+    """Update the work entry's current_phase and status mid-workflow.
+
+    Called after each phase node completes so the UI can show progress
+    without waiting for the entire workflow to finish.
+
+    Args:
+        db: The work entries database.
+        work_id: The work item ID.
+        current_phase: The phase that just completed.
+        status: The current status string.
+    """
+    try:
+        db["work_entries"].update(
+            work_id,
+            {
+                "current_phase": current_phase,
+                "status": status,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+    except Exception:
+        # Don't let a DB update failure crash the workflow
+        logger.warning(f"Failed to update progress for {work_id}", exc_info=True)
+
+
 # ── Submit work ──
 
 
@@ -146,9 +177,51 @@ async def submit_work(
                 "model": config.resolve_model(),
             }
         }
-        result = await graph.ainvoke(initial_state, thread_config)
 
-        # Update work entry with results
+        # Stream the graph so we can update the work entry after each phase.
+        # This lets the UI see progress (current_phase, status) while the
+        # workflow is still running, instead of only getting the final result.
+        result: dict[str, Any] = dict(initial_state)
+        async for chunk in graph.astream(initial_state, thread_config):
+            # Each chunk is {node_name: partial_state_update}
+            for node_name, node_output in chunk.items():
+                # Deep-merge artifacts so phase outputs accumulate instead of
+                # getting overwritten.  The LangGraph state reducer does this
+                # inside the graph, but our local `result` dict needs the same
+                # logic — a plain result.update() would replace the entire
+                # artifacts dict with the latest phase's output, losing all
+                # prior phase artifacts.
+                node_artifacts = node_output.get("artifacts")
+                if node_artifacts and isinstance(node_artifacts, dict):
+                    existing = result.get("artifacts", {})
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    merged = {**existing, **node_artifacts}
+                    # Deep-merge nested dicts (phase → {name: content})
+                    for key in set(existing) & set(node_artifacts):
+                        if (
+                            isinstance(existing[key], dict)
+                            and isinstance(node_artifacts[key], dict)
+                        ):
+                            merged[key] = {**existing[key], **node_artifacts[key]}
+                    node_output = {**node_output, "artifacts": merged}
+
+                # Merge the node output into our running result
+                result.update(node_output)
+                # Update the work entry DB so the UI can see progress
+                phase = node_output.get("current_phase", "")
+                status = node_output.get("status", "")
+                if phase or status:
+                    _update_work_progress(db, work_id, phase, status)
+                    logger.info(f"[{work_id}] Phase {phase or node_name} → {status}")
+                    audit.log_event(
+                        work_id,
+                        "phase_completed",
+                        node_name,
+                        {"phase": phase, "status": status},
+                    )
+
+        # Update work entry with final results
         final_status = result.get("status", "completed")
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
