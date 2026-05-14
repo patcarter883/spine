@@ -80,7 +80,7 @@ _PTC_ALLOWLISTS: dict[str, list[str | Any]] = {
 _DEFAULT_MEMORY_LIMIT = 64 * 1024 * 1024  # 64 MB QuickJS heap
 _DEFAULT_TIMEOUT = 10.0  # seconds per eval
 _DEFAULT_MAX_PTC_CALLS = 256
-_DEFAULT_MAX_RESULT_CHARS = 8000  # enough for substantial synthesis
+_DEFAULT_MAX_RESULT_CHARS = 4000  # compact synthesis for RLM — keeps context lean
 _DEFAULT_SNAPSHOT_BETWEEN_TURNS = True
 
 

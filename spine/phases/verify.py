@@ -5,7 +5,8 @@ plan, and tasks. All prior artifacts are on disk (not inlined) — the agent
 reads them on demand with filesystem tools.
 
 Context engineering: summarization middleware enabled for long-running
-multi-slice verification.
+multi-slice verification. RLM parallel dispatch via eval+PTC for per-slice
+verification subagents.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ from spine.workflow.registry import get_registry
 logger = logging.getLogger(__name__)
 
 
+# Maximum characters of artifact content to store in WorkflowState.
+_MAX_ARTIFACT_STATE_CHARS = 500
+
+
 def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the VERIFY phase.
 
@@ -48,6 +53,7 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
     """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
     workspace_root = state.get("workspace_root", ".")
 
     logger.info(f"[{work_id}] VERIFY phase starting")
@@ -58,27 +64,48 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         # Materialize prior artifacts to disk
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — all prior artifacts are on disk, NOT inlined
+        # Build prompt — all prior artifacts are on disk, NOT inlined.
+        # Skip spec/plan references for quick workflows that lack them.
+        has_spec = "spec" in work_type
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
         impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
-        prompt = (
-            f"Verify that the implementation meets the requirements. "
-            f"Check that all feature slices are implemented correctly, "
-            f"the plan was followed, and the original task is complete.\n\n"
-            f"## Original Requirements\n{description}\n\n"
-            "Prior artifacts are available on disk — read them as needed:\n"
-            f"- Specification: `{spec_path}/specification.md`\n"
-            f"- Plan: `{plan_path}/plan.md`\n"
-            f"- Feature Slices: `{tasks_path}/tasks.md`\n"
-            f"- Implementation: `{impl_path}/implementation.md`\n\n"
+
+        prompt_lines = [
+            "Verify that the implementation meets the requirements. "
+            "Check that all feature slices are implemented correctly, "
+            "the plan was followed, and the original task is complete.",
+            "",
+            "## Original Requirements",
+            description,
+            "",
+            "Prior artifacts are available on disk — read them as needed:",
+        ]
+        if has_spec:
+            prompt_lines.extend([
+                f"- Specification: `{spec_path}/specification.md`",
+                f"- Plan: `{plan_path}/plan.md`",
+            ])
+        prompt_lines.extend([
+            f"- Feature Slices: `{tasks_path}/tasks.md`",
+            f"- Implementation: `{impl_path}/implementation.md`",
+            "",
             "Use `read_file` and `grep` to inspect them. Do NOT load "
-            "everything into context at once.\n\n"
+            "everything into context at once.",
+            "",
             "Also inspect the actual code files on disk using `ls` and "
             "`read_file` — the implementation summary may not reflect "
-            "the actual state of the code."
-        )
+            "the actual state of the code.",
+            "",
+            "**RLM parallel verify pattern:** Use `eval` to read the "
+            "tasks artifact, extract the slice list, then dispatch a "
+            "`slice-verifier` subagent per slice via "
+            "`Promise.allSettled(tools.task(...))`. Synthesize the "
+            "verification report from subagent results in code — do NOT "
+            "re-read each slice file manually into conversation.",
+        ])
+        prompt = "\n".join(prompt_lines)
 
         ctx = build_context(state, PhaseName.VERIFY)
 
@@ -100,16 +127,18 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
                 "Manual review is required."
             )
 
-        # Determine final status from verification
+        # Determine final status from verification (use full content)
         is_verified = "VERIFIED" in verify_content.upper() or "PASSED" in verify_content.upper()
         final_status = "completed" if is_verified else "needs_review"
 
-        # Materialize this phase's artifacts to disk immediately
+        # Materialize full content to disk immediately
         phase_artifacts = {"verification.md": verify_content}
         materialize_phase_artifacts(PhaseName.VERIFY.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
-            "artifacts": {PhaseName.VERIFY.value: phase_artifacts},
+            "artifacts": {PhaseName.VERIFY.value: {
+                "verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]
+            }},
             "current_phase": PhaseName.VERIFY.value,
             "status": final_status,
             "prompt_request": None,

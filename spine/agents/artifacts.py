@@ -137,7 +137,14 @@ def materialize_artifacts(
             if not content:
                 continue
             file_path = phase_dir / filename
-            file_path.write_text(str(content), encoding="utf-8")
+            content_str = str(content)
+            # Skip if disk already has fuller content (state stores truncated previews).
+            # This prevents subsequent phases from overwriting full artifact files
+            # with truncated versions from state.
+            if file_path.exists() and len(content_str) < len(file_path.read_text(encoding="utf-8")):
+                logger.debug("Skipping materialize: disk has longer content than state for %s", file_path)
+                continue
+            file_path.write_text(content_str, encoding="utf-8")
             logger.debug("Materialized artifact: %s", file_path)
 
         paths[phase_key] = _artifact_path(work_id, phase_key)
@@ -191,6 +198,15 @@ def build_artifact_prompt(
         "The following artifacts from prior phases are available on disk. "
         "Use `read_file` and `grep` to read only what you need — do NOT "
         "load everything into context at once."
+    )
+    # RLM guidance: load artifact inventory into interpreter once,
+    # not into every turn's system prompt. Later eval calls can reference
+    # window.artifacts for paths.
+    lines.append(
+        "**RLM tip:** At the start of this phase, run one `eval` call to "
+        "load the artifact paths into interpreter state (e.g. "
+        "`window.artifactPaths = {...}`). Refer to those variables in "
+        "subsequent eval calls instead of repeating paths in conversation."
     )
 
     for phase in phase_order:

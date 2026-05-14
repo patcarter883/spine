@@ -33,6 +33,10 @@ from spine.workflow.registry import get_registry
 logger = logging.getLogger(__name__)
 
 
+# Maximum characters of artifact content to store in WorkflowState.
+_MAX_ARTIFACT_STATE_CHARS = 500
+
+
 def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the IMPLEMENT phase.
 
@@ -48,6 +52,7 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
     """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0)
     feedback = state.get("feedback", [])
     workspace_root = state.get("workspace_root", ".")
@@ -60,21 +65,41 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
         # Materialize prior artifacts to disk
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — all prior artifacts are on disk, NOT inlined
+        # Build prompt — all prior artifacts are on disk, NOT inlined.
+        # Skip spec/plan references for quick workflows that lack them.
+        has_spec = "spec" in work_type
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
-        prompt = (
-            f"Implement the feature slices described below. Write clean, "
-            f"production-quality code for each slice.\n\n"
-            f"## Work Description\n{description}\n\n"
-            "Prior artifacts are available on disk — read them as needed:\n"
-            f"- Specification: `{spec_path}/specification.md`\n"
-            f"- Plan: `{plan_path}/plan.md`\n"
-            f"- Feature Slices: `{tasks_path}/tasks.md`\n\n"
+
+        prompt_lines = [
+            "Implement the feature slices described below. Write clean, "
+            "production-quality code for each slice.",
+            "",
+            "## Work Description",
+            description,
+            "",
+        ]
+        if has_spec:
+            prompt_lines.extend([
+                "Prior artifacts are available on disk — read them as needed:",
+                f"- Specification: `{spec_path}/specification.md`",
+                f"- Plan: `{plan_path}/plan.md`",
+                f"- Feature Slices: `{tasks_path}/tasks.md`",
+                "",
+            ])
+        else:
+            prompt_lines.extend([
+                "Prior artifacts are available on disk — read them as needed:",
+                f"- Feature Slices: `{tasks_path}/tasks.md`",
+                "",
+            ])
+        prompt_lines.extend([
             "Use `read_file` and `grep` to inspect them. Do NOT load "
-            "everything into context at once.\n\n"
-        )
+            "everything into context at once.",
+            "",
+        ])
+        prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
@@ -95,12 +120,14 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
 
         impl_content = extract_response(result)
 
-        # Materialize this phase's artifacts to disk immediately
+        # Materialize full content to disk immediately
         phase_artifacts = {"implementation.md": impl_content}
         materialize_phase_artifacts(PhaseName.IMPLEMENT.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
-            "artifacts": {PhaseName.IMPLEMENT.value: phase_artifacts},
+            "artifacts": {PhaseName.IMPLEMENT.value: {
+                "implementation.md": impl_content[:_MAX_ARTIFACT_STATE_CHARS]
+            }},
             "current_phase": PhaseName.IMPLEMENT.value,
             "status": "running",
             "prompt_request": None,

@@ -38,19 +38,27 @@ logger = logging.getLogger(__name__)
 
 _SLICE_PATTERN = "slice-*.md"
 
+# Maximum characters of artifact content to store in WorkflowState.
+# Full content lives on disk via materialize_phase_artifacts(). Keeping
+# state compact prevents ~260K tokens of artifact bloat across turns.
+_MAX_ARTIFACT_STATE_CHARS = 500
+
 
 def _collect_slice_files(
     workspace_root: str,
     work_id: str,
 ) -> dict[str, str]:
-    """Read any slice-*.md files the agent wrote to the tasks artifact dir.
+    """Read slice files and return truncated previews for state.
+
+    Full content is already on disk — state only needs enough to show
+    in artifact prompts and satisfy the artifact gate threshold (≥50 chars).
 
     Args:
         workspace_root: Absolute path to the project workspace.
         work_id: Work item identifier for path scoping.
 
     Returns:
-        Dict of ``{filename: content}`` for each discovered slice file.
+        Dict of ``{filename: truncated_preview}`` for each discovered slice file.
     """
     tasks_dir = Path(workspace_root) / _artifact_path(work_id, PhaseName.TASKS.value)
     if not tasks_dir.is_dir():
@@ -58,7 +66,8 @@ def _collect_slice_files(
     slices: dict[str, str] = {}
     for path in sorted(tasks_dir.glob(_SLICE_PATTERN)):
         try:
-            slices[path.name] = path.read_text(encoding="utf-8")
+            content = path.read_text(encoding="utf-8")
+            slices[path.name] = content[:_MAX_ARTIFACT_STATE_CHARS]
         except OSError:
             logger.warning("Could not read slice file: %s", path)
     return slices
@@ -79,6 +88,7 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
     """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.TASKS.value, 0)
     feedback = state.get("feedback", [])
     workspace_root = state.get("workspace_root", ".")
@@ -91,21 +101,43 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
         # Materialize prior artifacts to disk
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — plan and spec are on disk (work_id-scoped paths)
+        # Build prompt — plan and spec are on disk (work_id-scoped paths).
+        # Skip spec/plan references for quick workflows that lack them.
+        has_spec = "spec" in work_type  # only spec/critical_spec produce specify+plan
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        prompt = (
-            f"Break the plan into smaller, executable feature slices "
-            f"with clear dependencies.\n\n"
-            f"## Work Description\n{description}\n\n"
-            "Prior artifacts are available on disk:\n"
-            f"- Specification: `{spec_path}/specification.md`\n"
-            f"- Plan: `{plan_path}/plan.md`\n\n"
-            "Read them with `read_file` before decomposing.\n\n"
+
+        prompt_lines = [
+            "Break the plan into smaller, executable feature slices "
+            "with clear dependencies.",
+            "",
+            "## Work Description",
+            description,
+            "",
+        ]
+        if has_spec:
+            prompt_lines.extend([
+                "Prior artifacts are available on disk:",
+                f"- Specification: `{spec_path}/specification.md`",
+                f"- Plan: `{plan_path}/plan.md`",
+                "",
+                "Read them with `read_file` before decomposing.",
+                "",
+            ])
+        else:
+            prompt_lines.extend([
+                "This is a quick workflow — no specification or plan artifacts "
+                "exist. Work from the task description directly. Inspect the "
+                "codebase with `read_file` and `grep` to understand context.",
+                "",
+            ])
+        prompt_lines.extend([
             "Write each slice as a separate file named `slice-<name>.md` "
             "in the tasks artifact directory, then produce a summary "
-            "`tasks.md` that references them.\n\n"
-        )
+            "`tasks.md` that references them.",
+            "",
+        ])
+        prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
@@ -129,13 +161,20 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
         # Collect any slice files the agent wrote to disk
         slice_files = _collect_slice_files(workspace_root, work_id)
 
-        # Build the full artifacts dict for this phase
-        phase_artifacts: dict[str, str] = {"tasks.md": tasks_content}
+        # Materialize main artifact to disk (slice files already on disk from agent writes)
+        materialize_phase_artifacts(
+            PhaseName.TASKS.value,
+            {"tasks.md": tasks_content},
+            workspace_root,
+            work_id=work_id,
+        )
+
+        # Build state artifacts with truncated previews — full content is on disk
+        phase_artifacts: dict[str, str] = {
+            "tasks.md": tasks_content[:_MAX_ARTIFACT_STATE_CHARS]
+        }
         # Merge in slice files (existing state files preserved by reducer)
         phase_artifacts.update(slice_files)
-
-        # Materialize this phase's artifacts to disk immediately
-        materialize_phase_artifacts(PhaseName.TASKS.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
             "artifacts": {PhaseName.TASKS.value: phase_artifacts},

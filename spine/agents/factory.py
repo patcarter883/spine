@@ -44,6 +44,39 @@ from spine.agents.interpreter import build_interpreter_middleware, interpreter_e
 logger = logging.getLogger(__name__)
 
 
+# ── RLM preamble — injected into system prompts when interpreter is active ──
+# The Recursive Language Model pattern (arXiv:2512.24601) uses the interpreter
+# as a workspace to keep intermediate data OUT of model context. This preamble
+# instructs the agent to use eval for orchestration, not iterate tool-by-tool.
+
+_RLM_PREAMBLE = (
+    "\n\n## Interpreter Workspace (eval tool)\n\n"
+    "You have a persistent QuickJS runtime via the `eval` tool. "
+    "The interpreter is your **orchestration workspace** — use it "
+    "aggressively to keep the model context lean.\n\n"
+    "**Core rules:**\n"
+    "1. **Decompose in code, not conversation.** When processing ≥3 files "
+    "or spawning ≥3 subagents, write a JS program in `eval` that reads "
+    "files into variables, extracts structure, and dispatches work. "
+    "Intermediate data stays in the interpreter — only the final synthesis "
+    "returns to the model.\n"
+    "2. **Parallel dispatch.** Use `Promise.all(tools.task(...))` for "
+    "independent subagents. Use `Promise.allSettled()` for error-tolerant "
+    "batches with retry logic.\n"
+    "3. **Interpreter as working memory.** File contents, grep results, "
+    "and subagent outputs live in JS variables (`window.results = ...`). "
+    "Variables persist across turns (snapshots). Do NOT type raw data "
+    "into conversation — process it in code.\n"
+    "4. **Before each manual `read_file`/`grep` call, ask:** can I write "
+    "one eval program that does this work and returns only what's needed?\n"
+    "5. **Keep results compact.** The interpreter caps output at ~4000 "
+    "chars. Synthesize findings — don't dump raw data.\n\n"
+    "**Tools available in eval via PTC:** `tools.task(...)` for subagent "
+    "delegation. Filesystem and shell tools are called directly — not "
+    "from eval — but their results can be loaded into eval for processing.\n"
+)
+
+
 def build_phase_agent(
     state: WorkflowState,
     config: RunnableConfig | None,
@@ -137,6 +170,10 @@ def build_phase_agent(
     context_schema = SpineContext
 
     # ── Construct the agent ──────────────────────────────────────────
+    # RLM preamble: append interpreter instructions when available
+    if has_interpreter:
+        system_prompt += _RLM_PREAMBLE
+
     agent_kwargs: dict[str, Any] = {
         "name": f"spine-{phase.value}",
         "model": model,
