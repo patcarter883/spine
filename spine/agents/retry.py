@@ -97,9 +97,21 @@ def _is_transient_error(exc: Exception) -> bool:
         if str(code) in exc_str:
             return True
 
-    # ── httpx transport errors ──
-    if "httpx" in exc_module and "transport" in exc_type_name.lower():
-        return True
+    # ── httpx transport errors ────────────────────────────────────────
+    # Distinguish between transient errors (connection refused, timeout)
+    # and mid-stream drops (server started responding then disconnected).
+    #
+    # RemoteProtocolError with "peer closed connection" means the server
+    # sent a partial response then dropped — retrying re-sends the same
+    # prompt for zero or marginal benefit and wastes tokens.  Mark as
+    # permanent so we fail fast instead of burning retries on a hung
+    # stream.
+    if "httpx" in exc_module:
+        exc_type_lower = exc_type_name.lower()
+        if "remoteprotocolerror" in exc_type_lower:
+            return False
+        if "transport" in exc_type_lower:
+            return True
 
     # Default: not transient — don't retry logic bugs or auth errors
     return False

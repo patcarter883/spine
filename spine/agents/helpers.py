@@ -125,6 +125,10 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
     don't lose the attribution headers and Azure-ignore rule that the
     string-based ``init_chat_model`` path would normally provide.
 
+    Sets a default ``request_timeout`` of 300 seconds (5 minutes) to
+    prevent hung connections from blocking the workflow indefinitely.
+    Provider config can override via ``providers.llm[].request_timeout``.
+
     Args:
         model_spec: Full model spec like ``"openrouter:z-ai/glm-4.5-air:free"``.
         session_id: Work item ID for OpenRouter request grouping.
@@ -147,9 +151,18 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
     # string-based init_chat_model path would normally inject.
     profile_kwargs = apply_provider_profile(model_spec)
 
+    # ── Resolve request_timeout ──────────────────────────────────────
+    # Default: 300s (5 min).  Provider config can override this via
+    # providers.llm[].request_timeout.  Without a timeout, hung
+    # connections (e.g. OpenRouter dropping mid-stream) can block
+    # the workflow for 30+ minutes waiting for OS-level TCP timeouts.
+    # Note: ChatOpenRouter expects milliseconds, not seconds.
+    timeout_ms = _resolve_timeout_from_config(default=300) * 1000
+
     return ChatOpenRouter(
         model=model_name,
         session_id=truncated_session_id,
+        request_timeout=timeout_ms,
         **profile_kwargs,
     )
 
@@ -190,12 +203,41 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
         if key in provider_cfg:
             kwargs[key] = provider_cfg[key]
 
+    # ── Default request_timeout ───────────────────────────────────────
+    # If not explicitly configured, default to 300s (5 min) to prevent
+    # hung connections from blocking the workflow for 30+ minutes.
+    if "request_timeout" not in kwargs:
+        kwargs["request_timeout"] = 300
+
     return ChatOpenAI(**kwargs)
 
 
 def debug_enabled() -> bool:
     """Check if LLM debug logging is enabled via the SPINE_DEBUG_LLM env var."""
     return os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_timeout_from_config(default: int = 300) -> int:
+    """Resolve the request_timeout in seconds from provider config.
+
+    Checks the active provider config for a ``request_timeout`` field.
+    Falls back to ``default`` when not configured.  The return value is
+    always in **seconds** — callers must convert to milliseconds when
+    needed by the underlying client.
+
+    Args:
+        default: Default timeout in seconds when not configured.
+
+    Returns:
+        Timeout value in seconds.
+    """
+    provider_cfg = _active_provider_config()
+    if provider_cfg and "request_timeout" in provider_cfg:
+        try:
+            return int(provider_cfg["request_timeout"])
+        except (ValueError, TypeError):
+            pass
+    return default
 
 
 def extract_response(result: dict[str, Any]) -> str:
