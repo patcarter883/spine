@@ -78,17 +78,51 @@ class SpineConfig:
             ) in ("1", "true", "yes"),
         )
 
-    def resolve_model(self) -> str:
+    def resolve_model(self, phase: str | None = None) -> str:
         """Resolve the LLM model identifier from provider config.
 
-        Reads the first enabled LLM provider's ``model`` field. Falls back to
-        ``SPINE_MODEL`` env var, then raises ``ValueError`` if neither is set
-        (rather than defaulting to ``openai:gpt-4o`` which requires OpenAI
-        credentials).
+        Supports per-phase and per-subagent model overrides via the
+        ``providers.phases`` section of ``.spine/config.yaml``.  Resolution
+        order:
+
+        1. ``providers.phases.<phase>.model`` (e.g. ``implement``)
+        2. ``providers.phases.<phase/subagents/name>.model``
+           (e.g. ``implement/subagents/slice-implementer``)
+        3. First enabled LLM provider's ``model`` field
+        4. ``SPINE_MODEL`` env var
+        5. ``ValueError`` if none of the above are set
+
+        The path-style key (``phase/subagents/name``) is checked **before**
+        the bare phase key so that subagent overrides take priority over the
+        phase default.
+
+        Args:
+            phase: Optional phase or phase/subagent path (e.g. ``"implement"``
+                or ``"implement/subagents/slice-implementer"``).  When
+                ``None``, only the default provider and env var are consulted.
 
         Returns:
             A model string like ``openrouter:z-ai/glm-4.5-air:free``.
+
+        Raises:
+            ValueError: If no model is configured anywhere.
         """
+        # Check phase-specific overrides first (more specific key wins)
+        if phase:
+            phases = self.providers.get("phases", {})
+            # Exact key first (e.g. "implement/subagents/slice-implementer")
+            phase_cfg = phases.get(phase, {})
+            if isinstance(phase_cfg, dict) and phase_cfg.get("model"):
+                return phase_cfg["model"]
+            # Fall back to parent phase key (e.g. "implement" from
+            # "implement/subagents/slice-implementer")
+            parent_phase = phase.split("/")[0]
+            if parent_phase != phase:
+                parent_cfg = phases.get(parent_phase, {})
+                if isinstance(parent_cfg, dict) and parent_cfg.get("model"):
+                    return parent_cfg["model"]
+
+        # Default provider resolution
         provider = self.resolve_active_provider()
         if provider:
             return provider["model"]

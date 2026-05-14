@@ -59,7 +59,13 @@ You have access to standard tools:
 - **Filesystem**: read_file, write_file, edit_file, ls, glob, grep — use \
 these to inspect and modify the workspace.
 - **Execute**: run shell commands (linters, tests, build scripts).
-- **Task**: delegate to subagents for parallel work on independent slices.
+- **Task**: delegate to subagents for parallel work. Available subagents \
+vary by phase:
+  - SPECIFY: ``researcher`` — read-only codebase investigation
+  - IMPLEMENT: ``slice-implementer`` — single feature slice implementation
+  - VERIFY: ``slice-verifier`` — single feature slice verification
+  Phases without listed subagents (PLAN, TASKS, CRITIC) do not use the \
+task tool.
 - **Eval** *(when enabled)*: a QuickJS interpreter for code-first orchestration \
 — composing tool calls, transforming structured data, and managing intermediate \
 state outside the model context. See the RLM pattern skill for details.

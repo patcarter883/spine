@@ -15,6 +15,16 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
 from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.subagents import build_phase_subagents
+
+
+def _build_subagents(
+    phase: PhaseName,
+    state: WorkflowState,
+    config: RunnableConfig | None,
+) -> list[Any] | None:
+    """Resolve subagent specs for the VERIFY phase."""
+    return build_phase_subagents(phase, state, config)
 
 
 def build_verify_agent(
@@ -69,6 +79,7 @@ def build_verify_agent(
         phase=PhaseName.VERIFY,
         system_prompt=system_prompt,
         add_summarization=True,  # VERIFY can be long-running
+        subagents=_build_subagents(PhaseName.VERIFY, state, config),
     )
 
     return agent

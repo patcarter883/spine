@@ -14,6 +14,16 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
 from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.subagents import build_phase_subagents
+
+
+def _build_subagents(
+    phase: PhaseName,
+    state: WorkflowState,
+    config: RunnableConfig | None,
+) -> list[Any] | None:
+    """Resolve subagent specs for the IMPLEMENT phase."""
+    return build_phase_subagents(phase, state, config)
 
 
 def build_implement_agent(
@@ -64,6 +74,7 @@ def build_implement_agent(
         phase=PhaseName.IMPLEMENT,
         system_prompt=system_prompt,
         add_summarization=True,  # IMPLEMENT can be long-running
+        subagents=_build_subagents(PhaseName.IMPLEMENT, state, config),
     )
 
     return agent

@@ -33,29 +33,40 @@ console.log(relevant.join('\n'));
 
 ## Orchestrating subagents (PTC)
 
-You can call `tools.task(...)` from inside eval to spawn subagents for parallel work:
+You can call `tools.task(...)` from inside eval to spawn subagents for parallel work.
+**Use the named subagent for the current phase** (available via ``runtime.context.active_subagent``)
+instead of ``general-purpose`` — named subagents have tailored prompts, tool restrictions,
+and structured output formats that produce better results:
 
 ```js
+const subagent = runtime.context?.active_subagent || 'general-purpose';
 const topics = ['auth', 'api', 'data-model'];
 const reports = await Promise.all(
   topics.map(t => tools.task({
     description: `Research ${t} in this codebase and report findings.`,
-    subagent_type: 'general-purpose',
+    subagent_type: subagent,
   }))
 );
 reports.join('\n\n');
 ```
+
+Subagent names by phase:
+- SPECIFY: ``researcher`` (read-only codebase investigation)
+- IMPLEMENT: ``slice-implementer`` (single feature slice implementation)
+- VERIFY: ``slice-verifier`` (single feature slice verification)
+- PLAN, TASKS, CRITIC: no subagents — do not call ``task``
 
 ## Parallel execution by wave
 
 Execute independent work concurrently:
 
 ```js
+const subagent = runtime.context?.active_subagent || 'general-purpose';
 const wave1 = items.filter(s => s.deps.length === 0);
 const results1 = await Promise.all(
   wave1.map(item => tools.task({
     description: `Process the ${item.name} item. Files: ${item.files.join(', ')}.`,
-    subagent_type: 'general-purpose',
+    subagent_type: subagent,
   }))
 );
 ```
@@ -65,10 +76,11 @@ const results1 = await Promise.all(
 Handle failures without consuming model context:
 
 ```js
+const subagent = runtime.context?.active_subagent || 'general-purpose';
 const outcomes = await Promise.allSettled(
   wave.map(item => tools.task({
     description: `Process ${item.name}`,
-    subagent_type: 'general-purpose',
+    subagent_type: subagent,
   }))
 );
 const succeeded = outcomes

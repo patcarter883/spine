@@ -5,7 +5,7 @@ spine:
 
 providers:
   llm:
-  - name: openrouter-da
+  - name: default
     type: deepagents-model
     model: openrouter:poolside/laguna-m.1:free
     priority: 1

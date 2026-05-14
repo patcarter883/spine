@@ -18,8 +18,13 @@ from langchain_core.runnables import RunnableConfig
 def resolve_model(
     config: RunnableConfig | None,
     session_id: str | None = None,
+    phase: str | None = None,
 ) -> str | BaseChatModel:
     """Resolve the LLM model identifier from config or SpineConfig.
+
+    Supports per-phase and per-subagent model overrides.  When ``phase`` is
+    provided, checks ``SpineConfig.providers.phases.<phase>.model`` before
+    falling back to the default provider resolution.
 
     When the resolved model is an OpenRouter model and a ``session_id`` is
     provided, returns a pre-built :class:`ChatOpenRouter` instance with
@@ -40,12 +45,15 @@ def resolve_model(
         session_id: Optional session identifier (typically the work_id) to
             pass to OpenRouter for request grouping. Ignored for non-OpenRouter
             providers.
+        phase: Optional phase or phase/subagent path for model override
+            resolution (e.g. ``"implement"`` or
+            ``"implement/subagents/slice-implementer"``).
 
     Returns:
         A model string like ``"openrouter:z-ai/glm-4.5-air:free"`` or a
         pre-built ``BaseChatModel`` instance when extra config is needed.
     """
-    model_spec = _model_spec_from_config(config)
+    model_spec = _model_spec_from_config(config, phase=phase)
 
     # Only build a pre-built model when the provider needs extra kwargs
     # (base_url, api_key, session_id, etc.) that the string-based
@@ -76,13 +84,25 @@ def resolve_model(
     return model_spec
 
 
-def _model_spec_from_config(config: RunnableConfig | None) -> str:
-    """Extract the model spec string from config or SpineConfig."""
+def _model_spec_from_config(config: RunnableConfig | None, phase: str | None = None) -> str:
+    """Extract the model spec string from config or SpineConfig.
+
+    Checks ``config["configurable"]["model"]`` first, then delegates to
+    ``SpineConfig.resolve_model(phase=phase)`` which handles per-phase
+    overrides and the default provider resolution.
+
+    Args:
+        config: LangGraph runtime config.
+        phase: Optional phase or phase/subagent path for override resolution.
+
+    Returns:
+        A model spec string like ``"openrouter:z-ai/glm-4.5-air:free"``.
+    """
     if config and config.get("configurable", {}).get("model"):
         return config["configurable"]["model"]
     from spine.config import SpineConfig
 
-    return SpineConfig.load().resolve_model()
+    return SpineConfig.load().resolve_model(phase=phase)
 
 
 def _active_provider_config() -> dict[str, Any] | None:

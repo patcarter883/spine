@@ -43,6 +43,12 @@ via the ``ptc`` (programmatic tool calling) allowlist:
 - VERIFY:  ``task`` — spawn subagents to verify each slice independently.
 - CRITIC:  (none) — the critic reviews output, it doesn't orchestrate.
 
+When using PTC to call the ``task`` tool, use the named subagent for the
+current phase (e.g. ``researcher`` for SPECIFY, ``slice-implementer`` for
+IMPLEMENT, ``slice-verifier`` for VERIFY) instead of ``general-purpose``.
+The named subagents have tailored system prompts, tool restrictions, and
+structured response formats that produce better results.
+
 Call ``build_interpreter_middleware(phase_name)`` to get the right config.
 """
 
