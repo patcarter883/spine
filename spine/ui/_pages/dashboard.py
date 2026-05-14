@@ -5,24 +5,17 @@ from __future__ import annotations
 import streamlit as st
 
 from spine.ui_api import UIApi
-from spine.ui.utils import status_icon, truncate, create_work_link
+from spine.ui.utils import status_icon, truncate
 
 
 def render(api: UIApi) -> None:
     """Render the dashboard page."""
     st.title("🦴 SPINE Dashboard")
 
-    # Auto-refresh if any work is running
-    running = api.list_work(status="running", limit=100)
-    if running:
-        st.markdown(
-            '<meta http-equiv="refresh" content="10">',
-            unsafe_allow_html=True,
-        )
-
     # ── Quick stats ──
     col1, col2, col3, col4 = st.columns(4)
 
+    running = api.list_work(status="running", limit=100)
     completed = api.list_work(status="completed", limit=100)
     needs_review = api.list_work(status="needs_review", limit=100)
     failed = api.list_work(status="failed", limit=100)
@@ -52,11 +45,12 @@ def render(api: UIApi) -> None:
         with st.container():
             col1, col2, col3 = st.columns([1, 4, 2])
             col1.write(f"{icon}")
-            
-            # Make work ID clickable
+
+            # Clickable link to work detail page (same window)
             col2.markdown(
-                f"**{create_work_link(work_id, work_id)}** — {desc}",
-                help=f"Click to view details for {work_id}"
+                f'<a href="/work-detail?work_id={work_id}" target="_self"><b>{work_id}</b></a> — {desc}',
+                unsafe_allow_html=True,
+                help=f"Click to view details for {work_id}",
             )
             col3.write(f"{phase or status}")
 
