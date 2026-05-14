@@ -171,10 +171,15 @@ class RalphLoopWorker:
                     )
                 )
 
+                # Derive the queue item status from the work result so
+                # the queue page can distinguish failed from completed.
+                work_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
+                queue_status = work_status if work_status in ("failed", "needs_review") else "completed"
+
                 self._get_db()["queue"].update(
                     item_id,
                     {
-                        "status": "completed",
+                        "status": queue_status,
                         "completed_at": datetime.now().isoformat(),
                         "result": json.dumps(result),
                     },

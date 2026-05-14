@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import streamlit as st
 
-from spine.ui_api import UIApi
+from spine.ui.pages import get as get_page
 from spine.ui.utils import status_icon, truncate
+from spine.ui_api import UIApi
 
 
 def render(api: UIApi) -> None:
@@ -46,12 +47,16 @@ def render(api: UIApi) -> None:
             col1, col2, col3 = st.columns([1, 4, 2])
             col1.write(f"{icon}")
 
-            # Clickable link to work detail page (same window)
-            col2.markdown(
-                f'<a href="/work-detail?work_id={work_id}" target="_self"><b>{work_id}</b></a> — {desc}',
-                unsafe_allow_html=True,
-                help=f"Click to view details for {work_id}",
-            )
+            # Clickable button to navigate to work detail page
+            if col2.button(
+                f"**{work_id}** — {desc}",
+                key=f"dash_{work_id}",
+                use_container_width=True,
+            ):
+                st.switch_page(
+                    get_page("work-detail"),
+                    query_params={"work_id": work_id},
+                )
             col3.write(f"{phase or status}")
 
     # ── Worker status ──

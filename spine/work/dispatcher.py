@@ -218,6 +218,20 @@ async def submit_work(
                             merged[key] = {**existing[key], **node_artifacts[key]}
                     node_output = {**node_output, "artifacts": merged}
 
+                # Accumulate feedback list instead of overwriting.
+                # The LangGraph state reducer (operator.add) appends inside
+                # the graph, but result.update() would replace the whole list
+                # with just the latest node's entries.
+                node_feedback = node_output.get("feedback")
+                if node_feedback and isinstance(node_feedback, list):
+                    existing_fb = result.get("feedback", [])
+                    if not isinstance(existing_fb, list):
+                        existing_fb = []
+                    node_output = {
+                        **node_output,
+                        "feedback": existing_fb + node_feedback,
+                    }
+
                 # Merge the node output into our running result
                 result.update(node_output)
                 # Update the work entry DB so the UI can see progress
@@ -249,10 +263,30 @@ async def submit_work(
                                 )
                                 logger.debug(f"[{work_id}] Saved artifact {art_phase}/{art_name}")
 
-        # Update work entry with final results
+        # Update work entry with final results.
+        # Derive the terminal status from the graph state:
+        #   - If the critic routed to needs_review → END, the feedback
+        #     contains a needs_review entry.
+        #   - If the graph completed naturally (all phases ran), status
+        #     should be "completed" or the verify phase's final status.
+        #   - The top-level except (below) catches true failures.
         final_status = result.get("status", "completed")
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
+        feedback = result.get("feedback", [])
+
+        # If status is still "running" after graph completes, the graph
+        # ended normally — treat as completed.
+        if final_status == "running":
+            final_status = "completed"
+
+        # Check if any feedback entry indicates needs_review (the critic
+        # router sends to END when max retries are exceeded).
+        if any(
+            isinstance(f, dict) and f.get("status") == "needs_review"
+            for f in feedback
+        ):
+            final_status = "needs_review"
 
         # Save artifacts to disk
         for phase, phase_artifacts in result_artifacts.items():
@@ -269,7 +303,7 @@ async def submit_work(
                 "result": json.dumps(
                     {
                         "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
-                        "feedback_count": len(result.get("feedback", [])),
+                        "feedback_count": len(feedback),
                         "prompt_request": result.get("prompt_request"),
                     }
                 ),
@@ -304,10 +338,14 @@ async def submit_work(
 
     except Exception as e:
         logger.error(f"Work {work_id} failed: {e}", exc_info=True)
+        last_phase = ""
+        if isinstance(locals().get("result"), dict):
+            last_phase = result.get("current_phase", "")  # type: ignore[possibly-undefined]
         db["work_entries"].update(
             work_id,
             {
                 "status": TaskStatus.FAILED.value,
+                "current_phase": last_phase,
                 "updated_at": datetime.now().isoformat(),
                 "result": json.dumps({"error": str(e)}),
             },

@@ -96,7 +96,8 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
         logger.error(f"[{work_id}] SPECIFY phase failed: {e}", exc_info=True)
         return {
             "artifacts": {PhaseName.SPECIFY.value: {}},
-            "status": "failed",
+            "current_phase": PhaseName.SPECIFY.value,
+            "status": "running",
             "prompt_request": {
                 "message": f"SPECIFY phase failed: {e}",
                 "phase": PhaseName.SPECIFY.value,

@@ -119,7 +119,8 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         logger.error(f"[{work_id}] VERIFY phase failed: {e}", exc_info=True)
         return {
             "artifacts": {PhaseName.VERIFY.value: {}},
-            "status": "failed",
+            "current_phase": PhaseName.VERIFY.value,
+            "status": "needs_review",
             "prompt_request": {
                 "message": f"VERIFY phase failed: {e}",
                 "phase": PhaseName.VERIFY.value,

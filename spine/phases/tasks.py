@@ -98,7 +98,8 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
         logger.error(f"[{work_id}] TASKS phase failed: {e}", exc_info=True)
         return {
             "artifacts": {PhaseName.TASKS.value: {}},
-            "status": "failed",
+            "current_phase": PhaseName.TASKS.value,
+            "status": "running",
             "prompt_request": {
                 "message": f"TASKS phase failed: {e}",
                 "phase": PhaseName.TASKS.value,

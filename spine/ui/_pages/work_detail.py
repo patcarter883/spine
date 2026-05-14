@@ -23,8 +23,8 @@ def render(api: UIApi) -> None:
         if not work_id:
             st.info("Enter a work item ID or click a work item from the dashboard to view details.")
 
-            # Show recent work items as clickable links
-            recent_work = api.list_work(limit=10)
+            # Show recent work items as clickable buttons
+            recent_work = api.list_work(limit=20)
             if recent_work:
                 st.subheader("Recent Work Items")
                 for item in recent_work:
@@ -35,11 +35,15 @@ def render(api: UIApi) -> None:
 
                     col1, col2 = st.columns([1, 4])
                     col1.write(f"{icon}")
-                    col2.markdown(
-                        f'<a href="/work-detail?work_id={item_id}" target="_self"><b>{item_id}</b></a> — {desc}',
-                        unsafe_allow_html=True,
-                        help=f"Click to view details for {item_id}",
-                    )
+                    if col2.button(
+                        f"**{item_id}** — {desc}",
+                        key=f"recent_{item_id}",
+                        use_container_width=True,
+                    ):
+                        st.switch_page(
+                            get_page("work-detail"),
+                            query_params={"work_id": item_id},
+                        )
 
             return
 

@@ -96,12 +96,13 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
         logger.error(f"[{work_id}] PLAN phase failed: {e}", exc_info=True)
         return {
             "artifacts": {PhaseName.PLAN.value: {}},
-            "status": "failed",
-            "prompt_request": {"message": f"PLAN phase failed: {e}", "phase": PhaseName.PLAN.value},
+            "current_phase": PhaseName.PLAN.value,
+            "status": "running",
+            "prompt_request": {
+                "message": f"PLAN phase failed: {e}",
+                "phase": PhaseName.PLAN.value,
+            },
         }
-
-
-# ── Self-register on import ──
 _registry = get_registry()
 _registry.register(
     name=PhaseName.PLAN.value,

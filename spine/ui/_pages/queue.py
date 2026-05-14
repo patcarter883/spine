@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 import streamlit as st
 
+from spine.ui.utils import status_icon
 from spine.ui_api import UIApi
 
 
@@ -167,10 +169,26 @@ def render(api: UIApi) -> None:
         st.caption("No completed jobs yet.")
     else:
         for item in recent:
-            emoji = "✅" if item.get("status") == "completed" else "❌"
+            # Queue item status is now derived from the work result
+            # (completed / failed / needs_review).
+            queue_status = item.get("status", "completed")
+            icon = status_icon(queue_status)
+
+            # Also try to extract the inner work status for the tooltip
+            # when the queue status was back-compat set to "completed".
+            result_raw = item.get("result", "")
+            inner_status = None
+            if result_raw:
+                try:
+                    inner = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
+                    inner_status = inner.get("status") if isinstance(inner, dict) else None
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            display_status = inner_status or queue_status
+
             with st.container(border=True):
                 rc1, rc2, rc3 = st.columns([4, 1, 2])
-                rc1.markdown(f"{emoji} **{item.get('description', '')[:100]}**")
-                rc2.write(item.get("status", ""))
+                rc1.markdown(f"{icon} **{item.get('description', '')[:100]}**")
+                rc2.write(display_status)
                 elapsed = _elapsed(item.get("started_at"))
                 rc3.caption(f"Finished {item.get('completed_at', '')[:10]} · Took {elapsed}")

@@ -103,7 +103,8 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
         logger.error(f"[{work_id}] IMPLEMENT phase failed: {e}", exc_info=True)
         return {
             "artifacts": {PhaseName.IMPLEMENT.value: {}},
-            "status": "failed",
+            "current_phase": PhaseName.IMPLEMENT.value,
+            "status": "running",
             "prompt_request": {
                 "message": f"IMPLEMENT phase failed: {e}",
                 "phase": PhaseName.IMPLEMENT.value,
