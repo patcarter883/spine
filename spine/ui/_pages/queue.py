@@ -3,34 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 
 import streamlit as st
 
-from spine.ui.utils import status_icon
+from spine.ui.utils import format_duration, status_icon
 from spine.ui_api import UIApi
 
 
 # ── Helpers ──
-
-
-def _elapsed(iso_str: str | None) -> str:
-    """Human-readable elapsed time from an ISO timestamp."""
-    if not iso_str:
-        return "—"
-    try:
-        start = datetime.fromisoformat(iso_str)
-        delta = datetime.now() - start
-        total_secs = int(delta.total_seconds())
-        if total_secs < 60:
-            return f"{total_secs}s"
-        mins = total_secs // 60
-        hours = mins // 60
-        if hours > 0:
-            return f"{hours}h {mins % 60}m"
-        return f"{mins}m {total_secs % 60}s"
-    except (ValueError, TypeError):
-        return "—"
 
 
 _PHASE_SEQUENCE: dict[str, list[str]] = {
@@ -132,7 +112,7 @@ def render(api: UIApi) -> None:
         meta = st.columns(4)
         meta[0].metric("Work ID", f"`{active.get('id', '')}`")
         meta[1].metric("Type", active.get("work_type", ""))
-        meta[2].metric("Total Time", _elapsed(active.get("created_at")))
+        meta[2].metric("Total Time", format_duration(active.get("created_at")))
 
         current_phase = active.get("current_phase", "starting")
         meta[3].metric("Current Phase", current_phase.title() if current_phase else "Starting")
@@ -160,7 +140,7 @@ def render(api: UIApi) -> None:
                 pc1, pc2, pc3 = st.columns([4, 1, 2])
                 pc1.markdown(f"**{item.get('description', '')[:120]}**")
                 pc2.write(item.get("work_type", ""))
-                pc3.caption(f"Enqueued {_elapsed(item.get('enqueued_at'))} ago")
+                pc3.caption(f"Enqueued {format_duration(item.get('enqueued_at'))} ago")
 
     # ── Recent history ──
     st.divider()
@@ -190,5 +170,5 @@ def render(api: UIApi) -> None:
                 rc1, rc2, rc3 = st.columns([4, 1, 2])
                 rc1.markdown(f"{icon} **{item.get('description', '')[:100]}**")
                 rc2.write(display_status)
-                elapsed = _elapsed(item.get("started_at"))
+                elapsed = format_duration(item.get("started_at"), item.get("completed_at"))
                 rc3.caption(f"Finished {item.get('completed_at', '')[:10]} · Took {elapsed}")

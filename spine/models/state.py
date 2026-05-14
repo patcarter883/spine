@@ -12,9 +12,34 @@ def _merge_dicts(left: dict, right: dict) -> dict:
     """Merge two dicts, with right overwriting left for overlapping keys.
 
     Used as a LangGraph reducer for dict-typed state fields that should
-    accumulate across phases (artifacts, retry_count, etc.).
+    accumulate across phases (retry_count, etc.).
     """
     merged = {**left, **right}
+    return merged
+
+
+def _merge_artifacts(left: dict, right: dict) -> dict:
+    """Deep-merge artifacts dicts so per-file entries aren't lost.
+
+    Artifacts have a two-level structure: ``{phase: {filename: content}}``.
+    A shallow merge would replace the entire inner dict for a phase key,
+    destroying any files that weren't re-produced (e.g. individual slice
+    files from the tasks phase).  This reducer merges at the file level
+    instead, so returning ``{"tasks": {"tasks.md": summary}}`` only
+    overwrites ``tasks.md`` — any ``slice-1.md``, ``slice-2.md``, etc.
+    from a prior run are preserved.
+    """
+    merged = {**left}
+    for phase_key, phase_artifacts in right.items():
+        if not phase_artifacts or not isinstance(phase_artifacts, dict):
+            # New value is empty or not a dict — overwrite the key
+            merged[phase_key] = phase_artifacts
+        elif phase_key in merged and isinstance(merged.get(phase_key), dict):
+            # Both sides are dicts — merge at the file level
+            merged[phase_key] = {**merged[phase_key], **phase_artifacts}
+        else:
+            # Left side missing or not a dict — use right's value
+            merged[phase_key] = phase_artifacts
     return merged
 
 
@@ -34,7 +59,7 @@ class WorkflowState(TypedDict, total=False):
     phase_index: int
     retry_count: Annotated[dict, _merge_dicts]
     max_retries: int
-    artifacts: Annotated[dict, _merge_dicts]
+    artifacts: Annotated[dict, _merge_artifacts]
     feedback: Annotated[list, operator.add]
     status: str
     prompt_request: dict | None

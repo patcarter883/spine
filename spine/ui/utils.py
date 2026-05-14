@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 
 # ── Status display helpers ──
 
@@ -47,6 +49,45 @@ def truncate(text: str, max_len: int = 100) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+# ── Duration formatting ──
+
+
+def format_duration(start_iso: str | None, end_iso: str | None = None) -> str:
+    """Human-readable elapsed time between two timestamps.
+
+    When *end_iso* is provided, computes ``end - start`` (actual duration).
+    When *end_iso* is ``None``, computes ``now - start`` (live elapsed time).
+
+    Args:
+        start_iso: ISO 8601 start timestamp string, or ``None``.
+        end_iso: ISO 8601 end timestamp string. When ``None``, uses the
+            current time instead.
+
+    Returns:
+        A human-readable duration string like ``"5m 30s"``, ``"2h 15m"``,
+        or ``"7s"``. Returns ``"—`` when inputs are invalid or ``None``.
+    """
+    if not start_iso:
+        return "—"
+    try:
+        start = datetime.fromisoformat(start_iso)
+        if end_iso:
+            end = datetime.fromisoformat(end_iso)
+            delta = end - start
+        else:
+            delta = datetime.now() - start
+        total_secs = max(0, int(delta.total_seconds()))
+        if total_secs < 60:
+            return f"{total_secs}s"
+        mins = total_secs // 60
+        hours = mins // 60
+        if hours > 0:
+            return f"{hours}h {mins % 60}m"
+        return f"{mins}m {total_secs % 60}s"
+    except (ValueError, TypeError):
+        return "—"
 
 
 # ── Navigation helpers ──

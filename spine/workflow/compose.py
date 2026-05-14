@@ -7,6 +7,11 @@ Each critic instance gets a unique node name (e.g. ``critic_specify``,
 ``critic_plan``) so the same critic function can appear multiple times in
 a workflow graph — each reviewing a different preceding phase.
 
+Artifact gates are wired as **nodes** (not just conditional edge functions)
+so they can write ``status = "needs_review"`` and feedback entries to state
+when they fail. This ensures the dispatcher detects the human-review condition
+instead of silently marking the work as completed.
+
 Phase sequences by WorkType:
     quick:           TASKS → IMPLEMENT → VERIFY
     critical_quick:  TASKS → CRITIC → IMPLEMENT → VERIFY
@@ -29,6 +34,10 @@ from spine.models.enums import PhaseName, WorkType
 from spine.models.state import WorkflowState
 from spine.workflow.registry import get_registry
 from spine.workflow.critic_review import critic_router
+from spine.workflow.artifact_gate import (
+    make_artifact_gate_node,
+    artifact_gate_router,
+)
 
 
 # ── Phase sequences per work type ──
@@ -68,6 +77,11 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
 }
 
 
+def _gate_node_name(source_node: str, next_node: str) -> str:
+    """Derive a unique node name for a gate between two phases."""
+    return f"gate_{source_node}_to_{next_node}"
+
+
 def build_workflow_graph(
     work_type: str,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -77,6 +91,7 @@ def build_workflow_graph(
     The graph wires phase nodes with:
     - Sequential edges for non-critic phases
     - Conditional edges after critic nodes that route to rework or next phase
+    - Artifact gate nodes that check prerequisites before verify/implement
     - Retry counting and needs_review escalation
 
     Critic nodes are named ``critic_{reviewed_phase}`` to allow multiple
@@ -103,6 +118,19 @@ def build_workflow_graph(
     # ── Build the graph ──
     graph = StateGraph(WorkflowState)
 
+    # Collect which edges need artifact gates.
+    # We gate based on the *target* node: verify requires implement artifacts,
+    # implement requires tasks artifacts.  The source node can be any phase
+    # (including a critic node) — we look at what comes just before the target.
+    gate_edges: dict[tuple[str, str], str] = {}  # (src, dst) → required_phase
+    for i, (node_name, _reviewed_phase) in enumerate(phase_seq):
+        if i < len(phase_seq) - 1:
+            next_node_name = phase_seq[i + 1][0]
+            if next_node_name == PhaseName.VERIFY.value:
+                gate_edges[(node_name, next_node_name)] = PhaseName.IMPLEMENT.value
+            elif next_node_name == PhaseName.IMPLEMENT.value:
+                gate_edges[(node_name, next_node_name)] = PhaseName.TASKS.value
+
     # Add all phase/critic nodes
     for node_name, reviewed_phase in phase_seq:
         if node_name.startswith(PhaseName.CRITIC.value):
@@ -118,27 +146,59 @@ def build_workflow_graph(
             phase_def = registry.require(node_name)
             graph.add_node(node_name, phase_def.call_fn)
 
+    # Add artifact gate nodes
+    for (src, dst), required_phase in gate_edges.items():
+        gate_name = _gate_node_name(src, dst)
+        graph.add_node(
+            gate_name,
+            make_artifact_gate_node(required_phase, dst),
+        )
+
     # Wire the graph
     graph.add_edge(START, phase_seq[0][0])
 
     for i, (node_name, reviewed_phase) in enumerate(phase_seq):
-        if i < len(phase_seq) - 1:
-            next_node = phase_seq[i + 1][0]
-        else:
-            next_node = None  # last node → END
+        is_last = i == len(phase_seq) - 1
+        next_node = phase_seq[i + 1][0] if not is_last else None
+
+        # Check if there's a gate between this node and the next
+        edge_key = (node_name, next_node) if next_node else None
+        has_gate = edge_key in gate_edges if edge_key else False
 
         if node_name.startswith(PhaseName.CRITIC.value):
             # Critic node → conditional edge
             pre_critic = phase_seq[i - 1][0] if i > 0 else phase_seq[0][0]
-            after_critic = next_node or END
+
+            # Determine where "passed" routes to
+            if has_gate and next_node:
+                gate_name = _gate_node_name(node_name, next_node)
+                critic_proceed_target: str = gate_name
+            elif not is_last and next_node:
+                critic_proceed_target = next_node
+            else:
+                critic_proceed_target = END
 
             graph.add_conditional_edges(
                 node_name,
                 critic_router,
                 {
-                    "passed": after_critic if after_critic != END else END,
+                    "passed": critic_proceed_target,
                     "needs_revision": pre_critic,  # rework loop
                     "needs_review": END,  # stop for human
+                },
+            )
+        elif has_gate and next_node:
+            # Route to the gate node, which then conditionally routes
+            gate_name = _gate_node_name(node_name, next_node)
+            graph.add_edge(node_name, gate_name)
+
+            # Gate node → conditional edge (proceed or END)
+            graph.add_conditional_edges(
+                gate_name,
+                artifact_gate_router,
+                {
+                    "proceed": next_node,
+                    "needs_review": END,
                 },
             )
         elif next_node is not None:

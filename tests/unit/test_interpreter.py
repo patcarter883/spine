@@ -389,9 +389,9 @@ class TestAgentBuilderIntegration:
         # Should NOT contain the inlined content
         assert "A very long spec" not in prompt
         assert "A very long plan" not in prompt
-        # Should reference the path
-        assert ".spine/artifacts/specify/" in prompt
-        assert ".spine/artifacts/plan/" in prompt
+        # Should reference the work_id-scoped path
+        assert ".spine/artifacts/test-1/specify/" in prompt
+        assert ".spine/artifacts/test-1/plan/" in prompt
 
 
 class TestPTCAllowlists:

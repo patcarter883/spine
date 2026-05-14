@@ -45,6 +45,8 @@ def build_verify_agent(
     """
     workspace_root = state.get("workspace_root", ".")
 
+    work_id = state.get("work_id", "")
+
     system_prompt = (
         "You are a verification engineer. Review the implementation "
         "against the specification, plan, and feature slices.\n\n"
@@ -69,7 +71,7 @@ def build_verify_agent(
         "use `read_file` and `grep` to inspect them when needed. "
         "Do NOT load everything into context at once.\n\n"
         + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.VERIFY.value
+            state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
         )
     )
 

@@ -23,7 +23,11 @@ from spine.agents.verify_agent import build_verify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
+from spine.agents.artifacts import (
+    materialize_artifacts,
+    materialize_phase_artifacts,
+    _artifact_path,
+)
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -52,19 +56,23 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         agent = build_verify_agent(state, config)
 
         # Materialize prior artifacts to disk
-        materialize_artifacts(state, workspace_root)
+        materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build prompt — all prior artifacts are on disk, NOT inlined
+        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
+        impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
         prompt = (
             f"Verify that the implementation meets the requirements. "
             f"Check that all feature slices are implemented correctly, "
             f"the plan was followed, and the original task is complete.\n\n"
             f"## Original Requirements\n{description}\n\n"
             "Prior artifacts are available on disk — read them as needed:\n"
-            "- Specification: `.spine/artifacts/specify/specification.md`\n"
-            "- Plan: `.spine/artifacts/plan/plan.md`\n"
-            "- Feature Slices: `.spine/artifacts/tasks/tasks.md`\n"
-            "- Implementation: `.spine/artifacts/implement/implementation.md`\n\n"
+            f"- Specification: `{spec_path}/specification.md`\n"
+            f"- Plan: `{plan_path}/plan.md`\n"
+            f"- Feature Slices: `{tasks_path}/tasks.md`\n"
+            f"- Implementation: `{impl_path}/implementation.md`\n\n"
             "Use `read_file` and `grep` to inspect them. Do NOT load "
             "everything into context at once.\n\n"
             "Also inspect the actual code files on disk using `ls` and "
@@ -98,7 +106,7 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
 
         # Materialize this phase's artifacts to disk immediately
         phase_artifacts = {"verification.md": verify_content}
-        materialize_phase_artifacts(PhaseName.VERIFY.value, phase_artifacts, workspace_root)
+        materialize_phase_artifacts(PhaseName.VERIFY.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
             "artifacts": {PhaseName.VERIFY.value: phase_artifacts},

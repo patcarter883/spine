@@ -24,4 +24,11 @@ build/
 
 # Debug / scratch files
 llm_debug.txt
+test_root.py.langgraph_api/
+.langgraph_api/
+
+# LangGraph dev server runtime
+.langgraph_api/
+
+# Scratch files
 test_root.py

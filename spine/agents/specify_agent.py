@@ -46,6 +46,8 @@ def build_specify_agent(
     """
     workspace_root = state.get("workspace_root", ".")
 
+    work_id = state.get("work_id", "")
+
     system_prompt = (
         "You are a technical specification writer. Given a work description, "
         "produce a detailed specification document.\n\n"
@@ -61,7 +63,7 @@ def build_specify_agent(
         "use `read_file` and `grep` to inspect them when needed. "
         "Do NOT load everything into context at once.\n\n"
         + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.SPECIFY.value
+            state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
         )
     )
 

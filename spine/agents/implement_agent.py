@@ -44,6 +44,8 @@ def build_implement_agent(
     """
     workspace_root = state.get("workspace_root", ".")
 
+    work_id = state.get("work_id", "")
+
     system_prompt = (
         "You are an implementation engineer. Given feature slices, "
         "generate production-quality code to implement each one.\n\n"
@@ -64,7 +66,7 @@ def build_implement_agent(
         "use `read_file` and `grep` to inspect them when needed. "
         "Do NOT load everything into context at once.\n\n"
         + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.IMPLEMENT.value
+            state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
         )
     )
 

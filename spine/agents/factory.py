@@ -94,10 +94,12 @@ def build_phase_agent(
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
 
+    work_id = state.get("work_id", "")
+
     # ── Materialize prior artifacts to disk ──────────────────────────
     # Subagents skip this — the parent already materialized.
     if not is_subagent:
-        materialize_artifacts(state, workspace_root)
+        materialize_artifacts(state, workspace_root, work_id=work_id)
 
     # ── Middleware ───────────────────────────────────────────────────
     middleware: list[Any] = list(extra_middleware or [])

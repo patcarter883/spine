@@ -7,7 +7,7 @@ from datetime import datetime
 
 from spine.models.enums import ReviewStatus, TaskStatus, PhaseName, WorkType
 from spine.models.types import Task, Artifact, ReviewFeedback, PromptRequest
-from spine.models.state import WorkflowState, _merge_dicts
+from spine.models.state import WorkflowState, _merge_dicts, _merge_artifacts
 
 
 class TestTask:
@@ -157,6 +157,50 @@ class TestWorkflowState:
         merged = _merge_dicts(left, right)
         
         assert merged == {"a": 1, "b": 3, "c": 4}  # b from right overwrites left
+
+    def test_merge_artifacts_deep_merge(self) -> None:
+        """Test that _merge_artifacts merges at the file level, not the phase level."""
+        left = {
+            "tasks": {
+                "tasks.md": "summary v1",
+                "slice-auth.md": "auth slice",
+                "slice-routes.md": "routes slice",
+            },
+            "specify": {"specification.md": "spec content"},
+        }
+        right = {
+            "tasks": {"tasks.md": "summary v2"},  # rework — only tasks.md updated
+        }
+
+        merged = _merge_artifacts(left, right)
+
+        # tasks.md is updated to v2, but slice files are preserved
+        assert merged["tasks"]["tasks.md"] == "summary v2"
+        assert merged["tasks"]["slice-auth.md"] == "auth slice"
+        assert merged["tasks"]["slice-routes.md"] == "routes slice"
+        assert merged["specify"]["specification.md"] == "spec content"
+
+    def test_merge_artifacts_empty_right(self) -> None:
+        """Test that empty right dict doesn't destroy left."""
+        left = {"tasks": {"tasks.md": "content"}}
+        merged = _merge_artifacts(left, {})
+        assert merged == {"tasks": {"tasks.md": "content"}}
+
+    def test_merge_artifacts_new_phase(self) -> None:
+        """Test that a new phase key is added correctly."""
+        left = {"specify": {"specification.md": "spec"}}
+        right = {"plan": {"plan.md": "the plan"}}
+        merged = _merge_artifacts(left, right)
+        assert merged["plan"]["plan.md"] == "the plan"
+        assert merged["specify"]["specification.md"] == "spec"
+
+    def test_merge_artifacts_empty_phase_value(self) -> None:
+        """Test that an empty phase dict on the right doesn't corrupt left."""
+        left = {"tasks": {"tasks.md": "content", "slice-1.md": "slice"}}
+        right = {"tasks": {}}  # error path returns empty dict
+        merged = _merge_artifacts(left, right)
+        # Empty dict from right overwrites the phase key (LangGraph semantics)
+        assert merged["tasks"] == {}
 
     def test_workflow_state_typed_dict(self) -> None:
         """Test that WorkflowState accepts expected fields."""

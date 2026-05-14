@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from spine.models.enums import PhaseName
+from spine.agents.artifacts import _artifact_path
 
 
 @dataclass
@@ -80,6 +81,7 @@ def build_context(
     # Build artifact paths — these are where prior phase outputs live on disk
     # (materialized by the phase functions via the artifact materializer).
     workspace_root = state.get("workspace_root", ".")
+    work_id = state.get("work_id", "")
     artifacts = state.get("artifacts", {})
     artifact_paths: dict[str, str] = {}
     for phase_key in (
@@ -89,7 +91,7 @@ def build_context(
         PhaseName.IMPLEMENT.value,
     ):
         if artifacts.get(phase_key):
-            artifact_paths[phase_key] = f".spine/artifacts/{phase_key}"
+            artifact_paths[phase_key] = _artifact_path(work_id, phase_key)
 
     # Resolve the named subagent for this phase (for interpreter PTC)
     from spine.agents.subagents import PHASE_SUBAGENTS

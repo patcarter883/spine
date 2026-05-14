@@ -272,13 +272,25 @@ def build_subagent_spec(
     # ── Skills: default per subagent type + any extra ─────────────
     skills = _resolve_subagent_skills(name, phase, workspace_root, extra_skills)
 
+    # ── Tools: resolve string names to actual BaseTool instances ──
+    # The SubAgent spec requires actual tool instances (BaseTool | Callable | dict),
+    # not string names. We create a FilesystemMiddleware to get the tools,
+    # then filter by the allowed tool names for this subagent type.
+    from deepagents.backends.local_shell import LocalShellBackend
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    backend = LocalShellBackend(root_dir=workspace_root, virtual_mode=False)
+    fs_mw = FilesystemMiddleware(backend=backend)
+    allowed_tool_names = SUBAGENT_TOOLS[name]
+    tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]
+
     # ── Build spec ───────────────────────────────────────────────
     spec: dict[str, Any] = {
         "name": name,
         "description": SUBAGENT_DESCRIPTIONS[name],
         "system_prompt": SUBAGENT_PROMPTS[name],
         "model": model,
-        "tools": SUBAGENT_TOOLS[name],
+        "tools": tools,
         "response_format": SUBAGENT_RESPONSE_MODELS[name],
     }
     if memory:
@@ -367,12 +379,11 @@ def _resolve_subagent_skills(
     default_skills: list[str] = []
 
     if name == "slice-verifier":
-        # The verifier benefits from code-review skills if available
+        # The verifier benefits from code-review skills (VERIFY phase has this)
         phase_skills = resolve_skills(
             phase=phase.value,
             workspace_root=workspace_root,
             include_rlm=False,
-            skill_allowlist=["code-review"],
         )
         default_skills = phase_skills
 

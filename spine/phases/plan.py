@@ -51,15 +51,16 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
         agent = build_plan_agent(state, config)
 
         # Materialize prior artifacts to disk
-        materialize_artifacts(state, workspace_root)
+        materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — specification is on disk at .spine/artifacts/specify/
+        # Build prompt — specification is on disk at work_id-scoped path
+        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         prompt = (
             f"Create a detailed technical plan based on the specification.\n\n"
             f"## Work Description\n{description}\n\n"
-            "The full specification is available on disk at "
-            "`.spine/artifacts/specify/specification.md` — read it with "
-            "`read_file` before planning.\n\n"
+            f"The full specification is available on disk at "
+            f"`{spec_path}/specification.md` — read it with "
+            f"`read_file` before planning.\n\n"
         )
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
@@ -83,7 +84,7 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
 
         # Materialize this phase's artifacts to disk immediately
         phase_artifacts = {"plan.md": plan_content}
-        materialize_phase_artifacts(PhaseName.PLAN.value, phase_artifacts, workspace_root)
+        materialize_phase_artifacts(PhaseName.PLAN.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
             "artifacts": {PhaseName.PLAN.value: phase_artifacts},

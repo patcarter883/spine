@@ -1,4 +1,9 @@
-"""SPINE configuration — load and validate .spine/config.yaml."""
+"""SPINE configuration — load and validate .spine/config.yaml.
+
+Environment variables are loaded from ``.env`` (project root) on first
+import so that ``LANGSMITH_*`` and other runtime vars are available to
+LangGraph, Deep Agents, and LangSmith tracing without manual sourcing.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+
+# ── Load .env on import ──
+# This ensures LANGSMITH_API_KEY, LANGSMITH_TRACING, OPENROUTER_API_KEY,
+# etc. are set before any LangGraph or Deep Agents code reads them.
+# It's safe to call multiple times (no-op if already loaded).
+
+def _load_dotenv() -> None:
+    """Load .env from the project root if python-dotenv is available."""
+    try:
+        from dotenv import load_dotenv
+        # Walk up from CWD to find .env — prefer project root
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
+    except ImportError:
+        # python-dotenv not installed — env vars must be set manually
+        pass
+
+_load_dotenv()
 
 
 @dataclass

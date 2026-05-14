@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from spine.config import SpineConfig
+from spine.models.enums import TaskStatus
 from spine.persistence.artifacts import ArtifactStore
 from spine.services.audit_service import AuditService
 from spine.work.dispatcher import get_work_status, list_work
@@ -205,3 +206,57 @@ class UIApi:
             "recent": recent,
             "status_summary": worker.queue_status(),
         }
+
+    # ── Resume operations ──
+
+    def resume_work(
+        self,
+        work_id: str,
+        human_feedback: str,
+        action: str = "rework",
+    ) -> dict[str, Any]:
+        """Resume a work item in ``needs_review`` status.
+
+        Non-blocking: enqueues the resume for async processing via
+        RalphLoopWorker and returns immediately. The work_detail page
+        can poll for progress.
+
+        Args:
+            work_id: The work item ID.
+            human_feedback: The human's review input.
+            action: ``"rework"`` to rerun from the flagged phase,
+                ``"approve"`` to proceed without rework.
+
+        Returns:
+            Dict with queue_id, status, work_id.
+        """
+        from spine.work.dispatcher import resume_work as _async_resume
+
+        # Mark the work entry as running immediately so the UI
+        # shows progress right away.
+        self._mark_running(work_id)
+
+        # Run resume in the background via RalphLoopWorker thread pool
+        import asyncio
+        import concurrent.futures
+
+        def _run():
+            asyncio.run(_async_resume(work_id, human_feedback, action, self._config))
+
+        # Submit to the worker's executor (or a fresh one)
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(_run)
+
+        return {
+            "work_id": work_id,
+            "status": "running",
+            "action": action,
+        }
+
+    def _mark_running(self, work_id: str) -> None:
+        """Transition a needs_review work entry back to running."""
+        from spine.work.dispatcher import update_work_status
+
+        update_work_status(work_id, TaskStatus.RUNNING.value, config=self._config)

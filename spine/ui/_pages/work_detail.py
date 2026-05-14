@@ -6,7 +6,67 @@ import streamlit as st
 
 from spine.ui.pages import get as get_page
 from spine.ui_api import UIApi
-from spine.ui.utils import format_timestamp, status_icon, truncate
+from spine.ui.utils import format_duration, format_timestamp, status_icon, truncate
+
+
+# ── Helpers ──
+
+
+def _execution_duration(
+    api: UIApi, work_id: str, entry: dict[str, object], status: str
+) -> str:
+    """Compute execution duration from audit log events.
+
+    For completed/failed items, returns the wall-clock time between the first
+    ``work_submitted`` (or ``work_started``) event and the last
+    ``work_completed`` (or ``work_failed``) event.
+
+    For running items, returns the time elapsed since the first start
+    event.
+
+    Args:
+        api: The UIApi instance for querying audit logs.
+        work_id: The work item ID.
+        entry: The work entry dict (used for fallback timestamps).
+        status: Current status of the work item.
+
+    Returns:
+        Human-readable duration string, or ``"—`` if insufficient data.
+    """
+    terminal_statuses = ("completed", "failed", "needs_review")
+    audit_events = api.get_audit_log(work_id=work_id)
+    if not audit_events:
+        return format_duration(entry.get("created_at"), entry.get("updated_at"))
+
+    # Determine start event: first work_submitted or work_started
+    start_event = next(
+        (
+            e
+            for e in audit_events
+            if e.get("event_type") in ("work_submitted", "work_started")
+        ),
+        None,
+    )
+    start_ts = start_event.get("timestamp") if start_event else None
+
+    if status in terminal_statuses:
+        # Find the last terminal event for completed/failed items
+        end_event = next(
+            (
+                e
+                for e in reversed(audit_events)
+                if e.get("event_type") in ("work_completed", "work_failed")
+            ),
+            None,
+        )
+        end_ts = end_event.get("timestamp") if end_event else None
+        return format_duration(start_ts, end_ts)
+    elif status == "running":
+        # Live elapsed time since start
+        return format_duration(start_ts)
+    else:
+        # Unknown or pending — fall back to entry timestamps
+        return format_duration(entry.get("created_at"), entry.get("updated_at"))
 
 
 def render(api: UIApi) -> None:
@@ -65,7 +125,7 @@ def render(api: UIApi) -> None:
     col1.write(f"**Status:** {status}")
     col1.write(f"**Type:** {entry.get('work_type', 'N/A')}")
     col1.write(f"**Phase:** {entry.get('current_phase', 'N/A')}")
-    col2.write(f"**Created:** {format_timestamp(entry.get('created_at'))}")
+    col2.write(f'**Execution Time:** {_execution_duration(api, work_id, entry, status)}')
     col2.write(f"**Updated:** {format_timestamp(entry.get('updated_at'))}")
 
     # ── Description ──
@@ -134,9 +194,27 @@ def render(api: UIApi) -> None:
     # ── Status-specific actions ──
     if status == "needs_review":
         st.warning("This work item needs human review.")
-        _human_input = st.text_input("Your input / decision")
-        if st.button("Resume with input"):
-            st.info("Resume functionality coming soon.")
+        action = st.radio(
+            "Resume action",
+            ["Rework from flagged phase", "Approve and proceed"],
+            horizontal=True,
+            key=f"action_{work_id}",
+        )
+        resume_action = "rework" if action.startswith("Rework") else "approve"
+        human_input = st.text_area(
+            "Your feedback / instructions",
+            placeholder="Describe what needs to change, or confirm approval...",
+            key=f"feedback_{work_id}",
+        )
+        if st.button("▶ Resume with feedback", type="primary", key=f"resume_{work_id}"):
+            if not human_input.strip():
+                st.error("Please provide feedback before resuming.")
+            else:
+                result = api.resume_work(work_id, human_input.strip(), resume_action)
+                st.success(
+                    f"Resumed! Status: {result['status']} | Action: {result['action']}"
+                )
+                st.rerun()
     elif status == "running":
         st.info("Work is currently in progress. Updates will appear automatically.")
 

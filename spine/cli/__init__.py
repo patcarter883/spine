@@ -197,7 +197,7 @@ def resume(work_id: str, human_input: str | None, config_path: str) -> None:
     """
     config = SpineConfig.load(path=config_path)
 
-    from spine.work.dispatcher import get_work_status, update_work_status
+    from spine.work.dispatcher import get_work_status
 
     entry = get_work_status(work_id, config)
     if entry is None:
@@ -208,12 +208,28 @@ def resume(work_id: str, human_input: str | None, config_path: str) -> None:
         console.print(f"[yellow]Work item is not paused (status: {entry.get('status')}).[/yellow]")
         return
 
-    # TODO: implement resume via LangGraph Command(resume=...)
-    console.print(f"[blue]Resuming work item {work_id}...[/blue]")
-    update_work_status(work_id, "running", config=config)
+    feedback = human_input or "Approved — proceed with the workflow."
+    action = "rework" if human_input else "approve"
 
-    # Re-invoke the workflow from the checkpoint
-    console.print("[yellow]Resume via LangGraph checkpointing not yet implemented.[/yellow]")
+    console.print(f"[blue]Resuming work item {work_id} ({action})...[/blue]")
+
+    from spine.work.dispatcher import resume_work
+
+    result = asyncio.run(resume_work(work_id, feedback, action, config))
+
+    if "error" in result:
+        console.print(f"[bold red]Resume failed:[/bold red] {result['error']}")
+        sys.exit(1)
+
+    status_color = "green" if result["status"] == "completed" else "yellow"
+    console.print(
+        Panel(
+            f"Work ID: {result['work_id']}\n"
+            f"Status: [{status_color}]{result['status']}[/{status_color}]\n"
+            f"Action: {action}",
+            title="Resume Result",
+        )
+    )
 
 
 @main.command()

@@ -8,6 +8,7 @@ slices that can be implemented in parallel or sequentially.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from typing import Optional
@@ -20,10 +21,47 @@ from spine.agents.tasks_agent import build_tasks_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
+from spine.agents.artifacts import (
+    materialize_artifacts,
+    materialize_phase_artifacts,
+    _artifact_path,
+)
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
+
+# ── Pattern for discovering slice files written by the agent ────────────
+# After the tasks agent runs, it may have written individual slice files
+# (e.g. slice-auth-middleware.md) alongside the main tasks.md.  We scan
+# for these so the artifacts dict in state stays consistent with disk,
+# preventing later phases from losing access to them.
+
+_SLICE_PATTERN = "slice-*.md"
+
+
+def _collect_slice_files(
+    workspace_root: str,
+    work_id: str,
+) -> dict[str, str]:
+    """Read any slice-*.md files the agent wrote to the tasks artifact dir.
+
+    Args:
+        workspace_root: Absolute path to the project workspace.
+        work_id: Work item identifier for path scoping.
+
+    Returns:
+        Dict of ``{filename: content}`` for each discovered slice file.
+    """
+    tasks_dir = Path(workspace_root) / _artifact_path(work_id, PhaseName.TASKS.value)
+    if not tasks_dir.is_dir():
+        return {}
+    slices: dict[str, str] = {}
+    for path in sorted(tasks_dir.glob(_SLICE_PATTERN)):
+        try:
+            slices[path.name] = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Could not read slice file: %s", path)
+    return slices
 
 
 def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
@@ -51,17 +89,22 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
         agent = build_tasks_agent(state, config)
 
         # Materialize prior artifacts to disk
-        materialize_artifacts(state, workspace_root)
+        materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — plan and spec are on disk
+        # Build prompt — plan and spec are on disk (work_id-scoped paths)
+        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         prompt = (
             f"Break the plan into smaller, executable feature slices "
             f"with clear dependencies.\n\n"
             f"## Work Description\n{description}\n\n"
             "Prior artifacts are available on disk:\n"
-            "- Specification: `.spine/artifacts/specify/specification.md`\n"
-            "- Plan: `.spine/artifacts/plan/plan.md`\n\n"
+            f"- Specification: `{spec_path}/specification.md`\n"
+            f"- Plan: `{plan_path}/plan.md`\n\n"
             "Read them with `read_file` before decomposing.\n\n"
+            "Write each slice as a separate file named `slice-<name>.md` "
+            "in the tasks artifact directory, then produce a summary "
+            "`tasks.md` that references them.\n\n"
         )
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
@@ -83,9 +126,16 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
 
         tasks_content = extract_response(result)
 
+        # Collect any slice files the agent wrote to disk
+        slice_files = _collect_slice_files(workspace_root, work_id)
+
+        # Build the full artifacts dict for this phase
+        phase_artifacts: dict[str, str] = {"tasks.md": tasks_content}
+        # Merge in slice files (existing state files preserved by reducer)
+        phase_artifacts.update(slice_files)
+
         # Materialize this phase's artifacts to disk immediately
-        phase_artifacts = {"tasks.md": tasks_content}
-        materialize_phase_artifacts(PhaseName.TASKS.value, phase_artifacts, workspace_root)
+        materialize_phase_artifacts(PhaseName.TASKS.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
             "artifacts": {PhaseName.TASKS.value: phase_artifacts},

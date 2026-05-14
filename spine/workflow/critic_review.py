@@ -141,18 +141,24 @@ def agent_critic_check(
 
         # Materialize artifacts to disk so the critic can read them
         workspace_root = state.get("workspace_root", ".")
-        materialize_artifacts(state, workspace_root)
+        work_id = state.get("work_id", "unknown")
+        materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build a compact preview with paths to full files
-        artifact_preview = build_inline_artifact_prompt(state, reviewed_phase)
+        artifact_preview = build_inline_artifact_prompt(
+            state, reviewed_phase, work_id=work_id
+        )
 
         # Format the review request
+        from spine.agents.artifacts import _artifact_path
+
+        reviewed_path = _artifact_path(work_id, reviewed_phase)
         prompt = (
             f"Review the output of the {reviewed_phase} phase.\n\n"
             f"Work description: {state.get('description', '')}\n\n"
             f"{artifact_preview}"
             f"Full artifact content is available on disk at "
-            f"`.spine/artifacts/{reviewed_phase}/` — use `read_file` to "
+            f"`{reviewed_path}/` — use `read_file` to "
             f"inspect details.\n\n"
             f"Provide a review: PASSED, NEEDS_REVISION, or NEEDS_REVIEW.\n"
             f"Include specific reasons and suggestions for improvement."

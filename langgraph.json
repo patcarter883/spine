@@ -1,0 +1,10 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "spec": "spine.workflow.studio:spec_graph",
+    "critical_spec": "spine.workflow.studio:critical_spec_graph",
+    "quick": "spine.workflow.studio:quick_graph",
+    "critical_quick": "spine.workflow.studio:critical_quick_graph"
+  },
+  "env": ".env"
+}

@@ -34,6 +34,8 @@ def build_tasks_agent(
     """
     workspace_root = state.get("workspace_root", ".")
 
+    work_id = state.get("work_id", "")
+
     system_prompt = (
         "You are a task decomposition specialist. Given a plan, "
         "break it into smaller, executable feature slices.\n\n"
@@ -51,7 +53,7 @@ def build_tasks_agent(
         "Prior artifacts from earlier phases are available on disk — "
         "use `read_file` and `grep` to inspect them when needed.\n\n"
         + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.TASKS.value
+            state.get("artifacts", {}), PhaseName.TASKS.value, work_id=work_id
         )
     )
 

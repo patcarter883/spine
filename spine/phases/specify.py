@@ -23,7 +23,11 @@ from spine.agents.specify_agent import build_specify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
+from spine.agents.artifacts import (
+    materialize_artifacts,
+    materialize_phase_artifacts,
+    _artifact_path,
+)
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -55,7 +59,7 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
         agent = build_specify_agent(state, config)
 
         # Materialize prior artifacts to disk so the agent can read them
-        materialize_artifacts(state, workspace_root)
+        materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build the prompt — prior artifacts are on disk, not inlined
         prompt = f"Create a detailed specification for the following work:\n\n{description}"
@@ -83,7 +87,7 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
 
         # Materialize this phase's artifacts to disk immediately
         phase_artifacts = {"specification.md": spec_content}
-        materialize_phase_artifacts(PhaseName.SPECIFY.value, phase_artifacts, workspace_root)
+        materialize_phase_artifacts(PhaseName.SPECIFY.value, phase_artifacts, workspace_root, work_id=work_id)
 
         return {
             "artifacts": {PhaseName.SPECIFY.value: phase_artifacts},

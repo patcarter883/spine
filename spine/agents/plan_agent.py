@@ -33,6 +33,8 @@ def build_plan_agent(
     """
     workspace_root = state.get("workspace_root", ".")
 
+    work_id = state.get("work_id", "")
+
     system_prompt = (
         "You are a technical architect. Given a specification, "
         "create a detailed technical plan document.\n\n"
@@ -50,7 +52,7 @@ def build_plan_agent(
         "Prior artifacts from earlier phases are available on disk — "
         "use `read_file` and `grep` to inspect them when needed.\n\n"
         + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.PLAN.value
+            state.get("artifacts", {}), PhaseName.PLAN.value, work_id=work_id
         )
     )
 

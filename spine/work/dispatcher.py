@@ -464,3 +464,291 @@ def update_work_status(
         updates["current_phase"] = current_phase
 
     db["work_entries"].update(work_id, updates)
+
+
+# ── Resume work ──
+
+
+async def resume_work(
+    work_id: str,
+    human_feedback: str,
+    action: str = "rework",
+    config: SpineConfig | None = None,
+) -> dict[str, Any]:
+    """Resume a work item that is in ``needs_review`` status.
+
+    Restarts the workflow from the beginning with the full accumulated
+    state (prior artifacts, critic feedback, and the new human feedback)
+    injected into the initial state.  Phases that have already produced
+    artifacts will see them on disk and refine them based on the feedback
+    rather than generating from scratch.
+
+    Args:
+        work_id: The work item ID to resume.
+        human_feedback: The human's review input / decision.
+        action: Resume action — ``"rework"`` (default) reruns from the
+            phase that was flagged, ``"approve"`` forces the workflow
+            to proceed without rework.
+        config: Optional SpineConfig.
+
+    Returns:
+        A dict with keys: ``work_id``, ``status``, ``work_type``.
+
+    Raises:
+        ValueError: If the work item is not in ``needs_review`` status.
+    """
+    if config is None:
+        config = SpineConfig.load()
+    config.ensure_dirs()
+
+    db = _get_work_db(config)
+
+    # Validate the work item exists and is in needs_review
+    try:
+        entry = db["work_entries"].get(work_id)
+    except sqlite_utils.db.NotFoundError:
+        raise ValueError(f"Work item '{work_id}' not found")
+
+    if entry.get("status") != "needs_review":
+        raise ValueError(
+            f"Work item '{work_id}' is in '{entry.get('status')}' status, "
+            f"not 'needs_review'. Only needs_review items can be resumed."
+        )
+
+    work_type = entry.get("work_type", "spec")
+    description = entry.get("description", "")
+
+    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
+    artifacts = ArtifactStore(base_path=config.artifact_path)
+
+    audit.log_event(
+        work_id,
+        "work_resumed",
+        "dispatcher",
+        {
+            "human_feedback": human_feedback[:200],
+            "action": action,
+        },
+    )
+
+    # Load the existing checkpoint to recover accumulated state
+    from spine.persistence.checkpoint import CheckpointStore
+
+    checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+    saved_state = await checkpoint_store.get_state(work_id)
+
+    # Build initial state for the resumed run, seeded with the
+    # accumulated artifacts and feedback from the previous run.
+    if saved_state:
+        prior_artifacts = saved_state.get("artifacts", {})
+        prior_feedback = saved_state.get("feedback", [])
+        prior_retry_count = saved_state.get("retry_count", {})
+    else:
+        # Fallback: reconstruct from work entry result
+        result_data = entry.get("result", {})
+        if isinstance(result_data, str):
+            try:
+                result_data = json.loads(result_data)
+            except json.JSONDecodeError:
+                result_data = {}
+        prior_artifacts = {}
+        prior_feedback = []
+        prior_retry_count = {}
+
+    # Append the human feedback to the accumulated feedback list
+    human_review_entry = {
+        "status": "needs_revision" if action == "rework" else "passed",
+        "tier": "human",
+        "reason": human_feedback,
+        "suggestions": [],
+    }
+    all_feedback = list(prior_feedback) + [human_review_entry]
+
+    # Mark the work entry as running again
+    db["work_entries"].update(
+        work_id,
+        {
+            "status": TaskStatus.RUNNING.value,
+            "current_phase": "",
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+
+    # ── Rebuild and re-run the workflow graph ──
+    try:
+        from spine.workflow.compose import build_workflow_graph
+
+        checkpointer = await checkpoint_store.get_checkpointer()
+        graph = build_workflow_graph(work_type, checkpointer=checkpointer)
+
+        # Seed the new run with all prior state plus the human feedback
+        resume_state: dict[str, Any] = {
+            "work_id": work_id,
+            "work_type": work_type,
+            "description": description,
+            "current_phase": "",
+            "phase_index": 0,
+            "retry_count": prior_retry_count,
+            "max_retries": config.max_critic_retries,
+            "artifacts": prior_artifacts,
+            "feedback": all_feedback,
+            "status": "running",
+            "prompt_request": None,
+            "critic_reviewing": "",
+            "workspace_root": config.workspace_root,
+        }
+
+        thread_config = {
+            "configurable": {
+                "thread_id": work_id,
+                "model": config.resolve_model(),
+            }
+        }
+
+        # Stream the graph, updating the work entry after each phase
+        # (same pattern as submit_work)
+        result: dict[str, Any] = dict(resume_state)
+        async for chunk in graph.astream(resume_state, thread_config):
+            for node_name, node_output in chunk.items():
+                # Deep-merge artifacts
+                node_artifacts = node_output.get("artifacts")
+                if node_artifacts and isinstance(node_artifacts, dict):
+                    existing = result.get("artifacts", {})
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    merged = {**existing, **node_artifacts}
+                    for key in set(existing) & set(node_artifacts):
+                        if isinstance(existing[key], dict) and isinstance(
+                            node_artifacts[key], dict
+                        ):
+                            merged[key] = {**existing[key], **node_artifacts[key]}
+                    node_output = {**node_output, "artifacts": merged}
+
+                # Accumulate feedback
+                node_feedback = node_output.get("feedback")
+                if node_feedback and isinstance(node_feedback, list):
+                    existing_fb = result.get("feedback", [])
+                    if not isinstance(existing_fb, list):
+                        existing_fb = []
+                    node_output = {
+                        **node_output,
+                        "feedback": existing_fb + node_feedback,
+                    }
+
+                result.update(node_output)
+                phase = node_output.get("current_phase", "")
+                status = node_output.get("status", "")
+                if phase or status:
+                    _update_work_progress(db, work_id, phase, status)
+                    logger.info(
+                        f"[{work_id}] Resume: Phase {phase or node_name} → {status}"
+                    )
+                    audit.log_event(
+                        work_id,
+                        "phase_completed",
+                        node_name,
+                        {"phase": phase, "status": status},
+                    )
+
+                # Persist artifacts
+                node_artifacts = node_output.get("artifacts")
+                if node_artifacts and isinstance(node_artifacts, dict):
+                    for art_phase, phase_arts in node_artifacts.items():
+                        if not isinstance(phase_arts, dict):
+                            continue
+                        for art_name, art_content in phase_arts.items():
+                            if art_content is not None:
+                                artifacts.save_artifact(
+                                    work_id, art_phase, art_name, str(art_content)
+                                )
+
+        # Derive final status (same logic as submit_work)
+        final_status = result.get("status", "completed")
+        final_phase = result.get("current_phase", "")
+        result_artifacts = result.get("artifacts", {})
+        feedback = result.get("feedback", [])
+
+        if final_status == "running":
+            final_status = "completed"
+
+        if any(
+            isinstance(f, dict) and f.get("status") == "needs_review"
+            for f in feedback
+        ):
+            final_status = "needs_review"
+
+        db["work_entries"].update(
+            work_id,
+            {
+                "status": final_status,
+                "current_phase": final_phase,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps(
+                    {
+                        "artifacts": {
+                            k: list(v.keys()) for k, v in result_artifacts.items()
+                        },
+                        "feedback_count": len(feedback),
+                        "prompt_request": result.get("prompt_request"),
+                    }
+                ),
+            },
+        )
+
+        audit.log_event(
+            work_id,
+            "work_completed",
+            final_phase,
+            {"status": final_status, "resumed": True},
+        )
+
+        try:
+            from spine.ui.ws_bus import get_bus
+
+            get_bus().publish_sync(
+                "work_completed",
+                {"work_id": work_id, "status": final_status},
+            )
+        except Exception:
+            pass
+
+        return {
+            "work_id": work_id,
+            "status": final_status,
+            "work_type": work_type,
+        }
+
+    except Exception as e:
+        logger.error(f"Resume of work {work_id} failed: {e}", exc_info=True)
+        last_phase = ""
+        if isinstance(locals().get("result"), dict):
+            last_phase = result.get("current_phase", "")
+        db["work_entries"].update(
+            work_id,
+            {
+                "status": TaskStatus.FAILED.value,
+                "current_phase": last_phase,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps({"error": str(e), "resumed": True}),
+            },
+        )
+        audit.log_event(
+            work_id, "work_failed", "dispatcher", {"error": str(e), "resumed": True}
+        )
+
+        try:
+            from spine.ui.ws_bus import get_bus
+
+            get_bus().publish_sync(
+                "work_failed",
+                {"work_id": work_id, "error": str(e)},
+            )
+        except Exception:
+            pass
+
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.FAILED.value,
+            "work_type": work_type,
+            "error": str(e),
+        }
