@@ -2467,6 +2467,7 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "sqlite-utils" },
     { name = "streamlit" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -2499,6 +2500,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "sqlite-utils", specifier = ">=3.36" },
     { name = "streamlit", specifier = ">=1.30.0" },
+    { name = "websockets", specifier = ">=13.0" },
 ]
 
 [package.metadata.requires-dev]

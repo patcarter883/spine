@@ -1,4 +1,12 @@
-"""SPINE Streamlit app — main entry point and navigation."""
+"""SPINE Streamlit app — main entry point and navigation.
+
+Uses Streamlit's built-in ``st.navigation`` / ``st.Page`` multipage
+routing for deep-linkable URLs (e.g. ``/work-detail?work_id=abc``).
+
+A lightweight WebSocket server runs in a daemon thread to push
+state-change events to the browser, replacing the old
+``<meta http-equiv=refresh>`` force-refresh hack.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +14,10 @@ import os
 
 import streamlit as st
 
+from spine.ui.pages import register
 from spine.ui_api import UIApi
+from spine.ui.ws_component import render_ws_client
+from spine.ui.ws_server import start_ws_server
 
 st.set_page_config(
     page_title="SPINE Dashboard",
@@ -19,6 +30,11 @@ st.set_page_config(
 if "api" not in st.session_state:
     st.session_state.api = UIApi()
 
+# ── Start WebSocket server (once per process) ──
+if "_ws_started" not in st.session_state:
+    start_ws_server()
+    st.session_state._ws_started = True
+
 api: UIApi = st.session_state.api
 
 # ── LLM debug logging ──
@@ -27,30 +43,86 @@ if os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes"):
 
     install_global()
 
-# ── Navigation ──
-PAGES = {
-    "Dashboard": "spine.ui._pages.dashboard",
-    "Submit Work": "spine.ui._pages.work_submit",
-    "Work Details": "spine.ui._pages.work_detail",
-    "Work History": "spine.ui._pages.work_history",
-    "Config": "spine.ui._pages.config_view",
-    "Audit Log": "spine.ui._pages.audit_log",
-    "Human Review": "spine.ui._pages.human_review",
+
+# ── Page definitions ──
+
+
+def _dashboard() -> None:
+    from spine.ui._pages.dashboard import render
+
+    render(api)
+
+
+def _submit_work() -> None:
+    from spine.ui._pages.work_submit import render
+
+    render(api)
+
+
+def _queue() -> None:
+    from spine.ui._pages.queue import render
+
+    render(api)
+
+
+def _work_detail() -> None:
+    from spine.ui._pages.work_detail import render
+
+    render(api)
+
+
+def _work_history() -> None:
+    from spine.ui._pages.work_history import render
+
+    render(api)
+
+
+def _config() -> None:
+    from spine.ui._pages.config_view import render
+
+    render(api)
+
+
+def _audit_log() -> None:
+    from spine.ui._pages.audit_log import render
+
+    render(api)
+
+
+def _human_review() -> None:
+    from spine.ui._pages.human_review import render
+
+    render(api)
+
+
+pages = {
+    "": [
+        st.Page(_dashboard, title="Dashboard", icon="🏠", url_path="dashboard"),
+        st.Page(_submit_work, title="Submit Work", icon="📝", url_path="submit"),
+        st.Page(_queue, title="Queue", icon="🚦", url_path="queue"),
+    ],
+    "Work": [
+        st.Page(_work_detail, title="Work Details", icon="🔍", url_path="work-detail"),
+        st.Page(_work_history, title="Work History", icon="📜", url_path="work-history"),
+    ],
+    "System": [
+        st.Page(_human_review, title="Human Review", icon="👤", url_path="human-review"),
+        st.Page(_audit_log, title="Audit Log", icon="📋", url_path="audit-log"),
+        st.Page(_config, title="Config", icon="⚙️", url_path="config"),
+    ],
 }
 
-st.sidebar.title("🦴 SPINE")
-st.sidebar.caption("Deterministic AI Agent Harness")
+# ── Navigation (renders sidebar, returns selected page) ──
+page = st.navigation(pages)
 
-selection = st.sidebar.radio("Navigate", list(PAGES.keys()))
+# ── Register page objects for cross-page navigation ──
+for section_pages in pages.values():
+    for p in section_pages:
+        register(p.url_path, p)
 
-# ── Load and render selected page ──
-module_name = PAGES[selection]
-try:
-    import importlib
+# ── WebSocket live-update bridge (in sidebar, below nav) ──
+with st.sidebar:
+    render_ws_client()
 
-    page_module = importlib.import_module(module_name)
-    page_module.render(api)
-except Exception as e:
-    st.error(f"Error loading page: {e}")
-    with st.expander("Details"):
-        __import__("traceback").print_exc()
+# ── Run the selected page ──
+page.run()

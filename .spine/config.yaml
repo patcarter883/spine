@@ -1,6 +1,6 @@
 spine:
   checkpoint_path: .spine/spine.db
-  workspace_root: /home/pat/Projects/spine
+  workspace_root: /home/pat/projects/spine
   interpreter_enabled: true
 
 providers:

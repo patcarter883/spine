@@ -47,7 +47,7 @@ def render(api: UIApi) -> None:
             )
             st.info(
                 "Your work has been queued for background processing. "
-                "Use the **Work Status** page to track progress."
+                "Updates will appear automatically on the dashboard."
             )
             st.json(result)
 

@@ -140,7 +140,7 @@ class RalphLoopWorker:
             item_id = item["id"]
             logger.info(f"Processing queue item {item_id}")
 
-            # Mark as started
+            # Mark as started in the queue
             self._get_db()["queue"].update(
                 item_id,
                 {
@@ -148,6 +148,17 @@ class RalphLoopWorker:
                     "started_at": datetime.now().isoformat(),
                 },
             )
+
+            # ── Push event to WebSocket bus ──
+            try:
+                from spine.ui.ws_bus import get_bus
+
+                get_bus().publish_sync(
+                    "queue_started",
+                    {"queue_id": item_id, "description": item["description"][:200]},
+                )
+            except Exception:
+                pass
 
             try:
                 from spine.work.dispatcher import submit_work
@@ -169,6 +180,17 @@ class RalphLoopWorker:
                     },
                 )
 
+                # ── Push completion event to WebSocket bus ──
+                try:
+                    from spine.ui.ws_bus import get_bus
+
+                    get_bus().publish_sync(
+                        "queue_completed",
+                        {"queue_id": item_id, "result": result},
+                    )
+                except Exception:
+                    pass
+
             except Exception as e:
                 logger.error(f"Queue item {item_id} failed: {e}", exc_info=True)
                 self._get_db()["queue"].update(
@@ -179,6 +201,17 @@ class RalphLoopWorker:
                         "result": json.dumps({"error": str(e)}),
                     },
                 )
+
+                # ── Push failure event to WebSocket bus ──
+                try:
+                    from spine.ui.ws_bus import get_bus
+
+                    get_bus().publish_sync(
+                        "queue_failed",
+                        {"queue_id": item_id, "error": str(e)},
+                    )
+                except Exception:
+                    pass
 
     def queue_status(self) -> dict[str, int]:
         """Get counts of queue items by status.
@@ -191,6 +224,52 @@ class RalphLoopWorker:
             status = row.get("status", "unknown")
             counts[status] = counts.get(status, 0) + 1
         return counts
+
+    def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List pending queue items.
+
+        Args:
+            limit: Maximum number of items to return.
+
+        Returns:
+            List of pending queue item dicts, oldest first.
+        """
+        rows = list(
+            self._get_db()["queue"].rows_where(
+                "status = ?", ["pending"], order_by="enqueued_at", limit=limit,
+            )
+        )
+        return rows
+
+    def get_active(self) -> dict[str, Any] | None:
+        """Get the currently running queue item, if any.
+
+        Returns:
+            The running queue item dict, or None.
+        """
+        rows = list(
+            self._get_db()["queue"].rows_where(
+                "status = ?", ["running"], order_by="started_at", limit=1,
+            )
+        )
+        return rows[0] if rows else None
+
+    def list_recent_completed(self, limit: int = 20) -> list[dict[str, Any]]:
+        """List recently completed/failed queue items.
+
+        Args:
+            limit: Maximum number of items to return.
+
+        Returns:
+            List of completed/failed queue item dicts, newest first.
+        """
+        rows = list(
+            self._get_db()["queue"].rows_where(
+                "status IN (?, ?)", ["completed", "failed"],
+                order_by="completed_at DESC", limit=limit,
+            )
+        )
+        return rows
 
 
 def get_worker(config: SpineConfig | None = None) -> RalphLoopWorker:

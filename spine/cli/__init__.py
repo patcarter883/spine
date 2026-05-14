@@ -281,7 +281,17 @@ def ui(port: int, config_path: str, debug_llm: bool) -> None:
         env = {**os.environ, "SPINE_DEBUG_LLM": "1"}
 
     result = subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", app_path, "--server.port", str(port)],
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            app_path,
+            "--server.port",
+            str(port),
+            "--server.runOnSave",
+            "false",
+        ],
         env=env,
     )
     sys.exit(result.returncode)

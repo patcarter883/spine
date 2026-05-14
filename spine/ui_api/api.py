@@ -14,6 +14,7 @@ from spine.config import SpineConfig
 from spine.persistence.artifacts import ArtifactStore
 from spine.services.audit_service import AuditService
 from spine.work.dispatcher import get_work_status, list_work
+from spine.work.ralph_worker import get_worker
 
 logger = logging.getLogger(__name__)
 
@@ -174,10 +175,33 @@ class UIApi:
         Returns:
             Dict with queue item counts by status.
         """
-        from spine.work.ralph_worker import get_worker
-
         worker = get_worker(self._config)
         return {
             "running": worker.running,
             "queue": worker.queue_status(),
+        }
+
+    # ── Queue operations ──
+
+    def get_queue_overview(self) -> dict[str, Any]:
+        """Get a combined view of the queue: pending items, active job with
+        phase and timing, and recent history.
+
+        Returns:
+            Dict with keys: pending, active, recent, status_summary.
+        """
+        worker = get_worker(self._config)
+        pending = worker.list_pending()
+        recent = worker.list_recent_completed()
+
+        # Active job is the latest running work entry (there's at most one
+        # since RalphLoopWorker processes sequentially).
+        running_entries = list_work(status="running", limit=1, config=self._config)
+        active: dict[str, Any] | None = running_entries[0] if running_entries else None
+
+        return {
+            "pending": pending,
+            "active": active,
+            "recent": recent,
+            "status_summary": worker.queue_status(),
         }
