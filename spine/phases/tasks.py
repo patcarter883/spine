@@ -127,8 +127,15 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
         else:
             prompt_lines.extend([
                 "This is a quick workflow — no specification or plan artifacts "
-                "exist. Work from the task description directly. Inspect the "
-                "codebase with `read_file` and `grep` to understand context.",
+                "exist. Work from the task description directly.",
+                "",
+                "Use researcher subagents via the interpreter (`eval`) to "
+                "explore the codebase in parallel — your system prompt has "
+                "the detailed strategy. Focus 2-3 researchers on the modules "
+                "most relevant to this task, then synthesize into slices.",
+                "",
+                "Spend at most 2-3 turns on exploration before writing. "
+                "Better to produce slices with partial knowledge than none at all.",
                 "",
             ])
         prompt_lines.extend([
@@ -160,6 +167,68 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
 
         # Collect any slice files the agent wrote to disk
         slice_files = _collect_slice_files(workspace_root, work_id)
+
+        # ── Detect empty response (agent explored but never wrote) ─────
+        # The agent may read files and reason about the codebase but never
+        # produce output — especially with thinking models that exhaust
+        # their reasoning budget mid-analysis.  Retry once with a direct,
+        # output-focused prompt that skips exploration altogether.
+        if not tasks_content.strip() and not slice_files:
+            logger.warning(
+                "[%s] TASKS agent produced no output and no slice files — "
+                "retrying with direct output prompt",
+                work_id,
+            )
+            retry_prompt = (
+                f"## Work Description\n{description}\n\n"
+                "**Write the task decomposition NOW.** "
+                "Do NOT read any more files — you have already gathered "
+                "enough context. Produce:\n\n"
+                "1. A `tasks.md` summary listing 2-5 feature slices with "
+                "dependencies, files to modify, and acceptance criteria.\n"
+                "2. Individual `slice-<name>.md` files for each slice.\n\n"
+                "Output format in tasks.md:\n"
+                "```markdown\n"
+                "## Slice 1: <name>\n"
+                "- **Files:** ...\n"
+                "- **Depends on:** none\n"
+                "- **Complexity:** small\n"
+                "- **Acceptance:** ...\n```\n"
+            )
+            retry_result = invoke_with_retry(
+                agent,
+                {"messages": [{"role": "user", "content": retry_prompt}]},
+                phase_name=PhaseName.TASKS.value,
+                work_id=work_id,
+                context=ctx,
+            )
+            tasks_content = extract_response(retry_result)
+            slice_files = _collect_slice_files(workspace_root, work_id)
+
+            if not tasks_content.strip() and not slice_files:
+                logger.error(
+                    "[%s] TASKS agent produced no output on retry either — "
+                    "flagging for human review",
+                    work_id,
+                )
+                return {
+                    "artifacts": {PhaseName.TASKS.value: {}},
+                    "current_phase": PhaseName.TASKS.value,
+                    "status": "needs_review",
+                    "feedback": [{
+                        "status": "needs_review",
+                        "tier": "structural",
+                        "reason": (
+                            "Tasks agent produced no output after retry. "
+                            "The model may need human guidance to decompose this work."
+                        ),
+                        "suggestions": [
+                            "Provide more specific instructions in the work description",
+                            "Use a spec/critical_spec workflow type instead of quick",
+                        ],
+                    }],
+                    "prompt_request": None,
+                }
 
         # Materialize main artifact to disk (slice files already on disk from agent writes)
         materialize_phase_artifacts(

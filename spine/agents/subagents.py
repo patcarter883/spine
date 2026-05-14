@@ -213,9 +213,10 @@ SUBAGENT_TOOLS: dict[str, list[str]] = {
 
 PHASE_SUBAGENTS: dict[str, list[str]] = {
     PhaseName.SPECIFY.value: ["researcher"],
+    PhaseName.TASKS.value: ["researcher"],
     PhaseName.IMPLEMENT.value: ["slice-implementer"],
     PhaseName.VERIFY.value: ["slice-verifier"],
-    # PLAN, TASKS, CRITIC — single-agent, no subagents
+    # PLAN, CRITIC — single-agent, no subagents
 }
 
 
