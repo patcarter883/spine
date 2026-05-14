@@ -26,6 +26,7 @@ from spine.workflow.critic_review import (
     structural_critic_check,
     agent_critic_check,
 )
+from spine.agents.artifacts import materialize_phase_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -
     """
     work_id = state.get("work_id", "unknown")
     reviewed_phase = _get_reviewed_phase(state)
+    workspace_root = state.get("workspace_root", ".")
 
     logger.info(f"[{work_id}] CRITIC reviewing {reviewed_phase}")
 
@@ -58,8 +60,10 @@ def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         # Increment retry count for the reviewed phase
         retry_count = state.get("retry_count", {})
         current = retry_count.get(reviewed_phase, 0)
+        phase_artifacts = {"review.md": structural_result["reason"]}
+        materialize_phase_artifacts(PhaseName.CRITIC.value, phase_artifacts, workspace_root)
         return {
-            "artifacts": {PhaseName.CRITIC.value: {"review.md": structural_result["reason"]}},
+            "artifacts": {PhaseName.CRITIC.value: phase_artifacts},
             "feedback": [structural_result],
             "retry_count": {reviewed_phase: current + 1},
             "current_phase": PhaseName.CRITIC.value,
@@ -74,8 +78,12 @@ def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -
     current = retry_count.get(reviewed_phase, 0)
     new_retry = current + 1 if agent_result["status"] != "passed" else current
 
+    # Materialize this phase's artifacts to disk immediately
+    phase_artifacts = {"review.md": agent_result["reason"]}
+    materialize_phase_artifacts(PhaseName.CRITIC.value, phase_artifacts, workspace_root)
+
     return {
-        "artifacts": {PhaseName.CRITIC.value: {"review.md": agent_result["reason"]}},
+        "artifacts": {PhaseName.CRITIC.value: phase_artifacts},
         "feedback": [agent_result],
         "retry_count": {reviewed_phase: new_retry},
         "current_phase": PhaseName.CRITIC.value,

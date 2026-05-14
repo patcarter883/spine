@@ -20,7 +20,7 @@ from spine.agents.plan_agent import build_plan_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts
+from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -81,8 +81,12 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
 
         plan_content = extract_response(result)
 
+        # Materialize this phase's artifacts to disk immediately
+        phase_artifacts = {"plan.md": plan_content}
+        materialize_phase_artifacts(PhaseName.PLAN.value, phase_artifacts, workspace_root)
+
         return {
-            "artifacts": {PhaseName.PLAN.value: {"plan.md": plan_content}},
+            "artifacts": {PhaseName.PLAN.value: phase_artifacts},
             "current_phase": PhaseName.PLAN.value,
             "status": "running",
             "prompt_request": None,

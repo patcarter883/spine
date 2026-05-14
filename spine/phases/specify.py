@@ -23,7 +23,7 @@ from spine.agents.specify_agent import build_specify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts
+from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -81,8 +81,12 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
         # Extract the specification from the agent's response
         spec_content = extract_response(result)
 
+        # Materialize this phase's artifacts to disk immediately
+        phase_artifacts = {"specification.md": spec_content}
+        materialize_phase_artifacts(PhaseName.SPECIFY.value, phase_artifacts, workspace_root)
+
         return {
-            "artifacts": {PhaseName.SPECIFY.value: {"specification.md": spec_content}},
+            "artifacts": {PhaseName.SPECIFY.value: phase_artifacts},
             "current_phase": PhaseName.SPECIFY.value,
             "status": "running",
             "prompt_request": None,

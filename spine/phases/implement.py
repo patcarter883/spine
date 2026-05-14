@@ -23,7 +23,7 @@ from spine.agents.implement_agent import build_implement_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import invoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts
+from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -88,8 +88,12 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
 
         impl_content = extract_response(result)
 
+        # Materialize this phase's artifacts to disk immediately
+        phase_artifacts = {"implementation.md": impl_content}
+        materialize_phase_artifacts(PhaseName.IMPLEMENT.value, phase_artifacts, workspace_root)
+
         return {
-            "artifacts": {PhaseName.IMPLEMENT.value: {"implementation.md": impl_content}},
+            "artifacts": {PhaseName.IMPLEMENT.value: phase_artifacts},
             "current_phase": PhaseName.IMPLEMENT.value,
             "status": "running",
             "prompt_request": None,

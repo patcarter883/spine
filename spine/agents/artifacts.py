@@ -36,6 +36,39 @@ logger = logging.getLogger(__name__)
 ARTIFACTS_DIR = ".spine/artifacts"
 
 
+def materialize_phase_artifacts(
+    phase: str,
+    phase_artifacts: dict[str, str],
+    workspace_root: str,
+) -> None:
+    """Write a single phase's artifacts to the filesystem immediately.
+
+    Unlike :func:`materialize_artifacts` which reads from workflow state, this
+    takes the artifacts dict directly so a phase can persist its own output
+    right after producing it — without waiting for the next phase to call
+    ``materialize_artifacts(state, ...)`` at its start.
+
+    Idempotent — rewrites files on each call.
+
+    Args:
+        phase: The phase name (e.g. ``"specify"``).
+        phase_artifacts: Dict of ``{filename: content}`` for this phase.
+        workspace_root: Absolute path to the project workspace.
+    """
+    if not phase_artifacts:
+        return
+    root = Path(workspace_root)
+    phase_dir = root / ARTIFACTS_DIR / phase
+    phase_dir.mkdir(parents=True, exist_ok=True)
+
+    for filename, content in phase_artifacts.items():
+        if not content:
+            continue
+        file_path = phase_dir / filename
+        file_path.write_text(str(content), encoding="utf-8")
+        logger.debug("Materialized phase artifact: %s", file_path)
+
+
 def materialize_artifacts(
     state: dict[str, Any],
     workspace_root: str,

@@ -66,7 +66,8 @@ def _update_work_progress(
     """Update the work entry's current_phase and status mid-workflow.
 
     Called after each phase node completes so the UI can show progress
-    without waiting for the entire workflow to finish.
+    without waiting for the entire workflow to finish.  Also publishes
+    a WebSocket event so connected UI clients get live push updates.
 
     Args:
         db: The work entries database.
@@ -86,6 +87,18 @@ def _update_work_progress(
     except Exception:
         # Don't let a DB update failure crash the workflow
         logger.warning(f"Failed to update progress for {work_id}", exc_info=True)
+
+    # ── Push event to WebSocket bus ──
+    try:
+        from spine.ui.ws_bus import get_bus
+
+        get_bus().publish_sync(
+            "work_progress",
+            {"work_id": work_id, "current_phase": current_phase, "status": status},
+        )
+    except Exception:
+        # Bus may not be initialised (CLI-only mode) — that's fine.
+        pass
 
 
 # ── Submit work ──
@@ -199,9 +212,8 @@ async def submit_work(
                     merged = {**existing, **node_artifacts}
                     # Deep-merge nested dicts (phase → {name: content})
                     for key in set(existing) & set(node_artifacts):
-                        if (
-                            isinstance(existing[key], dict)
-                            and isinstance(node_artifacts[key], dict)
+                        if isinstance(existing[key], dict) and isinstance(
+                            node_artifacts[key], dict
                         ):
                             merged[key] = {**existing[key], **node_artifacts[key]}
                     node_output = {**node_output, "artifacts": merged}
@@ -220,6 +232,22 @@ async def submit_work(
                         node_name,
                         {"phase": phase, "status": status},
                     )
+
+                # Persist artifacts to disk immediately after each phase
+                # completes, so they're visible on disk without waiting for
+                # the entire workflow to finish.  We use ArtifactStore (with
+                # work_id) and also materialize to the agent-readable path.
+                node_artifacts = node_output.get("artifacts")
+                if node_artifacts and isinstance(node_artifacts, dict):
+                    for art_phase, phase_arts in node_artifacts.items():
+                        if not isinstance(phase_arts, dict):
+                            continue
+                        for art_name, art_content in phase_arts.items():
+                            if art_content is not None:
+                                artifacts.save_artifact(
+                                    work_id, art_phase, art_name, str(art_content)
+                                )
+                                logger.debug(f"[{work_id}] Saved artifact {art_phase}/{art_name}")
 
         # Update work entry with final results
         final_status = result.get("status", "completed")
@@ -257,6 +285,17 @@ async def submit_work(
             },
         )
 
+        # ── Push completion event to WebSocket bus ──
+        try:
+            from spine.ui.ws_bus import get_bus
+
+            get_bus().publish_sync(
+                "work_completed",
+                {"work_id": work_id, "status": final_status},
+            )
+        except Exception:
+            pass
+
         return {
             "work_id": work_id,
             "status": final_status,
@@ -274,6 +313,17 @@ async def submit_work(
             },
         )
         audit.log_event(work_id, "work_failed", "dispatcher", {"error": str(e)})
+
+        # ── Push failure event to WebSocket bus ──
+        try:
+            from spine.ui.ws_bus import get_bus
+
+            get_bus().publish_sync(
+                "work_failed",
+                {"work_id": work_id, "error": str(e)},
+            )
+        except Exception:
+            pass
         return {
             "work_id": work_id,
             "status": TaskStatus.FAILED.value,
