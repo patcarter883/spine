@@ -37,6 +37,13 @@ from spine.ui.ws_bus import Event, get_bus
 
 logger = logging.getLogger(__name__)
 
+# Silence noisy websockets handshake failures — clients (browser preconnect,
+# health probes) that open a TCP socket then disconnect before sending a valid
+# HTTP request trigger EOFError/InvalidMessage at INFO level.  These are
+# harmless and expected.  Set to WARNING by default; override by configuring
+# the "websockets.server" logger explicitly before importing this module.
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
+
 DEFAULT_WS_PORT = 8765
 
 # ── Process-level guard ──

@@ -184,14 +184,15 @@ def render(api: UIApi) -> None:
             # Show recent work items as clickable buttons
             recent_work = api.list_work(limit=20)
             if recent_work:
-                st.subheader("Recent Work Items")
+                st.subheader("Recent Work Items (newest first)")
                 for item in recent_work:
                     item_id = item.get("id", "")
                     status = item.get("status", "unknown")
                     icon = status_icon(status)
                     desc = truncate(item.get("description", ""), 60)
+                    created = format_timestamp(item.get("created_at"))
 
-                    col1, col2 = st.columns([1, 4])
+                    col1, col2, col3 = st.columns([1, 4, 2])
                     col1.write(f"{icon}")
                     if col2.button(
                         f"**{item_id}** — {desc}",
@@ -202,6 +203,7 @@ def render(api: UIApi) -> None:
                             get_page("work-detail"),
                             query_params={"work_id": item_id},
                         )
+                    col3.caption(created)
 
             return
 

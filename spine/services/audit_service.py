@@ -105,7 +105,7 @@ class AuditService:
         results = table.rows_where(
             where=where,
             where_args=where_args if where_args else None,
-            order_by="-timestamp",
+            order_by="timestamp DESC",
             limit=limit,
         )
         # Parse details JSON back to dict

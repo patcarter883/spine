@@ -237,11 +237,11 @@ class RalphLoopWorker:
             limit: Maximum number of items to return.
 
         Returns:
-            List of pending queue item dicts, oldest first.
+            List of pending queue item dicts, newest first.
         """
         rows = list(
             self._get_db()["queue"].rows_where(
-                "status = ?", ["pending"], order_by="enqueued_at", limit=limit,
+                "status = ?", ["pending"], order_by="enqueued_at DESC", limit=limit,
             )
         )
         return rows

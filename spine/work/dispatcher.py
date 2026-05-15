@@ -31,13 +31,14 @@ from spine.services.audit_service import AuditService
 logger = logging.getLogger(__name__)
 
 # ── Stall detection ─────────────────────────────────────────────────────
-# Maximum time to wait for a single graph chunk before declaring the
-# workflow stalled.  When a subagent's LLM call hangs (e.g. OpenRouter
-# drops the connection but never closes it), the astream iterator blocks
-# forever.  This timeout catches that condition and marks the work item
-# as "stalled" so the UI and queue show the real state.
-# Default: 10 minutes (2x the 5-minute LLM request_timeout).
-_STALL_TIMEOUT_SECONDS = int(__import__("os").environ.get("SPINE_STALL_TIMEOUT", "600"))
+# Maximum time to wait for a single stream event (update or LLM token)
+# before declaring the workflow stalled.  With stream_mode=["updates",
+# "messages"] and subgraphs=True, token-level LLM output keeps this timer
+# alive during long agent runs.  Only a genuine connection drop or hung
+# LLM call will trigger the stall.
+# Default: 2 minutes — generous enough for brief pauses between agent
+# turns, but catches genuine hangs quickly.
+_STALL_TIMEOUT_SECONDS = int(__import__("os").environ.get("SPINE_STALL_TIMEOUT", "120"))
 
 
 # ── Work entries database ──
@@ -205,12 +206,30 @@ async def submit_work(
         # This lets the UI see progress (current_phase, status) while the
         # workflow is still running, instead of only getting the final result.
         #
+        # Stream mode: ["updates", "messages"] with subgraphs=True.
+        #   - "updates" yields {node_name: output} on each node completion
+        #     (same as the default "values" mode but without full state).
+        #   - "messages" yields token-level LLM output from inside nodes,
+        #     keeping the stall timer alive during long agent runs.
+        #   - subgraphs=True reaches into Deep Agent subgraph LLM calls.
+        #
+        # With mixed stream_mode, chunks are tuples: (mode, data).
+        #   - ("updates", {node_name: output}) — node completed
+        #   - ("messages", (AIMessageChunk, metadata)) — LLM token
+        #
         # Stall detection: wrap the astream iterator with a per-chunk timeout.
-        # If no chunk arrives within _STALL_TIMEOUT_SECONDS, the workflow is
-        # considered stalled (e.g. a subagent LLM call hung).  We mark the
-        # work entry as "stalled" and break out instead of blocking forever.
+        # If no chunk (update OR message token) arrives within
+        # _STALL_TIMEOUT_SECONDS, the workflow is considered stalled
+        # (e.g. the LLM connection dropped silently).  Token-level streaming
+        # means the timer resets on every LLM token, so only a genuine
+        # hang triggers the stall — not a legitimately long agent run.
         result: dict[str, Any] = dict(initial_state)
-        stream_iter = graph.astream(initial_state, thread_config)
+        stream_iter = graph.astream(
+            initial_state,
+            thread_config,
+            stream_mode=["updates", "messages"],
+            subgraphs=True,
+        )
         stalled = False
         while True:
             try:
@@ -236,8 +255,21 @@ async def submit_work(
                     {"last_phase": last_phase, "timeout": _STALL_TIMEOUT_SECONDS},
                 )
                 break
-            # Each chunk is {node_name: partial_state_update}
-            for node_name, node_output in chunk.items():
+
+            # With stream_mode=["updates", "messages"], each chunk is a
+            # tuple (mode, data).  Skip message tokens — they only serve
+            # to keep the stall timer alive.  Process "updates" chunks
+            # (node completions) for state tracking and artifact persistence.
+            if not isinstance(chunk, tuple) or len(chunk) != 2:
+                continue
+            mode, data = chunk
+            if mode != "updates":
+                # "messages" tokens just reset the stall timer — nothing
+                # else to do with them here.
+                continue
+
+            # data is {node_name: partial_state_update}
+            for node_name, node_output in data.items():
                 # Deep-merge artifacts so phase outputs accumulate instead of
                 # getting overwritten.  The LangGraph state reducer does this
                 # inside the graph, but our local `result` dict needs the same
@@ -465,11 +497,11 @@ def list_work(
         rows = table.rows_where(
             "status = ?",
             [status],
-            order_by="-created_at",
+            order_by="created_at DESC",
             limit=limit,
         )
     else:
-        rows = table.rows_where(order_by="-created_at", limit=limit)
+        rows = table.rows_where(order_by="created_at DESC", limit=limit)
 
     results = []
     for row in rows:
@@ -650,10 +682,25 @@ async def resume_work(
         }
 
         # Stream the graph, updating the work entry after each phase
-        # (same pattern as submit_work)
+        # (same pattern as submit_work — uses stream_mode=["updates", "messages"]
+        # with subgraphs=True for token-level liveness / stall detection)
         result: dict[str, Any] = dict(resume_state)
-        async for chunk in graph.astream(resume_state, thread_config):
-            for node_name, node_output in chunk.items():
+        async for chunk in graph.astream(
+            resume_state,
+            thread_config,
+            stream_mode=["updates", "messages"],
+            subgraphs=True,
+        ):
+            # With mixed stream_mode, chunks are tuples (mode, data).
+            # Skip message tokens — they only serve to keep the stall timer
+            # alive.  Process "updates" for state tracking.
+            if not isinstance(chunk, tuple) or len(chunk) != 2:
+                continue
+            mode, data = chunk
+            if mode != "updates":
+                continue
+
+            for node_name, node_output in data.items():
                 # Deep-merge artifacts
                 node_artifacts = node_output.get("artifacts")
                 if node_artifacts and isinstance(node_artifacts, dict):

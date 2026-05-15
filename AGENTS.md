@@ -380,6 +380,7 @@ LANGSMITH_PROJECT=spine
 - **`.env` must be at project root** — `spine/config.py` loads `.env` from `Path.cwd()`. If running from a different directory, the env vars won't be loaded. `langgraph dev` handles this via `langgraph.json`.
 - **Resume re-runs the full graph** — `resume_work()` re-invokes the entire StateGraph from START with accumulated state + human feedback. It does NOT resume from the exact checkpoint position. For true mid-graph resume, use LangGraph's `interrupt()` + `Command(resume=...)` pattern instead.
 - **Critic node `current_phase` is always `"critic"`** — The critic returns `current_phase: PhaseName.CRITIC.value` regardless of which phase it's reviewing (e.g. `critic_plan` node still returns `current_phase: "critic"`). The audit log uses the node name (`critic_plan`) which is correct, but `current_phase` in state is generic.
+- **Stall detection uses token-level streaming** — The dispatcher streams the graph with `stream_mode=["updates", "messages"]` and `subgraphs=True`. This means the stall timer (`SPINE_STALL_TIMEOUT`, default 120s) resets on every LLM token, not just on node completions. Only a genuine connection drop triggers a stall — legitimately long agent runs keep the timer alive. Do NOT revert to `stream_mode="values"` or remove `subgraphs=True` without also increasing the stall timeout, or long agent runs will be falsely marked as stalled.
 
 ---
 
