@@ -6,6 +6,9 @@ the agent reads them on demand from the filesystem.
 
 Context engineering: summarization middleware enabled for long-running
 multi-slice implementation.
+
+Phase node functions are async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer.
 """
 
 from __future__ import annotations
@@ -21,11 +24,12 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.implement_agent import build_implement_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import invoke_with_retry
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
+    scan_artifact_dir,
     _artifact_path,
 )
 from spine.workflow.registry import get_registry
@@ -37,7 +41,7 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the IMPLEMENT phase.
 
     Delegates to the implement Deep Agent, which writes code for each
@@ -110,7 +114,7 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
 
         ctx = build_context(state, PhaseName.IMPLEMENT)
 
-        result = invoke_with_retry(
+        result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.IMPLEMENT.value,
@@ -120,14 +124,27 @@ def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None
 
         impl_content = extract_response(result)
 
-        # Materialize full content to disk immediately
-        phase_artifacts = {"implementation.md": impl_content}
-        materialize_phase_artifacts(PhaseName.IMPLEMENT.value, phase_artifacts, workspace_root, work_id=work_id)
+        # ── Collect artifacts from disk (agent writes via write_file) ─────
+        # The authoritative artifacts are the files the agent wrote to disk,
+        # NOT the extracted LLM response.  For thinking models the response
+        # is chain-of-thought reasoning.
+        disk_artifacts = scan_artifact_dir(
+            workspace_root, work_id, PhaseName.IMPLEMENT.value,
+            max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        )
+
+        # Fallback: if agent wrote nothing, materialize from response
+        if not disk_artifacts and impl_content.strip():
+            materialize_phase_artifacts(
+                PhaseName.IMPLEMENT.value,
+                {"implementation.md": impl_content},
+                workspace_root,
+                work_id=work_id,
+            )
+            disk_artifacts = {"implementation.md": impl_content[:_MAX_ARTIFACT_STATE_CHARS]}
 
         return {
-            "artifacts": {PhaseName.IMPLEMENT.value: {
-                "implementation.md": impl_content[:_MAX_ARTIFACT_STATE_CHARS]
-            }},
+            "artifacts": {PhaseName.IMPLEMENT.value: disk_artifacts},
             "current_phase": PhaseName.IMPLEMENT.value,
             "status": "running",
             "prompt_request": None,

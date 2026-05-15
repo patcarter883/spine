@@ -7,6 +7,9 @@ reads them on demand with filesystem tools.
 Context engineering: summarization middleware enabled for long-running
 multi-slice verification. RLM parallel dispatch via eval+PTC for per-slice
 verification subagents.
+
+Phase node functions are async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer.
 """
 
 from __future__ import annotations
@@ -22,11 +25,12 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.verify_agent import build_verify_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import invoke_with_retry
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
+    scan_artifact_dir,
     _artifact_path,
 )
 from spine.workflow.registry import get_registry
@@ -38,7 +42,7 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the VERIFY phase.
 
     Delegates to the verify Deep Agent, which reviews all artifacts
@@ -109,7 +113,7 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
 
         ctx = build_context(state, PhaseName.VERIFY)
 
-        result = invoke_with_retry(
+        result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.VERIFY.value,
@@ -119,26 +123,39 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
 
         verify_content = extract_response(result)
 
-        # Provide a fallback if the agent returned nothing useful
-        if not verify_content or len(verify_content.strip()) < 20:
-            verify_content = (
-                "Verification could not produce a meaningful report. "
-                "The agent returned insufficient output. "
-                "Manual review is required."
-            )
+        # ── Collect artifacts from disk (agent writes via write_file) ─────
+        disk_artifacts = scan_artifact_dir(
+            workspace_root, work_id, PhaseName.VERIFY.value,
+            max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        )
 
-        # Determine final status from verification (use full content)
-        is_verified = "VERIFIED" in verify_content.upper() or "PASSED" in verify_content.upper()
+        # Fallback: if agent wrote nothing, use the extracted response
+        if not disk_artifacts:
+            # Provide a fallback if the agent returned nothing useful
+            if not verify_content or len(verify_content.strip()) < 20:
+                verify_content = (
+                    "Verification could not produce a meaningful report. "
+                    "The agent returned insufficient output. "
+                    "Manual review is required."
+                )
+            materialize_phase_artifacts(
+                PhaseName.VERIFY.value,
+                {"verification.md": verify_content},
+                workspace_root,
+                work_id=work_id,
+            )
+            disk_artifacts = {"verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]}
+
+        # Determine final status from verification content
+        # Check the verification artifact (use first one found on disk, or the response)
+        verify_text = ""
+        if disk_artifacts:
+            verify_text = next(iter(disk_artifacts.values()), "")
+        is_verified = "VERIFIED" in verify_text.upper() or "PASSED" in verify_text.upper()
         final_status = "completed" if is_verified else "needs_review"
 
-        # Materialize full content to disk immediately
-        phase_artifacts = {"verification.md": verify_content}
-        materialize_phase_artifacts(PhaseName.VERIFY.value, phase_artifacts, workspace_root, work_id=work_id)
-
         return {
-            "artifacts": {PhaseName.VERIFY.value: {
-                "verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]
-            }},
+            "artifacts": {PhaseName.VERIFY.value: disk_artifacts},
             "current_phase": PhaseName.VERIFY.value,
             "status": final_status,
             "prompt_request": None,
@@ -146,7 +163,7 @@ def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -
                 {
                     "status": "passed" if is_verified else "needs_review",
                     "tier": "verify",
-                    "reason": verify_content[:500],
+                    "reason": verify_text[:500],
                     "suggestions": [],
                 }
             ],

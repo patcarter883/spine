@@ -3,6 +3,9 @@
 This phase takes a specification and produces a technical plan document.
 Context engineering: specification is on disk (not inlined). SpineContext
 passed at invoke time.
+
+Phase node functions are async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer.
 """
 
 from __future__ import annotations
@@ -18,15 +21,15 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.plan_agent import build_plan_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import invoke_with_retry
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts
+from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts, _artifact_path
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
 
 
-def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the PLAN phase.
 
     Delegates to the plan Deep Agent, which designs the technical architecture
@@ -72,7 +75,7 @@ def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> 
 
         ctx = build_context(state, PhaseName.PLAN)
 
-        result = invoke_with_retry(
+        result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.PLAN.value,

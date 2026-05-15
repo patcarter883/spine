@@ -3,12 +3,14 @@
 This is where decomposition occurs. The tasks Deep Agent reads the plan
 (on disk, not inlined) and breaks it into smaller, independent feature
 slices that can be implemented in parallel or sequentially.
+
+Phase node functions are async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 from typing import Optional
@@ -19,9 +21,10 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.tasks_agent import build_tasks_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import invoke_with_retry
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
+    scan_artifact_dir,
     materialize_artifacts,
     materialize_phase_artifacts,
     _artifact_path,
@@ -30,50 +33,13 @@ from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
 
-# ── Pattern for discovering slice files written by the agent ────────────
-# After the tasks agent runs, it may have written individual slice files
-# (e.g. slice-auth-middleware.md) alongside the main tasks.md.  We scan
-# for these so the artifacts dict in state stays consistent with disk,
-# preventing later phases from losing access to them.
-
-_SLICE_PATTERN = "slice-*.md"
-
 # Maximum characters of artifact content to store in WorkflowState.
-# Full content lives on disk via materialize_phase_artifacts(). Keeping
+# Full content lives on disk via scan_artifact_dir(). Keeping
 # state compact prevents ~260K tokens of artifact bloat across turns.
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-def _collect_slice_files(
-    workspace_root: str,
-    work_id: str,
-) -> dict[str, str]:
-    """Read slice files and return truncated previews for state.
-
-    Full content is already on disk — state only needs enough to show
-    in artifact prompts and satisfy the artifact gate threshold (≥50 chars).
-
-    Args:
-        workspace_root: Absolute path to the project workspace.
-        work_id: Work item identifier for path scoping.
-
-    Returns:
-        Dict of ``{filename: truncated_preview}`` for each discovered slice file.
-    """
-    tasks_dir = Path(workspace_root) / _artifact_path(work_id, PhaseName.TASKS.value)
-    if not tasks_dir.is_dir():
-        return {}
-    slices: dict[str, str] = {}
-    for path in sorted(tasks_dir.glob(_SLICE_PATTERN)):
-        try:
-            content = path.read_text(encoding="utf-8")
-            slices[path.name] = content[:_MAX_ARTIFACT_STATE_CHARS]
-        except OSError:
-            logger.warning("Could not read slice file: %s", path)
-    return slices
-
-
-def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the TASKS phase.
 
     Delegates to the tasks Deep Agent, which decomposes the plan into
@@ -107,6 +73,10 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
 
+        # ── Compute the exact artifact output path ──
+        # The agent needs the full work_id-scoped path to write slice files.
+        tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
+
         prompt_lines = [
             "Break the plan into smaller, executable feature slices "
             "with clear dependencies.",
@@ -114,6 +84,10 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
             "## Work Description",
             description,
             "",
+            f"## Artifact Output Directory\n"
+            f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
+            f"This is relative to your workspace root (`{workspace_root}`).\n"
+            f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
         ]
         if has_spec:
             prompt_lines.extend([
@@ -139,10 +113,15 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
                 "",
             ])
         prompt_lines.extend([
-            "Write each slice as a separate file named `slice-<name>.md` "
-            "in the tasks artifact directory, then produce a summary "
-            "`tasks.md` that references them.",
-            "",
+            f"## Instructions\n"
+            f"1. Explore the codebase (use researcher subagents via the interpreter\n"
+            f"   for parallel exploration, or `read_file`/`grep` for quick checks).\n"
+            f"2. After exploring, write individual `slice-<name>.md` files using\n"
+            f"   `write_file` to `{tasks_artifact_dir}/slice-<name>.md`.\n"
+            f"3. Write a summary `tasks.md` to `{tasks_artifact_dir}/tasks.md`\n"
+            f"   that references each slice.\n"
+            f"4. **You MUST call `write_file`** — do not just describe the slices\n"
+            f"   in conversation. Write them to disk.\n",
         ])
         prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
@@ -155,7 +134,7 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
 
         ctx = build_context(state, PhaseName.TASKS)
 
-        result = invoke_with_retry(
+        result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.TASKS.value,
@@ -163,19 +142,35 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
             context=ctx,
         )
 
-        tasks_content = extract_response(result)
+        # ── Collect artifacts from disk (agent writes via write_file) ───────
+        # The authoritative artifacts are the files the agent wrote to disk,
+        # NOT the extracted LLM response.  For thinking models (e.g.
+        # DeepSeek-v4-flash), the last message content is chain-of-thought
+        # reasoning that should NOT become an artifact.
+        disk_artifacts = scan_artifact_dir(
+            workspace_root, work_id, PhaseName.TASKS.value,
+            max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        )
 
-        # Collect any slice files the agent wrote to disk
-        slice_files = _collect_slice_files(workspace_root, work_id)
+        # ── Fallback: if agent wrote nothing, try extract_response ────────
+        # This handles agents that produce output in conversation but never
+        # called write_file (e.g. non-thinking models on simple tasks).
+        if not disk_artifacts:
+            tasks_content = extract_response(result)
+            if tasks_content.strip():
+                # Materialize to disk so later phases can read it
+                materialize_phase_artifacts(
+                    PhaseName.TASKS.value,
+                    {"tasks.md": tasks_content},
+                    workspace_root,
+                    work_id=work_id,
+                )
+                disk_artifacts = {"tasks.md": tasks_content[:_MAX_ARTIFACT_STATE_CHARS]}
 
         # ── Detect empty response (agent explored but never wrote) ─────
-        # The agent may read files and reason about the codebase but never
-        # produce output — especially with thinking models that exhaust
-        # their reasoning budget mid-analysis.  Retry once with a direct,
-        # output-focused prompt that skips exploration altogether.
-        if not tasks_content.strip() and not slice_files:
+        if not disk_artifacts:
             logger.warning(
-                "[%s] TASKS agent produced no output and no slice files — "
+                "[%s] TASKS agent produced no output and no files — "
                 "retrying with direct output prompt",
                 work_id,
             )
@@ -195,17 +190,32 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
                 "- **Complexity:** small\n"
                 "- **Acceptance:** ...\n```\n"
             )
-            retry_result = invoke_with_retry(
+            retry_result = await ainvoke_with_retry(
                 agent,
                 {"messages": [{"role": "user", "content": retry_prompt}]},
                 phase_name=PhaseName.TASKS.value,
                 work_id=work_id,
                 context=ctx,
             )
-            tasks_content = extract_response(retry_result)
-            slice_files = _collect_slice_files(workspace_root, work_id)
+            # Scan disk again after retry
+            disk_artifacts = scan_artifact_dir(
+                workspace_root, work_id, PhaseName.TASKS.value,
+                max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+            )
 
-            if not tasks_content.strip() and not slice_files:
+            # If still nothing, try extract_response from retry
+            if not disk_artifacts:
+                tasks_content = extract_response(retry_result)
+                if tasks_content.strip():
+                    materialize_phase_artifacts(
+                        PhaseName.TASKS.value,
+                        {"tasks.md": tasks_content},
+                        workspace_root,
+                        work_id=work_id,
+                    )
+                    disk_artifacts = {"tasks.md": tasks_content[:_MAX_ARTIFACT_STATE_CHARS]}
+
+            if not disk_artifacts:
                 logger.error(
                     "[%s] TASKS agent produced no output on retry either — "
                     "flagging for human review",
@@ -230,23 +240,8 @@ def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) ->
                     "prompt_request": None,
                 }
 
-        # Materialize main artifact to disk (slice files already on disk from agent writes)
-        materialize_phase_artifacts(
-            PhaseName.TASKS.value,
-            {"tasks.md": tasks_content},
-            workspace_root,
-            work_id=work_id,
-        )
-
-        # Build state artifacts with truncated previews — full content is on disk
-        phase_artifacts: dict[str, str] = {
-            "tasks.md": tasks_content[:_MAX_ARTIFACT_STATE_CHARS]
-        }
-        # Merge in slice files (existing state files preserved by reducer)
-        phase_artifacts.update(slice_files)
-
         return {
-            "artifacts": {PhaseName.TASKS.value: phase_artifacts},
+            "artifacts": {PhaseName.TASKS.value: disk_artifacts},
             "current_phase": PhaseName.TASKS.value,
             "status": "running",
             "prompt_request": None,

@@ -6,6 +6,10 @@ and documentation.
 
 Context engineering: prior artifacts are on disk (not inlined). SpineContext
 is passed at invoke time for typed per-run context.
+
+Phase node functions are async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer — sync nodes run in a thread
+pool, which breaks ``asyncio.Lock`` objects bound to the original loop.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.specify_agent import build_specify_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import invoke_with_retry
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
@@ -33,7 +37,7 @@ from spine.workflow.registry import get_registry
 logger = logging.getLogger(__name__)
 
 
-def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the SPECIFY phase.
 
     Delegates to the specify Deep Agent, which generates a specification
@@ -74,7 +78,7 @@ def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) 
         # Build runtime context for the agent
         ctx = build_context(state, PhaseName.SPECIFY)
 
-        result = invoke_with_retry(
+        result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.SPECIFY.value,

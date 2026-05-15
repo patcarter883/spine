@@ -8,6 +8,9 @@ It performs two-tier review (structural + agent) and routes:
 
 This module provides the node function for the LangGraph graph.
 The actual review logic is in ``spine.workflow.critic_review``.
+
+Phase node functions are async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from spine.workflow.registry import get_registry
 logger = logging.getLogger(__name__)
 
 
-def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Execute the CRITIC phase node.
 
     Runs two-tier review and updates state with feedback and retry counts.
@@ -72,7 +75,7 @@ def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -
         }
 
     # ── Tier 2: Agent check ──
-    agent_result = agent_critic_check(state, reviewed_phase, config=config)
+    agent_result = await agent_critic_check(state, reviewed_phase, config=config)
     logger.info(f"[{work_id}] Agent check for {reviewed_phase}: {agent_result['status']}")
 
     # Increment retry count if needs revision
