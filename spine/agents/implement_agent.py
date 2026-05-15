@@ -2,7 +2,7 @@
 
 Uses the shared :func:`build_phase_agent` factory with summarization
 middleware enabled (IMPLEMENT can be long-running with many slices).
-RLM guidance via the ``rlm-pattern`` skill, prior artifacts on disk.
+Structured gather→execute workflow keeps the agent's context lean.
 """
 
 from __future__ import annotations
@@ -43,35 +43,42 @@ def build_implement_agent(
         A compiled Deep Agent ready for invocation.
     """
     workspace_root = state.get("workspace_root", ".")
-
     work_id = state.get("work_id", "")
+    tasks_path = f".spine/artifacts/{work_id}/tasks"
 
     system_prompt = (
         "You are an implementation engineer. Given feature slices, "
         "generate production-quality code to implement each one.\n\n"
-        "Guidelines:\n"
-        "1. Write clean, well-documented code\n"
-        "2. Follow the project's existing coding conventions and patterns\n"
-        "3. Include appropriate type annotations and docstrings\n"
-        "4. Handle errors gracefully\n"
-        "5. Write code that is testable\n\n"
-        "**RLM parallel implementation pattern:** Use `eval` to read the "
-        "tasks artifact, extract slice names and dependencies, wave-sort "
-        "them in JS code, then dispatch independent slices in parallel via "
-        "`Promise.all(tools.task(...))` using `slice-implementer` subagents. "
-        "Collect results in the interpreter, process wave by wave, and only "
-        "return a compact implementation summary to the conversation.\n\n"
-        "For simple single-slice work, direct tool calls are fine. For "
-        "≥2 independent slices, always use eval + Promise.all for parallel "
-        "dispatch.\n\n"
-        f"Your workspace root is: {workspace_root}\n"
-        "All file paths should be relative to this root directory. "
-        "Use the write_file tool to create files on disk.\n\n"
-        "After implementing all slices, provide a summary of what "
-        "was created and any decisions made during implementation.\n\n"
-        "Prior artifacts (specification, plan, feature slices) are on disk — "
-        "use `read_file` and `grep` to inspect them when needed. "
-        "Do NOT load everything into context at once.\n\n"
+        f"Your workspace root is: {workspace_root}\n\n"
+        "## Workflow (follow this order)\n\n"
+        "### Phase 1: Gather (1-2 turns)\n"
+        "Batch-read ALL relevant files in ONE response:\n"
+        "- Read the tasks artifact and all slice files\n"
+        "- Read every target source file you will modify\n"
+        f"- Read the codebase map (if available): `{tasks_path}/codebase-map.md`\n"
+        "- Use grep/glob to find related files\n"
+        "Do NOT start writing until you have gathered context.\n\n"
+        "### Phase 2: Plan (1 turn, use eval)\n"
+        "Use `eval` to:\n"
+        "- Parse slice dependencies and sort into waves\n"
+        "- Determine which slices can be implemented in parallel\n"
+        "- Build an execution plan with file-level changes\n\n"
+        "### Phase 3: Execute (2-4 turns)\n"
+        "For each wave:\n"
+        "- If ≥2 independent slices: dispatch slice-implementer subagents "
+        "via `Promise.all(tools.task(...))` from eval\n"
+        "- If 1 slice or dependent work: implement directly with "
+        "write_file/edit_file (batch related edits in one response)\n"
+        "- After each wave, run tests with execute\n\n"
+        "### Phase 4: Verify (1-2 turns)\n"
+        "- Run the full test suite\n"
+        "- Fix any failures\n"
+        "- Write implementation.md summary to disk\n\n"
+        "## Rules\n"
+        "- Batch reads: read ≥3 files per turn, not one at a time\n"
+        "- Use eval for orchestration, not conversation\n"
+        "- Never re-read a file you already have in context\n"
+        "- After 2 failed attempts at the same fix, stop and re-analyze\n\n"
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
         )

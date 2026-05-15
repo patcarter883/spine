@@ -2,8 +2,7 @@
 
 Uses the shared :func:`build_phase_agent` factory with summarization
 middleware enabled (VERIFY can be long-running across many slices).
-RLM guidance via the ``rlm-pattern`` skill, verification guidance via
-the ``code-review`` skill, prior artifacts on disk.
+Structured gather→verify→report workflow with parallel subagent dispatch.
 """
 
 from __future__ import annotations
@@ -44,39 +43,35 @@ def build_verify_agent(
         A compiled Deep Agent ready for invocation.
     """
     workspace_root = state.get("workspace_root", ".")
-
     work_id = state.get("work_id", "")
+    tasks_path = f".spine/artifacts/{work_id}/tasks"
 
     system_prompt = (
         "You are a verification engineer. Review the implementation "
         "against the specification, plan, and feature slices.\n\n"
         f"Your workspace root is: {workspace_root}\n\n"
-        "IMPORTANT: You have filesystem and shell tools available. Use them!\n"
-        "1. Use read_file and ls to inspect the actual implemented files\n"
-        "2. Use execute to run tests and check for errors\n"
-        "3. Verify that files mentioned in the implementation actually exist\n\n"
-        "**RLM parallel verify pattern (USE THIS):** Read the tasks artifact "
-        "into eval, extract the slice list, then dispatch ONE `slice-verifier` "
-        "subagent per slice via `Promise.allSettled(tools.task(...))`. Each "
-        "subagent verifies one slice independently. Synthesize the final "
-        "verification report from subagent results in eval code. Do NOT "
-        "manually re-read each slice file into conversation — that's what "
-        "the subagents are for.\n\n"
-        "Check:\n"
-        "1. All feature slices are implemented\n"
-        "2. The implementation follows the plan's architecture\n"
-        "3. Success criteria from the specification are met\n"
-        "4. Code quality is acceptable (no obvious bugs)\n"
-        "5. Error handling is in place\n\n"
-        "Produce a verification report with:\n"
+        "## Workflow (follow this order)\n\n"
+        "### Phase 1: Gather (1-2 turns)\n"
+        "Batch-read ALL relevant artifacts and source files in ONE response:\n"
+        "- Read tasks.md and all slice files\n"
+        f"- Read the codebase map (if available): `{tasks_path}/codebase-map.md`\n"
+        "- Read the implementation summary\n"
+        "- Read the actual source files that were modified\n\n"
+        "### Phase 2: Verify (1-2 turns)\n"
+        "For ≥2 slices: dispatch slice-verifier subagents via "
+        "`Promise.allSettled(tools.task(...))` from eval — one per slice.\n"
+        "For 1 slice: verify directly using read_file and execute.\n\n"
+        "### Phase 3: Report (1 turn)\n"
+        "Synthesize findings into a verification report:\n"
         "- VERIFIED or NOT VERIFIED status\n"
         "- Checklist of each feature slice and its status\n"
         "- Any gaps or issues found\n"
-        "- Recommendations for improvement\n\n"
-        "End your report with a clear VERIFIED or NOT VERIFIED verdict.\n\n"
-        "Prior artifacts (specification, plan, feature slices) are on disk — "
-        "use `read_file` and `grep` to inspect them when needed. "
-        "Do NOT load everything into context at once.\n\n"
+        "- Write verification.md to disk\n\n"
+        "## Rules\n"
+        "- Batch reads: never read one file at a time\n"
+        "- Use eval for parallel subagent dispatch\n"
+        "- Inspect actual code, not just the implementation summary\n"
+        "- Run tests — do not assume they pass\n\n"
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
         )
