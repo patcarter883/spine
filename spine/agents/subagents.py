@@ -262,13 +262,19 @@ def build_subagent_spec(
     from spine.agents.skills_resolver import resolve_memory
 
     workspace_root = state.get("workspace_root", ".")
+    work_id = state.get("work_id", "")
 
     # ── Model: phase/subagents/<name> → phase → default ──────────
+    # Pass session_id so OpenRouter models get a pre-built ChatOpenRouter
+    # instance with request_timeout set. Without this, the model string
+    # goes through init_chat_model() which creates a ChatOpenRouter
+    # WITHOUT request_timeout — hung API connections then block the
+    # workflow indefinitely (no 5-minute timeout).
     model_path = f"{phase.value}/subagents/{name}"
-    model = resolve_model(config, phase=model_path)
+    model = resolve_model(config, session_id=work_id, phase=model_path)
 
-    # ── Memory: always include project AGENTS.md ─────────────────
-    memory = resolve_memory(workspace_root)
+    # ── Memory: include project AGENTS.md (skip for TASKS/CRITIC phases) ──
+    memory = resolve_memory(workspace_root, phase=phase.value)
 
     # ── Skills: default per subagent type + any extra ─────────────
     skills = _resolve_subagent_skills(name, phase, workspace_root, extra_skills)

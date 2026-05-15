@@ -159,12 +159,34 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
     # Note: ChatOpenRouter expects milliseconds, not seconds.
     timeout_ms = _resolve_timeout_from_config(default=300) * 1000
 
-    return ChatOpenRouter(
-        model=model_name,
-        session_id=truncated_session_id,
-        request_timeout=timeout_ms,
+    # ── Resolve max_completion_tokens ────────────────────────────────
+    # When max_completion_tokens is not set, reasoning models (e.g.
+    # DeepSeek-v4-flash) can consume their entire output budget on
+    # chain-of-thought tokens, leaving the visible content truncated
+    # mid-generation.  Setting an explicit limit ensures the model
+    # allocates enough output budget to produce complete artifacts.
+    #
+    # Provider config can override via providers.llm[].max_completion_tokens
+    # or providers.llm[].max_tokens.  max_completion_tokens is preferred
+    # (it includes reasoning tokens in the budget, giving the model full
+    # control over allocation).
+    provider_cfg = _active_provider_config() or {}
+    max_completion_tokens = provider_cfg.get("max_completion_tokens")
+    max_tokens = provider_cfg.get("max_tokens")
+
+    model_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "session_id": truncated_session_id,
+        "request_timeout": timeout_ms,
         **profile_kwargs,
-    )
+    }
+    if max_completion_tokens is not None:
+        model_kwargs["max_completion_tokens"] = int(max_completion_tokens)
+    elif max_tokens is not None:
+        # Fall back to max_tokens if max_completion_tokens isn't set
+        model_kwargs["max_tokens"] = int(max_tokens)
+
+    return ChatOpenRouter(**model_kwargs)
 
 
 def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseChatModel:
@@ -199,7 +221,7 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
         kwargs["api_key"] = api_key
 
     # Pass through optional tuning fields if present
-    for key in ("temperature", "max_tokens", "max_retries", "request_timeout"):
+    for key in ("temperature", "max_tokens", "max_completion_tokens", "max_retries", "request_timeout"):
         if key in provider_cfg:
             kwargs[key] = provider_cfg[key]
 
@@ -243,14 +265,34 @@ def _resolve_timeout_from_config(default: int = 300) -> int:
 def extract_response(result: dict[str, Any]) -> str:
     """Extract the text content from a Deep Agent's last message.
 
+    For thinking/reasoning models (e.g. DeepSeek-v4-flash), the final
+    message content may be chain-of-thought reasoning rather than
+    structured output.  We detect this pattern and return an empty string
+    to avoid polluting artifacts with leaked reasoning.
+
     Args:
         result: The agent result dict (has ``"messages"`` key).
 
     Returns:
-        The content string of the final message, or empty string if none.
+        The content string of the final message, or empty string if the
+        content appears to be leaked reasoning or is absent.
     """
     messages = result.get("messages", [])
     if messages:
         last = messages[-1]
-        return getattr(last, "content", str(last))
+        content = getattr(last, "content", str(last))
+        if not content:
+            return ""
+        # ── Detect leaked thinking-model reasoning ─────────────────────
+        # Thinking models sometimes put their chain-of-thought in the
+        # content field instead of reasoning_content.  Common patterns:
+        #   - "Now let me check..." / "Let me look at..." / "I should..."
+        #   - "Good, I can see..." / "The problem is..."
+        #   - Starts with a lowercase letter (structured artifacts start
+        #     with a heading or title case)
+        stripped = content.strip()
+        if stripped and not stripped[0].isupper() and not stripped[0] in ("#", "*", "-", "|", "`", "[", '"'):
+            # Looks like reasoning, not a structured artifact
+            return ""
+        return content
     return ""

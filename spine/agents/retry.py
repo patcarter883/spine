@@ -5,9 +5,10 @@ or an OpenRouter ``ResponseValidationError`` from an error body), the
 agent invocation should be retried with exponential backoff rather than
 failing the entire workflow immediately.
 
-This module provides ``invoke_with_retry()`` which wraps
-``agent.invoke()`` with configurable retry logic. It classifies errors
-as transient (retryable) or permanent (raise immediately).
+This module provides ``invoke_with_retry()`` and
+``ainvoke_with_retry()`` which wrap ``agent.invoke()`` / ``agent.ainvoke()``
+with configurable retry logic. It classifies errors as transient (retryable)
+or permanent (raise immediately).
 
 Updated to support DA's ``context=`` kwarg for passing SpineContext
 at invoke time.
@@ -15,6 +16,7 @@ at invoke time.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -135,6 +137,11 @@ def invoke_with_retry(
     backoff and jitter. Permanent errors (4xx, auth, logic bugs) raise
     immediately.
 
+    .. deprecated::
+        Prefer :func:`ainvoke_with_retry` for async phase nodes.
+        This sync wrapper is kept for backward compatibility but should
+        not be used in new async node functions.
+
     Args:
         agent: A compiled Deep Agent (result of ``create_deep_agent()``).
         input_: The input dict (typically ``{"messages": [...]}``).
@@ -198,3 +205,95 @@ def invoke_with_retry(
     if last_exc:
         raise last_exc
     raise RuntimeError("invoke_with_retry: unexpected state")
+
+
+async def ainvoke_with_retry(
+    agent: Any,
+    input_: dict[str, Any],
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    max_delay: float = DEFAULT_MAX_DELAY,
+    phase_name: str = "",
+    work_id: str = "",
+    context: Any = None,
+) -> dict[str, Any]:
+    """Async invoke a Deep Agent with exponential backoff retry for transient errors.
+
+    Calls ``agent.ainvoke(input_, context=context)`` and retries on transient
+    API errors with exponential backoff and jitter. This is the async
+    counterpart to :func:`invoke_with_retry` and should be used in all
+    async phase node functions.
+
+    Using ``ainvoke`` instead of ``invoke`` is critical for event loop
+    correctness: when the outer LangGraph graph runs via ``graph.astream()``,
+    sync node functions are dispatched to a thread pool.  Inside that thread,
+    subagents that inherit the parent checkpointer encounter an
+    ``asyncio.Lock`` bound to the original event loop, producing
+    ``RuntimeError: is bound to a different event loop``.  Async nodes
+    stay on the same event loop throughout, avoiding this class of bug
+    entirely.
+
+    Args:
+        agent: A compiled Deep Agent (result of ``create_deep_agent()``).
+        input_: The input dict (typically ``{"messages": [...]}``).
+        max_retries: Maximum number of retry attempts (default 3).
+        base_delay: Initial delay between retries in seconds (default 2).
+        max_delay: Maximum delay cap in seconds (default 60).
+        phase_name: Phase name for logging context.
+        work_id: Work ID for logging context.
+        context: Optional SpineContext to pass via DA's context= kwarg.
+            Propagates to subagents automatically.
+
+    Returns:
+        The agent's result dict.
+
+    Raises:
+        Exception: The last exception if all retries are exhausted, or
+            immediately if the error is permanent (non-transient).
+    """
+    prefix = f"[{work_id}]" if work_id else ""
+    phase_label = f" {phase_name}" if phase_name else ""
+
+    # Build invoke kwargs — only add context if provided
+    invoke_kwargs: dict[str, Any] = {}
+    if context is not None:
+        invoke_kwargs["context"] = context
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await agent.ainvoke(input_, **invoke_kwargs)
+        except Exception as exc:
+            last_exc = exc
+
+            if not _is_transient_error(exc):
+                logger.error(
+                    f"{prefix}{phase_label} permanent error (attempt {attempt + 1}): {exc}"
+                )
+                raise
+
+            if attempt >= max_retries:
+                logger.error(
+                    f"{prefix}{phase_label} exhausted {max_retries} retries for transient error: {exc}"
+                )
+                raise
+
+            # Exponential backoff with jitter
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            jitter = delay * 0.1  # ±10% jitter
+            import random
+
+            sleep_time = delay + random.uniform(-jitter, jitter)
+            sleep_time = max(sleep_time, 0.5)  # floor at 0.5s
+
+            logger.warning(
+                f"{prefix}{phase_label} transient error (attempt {attempt + 1}/{max_retries + 1}), "
+                f"retrying in {sleep_time:.1f}s: {type(exc).__name__}: {exc}"
+            )
+            await asyncio.sleep(sleep_time)
+
+    # Should never reach here, but satisfy the type checker
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("ainvoke_with_retry: unexpected state")

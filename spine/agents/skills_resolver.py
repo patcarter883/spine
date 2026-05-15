@@ -92,6 +92,7 @@ def resolve_skills(
 
 def resolve_memory(
     workspace_root: str | None = None,
+    phase: str | None = None,
 ) -> list[str]:
     """Build the list of memory file paths for a SPINE phase agent.
 
@@ -99,11 +100,16 @@ def resolve_memory(
     context.  We load:
 
     1. The target project's AGENTS.md (if it exists at the workspace root).
+       **Skipped for TASKS and CRITIC phases** — these phases don't need
+       testing patterns, config formats, or dependency tables, and the
+       full file costs ~22K chars (~5K tokens) per turn.
     2. The target project's .spine/AGENTS.md (if it exists — project-specific
-       SPINE conventions).
+       SPINE conventions).  Always loaded — this is typically small.
 
     Args:
         workspace_root: Project workspace root.
+        phase: Phase name (e.g. "tasks", "specify"). When provided, phases
+            that don't benefit from project-level AGENTS.md content skip it.
 
     Returns:
         List of absolute file paths, ready to pass to
@@ -115,12 +121,21 @@ def resolve_memory(
     memory_paths: list[str] = []
     root = Path(workspace_root)
 
+    # Phases that don't need the full project AGENTS.md — it's ~22K chars
+    # of mostly irrelevant content (testing, config, deps, workflows).
+    # The decomposer (TASKS) gets codebase context from researcher subagents
+    # and the architecture overview from the feature-slice-decomposition skill.
+    # The critic (CRITIC) only reviews the artifact under review.
+    _SKIP_AGENTS_MD: set[str] = {PhaseName.TASKS.value, PhaseName.CRITIC.value}
+
     # Project root AGENTS.md
-    agents_md = root / "AGENTS.md"
-    if agents_md.exists():
-        memory_paths.append(str(agents_md))
+    if phase not in _SKIP_AGENTS_MD:
+        agents_md = root / "AGENTS.md"
+        if agents_md.exists():
+            memory_paths.append(str(agents_md))
 
     # .spine/AGENTS.md — SPINE-specific conventions for this project
+    # Always loaded — typically small and highly relevant.
     spine_agents = root / ".spine" / "AGENTS.md"
     if spine_agents.exists():
         memory_paths.append(str(spine_agents))

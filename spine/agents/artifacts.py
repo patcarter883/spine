@@ -152,6 +152,46 @@ def materialize_artifacts(
     return paths
 
 
+def scan_artifact_dir(
+    workspace_root: str,
+    work_id: str,
+    phase: str,
+    max_preview_chars: int = 500,
+) -> dict[str, str]:
+    """Scan a phase artifact directory for files the agent wrote to disk.
+
+    After an agent runs, the authoritative artifacts are the files it wrote via
+    ``write_file`` — not the extracted LLM response (which for thinking models
+    contains leaked reasoning).  This function discovers all files in the
+    artifact directory and returns truncated previews suitable for storing in
+    ``WorkflowState`` (full content lives on disk).
+
+    Args:
+        workspace_root: Absolute path to the project workspace.
+        work_id: Work item identifier for path scoping.
+        phase: The phase name (e.g. ``"tasks"``).
+        max_preview_chars: Maximum characters per file for state previews.
+
+    Returns:
+        Dict of ``{filename: truncated_preview}`` for each discovered file.
+        Returns empty dict if the directory doesn't exist.
+    """
+    root = Path(workspace_root)
+    phase_dir = root / _artifact_path(work_id, phase)
+    if not phase_dir.is_dir():
+        return {}
+
+    artifacts: dict[str, str] = {}
+    for path in sorted(phase_dir.iterdir()):
+        if path.is_file() and not path.name.endswith(".meta.json"):
+            try:
+                content = path.read_text(encoding="utf-8")
+                artifacts[path.name] = content[:max_preview_chars]
+            except OSError:
+                logger.warning("Could not read artifact file: %s", path)
+    return artifacts
+
+
 def build_artifact_prompt(
     artifacts: dict[str, Any],
     current_phase: str,

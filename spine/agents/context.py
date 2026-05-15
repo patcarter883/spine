@@ -12,22 +12,33 @@ the system prompt because:
 
 This module defines ``SpineContext`` — the per-run context for all SPINE
 phase agents — and a helper to build one from a ``WorkflowState``.
+
+.. note::
+
+   ``SpineContext`` is a Pydantic ``BaseModel`` (not a plain dataclass)
+   because LangGraph's config schema uses Pydantic to serialise the
+   ``context_schema`` field during checkpointing.  A plain dataclass
+   produces ``PydanticSerializationUnexpectedValue`` warnings because
+   the Pydantic model field defaults to ``None`` but receives a
+   dataclass instance.  Making it a ``BaseModel`` lets Pydantic
+   serialise it natively, eliminating the warnings.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import BaseModel, Field
 
 from spine.models.enums import PhaseName
 from spine.agents.artifacts import _artifact_path
 
 
-@dataclass
-class SpineContext:
+class SpineContext(BaseModel):
     """Runtime context for a SPINE phase agent invocation.
 
-    Passed via the ``context=`` kwarg to ``agent.invoke()`` and available
-    inside tools as ``runtime.context``.  Propagates to subagents.
+    Passed via the ``context=`` kwarg to ``agent.invoke()`` / ``agent.ainvoke()``
+    and available inside tools as ``runtime.context``.  Propagates to subagents.
 
     Attributes:
         work_id: Unique work item identifier.
@@ -43,14 +54,16 @@ class SpineContext:
         artifact_paths: Mapping of phase name -> artifact file path on disk.
     """
 
+    model_config = {"arbitrary_types_allowed": True}
+
     work_id: str = ""
     phase: str = ""
     active_subagent: str = ""
     workspace_root: str = "."
     retry_count: int = 0
     is_rework: bool = False
-    critic_feedback: list[str] = field(default_factory=list)
-    artifact_paths: dict[str, str] = field(default_factory=dict)
+    critic_feedback: list[str] = Field(default_factory=list)
+    artifact_paths: dict[str, str] = Field(default_factory=dict)
 
 
 def build_context(

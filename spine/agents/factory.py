@@ -149,7 +149,7 @@ def build_phase_agent(
         _add_summarization_middleware(middleware, model, backend)
 
     # ── Memory ───────────────────────────────────────────────────────
-    memory = resolve_memory(workspace_root)
+    memory = resolve_memory(workspace_root, phase=phase.value)
     if memory:
         logger.debug("Phase %s: loading memory files: %s", phase.value, memory)
 
