@@ -115,6 +115,12 @@ def build_phase_agent(
     if add_summarization and not is_subagent:
         _add_summarization_middleware(middleware, model, backend)
 
+    # Context editing: trim old tool results for long-running phases
+    if phase in (PhaseName.IMPLEMENT, PhaseName.VERIFY) and not is_subagent:
+        from spine.agents.context_editing import ToolOutputTrimmer
+
+        middleware.append(ToolOutputTrimmer(max_full_tool_results=20))
+
     # ── Memory ───────────────────────────────────────────────────────
     memory = resolve_memory(workspace_root, phase=phase.value)
     if memory:
@@ -161,39 +167,95 @@ def build_phase_agent(
     return agent
 
 
+_SPINE_SUMMARY_PROMPT = """\
+You are summarizing the conversation history of an autonomous code agent \
+(inside a SPINE workflow phase). The agent is NOT a chatbot — it is a \
+phase executor that reads files, writes code, runs tests, and dispatches \
+subagents. Your summary MUST preserve the agent's working state so it \
+can continue seamlessly after compaction.
+
+PRESERVE these in your summary (in this order):
+
+1. **Active objective**: What is the agent currently working on? Include \
+the exact work description and which phase (tasks/implement/verify).
+
+2. **Files currently being modified**: List every absolute file path the \
+agent has read or written. Mark which ones have UNCOMMITTED changes.
+
+3. **Unresolved errors**: Any compiler errors, linter failures, or test \
+failures the agent has NOT yet fixed. Include the exact error messages.
+
+4. **Feature slice status**: For each slice being implemented/verified, \
+note: slice name, status (not started / in progress / done), and any \
+blockers.
+
+5. **Subagent results**: Brief summary of any subagent (researcher, \
+slice-implementer, slice-verifier) results received.
+
+6. **Offloaded history path**: If the conversation was previously \
+compacted, the offloaded history file path is referenced in the summary \
+message. Preserve that path so the agent can page back if needed.
+
+STRIP: Narration ("I will now..."), planning chatter, and repeated \
+file contents that are available on disk. The agent can re-read files \
+from disk — do not include full file contents in the summary.
+"""
+
+
 def _add_summarization_middleware(
     middleware: list[Any],
     model: Any,
     backend: Any,
 ) -> None:
-    """Add the DA summarization tool middleware to the middleware list.
+    """Add DA summarization middleware with SPINE-specific configuration.
 
-    The summarization tool lets the agent proactively compress its context
-    at opportune times (e.g. between implementation waves) instead of
-    waiting for the automatic 85% context threshold.
-
-    Falls back silently if the middleware is not available or if model
-    initialization fails (e.g. missing API keys in test environments).
+    Three key design decisions:
+    1. Token-based trigger (80K) — model-independent, leaves 48K buffer.
+    2. Custom state-extraction summary prompt — preserves file paths,
+       errors, slice objectives, and offloaded history path.
+    3. Keep window of 20 messages — covers full edit-test-fix cycle.
     """
     try:
         from deepagents.middleware.summarization import (
+            create_summarization_middleware,
             create_summarization_tool_middleware,
         )
 
-        # create_summarization_tool_middleware may internally resolve the
-        # model string, which can fail in test environments without API
-        # keys.  Catch and skip gracefully.
         try:
-            mw = create_summarization_tool_middleware(model, backend)
-            middleware.append(mw)
-            logger.debug("Added summarization tool middleware")
-        except Exception as exc:
-            logger.debug(
-                "Summarization tool middleware could not be initialized "
-                "(skipping): %s", exc
+            # Auto-summarization with aggressive token trigger
+            auto_mw = create_summarization_middleware(
+                model,
+                backend,
+                trigger=("tokens", 80000),
+                keep=("messages", 20),
+                summary_prompt=_SPINE_SUMMARY_PROMPT,
             )
+            middleware.append(auto_mw)
+
+            # Manual compact_conversation tool for on-demand use
+            tool_mw = create_summarization_tool_middleware(model, backend)
+            middleware.append(tool_mw)
+
+            logger.debug(
+                "Added summarization middleware "
+                "(trigger=80K tokens, keep=20 msgs, custom prompt)"
+            )
+        except Exception as exc:
+            # Fallback: try just the tool middleware
+            logger.debug(
+                "Auto-summarization middleware failed, trying tool-only: %s", exc
+            )
+            try:
+                tool_mw = create_summarization_tool_middleware(model, backend)
+                middleware.append(tool_mw)
+                logger.debug("Added summarization tool middleware (fallback)")
+            except Exception as exc2:
+                logger.debug(
+                    "Summarization middleware could not be initialized "
+                    "(skipping): %s", exc2
+                )
     except ImportError:
         logger.debug(
-            "Summarization tool middleware not available "
-            "(requires deepagents >= 0.6.0)"
+            "Summarization middleware not available "
+            "(requires deepagents >= 0.5.0)"
         )
