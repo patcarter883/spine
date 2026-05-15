@@ -219,6 +219,54 @@ class RalphLoopWorker:
                 except Exception:
                     pass
 
+    def reset_stuck_items(self) -> int:
+        """Reset any queue items stuck in "running" back to "pending".
+
+        When the worker or UI dies mid-execution, items remain in "running"
+        status indefinitely.  This method resets them so they can be picked
+        up again on the next dequeue.
+
+        Also purges LangGraph checkpoints for those items so the graph
+        restarts cleanly from phase 0.
+
+        Returns:
+            The number of items that were reset.
+        """
+        from spine.persistence.checkpoint import CheckpointStore
+
+        db = self._get_db()
+        stuck = list(
+            db["queue"].rows_where("status = ?", ["running"], order_by="started_at")
+        )
+        if not stuck:
+            return 0
+
+        checkpoint_store = CheckpointStore(db_path=self.config.checkpoint_path)
+        count = 0
+        for item in stuck:
+            item_id = item["id"]
+            # Reset queue row to pending
+            db["queue"].update(
+                item_id,
+                {
+                    "status": "pending",
+                    "started_at": "",
+                    "completed_at": "",
+                    "result": "",
+                },
+            )
+            # Purge any LangGraph checkpoint so the graph starts fresh
+            # (must use async purge via the checkpointer)
+            import asyncio
+
+            saver = asyncio.run(checkpoint_store.get_checkpointer())
+            asyncio.run(saver.apurge({"configurable": {"thread_id": str(item_id)}}))
+            count += 1
+            logger.info(f"Reset stuck queue item {item_id}")
+
+        logger.info(f"reset_stuck_items: reset {count}/{len(stuck)} running items")
+        return count
+
     def queue_status(self) -> dict[str, int]:
         """Get counts of queue items by status.
 

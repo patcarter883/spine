@@ -305,3 +305,57 @@ class UIApi:
         from spine.work.dispatcher import update_work_status
 
         update_work_status(work_id, TaskStatus.RUNNING.value, config=self._config)
+
+    def restart_work(
+        self,
+        work_id: str,
+        clear_artifacts: bool = False,
+    ) -> dict[str, Any]:
+        """Restart a running, stalled, or needs_review work item from phase 0.
+
+        Non-blocking: runs the restart in the background via
+        RalphLoopWorker's executor and returns immediately. The work_detail
+        page can poll for progress.
+
+        Args:
+            work_id: The work item ID to restart.
+            clear_artifacts: If True, delete on-disk artifacts before
+                restarting so all phases regenerate from scratch.
+
+        Returns:
+            Dict with work_id, status, and work_type.
+        """
+        from spine.work.dispatcher import restart_work
+
+        import concurrent.futures
+
+        def _run() -> None:
+            import asyncio
+
+            asyncio.run(restart_work(work_id, self._config, clear_artifacts=clear_artifacts))
+
+        # Submit to the worker's executor (or a fresh one)
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        executor.submit(_run)
+
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.RUNNING.value,
+            "action": "restart",
+        }
+
+    def reset_stuck_items(self) -> int:
+        """Reset any queue items stuck in 'running' back to 'pending'.
+
+        Delegates to RalphLoopWorker.reset_stuck_items().  Use this when
+        the worker or UI died mid-execution and items are permanently
+        stuck in the 'running' state.
+
+        Returns:
+            The number of items that were reset.
+        """
+        worker = get_worker(self._config)
+        return worker.reset_stuck_items()

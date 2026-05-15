@@ -13,6 +13,7 @@ STATUS_COLORS = {
     "needs_review": "🟡",
     "failed": "🔴",
     "pending": "⚪",
+    "stalled": "🟠",
 }
 
 STATUS_BADGE = {
@@ -21,6 +22,7 @@ STATUS_BADGE = {
     "needs_review": "⚠️",
     "failed": "❌",
     "pending": "⏳",
+    "stalled": "🕐",
 }
 
 
@@ -32,6 +34,18 @@ def status_icon(status: str) -> str:
 def status_color(status: str) -> str:
     """Return a color emoji for a work status."""
     return STATUS_COLORS.get(status, "⚪")
+
+
+def status_color_css(status: str) -> str:
+    """Return a CSS color string for a work status."""
+    return {
+        "running": "blue",
+        "stalled": "orange",
+        "completed": "green",
+        "needs_review": "yellow",
+        "failed": "red",
+        "pending": "gray",
+    }.get(status, "white")
 
 
 def format_timestamp(ts: str | None) -> str:

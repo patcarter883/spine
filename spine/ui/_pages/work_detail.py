@@ -58,7 +58,7 @@ def _execution_duration(api: UIApi, work_id: str, entry: dict[str, object], stat
         )
         end_ts = end_event.get("timestamp") if end_event else None
         return format_duration(start_ts, end_ts)
-    elif status == "running":
+    elif status in ("running", "stalled"):
         # Live elapsed time since start
         return format_duration(start_ts)
     else:
@@ -264,8 +264,40 @@ def render(api: UIApi) -> None:
                 result = api.resume_work(work_id, human_input.strip(), resume_action)
                 st.success(f"Resumed! Status: {result['status']} | Action: {result['action']}")
                 st.rerun()
+
+        st.divider()
+        st.caption("Or restart from phase 0 (discarding accumulated feedback):")
+        if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
+            clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+            result = api.restart_work(work_id, clear_artifacts=clear)
+            st.success(
+                f"Restarted! Status: {result['status']} | Action: {result['action']}. "
+                "The workflow will re-run from the beginning."
+            )
+            st.rerun()
     elif status == "running":
         st.info("Work is currently in progress. Updates will appear automatically.")
+
+        if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
+            clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+            result = api.restart_work(work_id, clear_artifacts=clear)
+            st.success(
+                f"Restarted! Status: {result['status']} | Action: {result['action']}. "
+                "The workflow will re-run from the beginning."
+            )
+            st.rerun()
+
+    elif status == "stalled":
+        st.warning("This work item has stalled (no progress within the timeout).")
+
+        if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
+            clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+            result = api.restart_work(work_id, clear_artifacts=clear)
+            st.success(
+                f"Restarted! Status: {result['status']} | Action: {result['action']}. "
+                "The workflow will re-run from the beginning."
+            )
+            st.rerun()
 
     # ── Audit log section (auto-refreshing) ──
     st.divider()

@@ -460,135 +460,6 @@ async def submit_work(
         }
 
 
-# ── Query work ──
-
-
-def get_work_status(work_id: str, config: SpineConfig | None = None) -> dict[str, Any] | None:
-    """Get the status of a work item.
-
-    Args:
-        work_id: The work item ID.
-        config: Optional SpineConfig.
-
-    Returns:
-        A dict with work entry fields, or None if not found.
-    """
-    if config is None:
-        config = SpineConfig.load()
-
-    db = _get_work_db(config)
-    try:
-        row = db["work_entries"].get(work_id)
-        if row and row.get("result"):
-            row["result"] = json.loads(row["result"])
-        return row
-    except sqlite_utils.db.NotFoundError:
-        return None
-
-
-def list_work(
-    status: str | None = None,
-    limit: int = 50,
-    config: SpineConfig | None = None,
-) -> list[dict[str, Any]]:
-    """List work items, optionally filtered by status.
-
-    Args:
-        status: Filter by status (e.g. "running", "completed", "needs_review").
-        limit: Maximum number of items to return.
-        config: Optional SpineConfig.
-
-    Returns:
-        A list of work entry dicts, newest first.
-    """
-    if config is None:
-        config = SpineConfig.load()
-
-    db = _get_work_db(config)
-
-    # Use raw SQL so we can include `rowid` for the tiebreaker and use
-    # NULLS LAST (SQLite 3.30+).  The `rows_where` API doesn't expose
-    # rowid or support NULLS LAST natively.
-    if status:
-        rows = list(
-            db.query(
-                "SELECT rowid, * FROM work_entries "
-                "WHERE status = ? "
-                "ORDER BY created_at DESC NULLS LAST, rowid DESC "
-                "LIMIT ?",
-                [status, limit],
-            )
-        )
-    else:
-        rows = list(
-            db.query(
-                "SELECT rowid, * FROM work_entries "
-                "ORDER BY created_at DESC NULLS LAST, rowid DESC "
-                "LIMIT ?",
-                [limit],
-            )
-        )
-
-    results = []
-    for row in rows:
-        if row.get("result"):
-            try:
-                row["result"] = json.loads(row["result"])
-            except json.JSONDecodeError:
-                pass
-        results.append(row)
-
-    # ── Post-query Python safety-net sort ─────────────────────────────────
-    # Handles edge cases where SQLite ordering behaves unexpectedly
-    # (e.g. different sqlite-utils version, column type mismatch).
-    #
-    # Sort key: (group, created_at, rowid)
-    #   - group 1 for entries with a valid created_at
-    #   - group 0 for NULL created_at (sorts after group 1 in DESC)
-    #   - created_at as-is for ISO-8601 lexicographic ordering
-    #   - rowid as tiebreaker (higher = newer = first in DESC)
-    # With reverse=True, larger keys sort first.
-    def _sort_key(r: dict[str, Any]) -> tuple[int, str, int]:
-        """Sort key: newest-first, NULL timestamps at end."""
-        ts = r.get("created_at")
-        rid = r.get("rowid", 0) or 0
-        if ts is None:
-            return (0, "", rid)  # group 0 → last in descending order
-        return (1, ts, rid)  # group 1 → newest-first descending
-
-    results.sort(key=_sort_key, reverse=True)
-
-    return results
-
-
-def update_work_status(
-    work_id: str,
-    status: str,
-    current_phase: str | None = None,
-    config: SpineConfig | None = None,
-) -> None:
-    """Update the status of a work item.
-
-    Args:
-        work_id: The work item ID.
-        status: New status value.
-        current_phase: Optional updated phase name.
-        config: Optional SpineConfig.
-    """
-    if config is None:
-        config = SpineConfig.load()
-
-    db = _get_work_db(config)
-    updates: dict[str, Any] = {
-        "status": status,
-        "updated_at": datetime.now().isoformat(),
-    }
-    if current_phase is not None:
-        updates["current_phase"] = current_phase
-
-    db["work_entries"].update(work_id, updates)
-
-
 # ── Resume work ──
 
 
@@ -893,3 +764,451 @@ async def resume_work(
             "work_type": work_type,
             "error": str(e),
         }
+
+
+# ── Restart work ──
+
+
+async def restart_work(
+    work_id: str,
+    config: SpineConfig | None = None,
+    *,
+    clear_artifacts: bool = False,
+) -> dict[str, Any]:
+    """Restart a work item that is running, stalled, or needs_review.
+
+    Unlike ``resume_work`` (which continues from a checkpoint with human
+    feedback), ``restart_work`` re-runs the workflow from phase 0.  It
+    is intended for items whose worker or UI died mid-execution.
+
+    Steps:
+      1. Validates the work item exists and is in a restartable status.
+      2. Optionally clears on-disk artifacts and the checkpoint.
+      3. Resets the work entry status to "running".
+      4. Rebuilds the workflow graph and re-invokes it with fresh initial state.
+
+    Args:
+        work_id: The work item ID to restart.
+        config: Optional SpineConfig.
+        clear_artifacts: If True, delete on-disk artifacts before restarting.
+            Default False preserves them so downstream phases can re-use
+            what was already produced.
+
+    Returns:
+        A dict with keys ``work_id``, ``status``, ``work_type``.
+
+    Raises:
+        ValueError: If the work item is not in a restartable status.
+    """
+    if config is None:
+        config = SpineConfig.load()
+    config.ensure_dirs()
+
+    db = _get_work_db(config)
+
+    # ── Validate work item ──
+    try:
+        entry = db["work_entries"].get(work_id)
+    except sqlite_utils.db.NotFoundError:
+        raise ValueError(f"Work item '{work_id}' not found")
+
+    status = entry.get("status", "")
+    restartable = (
+        TaskStatus.RUNNING.value,
+        TaskStatus.STALLED.value,
+        TaskStatus.NEEDS_REVIEW.value,
+    )
+    if status not in restartable:
+        raise ValueError(
+            f"Work item '{work_id}' is in '{status}' status — "
+            f"only {restartable} items can be restarted."
+        )
+
+    work_type = entry.get("work_type", "spec")
+    description = entry.get("description", "")
+
+    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
+    artifact_store = ArtifactStore(base_path=config.artifact_path)
+
+    audit.log_event(
+        work_id,
+        "work_restarted",
+        "dispatcher",
+        {"previous_status": status, "clear_artifacts": clear_artifacts},
+    )
+
+    # ── Optionally wipe on-disk artifacts ──
+    if clear_artifacts:
+        work_dir = Path(artifact_store._base) / work_id
+        if work_dir.exists():
+            for f in work_dir.rglob("*"):
+                if f.is_file():
+                    f.unlink()
+            logger.info(f"[{work_id}] Cleared on-disk artifacts")
+
+    # Purge LangGraph checkpoint so the graph starts from phase 0
+    from spine.persistence.checkpoint import CheckpointStore
+
+    checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+    saver = await checkpoint_store.get_checkpointer()
+    await saver.apurge({"configurable": {"thread_id": work_id}})
+    logger.info(f"[{work_id}] Purged checkpoint")
+
+    # ── Rebuild initial state (fresh start) ──
+    initial_state: dict[str, Any] = {
+        "work_id": work_id,
+        "work_type": work_type,
+        "description": description,
+        "current_phase": "",
+        "phase_index": 0,
+        "retry_count": {},
+        "max_retries": config.max_critic_retries,
+        "artifacts": {},
+        "feedback": [],
+        "status": "running",
+        "prompt_request": None,
+        "critic_reviewing": "",
+        "workspace_root": config.workspace_root,
+    }
+
+    # Mark as running in the work entries DB
+    db["work_entries"].update(
+        work_id,
+        {
+            "status": TaskStatus.RUNNING.value,
+            "current_phase": "",
+            "updated_at": datetime.now().isoformat(),
+            "result": "{}",
+        },
+    )
+
+    # ── Rebuild and re-run the workflow graph ──
+    return await _run_workflow_graph(
+        work_id=work_id,
+        work_type=work_type,
+        config=config,
+        db=db,
+        audit=audit,
+        artifact_store=artifact_store,
+        initial_state=initial_state,
+        checkpoint_store=checkpoint_store,
+        is_restart=True,
+    )
+
+
+# ── Shared workflow execution logic (used by submit_work, resume_work, restart_work) ──
+
+
+async def _run_workflow_graph(
+    *,
+    work_id: str,
+    work_type: str,
+    config: SpineConfig,
+    db: sqlite_utils.Database,
+    audit: AuditService,
+    artifact_store: ArtifactStore,
+    initial_state: dict[str, Any],
+    checkpoint_store: CheckpointStore,
+    is_restart: bool = False,
+) -> dict[str, Any]:
+    """Run a workflow graph to completion, streaming updates.
+
+    This shared helper avoids the ~100-line duplication between
+    ``submit_work``, ``resume_work``, and ``restart_work``.
+    """
+    from spine.workflow.compose import build_workflow_graph
+
+    graph = build_workflow_graph(work_type, checkpointer=await checkpoint_store.get_checkpointer())
+
+    thread_config = {
+        "configurable": {
+            "thread_id": work_id,
+            "model": config.resolve_model(),
+        }
+    }
+
+    result: dict[str, Any] = dict(initial_state)
+    stream_iter = graph.astream(
+        initial_state,
+        thread_config,
+        stream_mode=["updates", "messages"],
+        subgraphs=True,
+        version="v2",
+    )
+    stalled = False
+
+    while True:
+        try:
+            chunk = await asyncio.wait_for(
+                stream_iter.__anext__(),
+                timeout=_STALL_TIMEOUT_SECONDS,
+            )
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            last_phase = result.get("current_phase", "")
+            logger.error(
+                f"[{work_id}] Workflow stalled — no chunk received for "
+                f"{_STALL_TIMEOUT_SECONDS}s (last phase: {last_phase}). "
+                f"Marking as stalled."
+            )
+            stalled = True
+            _update_work_progress(db, work_id, last_phase, "stalled")
+            audit.log_event(
+                work_id,
+                "work_stalled",
+                "dispatcher",
+                {"last_phase": last_phase, "timeout": _STALL_TIMEOUT_SECONDS},
+            )
+            break
+
+        if not isinstance(chunk, dict) or chunk.get("type") != "updates":
+            continue
+
+        ns = chunk.get("ns", ())
+        if ns != ():
+            continue
+
+        data = chunk.get("data", {})
+        for node_name, node_output in data.items():
+            node_artifacts = node_output.get("artifacts")
+            if node_artifacts and isinstance(node_artifacts, dict):
+                existing = result.get("artifacts", {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                merged = {**existing, **node_artifacts}
+                for key in set(existing) & set(node_artifacts):
+                    if isinstance(existing[key], dict) and isinstance(
+                        node_artifacts[key], dict
+                    ):
+                        merged[key] = {**existing[key], **node_artifacts[key]}
+                node_output = {**node_output, "artifacts": merged}
+
+            node_feedback = node_output.get("feedback")
+            if node_feedback and isinstance(node_feedback, list):
+                existing_fb = result.get("feedback", [])
+                if not isinstance(existing_fb, list):
+                    existing_fb = []
+                node_output = {
+                    **node_output,
+                    "feedback": existing_fb + node_feedback,
+                }
+
+            result.update(node_output)
+            phase = node_output.get("current_phase", "")
+            status = node_output.get("status", "")
+            if phase or status:
+                _update_work_progress(db, work_id, phase, status)
+                logger.info(f"[{work_id}] Phase {phase or node_name} → {status}")
+                audit.log_event(
+                    work_id,
+                    "phase_completed",
+                    node_name,
+                    {"phase": phase, "status": status},
+                )
+
+            node_artifacts = node_output.get("artifacts")
+            if node_artifacts and isinstance(node_artifacts, dict):
+                for art_phase, phase_arts in node_artifacts.items():
+                    if not isinstance(phase_arts, dict):
+                        continue
+                    for art_name, art_content in phase_arts.items():
+                        if art_content is not None:
+                            artifact_store.save_artifact(
+                                work_id, art_phase, art_name, str(art_content)
+                            )
+
+    # ── Final status ──
+    if stalled:
+        final_status = "stalled"
+    else:
+        final_status = result.get("status", "completed")
+
+    final_phase = result.get("current_phase", "")
+    result_artifacts = result.get("artifacts", {})
+    feedback = result.get("feedback", [])
+
+    if final_status == "running":
+        final_status = "completed"
+
+    if any(
+        isinstance(f, dict) and f.get("status") == "needs_review"
+        for f in feedback
+    ):
+        final_status = "needs_review"
+
+    result_payload = {
+        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
+        "feedback_count": len(feedback),
+        "prompt_request": result.get("prompt_request"),
+    }
+    if is_restart:
+        result_payload["restarted"] = True
+
+    db["work_entries"].update(
+        work_id,
+        {
+            "status": final_status,
+            "current_phase": final_phase,
+            "updated_at": datetime.now().isoformat(),
+            "result": json.dumps(result_payload),
+        },
+    )
+
+    audit.log_event(
+        work_id,
+        "work_completed",
+        final_phase,
+        {"status": final_status, "restarted": is_restart},
+    )
+
+    try:
+        from spine.ui.ws_bus import get_bus
+
+        get_bus().publish_sync(
+            "work_completed",
+            {"work_id": work_id, "status": final_status},
+        )
+    except Exception:
+        pass
+
+    return {
+        "work_id": work_id,
+        "status": final_status,
+        "work_type": work_type,
+        **({"restarted": True} if is_restart else {}),
+    }
+
+
+# ── Query work ──
+
+
+def get_work_status(work_id: str, config: SpineConfig | None = None) -> dict[str, Any] | None:
+    """Get the status of a work item.
+
+    Args:
+        work_id: The work item ID.
+        config: Optional SpineConfig.
+
+    Returns:
+        A dict with work entry fields, or None if not found.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    db = _get_work_db(config)
+    try:
+        row = db["work_entries"].get(work_id)
+        if row and row.get("result"):
+            row["result"] = json.loads(row["result"])
+        return row
+    except sqlite_utils.db.NotFoundError:
+        return None
+
+
+def list_work(
+    status: str | None = None,
+    limit: int = 50,
+    config: SpineConfig | None = None,
+) -> list[dict[str, Any]]:
+    """List work items, optionally filtered by status.
+
+    Args:
+        status: Filter by status (e.g. "running", "completed", "needs_review").
+        limit: Maximum number of items to return.
+        config: Optional SpineConfig.
+
+    Returns:
+        A list of work entry dicts, newest first.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    db = _get_work_db(config)
+
+    # Use raw SQL so we can include `rowid` for the tiebreaker and use
+    # NULLS LAST (SQLite 3.30+).  The `rows_where` API doesn't expose
+    # rowid or support NULLS LAST natively.
+    if status:
+        rows = list(
+            db.query(
+                "SELECT rowid, * FROM work_entries "
+                "WHERE status = ? "
+                "ORDER BY created_at DESC NULLS LAST, rowid DESC "
+                "LIMIT ?",
+                [status, limit],
+            )
+        )
+    else:
+        rows = list(
+            db.query(
+                "SELECT rowid, * FROM work_entries "
+                "ORDER BY created_at DESC NULLS LAST, rowid DESC "
+                "LIMIT ?",
+                [limit],
+            )
+        )
+
+    results = []
+    for row in rows:
+        if row.get("result"):
+            try:
+                row["result"] = json.loads(row["result"])
+            except json.JSONDecodeError:
+                pass
+        results.append(row)
+
+    # ── Post-query Python safety-net sort ─────────────────────────────────
+    # Handles edge cases where SQLite ordering behaves unexpectedly
+    # (e.g. different sqlite-utils version, column type mismatch).
+    #
+    # Sort key: (group, created_at, rowid)
+    #   - group 1 for entries with a valid created_at
+    #   - group 0 for NULL created_at (sorts after group 1 in DESC)
+    #   - created_at as-is for ISO-8601 lexicographic ordering
+    #   - rowid as tiebreaker (higher = newer = first in DESC)
+    # With reverse=True, larger keys sort first.
+    def _sort_key(r: dict[str, Any]) -> tuple[int, str, int]:
+        """Sort key: newest-first, NULL timestamps at end."""
+        ts = r.get("created_at")
+        rid = r.get("rowid", 0) or 0
+        if ts is None:
+            return (0, "", rid)  # group 0 → last in descending order
+        return (1, ts, rid)  # group 1 → newest-first descending
+
+    results.sort(key=_sort_key, reverse=True)
+
+    return results
+
+
+def update_work_status(
+    work_id: str,
+    status: str,
+    current_phase: str | None = None,
+    config: SpineConfig | None = None,
+) -> None:
+    """Update the status of a work item.
+
+    Args:
+        work_id: The work item ID.
+        status: New status value.
+        current_phase: Optional updated phase name.
+        config: Optional SpineConfig.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    db = _get_work_db(config)
+    updates: dict[str, Any] = {
+        "status": status,
+        "updated_at": datetime.now().isoformat(),
+    }
+    if current_phase is not None:
+        updates["current_phase"] = current_phase
+
+    db["work_entries"].update(work_id, updates)
+
+
+# ── Resume work ──
+
+# (resume_work is defined above)

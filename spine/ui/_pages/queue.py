@@ -109,6 +109,16 @@ def _render_active_job(api: UIApi) -> None:
             st.rerun()
     elif not active:
         st.info("No job is currently running. Submit work from the **Submit Work** page.")
+
+    # Reset stuck items button at the bottom of active job section
+    st.divider()
+    if st.button("🔄 Reset stuck running items", key="reset_stuck"):
+        reset_count = api.reset_stuck_items()
+        if reset_count:
+            st.success(f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed.")
+        else:
+            st.info("No stuck running items found.")
+        st.rerun()
     else:
         # Description line
         st.markdown(f"**{active.get('description', '')[:150]}**")

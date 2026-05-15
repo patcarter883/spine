@@ -233,6 +233,51 @@ def resume(work_id: str, human_input: str | None, config_path: str) -> None:
 
 
 @main.command()
+@click.argument("work_id")
+@click.option(
+    "--config",
+    "config_path",
+    default=".spine/config.yaml",
+    help="Path to config file.",
+)
+@click.option(
+    "--clear-artifacts",
+    is_flag=True,
+    default=False,
+    help="Delete all on-disk artifacts so phases regenerate from scratch.",
+)
+def restart(work_id: str, config_path: str, clear_artifacts: bool) -> None:
+    """Restart a running/stalled/paused work item from phase 0.
+
+    WORK_ID is the unique identifier of the work item to restart.
+    The item must be in \"running\", \"stalled\", or \"needs_review\" status.
+    """
+    import asyncio
+
+    config = SpineConfig.load(path=config_path)
+
+    from spine.work.dispatcher import restart_work
+
+    console.print(f"[blue]Restarting work item {work_id}...[/blue]")
+
+    result = asyncio.run(restart_work(work_id, config, clear_artifacts=clear_artifacts))
+
+    if "error" in result:
+        console.print(f"[bold red]Restart failed:[/bold red] {result['error']}")
+        sys.exit(1)
+
+    status_color = "green" if result["status"] == "completed" else "yellow"
+    console.print(
+        Panel(
+            f"Work ID: {result['work_id']}\\n"
+            f"Status: [{status_color}]{result['status']}[/{status_color}]\\n"
+            f"Action: restarted",
+            title="Restart Result",
+        )
+    )
+
+
+@main.command()
 @click.option(
     "--config",
     "config_path",
