@@ -1,12 +1,14 @@
-"""SPINE WebSocket live-update bridge for Streamlit.
+"""SPINE WebSocket status indicator for Streamlit.
 
 Embeds a tiny invisible HTML iframe that connects to the SPINE WebSocket
-server. When a state-change event arrives, it updates the ``_ws_ts``
-query parameter in the parent frame, which triggers a Streamlit rerun
-with fresh data — replacing the old ``<meta http-equiv=refresh>`` hack.
+server and displays a connection status indicator (green/red dot).
 
-A guard timestamp prevents rerun loops: the iframe only triggers a
-reload if the event's timestamp is newer than the last processed event.
+Previously, this component triggered full-page reruns via URL manipulation
+(``window.parent.location.replace``) whenever a WS event arrived. This
+caused form inputs (like the Submit Work description field) to be cleared
+mid-typing. That behaviour has been removed — pages that need live data
+refreshes now use ``@st.fragment(run_every=...)`` for isolated re-renders
+that preserve widget state.
 """
 
 from __future__ import annotations
@@ -17,25 +19,16 @@ import streamlit as st
 
 DEFAULT_WS_PORT = int(os.getenv("SPINE_WS_PORT", "8765"))
 
+# Minimal iframe: shows WS connection status (green dot / red dot) only.
+# No page-rerun logic — pages use @st.fragment(run_every=...) instead.
 _WS_HTML = """<html><body>
 <div id="s" style="font:9px monospace;color:#ccc">ws…</div>
 <script>
 (function(){{
-  var p={port},s=document.getElementById('s'),ws,d=500,D=15000,last=0;
+  var p={port},s=document.getElementById('s'),ws,d=500,D=15000;
   function c(){{
     try{{ws=new WebSocket('ws://localhost:'+p)}}catch(e){{return r()}}
     ws.onopen=function(){{s.textContent='🟢';d=500}};
-    ws.onmessage=function(e){{
-      try{{
-        var v=JSON.parse(e.data);
-        if(v.event_type && v.timestamp && v.timestamp>last){{
-          last=v.timestamp;
-          var u=new URL(window.parent.location.href);
-          u.searchParams.set('_ws_ts',v.timestamp.toString());
-          window.parent.location.replace(u.toString());
-        }}
-      }}catch(x){{}}
-    }};
     ws.onclose=function(){{s.textContent='🔴';r()}};
     ws.onerror=function(){{try{{ws.close()}}catch(e){{}}}};
   }}
@@ -46,16 +39,12 @@ _WS_HTML = """<html><body>
 
 
 def render_ws_client(ws_port: int | None = None) -> None:
-    """Render an invisible WebSocket bridge that triggers reruns on events.
+    """Render a WebSocket connection status indicator in the sidebar.
 
-    The embedded iframe maintains a persistent WS connection.  When a
-    push event arrives (``work_progress``, ``work_completed``,
-    ``work_failed``, etc.), it navigates the parent frame to the same
-    URL with an updated ``_ws_ts`` query parameter — Streamlit detects
-    the change and reruns the app.
-
-    The ``last`` guard ensures that stale or duplicate events don't
-    cause rerun loops.
+    The embedded iframe maintains a persistent WS connection and shows
+    a green dot when connected, red dot when disconnected. It does NOT
+    trigger page reruns — use ``@st.fragment(run_every=...)`` on pages
+    that need live data updates.
 
     Args:
         ws_port: WebSocket server port.  Defaults to ``SPINE_WS_PORT``

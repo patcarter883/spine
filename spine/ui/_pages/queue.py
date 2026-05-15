@@ -9,15 +9,14 @@ import streamlit as st
 from spine.ui.utils import format_duration, status_icon
 from spine.ui_api import UIApi
 
-
-# ── Polling fallback interval (seconds) ──
-# When the WebSocket bridge is disconnected or unavailable, this meta
-# refresh tag ensures the page eventually updates without manual reload.
-_POLL_INTERVAL = 30
+# ── Fragment refresh interval (seconds) ──
+# Each data section auto-refreshes via @st.fragment(run_every=...) so
+# only that fragment re-renders, preserving widget state elsewhere on
+# the page (e.g. form inputs on the Submit Work page).
+_POLL_INTERVAL = 10
 
 
 # ── Helpers ──
-
 
 _PHASE_SEQUENCE: dict[str, list[str]] = {
     "quick": ["tasks", "implement", "verify"],
@@ -78,39 +77,26 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
             col.caption(f"○ {icon} {label}")
 
 
-# ── Page ──
+# ── Fragment sections ──
 
 
-def render(api: UIApi) -> None:
-    """Render the Queue page."""
-    st.title("🚦 Queue")
-
-    # ── Polling fallback ──
-    # Ensure the page auto-refreshes even when the WebSocket bridge is
-    # unavailable (port conflict, browser security, start-up race, etc.).
-    # The meta refresh tag triggers a full Streamlit rerun at a fixed
-    # interval, providing a graceful degradation path when live push
-    # events are not arriving.
-    st.markdown(
-        f'<meta http-equiv="refresh" content="{_POLL_INTERVAL}">',
-        unsafe_allow_html=True,
-    )
-
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_summary(api: UIApi) -> None:
+    """Summary metrics — auto-refreshing fragment."""
     overview = api.get_queue_overview()
     summary = overview.get("status_summary", {})
-    active = overview.get("active")
-    pending = overview.get("pending", [])
-    recent = overview.get("recent", [])
 
-    # ── Summary metrics ──
     c1, c2, c3 = st.columns(3)
     c1.metric("Pending", summary.get("pending", 0))
     c2.metric("Running", summary.get("running", 0))
     c3.metric("Completed", summary.get("completed", 0))
 
-    # ── Active job ──
-    st.divider()
-    st.subheader("▸ Active Job")
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_active_job(api: UIApi) -> None:
+    """Active job detail — auto-refreshing fragment."""
+    overview = api.get_queue_overview()
+    active = overview.get("active")
 
     worker_status = api.get_worker_status()
     if not worker_status.get("running"):
@@ -147,9 +133,13 @@ def render(api: UIApi) -> None:
             f"Status: `{active.get('status', '')}`"
         )
 
-    # ── Pending jobs ──
-    st.divider()
-    st.subheader("▸ Pending Jobs")
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_pending(api: UIApi) -> None:
+    """Pending jobs list — auto-refreshing fragment."""
+    overview = api.get_queue_overview()
+    pending = overview.get("pending", [])
+
     if not pending:
         st.caption("No jobs waiting in the queue.")
     else:
@@ -160,20 +150,20 @@ def render(api: UIApi) -> None:
                 pc2.write(item.get("work_type", ""))
                 pc3.caption(f"Enqueued {format_duration(item.get('enqueued_at'))} ago")
 
-    # ── Recent history ──
-    st.divider()
-    st.subheader("▸ Recent Results")
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_recent(api: UIApi) -> None:
+    """Recent results list — auto-refreshing fragment."""
+    overview = api.get_queue_overview()
+    recent = overview.get("recent", [])
+
     if not recent:
         st.caption("No completed jobs yet.")
     else:
         for item in recent:
-            # Queue item status is now derived from the work result
-            # (completed / failed / needs_review).
             queue_status = item.get("status", "completed")
             icon = status_icon(queue_status)
 
-            # Also try to extract the inner work status for the tooltip
-            # when the queue status was back-compat set to "completed".
             result_raw = item.get("result", "")
             inner_status = None
             if result_raw:
@@ -190,3 +180,29 @@ def render(api: UIApi) -> None:
                 rc2.write(display_status)
                 elapsed = format_duration(item.get("started_at"), item.get("completed_at"))
                 rc3.caption(f"Finished {item.get('completed_at', '')[:10]} · Took {elapsed}")
+
+
+# ── Page ──
+
+
+def render(api: UIApi) -> None:
+    """Render the Queue page."""
+    st.title("🚦 Queue")
+
+    # ── Summary metrics ──
+    _render_summary(api)
+
+    # ── Active job ──
+    st.divider()
+    st.subheader("▸ Active Job")
+    _render_active_job(api)
+
+    # ── Pending jobs ──
+    st.divider()
+    st.subheader("▸ Pending Jobs")
+    _render_pending(api)
+
+    # ── Recent history ──
+    st.divider()
+    st.subheader("▸ Recent Results")
+    _render_recent(api)

@@ -8,28 +8,28 @@ from spine.ui.pages import get as get_page
 from spine.ui.utils import status_icon, truncate
 from spine.ui_api import UIApi
 
+# ── Fragment refresh interval (seconds) ──
+_POLL_INTERVAL = 10
 
-def render(api: UIApi) -> None:
-    """Render the dashboard page."""
-    st.title("🦴 SPINE Dashboard")
 
-    # ── Quick stats ──
-    col1, col2, col3, col4 = st.columns(4)
-
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_stats(api: UIApi) -> None:
+    """Quick stats — auto-refreshing fragment."""
     running = api.list_work(status="running", limit=100)
     completed = api.list_work(status="completed", limit=100)
     needs_review = api.list_work(status="needs_review", limit=100)
     failed = api.list_work(status="failed", limit=100)
 
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Running", len(running))
     col2.metric("Completed", len(completed))
     col3.metric("Needs Review", len(needs_review))
     col4.metric("Failed", len(failed))
 
-    st.divider()
 
-    # ── Recent work ──
-    st.subheader("Recent Work")
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_recent_work(api: UIApi) -> None:
+    """Recent work list — auto-refreshing fragment."""
     all_work = api.list_work(limit=20)
 
     if not all_work:
@@ -59,9 +59,10 @@ def render(api: UIApi) -> None:
                 )
             col3.write(f"{phase or status}")
 
-    # ── Worker status ──
-    st.divider()
-    st.subheader("Worker Status")
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_worker_status(api: UIApi) -> None:
+    """Worker status — auto-refreshing fragment."""
     try:
         worker_status = api.get_worker_status()
         if worker_status.get("running"):
@@ -73,3 +74,22 @@ def render(api: UIApi) -> None:
             st.json(queue)
     except Exception:
         st.info("Worker status unavailable")
+
+
+def render(api: UIApi) -> None:
+    """Render the dashboard page."""
+    st.title("🦴 SPINE Dashboard")
+
+    # ── Quick stats ──
+    _render_stats(api)
+
+    st.divider()
+
+    # ── Recent work ──
+    st.subheader("Recent Work")
+    _render_recent_work(api)
+
+    # ── Worker status ──
+    st.divider()
+    st.subheader("Worker Status")
+    _render_worker_status(api)

@@ -3,9 +3,9 @@
 Uses Streamlit's built-in ``st.navigation`` / ``st.Page`` multipage
 routing for deep-linkable URLs (e.g. ``/work-detail?work_id=abc``).
 
-A lightweight WebSocket server runs in a daemon thread to push
-state-change events to the browser, replacing the old
-``<meta http-equiv=refresh>`` force-refresh hack.
+A lightweight WebSocket server runs in a daemon thread for push events.
+Pages that need live data refreshes use ``@st.fragment(run_every=...)``
+for isolated re-renders that preserve widget state (no full-page reloads).
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import streamlit as st
 
 from spine.ui.pages import register
 from spine.ui_api import UIApi
-from spine.ui.ws_component import render_ws_client
 from spine.ui.ws_server import start_ws_server
 
 st.set_page_config(
@@ -117,10 +116,6 @@ page = st.navigation(pages)
 for section_pages in pages.values():
     for p in section_pages:
         register(p.url_path, p)
-
-# ── WebSocket live-update bridge (in sidebar, below nav) ──
-with st.sidebar:
-    render_ws_client()
 
 # ── Run the selected page ──
 page.run()

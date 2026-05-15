@@ -8,13 +8,14 @@ from spine.ui.pages import get as get_page
 from spine.ui_api import UIApi
 from spine.ui.utils import format_duration, format_timestamp, status_icon, truncate
 
+# ── Fragment refresh interval (seconds) ──
+_POLL_INTERVAL = 10
+
 
 # ── Helpers ──
 
 
-def _execution_duration(
-    api: UIApi, work_id: str, entry: dict[str, object], status: str
-) -> str:
+def _execution_duration(api: UIApi, work_id: str, entry: dict[str, object], status: str) -> str:
     """Compute execution duration from audit log events.
 
     For completed/failed items, returns the wall-clock time between the first
@@ -40,11 +41,7 @@ def _execution_duration(
 
     # Determine start event: first work_submitted or work_started
     start_event = next(
-        (
-            e
-            for e in audit_events
-            if e.get("event_type") in ("work_submitted", "work_started")
-        ),
+        (e for e in audit_events if e.get("event_type") in ("work_submitted", "work_started")),
         None,
     )
     start_ts = start_event.get("timestamp") if start_event else None
@@ -67,6 +64,107 @@ def _execution_duration(
     else:
         # Unknown or pending — fall back to entry timestamps
         return format_duration(entry.get("created_at"), entry.get("updated_at"))
+
+
+# ── Fragment sections ──
+
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_status_header(api: UIApi, work_id: str) -> None:
+    """Status header with metrics — auto-refreshing fragment."""
+    entry = api.get_work(work_id)
+    if entry is None:
+        st.error(f"Work item '{work_id}' not found.")
+        return
+
+    status = entry.get("status", "unknown")
+    icon = status_icon(status)
+
+    st.header(f"{icon} {work_id}")
+
+    col1, col2 = st.columns(2)
+    col1.write(f"**Status:** {status}")
+    col1.write(f"**Type:** {entry.get('work_type', 'N/A')}")
+    col1.write(f"**Phase:** {entry.get('current_phase', 'N/A')}")
+    col2.write(f"**Execution Time:** {_execution_duration(api, work_id, entry, status)}")
+    col2.write(f"**Updated:** {format_timestamp(entry.get('updated_at'))}")
+
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_artifacts(api: UIApi, work_id: str) -> None:
+    """Artifacts section — auto-refreshing fragment."""
+    # Fetch fresh entry to get latest work_type
+    entry = api.get_work(work_id)
+    if entry is None:
+        return
+
+    artifacts = api.get_artifacts(work_id)
+    if artifacts:
+        # Build phase order from the work item's workflow sequence,
+        # filtering out critic nodes (artifacts are keyed by phase name).
+        from spine.workflow.compose import WORKFLOW_SEQUENCES
+
+        work_type = entry.get("work_type", "quick")
+        sequence = WORKFLOW_SEQUENCES.get(work_type, WORKFLOW_SEQUENCES.get("quick", []))
+        # Only non-critic nodes produce artifact directories
+        node_index = {
+            name: i for i, (name, _) in enumerate(sequence) if not name.startswith("critic")
+        }
+
+        sorted_artifacts = sorted(
+            artifacts,
+            key=lambda a: (node_index.get(a.get("phase", ""), 99), a.get("name", "")),
+        )
+        for artifact in sorted_artifacts:
+            phase = artifact.get("phase", "unknown")
+            name = artifact.get("name", "unknown")
+            size = artifact.get("size", 0)
+            modified = artifact.get("modified", "N/A")
+
+            with st.expander(f"📄 {phase}/{name} ({size} bytes)"):
+                st.write(f"**Phase:** {phase}")
+                st.write(f"**Name:** {name}")
+                st.write(f"**Size:** {size} bytes")
+                st.write(f"**Modified:** {modified}")
+
+                # Load and display content
+                content = api.read_artifact(work_id, phase, name)
+                if content:
+                    if name.endswith(".md") or name.endswith(".txt"):
+                        st.markdown(content)
+                    elif name.endswith(".json"):
+                        st.json(content)
+                    else:
+                        st.code(content, language="text")
+    else:
+        st.info("No artifacts found for this work item.")
+
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_audit_log(api: UIApi, work_id: str) -> None:
+    """Audit log section — auto-refreshing fragment."""
+    audit_events = api.get_audit_log(work_id=work_id, limit=20)
+    if audit_events:
+        for event in audit_events:
+            col1, col2, col3, col4 = st.columns([2, 3, 1, 1])
+            col1.write(f"**{event.get('event_type', 'N/A')}**")
+            phase = event.get("phase", "N/A")
+            col2.write(
+                f"{phase}: {event.get('message', 'N/A')}"
+                if phase != "N/A"
+                else event.get("message", "N/A")
+            )
+            col3.write(
+                event.get("details", "").get("status", "")
+                if isinstance(event.get("details"), dict)
+                else ""
+            )
+            col4.write(format_timestamp(event.get("timestamp")))
+    else:
+        st.info("No audit events found for this work item.")
+
+
+# ── Page ──
 
 
 def render(api: UIApi) -> None:
@@ -115,18 +213,8 @@ def render(api: UIApi) -> None:
             st.switch_page(get_page("dashboard"))
         return
 
-    # ── Status display ──
-    status = entry.get("status", "unknown")
-    icon = status_icon(status)
-
-    st.header(f"{icon} {work_id}")
-
-    col1, col2 = st.columns(2)
-    col1.write(f"**Status:** {status}")
-    col1.write(f"**Type:** {entry.get('work_type', 'N/A')}")
-    col1.write(f"**Phase:** {entry.get('current_phase', 'N/A')}")
-    col2.write(f'**Execution Time:** {_execution_duration(api, work_id, entry, status)}')
-    col2.write(f"**Updated:** {format_timestamp(entry.get('updated_at'))}")
+    # ── Status display (auto-refreshing) ──
+    _render_status_header(api, work_id)
 
     # ── Description ──
     st.divider()
@@ -144,54 +232,15 @@ def render(api: UIApi) -> None:
         if result.get("error"):
             st.error(f"Error: {result['error']}")
 
-    # ── Detailed Artifacts Section ──
+    # ── Detailed Artifacts Section (auto-refreshing) ──
     st.divider()
     st.subheader("📁 Artifacts")
-
-    artifacts = api.get_artifacts(work_id)
-    if artifacts:
-        # Build phase order from the work item's workflow sequence,
-        # filtering out critic nodes (artifacts are keyed by phase name).
-        from spine.workflow.compose import WORKFLOW_SEQUENCES
-
-        work_type = entry.get("work_type", "quick")
-        sequence = WORKFLOW_SEQUENCES.get(work_type, WORKFLOW_SEQUENCES.get("quick", []))
-        # Only non-critic nodes produce artifact directories
-        node_index = {
-            name: i
-            for i, (name, _) in enumerate(sequence)
-            if not name.startswith("critic")
-        }
-
-        sorted_artifacts = sorted(
-            artifacts,
-            key=lambda a: (node_index.get(a.get("phase", ""), 99), a.get("name", "")),
-        )
-        for artifact in sorted_artifacts:
-            phase = artifact.get("phase", "unknown")
-            name = artifact.get("name", "unknown")
-            size = artifact.get("size", 0)
-            modified = artifact.get("modified", "N/A")
-
-            with st.expander(f"📄 {phase}/{name} ({size} bytes)"):
-                st.write(f"**Phase:** {phase}")
-                st.write(f"**Name:** {name}")
-                st.write(f"**Size:** {size} bytes")
-                st.write(f"**Modified:** {modified}")
-
-                # Load and display content
-                content = api.read_artifact(work_id, phase, name)
-                if content:
-                    if name.endswith(".md") or name.endswith(".txt"):
-                        st.markdown(content)
-                    elif name.endswith(".json"):
-                        st.json(content)
-                    else:
-                        st.code(content, language="text")
-    else:
-        st.info("No artifacts found for this work item.")
+    _render_artifacts(api, work_id)
 
     # ── Status-specific actions ──
+    # NOTE: These are NOT inside a fragment so that text_area input
+    # is preserved and not cleared on fragment re-renders.
+    status = entry.get("status", "unknown")
     if status == "needs_review":
         st.warning("This work item needs human review.")
         action = st.radio(
@@ -211,25 +260,12 @@ def render(api: UIApi) -> None:
                 st.error("Please provide feedback before resuming.")
             else:
                 result = api.resume_work(work_id, human_input.strip(), resume_action)
-                st.success(
-                    f"Resumed! Status: {result['status']} | Action: {result['action']}"
-                )
+                st.success(f"Resumed! Status: {result['status']} | Action: {result['action']}")
                 st.rerun()
     elif status == "running":
         st.info("Work is currently in progress. Updates will appear automatically.")
 
-    # ── Audit log section ──
+    # ── Audit log section (auto-refreshing) ──
     st.divider()
     st.subheader("📋 Audit Log")
-
-    audit_events = api.get_audit_log(work_id=work_id, limit=20)
-    if audit_events:
-        for event in audit_events:
-            col1, col2, col3, col4 = st.columns([2, 3, 1, 1])
-            col1.write(f"**{event.get('event_type', 'N/A')}**")
-            phase = event.get("phase", "N/A")
-            col2.write(f"{phase}: {event.get('message', 'N/A')}" if phase != "N/A" else event.get("message", "N/A"))
-            col3.write(event.get("details", "").get("status", "") if isinstance(event.get("details"), dict) else "")
-            col4.write(format_timestamp(event.get("timestamp")))
-    else:
-        st.info("No audit events found for this work item.")
+    _render_audit_log(api, work_id)
