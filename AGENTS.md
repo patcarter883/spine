@@ -44,7 +44,7 @@ langgraph dev
 SPINE WORKFLOW ENGINE (LangGraph StateGraph)
   START → specify → plan → [critic_plan] → tasks → implement → verify → END
               ↘ rework ↗            ↘ needs_review → END
-  │                                       ↘ artifact_gate → END
+  │                                  ↘ artifact_gate (tasks→implement) → END
   │
   └─ each node delegates to → Deep Agents Runtime
                                ├── SubAgents (from FeatureSlices)
@@ -60,8 +60,8 @@ WORK TYPES:
                    TASKS → CRITIC_TASKS → IMPLEMENT → VERIFY
 
 ARTIFACT GATES:
-  implement → verify:  checks implement has non-empty artifacts (≥50 chars)
   tasks → implement:   checks tasks has non-empty artifacts (≥50 chars)
+  NOTE: implement → verify is NOT gated; verify always runs after implement
 
 CRITIC ROUTING (two-tier: structural → agent):
   passed          → next phase
@@ -211,7 +211,7 @@ The critic gate enforces that a phase cannot proceed without `PASSED` status. Th
 
 ### 5. Artifact Gates Prevent Empty Progression
 
-Before `verify` runs, an artifact gate checks that `implement` produced non-empty artifacts (≥50 chars). Before `implement` runs, it checks `tasks`. If the gate fails, it routes to `needs_review → END` instead of proceeding. This prevents the workflow from reaching verify with no implementation.
+Before `implement` runs, an artifact gate checks that `tasks` produced non-empty artifacts (≥50 chars). If the gate fails, it routes to `needs_review → END` instead of proceeding. There is NO artifact gate between `implement` and `verify` — verify always runs after implement. If implement produced nothing, verify can detect and report that; there is no reason for a human review gate between those two phases.
 
 ### 6. SPINE Base Prompt Replaces DA Default
 
@@ -348,7 +348,7 @@ LANGSMITH_PROJECT=spine
 2. Create the phase module in `spine/phases/new_phase.py` with a `call_new_phase()` function that returns `{artifacts, current_phase, status, prompt_request}`
 3. Self-register in the registry at module bottom: `_registry.register(name=PhaseName.NEW_PHASE.value, call_fn=call_new_phase, build_agent_fn=build_new_agent)`
 4. Add the phase to the appropriate `WORKFLOW_SEQUENCES` in `spine/workflow/compose.py`
-5. If the phase needs an artifact gate before it, add to `ARTIFACT_GATE_MAP` in compose.py
+5. If the phase needs an artifact gate before it, add the gate logic in the `gate_edges` loop in `spine/workflow/compose.py`
 6. Create the agent builder in `spine/agents/new_phase_agent.py` using `build_phase_agent()`
 7. Add an entry point in `spine/workflow/studio.py` if needed for Studio
 8. Write tests in `tests/unit/test_workflow_gates.py`
@@ -366,13 +366,15 @@ LANGSMITH_PROJECT=spine
 
 ## Pitfalls
 
+- **Phase node functions MUST be async** — All phase node functions (`call_specify`, `call_plan`, etc.) must be `async def` and use `ainvoke_with_retry` (not `invoke_with_retry`). Sync nodes run in LangGraph's thread pool, which breaks `asyncio.Lock` objects in the checkpointer (`AsyncSqliteSaver.lock` is bound to the main event loop). When subagents inherit the parent checkpointer through `config["configurable"]`, they encounter `RuntimeError: is bound to a different event loop`. Async nodes stay on the same event loop throughout, avoiding this entirely.
 - **Never store providers in `WorkflowState`** — LangGraph's checkpointer serializes state to SQLite, and provider objects (LLM clients, HTTP sessions) are not serializable. Use `config["configurable"]["providers"]`.
 - **Phase nodes must return `status` and `prompt_request`** — Every return dict from a phase function must include `"status"` and `"prompt_request"`. Missing these causes empty entries in the audit log and work progress updates. The critic node was a previous offender.
-- **Artifact gates use ≥50 char threshold** — Artifacts shorter than 50 characters are treated as empty by the artifact gate. This avoids false positives from stub content but means very short valid artifacts would be rejected.
+- **Artifact gates use ≥50 char threshold** — Artifacts shorter than 50 characters are treated as empty by the artifact gate. This avoids false positives from stub content but means very short valid artifacts would be rejected. Only the tasks→implement transition is gated; implement→verify is NOT gated.
 - **OpenCode ACP + vLLM returns tiny responses** — Known protocol mismatch. Use `DeepAgentsModelProvider` with `init_chat_model()` directly for local models instead.
 - **RalphLoopWorker is a singleton** — Access via `get_worker()`, don't instantiate directly. Thread-safety enforced by `_WORKER_LOCK`.
 - **SQLite WAL mode** — Checkpoint DB uses WAL (Write-Ahead Logging). Multiple readers OK, one writer at a time. Don't hold long-running write transactions.
 - **TypedDict state keys** — `WorkflowState` is a TypedDict. New keys must be added to the type definition or LangGraph will silently drop them.
+- **`SpineContext` must be a Pydantic `BaseModel`** — LangGraph's config schema creates a Pydantic field `(SpineContext, None)` for the `context_schema`. When checkpointing, Pydantic tries to serialize this field. A plain dataclass produces `PydanticSerializationUnexpectedValue` warnings because the field type expects `None` but receives a dataclass instance. Using `BaseModel` lets Pydantic serialize it natively.
 - **`from __future__ import annotations`** — Required in files using `str | None` or forward references, but can break Pydantic models at runtime. Use with care in model files.
 - **Pre-built ChatOpenRouter must apply ProviderProfile kwargs** — When `resolve_model` returns a `ChatOpenRouter` instance (OpenRouter + session_id), the DA `ProviderProfile` factory chain is skipped. If you add new kwargs to the OpenRouter ProviderProfile, verify they're also handled in `_build_openrouter_model()`.
 - **`.env` must be at project root** — `spine/config.py` loads `.env` from `Path.cwd()`. If running from a different directory, the env vars won't be loaded. `langgraph dev` handles this via `langgraph.json`.
