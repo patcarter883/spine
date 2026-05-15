@@ -51,21 +51,31 @@ class ArtifactStore:
         # Guard: never overwrite a full on-disk artifact with a shorter
         # (truncated) version from workflow state.  The agent writes full
         # files via write_file; state only stores 500-char previews.
+        content_skipped = False
         if (
             not overwrite_shorter
             and artifact_path.exists()
             and len(content) < len(artifact_path.read_text(encoding="utf-8"))
         ):
-            return artifact_path
+            content_skipped = True
+        else:
+            artifact_path.write_text(content, encoding="utf-8")
 
-        artifact_path.write_text(content, encoding="utf-8")
-
-        # Write metadata sidecar
+        # Always write the metadata sidecar — even when the content write was
+        # skipped because the on-disk file was longer.  Without the sidecar,
+        # list_artifacts() (which globs for *.meta.json) can't discover the
+        # artifact, making it invisible to the UI and any code that queries the
+        # store.  Use the actual on-disk size when the guard fired.
+        on_disk_size = (
+            len(artifact_path.read_text(encoding="utf-8"))
+            if content_skipped and artifact_path.exists()
+            else len(content)
+        )
         meta = {
             "work_id": work_id,
             "phase": phase,
             "name": name,
-            "size": len(content),
+            "size": on_disk_size,
             "modified": datetime.now().isoformat(),
         }
         meta_path = artifact_dir / f"{name}.meta.json"
@@ -92,6 +102,11 @@ class ArtifactStore:
     def list_artifacts(self, work_id: str) -> list[dict[str, Any]]:
         """List all artifacts for a work item.
 
+        Discovers artifacts via their ``.meta.json`` sidecars.  Also detects
+        orphan artifact files (written by the agent via ``write_file`` but
+        missing a sidecar) and creates sidecars for them so they are visible
+        on subsequent calls.
+
         Args:
             work_id: The work item ID.
 
@@ -102,13 +117,55 @@ class ArtifactStore:
         if not work_dir.exists():
             return []
 
+        # Phase 1: discover via sidecars
         artifacts: list[dict[str, Any]] = []
+        known_artifacts: set[tuple[str, str]] = set()  # (phase, name)
+
         for meta_file in sorted(work_dir.rglob("*.meta.json")):
             try:
                 meta = json.loads(meta_file.read_text(encoding="utf-8"))
                 artifacts.append(meta)
+                phase = meta.get("phase", "")
+                name = meta.get("name", "")
+                if phase and name:
+                    known_artifacts.add((phase, name))
             except (json.JSONDecodeError, OSError):
                 continue
+
+        # Phase 2: discover orphans (artifact files with no sidecar) and
+        # create sidecars so they're visible to future calls.  This handles
+        # artifacts written by the agent via write_file before the dispatcher
+        # had a chance to save them through ArtifactStore.
+        for phase_dir in sorted(work_dir.iterdir()):
+            if not phase_dir.is_dir():
+                continue
+            phase = phase_dir.name
+            for artifact_file in sorted(phase_dir.iterdir()):
+                if not artifact_file.is_file():
+                    continue
+                if artifact_file.name.endswith(".meta.json"):
+                    continue
+                name = artifact_file.name
+                if (phase, name) in known_artifacts:
+                    continue
+                # Orphan found — create sidecar
+                try:
+                    content = artifact_file.read_text(encoding="utf-8")
+                    meta = {
+                        "work_id": work_id,
+                        "phase": phase,
+                        "name": name,
+                        "size": len(content),
+                        "modified": datetime.fromtimestamp(
+                            artifact_file.stat().st_mtime
+                        ).isoformat(),
+                    }
+                    meta_path = phase_dir / f"{name}.meta.json"
+                    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    artifacts.append(meta)
+                    known_artifacts.add((phase, name))
+                except (OSError, UnicodeDecodeError):
+                    continue
 
         return artifacts
 
