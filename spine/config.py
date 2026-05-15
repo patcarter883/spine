@@ -73,6 +73,7 @@ class SpineConfig:
     queue_path: str = ".spine/queue.db"
     workspace_root: str = ""
     interpreter_enabled: bool = False
+    tool_schema_validation: bool = True
 
     @staticmethod
     def _find_workspace_root() -> str:
@@ -142,6 +143,10 @@ class SpineConfig:
             interpreter_enabled=os.getenv(
                 "SPINE_INTERPRETER", str(spine.get("interpreter_enabled", False)).lower()
             ) in ("1", "true", "yes"),
+            tool_schema_validation=os.getenv(
+                "SPINE_TOOL_SCHEMA_VALIDATION",
+                str(spine.get("tool_schema_validation", True)).lower(),
+            ) not in ("0", "false", "no"),
         )
 
     def resolve_model(self, phase: str | None = None) -> str:

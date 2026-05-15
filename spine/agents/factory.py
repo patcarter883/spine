@@ -115,6 +115,22 @@ def build_phase_agent(
     if add_summarization and not is_subagent:
         _add_summarization_middleware(middleware, model, backend)
 
+    # Tool schema validation (rebound loop for self-correction)
+    # Validates tool call args against the registered schema before execution.
+    # On mismatch, returns a ToolMessage(status="error") so the model can
+    # self-correct within the same agent loop. Disabled for subagents
+    # (they're leaf agents with simpler tool sets) and via env var.
+    if not is_subagent:
+        import os as _os
+
+        _validation_enabled = _os.getenv(
+            "SPINE_TOOL_SCHEMA_VALIDATION", "true"
+        ).lower() not in ("0", "false", "no")
+        if _validation_enabled:
+            from spine.agents.tool_schema_validator import ToolSchemaValidator
+
+            middleware.append(ToolSchemaValidator())
+
     # Context editing: trim old tool results for long-running phases
     if phase in (PhaseName.TASKS, PhaseName.IMPLEMENT, PhaseName.VERIFY) and not is_subagent:
         from spine.agents.context_editing import ToolOutputTrimmer
