@@ -10,6 +10,12 @@ from spine.ui.utils import format_duration, status_icon
 from spine.ui_api import UIApi
 
 
+# ── Polling fallback interval (seconds) ──
+# When the WebSocket bridge is disconnected or unavailable, this meta
+# refresh tag ensures the page eventually updates without manual reload.
+_POLL_INTERVAL = 30
+
+
 # ── Helpers ──
 
 
@@ -50,7 +56,8 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
     current_base = current.rsplit("_", 1)[-1] if "_" in current else current
     try:
         current_idx = next(
-            i for i, p in enumerate(phases)
+            i
+            for i, p in enumerate(phases)
             if p == current or p == current_base or p.startswith(current_base)
         )
     except StopIteration:
@@ -77,6 +84,17 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
 def render(api: UIApi) -> None:
     """Render the Queue page."""
     st.title("🚦 Queue")
+
+    # ── Polling fallback ──
+    # Ensure the page auto-refreshes even when the WebSocket bridge is
+    # unavailable (port conflict, browser security, start-up race, etc.).
+    # The meta refresh tag triggers a full Streamlit rerun at a fixed
+    # interval, providing a graceful degradation path when live push
+    # events are not arriving.
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{_POLL_INTERVAL}">',
+        unsafe_allow_html=True,
+    )
 
     overview = api.get_queue_overview()
     summary = overview.get("status_summary", {})

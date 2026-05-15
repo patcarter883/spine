@@ -30,10 +30,8 @@ st.set_page_config(
 if "api" not in st.session_state:
     st.session_state.api = UIApi()
 
-# ── Start WebSocket server (once per process) ──
-if "_ws_started" not in st.session_state:
-    start_ws_server()
-    st.session_state._ws_started = True
+# ── Start WebSocket server (idempotent — safe to call every re-run) ──
+start_ws_server()
 
 api: UIApi = st.session_state.api
 

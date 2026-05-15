@@ -13,6 +13,7 @@ Work items are tracked in a SQLite database at ``.spine/work_entries.db``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -28,6 +29,15 @@ from spine.persistence.artifacts import ArtifactStore
 from spine.services.audit_service import AuditService
 
 logger = logging.getLogger(__name__)
+
+# ── Stall detection ─────────────────────────────────────────────────────
+# Maximum time to wait for a single graph chunk before declaring the
+# workflow stalled.  When a subagent's LLM call hangs (e.g. OpenRouter
+# drops the connection but never closes it), the astream iterator blocks
+# forever.  This timeout catches that condition and marks the work item
+# as "stalled" so the UI and queue show the real state.
+# Default: 10 minutes (2x the 5-minute LLM request_timeout).
+_STALL_TIMEOUT_SECONDS = int(__import__("os").environ.get("SPINE_STALL_TIMEOUT", "600"))
 
 
 # ── Work entries database ──
@@ -194,8 +204,38 @@ async def submit_work(
         # Stream the graph so we can update the work entry after each phase.
         # This lets the UI see progress (current_phase, status) while the
         # workflow is still running, instead of only getting the final result.
+        #
+        # Stall detection: wrap the astream iterator with a per-chunk timeout.
+        # If no chunk arrives within _STALL_TIMEOUT_SECONDS, the workflow is
+        # considered stalled (e.g. a subagent LLM call hung).  We mark the
+        # work entry as "stalled" and break out instead of blocking forever.
         result: dict[str, Any] = dict(initial_state)
-        async for chunk in graph.astream(initial_state, thread_config):
+        stream_iter = graph.astream(initial_state, thread_config)
+        stalled = False
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    stream_iter.__anext__(),
+                    timeout=_STALL_TIMEOUT_SECONDS,
+                )
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                last_phase = result.get("current_phase", "")
+                logger.error(
+                    f"[{work_id}] Workflow stalled — no chunk received for "
+                    f"{_STALL_TIMEOUT_SECONDS}s (last phase: {last_phase}). "
+                    f"Marking as stalled."
+                )
+                stalled = True
+                _update_work_progress(db, work_id, last_phase, "stalled")
+                audit.log_event(
+                    work_id,
+                    "work_stalled",
+                    "dispatcher",
+                    {"last_phase": last_phase, "timeout": _STALL_TIMEOUT_SECONDS},
+                )
+                break
             # Each chunk is {node_name: partial_state_update}
             for node_name, node_output in chunk.items():
                 # Deep-merge artifacts so phase outputs accumulate instead of
@@ -265,12 +305,16 @@ async def submit_work(
 
         # Update work entry with final results.
         # Derive the terminal status from the graph state:
+        #   - If stalled, the status was already set to "stalled" above.
         #   - If the critic routed to needs_review → END, the feedback
         #     contains a needs_review entry.
         #   - If the graph completed naturally (all phases ran), status
         #     should be "completed" or the verify phase's final status.
         #   - The top-level except (below) catches true failures.
-        final_status = result.get("status", "completed")
+        if stalled:
+            final_status = "stalled"
+        else:
+            final_status = result.get("status", "completed")
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])

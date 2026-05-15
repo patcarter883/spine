@@ -188,6 +188,18 @@ class UIApi:
         """Get a combined view of the queue: pending items, active job with
         phase and timing, and recent history.
 
+        The active job is sourced from the **queue** table (via
+        ``RalphLoopWorker.get_active()``) rather than the ``work_entries``
+        table.  The ``work_entries`` status can go stale because
+        ``dispatcher.py`` finalises it independently of the worker's queue
+        lifecycle.  The queue table is the authoritative source for the
+        currently-running item.
+
+        Phase-timing details (``current_phase``, ``created_at``,
+        ``updated_at``) are enriched from the corresponding ``work_entries``
+        record, so the UI can display a live phase progress bar and timing
+        captions.
+
         Returns:
             Dict with keys: pending, active, recent, status_summary.
         """
@@ -195,10 +207,12 @@ class UIApi:
         pending = worker.list_pending()
         recent = worker.list_recent_completed()
 
-        # Active job is the latest running work entry (there's at most one
-        # since RalphLoopWorker processes sequentially).
-        running_entries = list_work(status="running", limit=1, config=self._config)
-        active: dict[str, Any] | None = running_entries[0] if running_entries else None
+        # Active job from the queue table (authoritative source).
+        active = worker.get_active()
+
+        # Enrich with phase-timing details from work_entries.
+        if active is not None:
+            self._enrich_active_with_work_entry(active)
 
         return {
             "pending": pending,
@@ -206,6 +220,37 @@ class UIApi:
             "recent": recent,
             "status_summary": worker.queue_status(),
         }
+
+    def _enrich_active_with_work_entry(self, active: dict[str, Any]) -> None:
+        """Merge ``current_phase``, ``created_at``, ``updated_at`` from the
+        corresponding ``work_entries`` record into *active* (mutated in
+        place).
+
+        Correlation logic:
+        1. If the queue row already has a ``work_id`` (stored by the worker
+           after ``submit_work()`` returns), use it directly.
+        2. Otherwise, fall back to finding the most recently-created
+           ``work_entries`` row with ``status = "running"``.  Since the
+           worker processes items sequentially, there should be at most
+           one running work entry at any time.
+        """
+        work_id = active.get("work_id")
+        if not work_id:
+            # Fallback: find the running work entry by status.
+            entries = list_work(status="running", limit=1, config=self._config)
+            if entries:
+                work_id = entries[0].get("id")
+
+        if not work_id:
+            return
+
+        entry = get_work_status(work_id, self._config)
+        if entry is None:
+            return
+
+        for key in ("current_phase", "created_at", "updated_at"):
+            if key in entry and entry[key]:
+                active[key] = entry[key]
 
     # ── Resume operations ──
 
