@@ -1,13 +1,14 @@
 spine:
   checkpoint_path: .spine/spine.db
-  workspace_root: /home/pat/Projects/spine
+  workspace_root: /home/pat/projects/spine
   interpreter_enabled: true
 
 providers:
   llm:
   - name: default
     type: deepagents-model
-    model: openrouter:qwen/qwen3.6-27b
+    model: openrouter:deepseek/deepseek-v4-flash
+    max_completion_tokens: 32768
     priority: 1
     enabled: true
   # - name: local-da

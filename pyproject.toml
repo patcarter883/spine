@@ -30,6 +30,7 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "langchain-quickjs>=0.1.0",
     "websockets>=13.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [project.scripts]
