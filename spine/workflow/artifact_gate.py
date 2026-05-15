@@ -1,8 +1,12 @@
 """SPINE artifact gate — structural pre-check before phase transitions.
 
 An artifact gate ensures a phase doesn't run if its prerequisite phase
-produced no artifacts. This prevents the workflow from advancing to verify
-when implement produced nothing, for example.
+produced no artifacts. Currently only the tasks→implement transition is
+gated: implement requires meaningful task artifacts before it can generate code.
+
+The implement→verify transition is NOT gated. Verify always runs after
+implement — if implement produced nothing, verify can detect and report that.
+There is no reason for a human review gate between implement and verify.
 
 The gate is wired as a **node** in the LangGraph StateGraph, not a conditional
 edge function. This is critical: when the gate fails, it must write
@@ -16,10 +20,10 @@ to the next phase node. When it fails, it sets ``status = "needs_review"``,
 adds a feedback entry, and routes to END.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
+
+from langchain_core.runnables import RunnableConfig
 
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
@@ -67,7 +71,7 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
     """
 
     def gate_node(
-        state: WorkflowState, config: dict | None = None
+        state: WorkflowState, config: RunnableConfig | None = None
     ) -> dict[str, Any]:
         work_id = state.get("work_id", "unknown")
 

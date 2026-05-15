@@ -11,6 +11,11 @@ Feedback is tagged by tier so the reworking phase knows what to address.
 Context engineering: artifact content is on disk. The critic gets a short
 preview inline with paths to full files, rather than inlining everything.
 SpineContext is passed at invoke time.
+
+Agent critic check is async to avoid event-loop binding errors when
+subagents inherit the parent checkpointer — the sync ``invoke_with_retry``
+runs in a thread pool which breaks ``asyncio.Lock`` objects bound to the
+original event loop.
 """
 
 from __future__ import annotations
@@ -96,7 +101,7 @@ def structural_critic_check(state: WorkflowState, reviewed_phase: str) -> dict[s
     }
 
 
-def agent_critic_check(
+async def agent_critic_check(
     state: WorkflowState,
     reviewed_phase: str,
     config: Any | None = None,
@@ -133,7 +138,7 @@ def agent_critic_check(
             }
 
         # Build the critic agent and invoke it with retry
-        from spine.agents.retry import invoke_with_retry
+        from spine.agents.retry import ainvoke_with_retry
         from spine.agents.context import build_context
         from spine.agents.artifacts import materialize_artifacts, build_inline_artifact_prompt
 
@@ -166,7 +171,7 @@ def agent_critic_check(
 
         ctx = build_context(state, PhaseName.CRITIC)
 
-        result = invoke_with_retry(
+        result = await ainvoke_with_retry(
             critic_agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=f"critic/{reviewed_phase}",

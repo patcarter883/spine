@@ -12,6 +12,10 @@ so they can write ``status = "needs_review"`` and feedback entries to state
 when they fail. This ensures the dispatcher detects the human-review condition
 instead of silently marking the work as completed.
 
+Currently, only the tasks→implement transition is gated.  Verify always runs
+after implement — if implement produced nothing, verify detects and reports
+that; there is no reason for a human review gate between those two phases.
+
 Phase sequences by WorkType:
     quick:           TASKS → IMPLEMENT → VERIFY
     critical_quick:  TASKS → CRITIC → IMPLEMENT → VERIFY
@@ -20,11 +24,7 @@ Phase sequences by WorkType:
                      TASKS → CRITIC_TASKS → IMPLEMENT → VERIFY
 """
 
-from __future__ import annotations
-
 from typing import Any
-
-from typing import Optional
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -119,16 +119,16 @@ def build_workflow_graph(
     graph = StateGraph(WorkflowState)
 
     # Collect which edges need artifact gates.
-    # We gate based on the *target* node: verify requires implement artifacts,
-    # implement requires tasks artifacts.  The source node can be any phase
-    # (including a critic node) — we look at what comes just before the target.
+    # We gate based on the *target* node: implement requires tasks artifacts.
+    # Verify always runs after implement — it's the phase that confirms
+    # implementation meets requirements.  If implement produced nothing,
+    # verify can detect and report that; there is no reason for a human
+    # review gate between implement and verify.
     gate_edges: dict[tuple[str, str], str] = {}  # (src, dst) → required_phase
     for i, (node_name, _reviewed_phase) in enumerate(phase_seq):
         if i < len(phase_seq) - 1:
             next_node_name = phase_seq[i + 1][0]
-            if next_node_name == PhaseName.VERIFY.value:
-                gate_edges[(node_name, next_node_name)] = PhaseName.IMPLEMENT.value
-            elif next_node_name == PhaseName.IMPLEMENT.value:
+            if next_node_name == PhaseName.IMPLEMENT.value:
                 gate_edges[(node_name, next_node_name)] = PhaseName.TASKS.value
 
     # Add all phase/critic nodes
@@ -223,20 +223,23 @@ def _make_critic_node(
     Wraps the generic ``call_critic`` so the reviewed phase is determined
     by the graph position, not by inspecting state artifacts.
 
+    The wrapper is async because ``call_critic`` is async — LangGraph
+    handles async node functions natively.
+
     Args:
-        critic_fn: The base critic call function.
+        critic_fn: The base critic call function (async).
         reviewed_phase: The phase this critic instance reviews.
 
     Returns:
-        A node function with the correct reviewed_phase.
+        An async node function with the correct reviewed_phase.
     """
 
-    def critic_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict:
+    async def critic_node(state: WorkflowState, config: RunnableConfig | None = None) -> dict:
         """Critic node that reviews a specific phase."""
         # Inject which phase this critic reviews into state
         # so _get_reviewed_phase and critic_router can use it
         augmented_state = {**state, "critic_reviewing": reviewed_phase}
-        result = critic_fn(augmented_state, config)
+        result = await critic_fn(augmented_state, config)
         return result
 
     return critic_node

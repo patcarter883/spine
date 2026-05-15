@@ -2,12 +2,17 @@
 
 Each workflow phase registers itself with a name, a call function (the LangGraph
 node), and an agent builder that creates the Deep Agent for that phase.
+
+Phase node functions may be sync or async.  LangGraph handles both
+transparently — sync nodes run in a thread pool, async nodes run directly
+on the event loop.  All SPINE phase nodes are async to avoid event-loop
+binding errors with the checkpointer's ``asyncio.Lock``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Any
+from typing import Callable, Any, Awaitable
 
 
 @dataclass
@@ -16,14 +21,15 @@ class PhaseDefinition:
 
     Attributes:
         name: The phase identifier (must match a PhaseName enum value).
-        call_fn: The LangGraph node function. Signature: ``(state, config) -> dict``.
+        call_fn: The LangGraph node function. Signature: ``(state, config) -> dict``
+            (sync) or ``async (state, config) -> dict`` (async).
         build_agent_fn: Factory that creates a Deep Agent for this phase.
             Signature: ``(state, config) -> CompiledGraph``.
         description: Human-readable description of the phase.
     """
 
     name: str
-    call_fn: Callable[..., dict[str, Any]]
+    call_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]]
     build_agent_fn: Callable[..., Any]
     description: str = ""
 
@@ -41,7 +47,7 @@ class PhaseRegistry:
     def register(
         self,
         name: str,
-        call_fn: Callable[..., dict[str, Any]],
+        call_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]],
         build_agent_fn: Callable[..., Any],
         description: str = "",
     ) -> None:
@@ -49,7 +55,7 @@ class PhaseRegistry:
 
         Args:
             name: Phase name (must match a PhaseName enum value).
-            call_fn: LangGraph node function for this phase.
+            call_fn: LangGraph node function for this phase (sync or async).
             build_agent_fn: Factory that creates a Deep Agent for this phase.
             description: Human-readable description.
         """
