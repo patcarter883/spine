@@ -20,11 +20,35 @@ import yaml
 # It's safe to call multiple times (no-op if already loaded).
 
 def _load_dotenv() -> None:
-    """Load .env from the project root if python-dotenv is available."""
+    """Load .env from the project root if python-dotenv is available.
+
+    Search order:
+      1. CWD and its parents (works when launched from the project root)
+      2. The directory containing the spine package and its parents
+         (works when Streamlit or another runner changes CWD away
+         from the project root)
+
+    ``override=False`` ensures manually-set env vars always win.
+    """
     try:
         from dotenv import load_dotenv
-        # Walk up from CWD to find .env — prefer project root
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
+
+        # Strategy 1: walk up from CWD (includes CWD itself)
+        loaded = False
+        cwd = Path.cwd().resolve()
+        for candidate in [cwd, *cwd.parents]:
+            if (candidate / ".env").is_file():
+                loaded = load_dotenv(dotenv_path=candidate / ".env", override=False)
+                break
+
+        # Strategy 2: walk up from the package directory — this handles
+        # Streamlit which may launch with a CWD like $HOME or /tmp.
+        if not loaded:
+            pkg_dir = Path(__file__).resolve().parent
+            for candidate in pkg_dir.parents:
+                if (candidate / ".env").is_file():
+                    load_dotenv(dotenv_path=candidate / ".env", override=False)
+                    break
     except ImportError:
         # python-dotenv not installed — env vars must be set manually
         pass

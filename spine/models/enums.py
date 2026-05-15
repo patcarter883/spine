@@ -41,3 +41,4 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     NEEDS_REVIEW = "needs_review"
     FAILED = "failed"
+    STALLED = "stalled"
