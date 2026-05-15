@@ -119,6 +119,7 @@ async def submit_work(
     description: str,
     work_type: str = "spec",
     config: SpineConfig | None = None,
+    created_at: str | None = None,
 ) -> dict[str, Any]:
     """Submit a new work item for processing.
 
@@ -128,10 +129,16 @@ async def submit_work(
     3. Invokes the graph with checkpoint persistence
     4. Returns the work ID and initial state
 
+    When called from the background queue worker (RalphLoopWorker),
+    ``created_at`` should be the original ``enqueued_at`` timestamp so
+    the dashboard shows items in submission order, not processing order.
+
     Args:
         description: The work description / prompt.
         work_type: One of "quick", "critical_quick", "spec", "critical_spec".
         config: Optional SpineConfig (loads from default if not provided).
+        created_at: Optional ISO timestamp for the work entry's ``created_at``
+            field.  When ``None`` (default), uses the current time.
 
     Returns:
         A dict with keys: ``work_id``, ``status``, ``work_type``.
@@ -154,6 +161,8 @@ async def submit_work(
         },
     )
 
+    now = created_at or datetime.now().isoformat()
+
     # Record the work entry
     db = _get_work_db(config)
     db["work_entries"].insert(
@@ -163,8 +172,8 @@ async def submit_work(
             "work_type": work_type,
             "status": TaskStatus.RUNNING.value,
             "current_phase": "",
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
+            "created_at": now,
+            "updated_at": now,
             "result": "{}",
         }
     )
@@ -206,16 +215,16 @@ async def submit_work(
         # This lets the UI see progress (current_phase, status) while the
         # workflow is still running, instead of only getting the final result.
         #
-        # Stream mode: ["updates", "messages"] with subgraphs=True.
-        #   - "updates" yields {node_name: output} on each node completion
-        #     (same as the default "values" mode but without full state).
+        # Stream mode: ["updates", "messages"] with subgraphs=True, version="v2".
+        #   - "updates" yields {node_name: output} on each node completion.
         #   - "messages" yields token-level LLM output from inside nodes,
         #     keeping the stall timer alive during long agent runs.
         #   - subgraphs=True reaches into Deep Agent subgraph LLM calls.
-        #
-        # With mixed stream_mode, chunks are tuples: (mode, data).
-        #   - ("updates", {node_name: output}) — node completed
-        #   - ("messages", (AIMessageChunk, metadata)) — LLM token
+        #   - version="v2" gives a consistent dict-based StreamPart format:
+        #       {"type": "updates"|"messages"|..., "ns": (...), "data": ...}
+        #     The v1 format changes shape depending on stream_mode / subgraph
+        #     settings (2-tuple vs 3-tuple), which caused all chunks to be
+        #     silently dropped when subgraphs=True (len != 2 check failed).
         #
         # Stall detection: wrap the astream iterator with a per-chunk timeout.
         # If no chunk (update OR message token) arrives within
@@ -229,6 +238,7 @@ async def submit_work(
             thread_config,
             stream_mode=["updates", "messages"],
             subgraphs=True,
+            version="v2",
         )
         stalled = False
         while True:
@@ -256,18 +266,22 @@ async def submit_work(
                 )
                 break
 
-            # With stream_mode=["updates", "messages"], each chunk is a
-            # tuple (mode, data).  Skip message tokens — they only serve
-            # to keep the stall timer alive.  Process "updates" chunks
-            # (node completions) for state tracking and artifact persistence.
-            if not isinstance(chunk, tuple) or len(chunk) != 2:
-                continue
-            mode, data = chunk
-            if mode != "updates":
-                # "messages" tokens just reset the stall timer — nothing
-                # else to do with them here.
+            # V2 format: each chunk is a StreamPart dict:
+            #   {"type": "updates"|"messages", "ns": (...), "data": ...}
+            # Skip non-update chunks — "messages" tokens only serve to keep
+            # the stall timer alive.  Process "updates" chunks (node
+            # completions) for state tracking and artifact persistence.
+            if not isinstance(chunk, dict) or chunk.get("type") != "updates":
                 continue
 
+            # Only process root-level updates (ns == ()).
+            # Subgraph updates come from Deep Agent internals — we don't
+            # need to track them at this level.
+            ns = chunk.get("ns", ())
+            if ns != ():
+                continue
+
+            data = chunk.get("data", {})
             # data is {node_name: partial_state_update}
             for node_name, node_output in data.items():
                 # Deep-merge artifacts so phase outputs accumulate instead of
@@ -491,17 +505,29 @@ def list_work(
         config = SpineConfig.load()
 
     db = _get_work_db(config)
-    table = db["work_entries"]
 
+    # Use raw SQL so we can include `rowid` for the tiebreaker and use
+    # NULLS LAST (SQLite 3.30+).  The `rows_where` API doesn't expose
+    # rowid or support NULLS LAST natively.
     if status:
-        rows = table.rows_where(
-            "status = ?",
-            [status],
-            order_by="created_at DESC",
-            limit=limit,
+        rows = list(
+            db.query(
+                "SELECT rowid, * FROM work_entries "
+                "WHERE status = ? "
+                "ORDER BY created_at DESC NULLS LAST, rowid DESC "
+                "LIMIT ?",
+                [status, limit],
+            )
         )
     else:
-        rows = table.rows_where(order_by="created_at DESC", limit=limit)
+        rows = list(
+            db.query(
+                "SELECT rowid, * FROM work_entries "
+                "ORDER BY created_at DESC NULLS LAST, rowid DESC "
+                "LIMIT ?",
+                [limit],
+            )
+        )
 
     results = []
     for row in rows:
@@ -511,6 +537,27 @@ def list_work(
             except json.JSONDecodeError:
                 pass
         results.append(row)
+
+    # ── Post-query Python safety-net sort ─────────────────────────────────
+    # Handles edge cases where SQLite ordering behaves unexpectedly
+    # (e.g. different sqlite-utils version, column type mismatch).
+    #
+    # Sort key: (group, created_at, rowid)
+    #   - group 1 for entries with a valid created_at
+    #   - group 0 for NULL created_at (sorts after group 1 in DESC)
+    #   - created_at as-is for ISO-8601 lexicographic ordering
+    #   - rowid as tiebreaker (higher = newer = first in DESC)
+    # With reverse=True, larger keys sort first.
+    def _sort_key(r: dict[str, Any]) -> tuple[int, str, int]:
+        """Sort key: newest-first, NULL timestamps at end."""
+        ts = r.get("created_at")
+        rid = r.get("rowid", 0) or 0
+        if ts is None:
+            return (0, "", rid)  # group 0 → last in descending order
+        return (1, ts, rid)  # group 1 → newest-first descending
+
+    results.sort(key=_sort_key, reverse=True)
+
     return results
 
 
@@ -683,23 +730,26 @@ async def resume_work(
 
         # Stream the graph, updating the work entry after each phase
         # (same pattern as submit_work — uses stream_mode=["updates", "messages"]
-        # with subgraphs=True for token-level liveness / stall detection)
+        # with subgraphs=True and version="v2" for consistent StreamPart format)
         result: dict[str, Any] = dict(resume_state)
         async for chunk in graph.astream(
             resume_state,
             thread_config,
             stream_mode=["updates", "messages"],
             subgraphs=True,
+            version="v2",
         ):
-            # With mixed stream_mode, chunks are tuples (mode, data).
-            # Skip message tokens — they only serve to keep the stall timer
-            # alive.  Process "updates" for state tracking.
-            if not isinstance(chunk, tuple) or len(chunk) != 2:
+            # V2 format: each chunk is a StreamPart dict:
+            #   {"type": "updates"|"messages", "ns": (...), "data": ...}
+            # Skip non-update chunks.  Only process root-level updates
+            # (ns == ()) — subgraph updates come from Deep Agent internals.
+            if not isinstance(chunk, dict) or chunk.get("type") != "updates":
                 continue
-            mode, data = chunk
-            if mode != "updates":
+            ns = chunk.get("ns", ())
+            if ns != ():
                 continue
 
+            data = chunk.get("data", {})
             for node_name, node_output in data.items():
                 # Deep-merge artifacts
                 node_artifacts = node_output.get("artifacts")

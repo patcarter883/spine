@@ -168,6 +168,7 @@ class RalphLoopWorker:
                         description=item["description"],
                         work_type=item["work_type"],
                         config=self.config,
+                        created_at=item.get("enqueued_at"),
                     )
                 )
 

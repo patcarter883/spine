@@ -5,7 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from spine.ui.pages import get as get_page
-from spine.ui.utils import status_icon, truncate
+from spine.ui.utils import format_timestamp, status_icon, truncate
 from spine.ui_api import UIApi
 
 # ── Fragment refresh interval (seconds) ──
@@ -42,9 +42,10 @@ def _render_recent_work(api: UIApi) -> None:
         icon = status_icon(status)
         phase = item.get("current_phase", "")
         desc = truncate(item.get("description", ""), 80)
+        created = format_timestamp(item.get("created_at"))
 
         with st.container():
-            col1, col2, col3 = st.columns([1, 4, 2])
+            col1, col2, col3, col4 = st.columns([1, 3, 1.5, 1.5])
             col1.write(f"{icon}")
 
             # Clickable button to navigate to work detail page
@@ -58,6 +59,7 @@ def _render_recent_work(api: UIApi) -> None:
                     query_params={"work_id": work_id},
                 )
             col3.write(f"{phase or status}")
+            col4.write(f"{created}")
 
 
 @st.fragment(run_every=_POLL_INTERVAL)

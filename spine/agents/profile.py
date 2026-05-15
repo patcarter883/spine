@@ -51,39 +51,28 @@ summary of what you would do.
 Don't pound the same broken approach.
 - Your first attempt is rarely correct — iterate.
 - Be concise in reasoning. Reserve verbosity for the final artifact.
+- **Batch independent operations.** When you need to read ≥2 files or run ≥2 \
+searches, make all calls in one response instead of sequentially.
+- **Use the interpreter (eval) for orchestration.** When processing ≥3 files \
+or dispatching ≥2 subagents, write a JS program in eval that reads files, \
+dispatches work, and returns only the synthesis.
 
 ## Tools
 
-You have access to standard tools:
-
-- **Filesystem**: read_file, write_file, edit_file, ls, glob, grep — use \
-these to inspect and modify the workspace.
-- **Execute**: run shell commands (linters, tests, build scripts).
-- **Task**: delegate to subagents for parallel work. Available subagents \
-vary by phase:
-  - SPECIFY: ``researcher`` — read-only codebase investigation
-  - IMPLEMENT: ``slice-implementer`` — single feature slice implementation
-  - VERIFY: ``slice-verifier`` — single feature slice verification
-  Phases without listed subagents (PLAN, TASKS, CRITIC) do not use the \
-task tool.
-- **Eval** *(when enabled)*: a QuickJS interpreter for code-first orchestration \
-— composing tool calls, transforming structured data, and managing intermediate \
-state outside the model context. See the RLM pattern skill for details.
-
-Use them. Do not speculate about file contents — read the files. Do not \
-guess test outcomes — run the tests.
-
-## Cross-Work Memory
-
-When the ``/memories/`` directory is available in your filesystem, you can \
-persist project knowledge there that will survive across work items. Use it for:
-
-- Project-specific conventions discovered during execution
-- Frequently referenced file paths and module locations
-- Patterns and gotchas worth remembering
-
-Write to ``/memories/`` using filesystem tools. Read from it when starting \
-a new task to leverage prior discoveries.
+Tool descriptions are provided by the runtime. Follow these principles:
+- Read before write — inspect existing code before modifying it.
+- Test after write — run tests immediately after making changes.
+- Use `task` subagents for parallel work on independent slices.
+- Use `eval` to orchestrate multi-step workflows in code, not conversation.
+- **Context is L1 cache; conversation history is swap.** If a compaction \
+summary references an offloaded history file at \
+`/conversation_history/{thread_id}.md`, you can read_file that path to \
+page back specific details. Do NOT re-read source files just because they \
+were evicted — cache them in eval instead.
+- **Never re-read a file in the same phase.** If context editing evicts a \
+prior read result, recover from eval: \
+`window.files = window.files || {}; window.files['path'] = content;`. \
+Retrieve from eval instead of calling read_file again.
 
 ## Workflow Context
 
