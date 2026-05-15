@@ -19,12 +19,13 @@ out a crucial detail.
 from __future__ import annotations
 
 import logging
-from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware
 
 logger = logging.getLogger(__name__)
 
 
-class ToolOutputTrimmer:
+class ToolOutputTrimmer(AgentMiddleware):
     """Trims old tool outputs from the conversation to keep context lean.
 
     Replaces old tool result content with a compact placeholder when
@@ -34,6 +35,9 @@ class ToolOutputTrimmer:
     Design: treats context as L1 cache. Evicted content lives in the
     offloaded conversation history (swap) and can be paged back via
     read_file if needed.
+
+    Only intercepts model calls (``awrap_model_call``) — tool call
+    wrapping is passed through unchanged.
     """
 
     def __init__(
@@ -78,3 +82,16 @@ class ToolOutputTrimmer:
                 pass
 
         return await handler(request.override(messages=trimmed_messages))
+
+    # ── Pass-through tool call wrapping ────────────────────────────────
+    # This middleware only intercepts model calls. Tool calls must still
+    # be defined so DA's factory check (``m.__class__.wrap_tool_call is
+    # not AgentMiddleware.wrap_tool_call``) passes without AttributeError.
+
+    def wrap_tool_call(self, request, handler):
+        """Pass-through: no tool-call interception needed."""
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        """Pass-through: no tool-call interception needed."""
+        return await handler(request)

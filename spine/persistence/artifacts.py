@@ -19,7 +19,15 @@ class ArtifactStore:
     def __init__(self, base_path: str = ".spine/artifacts") -> None:
         self._base = Path(base_path)
 
-    def save_artifact(self, work_id: str, phase: str, name: str, content: str) -> Path:
+    def save_artifact(
+        self,
+        work_id: str,
+        phase: str,
+        name: str,
+        content: str,
+        *,
+        overwrite_shorter: bool = False,
+    ) -> Path:
         """Save an artifact to disk.
 
         Args:
@@ -27,6 +35,11 @@ class ArtifactStore:
             phase: The phase that produced the artifact.
             name: The artifact filename.
             content: The artifact content.
+            overwrite_shorter: When False (default), skip writing if the
+                file already exists on disk and is longer than the new
+                content.  This prevents truncated state previews (capped
+                at ``_MAX_ARTIFACT_STATE_CHARS``) from overwriting the
+                full files the agent originally wrote via ``write_file``.
 
         Returns:
             The path where the artifact was saved.
@@ -34,6 +47,17 @@ class ArtifactStore:
         artifact_dir = self._base / work_id / phase
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = artifact_dir / name
+
+        # Guard: never overwrite a full on-disk artifact with a shorter
+        # (truncated) version from workflow state.  The agent writes full
+        # files via write_file; state only stores 500-char previews.
+        if (
+            not overwrite_shorter
+            and artifact_path.exists()
+            and len(content) < len(artifact_path.read_text(encoding="utf-8"))
+        ):
+            return artifact_path
+
         artifact_path.write_text(content, encoding="utf-8")
 
         # Write metadata sidecar
