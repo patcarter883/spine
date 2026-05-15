@@ -74,6 +74,20 @@ class SpineConfig:
     workspace_root: str = ""
     interpreter_enabled: bool = False
 
+    @staticmethod
+    def _find_workspace_root() -> str:
+        """Auto-detect workspace root by searching upward for ``.spine/``.
+
+        Walks up from CWD looking for a ``.spine`` directory.  If found,
+        its parent is the workspace root.  Falls back to CWD if not found.
+        This mirrors the ``_load_dotenv`` strategy for ``.env`` discovery.
+        """
+        cwd = Path.cwd().resolve()
+        for candidate in [cwd, *cwd.parents]:
+            if (candidate / ".spine").is_dir():
+                return str(candidate)
+        return str(cwd)
+
     @classmethod
     def load(cls, path: str = ".spine/config.yaml") -> SpineConfig:
         """Load configuration from a YAML file, falling back to defaults.
@@ -100,9 +114,14 @@ class SpineConfig:
         # like /home/pat/projects vs /home/pat/Projects would silently
         # point at a different (or non-existent) directory, causing the
         # deep agent to write files to the wrong place.
+        #
+        # Auto-detect by searching upward for .spine/ when neither the env
+        # var nor the config file explicitly set a value.
         raw_root = os.getenv(
-            "SPINE_WORKSPACE_ROOT", spine.get("workspace_root", os.getcwd())
+            "SPINE_WORKSPACE_ROOT", spine.get("workspace_root", None)
         )
+        if raw_root is None:
+            raw_root = cls._find_workspace_root()
         resolved_root = str(Path(raw_root).resolve())
 
         return cls(

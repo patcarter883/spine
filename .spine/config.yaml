@@ -1,19 +1,18 @@
 spine:
   checkpoint_path: .spine/spine.db
-  workspace_root: /home/pat/projects/spine
   interpreter_enabled: true
 
 providers:
   llm:
   # - name: default
   #   type: deepagents-model
-  #   model: openrouter:deepseek/deepseek-v4-flash
+  #   model: openrouter:deepseek/deepseek-v4-pro
   #   max_completion_tokens: 32768
   #   priority: 1
   #   enabled: true
   - name: default
     type: deepagents-model
-    model: openai:unsloth/Mistral-Small-3.1-24B-Instruct-2503-GGUF:Q4_K_M
+    model: openai:model
     base_url: 'http://localhost:8000/v1'
     api_key: 'vllm'
     priority: 0
