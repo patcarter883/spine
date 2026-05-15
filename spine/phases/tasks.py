@@ -121,7 +121,13 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
             f"3. Write a summary `tasks.md` to `{tasks_artifact_dir}/tasks.md`\n"
             f"   that references each slice.\n"
             f"4. **You MUST call `write_file`** — do not just describe the slices\n"
-            f"   in conversation. Write them to disk.\n",
+            f"   in conversation. Write them to disk.\n"
+            f"5. Write a `codebase-map.md` to `{tasks_artifact_dir}/codebase-map.md` that captures your exploration findings:\n"
+            f"   - File paths with descriptions (what each file does)\n"
+            f"   - Key classes and functions (names, signatures)\n"
+            f"   - Import chains between relevant modules\n"
+            f"   - Conventions discovered (naming, patterns, error handling)\n"
+            f"   This map will be read by the implement and verify phases — it saves them from re-exploring the codebase.\n",
         ])
         prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:

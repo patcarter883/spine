@@ -90,17 +90,22 @@ async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] 
                 f"- Specification: `{spec_path}/specification.md`",
                 f"- Plan: `{plan_path}/plan.md`",
                 f"- Feature Slices: `{tasks_path}/tasks.md`",
+                f"- Codebase map: `{tasks_path}/codebase-map.md`",
                 "",
             ])
         else:
             prompt_lines.extend([
                 "Prior artifacts are available on disk — read them as needed:",
                 f"- Feature Slices: `{tasks_path}/tasks.md`",
+                f"- Codebase map: `{tasks_path}/codebase-map.md`",
                 "",
             ])
         prompt_lines.extend([
             "Use `read_file` and `grep` to inspect them. Do NOT load "
             "everything into context at once.",
+            "",
+            "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
+            "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
             "",
         ])
         prompt = "\n".join(prompt_lines)

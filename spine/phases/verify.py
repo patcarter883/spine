@@ -93,10 +93,14 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
             ])
         prompt_lines.extend([
             f"- Feature Slices: `{tasks_path}/tasks.md`",
+            f"- Codebase map: `{tasks_path}/codebase-map.md`",
             f"- Implementation: `{impl_path}/implementation.md`",
             "",
             "Use `read_file` and `grep` to inspect them. Do NOT load "
             "everything into context at once.",
+            "",
+            "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
+            "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
             "",
             "Also inspect the actual code files on disk using `ls` and "
             "`read_file` — the implementation summary may not reflect "
