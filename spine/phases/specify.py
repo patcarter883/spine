@@ -53,6 +53,7 @@ async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = 
     """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0)
     feedback = state.get("feedback", [])
     workspace_root = state.get("workspace_root", ".")
@@ -83,6 +84,7 @@ async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = 
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.SPECIFY.value,
             work_id=work_id,
+            work_type=work_type,
             context=ctx,
         )
 

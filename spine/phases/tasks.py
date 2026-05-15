@@ -21,7 +21,7 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.tasks_agent import build_tasks_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry
+from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     scan_artifact_dir,
@@ -145,6 +145,7 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.TASKS.value,
             work_id=work_id,
+            work_type=work_type,
             context=ctx,
         )
 
@@ -201,6 +202,7 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
                 {"messages": [{"role": "user", "content": retry_prompt}]},
                 phase_name=PhaseName.TASKS.value,
                 work_id=work_id,
+                work_type=work_type,
                 context=ctx,
             )
             # Scan disk again after retry
@@ -253,6 +255,26 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
             "prompt_request": None,
         }
 
+    except MaxTokenBudgetExceeded as e:
+        logger.error(f"[{work_id}] TASKS phase exceeded token budget: {e}")
+        return {
+            "artifacts": {PhaseName.TASKS.value: {}},
+            "current_phase": PhaseName.TASKS.value,
+            "status": "needs_review",
+            "feedback": [{
+                "status": "needs_review",
+                "tier": "structural",
+                "reason": str(e),
+                "suggestions": [
+                    "Reduce task scope or break into smaller work items",
+                    "Use a cheaper model for exploration phases",
+                ],
+            }],
+            "prompt_request": {
+                "message": str(e),
+                "phase": PhaseName.TASKS.value,
+            },
+        }
     except Exception as e:
         logger.error(f"[{work_id}] TASKS phase failed: {e}", exc_info=True)
         return {

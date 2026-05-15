@@ -116,7 +116,7 @@ def build_phase_agent(
         _add_summarization_middleware(middleware, model, backend)
 
     # Context editing: trim old tool results for long-running phases
-    if phase in (PhaseName.IMPLEMENT, PhaseName.VERIFY) and not is_subagent:
+    if phase in (PhaseName.TASKS, PhaseName.IMPLEMENT, PhaseName.VERIFY) and not is_subagent:
         from spine.agents.context_editing import ToolOutputTrimmer
 
         middleware.append(ToolOutputTrimmer(max_full_tool_results=20))

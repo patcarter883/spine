@@ -176,6 +176,7 @@ async def agent_critic_check(
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=f"critic/{reviewed_phase}",
             work_id=state.get("work_id", "unknown"),
+            work_type=state.get("work_type", ""),
             context=ctx,
         )
 

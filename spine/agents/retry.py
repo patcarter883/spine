@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -28,6 +29,130 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = 2.0  # seconds
 DEFAULT_MAX_DELAY = 60.0  # seconds
+
+# ── Token budget tracking ──────────────────────────────────────────
+# Global budget tracker per work_id. Quick/small workflows get smaller
+# budgets to fail fast before token bloat.
+
+_DEFAULT_QUICK_BUDGET = 200_000
+_DEFAULT_SPEC_BUDGET = 500_000
+_DEFAULT_CRITICAL_BUDGET = 1_000_000
+
+_token_budgets: dict[str, dict[str, Any]] = {}
+_token_budget_lock = asyncio.Lock()
+
+
+def _get_token_budget(work_id: str, work_type: str = "") -> int | None:
+    """Return the max token budget for a work item, or None if disabled."""
+    env_budget = os.getenv("SPINE_TOKEN_BUDGET", "").strip()
+    if env_budget:
+        try:
+            return int(env_budget)
+        except ValueError:
+            pass
+    if "critical" in work_type:
+        return _DEFAULT_CRITICAL_BUDGET
+    if "spec" in work_type:
+        return _DEFAULT_SPEC_BUDGET
+    return _DEFAULT_QUICK_BUDGET
+
+
+def _extract_token_usage(result: dict[str, Any]) -> tuple[int, int]:
+    """Extract input/output token counts from a DA agent result dict."""
+    input_tokens = 0
+    output_tokens = 0
+    messages = result.get("messages", [])
+    for msg in messages:
+        usage = getattr(msg, "usage_metadata", None) or {}
+        if isinstance(usage, dict):
+            input_tokens += usage.get("input_tokens", 0)
+            output_tokens += usage.get("output_tokens", 0)
+        # Some models embed usage in response_metadata
+        resp_meta = getattr(msg, "response_metadata", None) or {}
+        if isinstance(resp_meta, dict):
+            token_usage = resp_meta.get("token_usage", {}) or resp_meta.get("usage", {})
+            if isinstance(token_usage, dict):
+                input_tokens += token_usage.get("prompt_tokens", 0)
+                output_tokens += token_usage.get("completion_tokens", 0)
+    if input_tokens == 0 and output_tokens == 0:
+        # Fallback: estimate from message content (~4 chars/token)
+        for msg in messages:
+            content = getattr(msg, "content", "") or ""
+            if isinstance(content, str):
+                output_tokens += max(1, len(content) // 4)
+    return input_tokens, output_tokens
+
+
+class MaxTokenBudgetExceeded(Exception):
+    """Raised when a work item exceeds its token budget."""
+
+    def __init__(self, work_id: str, used: int, budget: int) -> None:
+        self.work_id = work_id
+        self.used = used
+        self.budget = budget
+        super().__init__(
+            f"Token budget exceeded for {work_id}: "
+            f"{used:,} / {budget:,} tokens"
+        )
+
+
+async def _check_and_update_token_budget(
+    work_id: str,
+    result: dict[str, Any],
+    work_type: str = "",
+) -> None:
+    """Update the running token count for a work item and enforce budget."""
+    budget = _get_token_budget(work_id, work_type)
+    if budget is None:
+        return
+
+    inp, out = _extract_token_usage(result)
+    total = inp + out
+
+    async with _token_budget_lock:
+        tracker = _token_budgets.setdefault(work_id, {"used": 0})
+        tracker["used"] += total
+        used = tracker["used"]
+
+    if used > budget:
+        raise MaxTokenBudgetExceeded(work_id, used, budget)
+
+    logger.info(
+        "[%s] Token usage: +%s (this turn), %s / %s total",
+        work_id,
+        total,
+        used,
+        budget,
+    )
+
+
+def _check_and_update_token_budget_sync(
+    work_id: str,
+    result: dict[str, Any],
+    work_type: str = "",
+) -> None:
+    """Sync version of token budget tracker for invoke_with_retry."""
+    budget = _get_token_budget(work_id, work_type)
+    if budget is None:
+        return
+
+    inp, out = _extract_token_usage(result)
+    total = inp + out
+
+    tracker = _token_budgets.setdefault(work_id, {"used": 0})
+    tracker["used"] += total
+    used = tracker["used"]
+
+    if used > budget:
+        raise MaxTokenBudgetExceeded(work_id, used, budget)
+
+    logger.info(
+        "[%s] Token usage: +%s (this turn), %s / %s total",
+        work_id,
+        total,
+        used,
+        budget,
+    )
 
 
 def _is_transient_error(exc: Exception) -> bool:
@@ -128,6 +253,7 @@ def invoke_with_retry(
     max_delay: float = DEFAULT_MAX_DELAY,
     phase_name: str = "",
     work_id: str = "",
+    work_type: str = "",
     context: Any = None,
 ) -> dict[str, Any]:
     """Invoke a Deep Agent with exponential backoff retry for transient errors.
@@ -169,9 +295,14 @@ def invoke_with_retry(
         invoke_kwargs["context"] = context
 
     last_exc: Exception | None = None
+    result: dict[str, Any] = {}
     for attempt in range(max_retries + 1):
         try:
-            return agent.invoke(input_, **invoke_kwargs)
+            result = agent.invoke(input_, **invoke_kwargs)
+            # Track token budget after every successful agent call
+            if work_id and result:
+                _check_and_update_token_budget_sync(work_id, result, work_type)
+            return result
         except Exception as exc:
             last_exc = exc
 
@@ -216,6 +347,7 @@ async def ainvoke_with_retry(
     max_delay: float = DEFAULT_MAX_DELAY,
     phase_name: str = "",
     work_id: str = "",
+    work_type: str = "",
     context: Any = None,
 ) -> dict[str, Any]:
     """Async invoke a Deep Agent with exponential backoff retry for transient errors.
@@ -261,9 +393,14 @@ async def ainvoke_with_retry(
         invoke_kwargs["context"] = context
 
     last_exc: Exception | None = None
+    result: dict[str, Any] = {}
     for attempt in range(max_retries + 1):
         try:
-            return await agent.ainvoke(input_, **invoke_kwargs)
+            result = await agent.ainvoke(input_, **invoke_kwargs)
+            # Track token budget after every successful agent call
+            if work_id and result:
+                await _check_and_update_token_budget(work_id, result, work_type)
+            return result
         except Exception as exc:
             last_exc = exc
 

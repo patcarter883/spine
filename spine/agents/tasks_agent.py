@@ -14,12 +14,16 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
 from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
 from spine.agents.artifacts import build_artifact_prompt
 from spine.agents.subagents import build_phase_subagents
+
+logger = logging.getLogger(__name__)
 
 
 def _build_subagents(
@@ -30,10 +34,23 @@ def _build_subagents(
     """Resolve subagent specs for the TASKS phase.
 
     Returns researcher subagents when the workflow type includes ``spec``
-    or ``quick`` (both need codebase exploration).  Returns ``None`` for
-    rework passes where prior context already exists.
+    or ``quick`` (both need codebase exploration), **unless** the quick
+    workflow is trivial (short UI-only description).  Returns ``None`` for
+    trivial quick workflows and for rework passes where prior context
+    already exists.
     """
     work_type = state.get("work_type", "")
+    if "quick" in work_type and "critical" not in work_type:
+        description = state.get("description", "")
+        # Skip researcher dispatch for trivial quick tasks to save tokens
+        if len(description) < 150:
+            logger.info(
+                "[%s] TASKS: skipping researcher subagents for trivial quick task "
+                "(description %d chars)",
+                state.get("work_id", ""),
+                len(description),
+            )
+            return None
     if "quick" in work_type or "spec" in work_type:
         return build_phase_subagents(phase, state, config)
     return None
@@ -127,6 +144,7 @@ def build_tasks_agent(
         config=config,
         phase=PhaseName.TASKS,
         system_prompt=system_prompt,
+        add_summarization=True,  # TASKS can be long-running with researcher subagents
         subagents=_build_subagents(PhaseName.TASKS, state, config),
     )
 

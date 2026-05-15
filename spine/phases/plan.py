@@ -44,6 +44,7 @@ async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = Non
     """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
     feedback = state.get("feedback", [])
     workspace_root = state.get("workspace_root", ".")
@@ -80,6 +81,7 @@ async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = Non
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name=PhaseName.PLAN.value,
             work_id=work_id,
+            work_type=work_type,
             context=ctx,
         )
 
