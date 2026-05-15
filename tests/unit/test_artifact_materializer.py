@@ -334,3 +334,69 @@ class TestBuildInlineArtifactPrompt:
         # Should use flat path structure
         assert ".spine/artifacts" in prompt
         assert "specify/specification.md" in prompt
+
+
+# ── scan_artifact_dir tests ──
+
+
+class TestScanArtifactDir:
+    """Tests for scan_artifact_dir — disk-first artifact discovery."""
+
+    def test_discovers_written_files(self):
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Simulate an agent writing slice files + tasks.md
+            tasks_dir = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "tasks"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "tasks.md").write_text("# Tasks\n\nSlice list here.", encoding="utf-8")
+            (tasks_dir / "slice-auth.md").write_text("# Slice: Auth\n\nDetails.", encoding="utf-8")
+            (tasks_dir / "slice-api.md").write_text("# Slice: API\n\nDetails.", encoding="utf-8")
+
+            result = scan_artifact_dir(tmpdir, "w1", "tasks")
+            assert "tasks.md" in result
+            assert "slice-auth.md" in result
+            assert "slice-api.md" in result
+            assert "# Tasks" in result["tasks.md"]
+
+    def test_truncates_previews(self):
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_dir = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "tasks"
+            tasks_dir.mkdir(parents=True)
+            long_content = "x" * 2000
+            (tasks_dir / "tasks.md").write_text(long_content, encoding="utf-8")
+
+            result = scan_artifact_dir(tmpdir, "w1", "tasks", max_preview_chars=100)
+            assert len(result["tasks.md"]) == 100
+
+    def test_skips_meta_json_files(self):
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_dir = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "tasks"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "tasks.md").write_text("Content", encoding="utf-8")
+            (tasks_dir / "tasks.md.meta.json").write_text('{"size": 7}', encoding="utf-8")
+
+            result = scan_artifact_dir(tmpdir, "w1", "tasks")
+            assert "tasks.md" in result
+            assert "tasks.md.meta.json" not in result
+
+    def test_returns_empty_when_dir_missing(self):
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = scan_artifact_dir(tmpdir, "w1", "tasks")
+            assert result == {}
+
+    def test_returns_empty_for_empty_dir(self):
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_dir = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "tasks"
+            tasks_dir.mkdir(parents=True)
+
+            result = scan_artifact_dir(tmpdir, "w1", "tasks")
+            assert result == {}

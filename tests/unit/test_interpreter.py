@@ -192,7 +192,7 @@ class TestAgentBuilderIntegration:
     """Tests that agent builders use the shared factory correctly."""
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_specify_agent_no_interpreter_when_disabled(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -214,7 +214,7 @@ class TestAgentBuilderIntegration:
             )
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=True)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_specify_agent_includes_interpreter_when_enabled(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -229,7 +229,7 @@ class TestAgentBuilderIntegration:
         assert len(call_kwargs["middleware"]) >= 1
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=True)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_specify_agent_rlm_skill_loaded_when_enabled(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -246,7 +246,7 @@ class TestAgentBuilderIntegration:
         assert "rlm-pattern" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_specify_agent_no_rlm_skill_when_disabled(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -263,7 +263,7 @@ class TestAgentBuilderIntegration:
         assert "rlm-pattern" not in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_specify_agent_no_rlm_in_prompt(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -283,7 +283,7 @@ class TestAgentBuilderIntegration:
         assert "Interpreter Workspace" not in prompt
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_specify_agent_loads_spec_writing_skill(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -299,7 +299,7 @@ class TestAgentBuilderIntegration:
         assert "spec-writing" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_tasks_agent_loads_decomposition_skill(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -315,7 +315,7 @@ class TestAgentBuilderIntegration:
         assert "feature-slice-decomposition" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_verify_agent_loads_code_review_skill(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -331,7 +331,7 @@ class TestAgentBuilderIntegration:
         assert "code-review" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_implement_agent_requests_summarization(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -351,7 +351,7 @@ class TestAgentBuilderIntegration:
         assert mock_da.called
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_agent_context_schema_is_spine_context(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
@@ -366,7 +366,7 @@ class TestAgentBuilderIntegration:
         assert call_kwargs["context_schema"] is SpineContext
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.resolve_model", return_value="openai:gpt-4o-mini")
+    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
     @patch("deepagents.create_deep_agent")
     def test_artifacts_referenced_by_path_not_inlined(
         self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock

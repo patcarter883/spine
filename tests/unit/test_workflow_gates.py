@@ -58,6 +58,11 @@ class TestArtifactGateNode:
         result = gate_fn(state)
         assert result["status"] == "needs_review"
 
+    # NOTE: The implement→verify artifact gate is no longer wired in the
+    # workflow graph (compose.py). Verify always runs after implement.
+    # The gate node function is still available for other uses, so these
+    # unit tests remain valid as contract tests for the function itself.
+
     def test_proceed_when_tasks_has_artifacts(self):
         from spine.workflow.artifact_gate import make_artifact_gate_node
 
@@ -108,7 +113,8 @@ class TestLegacyArtifactGateFn:
 class TestCriticStatusPropagation:
     """Tests that the critic node sets status in its output state."""
 
-    def test_critic_returns_status_on_structural_fail(self):
+    @pytest.mark.asyncio
+    async def test_critic_returns_status_on_structural_fail(self):
         from spine.phases.critic import call_critic
 
         # Mock the structural check to fail
@@ -129,12 +135,13 @@ class TestCriticStatusPropagation:
                     "retry_count": {"plan": 0},
                     "artifacts": {},
                 }
-                result = call_critic(state)
+                result = await call_critic(state)
                 assert result["status"] == "running"
                 assert result["current_phase"] == "critic"
                 assert result["prompt_request"] is None
 
-    def test_critic_returns_status_on_agent_pass(self):
+    @pytest.mark.asyncio
+    async def test_critic_returns_status_on_agent_pass(self):
         from spine.phases.critic import call_critic
 
         with patch(
@@ -163,7 +170,7 @@ class TestCriticStatusPropagation:
                         "retry_count": {"plan": 0},
                         "artifacts": {"plan": {"plan.md": "x" * 100}},
                     }
-                    result = call_critic(state)
+                    result = await call_critic(state)
                     assert result["status"] == "running"
                     assert result["current_phase"] == "critic"
                     assert result["prompt_request"] is None
@@ -271,3 +278,38 @@ class TestCriticRouter:
         }
         # No feedback → routes needs_revision as fallback
         assert critic_router(state) == "needs_revision"
+
+
+# ── Graph composition tests ──
+
+
+class TestWorkflowCompositionGates:
+    """Tests that artifact gates are wired correctly in the composed graph."""
+
+    def test_no_gate_between_implement_and_verify(self):
+        """Verify always runs after implement — no artifact gate between them."""
+        from spine.workflow.compose import build_workflow_graph
+
+        for work_type in ("quick", "critical_quick", "spec", "critical_spec"):
+            graph = build_workflow_graph(work_type)
+            node_names = set(graph.get_graph().nodes.keys())
+            # No gate node should exist between implement and verify
+            gate_names = [n for n in node_names if n.startswith("gate_implement_to_verify")]
+            assert gate_names == [], (
+                f"work_type={work_type}: found unexpected gate node(s) {gate_names} "
+                "between implement and verify"
+            )
+
+    def test_gate_exists_between_tasks_and_implement(self):
+        """Implement is gated on tasks artifacts — gate node must exist."""
+        from spine.workflow.compose import build_workflow_graph
+
+        for work_type in ("quick", "critical_quick", "spec", "critical_spec"):
+            graph = build_workflow_graph(work_type)
+            node_names = set(graph.get_graph().nodes.keys())
+            # A gate node should exist between tasks and implement
+            gate_names = [n for n in node_names if n.startswith("gate_") and "implement" in n]
+            assert len(gate_names) >= 1, (
+                f"work_type={work_type}: expected a gate node between tasks and implement, "
+                f"found none. All nodes: {sorted(node_names)}"
+            )
