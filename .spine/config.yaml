@@ -4,17 +4,17 @@ spine:
 
 providers:
   llm:
-  # - name: default
-  #   type: deepagents-model
-  #   model: openrouter:deepseek/deepseek-v4-pro
-  #   max_completion_tokens: 32768
-  #   priority: 1
-  #   enabled: true
   - name: default
     type: deepagents-model
-    model: openai:model
-    base_url: 'http://localhost:8000/v1'
-    api_key: 'vllm'
-    priority: 0
+    model: openrouter:deepseek/deepseek-v4-flash
+    max_completion_tokens: 32768
+    priority: 1
     enabled: true
+  # - name: default
+  #   type: deepagents-model
+  #   model: openai:model
+  #   base_url: 'http://localhost:8000/v1'
+  #   api_key: 'vllm'
+  #   priority: 0
+  #   enabled: true
   
