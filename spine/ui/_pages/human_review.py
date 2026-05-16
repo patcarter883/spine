@@ -34,7 +34,7 @@ def render(api: UIApi) -> None:
             st.write("**Description:**")
             st.write(item.get("description", ""))
 
-            pass
+            col1, col2 = st.columns(2)
             if col2.button("View Details", key=f"hr_view_{work_id}"):
                 from spine.ui.pages import get as get_page
 

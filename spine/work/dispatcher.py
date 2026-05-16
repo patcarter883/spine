@@ -851,7 +851,7 @@ async def restart_work(
 
     checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
     saver = await checkpoint_store.get_checkpointer()
-    await saver.apurge({"configurable": {"thread_id": work_id}})
+    await saver.adelete_thread(work_id)
     logger.info(f"[{work_id}] Purged checkpoint")
 
     # ── Rebuild initial state (fresh start) ──

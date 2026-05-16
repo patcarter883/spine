@@ -186,6 +186,13 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
         # Fall back to max_tokens if max_completion_tokens isn't set
         model_kwargs["max_tokens"] = int(max_tokens)
 
+    # ── Enable streaming for stall detection ─────────────────────────
+    # ChatOpenRouter defaults to streaming=False.  Without streaming,
+    # no on_llm_new_token callbacks fire during generation, so LangGraph's
+    # stream_mode=["messages"] yields nothing — and the stall detector
+    # falsely fires on slow models (reasoning models, long outputs).
+    model_kwargs.setdefault("streaming", True)
+
     return ChatOpenRouter(**model_kwargs)
 
 
@@ -230,6 +237,17 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
     # hung connections from blocking the workflow for 30+ minutes.
     if "request_timeout" not in kwargs:
         kwargs["request_timeout"] = 300
+
+    # ── Enable streaming for stall detection ─────────────────────────
+    # Without streaming=True, ChatOpenAI uses the non-streaming API
+    # endpoint and emits no on_llm_new_token callbacks during generation.
+    # LangGraph's stream_mode=["messages"] hooks into those callbacks to
+    # yield token-level chunks — which is what keeps the stall timer
+    # alive during long agent runs.  With streaming=False (the default),
+    # a slow local model that takes >120s to generate produces zero
+    # intermediate chunks, and the stall detector falsely marks the work
+    # as stalled even though inference is still running.
+    kwargs.setdefault("streaming", True)
 
     # ── Enable stream_usage for token counting ───────────────────────
     # Without stream_usage=True, ChatOpenAI does not send
