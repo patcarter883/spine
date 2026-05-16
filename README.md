@@ -92,6 +92,129 @@ providers:
         auto_approve: true
 ```
 
+#### Per-Phase and Per-Subagent Models
+
+SPINE supports assigning different LLM models to individual workflow phases and
+subagents.  This lets you route heavy reasoning (planning, specification) to
+large frontier models while using faster/cheaper models for implementation and
+verification — and even finer-grained subagent-level overrides.
+
+The model for every phase agent and subagent is resolved through the same
+hierarchy in `.spine/config.yaml`:
+
+**Resolution order (most specific wins):**
+
+1. `providers.phases.<phase>/subagents/<name>.model` — subagent override
+2. `providers.phases.<phase>.model` — per-phase override
+3. `providers.llm[].model` — default provider model
+4. `SPINE_MODEL` environment variable
+
+If none of the above are set, `spine` errors with a clear diagnostic.
+
+**Subagent keys use a path syntax:**  `phase/subagents/name`.  When a subagent
+key is unknown, resolution falls back to its parent phase key; when the phase
+itself is unknown, it falls back to the default provider.
+
+**Phases and their subagents:**
+
+| Phase      | Subagents                |
+|------------|--------------------------|
+| `specify`  | `researcher`             |
+| `plan`     | *(none)*                 |
+| `tasks`    | `researcher`             |
+| `implement`| `slice-implementer`      |
+| `verify`   | `slice-verifier`         |
+| `critic`   | *(none)*                 |
+
+**Example configuration:**
+
+```yaml
+providers:
+  # ── Named provider entries ─────────────────────────────────────────
+  llm:
+    - name: frontier
+      type: deepagents-model
+      model: openrouter:z-ai/glm-4.5-air:free
+      request_timeout: 600
+      enabled: true
+
+    - name: local-vllm
+      type: deepagents-model
+      model: openai:qwen3.6-local
+      base_url: http://localhost:8000/v1
+      api_key: vllm
+      temperature: 0.7
+      enabled: true
+
+    - name: local-tiny
+      type: deepagents-model
+      model: openai:dolphin3.0-local
+      base_url: http://localhost:8001/v1
+      api_key: vllm
+      temperature: 0.1
+      enabled: true
+
+  # ── Per-phase and subagent overrides ───────────────────────────────
+  phases:
+    # Heavy reasoning → frontier model (via reference)
+    specify:
+      provider: frontier
+    plan:
+      provider: frontier
+
+    # Implementation → local vLLM, but colder temperature for code
+    implement:
+      provider: local-vllm
+      temperature: 0.3           # freezes just the temp override
+
+    # Slice implementer subagent gets the same vLLM but even faster
+    implement/subagents/slice-implementer:
+      model: openai:codestral-local
+      provider: local-tiny
+
+    # Verification → cheap local model with custom endpoint
+    verify:
+      model: openai:tiny-model
+      base_url: http://other:8000/v1       # dedicated server
+      api_key: other-key
+      request_timeout: 120                 # short timeout for verify
+```
+
+**Provider resolution for ``base_url``, ``api_key``, and other settings** follows
+the same hierarchy as model resolution but with an extra dimension — you can
+either *inherit* a named provider's settings or *inline* the values directly:
+
+1. Phase config's direct provider keys (``base_url``, ``temperature``, etc.)
+   — always take priority
+2. Phase config's ``provider`` reference — look up ``providers.llm[name]``
+   and inherit all its settings
+3. First enabled entry in ``providers.llm[]``
+
+Direct keys are applied *on top of* the inherited provider, so you can
+reference a provider and then override just one or two fields:
+
+```yaml
+# Big provider defined once...
+llm:
+  - name: local-vllm
+    model: openai:qwen3.6
+    base_url: http://localhost:8000/v1
+    api_key: vllm
+    temperature: 0.7
+
+# ...then referenced with per-phase tweaks:
+phases:
+  implement:
+    provider: local-vllm
+    temperature: 0.3   # colder for code generation
+  verify:
+    provider: local-vllm
+    temperature: 0.1   # near-deterministic for tests
+```
+
+Only the settings change — each subagent still inherits the parent phase's
+system prompt, tool restrictions, and skill configuration.
+
 ### File Structure
 
 ```

@@ -98,6 +98,68 @@ def _render_active_job(api: UIApi) -> None:
     overview = api.get_queue_overview()
     active = overview.get("active")
 
+    if not active:
+        st.markdown(
+            ":gray[No active job — queue is idle or all jobs completed]"
+        )
+        return
+
+    work_id = active.get("id")
+    status = active.get("status", "unknown")
+    current_phase = active.get("current_phase", "unknown")
+    created_at = active.get("created_at")
+    work_type = active.get("work_type", "spec")
+
+    st.subheader("🔄 Active Job")
+    st.caption(f"ID: `{work_id}` | Type: {work_type} | Started: {created_at}")
+
+    # Status icon and label
+    status_icon_map = {
+        "pending": "⏳",
+        "running": "🔄",
+        "completed": "✅",
+        "failed": "❌",
+    }
+    icon = status_icon_map.get(status, "⚙️")
+    st.markdown(f"**Status:** {icon} {status.title()}")
+
+    # Phase progress bar
+    phases = _PHASE_SEQUENCE.get(work_type, [])
+    if phases:
+        st.markdown("**Progress:**")
+        _render_phase_bar(phases, current_phase)
+    else:
+        st.caption(f"Current phase: {current_phase}")
+
+    # Timing info
+    if created_at:
+        try:
+            from datetime import datetime
+
+            start = datetime.fromisoformat(created_at)
+            duration = format_duration(start)
+            st.caption(f"Elapsed: {duration}")
+        except Exception:
+            pass
+
+    # Description
+    description = active.get("description", "")
+    if description:
+        st.markdown(f"*{description}*")
+
+    # If failed, show result/reason
+    # TODO: Add result display on failed status
+    if status == "failed":
+        st.error("⚠️ Job failed — check result below")
+        result = active.get("result", "")
+        if result:
+            st.code(result)
+    if status == "failed":
+        result = active.get("result")
+        if result:
+            st.error("**Error:**")
+            st.code(result)
+
     worker_status = api.get_worker_status()
     if not worker_status.get("running"):
         st.info("⏸️ RalphLoopWorker is not running. Jobs will not be processed until started.")

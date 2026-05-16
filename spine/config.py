@@ -207,6 +207,12 @@ class SpineConfig:
             ".spine/config.yaml or set the SPINE_MODEL environment variable."
         )
 
+    # ── Provider keys that phases can override locally ────────────────
+    _PROVIDER_KEYS: tuple[str, ...] = (
+        "base_url", "api_key", "temperature", "max_tokens",
+        "max_completion_tokens", "request_timeout", "max_retries",
+    )
+
     def resolve_active_provider(self) -> dict | None:
         """Return the full config dict for the first enabled LLM provider.
 
@@ -222,6 +228,106 @@ class SpineConfig:
             if provider.get("enabled", True) and provider.get("model"):
                 return provider
         return None
+
+    def _lookup_provider_by_name(self, name: str) -> dict | None:
+        """Find a named provider in ``providers.llm[]``.
+
+        Args:
+            name: The ``"name"`` field of the provider entry to find.
+
+        Returns:
+            The full provider config dict, or ``None`` if not found.
+        """
+        for provider in self.providers.get("llm", []):
+            if provider.get("name") == name:
+                return provider
+        return None
+
+    def resolve_provider_config(self, phase: str | None = None) -> dict:
+        """Resolve provider-level settings for a given phase.
+
+        Unlike :meth:`resolve_model` (which returns only the model string),
+        this returns the full provider config dict — ``base_url``,
+        ``api_key``, ``temperature``, ``max_tokens``,
+        ``max_completion_tokens``, ``request_timeout``, ``max_retries`` —
+        after applying any per-phase overrides.
+
+        Resolution order (most specific wins, values are merged):
+
+        1. Phase config's direct provider keys (``base_url``,
+           ``temperature``, etc.) — take priority
+        2. Phase config's ``provider`` reference — look up
+           ``providers.llm[name]`` and inherit its settings
+        3. First enabled provider in ``providers.llm[]``
+
+        Args:
+            phase: Optional phase or phase/subagent path (e.g.
+                ``"implement"`` or
+                ``"implement/subagents/slice-implementer"``).  When
+                ``None``, only the default provider is consulted.
+
+        Returns:
+            A provider config dict containing ``base_url``, ``api_key``,
+            and any other provider-level fields.  May be empty if no
+            enabled provider is found.
+
+        Example config::
+
+            providers:
+              llm:
+                - name: vllm-local
+                  model: openai:qwen3.6
+                  base_url: http://localhost:8000/v1
+                  api_key: vllm
+                  temperature: 0.7
+                  enabled: true
+                - name: openrouter-gateway
+                  model: openrouter:deepseek/deepseek-v4-pro
+                  enabled: true
+              phases:
+                implement:
+                  provider: vllm-local           # inherit vllm-local settings
+                  temperature: 0.3               # but override temp
+                verify:
+                  base_url: http://other:8000/v1  # fully custom
+                  api_key: other-key
+        """
+        # ── Step 1: resolve base provider (from reference or default) ──
+        base: dict = {}
+        if phase:
+            phases = self.providers.get("phases", {})
+            for key in (phase, phase.split("/")[0] if "/" in phase else None):
+                if key is None:
+                    continue
+                phase_cfg = phases.get(key, {})
+                if not isinstance(phase_cfg, dict):
+                    continue
+                provider_ref = phase_cfg.get("provider")
+                if provider_ref:
+                    named = self._lookup_provider_by_name(provider_ref)
+                    if named:
+                        base = dict(named)
+                        break
+
+        if not base:
+            default = self.resolve_active_provider()
+            if default:
+                base = dict(default)
+
+        # ── Step 2: apply phase-level overrides on top ──
+        if phase:
+            phases = self.providers.get("phases", {})
+            for key in (phase, phase.split("/")[0] if "/" in phase else None):
+                if key is None:
+                    continue
+                phase_cfg = phases.get(key, {})
+                if not isinstance(phase_cfg, dict):
+                    continue
+                for k in self._PROVIDER_KEYS:
+                    if k in phase_cfg:
+                        base[k] = phase_cfg[k]
+
+        return base
 
     def ensure_dirs(self) -> None:
         """Create all necessary directories if they don't exist."""

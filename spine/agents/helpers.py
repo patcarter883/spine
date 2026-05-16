@@ -59,7 +59,7 @@ def resolve_model(
     # (base_url, api_key, session_id, etc.) that the string-based
     # init_chat_model path would silently drop.
     if session_id and model_spec.startswith("openrouter:"):
-        return _build_openrouter_model(model_spec, session_id)
+        return _build_openrouter_model(model_spec, session_id, phase=phase)
 
     # For local/OpenAI-compatible servers with custom base_url + api_key,
     # we must build a ChatOpenAI instance ourselves — otherwise
@@ -73,7 +73,7 @@ def resolve_model(
     # (e.g. "openai:gpt-4o-mini" for cloud OpenAI), we must NOT
     # apply the local server's base_url/api_key to it.
     if model_spec.startswith("openai:"):
-        provider_cfg = _active_provider_config()
+        provider_cfg = _active_provider_config(phase=phase)
         if (
             provider_cfg
             and provider_cfg.get("base_url")
@@ -105,19 +105,29 @@ def _model_spec_from_config(config: RunnableConfig | None, phase: str | None = N
     return SpineConfig.load().resolve_model(phase=phase)
 
 
-def _active_provider_config() -> dict[str, Any] | None:
-    """Return the full config dict for the first enabled LLM provider.
+def _active_provider_config(phase: str | None = None) -> dict[str, Any] | None:
+    """Return the full provider config dict for a given phase.
 
-    Delegates to :meth:`SpineConfig.resolve_active_provider` so that
-    ``base_url``, ``api_key``, ``temperature``, and other provider fields
-    are available for building pre-built model instances.
+    Delegates to :meth:`SpineConfig.resolve_provider_config` so that
+    per-phase overrides (``base_url``, ``api_key``, ``provider``
+    references, etc.) are applied before returning.
+
+    Args:
+        phase: Optional phase or phase/subagent path for policy resolution.
+
+    Returns:
+        The merged provider config dict, or ``None`` if no provider found.
     """
     from spine.config import SpineConfig
 
-    return SpineConfig.load().resolve_active_provider()
+    return SpineConfig.load().resolve_provider_config(phase=phase)
 
 
-def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
+def _build_openrouter_model(
+    model_spec: str,
+    session_id: str,
+    phase: str | None = None,
+) -> BaseChatModel:
     """Build a ChatOpenRouter instance with session_id set.
 
     Applies the DA ProviderProfile for OpenRouter (app_url, app_title,
@@ -127,11 +137,14 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
 
     Sets a default ``request_timeout`` of 300 seconds (5 minutes) to
     prevent hung connections from blocking the workflow indefinitely.
-    Provider config can override via ``providers.llm[].request_timeout``.
+    Provider config can override via ``providers.llm[].request_timeout``
+    or a per-phase ``request_timeout`` field.
 
     Args:
         model_spec: Full model spec like ``"openrouter:z-ai/glm-4.5-air:free"``.
         session_id: Work item ID for OpenRouter request grouping.
+        phase: Optional phase path for provider config resolution
+            (e.g. ``"implement"`` or ``"implement/subagents/slice-implementer"``).
 
     Returns:
         A configured ``ChatOpenRouter`` instance.
@@ -157,7 +170,7 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
     # connections (e.g. OpenRouter dropping mid-stream) can block
     # the workflow for 30+ minutes waiting for OS-level TCP timeouts.
     # Note: ChatOpenRouter expects milliseconds, not seconds.
-    timeout_ms = _resolve_timeout_from_config(default=300) * 1000
+    timeout_ms = _resolve_timeout_from_config(default=300, phase=phase) * 1000
 
     # ── Resolve max_completion_tokens ────────────────────────────────
     # When max_completion_tokens is not set, reasoning models (e.g.
@@ -170,7 +183,7 @@ def _build_openrouter_model(model_spec: str, session_id: str) -> BaseChatModel:
     # or providers.llm[].max_tokens.  max_completion_tokens is preferred
     # (it includes reasoning tokens in the budget, giving the model full
     # control over allocation).
-    provider_cfg = _active_provider_config() or {}
+    provider_cfg = _active_provider_config(phase=phase) or {}
     max_completion_tokens = provider_cfg.get("max_completion_tokens")
     max_tokens = provider_cfg.get("max_tokens")
 
@@ -266,21 +279,22 @@ def debug_enabled() -> bool:
     return os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes")
 
 
-def _resolve_timeout_from_config(default: int = 300) -> int:
+def _resolve_timeout_from_config(default: int = 300, phase: str | None = None) -> int:
     """Resolve the request_timeout in seconds from provider config.
 
-    Checks the active provider config for a ``request_timeout`` field.
+    Checks the phase-aware provider config for a ``request_timeout`` field.
     Falls back to ``default`` when not configured.  The return value is
     always in **seconds** — callers must convert to milliseconds when
     needed by the underlying client.
 
     Args:
         default: Default timeout in seconds when not configured.
+        phase: Optional phase path for provider config resolution.
 
     Returns:
         Timeout value in seconds.
     """
-    provider_cfg = _active_provider_config()
+    provider_cfg = _active_provider_config(phase=phase)
     if provider_cfg and "request_timeout" in provider_cfg:
         try:
             return int(provider_cfg["request_timeout"])
