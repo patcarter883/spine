@@ -102,8 +102,7 @@ HUMAN REVIEW RESUME:
 | `spine/agents/artifacts.py` | Artifact materialization to disk + inline preview builder |
 | `spine/agents/interpreter.py` | Code interpreter middleware (optional, per-phase) |
 | `spine/agents/skills_resolver.py` | `resolve_skills()`, `resolve_memory()` — loads phase-specific skills and memory |
-| `spine/agents/backend.py` | `build_backend()` — creates DA backend for agent tool access |
-| `spine/agents/backend_memory.py` | Cross-work memory via LangGraph InMemoryStore |
+| `spine/agents/backend.py` | `build_backend()` — creates DA backend with CompositeBackend + cross-work memory |
 | `spine/agents/debug_callback.py` | LLM debug logging callback (enabled via `--debug-llm` or `SPINE_DEBUG_LLM`) |
 | `spine/agents/subagents.py` | SubAgent spec builders for DA `task` tool delegation |
 | `spine/critic/agent.py` | Critic Deep Agent builder |

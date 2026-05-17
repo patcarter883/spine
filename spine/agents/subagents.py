@@ -306,12 +306,13 @@ def build_subagent_spec(
 
     # ── Tools: resolve string names to actual BaseTool instances ──
     # The SubAgent spec requires actual tool instances (BaseTool | Callable | dict),
-    # not string names. We create a FilesystemMiddleware to get the tools,
-    # then filter by the allowed tool names for this subagent type.
-    from deepagents.backends.local_shell import LocalShellBackend
+    # not string names. We use the shared build_backend() for consistency,
+    # then create FilesystemMiddleware to get the tools.
     from deepagents.middleware.filesystem import FilesystemMiddleware
 
-    backend = LocalShellBackend(root_dir=workspace_root, virtual_mode=False)
+    from spine.agents.backend import build_backend
+
+    backend = build_backend(workspace_root)
     fs_mw = FilesystemMiddleware(backend=backend)
     allowed_tool_names = SUBAGENT_TOOLS[name]
     tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]
