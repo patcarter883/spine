@@ -7,7 +7,6 @@ providers:
   - name: frontier
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
-    max_completion_tokens: 32768
     enabled: true
   - name: lfm
     type: deepagents-model
@@ -42,7 +41,7 @@ providers:
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: laguna-xs2
+      provider: local
 
     # Verification → cheap local model with custom endpoint
     verify:

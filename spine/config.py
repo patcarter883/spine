@@ -88,19 +88,40 @@ class SpineConfig:
     def _find_workspace_root() -> str:
         """Auto-detect workspace root by searching upward for ``.spine/``.
 
-        Walks up from CWD looking for a ``.spine`` directory.  If found,
-        its parent is the workspace root.  Falls back to CWD if not found.
+        Search order:
+          1. Walk up from CWD (works when launched from the project root)
+          2. Walk up from the spine package directory (handles Streamlit,
+             systemd, or other runners that change CWD away from the project)
+          3. Fall back to CWD if neither search finds ``.spine/``
+
         This mirrors the ``_load_dotenv`` strategy for ``.env`` discovery.
         """
+        # Strategy 1: walk up from CWD
         cwd = Path.cwd().resolve()
         for candidate in [cwd, *cwd.parents]:
             if (candidate / ".spine").is_dir():
                 return str(candidate)
+
+        # Strategy 2: walk up from the package directory — this handles
+        # Streamlit, systemd, or other runners that change CWD away from
+        # the project root (e.g. to /root or /tmp).  Without this, the
+        # workspace_root resolves to an inaccessible directory like /root,
+        # causing LocalShellBackend to fail with Permission denied.
+        pkg_dir = Path(__file__).resolve().parent
+        for candidate in pkg_dir.parents:
+            if (candidate / ".spine").is_dir():
+                return str(candidate)
+
         return str(cwd)
 
     @classmethod
     def load(cls, path: str = ".spine/config.yaml") -> SpineConfig:
         """Load configuration from a YAML file, falling back to defaults.
+
+        When *path* is relative and doesn't exist relative to CWD, also
+        searches upward from the spine package directory for the config
+        file.  This ensures Streamlit, systemd, and other runners that
+        change CWD away from the project root can still find the config.
 
         Args:
             path: Path to the configuration YAML file.
@@ -109,9 +130,23 @@ class SpineConfig:
             A SpineConfig instance with values from the file or defaults.
         """
         config = {}
+        resolved_path = path
+
         if os.path.exists(path):
+            resolved_path = path
+        else:
+            # Search from the package directory for the config file
+            # (same strategy as _find_workspace_root and _load_dotenv).
+            pkg_dir = Path(__file__).resolve().parent
+            for candidate in pkg_dir.parents:
+                candidate_path = candidate / path
+                if candidate_path.is_file():
+                    resolved_path = str(candidate_path)
+                    break
+
+        if os.path.exists(resolved_path):
             try:
-                with open(path) as f:
+                with open(resolved_path) as f:
                     config = yaml.safe_load(f) or {}
             except (yaml.parser.ParserError, yaml.scanner.ScannerError):
                 # If YAML is invalid, fall back to empty config (defaults will be used)
@@ -133,6 +168,28 @@ class SpineConfig:
         if raw_root is None:
             raw_root = cls._find_workspace_root()
         resolved_root = str(Path(raw_root).resolve())
+
+        # Sanity check: if workspace_root points to a directory the agent
+        # can't write to (e.g. /root when not running as root), log a
+        # warning.  This is a common failure mode when CWD is wrong and
+        # auto-detection falls back to an inaccessible path.
+        root_path = Path(resolved_root)
+        if not os.access(resolved_root, os.W_OK):
+            import logging
+            logging.getLogger(__name__).warning(
+                "workspace_root %s is not writable — agents will fail. "
+                "Set SPINE_WORKSPACE_ROOT or add 'workspace_root' to "
+                ".spine/config.yaml to fix this.",
+                resolved_root,
+            )
+        elif not (root_path / ".spine").is_dir():
+            import logging
+            logging.getLogger(__name__).warning(
+                "workspace_root %s has no .spine/ directory — auto-detection "
+                "may have resolved to the wrong path. Consider setting "
+                "SPINE_WORKSPACE_ROOT explicitly.",
+                resolved_root,
+            )
 
         return cls(
             checkpoint_path=os.getenv(

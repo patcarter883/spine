@@ -26,8 +26,6 @@ phase agents — and a helper to build one from a ``WorkflowState``.
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel, Field
 
 from spine.models.enums import PhaseName
@@ -80,7 +78,15 @@ def build_context(
         A populated SpineContext instance.
     """
     phase_name = phase.value if isinstance(phase, PhaseName) else phase
-    retry_count = state.get("retry_count", {}).get(phase_name, 0)
+    # retry_count is a dict {phase: count} in parent WorkflowState but
+    # a plain int inside subgraphs (state mapper already extracts it).
+    rc = state.get("retry_count", 0)
+    if isinstance(rc, dict):
+        retry_count = rc.get(phase_name, 0)
+    elif isinstance(rc, int):
+        retry_count = rc
+    else:
+        retry_count = 0
 
     # Extract critic feedback as a flat list of reason strings
     feedback = state.get("feedback", [])

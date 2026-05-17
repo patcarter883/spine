@@ -193,6 +193,15 @@ def _build_openrouter_model(
         "request_timeout": timeout_ms,
         **profile_kwargs,
     }
+    # ── Explicitly pass api_key from environment or provider config ──
+    # ChatOpenRouter validates OPENROUTER_API_KEY in os.environ on
+    # construction.  Worker threads/subprocesses may not inherit the
+    # parent shell's env vars, so we pass the key explicitly instead of
+    # relying on the implicit check.  Prefer the provider config's
+    # api_key field, then fall back to the environment variable.
+    api_key = provider_cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY", "")
+    if api_key:
+        model_kwargs["api_key"] = api_key
     if max_completion_tokens is not None:
         model_kwargs["max_completion_tokens"] = int(max_completion_tokens)
     elif max_tokens is not None:

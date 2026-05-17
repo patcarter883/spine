@@ -21,7 +21,7 @@ adds a feedback entry, and routes to END.
 """
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
 
@@ -71,7 +71,7 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
     """
 
     def gate_node(
-        state: WorkflowState, config: RunnableConfig | None = None
+        state: WorkflowState, config: Optional[RunnableConfig] = None
     ) -> dict[str, Any]:
         work_id = state.get("work_id", "unknown")
         workspace_root = state.get("workspace_root", ".")

@@ -7,11 +7,10 @@ The subgraph has two internal nodes:
 State schema: ``TasksSubgraphState`` — isolated from parent ``WorkflowState``.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from spine.models.enums import PhaseName
@@ -33,7 +32,7 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 
 async def _run_tasks_agent(
     state: TasksSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the tasks Deep Agent within the subgraph."""
     description = state.get("description", "")
@@ -143,7 +142,7 @@ async def _run_tasks_agent(
 
 async def _save_tasks_artifacts(
     state: TasksSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Save artifacts from the tasks agent to disk and state."""
     workspace_root = state.get("workspace_root", ".")

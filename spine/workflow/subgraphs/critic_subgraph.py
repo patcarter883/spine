@@ -8,14 +8,13 @@ Parameterized by ``reviewed_phase`` so the same subgraph builder can be
 used for critic_specify, critic_plan, critic_tasks.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
-from spine.models.enums import PhaseName, ReviewStatus
+from spine.models.enums import ReviewStatus
 from spine.workflow.subgraph_state import CriticSubgraphState
 from spine.workflow.critic_review import structural_critic_check, agent_critic_check
 
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 async def _structural_check_node(
     state: CriticSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the structural critic check within the subgraph."""
     reviewed_phase = state.get("reviewed_phase", "unknown")
@@ -39,7 +38,7 @@ async def _structural_check_node(
 
 async def _agent_check_node(
     state: CriticSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the agent critic check within the subgraph."""
     reviewed_phase = state.get("reviewed_phase", "unknown")
