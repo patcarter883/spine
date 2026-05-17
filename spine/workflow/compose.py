@@ -24,7 +24,7 @@ Phase sequences by WorkType:
                      TASKS → CRITIC_TASKS → IMPLEMENT → VERIFY
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -401,6 +401,27 @@ def _make_human_review_router(phase_seq: list[tuple[str, str | None]]):
     return router
 
 
+def _phase_status_router(state: WorkflowState) -> str:
+    """Generic post-phase router.
+
+    Reads ``state["status"]`` after a phase subgraph completes and decides
+    whether to proceed to the next node or halt for human review.  This is
+    the missing guard that previously let needs_review propagate forward
+    silently (Bug B): the result mapper set status=needs_review, but the
+    bare ``graph.add_edge(phase, next)`` ignored it.
+
+    Returns:
+        ``"proceed"`` when status is ``"running"`` (the phase succeeded),
+        ``"needs_review"`` when status is ``"needs_review"`` or anything
+        unexpected.  Routing targets are bound at edge-construction time
+        in :func:`build_workflow_graph`.
+    """
+    status = state.get("status", "running")
+    if status == "needs_review":
+        return "needs_review"
+    return "proceed"
+
+
 def _gate_node_name(source_node: str, next_node: str) -> str:
     """Derive a unique node name for a gate between two phases."""
     return f"gate_{source_node}_to_{next_node}"
@@ -543,12 +564,26 @@ def build_workflow_graph(
         {END: END},
     )
 
-    # Add artifact gate nodes
+    # Add artifact gate nodes and their outgoing conditional edges.
+    # Gate nodes route to ``next_node`` on proceed or ``human_review`` on
+    # needs_review.  Adding the conditional edges here (rather than in the
+    # per-phase loop below) ensures the gate's outgoing edges exist
+    # regardless of whether its source is a phase node or a critic node —
+    # the prior placement skipped the gate-outgoing edges when the gate
+    # source was a critic, leaving the gate as a dead-end node.
     for (src, dst), required_phase in gate_edges.items():
         gate_name = _gate_node_name(src, dst)
         graph.add_node(
             gate_name,
             make_artifact_gate_node(required_phase, dst),
+        )
+        graph.add_conditional_edges(
+            gate_name,
+            artifact_gate_router,
+            {
+                "proceed": dst,
+                "needs_review": "human_review",
+            },
         )
 
     # Wire the graph
@@ -585,23 +620,35 @@ def build_workflow_graph(
                     },
                 )
             elif has_gate and next_node:
-                # Route to the gate node, which then conditionally routes
+                # Route to the gate node; its outgoing conditional edges
+                # were registered in the gate-node loop above.
                 gate_name = _gate_node_name(node_name, next_node)
                 graph.add_edge(node_name, gate_name)
-
-                # Gate node → conditional edge (proceed or human_review)
+            elif next_node is not None:
+                # Status guard: if the phase produced needs_review, route
+                # to human_review instead of charging into the next phase.
+                # Without this, a failing specify silently feeds an empty
+                # plan, which feeds an empty critic, and so on — burning
+                # tokens and exceeding budgets.
                 graph.add_conditional_edges(
-                    gate_name,
-                    artifact_gate_router,
+                    node_name,
+                    _phase_status_router,
                     {
                         "proceed": next_node,
-                        "needs_review": "human_review",  # interrupt for human
+                        "needs_review": "human_review",
                     },
                 )
-            elif next_node is not None:
-                graph.add_edge(node_name, next_node)
             else:
-                graph.add_edge(node_name, END)
+                # Terminal phase: still guard so a needs_review on the
+                # final phase routes to human_review for resume support.
+                graph.add_conditional_edges(
+                    node_name,
+                    _phase_status_router,
+                    {
+                        "proceed": END,
+                        "needs_review": "human_review",
+                    },
+                )
 
     # Compile with optional checkpointer
     compile_kwargs: dict[str, Any] = {}
@@ -631,7 +678,7 @@ def _make_critic_node(
         An async node function with the correct reviewed_phase.
     """
 
-    async def critic_node(state: WorkflowState, config: RunnableConfig | None = None) -> dict:
+    async def critic_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict:
         """Critic node that reviews a specific phase."""
         # Inject which phase this critic reviews into state
         # so _get_reviewed_phase and critic_router can use it

@@ -5,11 +5,10 @@ The subgraph has two internal nodes:
 2. ``save_artifacts`` — scans disk for artifacts.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from spine.models.enums import PhaseName
@@ -30,7 +29,7 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 
 async def _run_specify_agent(
     state: SpecifySubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the specify Deep Agent within the subgraph."""
     description = state.get("description", "")
@@ -47,7 +46,8 @@ async def _run_specify_agent(
         prompt = (
             "Write a formal specification for the work described below.\n\n"
             f"## Work Description\n{description}\n\n"
-            "Write the specification to `specification.md` using `write_file`. "
+            f"Write the specification to `.spine/artifacts/{work_id}/specify/specification.md` "
+            "using `write_file`. "
             "The spec must include: scope, requirements, constraints, "
             "and acceptance criteria."
         )
@@ -86,7 +86,7 @@ async def _run_specify_agent(
 
 async def _save_specify_artifacts(
     state: SpecifySubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Save artifacts from the specify agent."""
     workspace_root = state.get("workspace_root", ".")

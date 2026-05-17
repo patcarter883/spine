@@ -12,7 +12,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
-from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.artifacts import build_artifact_prompt, build_current_phase_write_prompt
 
 
 def build_plan_agent(
@@ -51,6 +51,9 @@ def build_plan_agent(
         "to implement directly from this document.\n\n"
         "Prior artifacts from earlier phases are available on disk — "
         "use `read_file` and `grep` to inspect them when needed.\n\n"
+        + build_current_phase_write_prompt(
+            work_id, PhaseName.PLAN.value, expected_files=["plan.md"]
+        )
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.PLAN.value, work_id=work_id
         )

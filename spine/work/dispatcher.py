@@ -120,6 +120,7 @@ async def submit_work(
     work_type: str = "spec",
     config: SpineConfig | None = None,
     created_at: str | None = None,
+    work_id: str | None = None,
 ) -> dict[str, Any]:
     """Submit a new work item for processing.
 
@@ -139,6 +140,11 @@ async def submit_work(
         config: Optional SpineConfig (loads from default if not provided).
         created_at: Optional ISO timestamp for the work entry's ``created_at``
             field.  When ``None`` (default), uses the current time.
+        work_id: Optional pre-generated work item ID.  When ``None``, a new
+            8-char UUID prefix is generated.  The queue worker pre-generates
+            the ID so the queue row can display the correct work_id while
+            the job is still running, instead of falling back to the queue
+            sequence number.
 
     Returns:
         A dict with keys: ``work_id``, ``status``, ``work_type``.
@@ -147,7 +153,7 @@ async def submit_work(
         config = SpineConfig.load()
     config.ensure_dirs()
 
-    work_id = str(uuid.uuid4())[:8]
+    work_id = work_id or str(uuid.uuid4())[:8]
     audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
     artifacts = ArtifactStore(base_path=config.artifact_path)
 
@@ -207,7 +213,12 @@ async def submit_work(
         thread_config = {
             "configurable": {
                 "thread_id": work_id,
-                "model": config.resolve_model(),
+                # Per-phase model resolution happens inside each phase's
+                # build_phase_agent() via resolve_model(phase=...).  Do NOT
+                # inject a "model" key here — it would short-circuit
+                # _model_spec_from_config() in helpers.py and force every
+                # phase to use the default provider, ignoring
+                # providers.phases.<phase> overrides.
                 "spine_config": config,
             }
         }
@@ -283,8 +294,15 @@ async def submit_work(
                 continue
 
             data = chunk.get("data", {})
+            if not isinstance(data, dict):
+                continue
             # data is {node_name: partial_state_update}
+            # With subgraphs=True, some entries may be non-dict (e.g. tuples
+            # from subgraph-internal routing).  Skip those — only process
+            # dict outputs that carry state updates we can merge.
             for node_name, node_output in data.items():
+                if not isinstance(node_output, dict):
+                    continue
                 # Deep-merge artifacts so phase outputs accumulate instead of
                 # getting overwritten.  The LangGraph state reducer does this
                 # inside the graph, but our local `result` dict needs the same
@@ -596,7 +614,12 @@ async def resume_work(
         thread_config = {
             "configurable": {
                 "thread_id": work_id,
-                "model": config.resolve_model(),
+                # Per-phase model resolution happens inside each phase's
+                # build_phase_agent() via resolve_model(phase=...).  Do NOT
+                # inject a "model" key here — it would short-circuit
+                # _model_spec_from_config() in helpers.py and force every
+                # phase to use the default provider, ignoring
+                # providers.phases.<phase> overrides.
                 "spine_config": config,
             }
         }
@@ -815,7 +838,12 @@ async def resume_interrupted_work(
     thread_config = {
         "configurable": {
             "thread_id": work_id,
-            "model": config.resolve_model(),
+            # Per-phase model resolution happens inside each phase's
+            # build_phase_agent() via resolve_model(phase=...).  Do NOT
+            # inject a "model" key here — it would short-circuit
+            # _model_spec_from_config() in helpers.py and force every
+            # phase to use the default provider, ignoring
+            # providers.phases.<phase> overrides.
             "spine_config": config,
         }
     }
@@ -1035,7 +1063,12 @@ async def _run_workflow_graph(
     thread_config = {
         "configurable": {
             "thread_id": work_id,
-            "model": config.resolve_model(),
+            # Per-phase model resolution happens inside each phase's
+            # build_phase_agent() via resolve_model(phase=...).  Do NOT
+            # inject a "model" key here — it would short-circuit
+            # _model_spec_from_config() in helpers.py and force every
+            # phase to use the default provider, ignoring
+            # providers.phases.<phase> overrides.
             "spine_config": config,
         }
     }

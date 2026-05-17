@@ -7,11 +7,10 @@ The subgraph has two internal nodes:
 State schema: ``ImplementSubgraphState`` — isolated from parent ``WorkflowState``.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from spine.models.enums import PhaseName
@@ -33,7 +32,7 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 
 async def _run_implement_agent(
     state: ImplementSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the implement Deep Agent within the subgraph."""
     description = state.get("description", "")
@@ -78,12 +77,19 @@ async def _run_implement_agent(
                 f"- Codebase map: `{tasks_path}/codebase-map.md`",
                 "",
             ])
+        impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
         prompt_lines.extend([
             "Use `read_file` and `grep` to inspect them. Do NOT load "
             "everything into context at once.",
             "",
             "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
             "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
+            "",
+            "## Where to Write Your Output",
+            f"Write a summary of what you implemented to `{impl_path}/implementation.md` "
+            "using `write_file`. List every file you created or modified, with a one-line "
+            "description of each change.  This file is REQUIRED — without it, the workflow "
+            "treats the phase as failed.",
             "",
         ])
         prompt = "\n".join(prompt_lines)
@@ -128,7 +134,7 @@ async def _run_implement_agent(
 
 async def _save_implement_artifacts(
     state: ImplementSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Save artifacts from the implement agent to disk and state."""
     workspace_root = state.get("workspace_root", ".")

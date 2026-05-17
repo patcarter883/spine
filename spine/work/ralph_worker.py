@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -63,9 +64,16 @@ class RalphLoopWorker:
                     "started_at": str,
                     "completed_at": str,
                     "result": str,
+                    "work_id": str,
                 },
                 pk="id",
             )
+        else:
+            # Migrate: add work_id column if missing on existing DBs.
+            queue_table = db["queue"]
+            existing_cols = {c.name for c in queue_table.columns}
+            if "work_id" not in existing_cols and hasattr(queue_table, "add_column"):
+                queue_table.add_column("work_id", str)  # type: ignore[union-attr]
 
         return db
 
@@ -140,12 +148,17 @@ class RalphLoopWorker:
             item_id = item["id"]
             logger.info(f"Processing queue item {item_id}")
 
+            # Pre-generate a work_id so the queue row shows it while
+            # the job is running (rather than the queue sequence number).
+            work_id = str(uuid.uuid4())[:8]
+
             # Mark as started in the queue
             self._get_db()["queue"].update(
                 item_id,
                 {
                     "status": "running",
                     "started_at": datetime.now().isoformat(),
+                    "work_id": work_id,
                 },
             )
 
@@ -169,6 +182,7 @@ class RalphLoopWorker:
                         work_type=item["work_type"],
                         config=self.config,
                         created_at=item.get("enqueued_at"),
+                        work_id=work_id,
                     )
                 )
 
@@ -176,14 +190,19 @@ class RalphLoopWorker:
                 # the queue page can distinguish failed from completed.
                 work_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
                 queue_status = work_status if work_status in ("failed", "needs_review") else "completed"
+                work_id = result.get("work_id") if isinstance(result, dict) else None
+
+                update_payload: dict[str, Any] = {
+                    "status": queue_status,
+                    "completed_at": datetime.now().isoformat(),
+                    "result": json.dumps(result),
+                }
+                if work_id:
+                    update_payload["work_id"] = work_id
 
                 self._get_db()["queue"].update(
                     item_id,
-                    {
-                        "status": queue_status,
-                        "completed_at": datetime.now().isoformat(),
-                        "result": json.dumps(result),
-                    },
+                    update_payload,
                 )
 
                 # ── Push completion event to WebSocket bus ──

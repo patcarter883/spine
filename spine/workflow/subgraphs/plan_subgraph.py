@@ -5,11 +5,10 @@ The subgraph has two internal nodes:
 2. ``save_artifacts`` — scans disk for artifacts.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from spine.models.enums import PhaseName
@@ -31,7 +30,7 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 
 async def _run_plan_agent(
     state: PlanSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the plan Deep Agent within the subgraph."""
     description = state.get("description", "")
@@ -47,11 +46,12 @@ async def _run_plan_agent(
 
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
 
+        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         prompt = (
             "Create a detailed implementation plan based on the specification.\n\n"
             f"## Work Description\n{description}\n\n"
             f"Read the specification from `{spec_path}/specification.md`.\n\n"
-            "Write the plan to `plan.md` using `write_file`."
+            f"Write the plan to `{plan_path}/plan.md` using `write_file`."
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)
@@ -88,7 +88,7 @@ async def _run_plan_agent(
 
 async def _save_plan_artifacts(
     state: PlanSubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Save artifacts from the plan agent."""
     workspace_root = state.get("workspace_root", ".")

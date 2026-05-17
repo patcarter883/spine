@@ -14,7 +14,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
-from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.artifacts import build_artifact_prompt, build_current_phase_write_prompt
 from spine.agents.subagents import build_phase_subagents
 
 
@@ -62,6 +62,9 @@ def build_specify_agent(
         "Prior artifacts from earlier phases are available on disk — "
         "use `read_file` and `grep` to inspect them when needed. "
         "Do NOT load everything into context at once.\n\n"
+        + build_current_phase_write_prompt(
+            work_id, PhaseName.SPECIFY.value, expected_files=["specification.md"]
+        )
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
         )

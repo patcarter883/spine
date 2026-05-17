@@ -240,6 +240,9 @@ class UIApi:
             entries = list_work(status="running", limit=1, config=self._config)
             if entries:
                 work_id = entries[0].get("id")
+                if work_id:
+                    # Surface the work_id so the UI can display it.
+                    active["work_id"] = work_id
 
         if not work_id:
             return

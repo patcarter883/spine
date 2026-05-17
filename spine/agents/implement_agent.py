@@ -13,7 +13,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
-from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.artifacts import build_artifact_prompt, build_current_phase_write_prompt
 from spine.agents.subagents import build_phase_subagents
 
 
@@ -79,6 +79,9 @@ def build_implement_agent(
         "- Use eval for orchestration, not conversation\n"
         "- Never re-read a file you already have in context\n"
         "- After 2 failed attempts at the same fix, stop and re-analyze\n\n"
+        + build_current_phase_write_prompt(
+            work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]
+        )
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
         )

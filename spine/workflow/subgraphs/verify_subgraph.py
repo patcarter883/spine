@@ -7,11 +7,10 @@ The subgraph has two internal nodes:
 State schema: ``VerifySubgraphState`` — isolated from parent ``WorkflowState``.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from spine.models.enums import PhaseName
@@ -35,7 +34,7 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 
 async def _run_verify_agent(
     state: VerifySubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Run the verify Deep Agent within the subgraph.
 
@@ -78,6 +77,7 @@ async def _run_verify_agent(
                 f"- Specification: `{spec_path}/specification.md`",
                 f"- Plan: `{plan_path}/plan.md`",
             ])
+        verify_path = _artifact_path(work_id, PhaseName.VERIFY.value)
         prompt_lines.extend([
             f"- Feature Slices: `{tasks_path}/tasks.md`",
             f"- Codebase map: `{tasks_path}/codebase-map.md`",
@@ -92,6 +92,13 @@ async def _run_verify_agent(
             "Also inspect the actual code files on disk using `ls` and "
             "`read_file` — the implementation summary may not reflect "
             "the actual state of the code.",
+            "",
+            "## Where to Write Your Output",
+            f"Write your verification report to `{verify_path}/verification.md` "
+            "using `write_file`.  The report MUST begin with `VERIFIED` or `PASSED` "
+            "on the first line if the implementation meets requirements, or "
+            "`FAILED` followed by the issues found.  This file is REQUIRED — "
+            "without it, the workflow treats the phase as failed.",
             "",
             "**RLM parallel verify pattern:** Use `eval` to read the "
             "tasks artifact, extract the slice list, then dispatch a "
@@ -137,7 +144,7 @@ async def _run_verify_agent(
 
 async def _save_verify_artifacts(
     state: VerifySubgraphState,
-    config: Any = None,
+    config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Save artifacts from the verify agent to disk and state.
 

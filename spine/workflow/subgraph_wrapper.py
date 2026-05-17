@@ -7,8 +7,6 @@ Each wrapper:
 4. Maps subgraph output → ParentState update
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 from pathlib import Path
@@ -16,7 +14,6 @@ from typing import Any, Callable
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.graph import StateGraph
 
 from spine.models.state import WorkflowState
 from spine.agents.retry import MaxTokenBudgetExceeded
@@ -42,6 +39,7 @@ async def _get_phase_checkpointer(
     work_id: str,
     phase: str,
     checkpoint_base_dir: str | None = None,
+    workspace_root: str | None = None,
 ) -> AsyncSqliteSaver:
     """Get a phase-specific checkpointer for per-phase checkpoint isolation.
 
@@ -52,13 +50,22 @@ async def _get_phase_checkpointer(
         work_id: The work item ID.
         phase: Phase name (e.g. "verify").
         checkpoint_base_dir: Base directory for checkpoint files.
-            Defaults to .spine/checkpoints/.
+            Defaults to <workspace_root>/.spine/checkpoints/ (or the
+            package-based fallback if workspace_root is also unset).
+        workspace_root: The project workspace root. Used to resolve
+            the default checkpoint_base_dir when not explicitly set.
 
     Returns:
         An AsyncSqliteSaver scoped to this phase's database.
     """
     if checkpoint_base_dir is None:
-        checkpoint_base_dir = ".spine/checkpoints"
+        if workspace_root:
+            checkpoint_base_dir = str(Path(workspace_root) / ".spine" / "checkpoints")
+        else:
+            # Fallback: resolve relative to the spine package directory
+            # so that /root or /tmp CWD doesn't cause permission errors.
+            pkg_dir = Path(__file__).resolve().parent.parent
+            checkpoint_base_dir = str(pkg_dir / ".spine" / "checkpoints")
 
     cache_key = f"{work_id}/{phase}"
     if cache_key in _phase_checkpointer_cache:
@@ -87,7 +94,7 @@ _PHASE_TIMEOUTS: dict[str, int] = {
 _DEFAULT_PHASE_TIMEOUT = 900
 
 
-def _resolve_timeout(phase: str, config: Any | None = None) -> int:
+def _resolve_timeout(phase: str, config: RunnableConfig | None = None) -> int:
     """Resolve timeout for a phase from config or fallback defaults.
 
     Args:
@@ -204,7 +211,7 @@ def make_subgraph_node(
 
     async def subgraph_node(
         parent_state: WorkflowState,
-        config: RunnableConfig | None = None,
+        config: RunnableConfig = None,
     ) -> dict[str, Any]:
         work_id = parent_state.get("work_id", "unknown")
         timeout = _resolve_timeout(phase_name, config)
@@ -240,13 +247,17 @@ def make_subgraph_node(
                 if builder_fn is not None and not phase_name.startswith("critic"):
                     try:
                         checkpointer = await _get_phase_checkpointer(
-                            work_id, phase_name, checkpoint_base_dir
+                            work_id,
+                            phase_name,
+                            checkpoint_base_dir,
+                            workspace_root=parent_state.get("workspace_root"),
                         )
                         active_subgraph = builder_fn().compile(checkpointer=checkpointer)
-                    except Exception:
+                    except Exception as exc:
                         logger.warning(
                             f"[{work_id}] [{phase_name}] per-phase checkpointer failed, "
-                            f"falling back to parent checkpointer"
+                            f"falling back to parent checkpointer: {exc!r}",
+                            exc_info=True,
                         )
 
             # Invoke with timeout

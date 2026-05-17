@@ -20,15 +20,15 @@ _POLL_INTERVAL = 10
 
 _PHASE_SEQUENCE: dict[str, list[str]] = {
     "quick": ["tasks", "implement", "verify"],
-    "critical_quick": ["tasks", "critic", "implement", "verify"],
-    "spec": ["specify", "plan", "critic", "tasks", "implement", "verify"],
+    "critical_quick": ["tasks", "critic_tasks", "implement", "verify"],
+    "spec": ["specify", "plan", "critic_plan", "tasks", "implement", "verify"],
     "critical_spec": [
         "specify",
-        "critic-specify",
+        "critic_specify",
         "plan",
-        "critic-plan",
+        "critic_plan",
         "tasks",
-        "critic-tasks",
+        "critic_tasks",
         "implement",
         "verify",
     ],
@@ -38,9 +38,9 @@ _PHASE_EMOJI = {
     "specify": "📐",
     "plan": "📋",
     "critic": "🔍",
-    "critic-specify": "🔍",
-    "critic-plan": "🔍",
-    "critic-tasks": "🔍",
+    "critic_specify": "🔍",
+    "critic_plan": "🔍",
+    "critic_tasks": "🔍",
     "tasks": "📦",
     "implement": "🛠️",
     "verify": "✅",
@@ -52,20 +52,29 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
     if not phases:
         return
     cols = st.columns(len(phases))
-    current_base = current.rsplit("_", 1)[-1] if "_" in current else current
+    # Resolve the current phase to an index.  Prefer exact match, then
+    # match against the critic-of-phase form, then fall back to bare
+    # phase name.  This handles both pre-merge node names ("critic_plan")
+    # and post-merge canonical phase ("plan").
     try:
-        current_idx = next(
-            i
-            for i, p in enumerate(phases)
-            if p == current or p == current_base or p.startswith(current_base)
-        )
-    except StopIteration:
+        current_idx = phases.index(current)
+    except ValueError:
+        # Try variants: e.g. current="critic" matched against "critic_plan"
+        # by finding the first phase that starts with current_ or ends with
+        # _current.
         current_idx = -1
+        for i, p in enumerate(phases):
+            if p == current or p.startswith(f"{current}_") or p.endswith(f"_{current}"):
+                current_idx = i
+                break
 
     for i, (col, phase) in enumerate(zip(cols, phases)):
         icon = _PHASE_EMOJI.get(phase, "⚙️")
-        label = phase.replace("critic-", "𝘊 ").replace("-", " ").title().replace("Critic ", "𝘊 ")
-        label = phase.capitalize()
+        # Pretty label: "critic_plan" → "𝘊 Plan", "specify" → "Specify"
+        if phase.startswith("critic_"):
+            label = f"𝘊 {phase[len('critic_'):].title()}"
+        else:
+            label = phase.title()
         if current_idx < 0:
             # Unknown phase — show all as upcoming
             col.caption(f"○ {icon} {label}")
@@ -97,31 +106,69 @@ def _render_active_job(api: UIApi) -> None:
     """Active job detail — auto-refreshing fragment."""
     overview = api.get_queue_overview()
     active = overview.get("active")
+    worker_status = api.get_worker_status()
+    worker_running = worker_status.get("running", False)
+
+    # Worker not running — show the start button and return.
+    if not worker_running:
+        st.info("⏸️ RalphLoopWorker is not running. Jobs will not be processed until started.")
+        if st.button("▶️ Start Worker", use_container_width=True):
+            from spine.work.ralph_worker import get_worker
+
+            worker = get_worker(api._config)
+            worker.start()
+            st.rerun()
+        return
 
     if not active:
         st.markdown(
             ":gray[No active job — queue is idle or all jobs completed]"
         )
+        # Reset stuck items button (useful even when no active job)
+        if st.button("🔄 Reset stuck running items", key="reset_stuck"):
+            reset_count = api.reset_stuck_items()
+            if reset_count:
+                st.success(
+                    f"Reset {reset_count} stuck item(s) back to pending. "
+                    "They will be reprocessed."
+                )
+            else:
+                st.info("No stuck running items found.")
+            st.rerun()
         return
 
-    work_id = active.get("id")
+    # ── Active job present — render once, cleanly ──
+    # Prefer the work_id (UUID prefix from dispatcher) over the queue
+    # sequence number for the displayed ID.  The queue PK is purely a
+    # queue-internal sequence; work_id is the canonical identifier.
+    work_id = active.get("work_id") or ""
+    queue_id = active.get("id")
+    display_id = work_id or f"queue-{queue_id}"
+
     status = active.get("status", "unknown")
-    current_phase = active.get("current_phase", "unknown")
-    created_at = active.get("created_at")
+    current_phase = active.get("current_phase") or "starting"
     work_type = active.get("work_type", "spec")
+    created_at = active.get("created_at") or ""
+    updated_at = active.get("updated_at") or ""
+    description = active.get("description", "")
 
     st.subheader("🔄 Active Job")
-    st.caption(f"ID: `{work_id}` | Type: {work_type} | Started: {created_at}")
+    st.caption(
+        f"Work ID: `{display_id}`"
+        + (f"  ·  Queue #{queue_id}" if work_id and queue_id else "")
+    )
 
-    # Status icon and label
-    status_icon_map = {
-        "pending": "⏳",
-        "running": "🔄",
-        "completed": "✅",
-        "failed": "❌",
-    }
-    icon = status_icon_map.get(status, "⚙️")
-    st.markdown(f"**Status:** {icon} {status.title()}")
+    # Description
+    if description:
+        st.markdown(f"**{description[:200]}**")
+
+    # Metrics row
+    meta = st.columns(4)
+    meta[0].metric("Work ID", f"`{display_id}`")
+    meta[1].metric("Type", work_type)
+    meta[2].metric("Status", status.title())
+    phase_label = current_phase.replace("critic_", "𝘊 ").title() if current_phase else "Starting"
+    meta[3].metric("Current Phase", phase_label)
 
     # Phase progress bar
     phases = _PHASE_SEQUENCE.get(work_type, [])
@@ -131,79 +178,40 @@ def _render_active_job(api: UIApi) -> None:
     else:
         st.caption(f"Current phase: {current_phase}")
 
-    # Timing info
+    # Timing
     if created_at:
         try:
-            from datetime import datetime
+            from datetime import datetime as _dt
 
-            start = datetime.fromisoformat(created_at)
+            start = _dt.fromisoformat(created_at)
             duration = format_duration(start)
-            st.caption(f"Elapsed: {duration}")
+            st.caption(
+                f"Started {created_at[:19]}  ·  "
+                f"Last updated {updated_at[:19] or '—'}  ·  "
+                f"Elapsed: {duration}"
+            )
         except Exception:
-            pass
-
-    # Description
-    description = active.get("description", "")
-    if description:
-        st.markdown(f"*{description}*")
+            st.caption(f"Started {created_at[:19]}")
 
     # If failed, show result/reason
-    # TODO: Add result display on failed status
     if status == "failed":
-        st.error("⚠️ Job failed — check result below")
         result = active.get("result", "")
-        if result:
-            st.code(result)
-    if status == "failed":
-        result = active.get("result")
         if result:
             st.error("**Error:**")
             st.code(result)
 
-    worker_status = api.get_worker_status()
-    if not worker_status.get("running"):
-        st.info("⏸️ RalphLoopWorker is not running. Jobs will not be processed until started.")
-        if st.button("▶️ Start Worker", use_container_width=True):
-            from spine.work.ralph_worker import get_worker
-
-            worker = get_worker(api._config)
-            worker.start()
-            st.rerun()
-    elif not active:
-        st.info("No job is currently running. Submit work from the **Submit Work** page.")
-
-    # Reset stuck items button at the bottom of active job section
+    # Reset stuck items button
     st.divider()
     if st.button("🔄 Reset stuck running items", key="reset_stuck"):
         reset_count = api.reset_stuck_items()
         if reset_count:
-            st.success(f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed.")
+            st.success(
+                f"Reset {reset_count} stuck item(s) back to pending. "
+                "They will be reprocessed."
+            )
         else:
             st.info("No stuck running items found.")
         st.rerun()
-    else:
-        # Description line
-        st.markdown(f"**{active.get('description', '')[:150]}**")
-
-        meta = st.columns(4)
-        meta[0].metric("Work ID", f"`{active.get('id', '')}`")
-        meta[1].metric("Type", active.get("work_type", ""))
-        meta[2].metric("Total Time", format_duration(active.get("created_at")))
-
-        current_phase = active.get("current_phase", "starting")
-        meta[3].metric("Current Phase", current_phase.title() if current_phase else "Starting")
-
-        # Phase progress bar
-        phases = _PHASE_SEQUENCE.get(active.get("work_type", ""), [])
-        if phases:
-            _render_phase_bar(phases, current_phase)
-
-        # Timing detail
-        st.caption(
-            f"Started {active.get('created_at', '')[:19]}  ·  "
-            f"Last updated {active.get('updated_at', '')[:19]}  ·  "
-            f"Status: `{active.get('status', '')}`"
-        )
 
 
 @st.fragment(run_every=_POLL_INTERVAL)

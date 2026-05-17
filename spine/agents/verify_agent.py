@@ -13,7 +13,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
-from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.artifacts import build_artifact_prompt, build_current_phase_write_prompt
 from spine.agents.subagents import build_phase_subagents
 
 
@@ -72,6 +72,9 @@ def build_verify_agent(
         "- Use eval for parallel subagent dispatch\n"
         "- Inspect actual code, not just the implementation summary\n"
         "- Run tests — do not assume they pass\n\n"
+        + build_current_phase_write_prompt(
+            work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
+        )
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
         )

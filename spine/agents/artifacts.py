@@ -296,6 +296,50 @@ def build_artifact_prompt(
     return "\n".join(lines) + "\n\n"
 
 
+def build_current_phase_write_prompt(
+    work_id: str,
+    current_phase: str,
+    expected_files: list[str] | None = None,
+) -> str:
+    """Build a prompt section telling the agent WHERE to write its outputs.
+
+    Without this, agents call ``write_file("specification.md", ...)`` which
+    lands at the workspace root.  The subgraph's ``save_artifacts`` node
+    then scans ``.spine/artifacts/{work_id}/{phase}/`` and finds nothing,
+    so the phase is flagged ``needs_review`` despite the agent having
+    written a valid document — just in the wrong place.
+
+    Args:
+        work_id: Unique work item identifier.
+        current_phase: The phase name (e.g. ``"specify"``).
+        expected_files: Optional list of files the agent is expected to
+            produce (e.g. ``["specification.md"]``).  Listed in the prompt
+            so the agent uses the correct relative paths.
+
+    Returns:
+        A markdown-formatted instruction block.
+    """
+    base_path = _artifact_path(work_id, current_phase)
+    lines: list[str] = [
+        "## Where to Write This Phase's Artifacts",
+        "",
+        f"All files you produce for the **{current_phase.upper()}** phase MUST be written",
+        f"to the directory `{base_path}/`.",
+        "",
+        "Use `write_file` with paths like:",
+    ]
+    files = expected_files or ["<filename>.md"]
+    for f in files:
+        lines.append(f"  - `{base_path}/{f}`")
+    lines.append("")
+    lines.append(
+        "Do NOT write to the workspace root (e.g. `./specification.md`) — files there "
+        "are invisible to the workflow and will cause the phase to be flagged for "
+        "human review even if the content is correct."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
 def build_inline_artifact_prompt(
     state: dict[str, Any],
     current_phase: str,
