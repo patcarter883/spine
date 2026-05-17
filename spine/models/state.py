@@ -43,6 +43,20 @@ def _merge_artifacts(left: dict, right: dict) -> dict:
     return merged
 
 
+class PhaseResult(TypedDict, total=False):
+    """Lightweight summary of a phase subgraph's output.
+
+    Stored in ``WorkflowState.phase_results`` so the parent graph can
+    track progress without carrying full artifact content.
+    """
+
+    phase: str
+    status: str  # "success" | "needs_review" | "error"
+    artifact_count: int
+    artifact_names: list[str]
+    error: str | None
+
+
 class WorkflowState(TypedDict, total=False):
     """State schema for the SPINE workflow StateGraph.
 
@@ -50,6 +64,7 @@ class WorkflowState(TypedDict, total=False):
     - artifacts: phase output documents merge by key
     - feedback: review feedback appends to a list
     - retry_count: per-phase retry counts merge by phase name
+    - phase_results: per-phase summary dicts merge by key
     """
 
     work_id: str
@@ -65,3 +80,5 @@ class WorkflowState(TypedDict, total=False):
     prompt_request: dict | None
     critic_reviewing: str  # Phase the current critic node is reviewing
     workspace_root: str  # Project root directory for deep agent backends
+    phase_results: Annotated[dict, _merge_dicts]  # phase → PhaseResult
+    needs_review_phase: str | None  # Which phase triggered human review

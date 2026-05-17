@@ -74,6 +74,15 @@ class SpineConfig:
     workspace_root: str = ""
     interpreter_enabled: bool = False
     tool_schema_validation: bool = True
+    phase_timeouts: dict = field(default_factory=lambda: {
+        "specify": 600,
+        "plan": 600,
+        "tasks": 900,
+        "implement": 1800,
+        "verify": 600,
+        "critic": 300,
+    })
+    default_timeout: int = 900
 
     @staticmethod
     def _find_workspace_root() -> str:

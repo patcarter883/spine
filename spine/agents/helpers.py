@@ -322,18 +322,19 @@ def extract_response(result: dict[str, Any]) -> str:
     if messages:
         last = messages[-1]
         content = getattr(last, "content", str(last))
-        if not content:
-            return ""
-        # ── Detect leaked thinking-model reasoning ─────────────────────
-        # Thinking models sometimes put their chain-of-thought in the
-        # content field instead of reasoning_content.  Common patterns:
-        #   - "Now let me check..." / "Let me look at..." / "I should..."
-        #   - "Good, I can see..." / "The problem is..."
-        #   - Starts with a lowercase letter (structured artifacts start
-        #     with a heading or title case)
-        stripped = content.strip()
-        if stripped and not stripped[0].isupper() and not stripped[0] in ("#", "*", "-", "|", "`", "[", '"'):
-            # Looks like reasoning, not a structured artifact
-            return ""
-        return content
+        # ── Try content first ──────────────────────────────────────────
+        if content and len(content.strip()) > 0:
+            # Detect leaked thinking-model reasoning
+            stripped = content.strip()
+            if stripped and not stripped[0].isupper() and stripped[0] not in ("#", "*", "-", "|", "`", "[", '"'):
+                # Looks like reasoning, not a structured artifact
+                return ""
+            return content
+        # ── Fall back to reasoning_content for thinking models ─────────
+        reasoning = (
+            getattr(last, "additional_kwargs", {}).get("reasoning_content", "")
+            or ""
+        )
+        if reasoning and len(reasoning.strip()) > 10:
+            return reasoning.strip()
     return ""

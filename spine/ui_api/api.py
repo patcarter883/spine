@@ -300,6 +300,53 @@ class UIApi:
             "action": action,
         }
 
+    def resume_interrupted_work(
+        self,
+        work_id: str,
+        action: str,
+        feedback: str = "",
+    ) -> dict[str, Any]:
+        """Resume a work item that hit an interrupt() for human review.
+
+        Uses LangGraph's Command(resume=...) to continue from the interrupt
+        point without restarting the entire graph.  This is the preferred
+        resume path for subgraph-based workflows — the legacy resume_work()
+        restarts the full graph from scratch.
+
+        Non-blocking: enqueues for async processing via RalphLoopWorker.
+
+        Args:
+            work_id: The work item ID.
+            action: ``"rework"``, ``"approve"``, or ``"abort"``.
+            feedback: Human review text.
+
+        Returns:
+            Dict with work_id, status, and action.
+        """
+        from spine.work.dispatcher import resume_interrupted_work as _async_resume
+
+        # Mark the work entry as running immediately so the UI
+        # shows progress right away.
+        self._mark_running(work_id)
+
+        # Run resume in the background via RalphLoopWorker thread pool
+        import asyncio
+        import concurrent.futures
+
+        def _run():
+            asyncio.run(_async_resume(work_id, action, feedback, self._config))
+
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(_run)
+
+        return {
+            "work_id": work_id,
+            "status": "running",
+            "action": action,
+        }
+
     def _mark_running(self, work_id: str) -> None:
         """Transition a needs_review work entry back to running."""
         from spine.work.dispatcher import update_work_status

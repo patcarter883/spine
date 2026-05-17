@@ -1,0 +1,252 @@
+"""TASKS phase as a LangGraph subgraph.
+
+The subgraph has two internal nodes:
+1. ``run_agent`` — builds and invokes the tasks Deep Agent.
+2. ``save_artifacts`` — scans disk for artifacts, handles retry logic.
+
+State schema: ``TasksSubgraphState`` — isolated from parent ``WorkflowState``.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from langgraph.graph import END, START, StateGraph
+
+from spine.models.enums import PhaseName
+from spine.workflow.subgraph_state import TasksSubgraphState
+from spine.agents.tasks_agent import build_tasks_agent
+from spine.agents.helpers import extract_response
+from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
+from spine.agents.context import build_context
+from spine.agents.artifacts import (
+    materialize_artifacts,
+    materialize_phase_artifacts,
+    scan_artifact_dir,
+    _artifact_path,
+)
+
+logger = logging.getLogger(__name__)
+_MAX_ARTIFACT_STATE_CHARS = 500
+
+
+async def _run_tasks_agent(
+    state: TasksSubgraphState,
+    config: Any = None,
+) -> dict[str, Any]:
+    """Run the tasks Deep Agent within the subgraph."""
+    description = state.get("description", "")
+    work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
+    workspace_root = state.get("workspace_root", ".")
+    retry_count = state.get("retry_count", 0)
+    feedback = state.get("feedback", [])
+
+    logger.info(f"[{work_id}] TASKS subgraph: run_agent starting")
+
+    try:
+        agent = build_tasks_agent(dict(state), config)
+        materialize_artifacts(dict(state), workspace_root, work_id=work_id)
+
+        has_spec = "spec" in work_type
+        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
+
+        prompt_lines = [
+            "Break the plan into smaller, executable feature slices "
+            "with clear dependencies.",
+            "",
+            "## Work Description",
+            description,
+            "",
+        ]
+        if has_spec:
+            prompt_lines.extend([
+                f"## Artifact Output Directory\n"
+                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
+                f"This is relative to your workspace root (`{workspace_root}`).\n"
+                f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
+                "Prior artifacts are available on disk:",
+                f"- Specification: `{spec_path}/specification.md`",
+                f"- Plan: `{plan_path}/plan.md`",
+                "",
+                "Read them with `read_file` before decomposing.",
+                "",
+            ])
+        else:
+            prompt_lines.extend([
+                f"## Artifact Output Directory\n"
+                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
+                f"This is relative to your workspace root (`{workspace_root}`).\n"
+                f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
+                "This is a quick workflow — no specification or plan artifacts "
+                "exist. Work from the task description directly.",
+                "",
+                "Use researcher subagents via the interpreter (`eval`) to "
+                "explore the codebase in parallel.",
+                "",
+                "Spend at most 2-3 turns on exploration before writing. "
+                "Better to produce slices with partial knowledge than none at all.",
+                "",
+            ])
+        prompt_lines.extend([
+            "## Instructions\n"
+            "1. Explore the codebase (use researcher subagents via interpreter\n"
+            "   for parallel exploration, or `read_file`/`grep` for quick checks).\n"
+            "2. After exploring, write individual `slice-<name>.md` files using\n"
+            "   `write_file`.\n"
+            "3. Write a summary `tasks.md` that references each slice.\n"
+            "4. **You MUST call `write_file`** — do not just describe slices.\n"
+            "5. Write a `codebase-map.md` capturing exploration findings.\n",
+        ])
+        prompt = "\n".join(prompt_lines)
+        if retry_count > 0 and feedback:
+            feedback_text = "\n".join(
+                f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
+                for f in feedback if isinstance(f, dict)
+            )
+            prompt += f"## Previous Review Feedback\n{feedback_text}\n"
+
+        ctx = build_context(dict(state), PhaseName.TASKS)
+
+        result = await ainvoke_with_retry(
+            agent,
+            {"messages": [{"role": "user", "content": prompt}]},
+            phase_name=PhaseName.TASKS.value,
+            work_id=work_id,
+            work_type=work_type,
+            context=ctx,
+        )
+
+        return {
+            "messages": result.get("messages", []),
+            "agent_response": extract_response(result),
+        }
+
+    except MaxTokenBudgetExceeded as e:
+        logger.error(f"[{work_id}] TASKS subgraph token budget exceeded: {e}")
+        return {
+            "messages": [],
+            "agent_response": f"Token budget exceeded: {e}",
+            "phase_status": "needs_review",
+        }
+    except Exception as e:
+        logger.error(f"[{work_id}] TASKS subgraph agent failed: {e}", exc_info=True)
+        return {
+            "messages": [],
+            "agent_response": f"Agent error: {e}",
+            "phase_status": "error",
+        }
+
+
+async def _save_tasks_artifacts(
+    state: TasksSubgraphState,
+    config: Any = None,
+) -> dict[str, Any]:
+    """Save artifacts from the tasks agent to disk and state."""
+    workspace_root = state.get("workspace_root", ".")
+    work_id = state.get("work_id", "unknown")
+    agent_response = state.get("agent_response", "")
+    existing_phase_status = state.get("phase_status", "")
+    description = state.get("description", "")
+    work_type = state.get("work_type", "")
+
+    if existing_phase_status in ("error", "needs_review"):
+        return {
+            "artifacts_output": {},
+            "phase_status": existing_phase_status,
+        }
+
+    disk_artifacts = scan_artifact_dir(
+        workspace_root, work_id, PhaseName.TASKS.value,
+        max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+    )
+
+    # ── Fallback: if agent wrote nothing, try extract_response ─────────
+    if not disk_artifacts:
+        tasks_content = agent_response
+        if tasks_content.strip():
+            materialize_phase_artifacts(
+                PhaseName.TASKS.value,
+                {"tasks.md": tasks_content},
+                workspace_root,
+                work_id=work_id,
+            )
+            disk_artifacts = {"tasks.md": tasks_content[:_MAX_ARTIFACT_STATE_CHARS]}
+
+    # ── Retry with fresh agent if still nothing ───────────────────────────
+    if not disk_artifacts:
+        logger.warning(
+            "[%s] TASKS agent produced no output — retrying with fresh agent",
+            work_id,
+        )
+        retry_agent = build_tasks_agent(dict(state), config)
+        ctx = build_context(dict(state), PhaseName.TASKS)
+        retry_prompt = (
+            f"## Work Description\n{description}\n\n"
+            "**Write the task decomposition NOW.** "
+            "Do NOT read any more files. Produce:\n\n"
+            "1. A `tasks.md` summary listing 2-5 feature slices.\n"
+            "2. Individual `slice-<name>.md` files for each slice.\n\n"
+            "Output format in tasks.md:\n"
+            "```markdown\n"
+            "## Slice 1: <name>\n"
+            "- **Files:** ...\n"
+            "- **Depends on:** none\n"
+            "- **Complexity:** small\n"
+            "- **Acceptance:** ...\n"
+            "```\n"
+        )
+        retry_result = await ainvoke_with_retry(
+            retry_agent,
+            {"messages": [{"role": "user", "content": retry_prompt}]},
+            phase_name=PhaseName.TASKS.value,
+            work_id=work_id,
+            work_type=work_type,
+            context=ctx,
+        )
+        # Scan disk again after retry
+        disk_artifacts = scan_artifact_dir(
+            workspace_root, work_id, PhaseName.TASKS.value,
+            max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        )
+
+        # If still nothing, try extract_response from retry
+        if not disk_artifacts:
+            tasks_content = extract_response(retry_result)
+            if tasks_content.strip():
+                materialize_phase_artifacts(
+                    PhaseName.TASKS.value,
+                    {"tasks.md": tasks_content},
+                    workspace_root,
+                    work_id=work_id,
+                )
+                disk_artifacts = {"tasks.md": tasks_content[:_MAX_ARTIFACT_STATE_CHARS]}
+
+        if not disk_artifacts:
+            logger.error(
+                "[%s] TASKS subgraph: no artifacts produced even with retry",
+                work_id,
+            )
+            return {
+                "artifacts_output": {},
+                "phase_status": "needs_review",
+            }
+
+    return {
+        "artifacts_output": disk_artifacts,
+        "phase_status": "success",
+    }
+
+
+def build_tasks_subgraph() -> Any:
+    """Build the TASKS phase subgraph."""
+    builder = StateGraph(TasksSubgraphState)
+    builder.add_node("run_agent", _run_tasks_agent)
+    builder.add_node("save_artifacts", _save_tasks_artifacts)
+    builder.add_edge(START, "run_agent")
+    builder.add_edge("run_agent", "save_artifacts")
+    builder.add_edge("save_artifacts", END)
+    return builder.compile()

@@ -74,8 +74,35 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
         state: WorkflowState, config: RunnableConfig | None = None
     ) -> dict[str, Any]:
         work_id = state.get("work_id", "unknown")
+        workspace_root = state.get("workspace_root", ".")
 
-        if _has_meaningful_artifacts(state, required_phase):
+        # Check state-level artifacts first (fast, no I/O)
+        has_state_artifacts = _has_meaningful_artifacts(state, required_phase)
+
+        # Also validate on-disk presence — state may have a summary but the
+        # agent may not have actually written the files, or they may have
+        # been written to the wrong path.  Disk is the ground truth.
+        has_disk_artifacts = False
+        try:
+            from spine.agents.artifacts import validate_artifact_dir
+            has_disk_artifacts = validate_artifact_dir(
+                workspace_root, work_id, required_phase
+            )
+        except Exception:
+            # Don't let a disk check failure crash the gate — fall back
+            # to the state check result.
+            has_disk_artifacts = True
+
+        # Pass if state has artifacts.  Log a warning if disk check fails
+        # but don't block — disk may be empty because the dispatcher hasn't
+        # persisted yet, or because the workspace_root is different.
+        if has_state_artifacts:
+            if not has_disk_artifacts:
+                logger.warning(
+                    "[%s] Artifact gate: %s has artifacts in state but not on "
+                    "disk at .spine/artifacts/%s/%s/. Proceeding anyway.",
+                    work_id, required_phase, work_id, required_phase,
+                )
             logger.debug(
                 "[%s] Artifact gate passed for %s → %s",
                 work_id, required_phase, next_node,
@@ -86,10 +113,16 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
                 "prompt_request": None,
             }
 
+        # Provide a specific reason for the failure
+        reason = (
+            f"Artifact gate: {required_phase} produced no "
+            f"meaningful artifacts (≥{MIN_ARTIFACT_CHARS} chars), "
+            f"cannot proceed to {next_node}."
+        )
+
         logger.warning(
-            "[%s] Artifact gate: %s produced no meaningful artifacts, "
-            "cannot proceed to %s. Flagging for human review.",
-            work_id, required_phase, next_node,
+            "[%s] %s Flagging for human review.",
+            work_id, reason,
         )
         return {
             "current_phase": required_phase,
@@ -98,11 +131,7 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
                 {
                     "status": "needs_review",
                     "tier": "structural",
-                    "reason": (
-                        f"Artifact gate: {required_phase} produced no "
-                        f"meaningful artifacts (≥{MIN_ARTIFACT_CHARS} chars), "
-                        f"cannot proceed to {next_node}."
-                    ),
+                    "reason": reason,
                     "suggestions": [],
                 }
             ],

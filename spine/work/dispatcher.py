@@ -208,6 +208,7 @@ async def submit_work(
             "configurable": {
                 "thread_id": work_id,
                 "model": config.resolve_model(),
+                "spine_config": config,
             }
         }
 
@@ -596,6 +597,7 @@ async def resume_work(
             "configurable": {
                 "thread_id": work_id,
                 "model": config.resolve_model(),
+                "spine_config": config,
             }
         }
 
@@ -766,6 +768,116 @@ async def resume_work(
         }
 
 
+
+# ── Resume interrupted work (using Command + interrupt) ──
+
+async def resume_interrupted_work(
+    work_id: str,
+    action: str,
+    feedback: str,
+    config: SpineConfig | None = None,
+) -> dict[str, Any]:
+    """Resume a workflow that hit an ``interrupt()`` for human review.
+
+    Uses LangGraph's ``Command(resume=...)`` to continue from the
+    interrupt point without restarting the entire graph.
+
+    Args:
+        work_id: The work item ID.
+        action: ``"rework"``, ``"approve"``, or ``"abort"``.
+        feedback: Human review text.
+        config: Optional SpineConfig.
+
+    Returns:
+        Dict with ``work_id``, ``status``, ``work_type``.
+    """
+    if config is None:
+        config = SpineConfig.load()
+    config.ensure_dirs()
+
+    db = _get_work_db(config)
+
+    try:
+        entry = db["work_entries"].get(work_id)
+    except sqlite_utils.db.NotFoundError:
+        raise ValueError(f"Work item '{work_id}' not found")
+
+    work_type = entry.get("work_type", "spec")
+
+    from spine.persistence.checkpoint import CheckpointStore
+    from spine.workflow.compose import build_workflow_graph
+    from langgraph.types import Command
+
+    checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+    checkpointer = await checkpoint_store.get_checkpointer()
+    graph = build_workflow_graph(work_type, checkpointer=checkpointer)
+
+    thread_config = {
+        "configurable": {
+            "thread_id": work_id,
+            "model": config.resolve_model(),
+            "spine_config": config,
+        }
+    }
+
+    command = Command(resume={"action": action, "feedback": feedback})
+
+    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
+    audit.log_event(
+        work_id,
+        "work_resumed_interrupt",
+        "dispatcher",
+        {"action": action, "feedback": feedback[:200]},
+    )
+
+    # Stream the rest of the graph from the interrupt point
+    result: dict[str, Any] = {}
+    async for chunk in graph.astream(
+        command,
+        thread_config,
+        stream_mode=["updates", "messages"],
+        subgraphs=True,
+        version="v2",
+    ):
+        if not isinstance(chunk, dict) or chunk.get("type") != "updates":
+            continue
+        if chunk.get("ns", ()) != ():
+            continue
+
+        data = chunk.get("data", {})
+        for _node_name, node_output in data.items():
+            result.update(node_output)
+            phase = node_output.get("current_phase", "")
+            status = node_output.get("status", "")
+            if phase or status:
+                _update_work_progress(db, work_id, phase, status)
+
+    final_status = result.get("status", "completed")
+    final_phase = result.get("current_phase", "")
+
+    db["work_entries"].update(
+        work_id,
+        {
+            "status": final_status,
+            "current_phase": final_phase,
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+
+    audit.log_event(
+        work_id,
+        "work_completed",
+        final_phase,
+        {"status": final_status, "resumed_from_interrupt": True},
+    )
+
+    return {
+        "work_id": work_id,
+        "status": final_status,
+        "work_type": work_type,
+    }
+
+
 # ── Restart work ──
 
 
@@ -924,6 +1036,7 @@ async def _run_workflow_graph(
         "configurable": {
             "thread_id": work_id,
             "model": config.resolve_model(),
+            "spine_config": config,
         }
     }
 

@@ -34,6 +34,23 @@ def render(api: UIApi) -> None:
             st.write("**Description:**")
             st.write(item.get("description", ""))
 
+            action = st.radio(
+                "Action",
+                ["Rework", "Approve"],
+                horizontal=True,
+                key=f"hr_action_{work_id}",
+            )
+            resume_action = "rework" if action == "Rework" else "approve"
+            feedback = st.text_input(
+                "Feedback",
+                placeholder="Optional: add instructions...",
+                key=f"hr_feedback_{work_id}",
+            )
+            if st.button("▶ Resume", key=f"hr_resume_{work_id}"):
+                api.resume_interrupted_work(work_id, resume_action, feedback)
+                st.success(f"Resumed {work_id} with action: {resume_action}")
+                st.rerun()
+
             col1, col2 = st.columns(2)
             if col2.button("View Details", key=f"hr_view_{work_id}"):
                 from spine.ui.pages import get as get_page

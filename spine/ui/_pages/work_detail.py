@@ -245,25 +245,53 @@ def render(api: UIApi) -> None:
     status = entry.get("status", "unknown")
     if status == "needs_review":
         st.warning("This work item needs human review.")
+
+        # Show two resume options: interrupt-based (preferred) and legacy
+        st.subheader("Resume Options")
+        st.caption(
+            "**Resume from review** continues from the exact point the workflow "
+            "paused (recommended).  **Resume from scratch** restarts the entire "
+            "graph with your feedback appended."
+        )
+
         action = st.radio(
             "Resume action",
-            ["Rework from flagged phase", "Approve and proceed"],
+            ["Rework from flagged phase", "Approve and proceed", "Abort"],
             horizontal=True,
             key=f"action_{work_id}",
         )
-        resume_action = "rework" if action.startswith("Rework") else "approve"
+        resume_action = (
+            "rework" if action.startswith("Rework")
+            else "approve" if action.startswith("Approve")
+            else "abort"
+        )
         human_input = st.text_area(
             "Your feedback / instructions",
             placeholder="Describe what needs to change, or confirm approval...",
             key=f"feedback_{work_id}",
         )
-        if st.button("▶ Resume with feedback", type="primary", key=f"resume_{work_id}"):
-            if not human_input.strip():
+
+        # Primary: interrupt-based resume (preserves checkpoint position)
+        if st.button("▶ Resume from review", type="primary", key=f"resume_interrupt_{work_id}"):
+            if not human_input.strip() and resume_action != "abort":
                 st.error("Please provide feedback before resuming.")
             else:
-                result = api.resume_work(work_id, human_input.strip(), resume_action)
+                result = api.resume_interrupted_work(
+                    work_id, resume_action, human_input.strip()
+                )
                 st.success(f"Resumed! Status: {result['status']} | Action: {result['action']}")
                 st.rerun()
+
+        # Secondary: legacy resume (restarts from scratch)
+        with st.expander("Legacy: Resume from scratch"):
+            st.warning("This restarts the entire workflow from phase 0 with your feedback.")
+            if st.button("▶ Legacy Resume with feedback", key=f"resume_legacy_{work_id}"):
+                if not human_input.strip():
+                    st.error("Please provide feedback before resuming.")
+                else:
+                    result = api.resume_work(work_id, human_input.strip(), resume_action)
+                    st.success(f"Resumed! Status: {result['status']} | Action: {result['action']}")
+                    st.rerun()
 
         st.divider()
         st.caption("Or restart from phase 0 (discarding accumulated feedback):")

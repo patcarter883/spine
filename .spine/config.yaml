@@ -4,17 +4,46 @@ spine:
 
 providers:
   llm:
-  - name: default
+  - name: frontier
     type: deepagents-model
-    model: openrouter:deepseek/deepseek-v4-flash
+    model: openrouter:z-ai/glm-5.1
     max_completion_tokens: 32768
-    priority: 1
     enabled: true
-  # - name: default
-  #   type: deepagents-model
-  #   model: openai:model
-  #   base_url: 'http://localhost:8000/v1'
-  #   api_key: 'vllm'
-  #   priority: 0
-  #   enabled: true
+  - name: lfm
+    type: deepagents-model
+    model: openrouter:liquid/lfm-2-24b-a2b
+    enabled: true
+  - name: laguna-m1
+    type: deepagents-model
+    model: openrouter:poolside/laguna-m.1:free
+    enabled: true
+  - name: laguna-xs2
+    type: deepagents-model
+    model: openrouter:poolside/laguna-xs.2:free
+    enabled: true
+  - name: local
+    type: deepagents-model
+    model: openai:model
+    base_url: 'http://localhost:8000/v1'
+    api_key: 'vllm'
+    enabled: true
   
+  phases:
+    # Heavy reasoning → frontier model (via reference)
+    specify:
+      provider: frontier
+    plan:
+      provider: lfm
+
+    # Implementation → local vLLM, but colder temperature for code
+    implement:
+      provider: laguna-m1
+      temperature: 0.3           # freezes just the temp override
+
+    # Slice implementer subagent gets the same vLLM but even faster
+    implement/subagents/slice-implementer:
+      provider: laguna-xs2
+
+    # Verification → cheap local model with custom endpoint
+    verify:
+      model: local                 # short timeout for verify

@@ -192,6 +192,38 @@ def scan_artifact_dir(
     return artifacts
 
 
+def validate_artifact_dir(
+    workspace_root: str,
+    work_id: str,
+    phase: str,
+) -> bool:
+    """Return True if artifacts exist at the expected path for a phase.
+
+    After each subgraph run, this validates that the agent produced output
+    at the expected location (``.spine/artifacts/{work_id}/{phase}/``).
+    Used by the artifact gate and by verify to confirm prior phases wrote
+    files to the right place.
+
+    Args:
+        workspace_root: Absolute path to the project workspace.
+        work_id: Work item identifier.
+        phase: The phase name (e.g. ``"tasks"``).
+
+    Returns:
+        True if the artifact directory exists and contains at least one
+        non-meta file.  False otherwise.
+    """
+    root = Path(workspace_root)
+    phase_dir = root / _artifact_path(work_id, phase)
+    if not phase_dir.is_dir():
+        return False
+    files = [f for f in phase_dir.iterdir() if f.is_file() and not f.name.endswith(".meta.json")]
+    if not files:
+        return False
+    logger.info(f"Validated {len(files)} artifacts at {phase_dir}")
+    return True
+
+
 def build_artifact_prompt(
     artifacts: dict[str, Any],
     current_phase: str,

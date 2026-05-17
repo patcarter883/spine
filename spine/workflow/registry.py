@@ -23,14 +23,18 @@ class PhaseDefinition:
         name: The phase identifier (must match a PhaseName enum value).
         call_fn: The LangGraph node function. Signature: ``(state, config) -> dict``
             (sync) or ``async (state, config) -> dict`` (async).
+            **DEPRECATED** — use ``subgraph_node_fn`` instead for new phases.
         build_agent_fn: Factory that creates a Deep Agent for this phase.
             Signature: ``(state, config) -> CompiledGraph``.
+        subgraph_node_fn: New-style subgraph wrapper node function.
+            When set, this takes precedence over ``call_fn``.
         description: Human-readable description of the phase.
     """
 
     name: str
-    call_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]]
-    build_agent_fn: Callable[..., Any]
+    call_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]] | None = None
+    build_agent_fn: Callable[..., Any] | None = None
+    subgraph_node_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]] | None = None
     description: str = ""
 
 
@@ -47,22 +51,25 @@ class PhaseRegistry:
     def register(
         self,
         name: str,
-        call_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]],
-        build_agent_fn: Callable[..., Any],
+        call_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]] | None = None,
+        build_agent_fn: Callable[..., Any] | None = None,
+        subgraph_node_fn: Callable[..., dict[str, Any] | Awaitable[dict[str, Any]]] | None = None,
         description: str = "",
     ) -> None:
         """Register a workflow phase.
 
         Args:
             name: Phase name (must match a PhaseName enum value).
-            call_fn: LangGraph node function for this phase (sync or async).
+            call_fn: LangGraph node function for this phase (legacy).
             build_agent_fn: Factory that creates a Deep Agent for this phase.
+            subgraph_node_fn: New-style subgraph wrapper node function.
             description: Human-readable description.
         """
         self._phases[name] = PhaseDefinition(
             name=name,
             call_fn=call_fn,
             build_agent_fn=build_agent_fn,
+            subgraph_node_fn=subgraph_node_fn,
             description=description,
         )
 

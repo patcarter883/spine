@@ -24,13 +24,14 @@ Phase sequences by WorkType:
                      TASKS → CRITIC_TASKS → IMPLEMENT → VERIFY
 """
 
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.types import interrupt
 
-from spine.models.enums import PhaseName, WorkType
+from spine.models.enums import PhaseName, ReviewStatus, WorkType
 from spine.models.state import WorkflowState
 from spine.workflow.registry import get_registry
 from spine.workflow.critic_review import critic_router
@@ -38,6 +39,250 @@ from spine.workflow.artifact_gate import (
     make_artifact_gate_node,
     artifact_gate_router,
 )
+from spine.workflow.subgraph_wrapper import (
+    make_subgraph_node,
+    make_success_result_mapper,
+)
+from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
+from spine.workflow.subgraphs.implement_subgraph import build_implement_subgraph
+from spine.workflow.subgraphs.tasks_subgraph import build_tasks_subgraph
+from spine.workflow.subgraphs.specify_subgraph import build_specify_subgraph
+from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
+from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
+
+# ── Subgraph builder registry ──────────────────────────────────────────
+# Used by the per-phase checkpointer to recompile subgraphs at runtime
+# with phase-specific SQLite databases instead of sharing the parent's.
+
+_SUBGRAPH_BUILDER_REGISTRY: dict[str, Callable] = {}
+
+
+def register_subgraph_builder(phase: str, builder: Callable) -> None:
+    """Register a subgraph builder so per-phase checkpointers can recompile."""
+    _SUBGRAPH_BUILDER_REGISTRY[phase] = builder
+
+
+def get_subgraph_builder(phase: str) -> Callable | None:
+    """Get the registered builder for a phase, or None."""
+    return _SUBGRAPH_BUILDER_REGISTRY.get(phase)
+
+
+# Register all phase builders at import time.
+register_subgraph_builder(PhaseName.VERIFY.value, build_verify_subgraph)
+register_subgraph_builder(PhaseName.IMPLEMENT.value, build_implement_subgraph)
+register_subgraph_builder(PhaseName.TASKS.value, build_tasks_subgraph)
+register_subgraph_builder(PhaseName.SPECIFY.value, build_specify_subgraph)
+register_subgraph_builder(PhaseName.PLAN.value, build_plan_subgraph)
+# Critic is parameterized by reviewed_phase — register keyed variants.
+register_subgraph_builder(f"{PhaseName.CRITIC.value}_tasks", build_critic_subgraph)
+register_subgraph_builder(f"{PhaseName.CRITIC.value}_plan", build_critic_subgraph)
+register_subgraph_builder(f"{PhaseName.CRITIC.value}_specify", build_critic_subgraph)
+
+
+# Feature flags for per-phase subgraph migration.
+# During rollout, phases can be enabled independently.
+_SUBGRAPH_ENABLED: dict[str, bool] = {
+    PhaseName.VERIFY.value: True,
+    PhaseName.IMPLEMENT.value: True,
+    PhaseName.TASKS.value: True,
+    PhaseName.SPECIFY.value: True,
+    PhaseName.PLAN.value: True,
+    PhaseName.CRITIC.value: True,
+}
+
+
+def _base_state_mapper(parent_state: WorkflowState, config) -> dict:
+    """Base fields shared by all phase state mappers."""
+    return {
+        "work_id": parent_state.get("work_id", "unknown"),
+        "work_type": parent_state.get("work_type", ""),
+        "description": parent_state.get("description", ""),
+        "workspace_root": parent_state.get("workspace_root", "."),
+        "feedback": parent_state.get("feedback", []),
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+    }
+
+
+def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.SPECIFY.value,
+        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0),
+    }
+
+
+def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
+    work_id = parent_state.get("work_id", "")
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.PLAN.value,
+        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0),
+        "spec_path": f".spine/artifacts/{work_id}/specify",
+    }
+
+
+def _tasks_state_mapper(parent_state: WorkflowState, config) -> dict:
+    work_id = parent_state.get("work_id", "")
+    work_type = parent_state.get("work_type", "")
+    has_spec = "spec" in work_type
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.TASKS.value,
+        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.TASKS.value, 0),
+        "plan_path": f".spine/artifacts/{work_id}/plan" if has_spec else None,
+        "spec_path": f".spine/artifacts/{work_id}/specify" if has_spec else None,
+    }
+
+
+def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
+    work_id = parent_state.get("work_id", "")
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.IMPLEMENT.value,
+        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0),
+        "tasks_path": f".spine/artifacts/{work_id}/tasks",
+    }
+
+
+def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
+    """Map parent WorkflowState to VerifySubgraphState."""
+    work_id = parent_state.get("work_id", "")
+    work_type = parent_state.get("work_type", "")
+    has_spec = "spec" in work_type
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.VERIFY.value,
+        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.VERIFY.value, 0),
+        "tasks_path": f".spine/artifacts/{work_id}/tasks",
+        "spec_path": f".spine/artifacts/{work_id}/specify" if has_spec else None,
+        "plan_path": f".spine/artifacts/{work_id}/plan" if has_spec else None,
+    }
+
+
+def _critic_state_mapper(reviewed_phase: str):
+    """Create a state mapper for a critic subgraph reviewing a specific phase."""
+    def mapper(parent_state: WorkflowState, config) -> dict:
+        work_id = parent_state.get("work_id", "")
+        return {
+            **_base_state_mapper(parent_state, config),
+            "phase": PhaseName.CRITIC.value,
+            "retry_count": parent_state.get("retry_count", {}).get(reviewed_phase, 0),
+            "reviewed_phase": reviewed_phase,
+            "reviewed_phase_path": f".spine/artifacts/{work_id}/{reviewed_phase}",
+        }
+    return mapper
+
+
+def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+    """Map VerifySubgraphState output back to parent WorkflowState."""
+    base = make_success_result_mapper(PhaseName.VERIFY.value)(subgraph_result, parent_state)
+    phase_status = subgraph_result.get("phase_status", "")
+    if phase_status == "needs_review":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.VERIFY.value
+        base["feedback"] = base.get("feedback", []) + [
+            {
+                "status": "needs_review",
+                "tier": "verify",
+                "reason": "Verification did not pass. See verification.md for details.",
+                "suggestions": [],
+            }
+        ]
+    elif phase_status == "error":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.VERIFY.value
+    return base
+
+
+def _implement_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+    """Map ImplementSubgraphState output back to parent WorkflowState."""
+    base = make_success_result_mapper(PhaseName.IMPLEMENT.value)(subgraph_result, parent_state)
+    phase_status = subgraph_result.get("phase_status", "")
+    if phase_status == "needs_review":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.IMPLEMENT.value
+    elif phase_status == "error":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.IMPLEMENT.value
+    return base
+
+
+def _tasks_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+    """Map TasksSubgraphState output back to parent WorkflowState."""
+    base = make_success_result_mapper(PhaseName.TASKS.value)(subgraph_result, parent_state)
+    phase_status = subgraph_result.get("phase_status", "")
+    if phase_status == "needs_review":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.TASKS.value
+    elif phase_status == "error":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.TASKS.value
+    return base
+
+
+def _specify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+    """Map SpecifySubgraphState output back to parent WorkflowState."""
+    base = make_success_result_mapper(PhaseName.SPECIFY.value)(subgraph_result, parent_state)
+    phase_status = subgraph_result.get("phase_status", "")
+    if phase_status == "needs_review":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.SPECIFY.value
+    elif phase_status == "error":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.SPECIFY.value
+    return base
+
+
+def _plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+    """Map PlanSubgraphState output back to parent WorkflowState."""
+    base = make_success_result_mapper(PhaseName.PLAN.value)(subgraph_result, parent_state)
+    phase_status = subgraph_result.get("phase_status", "")
+    if phase_status == "needs_review":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.PLAN.value
+    elif phase_status == "error":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.PLAN.value
+    return base
+
+
+def _critic_result_mapper(reviewed_phase: str):
+    """Create a result mapper for a critic subgraph reviewing a specific phase."""
+    def mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+        # Critic doesn't produce artifacts_output — it produces review results
+        base: dict[str, Any] = {
+            "current_phase": PhaseName.CRITIC.value,
+            "status": "running",
+            "prompt_request": None,
+        }
+        
+        structural_result = subgraph_result.get("structural_result", {})
+        agent_result = subgraph_result.get("agent_result", {})
+        
+        # Determine effective feedback from both tiers
+        effective_result = agent_result if agent_result else structural_result
+        if not effective_result:
+            effective_result = {
+                "status": "passed",
+                "tier": "structural",
+                "reason": "No review performed",
+                "suggestions": [],
+            }
+        
+        base["feedback"] = [effective_result]
+        
+        phase_status = subgraph_result.get("phase_status", "")
+        if phase_status == ReviewStatus.NEEDS_REVIEW.value:
+            base["status"] = "needs_review"
+            base["needs_review_phase"] = reviewed_phase
+        elif phase_status == ReviewStatus.NEEDS_REVISION.value:
+            # Router will check retry count and route accordingly
+            base["status"] = "running"
+        
+        return base
+    return mapper
 
 
 # ── Phase sequences per work type ──
@@ -75,6 +320,85 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (PhaseName.VERIFY.value, None),
     ],
 }
+
+
+def _human_review_interrupt(state: WorkflowState) -> dict:
+    """Interrupt the graph for human review between phases.
+
+    The workflow pauses here. A human (via UI or CLI) reviews the
+    current state and calls ``Command(resume={...})`` to continue.
+
+    Returns:
+        A dict with the human decision and feedback.
+    """
+    needs_review_phase = state.get("needs_review_phase", "")
+    feedback = state.get("feedback", [])
+    phase_results = state.get("phase_results", {})
+
+    last_fb = feedback[-1] if feedback else {}
+    review_info = {
+        "phase": needs_review_phase or state.get("current_phase", ""),
+        "reason": last_fb.get("reason", "No reason provided"),
+        "suggestions": last_fb.get("suggestions", []),
+        "phase_results": phase_results,
+    }
+
+    # interrupt() pauses the graph. Human response comes back via Command(resume=...)
+    human_decision = interrupt(review_info)
+
+    return {
+        "human_feedback": human_decision,
+        "needs_review_phase": None,
+    }
+
+
+def _make_human_review_router(phase_seq: list[tuple[str, str | None]]):
+    """Create a human review router that knows the phase sequence.
+
+    Returns a router function for add_conditional_edges that routes:
+    - "rework" → back to the needs_review_phase node
+    - "approve" → to the phase after needs_review_phase in the sequence
+    - "abort" → END
+    """
+
+    # Build a lookup: phase_name → index in phase_seq
+    phase_index = {}
+    for idx, (name, _) in enumerate(phase_seq):
+        phase_index[name] = idx
+
+    def router(state: WorkflowState) -> str:
+        human_feedback = state.get("human_feedback", {})
+        action = (
+            human_feedback.get("action", "abort")
+            if isinstance(human_feedback, dict)
+            else "abort"
+        )
+
+        if action == "rework":
+            needs_review = state.get("needs_review_phase")
+            if needs_review and needs_review in phase_index:
+                return needs_review
+            # Fallback: if we can't find the phase, still try rework
+            return needs_review or "abort"
+
+        if action == "approve":
+            needs_review = state.get("needs_review_phase")
+            if needs_review and needs_review in phase_index:
+                idx = phase_index[needs_review]
+                if idx + 1 < len(phase_seq):
+                    return phase_seq[idx + 1][0]
+                return END
+            # Fallback: advance from current_phase
+            current = state.get("current_phase", "")
+            if current in phase_index:
+                idx = phase_index[current]
+                if idx + 1 < len(phase_seq):
+                    return phase_seq[idx + 1][0]
+            return END
+
+        return "abort"
+
+    return router
 
 
 def _gate_node_name(source_node: str, next_node: str) -> str:
@@ -125,6 +449,7 @@ def build_workflow_graph(
     # verify can detect and report that; there is no reason for a human
     # review gate between implement and verify.
     gate_edges: dict[tuple[str, str], str] = {}  # (src, dst) → required_phase
+    _human_review_targets: dict[str, dict[str, str]] = {}  # node → {rework, approve}
     for i, (node_name, _reviewed_phase) in enumerate(phase_seq):
         if i < len(phase_seq) - 1:
             next_node_name = phase_seq[i + 1][0]
@@ -134,17 +459,89 @@ def build_workflow_graph(
     # Add all phase/critic nodes
     for node_name, reviewed_phase in phase_seq:
         if node_name.startswith(PhaseName.CRITIC.value):
-            # Critic node — use call_critic, store reviewed_phase in a closure
-            critic_def = registry.require(PhaseName.CRITIC.value)
+            # Critic node — use subgraph if enabled, else legacy
             _reviewed = reviewed_phase or "unknown"
-            graph.add_node(
-                node_name,
-                _make_critic_node(critic_def.call_fn, _reviewed),
-            )
+            if _SUBGRAPH_ENABLED.get(PhaseName.CRITIC.value, False):
+                critic_subgraph = build_critic_subgraph(_reviewed)
+                graph.add_node(
+                    node_name,
+                    make_subgraph_node(
+                        critic_subgraph,
+                        node_name,
+                        _critic_state_mapper(_reviewed),
+                        _critic_result_mapper(_reviewed),
+                        use_per_phase_checkpointer=True,
+                    ),
+                )
+            else:
+                critic_def = registry.require(PhaseName.CRITIC.value)
+                critic_fn = critic_def.call_fn or critic_def.subgraph_node_fn
+                if critic_fn is None:
+                    raise ValueError(
+                        f"Critic phase '{node_name}' has no call_fn or subgraph_node_fn"
+                    )
+                graph.add_node(
+                    node_name,
+                    _make_critic_node(critic_fn, _reviewed),
+                )
+        elif _SUBGRAPH_ENABLED.get(node_name, False):
+            # Subgraph node (new style) — look up builder, mapper, and result mapper
+            # from the module-level registry and lookup tables.
+            _STATE_MAPPERS = {
+                PhaseName.VERIFY.value: _verify_state_mapper,
+                PhaseName.IMPLEMENT.value: _implement_state_mapper,
+                PhaseName.TASKS.value: _tasks_state_mapper,
+                PhaseName.SPECIFY.value: _specify_state_mapper,
+                PhaseName.PLAN.value: _plan_state_mapper,
+            }
+            _RESULT_MAPPERS = {
+                PhaseName.VERIFY.value: _verify_result_mapper,
+                PhaseName.IMPLEMENT.value: _implement_result_mapper,
+                PhaseName.TASKS.value: _tasks_result_mapper,
+                PhaseName.SPECIFY.value: _specify_result_mapper,
+                PhaseName.PLAN.value: _plan_result_mapper,
+            }
+
+            builder_fn = _SUBGRAPH_BUILDER_REGISTRY.get(node_name)
+            if builder_fn is not None:
+                subgraph = builder_fn()
+                state_mapper = _STATE_MAPPERS[node_name]
+                result_mapper = _RESULT_MAPPERS[node_name]
+                graph.add_node(
+                    node_name,
+                    make_subgraph_node(
+                        subgraph,
+                        node_name,
+                        state_mapper,
+                        result_mapper,
+                        use_per_phase_checkpointer=True,
+                    ),
+                )
+            else:
+                # Fallback to legacy for phases not yet migrated
+                phase_def = registry.require(node_name)
+                if phase_def.subgraph_node_fn:
+                    graph.add_node(node_name, phase_def.subgraph_node_fn)
+                elif phase_def.call_fn:
+                    graph.add_node(node_name, phase_def.call_fn)
+                else:
+                    raise ValueError(
+                        f"Phase '{node_name}' has no call_fn or subgraph_node_fn"
+                    )
         else:
-            # Regular phase node
+            # Legacy phase node
             phase_def = registry.require(node_name)
+            if phase_def.call_fn is None:
+                raise ValueError(f"Phase '{node_name}' has no call_fn (legacy mode)")
             graph.add_node(node_name, phase_def.call_fn)
+
+    # Add human review interrupt node (once, not per gate)
+    graph.add_node("human_review", _human_review_interrupt)
+    graph.add_conditional_edges(
+        "human_review",
+        _make_human_review_router(phase_seq),
+        {END: END},
+    )
 
     # Add artifact gate nodes
     for (src, dst), required_phase in gate_edges.items():
@@ -158,53 +555,53 @@ def build_workflow_graph(
     graph.add_edge(START, phase_seq[0][0])
 
     for i, (node_name, reviewed_phase) in enumerate(phase_seq):
-        is_last = i == len(phase_seq) - 1
-        next_node = phase_seq[i + 1][0] if not is_last else None
+            is_last = i == len(phase_seq) - 1
+            next_node = phase_seq[i + 1][0] if not is_last else None
 
-        # Check if there's a gate between this node and the next
-        edge_key = (node_name, next_node) if next_node else None
-        has_gate = edge_key in gate_edges if edge_key else False
+            # Check if there's a gate between this node and the next
+            edge_key = (node_name, next_node) if next_node else None
+            has_gate = edge_key in gate_edges if edge_key else False
 
-        if node_name.startswith(PhaseName.CRITIC.value):
-            # Critic node → conditional edge
-            pre_critic = phase_seq[i - 1][0] if i > 0 else phase_seq[0][0]
+            if node_name.startswith(PhaseName.CRITIC.value):
+                # Critic node → conditional edge
+                pre_critic = phase_seq[i - 1][0] if i > 0 else phase_seq[0][0]
 
-            # Determine where "passed" routes to
-            if has_gate and next_node:
+                # Determine where "passed" routes to
+                if has_gate and next_node:
+                    gate_name = _gate_node_name(node_name, next_node)
+                    critic_proceed_target: str = gate_name
+                elif not is_last and next_node:
+                    critic_proceed_target = next_node
+                else:
+                    critic_proceed_target = END
+
+                graph.add_conditional_edges(
+                    node_name,
+                    critic_router,
+                    {
+                        "passed": critic_proceed_target,
+                        "needs_revision": pre_critic,  # rework loop
+                        "needs_review": "human_review",  # interrupt for human
+                    },
+                )
+            elif has_gate and next_node:
+                # Route to the gate node, which then conditionally routes
                 gate_name = _gate_node_name(node_name, next_node)
-                critic_proceed_target: str = gate_name
-            elif not is_last and next_node:
-                critic_proceed_target = next_node
+                graph.add_edge(node_name, gate_name)
+
+                # Gate node → conditional edge (proceed or human_review)
+                graph.add_conditional_edges(
+                    gate_name,
+                    artifact_gate_router,
+                    {
+                        "proceed": next_node,
+                        "needs_review": "human_review",  # interrupt for human
+                    },
+                )
+            elif next_node is not None:
+                graph.add_edge(node_name, next_node)
             else:
-                critic_proceed_target = END
-
-            graph.add_conditional_edges(
-                node_name,
-                critic_router,
-                {
-                    "passed": critic_proceed_target,
-                    "needs_revision": pre_critic,  # rework loop
-                    "needs_review": END,  # stop for human
-                },
-            )
-        elif has_gate and next_node:
-            # Route to the gate node, which then conditionally routes
-            gate_name = _gate_node_name(node_name, next_node)
-            graph.add_edge(node_name, gate_name)
-
-            # Gate node → conditional edge (proceed or END)
-            graph.add_conditional_edges(
-                gate_name,
-                artifact_gate_router,
-                {
-                    "proceed": next_node,
-                    "needs_review": END,
-                },
-            )
-        elif next_node is not None:
-            graph.add_edge(node_name, next_node)
-        else:
-            graph.add_edge(node_name, END)
+                graph.add_edge(node_name, END)
 
     # Compile with optional checkpointer
     compile_kwargs: dict[str, Any] = {}
