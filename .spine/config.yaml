@@ -14,11 +14,11 @@ providers:
     enabled: true
   - name: laguna-m1
     type: deepagents-model
-    model: openrouter:poolside/laguna-m.1:free
+    model: openrouter:qwen/qwen3.6-plus
     enabled: true
   - name: laguna-xs2
     type: deepagents-model
-    model: openrouter:poolside/laguna-xs.2:free
+    model: openrouter:qwen/qwen3-coder-next
     enabled: true
   - name: local
     type: deepagents-model
@@ -41,8 +41,8 @@ providers:
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: local
+      provider: laguna-xs2
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: local              # short timeout for verify
+      provider: laguna-m1              # short timeout for verify
