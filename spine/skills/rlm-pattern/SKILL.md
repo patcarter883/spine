@@ -39,13 +39,13 @@ Then read only the slice files you need — in one eval call.
 ## Pattern 2: Parallel subagent dispatch (IMPLEMENT/VERIFY)
 
 ```js
-const subagent = runtime.context?.active_subagent || 'slice-implementer';
+const subagent = globalThis.context?.phase === 'verify' ? 'slice-verifier' : 'slice-implementer';
 const slices = ['slice-queue-pending-reorder', 'slice-work-detail-reorder', 'slice-tests'];
 
 // Wave sort: all slices have no dependencies → one wave
 const results = await Promise.allSettled(
   slices.map(name => tools.task({
-    description: `Implement the slice defined in .spine/artifacts/${runtime.context?.work_id}/tasks/${name}.md. Read the slice file and codebase-map.md first, then implement the changes described.`,
+    description: `Implement the slice defined in .spine/artifacts/${globalThis.context?.work_id}/tasks/${name}.md. Read the slice file and codebase-map.md first, then implement the changes described.`,
     subagent_type: subagent,
   }))
 );
@@ -74,10 +74,40 @@ const summaries = reports.map(r => r.substring(0, 200));
 console.log(summaries.join('\\n\\n'));
 ```
 
+## Filesystem tool access
+
+The PTC allowlist includes filesystem tools for codebase exploration directly from eval:
+
+- **`read_file`** — read file contents
+- **`grep`** — search file contents (regex)
+- **`glob`** — find files by pattern
+- **`ls`** — list directory contents
+- **`write_file`** — write files to disk
+- **`edit_file`** — make targeted edits to files
+
+Use these to inspect and transform files without leaving the interpreter:
+
+```js
+// Batch-read multiple files from eval
+const config = await tools.read_file({path: 'pyproject.toml'});
+const readme = await tools.read_file({path: 'README.md'});
+console.log('Config length:', config.length);
+
+// Search for patterns across the codebase
+const matches = await tools.grep({pattern: 'PhaseName', path: 'spine/'});
+console.log('PhaseName occurrences:', matches);
+
+// Find files by glob pattern
+const testFiles = await tools.glob({pattern: 'tests/**/*.py'});
+console.log('Test files:', testFiles);
+```
+
+These complement the `task` tool — use filesystem tools for direct inspection and `task` for subagent delegation.
+
 ## Critical rules
 
 1. **Never dump raw data into conversation.** Process in eval, return synthesis.
-2. **Use runtime.context.** Access `runtime.context.work_id`, `runtime.context.active_subagent` etc.
+2. **Use globalThis.context.** Access `globalThis.context.work_id`, `globalThis.context.phase` etc. — seeded by the phase prompt on the first turn.
 3. **Subagent descriptions must be self-contained.** Include file paths and reference codebase-map.md, not "read the slice I mentioned earlier."
 4. **Keep eval output under 4000 chars.** The runtime truncates at max_result_chars.
-5. **Variables persist across turns.** Store intermediate results in `window.results = ...`.
+5. **Variables persist across turns.** Store intermediate results in `globalThis.results = ...`.

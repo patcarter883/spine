@@ -86,8 +86,7 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
             "",
             f"## Artifact Output Directory\n"
             f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
-            f"This is relative to your workspace root (`{workspace_root}`).\n"
-            f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
+            f"Use this relative path with `write_file` — do NOT construct absolute paths.\n",
         ]
         if has_spec:
             prompt_lines.extend([

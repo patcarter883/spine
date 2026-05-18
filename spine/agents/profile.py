@@ -9,16 +9,22 @@ minimum followup") actively fights SPINE's workflow model.
 This module:
 
 1.  Defines ``SPINE_BASE_PROMPT`` — a replacement base prompt that preserves
-    the useful behavioural guidance from the DA default (act-don't-talk,
-    iterate, stop-and-analyze) while reframing the agent as a phase executor.
-2.  Registers ``HarnessProfile`` instances for the providers SPINE uses so that
-    ``create_deep_agent`` automatically picks up our base prompt via the
-    ``base_system_prompt`` field (the ``CUSTOM`` slot in the prompt assembly
-    order).
+the useful behavioural guidance from the DA default (act-don't-talk,
+iterate, stop-and-analyze) while reframing the agent as a phase executor.
+2.  Registers ``HarnessProfile`` instances for the providers SPINE uses so
+that the agent factory can resolve the profile and apply the
+``base_system_prompt`` field (the ``CUSTOM`` slot in the prompt assembly
+order).
 
-Prompt assembly order (per DA docs)::
+Prompt assembly order (in ``build_phase_agent``)::
 
-    USER (phase system_prompt) → CUSTOM (SPINE_BASE_PROMPT) → SUFFIX (none)
+    USER (phase system_prompt) → CUSTOM (SPINE_BASE_PROMPT from profile) → SUFFIX (none)
+
+Note: The factory now uses ``create_agent`` directly instead of
+``create_deep_agent``, so the HarnessProfile is resolved manually
+via ``_resolve_profile()`` rather than automatically by DA.  The profile
+still serves its purpose: it holds ``base_system_prompt`` and
+``tool_description_overrides`` that the factory reads.
 
 RLM/interpreter guidance has been moved to the ``rlm-pattern`` skill for
 progressive disclosure — it's loaded only when the interpreter is available,
@@ -71,7 +77,7 @@ page back specific details. Do NOT re-read source files just because they \
 were evicted — cache them in eval instead.
 - **Never re-read a file in the same phase.** If context editing evicts a \
 prior read result, recover from eval: \
-`window.files = window.files || {}; window.files['path'] = content;`. \
+`globalThis.files = globalThis.files || {}; globalThis.files['path'] = content;`. \
 Retrieve from eval instead of calling read_file again.
 
 ## Workflow Context
@@ -110,8 +116,9 @@ def ensure_spine_profiles() -> None:
     """Register SPINE HarnessProfiles for all supported providers.
 
     Safe to call multiple times — subsequent calls are no-ops after the
-    first registration.  Must be called before any ``create_deep_agent()``
-    invocation (typically at package import time or CLI startup).
+    first registration.  Must be called before any agent construction
+    (typically at package import time or CLI startup) so that
+    ``_resolve_profile()`` in the factory can find the registered profile.
     """
     global _REGISTERED
     if _REGISTERED:

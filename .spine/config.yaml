@@ -43,6 +43,6 @@ providers:
     implement/subagents/slice-implementer:
       provider: local
 
-    # Verification → cheap local model with custom endpoint
+    # Verification → local vLLM model with custom endpoint
     verify:
-      model: local                 # short timeout for verify
+      provider: local              # short timeout for verify

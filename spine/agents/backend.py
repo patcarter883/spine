@@ -32,12 +32,90 @@ MEMORY_PATH = "/memories/"
 _store: InMemoryStore | None = None
 
 
-def _get_store() -> InMemoryStore:
-    """Get or create the singleton InMemoryStore for cross-work memory."""
+class _NormalizingLocalShellBackend(LocalShellBackend):
+    """LocalShellBackend that strips accidental absolute paths before resolution.
+
+    Under virtual_mode=True, paths starting with ``/`` are treated as
+    virtual paths relative to ``root_dir``. If the model constructs a
+    full absolute path like ``/home/user/project/.spine/...``, it gets
+    double-nested (``root_dir + /home/user/project/.spine/...``).
+
+    This subclass detects when a path starts with our own ``root_dir``
+    and strips the prefix before delegating to the parent ``_resolve_path``.
+    """
+
+    def _resolve_path(self, key: str) -> Path:
+        if self.virtual_mode and key.startswith(str(self.cwd)):
+            key = key[len(str(self.cwd)):].lstrip("/")
+        return super()._resolve_path(key)
+
+
+def _seed_store(store: InMemoryStore, root: Path) -> None:
+    """Pre-seed the InMemoryStore with project knowledge.
+
+    Reads ``AGENTS.md`` from the project root (if it exists) and stores it
+    at namespace ``/memories/``, key ``conventions`` so agents don't need
+    to read_file it every time.
+
+    Args:
+        store: The singleton InMemoryStore to seed.
+        root: Absolute path to the project workspace root.
+    """
+    # ── Seed AGENTS.md as conventions ────────────────────────────
+    agents_md = root / "AGENTS.md"
+    if agents_md.is_file():
+        content = agents_md.read_text(encoding="utf-8")
+        store.put(
+            ("memories",),  # namespace tuple
+            "conventions",  # key
+            {"content": content},  # value dict
+        )
+        logger.info(
+            "Seeded memory store with AGENTS.md (%d chars) as 'conventions'",
+            len(content),
+        )
+    else:
+        logger.debug("No AGENTS.md found at %s — skipping conventions seed", agents_md)
+
+    # ── Seed project structure summary if available ───────────────
+    structure_files = [
+        root / ".spine" / "codebase-map.md",
+        root / ".spine" / "structure.md",
+    ]
+    for sf in structure_files:
+        if sf.is_file():
+            content = sf.read_text(encoding="utf-8")
+            key = sf.stem  # e.g. "codebase-map" or "structure"
+            store.put(
+                ("memories",),
+                key,
+                {"content": content},
+            )
+            logger.info(
+                "Seeded memory store with %s (%d chars) as %r",
+                sf.name,
+                len(content),
+                key,
+            )
+
+
+def _get_store(root: Path | None = None) -> InMemoryStore:
+    """Get or create the singleton InMemoryStore for cross-work memory.
+
+    On first creation, seeds the store with project knowledge from AGENTS.md
+    and any available structure summaries under ``.spine/``.
+
+    Args:
+        root: Optional project root Path. If provided on the first call,
+            the store will be seeded with project knowledge. Subsequent
+            calls with different roots will not re-seed.
+    """
     global _store
     if _store is None:
         _store = InMemoryStore()
         logger.debug("Created InMemoryStore for cross-work memory")
+        if root is not None:
+            _seed_store(_store, root)
     return _store
 
 
@@ -61,13 +139,13 @@ def build_backend(workspace_root: str) -> LocalShellBackend | object:
     try:
         from deepagents.backends import CompositeBackend, StoreBackend
 
-        local_backend = LocalShellBackend(
+        local_backend = _NormalizingLocalShellBackend(
             root_dir=str(root),
             virtual_mode=True,
             timeout=120,
         )
 
-        store = _get_store()
+        store = _get_store(root)
         memory_backend = StoreBackend(store=store)
 
         composite = CompositeBackend(
@@ -84,7 +162,7 @@ def build_backend(workspace_root: str) -> LocalShellBackend | object:
             "CompositeBackend not available (requires deepagents >= 0.6.0), "
             "falling back to LocalShellBackend without cross-work memory"
         )
-        return LocalShellBackend(
+        return _NormalizingLocalShellBackend(
             root_dir=str(root),
             virtual_mode=True,
             timeout=120,

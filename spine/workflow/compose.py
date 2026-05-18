@@ -483,7 +483,7 @@ def build_workflow_graph(
             # Critic node — use subgraph if enabled, else legacy
             _reviewed = reviewed_phase or "unknown"
             if _SUBGRAPH_ENABLED.get(PhaseName.CRITIC.value, False):
-                critic_subgraph = build_critic_subgraph(_reviewed)
+                critic_subgraph = build_critic_subgraph(_reviewed).compile()
                 graph.add_node(
                     node_name,
                     make_subgraph_node(
@@ -525,7 +525,7 @@ def build_workflow_graph(
 
             builder_fn = _SUBGRAPH_BUILDER_REGISTRY.get(node_name)
             if builder_fn is not None:
-                subgraph = builder_fn()
+                subgraph = builder_fn().compile()
                 state_mapper = _STATE_MAPPERS[node_name]
                 result_mapper = _RESULT_MAPPERS[node_name]
                 graph.add_node(

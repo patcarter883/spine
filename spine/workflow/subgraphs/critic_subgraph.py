@@ -94,4 +94,4 @@ def build_critic_subgraph(reviewed_phase: str) -> Any:
     )
     builder.add_edge("agent_check", END)
 
-    return builder.compile()
+    return builder

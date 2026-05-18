@@ -17,13 +17,13 @@ class TestVerifySubgraphCompilation:
     def test_verify_subgraph_compiles(self):
         from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
 
-        graph = build_verify_subgraph()
+        graph = build_verify_subgraph().compile()
         assert graph is not None
 
     def test_verify_subgraph_has_correct_nodes(self):
         from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
 
-        graph = build_verify_subgraph()
+        graph = build_verify_subgraph().compile()
         nodes = set(graph.get_graph().nodes.keys())
         assert "run_agent" in nodes
         assert "save_artifacts" in nodes
@@ -31,7 +31,7 @@ class TestVerifySubgraphCompilation:
     def test_verify_subgraph_edges(self):
         from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
 
-        graph = build_verify_subgraph()
+        graph = build_verify_subgraph().compile()
         mermaid = graph.get_graph().draw_mermaid()
         assert "run_agent" in mermaid
         assert "save_artifacts" in mermaid

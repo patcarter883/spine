@@ -31,14 +31,13 @@ def build_plan_agent(
     Returns:
         A compiled Deep Agent ready for invocation.
     """
-    workspace_root = state.get("workspace_root", ".")
-
     work_id = state.get("work_id", "")
 
     system_prompt = (
         "You are a technical architect. Given a specification, "
         "create a detailed technical plan document.\n\n"
-        f"Your workspace root is: {workspace_root}\n\n"
+        "Your filesystem is rooted at the project workspace. "
+        "Use relative paths (e.g. `src/main.py`, `.spine/artifacts/...`).\n\n"
         "The plan should include:\n"
         "1. Architecture overview (components, data flow, interfaces)\n"
         "2. Technology choices and rationale\n"
@@ -51,6 +50,10 @@ def build_plan_agent(
         "to implement directly from this document.\n\n"
         "Prior artifacts from earlier phases are available on disk — "
         "use `read_file` and `grep` to inspect them when needed.\n\n"
+        "When the interpreter is available, seed it with context on your first turn:\n"
+        "```python\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "plan", "artifact_dir": ".spine/artifacts/{work_id}/plan"}};\\n'
+        + "```\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.PLAN.value, expected_files=["plan.md"]
         )
@@ -64,6 +67,7 @@ def build_plan_agent(
         config=config,
         phase=PhaseName.PLAN,
         system_prompt=system_prompt,
+        add_summarization=True,  # PLAN can accumulate many read_file results
     )
 
     return agent

@@ -32,15 +32,28 @@ The interpreter is the **orchestration brain**, not the **execution hands**.
 Filesystem writes, shell commands, and test runs still go through the backend
 (``LocalShellBackend``) and are language-agnostic.
 
+QuickJS environment
+-------------------
+The eval tool runs inside **QuickJS**, a server-side JS sandbox. Key globals:
+
+- ``globalThis`` — the global object (NOT ``window`` — that's browser-only)
+- ``globalThis.tools`` — PTC-accessible DA tools (based on allowlist)
+- ``globalThis.console`` — captured console output
+- ``globalThis.context`` — seeded by SPINE phase prompts with work_id, phase,
+  artifact_dir
+
+Using ``window.*`` in eval code causes ``ReferenceError: window is not defined``.
+All prompts and skills must use ``globalThis.*`` instead.
+
 PTC allowlists per phase
 ------------------------
 Each SPINE phase gets a different set of tools exposed in the interpreter
 via the ``ptc`` (programmatic tool calling) allowlist:
 
-- SPECIFY: ``task`` — spawn research subagents for spec research.
-- TASKS:   ``task`` — spawn subagents to decompose plan into feature slices.
-- IMPLEMENT: ``task`` — spawn subagents per slice, run in parallel.
-- VERIFY:  ``task`` — spawn subagents to verify each slice independently.
+- SPECIFY: ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
+- TASKS:   ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
+- IMPLEMENT: ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
+- VERIFY:  ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
 - CRITIC:  (none) — the critic reviews output, it doesn't orchestrate.
 
 When using PTC to call the ``task`` tool, use the named subagent for the
@@ -63,14 +76,15 @@ logger = logging.getLogger(__name__)
 
 # ── PTC allowlists per phase ────────────────────────────────────────────
 # Maps SPINE phase names to the list of DA tools that the interpreter
-# is allowed to call programmatically. Only "task" is exposed — it's the
-# subagent delegation tool, which is the key primitive for RLM decomposition.
+# is allowed to call programmatically. Each phase exposes "task" for
+# subagent delegation plus filesystem tools (read_file, grep, glob, ls,
+# write_file, edit_file) for codebase exploration and artifact I/O.
 
 _PTC_ALLOWLISTS: dict[str, list[str | Any]] = {
-    PhaseName.SPECIFY.value: ["task"],
-    PhaseName.TASKS.value: ["task"],
-    PhaseName.IMPLEMENT.value: ["task"],
-    PhaseName.VERIFY.value: ["task"],
+    PhaseName.SPECIFY.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.TASKS.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.IMPLEMENT.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.VERIFY.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
     # CRITIC and PLAN don't need PTC — they review/plan, not orchestrate.
 }
 

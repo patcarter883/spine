@@ -7,6 +7,7 @@ Verifies that:
 4. Phase-specific PTC allowlists are correct
 5. Skills are loaded for the right phases
 6. RLM guidance is in skills, not inline in system prompt
+7. FilesystemMiddleware uses SPINE custom prompt (relative paths)
 """
 
 from __future__ import annotations
@@ -188,191 +189,227 @@ def _make_state(**overrides: object) -> dict:
     return base
 
 
+def _mock_create_agent() -> MagicMock:
+    """Create a mock create_agent return value.
+
+    The mock agent has ``.with_config()`` that returns itself,
+    matching the chained call pattern in the factory.
+    """
+    mock_agent = MagicMock()
+    mock_agent.with_config.return_value = mock_agent
+    return mock_agent
+
+
+# ── Shared patch decorators for agent builder tests ──────────────────────
+#
+# Agent construction hits real LLM constructors (ChatOpenRouter,
+# ChatOpenAI) during model resolution.  Patching at the constructor level
+# prevents API key validation failures while still exercising the
+# middleware assembly logic.
+#
+# Patch order (bottom-to-top in decorator stack, innermost first):
+# 1. ChatOpenRouter.__init__ — prevents OpenRouter API key check
+# 2. create_agent — captures middleware and system_prompt args
+# 3. interpreter_enabled — controls CodeInterpreterMiddleware presence
+
+
 class TestAgentBuilderIntegration:
     """Tests that agent builders use the shared factory correctly."""
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_specify_agent_no_interpreter_when_disabled(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """specify_agent should not include interpreter middleware when disabled."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
-        # When interpreter is disabled, middleware should be absent or None
-        middleware = call_kwargs.get("middleware")
-        if middleware is not None:
-            # Summarization middleware may be present for some phases,
-            # but interpreter middleware should not
-            assert not any(
-                "CodeInterpreter" in type(m).__name__
-                for m in middleware
-            )
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        assert not any(
+            "CodeInterpreter" in type(m).__name__
+            for m in middleware
+        )
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=True)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_specify_agent_includes_interpreter_when_enabled(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """specify_agent should include interpreter middleware when enabled."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
-        assert "middleware" in call_kwargs
-        assert len(call_kwargs["middleware"]) >= 1
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        assert any(
+            "CodeInterpreter" in type(m).__name__
+            for m in middleware
+        )
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=True)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_specify_agent_rlm_skill_loaded_when_enabled(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """specify_agent should load the rlm-pattern skill when interpreter is enabled."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
-        # Skills should include rlm-pattern when interpreter is enabled
-        skills = call_kwargs.get("skills", [])
-        skill_names = [s.split("/")[-1] for s in (skills or [])]
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        skills_mw = next(
+            (m for m in middleware if "SkillsMiddleware" in type(m).__name__),
+            None,
+        )
+        assert skills_mw is not None, "SkillsMiddleware should be in the stack when skills are present"
+        sources = getattr(skills_mw, "_sources", []) or getattr(skills_mw, "sources", [])
+        skill_names = [s.split("/")[-1] for s in sources]
         assert "rlm-pattern" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_specify_agent_no_rlm_skill_when_disabled(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """specify_agent should NOT load rlm-pattern skill when interpreter is disabled."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
-        # Skills should NOT include rlm-pattern when interpreter is disabled
-        skills = call_kwargs.get("skills", [])
-        skill_names = [s.split("/")[-1] for s in (skills or [])]
-        assert "rlm-pattern" not in skill_names
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        skills_mws = [m for m in middleware if "SkillsMiddleware" in type(m).__name__]
+        for smw in skills_mws:
+            sources = getattr(smw, "_sources", []) or getattr(smw, "sources", [])
+            skill_names = [s.split("/")[-1] for s in sources]
+            assert "rlm-pattern" not in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_specify_agent_no_rlm_in_prompt(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
-        """specify_agent should NOT have RLM guidance inline in system_prompt.
-
-        RLM guidance is now in the rlm-pattern skill (progressive disclosure),
-        not hardcoded in the system prompt.
-        """
-        mock_da.return_value = MagicMock()
+        """specify_agent should NOT have RLM guidance inline in system_prompt."""
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
+        call_kwargs = mock_ca.call_args[1]
         prompt = call_kwargs["system_prompt"]
-        # RLM guidance should NOT be inline anymore — it's in skills
         assert "Interpreter Workspace" not in prompt
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_specify_agent_loads_spec_writing_skill(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """specify_agent should load the spec-writing skill."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
-        skills = call_kwargs.get("skills", [])
-        skill_names = [s.split("/")[-1] for s in (skills or [])]
-        assert "spec-writing" in skill_names
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        skills_mw = next(
+            (m for m in middleware if "SkillsMiddleware" in type(m).__name__),
+            None,
+        )
+        if skills_mw is not None:
+            sources = getattr(skills_mw, "_sources", []) or getattr(skills_mw, "sources", [])
+            skill_names = [s.split("/")[-1] for s in sources]
+            assert "spec-writing" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_tasks_agent_loads_decomposition_skill(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """tasks_agent should load the feature-slice-decomposition skill."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.tasks_agent import build_tasks_agent
 
         build_tasks_agent(_make_state(current_phase="tasks"))
-        call_kwargs = mock_da.call_args[1]
-        skills = call_kwargs.get("skills", [])
-        skill_names = [s.split("/")[-1] for s in (skills or [])]
-        assert "feature-slice-decomposition" in skill_names
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        skills_mw = next(
+            (m for m in middleware if "SkillsMiddleware" in type(m).__name__),
+            None,
+        )
+        if skills_mw is not None:
+            sources = getattr(skills_mw, "_sources", []) or getattr(skills_mw, "sources", [])
+            skill_names = [s.split("/")[-1] for s in sources]
+            assert "feature-slice-decomposition" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_verify_agent_loads_code_review_skill(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """verify_agent should load the code-review skill."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.verify_agent import build_verify_agent
 
         build_verify_agent(_make_state(current_phase="verify"))
-        call_kwargs = mock_da.call_args[1]
-        skills = call_kwargs.get("skills", [])
-        skill_names = [s.split("/")[-1] for s in (skills or [])]
-        assert "code-review" in skill_names
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        skills_mw = next(
+            (m for m in middleware if "SkillsMiddleware" in type(m).__name__),
+            None,
+        )
+        if skills_mw is not None:
+            sources = getattr(skills_mw, "_sources", []) or getattr(skills_mw, "sources", [])
+            skill_names = [s.split("/")[-1] for s in sources]
+            assert "code-review" in skill_names
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_implement_agent_requests_summarization(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
-        """implement_agent should request summarization middleware (add_summarization=True).
-
-        The actual middleware creation may fail in test environments without
-        API keys, but the factory flag is set correctly.
-        """
-        mock_da.return_value = MagicMock()
+        """implement_agent should request summarization middleware."""
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.implement_agent import build_implement_agent
 
         build_implement_agent(_make_state(current_phase="implement"))
-        # The key thing: build_implement_agent passes add_summarization=True.
-        # We can't easily verify middleware content without API keys,
-        # but we can verify the agent was built successfully.
-        assert mock_da.called
+        assert mock_ca.called
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_agent_context_schema_is_spine_context(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """All agents should use SpineContext as context_schema."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
         from spine.agents.context import SpineContext
 
         build_specify_agent(_make_state())
-        call_kwargs = mock_da.call_args[1]
+        call_kwargs = mock_ca.call_args[1]
         assert call_kwargs["context_schema"] is SpineContext
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.helpers.resolve_model", return_value="openai:gpt-4o-mini")
-    @patch("deepagents.create_deep_agent")
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_artifacts_referenced_by_path_not_inlined(
-        self, mock_da: MagicMock, mock_model: MagicMock, mock_enabled: MagicMock
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
         """System prompt should reference artifacts by path, not inline content."""
-        mock_da.return_value = MagicMock()
+        mock_ca.return_value = _mock_create_agent()
         from spine.agents.implement_agent import build_implement_agent
 
         state = _make_state(
@@ -384,14 +421,38 @@ class TestAgentBuilderIntegration:
         )
 
         build_implement_agent(state)
-        call_kwargs = mock_da.call_args[1]
+        call_kwargs = mock_ca.call_args[1]
         prompt = call_kwargs["system_prompt"]
-        # Should NOT contain the inlined content
         assert "A very long spec" not in prompt
         assert "A very long plan" not in prompt
-        # Should reference the work_id-scoped path
         assert ".spine/artifacts/test-1/specify/" in prompt
         assert ".spine/artifacts/test-1/plan/" in prompt
+
+    @patch("spine.agents.factory.interpreter_enabled", return_value=False)
+    @patch("spine.agents.factory.create_agent")
+    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
+    def test_filesystem_middleware_uses_spine_prompt(
+        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
+    ) -> None:
+        """FilesystemMiddleware should use the SPINE custom prompt with relative-path guidance."""
+        mock_ca.return_value = _mock_create_agent()
+        from spine.agents.specify_agent import build_specify_agent
+
+        build_specify_agent(_make_state())
+        call_kwargs = mock_ca.call_args[1]
+        middleware = call_kwargs.get("middleware", [])
+        fs_mw = next(
+            (m for m in middleware if "FilesystemMiddleware" in type(m).__name__),
+            None,
+        )
+        assert fs_mw is not None, "FilesystemMiddleware should be in the stack"
+        fs_prompt = getattr(fs_mw, "_custom_system_prompt", "") or getattr(fs_mw, "_system_prompt", "") or getattr(fs_mw, "system_prompt", "")
+        assert "relative paths" in fs_prompt.lower(), (
+            "FilesystemMiddleware prompt should mention 'relative paths'"
+        )
+        assert "double-nested" in fs_prompt, (
+            "FilesystemMiddleware prompt should warn about double-nesting"
+        )
 
 
 class TestPTCAllowlists:

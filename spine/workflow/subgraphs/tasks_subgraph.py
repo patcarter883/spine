@@ -248,4 +248,4 @@ def build_tasks_subgraph() -> Any:
     builder.add_edge(START, "run_agent")
     builder.add_edge("run_agent", "save_artifacts")
     builder.add_edge("save_artifacts", END)
-    return builder.compile()
+    return builder

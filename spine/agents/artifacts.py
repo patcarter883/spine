@@ -273,11 +273,11 @@ def build_artifact_prompt(
     )
     # RLM guidance: load artifact inventory into interpreter once,
     # not into every turn's system prompt. Later eval calls can reference
-    # window.artifacts for paths.
+    # globalThis.artifacts for paths.
     lines.append(
         "**RLM tip:** At the start of this phase, run one `eval` call to "
         "load the artifact paths into interpreter state (e.g. "
-        "`window.artifactPaths = {...}`). Refer to those variables in "
+        "`globalThis.artifactPaths = {...}`). Refer to those variables in "
         "subsequent eval calls instead of repeating paths in conversation."
     )
 

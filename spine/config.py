@@ -222,12 +222,14 @@ class SpineConfig:
         ``providers.phases`` section of ``.spine/config.yaml``.  Resolution
         order:
 
-        1. ``providers.phases.<phase>.model`` (e.g. ``implement``)
-        2. ``providers.phases.<phase/subagents/name>.model``
-           (e.g. ``implement/subagents/slice-implementer``)
-        3. First enabled LLM provider's ``model`` field
-        4. ``SPINE_MODEL`` env var
-        5. ``ValueError`` if none of the above are set
+        1. ``providers.phases.<phase>.model`` (explicit model string)
+        2. ``providers.phases.<phase>.provider`` → look up the named
+           provider in ``providers.llm[]`` and return its ``model``
+        3. ``providers.phases.<phase/subagents/name>.model`` or
+           ``.provider`` (e.g. ``implement/subagents/slice-implementer``)
+        4. First enabled LLM provider's ``model`` field
+        5. ``SPINE_MODEL`` env var
+        6. ``ValueError`` if none of the above are set
 
         The path-style key (``phase/subagents/name``) is checked **before**
         the bare phase key so that subagent overrides take priority over the
@@ -247,17 +249,22 @@ class SpineConfig:
         # Check phase-specific overrides first (more specific key wins)
         if phase:
             phases = self.providers.get("phases", {})
-            # Exact key first (e.g. "implement/subagents/slice-implementer")
-            phase_cfg = phases.get(phase, {})
-            if isinstance(phase_cfg, dict) and phase_cfg.get("model"):
-                return phase_cfg["model"]
-            # Fall back to parent phase key (e.g. "implement" from
-            # "implement/subagents/slice-implementer")
-            parent_phase = phase.split("/")[0]
-            if parent_phase != phase:
-                parent_cfg = phases.get(parent_phase, {})
-                if isinstance(parent_cfg, dict) and parent_cfg.get("model"):
-                    return parent_cfg["model"]
+            # Check both exact key and parent phase key, in that order
+            for key in (phase, phase.split("/")[0] if "/" in phase else None):
+                if key is None:
+                    continue
+                phase_cfg = phases.get(key, {})
+                if not isinstance(phase_cfg, dict):
+                    continue
+                # 1. Explicit model string on the phase config
+                if phase_cfg.get("model"):
+                    return phase_cfg["model"]
+                # 2. Provider reference — look up the named provider
+                provider_ref = phase_cfg.get("provider")
+                if provider_ref:
+                    named = self._lookup_provider_by_name(provider_ref)
+                    if named and named.get("model"):
+                        return named["model"]
 
         # Default provider resolution
         provider = self.resolve_active_provider()

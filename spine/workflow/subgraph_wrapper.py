@@ -196,7 +196,10 @@ def make_subgraph_node(
     Args:
         subgraph: Compiled StateGraph for this phase, or a callable
             that returns one when invoked with a checkpointer (used by
-            builders that need per-phase isolation).
+            builders that need per-phase isolation). NOTE: when using
+            use_per_phase_checkpointer=True, the builder from the registry
+            must return an uncompiled StateGraph so it can be recompiled
+            with a per-phase checkpointer.
         phase_name: Phase enum value (e.g. "verify").
         state_mapper: Function (parent_state, config) → subgraph_input.
         result_mapper: Function (subgraph_output, parent_state) → parent_state_update.

@@ -73,7 +73,6 @@ def build_tasks_agent(
     Returns:
         A compiled Deep Agent ready for invocation.
     """
-    workspace_root = state.get("workspace_root", ".")
     work_id = state.get("work_id", "")
     work_type = state.get("work_type", "")
     is_quick = "quick" in work_type
@@ -83,7 +82,8 @@ def build_tasks_agent(
     system_prompt = (
         "You are a task decomposition specialist. Given a work description, "
         "break it into smaller, executable feature slices.\n\n"
-        f"Your workspace root is: {workspace_root}\n\n"
+        "Your filesystem is rooted at the project workspace. "
+        "Use relative paths (e.g. `src/main.py`, `.spine/artifacts/...`).\n\n"
         "## Workflow (follow this order)\n\n"
     )
 
@@ -134,6 +134,10 @@ def build_tasks_agent(
         "implement.\n\n"
         "Prior artifacts from earlier phases are available on disk — "
         "use `read_file` and `grep` to inspect them when needed.\n\n"
+        "When the interpreter is available, seed it with context on your first turn:\n"
+        "```python\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "tasks", "artifact_dir": ".spine/artifacts/{work_id}/tasks"}};\\n'
+        + "```\n\n"
         + build_artifact_prompt(
             state.get("artifacts", {}), PhaseName.TASKS.value, work_id=work_id
         )

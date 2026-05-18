@@ -20,7 +20,7 @@ class TestAllSubgraphsCompile:
 
     def test_verify_subgraph_compiles(self):
         from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
-        graph = build_verify_subgraph()
+        graph = build_verify_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "run_agent" in nodes
@@ -28,7 +28,7 @@ class TestAllSubgraphsCompile:
 
     def test_implement_subgraph_compiles(self):
         from spine.workflow.subgraphs.implement_subgraph import build_implement_subgraph
-        graph = build_implement_subgraph()
+        graph = build_implement_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "run_agent" in nodes
@@ -36,7 +36,7 @@ class TestAllSubgraphsCompile:
 
     def test_tasks_subgraph_compiles(self):
         from spine.workflow.subgraphs.tasks_subgraph import build_tasks_subgraph
-        graph = build_tasks_subgraph()
+        graph = build_tasks_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "run_agent" in nodes
@@ -44,7 +44,7 @@ class TestAllSubgraphsCompile:
 
     def test_specify_subgraph_compiles(self):
         from spine.workflow.subgraphs.specify_subgraph import build_specify_subgraph
-        graph = build_specify_subgraph()
+        graph = build_specify_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "run_agent" in nodes
@@ -52,7 +52,7 @@ class TestAllSubgraphsCompile:
 
     def test_plan_subgraph_compiles(self):
         from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
-        graph = build_plan_subgraph()
+        graph = build_plan_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "run_agent" in nodes
@@ -60,7 +60,7 @@ class TestAllSubgraphsCompile:
 
     def test_critic_subgraph_compiles(self):
         from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
-        graph = build_critic_subgraph("plan")
+        graph = build_critic_subgraph("plan").compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "structural_check" in nodes

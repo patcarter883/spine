@@ -42,14 +42,14 @@ def build_verify_agent(
     Returns:
         A compiled Deep Agent ready for invocation.
     """
-    workspace_root = state.get("workspace_root", ".")
     work_id = state.get("work_id", "")
     tasks_path = f".spine/artifacts/{work_id}/tasks"
 
     system_prompt = (
         "You are a verification engineer. Review the implementation "
         "against the specification, plan, and feature slices.\n\n"
-        f"Your workspace root is: {workspace_root}\n\n"
+        "Your filesystem is rooted at the project workspace. "
+        "Use relative paths (e.g. `src/main.py`, `.spine/artifacts/...`).\n\n"
         "## Workflow (follow this order)\n\n"
         "### Phase 1: Gather (1-2 turns)\n"
         "Batch-read ALL relevant artifacts and source files in ONE response:\n"
@@ -72,6 +72,10 @@ def build_verify_agent(
         "- Use eval for parallel subagent dispatch\n"
         "- Inspect actual code, not just the implementation summary\n"
         "- Run tests — do not assume they pass\n\n"
+        "When the interpreter is available, seed it with context on your first turn:\n"
+        "```python\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "verify", "artifact_dir": ".spine/artifacts/{work_id}/verify"}};\\n'
+        + "```\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
         )

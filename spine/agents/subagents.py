@@ -134,11 +134,14 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "7. Batch reads: read 3-5 files per turn, not one at a time.\n\n"
         "IMPORTANT: You are read-only. Do not modify any files.\n"
         "Be concise — your output will be consumed by the specification writer.\n\n"
-        "End with a structured report:\n"
-        "```json\n"
-        "{\"summary\": \"...\", \"patterns\": [...], \"file_map\": {...}, "
-        "\"dependencies\": [...]}\n"
-        "```\n"
+        "CRITICAL: Return a concise structured summary. Do NOT return raw file "
+        "contents — summarize findings, key facts, and relevant code signatures "
+        "only. The parent agent needs your analysis, not the raw source.\n\n"
+        "Your output MUST follow the ResearchFindings schema:\n"
+        "- summary: concise paragraph summarizing findings\n"
+        "- patterns: notable patterns, conventions, or idioms discovered\n"
+        "- file_map: mapping of important file paths to brief descriptions\n"
+        "- dependencies: key dependencies, imports, or external services\n"
     ),
     "slice-implementer": (
         "YOU MUST USE TOOLS. Do not describe changes — make them with "
@@ -308,12 +311,19 @@ def build_subagent_spec(
     # The SubAgent spec requires actual tool instances (BaseTool | Callable | dict),
     # not string names. We use the shared build_backend() for consistency,
     # then create FilesystemMiddleware to get the tools.
+    # IMPORTANT: Use SPINE_FILESYSTEM_PROMPT to avoid the "All file paths must
+    # start with a /" default that conflicts with virtual_mode=True.
     from deepagents.middleware.filesystem import FilesystemMiddleware
 
     from spine.agents.backend import build_backend
+    from spine.agents.factory import SPINE_FILESYSTEM_PROMPT, SPINE_FILESYSTEM_EXEC_PROMPT
 
     backend = build_backend(workspace_root)
-    fs_mw = FilesystemMiddleware(backend=backend)
+    # Choose prompt based on whether this subagent has execute tool access
+    subagent_tools = SUBAGENT_TOOLS.get(name, [])
+    has_execute = "execute" in subagent_tools
+    fs_prompt = SPINE_FILESYSTEM_EXEC_PROMPT if has_execute else SPINE_FILESYSTEM_PROMPT
+    fs_mw = FilesystemMiddleware(backend=backend, system_prompt=fs_prompt)
     allowed_tool_names = SUBAGENT_TOOLS[name]
     tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]
 
@@ -325,6 +335,11 @@ def build_subagent_spec(
         "model": model,
         "tools": tools,
     }
+    # Only researcher gets response_format — structured summaries prevent
+    # raw file contents from bloating the parent agent's context.
+    # slice-implementer and slice-verifier need free-form tool use.
+    if name == "researcher":
+        spec["response_format"] = SUBAGENT_RESPONSE_MODELS[name]
     if memory:
         spec["memory"] = memory
     if skills:

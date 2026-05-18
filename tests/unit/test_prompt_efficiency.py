@@ -9,7 +9,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytest
 
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
@@ -62,8 +61,8 @@ class TestPromptEfficiency:
 class TestSubagentAutonomy:
     """Verify subagents are configured for autonomous tool use."""
 
-    def test_subagent_no_response_format(self):
-        """Subagent specs should NOT include response_format."""
+    def test_subagent_response_format_policy(self):
+        """Researcher gets response_format (structured summaries); others don't."""
         from unittest.mock import patch, MagicMock
         from spine.agents.subagents import build_subagent_spec
 
@@ -91,10 +90,16 @@ class TestSubagentAutonomy:
                     phase=PhaseName.IMPLEMENT,
                     state=state,
                 )
-            assert "response_format" not in spec, (
-                f"Subagent {name!r} still has response_format — "
-                f"should be removed for autonomous tool use"
-            )
+            if name == "researcher":
+                assert "response_format" in spec, (
+                    "Researcher subagent should have response_format "
+                    "for structured summaries"
+                )
+            else:
+                assert "response_format" not in spec, (
+                    f"Subagent {name!r} should not have response_format — "
+                    f"only researcher uses structured output"
+                )
 
     def test_subagent_prompt_enforces_tools(self):
         """Subagent prompts must contain 'MUST USE TOOLS' instruction."""

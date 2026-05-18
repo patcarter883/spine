@@ -118,11 +118,16 @@ async def _save_specify_artifacts(
 
 
 def build_specify_subgraph() -> Any:
-    """Build the SPECIFY phase subgraph."""
+    """Build the SPECIFY phase subgraph.
+
+    Returns:
+        Uncompiled StateGraph builder. Call .compile() to get a runnable graph,
+        or .compile(checkpointer=...) for per-phase checkpoint isolation.
+    """
     builder = StateGraph(SpecifySubgraphState)
     builder.add_node("run_agent", _run_specify_agent)
     builder.add_node("save_artifacts", _save_specify_artifacts)
     builder.add_edge(START, "run_agent")
     builder.add_edge("run_agent", "save_artifacts")
     builder.add_edge("save_artifacts", END)
-    return builder.compile()
+    return builder

@@ -1,4 +1,4 @@
-"""SPINE agent factory — shared Deep Agent construction for all phases.
+"""SPINE agent factory — custom agent construction with full middleware control.
 
 Every phase agent builder (specify, plan, implement, etc.) was duplicating
 the same pattern: resolve model, build backend, optionally add interpreter
@@ -7,14 +7,35 @@ logic and adds the context engineering features:
 
 - **Artifacts on disk** — prior artifacts are materialized to the filesystem
   and referenced by path, not inlined into the prompt.
-- **Memory** — workspace AGENTS.md files are loaded via DA's ``memory``
-  parameter for always-injected project conventions.
-- **Skills** — phase-specific and RLM skills are loaded via DA's ``skills``
-  parameter for progressive disclosure.
+- **Memory** — workspace AGENTS.md files are loaded via ``MemoryMiddleware``
+  for always-injected project conventions.
+- **Skills** — phase-specific and RLM skills are loaded via ``SkillsMiddleware``
+  for progressive disclosure.
 - **Context schema** — ``SpineContext`` provides typed per-run context that
   propagates to subagents automatically.
 - **Summarization middleware** — for long-running phases, the agent can
   proactively compress its context between tasks.
+
+## Why ``create_agent`` instead of ``create_deep_agent``?
+
+SPINE uses ``langchain.agents.create_agent`` (LangChain 1.0) directly instead
+of ``deepagents.create_deep_agent``.  The Deep Agents harness auto-adds
+``FilesystemMiddleware``, ``TodoListMiddleware``, ``SubAgentMiddleware``, etc.
+with no way to customise the ``FilesystemMiddleware`` system prompt.  The
+default prompt says **"All file paths must start with a /"**, which conflicts
+with ``virtual_mode=True`` on our ``LocalShellBackend`` — absolute paths get
+double-nested under the workspace root.
+
+By assembling the middleware stack ourselves, we gain:
+
+1. **Custom filesystem prompt** — relative-path guidance that works with
+   ``virtual_mode=True``.
+2. **Explicit stack** — every middleware is visible, no hidden auto-wiring.
+3. **Trimmed prompts** — we only inject what SPINE needs, avoiding DA's
+   conversational framing that fights SPINE's phase-executor model.
+4. **Interpreter in the stack** — the ``CodeInterpreterMiddleware`` (eval tool)
+   is always present for phases that enable it, with instructions in the
+   filesystem prompt about how to use it for orchestration.
 
 Usage::
 
@@ -33,7 +54,17 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from langchain.agents import create_agent
+from langchain.agents.middleware import TodoListMiddleware
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.runnables import RunnableConfig
+
+from deepagents.graph import BASE_AGENT_PROMPT
+from deepagents.middleware.filesystem import FilesystemMiddleware, supports_execution
+from deepagents.middleware.memory import MemoryMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from deepagents.middleware.skills import SkillsMiddleware
+from deepagents.middleware.subagents import SubAgentMiddleware
 
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
@@ -41,147 +72,68 @@ from spine.agents.context import SpineContext
 from spine.agents.helpers import resolve_model, debug_enabled
 from spine.agents.interpreter import build_interpreter_middleware, interpreter_enabled
 
+# ── Per-phase recursion limits ──────────────────────────────────────
+# Lower than the old 9_999 default to prevent runaway token spend.
+# SPECIFY/PLAN are exploration-heavy; IMPLEMENT/VERIFY are code-heavy.
+PHASE_RECURSION_LIMITS: dict[str, int] = {
+    PhaseName.SPECIFY.value: 250,
+    PhaseName.PLAN.value: 250,
+    PhaseName.TASKS.value: 200,
+    PhaseName.IMPLEMENT.value: 500,
+    PhaseName.VERIFY.value: 300,
+    PhaseName.CRITIC.value: 100,
+}
+
 logger = logging.getLogger(__name__)
 
 
-def build_phase_agent(
-    state: WorkflowState,
-    config: RunnableConfig | None,
-    phase: PhaseName,
-    system_prompt: str,
-    *,
-    extra_middleware: list[Any] | None = None,
-    add_summarization: bool = False,
-    subagents: list[Any] | None = None,
-    response_format: Any | None = None,
-    is_subagent: bool = False,
-) -> Any:
-    """Build a Deep Agent for a SPINE phase with full context engineering.
+# ── SPINE filesystem system prompt ───────────────────────────────────────
+# Replaces DA's default "All file paths must start with a /" prompt.
+# Under virtual_mode=True, paths are resolved relative to the workspace root.
+# Relative paths like ".spine/artifacts/..." map correctly; absolute paths
+# like "/home/user/project/.spine/..." double-nest.  This prompt teaches the
+# agent the correct convention.
 
-    This is the single entry point for all phase agent construction.
-    It handles model resolution, backend creation, interpreter middleware,
-    memory, skills, context schema, and summarization — so individual
-    agent builders don't have to.
+SPINE_FILESYSTEM_PROMPT = """\
+## Filesystem Tools — ls, read_file, write_file, edit_file, glob, grep
 
-    Args:
-        state: The current workflow state.
-        config: LangGraph runtime config.
-        phase: The phase being executed.
-        system_prompt: Phase-specific system prompt (role + task framing).
-        extra_middleware: Additional middleware to include.
-        add_summarization: Whether to add the summarization tool middleware
-            (recommended for IMPLEMENT and VERIFY).
-        subagents: Optional subagent specs for this phase.
-        response_format: Optional Pydantic model or ResponseFormat for
-            structured output (DA ≥0.5.3).
-        is_subagent: When True, skips artifact materialization and
-            interpreter/summarization middleware (subagents are leaf
-            agents, not orchestrators).
+You have access to a virtual filesystem rooted at the project workspace.
 
-    Returns:
-        A compiled Deep Agent ready for invocation.
-    """
-    from deepagents import create_deep_agent
+**Path conventions (CRITICAL — violations break artifact storage):**
+- Use **relative paths** from the workspace root: `.spine/artifacts/file.md`, `src/main.py`.
+- A leading `/` is treated as workspace-relative (e.g. `/src/main.py` resolves correctly).
+- **NEVER use absolute paths** like `/home/user/project/src/main.py` — the filesystem
+  treats them as virtual paths relative to the workspace root, so they get double-nested
+  and your files end up at the wrong location. Always use `src/main.py` or `/src/main.py`.
+- Path traversal (`..`, `~`) is blocked by the virtual filesystem.
+- Use pagination (offset/limit) when reading large files.
 
-    from spine.agents.backend import build_backend
-    from spine.agents.artifacts import materialize_artifacts
-    from spine.agents.skills_resolver import resolve_skills, resolve_memory
+Tools:
+- ls: list files in a directory
+- read_file: read a file (supports offset/limit for large files, plus images/PDFs)
+- write_file: create or overwrite a file
+- edit_file: find-and-replace within a file (supports replace_all)
+- glob: find files matching a pattern (e.g. `**/*.py`)
+- grep: search file contents with multiple output modes
 
-    # ── Resolve model and backend ────────────────────────────────────
-    # Use phase-aware model resolution so per-phase overrides in
-    # providers.phases take effect.
-    model = resolve_model(config, session_id=state.get("work_id"), phase=phase.value)
-    workspace_root = state.get("workspace_root", ".")
-    backend = build_backend(workspace_root)
+## Large Tool Results
 
-    work_id = state.get("work_id", "")
+When a tool result is too large, it may be offloaded to `/large_tool_results/<tool_call_id>` \
+instead of being returned inline. Use `read_file` to inspect in chunks, or `grep` within \
+`/large_tool_results/` to search across offloaded results."""
 
-    # ── Materialize prior artifacts to disk ──────────────────────────
-    # Subagents skip this — the parent already materialized.
-    if not is_subagent:
-        materialize_artifacts(state, workspace_root, work_id=work_id)
+SPINE_FILESYSTEM_EXEC_PROMPT = SPINE_FILESYSTEM_PROMPT + """
 
-    # ── Middleware ───────────────────────────────────────────────────
-    middleware: list[Any] = list(extra_middleware or [])
+## Execute Tool — execute
 
-    # Interpreter middleware (only for top-level phase agents)
-    has_interpreter = False
-    if not is_subagent:
-        has_interpreter = interpreter_enabled()
-        if has_interpreter:
-            middleware.append(build_interpreter_middleware(phase.value))
+You have access to an `execute` tool for running shell commands.
+Use it for commands, scripts, tests, builds, and other shell operations.
+Commands run in the workspace root directory.
 
-    # Summarization tool middleware (for long-running phases)
-    if add_summarization and not is_subagent:
-        _add_summarization_middleware(middleware, model, backend)
+- execute: run a shell command (returns output and exit code)"""
 
-    # Tool schema validation (rebound loop for self-correction)
-    # Validates tool call args against the registered schema before execution.
-    # On mismatch, returns a ToolMessage(status="error") so the model can
-    # self-correct within the same agent loop. Disabled for subagents
-    # (they're leaf agents with simpler tool sets) and via env var.
-    if not is_subagent:
-        import os as _os
 
-        _validation_enabled = _os.getenv(
-            "SPINE_TOOL_SCHEMA_VALIDATION", "true"
-        ).lower() not in ("0", "false", "no")
-        if _validation_enabled:
-            from spine.agents.tool_schema_validator import ToolSchemaValidator
-
-            middleware.append(ToolSchemaValidator())
-
-    # Context editing: trim old tool results for long-running phases
-    if phase in (PhaseName.TASKS, PhaseName.IMPLEMENT, PhaseName.VERIFY) and not is_subagent:
-        from spine.agents.context_editing import ToolOutputTrimmer
-
-        middleware.append(ToolOutputTrimmer(max_full_tool_results=20))
-
-    # ── Memory ───────────────────────────────────────────────────────
-    memory = resolve_memory(workspace_root, phase=phase.value)
-    if memory:
-        logger.debug("Phase %s: loading memory files: %s", phase.value, memory)
-
-    # ── Skills ───────────────────────────────────────────────────────
-    # Subagents don't use the interpreter, so never include RLM skills.
-    include_rlm = has_interpreter if not is_subagent else False
-    skills = resolve_skills(
-        phase=phase.value,
-        workspace_root=workspace_root,
-        include_rlm=include_rlm,
-    )
-    if skills:
-        logger.debug("Phase %s: loading skills: %s", phase.value, skills)
-
-    # ── Context schema ───────────────────────────────────────────────
-    # SpineContext is passed at invoke time via context= kwarg.
-    # It propagates to subagents automatically.
-    context_schema = SpineContext
-
-    # ── Construct the agent ──────────────────────────────────────────
-    agent_kwargs: dict[str, Any] = {
-        "name": f"spine-{phase.value}",
-        "model": model,
-        "backend": backend,
-        "system_prompt": system_prompt,
-        "context_schema": context_schema,
-        "debug": debug_enabled(),
-    }
-    if middleware:
-        agent_kwargs["middleware"] = middleware
-    if memory:
-        agent_kwargs["memory"] = memory
-    if skills:
-        agent_kwargs["skills"] = skills
-    if subagents:
-        agent_kwargs["subagents"] = subagents
-    if response_format:
-        agent_kwargs["response_format"] = response_format
-
-    agent = create_deep_agent(**agent_kwargs)
-
-    return agent
-
+# ── SPINE summarization summary prompt ───────────────────────────────────
 
 _SPINE_SUMMARY_PROMPT = """\
 You are summarizing the conversation history of an autonomous code agent \
@@ -195,7 +147,7 @@ PRESERVE these in your summary (in this order):
 1. **Active objective**: What is the agent currently working on? Include \
 the exact work description and which phase (tasks/implement/verify).
 
-2. **Files currently being modified**: List every absolute file path the \
+2. **Files currently being modified**: List every relative file path the \
 agent has read or written. Mark which ones have UNCOMMITTED changes.
 
 3. **Unresolved errors**: Any compiler errors, linter failures, or test \
@@ -218,6 +170,267 @@ from disk — do not include full file contents in the summary.
 """
 
 
+# ── Main factory function ────────────────────────────────────────────────
+
+def build_phase_agent(
+    state: WorkflowState,
+    config: RunnableConfig | None,
+    phase: PhaseName,
+    system_prompt: str,
+    *,
+    extra_middleware: list[Any] | None = None,
+    add_summarization: bool = False,
+    subagents: list[Any] | None = None,
+    response_format: Any | None = None,
+    is_subagent: bool = False,
+) -> Any:
+    """Build a LangChain agent for a SPINE phase with full context engineering.
+
+    This is the single entry point for all phase agent construction.
+    It handles model resolution, backend creation, full middleware assembly,
+    memory, skills, context schema, and summarization — so individual
+    phase builders don't have to.
+
+    Uses ``create_agent`` directly with a custom middleware stack, giving
+    full control over the ``FilesystemMiddleware`` system prompt and stack
+    ordering.  This replaces the previous ``create_deep_agent`` approach
+    which could not customise the filesystem prompt.
+
+    Args:
+        state: The current workflow state.
+        config: LangGraph runtime config.
+        phase: The phase being executed.
+        system_prompt: Phase-specific system prompt (role + task framing).
+        extra_middleware: Additional middleware to include.
+        add_summarization: Whether to add the summarization tool middleware
+            (recommended for IMPLEMENT and VERIFY).
+        subagents: Optional subagent specs for this phase.
+        response_format: Optional Pydantic model or ResponseFormat for
+            structured output (DA ≥0.5.3).
+        is_subagent: When True, skips artifact materialization and
+            interpreter/summarization middleware (subagents are leaf
+            agents, not orchestrators).
+
+    Returns:
+        A compiled agent (CompiledStateGraph) ready for invocation.
+    """
+    from spine.agents.backend import build_backend
+    from spine.agents.artifacts import materialize_artifacts
+    from spine.agents.skills_resolver import resolve_skills, resolve_memory
+
+    # ── Resolve model and backend ────────────────────────────────────
+    model = resolve_model(config, session_id=state.get("work_id"), phase=phase.value)
+    workspace_root = state.get("workspace_root", ".")
+    backend = build_backend(workspace_root)
+    work_id = state.get("work_id", "")
+
+    # ── Resolve profile for prompt assembly ──────────────────────────
+    # The HarnessProfile is registered per-provider by ensure_spine_profiles().
+    # It holds base_system_prompt (SPINE_BASE_PROMPT) and tool_description_overrides.
+    # _harness_profile_for_model needs a BaseChatModel, so if our resolve_model
+    # returned a string, we pass it through DA's resolve_model first.
+    _model_spec = model if isinstance(model, str) else None
+    resolved_model = _resolve_model_for_profile(model)
+    profile = _resolve_profile(resolved_model, _model_spec)
+    base_prompt = _apply_profile_prompt(profile, BASE_AGENT_PROMPT)
+    tool_desc_overrides = _get_tool_description_overrides(profile)
+
+    # ── Materialize prior artifacts to disk ──────────────────────────
+    if not is_subagent:
+        materialize_artifacts(state, workspace_root, work_id=work_id)
+
+    # ── Assemble final system prompt ─────────────────────────────────
+    # Assembly order: user system_prompt → base prompt (CUSTOM slot)
+    if system_prompt is None:
+        final_system_prompt: str = base_prompt
+    else:
+        final_system_prompt = system_prompt + "\n\n" + base_prompt
+
+    # ── Memory ───────────────────────────────────────────────────────
+    memory = resolve_memory(workspace_root, phase=phase.value)
+    if memory:
+        logger.debug("Phase %s: loading memory files: %s", phase.value, memory)
+
+    # ── Skills ───────────────────────────────────────────────────────
+    # Check if interpreter will be in the stack (needed before building
+    # skills, because include_rlm affects skill resolution)
+    has_interpreter = not is_subagent and interpreter_enabled()
+    include_rlm = has_interpreter if not is_subagent else False
+    skills = resolve_skills(
+        phase=phase.value,
+        workspace_root=workspace_root,
+        include_rlm=include_rlm,
+    )
+    if skills:
+        logger.debug("Phase %s: loading skills: %s", phase.value, skills)
+
+    # ── Build the middleware stack ───────────────────────────────────
+    middleware = _build_middleware_stack(
+        backend=backend,
+        model=model,
+        phase=phase,
+        is_subagent=is_subagent,
+        add_summarization=add_summarization,
+        has_interpreter=has_interpreter,
+        extra_middleware=extra_middleware,
+        tool_desc_overrides=tool_desc_overrides,
+        profile=profile,
+        subagents=subagents,
+        memory=memory,
+        skills=skills,
+    )
+
+    # ── Context schema ───────────────────────────────────────────────
+    context_schema = SpineContext
+
+    # ── Construct the agent ──────────────────────────────────────────
+    agent = create_agent(
+        model,
+        system_prompt=final_system_prompt,
+        tools=[],  # All tools come from middleware
+        middleware=middleware,
+        response_format=response_format,
+        context_schema=context_schema,
+        debug=debug_enabled(),
+        name=f"spine-{phase.value}",
+    ).with_config(
+        {
+            "recursion_limit": PHASE_RECURSION_LIMITS.get(phase.value, 9_999),
+            "metadata": {
+                "ls_integration": "spine",
+                "lc_agent_name": f"spine-{phase.value}",
+            },
+        }
+    )
+
+    return agent
+
+
+# ── Middleware stack builder ─────────────────────────────────────────────
+
+def _build_middleware_stack(
+    *,
+    backend: Any,
+    model: Any,
+    phase: PhaseName,
+    is_subagent: bool,
+    add_summarization: bool,
+    has_interpreter: bool,
+    extra_middleware: list[Any] | None,
+    tool_desc_overrides: dict[str, str],
+    profile: Any,
+    subagents: list[Any] | None,
+    memory: list[str] | None,
+    skills: list[str] | None,
+) -> list[Any]:
+    """Assemble the full middleware stack for a SPINE phase agent.
+
+    Replaces create_deep_agent's auto-wiring with explicit, auditable
+    middleware construction. Each entry is intentional and documented.
+
+    Stack order (from outermost to innermost in the middleware chain):
+
+    1.  TodoListMiddleware         — task planning state
+    2.  SkillsMiddleware           — progressive skill disclosure
+    3.  FilesystemMiddleware       — filesystem tools with SPINE custom prompt
+    4.  CodeInterpreterMiddleware  — eval tool (when enabled)
+    5.  SubAgentMiddleware         — task delegation (when subagents present)
+    6.  SummarizationMiddleware    — context compression
+    7.  PatchToolCallsMiddleware   — tool call normalization
+    8.  SPINE-specific middleware  — ToolSchemaValidator, ToolOutputTrimmer
+    9.  User extra_middleware
+    10. Profile extra_middleware
+    11. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
+    12. MemoryMiddleware           — AGENTS.md injection (when memory present)
+    """
+    middleware: list[Any] = []
+
+    # 1. Todo list — task planning state
+    middleware.append(TodoListMiddleware())
+
+    # 2. Skills — progressive disclosure of skill directories
+    if skills:
+        middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+
+    # 3. Filesystem — core tool surface with custom SPINE prompt
+    #    This is the key change from create_deep_agent: we provide a
+    #    custom system_prompt that uses relative paths instead of
+    #    DA's default "All file paths must start with a /".
+    fs_prompt = _get_filesystem_prompt(backend)
+    middleware.append(FilesystemMiddleware(
+        backend=backend,
+        system_prompt=fs_prompt,
+        custom_tool_descriptions=tool_desc_overrides,
+    ))
+
+    # 4. Interpreter (eval tool) — only for top-level phase agents
+    if has_interpreter:
+        middleware.append(build_interpreter_middleware(phase.value))
+
+    # 5. Subagent delegation — when subagent specs are provided
+    if subagents:
+        middleware.append(SubAgentMiddleware(
+            backend=backend,
+            subagents=subagents,
+            task_description=tool_desc_overrides.get("task"),
+        ))
+
+    # 6. Summarization — context compression for long-running phases
+    if add_summarization and not is_subagent:
+        _add_summarization_middleware(middleware, model, backend)
+
+    # 7. Patch tool calls — normalisation
+    middleware.append(PatchToolCallsMiddleware())
+
+    # 8. SPINE-specific middleware (tool validation, context editing)
+    if not is_subagent:
+        _add_spine_middleware(middleware, phase)
+
+    # 9. User-provided extra middleware
+    if extra_middleware:
+        middleware.extend(extra_middleware)
+
+    # 10. Profile extra middleware
+    if profile is not None:
+        try:
+            extra = profile.materialize_extra_middleware()
+            if extra:
+                middleware.extend(extra)
+        except Exception:
+            pass
+
+    # 11. Prompt caching (no-op for non-Anthropic models)
+    middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+
+    # 12. Memory — AGENTS.md injection (when memory sources provided)
+    if memory:
+        middleware.append(MemoryMiddleware(
+            backend=backend,
+            sources=memory,
+            add_cache_control=True,
+        ))
+
+    return middleware
+
+
+def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
+    """Add SPINE-specific middleware for tool validation and context editing."""
+    import os as _os
+
+    # Tool schema validation — rebound loop for self-correction
+    _validation_enabled = _os.getenv(
+        "SPINE_TOOL_SCHEMA_VALIDATION", "true"
+    ).lower() not in ("0", "false", "no")
+    if _validation_enabled:
+        from spine.agents.tool_schema_validator import ToolSchemaValidator
+        middleware.append(ToolSchemaValidator())
+
+    # Context editing: trim old tool results — all phases benefit from trimming
+    # SPECIFY/PLAN can accumulate 80+ read_file results, same as IMPLEMENT/VERIFY
+    from spine.agents.context_editing import ToolOutputTrimmer
+    middleware.append(ToolOutputTrimmer(max_full_tool_results=20))
+
+
 def _add_summarization_middleware(
     middleware: list[Any],
     model: Any,
@@ -238,7 +451,6 @@ def _add_summarization_middleware(
         )
 
         try:
-            # Auto-summarization with aggressive token trigger
             auto_mw = create_summarization_middleware(
                 model,
                 backend,
@@ -248,7 +460,6 @@ def _add_summarization_middleware(
             )
             middleware.append(auto_mw)
 
-            # Manual compact_conversation tool for on-demand use
             tool_mw = create_summarization_tool_middleware(model, backend)
             middleware.append(tool_mw)
 
@@ -257,7 +468,6 @@ def _add_summarization_middleware(
                 "(trigger=80K tokens, keep=20 msgs, custom prompt)"
             )
         except Exception as exc:
-            # Fallback: try just the tool middleware
             logger.debug(
                 "Auto-summarization middleware failed, trying tool-only: %s", exc
             )
@@ -275,3 +485,87 @@ def _add_summarization_middleware(
             "Summarization middleware not available "
             "(requires deepagents >= 0.5.0)"
         )
+
+
+# ── Profile helpers ──────────────────────────────────────────────────────
+
+def _resolve_model_for_profile(model: Any) -> Any:
+    """Resolve a model identifier to a BaseChatModel for profile lookup.
+
+    SPINE's ``resolve_model`` may return a string identifier (e.g.
+    ``"openrouter:openai/gpt-4o-mini"``) or a pre-built ``ChatOpenRouter``
+    instance.  DA's ``_harness_profile_for_model`` expects a
+    ``BaseChatModel`` so we need to materialise strings into model instances
+    first.  This uses DA's ``resolve_model`` which wraps
+    ``init_chat_model`` — it will fail if the provider API key is not
+    configured, which is fine because profile resolution is best-effort.
+    """
+    if isinstance(model, str):
+        try:
+            from deepagents._models import resolve_model as da_resolve_model
+            return da_resolve_model(model)
+        except Exception:
+            return model  # Return the string — _resolve_profile handles it
+    return model
+
+
+def _resolve_profile(model: Any, model_spec: str | None = None) -> Any:
+    """Resolve the HarnessProfile for the current model.
+
+    Args:
+        model: A BaseChatModel instance (preferred) or a string identifier.
+        model_spec: The original model string, used for key-based lookup.
+
+    Returns the profile registered for this model's provider, or None.
+    """
+    try:
+        from deepagents.profiles.harness.harness_profiles import _harness_profile_for_model
+        return _harness_profile_for_model(model, model_spec)
+    except (ImportError, Exception):
+        return None
+
+
+def _apply_profile_prompt(profile: Any, default_prompt: str) -> str:
+    """Apply the profile's prompt overlay to produce the base prompt.
+
+    If the profile has a ``base_system_prompt`` (SPINE's HarnessProfile
+    sets this to SPINE_BASE_PROMPT), use it.  Otherwise fall back to
+    DA's default BASE_AGENT_PROMPT.
+
+    If the profile has a ``system_prompt_suffix``, append it.
+    """
+    if profile is not None and profile.base_system_prompt is not None:
+        prompt = profile.base_system_prompt
+    else:
+        prompt = default_prompt
+
+    if profile is not None and profile.system_prompt_suffix is not None:
+        prompt = prompt + "\n\n" + profile.system_prompt_suffix
+
+    return prompt
+
+
+def _get_tool_description_overrides(profile: Any) -> dict[str, str]:
+    """Extract tool description overrides from the profile."""
+    if profile is None:
+        return {}
+    try:
+        return dict(profile.tool_description_overrides)
+    except (TypeError, AttributeError):
+        return {}
+
+
+def _get_filesystem_prompt(backend: Any) -> str:
+    """Choose the appropriate filesystem prompt based on backend capabilities.
+
+    If the backend supports execution (LocalShellBackend, sandbox backends),
+    include the execute tool section.  Otherwise, use the base filesystem
+    prompt only.
+    """
+    try:
+        if supports_execution(backend):
+            return SPINE_FILESYSTEM_EXEC_PROMPT
+    except Exception:
+        pass
+
+    return SPINE_FILESYSTEM_PROMPT
