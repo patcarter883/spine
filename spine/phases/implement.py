@@ -24,7 +24,7 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.implement_agent import build_implement_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
@@ -156,26 +156,6 @@ async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] 
             "prompt_request": None,
         }
 
-    except MaxTokenBudgetExceeded as e:
-        logger.error(f"[{work_id}] IMPLEMENT phase exceeded token budget: {e}")
-        return {
-            "artifacts": {PhaseName.IMPLEMENT.value: {}},
-            "current_phase": PhaseName.IMPLEMENT.value,
-            "status": "needs_review",
-            "feedback": [{
-                "status": "needs_review",
-                "tier": "structural",
-                "reason": str(e),
-                "suggestions": [
-                    "Reduce implementation scope or break into smaller work items",
-                    "Use a cheaper model for implementation phases",
-                ],
-            }],
-            "prompt_request": {
-                "message": str(e),
-                "phase": PhaseName.IMPLEMENT.value,
-            },
-        }
     except Exception as e:
         logger.error(f"[{work_id}] IMPLEMENT phase failed: {e}", exc_info=True)
         return {

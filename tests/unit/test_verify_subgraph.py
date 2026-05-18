@@ -95,18 +95,6 @@ class TestRunVerifyAgent:
             assert result.get("phase_status") == "error"
             assert "boom" in result["agent_response"]
 
-    @pytest.mark.asyncio
-    async def test_run_agent_max_token_budget(self):
-        from spine.workflow.subgraphs.verify_subgraph import _run_verify_agent
-        from spine.agents.retry import MaxTokenBudgetExceeded
-
-        with patch(
-            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent",
-            side_effect=MaxTokenBudgetExceeded(work_id="test", used=300000, budget=200000),
-        ):
-            state = {"work_id": "test", "work_type": "quick", "description": "d", "workspace_root": "."}
-            result = await _run_verify_agent(state)
-            assert result.get("phase_status") == "needs_review"
 
 
 class TestSaveVerifyArtifacts:

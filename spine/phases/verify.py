@@ -25,7 +25,7 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.verify_agent import build_verify_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
@@ -174,26 +174,6 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
             ],
         }
 
-    except MaxTokenBudgetExceeded as e:
-        logger.error(f"[{work_id}] VERIFY phase exceeded token budget: {e}")
-        return {
-            "artifacts": {PhaseName.VERIFY.value: {}},
-            "current_phase": PhaseName.VERIFY.value,
-            "status": "needs_review",
-            "feedback": [{
-                "status": "needs_review",
-                "tier": "structural",
-                "reason": str(e),
-                "suggestions": [
-                    "Reduce verification scope or break into smaller work items",
-                    "Use a cheaper model for verification phases",
-                ],
-            }],
-            "prompt_request": {
-                "message": str(e),
-                "phase": PhaseName.VERIFY.value,
-            },
-        }
     except Exception as e:
         logger.error(f"[{work_id}] VERIFY phase failed: {e}", exc_info=True)
         return {

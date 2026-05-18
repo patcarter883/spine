@@ -153,26 +153,6 @@ class TestMakeSubgraphNode:
         assert any("Timed out" in f.get("reason", "") for f in result["feedback"])
 
     @pytest.mark.asyncio
-    async def test_max_token_budget_exceeded(self):
-        from spine.workflow.subgraph_wrapper import make_subgraph_node
-        from spine.agents.retry import MaxTokenBudgetExceeded
-
-        mock_subgraph = AsyncMock()
-        mock_subgraph.ainvoke.side_effect = MaxTokenBudgetExceeded(
-            work_id="test123", used=300000, budget=200000
-        )
-
-        node_fn = make_subgraph_node(
-            mock_subgraph, "tasks", lambda p, c: {}, lambda r, p: {}
-        )
-
-        parent_state = {"work_id": "test123", "status": "running"}
-        result = await node_fn(parent_state, None)
-
-        assert result["status"] == "needs_review"
-        assert any("budget" in f.get("reason", "").lower() for f in result["feedback"])
-
-    @pytest.mark.asyncio
     async def test_generic_exception_returns_error(self):
         from spine.workflow.subgraph_wrapper import make_subgraph_node
 

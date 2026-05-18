@@ -43,7 +43,7 @@ class TestPromptEfficiency:
         """Base prompt must tell agents not to re-read files."""
         assert "re-read" in SPINE_BASE_PROMPT.lower() or "never" in SPINE_BASE_PROMPT.lower()
 
-    def test_base_prompt_under_token_budget(self):
+    def test_base_prompt_concise(self):
         """Base prompt should be under 800 tokens (~3200 chars)."""
         assert len(SPINE_BASE_PROMPT) < 3200, (
             f"SPINE_BASE_PROMPT is {len(SPINE_BASE_PROMPT)} chars — "

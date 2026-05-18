@@ -3,7 +3,7 @@
 Each wrapper:
 1. Maps ParentState → SubgraphState
 2. Invokes the subgraph with its own checkpointer + timeout
-3. Catches CancelledError, MaxTokenBudgetExceeded, and other exceptions
+3. Catches CancelledError and other exceptions
 4. Maps subgraph output → ParentState update
 """
 
@@ -16,7 +16,6 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from spine.models.state import WorkflowState
-from spine.agents.retry import MaxTokenBudgetExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -293,20 +292,6 @@ def make_subgraph_node(
                 parent_state,
                 phase_name,
                 "Cancelled — subgraph did not complete. Prior phases preserved.",
-            )
-
-        except MaxTokenBudgetExceeded as e:
-            logger.error(
-                f"[{work_id}] [{phase_name}] token budget exceeded: {e}"
-            )
-            return _needs_review_update(
-                parent_state,
-                phase_name,
-                str(e),
-                suggestions=[
-                    "Reduce task scope or break into smaller work items",
-                    "Use a cheaper model for this phase",
-                ],
             )
 
         except Exception as e:

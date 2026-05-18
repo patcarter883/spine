@@ -10,7 +10,7 @@ providers:
     enabled: true
   - name: lfm
     type: deepagents-model
-    model: openrouter:liquid/lfm-2-24b-a2b
+    model: openrouter:z-ai/glm-5.1
     enabled: true
   - name: laguna-m1
     type: deepagents-model

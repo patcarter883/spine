@@ -17,7 +17,7 @@ from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ImplementSubgraphState
 from spine.agents.implement_agent import build_implement_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
@@ -116,13 +116,6 @@ async def _run_implement_agent(
             "agent_response": extract_response(result),
         }
 
-    except MaxTokenBudgetExceeded as e:
-        logger.error(f"[{work_id}] IMPLEMENT subgraph token budget exceeded: {e}")
-        return {
-            "messages": [],
-            "agent_response": f"Token budget exceeded: {e}",
-            "phase_status": "needs_review",
-        }
     except Exception as e:
         logger.error(f"[{work_id}] IMPLEMENT subgraph agent failed: {e}", exc_info=True)
         return {

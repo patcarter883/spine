@@ -17,7 +17,7 @@ from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import TasksSubgraphState
 from spine.agents.tasks_agent import build_tasks_agent
 from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
+from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
@@ -124,13 +124,6 @@ async def _run_tasks_agent(
             "agent_response": extract_response(result),
         }
 
-    except MaxTokenBudgetExceeded as e:
-        logger.error(f"[{work_id}] TASKS subgraph token budget exceeded: {e}")
-        return {
-            "messages": [],
-            "agent_response": f"Token budget exceeded: {e}",
-            "phase_status": "needs_review",
-        }
     except Exception as e:
         logger.error(f"[{work_id}] TASKS subgraph agent failed: {e}", exc_info=True)
         return {

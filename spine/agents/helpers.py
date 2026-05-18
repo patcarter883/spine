@@ -275,8 +275,8 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
     # Without stream_usage=True, ChatOpenAI does not send
     # `stream_options: {"include_usage": true}` to the OpenAI-compatible
     # server.  The server then omits the final usage chunk, and
-    # AIMessage.usage_metadata is None.  This breaks LangSmith token
-    # tracing AND the SPINE token budget tracker.  All local inference
+    # AIMessage.usage_metadata is None.  This breaks LangSmith
+    # token tracing.  All local inference
     # engines (vLLM, SGLang, hipfire) support this OpenAI API option.
     kwargs.setdefault("stream_usage", True)
 
