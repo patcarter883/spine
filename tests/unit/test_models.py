@@ -15,10 +15,10 @@ class TestTask:
 
     def test_task_creation(self) -> None:
         """Test creating a task with default values."""
-        task = Task(id="test-task")
-        
+        task = Task(id="test-task", description="Test task")
+
         assert task.id == "test-task"
-        assert task.description == ""
+        assert task.description == "Test task"
         assert task.status == TaskStatus.PENDING
         assert task.artifact_paths == []
         assert task.error is None
@@ -53,11 +53,11 @@ class TestArtifact:
 
     def test_artifact_creation(self) -> None:
         """Test creating an artifact with default values."""
-        artifact = Artifact(path="/path/to/artifact.txt", content="Test content")
-        
+        artifact = Artifact(path="/path/to/artifact.txt", content="Test content", phase="test")
+
         assert artifact.path == "/path/to/artifact.txt"
         assert artifact.content == "Test content"
-        assert artifact.phase == ""
+        assert artifact.phase == "test"
         assert isinstance(artifact.produced_at, datetime)
 
     def test_artifact_with_phase(self) -> None:
@@ -69,7 +69,7 @@ class TestArtifact:
             phase="test_phase",
             produced_at=produced_at
         )
-        
+
         assert artifact.phase == "test_phase"
         assert artifact.produced_at == produced_at
 
@@ -78,9 +78,10 @@ class TestArtifact:
         long_content = "A" * 10000
         artifact = Artifact(
             path="/path/to/artifact.txt",
-            content=long_content
+            content=long_content,
+            phase="test"
         )
-        
+
         assert isinstance(artifact.content, str)
         assert artifact.content == long_content
 

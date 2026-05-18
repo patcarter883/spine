@@ -82,4 +82,9 @@ class WorkflowState(TypedDict, total=False):
     workspace_root: str  # Project root directory for deep agent backends
     phase_results: Annotated[dict, _merge_dicts]  # phase → PhaseResult
     needs_review_phase: str | None  # Which phase triggered human review
-    plan_id: str | None  # Optional reference to an approved planning work item
+    plan_id: str | None  # Optional reference to an approved planning work item.
+    # For execution work items spawned from a plan: references the planning work
+    # item that spawned this item. None for standalone quick/critical_quick items.
+    spawned_work_ids: Annotated[list[str], operator.add]  # IDs of execution work
+    # items spawned from this planning item. Empty for standalone execution items
+    # and for planning items that haven't been approved yet.

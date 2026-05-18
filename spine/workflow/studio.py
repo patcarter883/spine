@@ -35,3 +35,23 @@ def quick_graph():
 def critical_quick_graph():
     """CRITICAL_QUICK workflow: tasks → critic → implement → verify."""
     return build_workflow_graph("critical_quick")
+
+
+def plan_graph():
+    """PLAN workflow: specify → plan → critic_plan (no tasks/execution)."""
+    return build_workflow_graph("plan")
+
+
+def plan_spec_graph():
+    """PLAN_SPEC workflow: specify → critic_specify → plan → critic_plan."""
+    return build_workflow_graph("plan_spec")
+
+
+def plan_only_graph():
+    """PLAN_ONLY workflow: specify → plan → critic_plan (no spec critic)."""
+    return build_workflow_graph("plan_only")
+
+
+def critical_plan_only_graph():
+    """CRITICAL_PLAN_ONLY: specify → critic_specify → plan → critic_plan."""
+    return build_workflow_graph("critical_plan_only")

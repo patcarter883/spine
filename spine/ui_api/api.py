@@ -480,3 +480,88 @@ class UIApi:
         """
         worker = get_worker(self._config)
         return worker.reset_stuck_items()
+
+    # ── Planning operations ──
+
+    def list_planning_sessions(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List planning work items.
+
+        Args:
+            status: Optional status filter (e.g. 'completed', 'needs_review', 'awaiting_approval').
+            limit: Maximum number of results to return.
+
+        Returns:
+            List of planning work item dicts.
+        """
+        from spine.work.dispatcher import list_plans
+
+        return list_plans(status=status, limit=limit, config=self._config)
+
+    def get_planning_detail(self, plan_id: str) -> dict[str, Any] | None:
+        """Get details for a planning work item.
+
+        Args:
+            plan_id: The planning work item ID.
+
+        Returns:
+            Dict with work entry fields plus spec/plan artifacts, or None if not found.
+        """
+        entry = self.get_work(plan_id)
+        if entry is None:
+            return None
+
+        result = dict(entry)
+        result["artifacts"] = {}
+
+        # Load spec and plan artifacts
+        for phase in ("specify", "plan"):
+            for name in ("spec.md", "specification.md", "plan.md"):
+                content = self.read_artifact(plan_id, phase, name)
+                if content:
+                    result["artifacts"][f"{phase}/{name}"] = content[:5000]  # Truncate for UI
+                    break
+
+        return result
+
+    async def approve_plan(
+        self,
+        plan_id: str,
+        action: str = "approve",
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        """Approve a planning work item and optionally spawn execution tasks.
+
+        Non-blocking: runs the approval in the background via RalphLoopWorker's
+        executor and returns immediately.
+
+        Args:
+            plan_id: The planning work item ID.
+            action: One of "approve", "request_revision", "reject".
+            feedback: Optional feedback text.
+
+        Returns:
+            Dict with plan_id, status, and spawned_ids (if approved).
+        """
+        from spine.work.dispatcher import approve_and_spawn
+
+        import concurrent.futures
+
+        def _run() -> dict[str, Any]:
+            import asyncio
+
+            return asyncio.run(approve_and_spawn(plan_id, action, feedback, self._config))
+
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(_run)
+
+        return {
+            "plan_id": plan_id,
+            "status": "processing",
+            "action": action,
+        }

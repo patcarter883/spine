@@ -493,6 +493,54 @@ async def submit_work(
         }
 
 
+
+
+# ── List planning work ──
+
+
+async def list_plans(
+    status: str | None = None,
+    limit: int = 50,
+    config: SpineConfig | None = None,
+) -> list[dict[str, Any]]:
+    """List planning work items with optional status filter.
+
+    This function retrieves work items that are planning workflows
+    (work_type in: plan, plan_spec, plan_only, critical_plan_only).
+
+    Args:
+        status: Optional status filter (e.g., 'awaiting_approval', 'completed', 'needs_review').
+        limit: Maximum number of results to return.
+        config: Optional SpineConfig.
+
+    Returns:
+        List of work entry dicts for planning work items.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    db = _get_work_db(config)
+
+    # Planning work types
+    plan_types = ("plan", "plan_spec", "plan_only", "critical_plan_only")
+
+    # Query with optional status filter
+    placeholders = ",".join(["?" for _ in plan_types])
+    args = list(plan_types)
+
+    if status:
+        where_clause = f"work_type IN ({placeholders}) AND status = ?"
+        args.append(status)
+    else:
+        where_clause = f"work_type IN ({placeholders})"
+
+    args.append(limit)
+    where_clause += " ORDER BY created_at DESC LIMIT ?"
+
+    entries = list(db["work_entries"].search(where_clause, *args))
+
+    return [dict(entry) for entry in entries]
+
 # ── Resume work ──
 
 
@@ -1679,7 +1727,7 @@ def list_plans(
         config = SpineConfig.load()
 
     db = _get_work_db(config)
-    conditions = "work_type IN ('plan', 'plan_spec')"
+    conditions = "work_type IN ('plan', 'plan_spec', 'plan_only', 'critical_plan_only')"
     params: dict[str, Any] = {"limit": limit}
 
     if status:
@@ -1688,6 +1736,160 @@ def list_plans(
 
     sql = f"SELECT * FROM work_entries WHERE {conditions} ORDER BY created_at DESC LIMIT :limit"
     return list(db.query(sql, params))
+
+
+# ── Plan Approval & Spawning ──
+
+
+async def approve_and_spawn(
+    plan_id: str,
+    action: str = "approve",
+    feedback: str | None = None,
+    config: SpineConfig | None = None,
+) -> dict[str, Any]:
+    """Approve a planning work item and spawn execution tasks.
+
+    This is the bridge between the planning workflow and execution. When a plan
+    is approved via the spec & planning UI, this function:
+    1. Loads the plan's artifacts (spec.md, plan.md)
+    2. Resolves the plan into work units using the plan resolver
+    3. Spawns execution work items for each unit
+    4. Returns the spawned work IDs
+
+    Args:
+        plan_id: The ID of the approved planning work item.
+        action: One of "approve", "request_revision", or "reject".
+        feedback: Optional feedback text for revision requests.
+        config: Optional SpineConfig.
+
+    Returns:
+        A dict with keys: ``plan_id``, ``status``, ``spawned_ids``,
+        ``decomposition``.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    db = _get_work_db(config)
+    artifacts = ArtifactStore(base_path=config.artifact_path)
+    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
+
+    # Validate and fetch the plan work entry
+    try:
+        entry = db["work_entries"].get(plan_id)
+    except sqlite_utils.db.NotFoundError:
+        raise ValueError(f"Plan '{plan_id}' not found")
+
+    work_type = entry.get("work_type", "")
+    if work_type not in ("plan", "plan_spec", "plan_only", "critical_plan_only"):
+        raise ValueError(
+            f"Work item '{plan_id}' is not a planning work type (got '{work_type}')"
+        )
+
+    # Handle rejection
+    if action == "reject":
+        db["work_entries"].update(
+            plan_id,
+            {
+                "status": TaskStatus.REJECTED.value,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps({"action": "rejected", "feedback": feedback}),
+            },
+        )
+        audit.log_event(plan_id, "plan_rejected", "dispatcher", {"feedback": feedback})
+        return {"plan_id": plan_id, "status": "rejected", "spawned_ids": []}
+
+    # Handle revision request
+    if action == "request_revision":
+        db["work_entries"].update(
+            plan_id,
+            {
+                "status": TaskStatus.AWAITING_APPROVAL.value,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps({"action": "revision_requested", "feedback": feedback}),
+            },
+        )
+        audit.log_event(
+            plan_id, "plan_revision_requested", "dispatcher", {"feedback": feedback}
+        )
+        return {"plan_id": plan_id, "status": "awaiting_revision", "spawned_ids": []}
+
+    # Approve the plan
+    db["work_entries"].update(
+        plan_id,
+        {
+            "status": TaskStatus.APPROVED.value,
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+    audit.log_event(plan_id, "plan_approved", "dispatcher", {})
+
+    # Load the plan artifact
+    plan_content = ""
+    plan_path = artifacts.artifact_path(plan_id, "plan", "plan.md")
+    try:
+        plan_content = Path(plan_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Try alternative path
+        plan_path = artifacts.artifact_path(plan_id, "plan", "plan.txt")
+        plan_content = Path(plan_path).read_text(encoding="utf-8")
+
+    # Resolve plan to work units
+    from spine.work.plan_resolver import resolve_plan_to_units, create_work_spawn_specs
+
+    state = {
+        "work_id": plan_id,
+        "work_type": work_type,
+        "messages": [],
+    }
+
+    decomposition = await resolve_plan_to_units(
+        plan_content=plan_content,
+        work_type="quick",  # Default to quick for spawned tasks
+        state=state,
+    )
+
+    # Create spawn specs and submit work items
+    specs = create_work_spawn_specs(
+        decomposition=decomposition,
+        plan_id=plan_id,
+        base_description=entry.get("description", "Plan execution"),
+    )
+
+    spawned_ids: list[str] = []
+    for spec in specs:
+        result = await submit_work(
+            description=spec["description"],
+            work_type=spec.get("work_type", "quick"),
+            config=config,
+            plan_id=plan_id,
+        )
+        spawned_ids.append(result["work_id"])
+
+    # Update the plan entry with spawned work IDs
+    db["work_entries"].update(
+        plan_id,
+        {
+            "result": json.dumps(
+                {"approved": True, "spawned_ids": spawned_ids, "units_count": len(specs)}
+            ),
+        },
+    )
+
+    audit.log_event(
+        plan_id,
+        "plan_spawned_execution",
+        "dispatcher",
+        {"spawned_count": len(spawned_ids)},
+    )
+
+    return {
+        "plan_id": plan_id,
+        "status": "approved",
+        "spawned_ids": spawned_ids,
+        "decomposition": decomposition.model_dump(),
+    }
+
+
 
 
 # ── Resume work ──

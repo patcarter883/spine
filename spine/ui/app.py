@@ -92,11 +92,20 @@ def _human_review() -> None:
     render(api)
 
 
+def _spec_planning_render(api: UIApi) -> None:
+    from spine.ui._pages.spec_planning import render
+
+    render(api)
+
+
 pages = {
     "": [
         st.Page(_dashboard, title="Dashboard", icon="🏠", url_path="dashboard"),
         st.Page(_submit_work, title="Submit Work", icon="📝", url_path="submit"),
         st.Page(_queue, title="Queue", icon="🚦", url_path="queue"),
+    ],
+    "Planning": [
+        st.Page(lambda: _spec_planning_render(api), title="Spec & Planning", icon="📐", url_path="spec-planning"),
     ],
     "Work": [
         st.Page(_work_detail, title="Work Details", icon="🔍", url_path="work-detail"),

@@ -1,4 +1,8 @@
-"""SPINE Submit Work page — create new work items."""
+"""SPINE Submit Work page — create new work items (Quick work only).
+
+For Spec & Planning work, use the Spec & Planning page instead.
+The submit work page is restricted to quick work types for direct execution.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,10 @@ def render(api: UIApi) -> None:
 
     st.markdown(
         "Enter a work description and choose a workflow type. "
-        "SPINE will orchestrate the AI agent through the appropriate phases."
+        "SPINE will orchestrate the AI agent through the appropriate phases.\n\n"
+        "**Note:** This page is for **quick work types** only. "
+        "For Spec & Planning workflows (new feature planning, architecture), "
+        "use the **Spec & Planning** page instead."
     )
 
     # ── Input form ──
@@ -25,10 +32,8 @@ def render(api: UIApi) -> None:
 
     work_type = st.selectbox(
         "Workflow Type",
-        options=["spec", "critical_spec", "quick", "critical_quick"],
+        options=["quick", "critical_quick"],
         format_func=lambda x: {
-            "spec": "📐 Spec Work (SPECIFY → PLAN → CRITIC → TASKS → IMPLEMENT → VERIFY)",
-            "critical_spec": "🔒 Critical Spec (SPECIFY → CRITIC → PLAN → CRITIC → TASKS → CRITIC → IMPLEMENT → VERIFY)",
             "quick": "⚡ Quick Work (TASKS → IMPLEMENT → VERIFY)",
             "critical_quick": "🔒 Critical Quick (TASKS → CRITIC → IMPLEMENT → VERIFY)",
         }.get(x, x),
@@ -56,18 +61,21 @@ def render(api: UIApi) -> None:
     st.subheader("Workflow Types Reference")
 
     workflow_data = {
-        "Type": ["Quick", "Critical Quick", "Spec", "Critical Spec"],
+        "Type": ["Quick", "Critical Quick"],
         "Phases": [
             "TASKS → IMPLEMENT → VERIFY",
             "TASKS → CRITIC → IMPLEMENT → VERIFY",
-            "SPECIFY → PLAN → CRITIC → TASKS → IMPLEMENT → VERIFY",
-            "SPECIFY → CRITIC → PLAN → CRITIC → TASKS → CRITIC → IMPLEMENT → VERIFY",
         ],
         "Best For": [
             "Simple tasks, quick fixes",
             "Important quick tasks needing review",
-            "New features, greenfield work",
-            "Critical features, production changes",
         ],
     }
     st.table(workflow_data)
+
+    st.divider()
+    st.info(
+        "🔧 **For new feature planning, use the Spec & Planning page** from the "
+        "navigation menu. This allows you to review and approve specifications "
+        "and plans before spawning execution tasks."
+    )

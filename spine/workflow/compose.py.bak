@@ -22,10 +22,6 @@ Phase sequences by WorkType:
     spec:            SPECIFY → PLAN → CRITIC → TASKS → IMPLEMENT → VERIFY
     critical_spec:   SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN →
                      TASKS → CRITIC_TASKS → IMPLEMENT → VERIFY
-    plan:            SPECIFY → PLAN → CRITIC_PLAN (planning only, no execution)
-    plan_spec:       SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN
-    plan_only:       SPECIFY → PLAN → CRITIC_PLAN (no spec critic)
-    critical_plan_only: SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN
 """
 
 from typing import Any, Callable, Optional
@@ -323,26 +319,12 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
-    # Plan workflows - stop after plan phase, no execution spawned automatically
     WorkType.PLAN.value: [
         (PhaseName.SPECIFY.value, None),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
     ],
     WorkType.PLAN_SPEC.value: [
-        (PhaseName.SPECIFY.value, None),
-        (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
-        (PhaseName.PLAN.value, None),
-        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-    ],
-    # PLAN_ONLY and CRITICAL_PLAN_ONLY are aliases for PLAN and PLAN_SPEC
-    # Kept for backward compatibility with the original spec
-    WorkType.PLAN_ONLY.value: [
-        (PhaseName.SPECIFY.value, None),
-        (PhaseName.PLAN.value, None),
-        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-    ],
-    WorkType.CRITICAL_PLAN_ONLY.value: [
         (PhaseName.SPECIFY.value, None),
         (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),

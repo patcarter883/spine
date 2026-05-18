@@ -4,7 +4,11 @@
     "spec": "spine.workflow.studio:spec_graph",
     "critical_spec": "spine.workflow.studio:critical_spec_graph",
     "quick": "spine.workflow.studio:quick_graph",
-    "critical_quick": "spine.workflow.studio:critical_quick_graph"
+    "critical_quick": "spine.workflow.studio:critical_quick_graph",
+    "plan": "spine.workflow.studio:plan_graph",
+    "plan_spec": "spine.workflow.studio:plan_spec_graph",
+    "plan_only": "spine.workflow.studio:plan_only_graph",
+    "critical_plan_only": "spine.workflow.studio:critical_plan_only_graph"
   },
   "env": ".env"
 }

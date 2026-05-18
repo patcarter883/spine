@@ -25,6 +25,8 @@ class WorkType(str, Enum):
     CRITICAL_SPEC = "critical_spec"
     PLAN = "plan"
     PLAN_SPEC = "plan_spec"
+    PLAN_ONLY = "plan_only"
+    CRITICAL_PLAN_ONLY = "critical_plan_only"
 
 
 class ReviewStatus(str, Enum):
@@ -44,3 +46,6 @@ class TaskStatus(str, Enum):
     NEEDS_REVIEW = "needs_review"
     FAILED = "failed"
     STALLED = "stalled"
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
+    REJECTED = "rejected"
