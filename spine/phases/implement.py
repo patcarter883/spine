@@ -56,7 +56,10 @@ async def call_implement(
     Returns:
         Partial state update with implementation artifacts.
     """
-    description = state.get("description", "")  # noqa: F841 — reserved for feedback context
+    # NOTE: The original work description is NOT needed here — IMPLEMENT works
+    # from the feature slices and codebase map produced by TASKS (on disk),
+    # not from the raw description.  The only additional input beyond prior
+    # artifacts should be review feedback (critic gates, verify agent, human).
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0)

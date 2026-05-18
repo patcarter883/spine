@@ -39,9 +39,10 @@ async def _run_verify_agent(
     """Run the verify Deep Agent within the subgraph.
 
     Builds the agent from the subgraph state, materializes prior artifacts,
-    constructs the prompt, and invokes with retry.
+    constructs the prompt, and invokes with retry.  The original work
+    description is NOT included — VERIFY works from prior artifacts on
+    disk, not the raw description.
     """
-    description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     workspace_root = state.get("workspace_root", ".")
@@ -66,9 +67,6 @@ async def _run_verify_agent(
             "Verify that the implementation meets the requirements. "
             "Check that all feature slices are implemented correctly, "
             "the plan was followed, and the original task is complete.",
-            "",
-            "## Original Requirements",
-            description,
             "",
             "Prior artifacts are available on disk — read them as needed:",
         ]

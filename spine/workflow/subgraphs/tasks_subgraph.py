@@ -34,7 +34,13 @@ async def _run_tasks_agent(
     state: TasksSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the tasks Deep Agent within the subgraph."""
+    """Run the tasks Deep Agent within the subgraph.
+
+    For quick/critical_quick workflows, TASKS is the first phase so the
+    original description is included directly.  For spec/critical_spec
+    workflows, TASKS works from the specification and plan artifacts on
+    disk — the raw description is NOT included.
+    """
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
@@ -53,20 +59,15 @@ async def _run_tasks_agent(
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
 
-        prompt_lines = [
-            "Break the plan into smaller, executable feature slices "
-            "with clear dependencies.",
-            "",
-            "## Work Description",
-            description,
-            "",
-        ]
+        prompt_lines = []
+
         if has_spec:
+            # Spec/critical_spec: work from spec + plan artifacts, not the
+            # original description (already captured and expanded in them).
             prompt_lines.extend([
-                f"## Artifact Output Directory\n"
-                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
-                f"This is relative to your workspace root (`{workspace_root}`).\n"
-                f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
+                "Break the plan into smaller, executable feature slices "
+                "with clear dependencies.",
+                "",
                 "Prior artifacts are available on disk:",
                 f"- Specification: `{spec_path}/specification.md`",
                 f"- Plan: `{plan_path}/plan.md`",
@@ -75,13 +76,14 @@ async def _run_tasks_agent(
                 "",
             ])
         else:
+            # Quick/critical_quick: no prior artifacts — work from the
+            # original description and explore the codebase.
             prompt_lines.extend([
-                f"## Artifact Output Directory\n"
-                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
-                f"This is relative to your workspace root (`{workspace_root}`).\n"
-                f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
-                "This is a quick workflow — no specification or plan artifacts "
-                "exist. Work from the task description directly.",
+                "Break the work description into smaller, executable "
+                "feature slices with clear dependencies.",
+                "",
+                "## Work Description",
+                description,
                 "",
                 "Use researcher subagents via the interpreter (`eval`) to "
                 "explore the codebase in parallel.",
@@ -90,6 +92,13 @@ async def _run_tasks_agent(
                 "Better to produce slices with partial knowledge than none at all.",
                 "",
             ])
+
+        prompt_lines.extend([
+            f"## Artifact Output Directory\n"
+            f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
+            f"This is relative to your workspace root (`{workspace_root}`).\n"
+            f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
+        ])
         prompt_lines.extend([
             "## Instructions\n"
             "1. Explore the codebase (use researcher subagents via interpreter\n"
@@ -142,7 +151,6 @@ async def _save_tasks_artifacts(
     work_id = state.get("work_id", "unknown")
     agent_response = state.get("agent_response", "")
     existing_phase_status = state.get("phase_status", "")
-    description = state.get("description", "")
     work_type = state.get("work_type", "")
 
     if existing_phase_status in ("error", "needs_review"):
@@ -177,7 +185,6 @@ async def _save_tasks_artifacts(
         retry_agent = build_tasks_agent(dict(state), config)
         ctx = build_context(dict(state), PhaseName.TASKS)
         retry_prompt = (
-            f"## Work Description\n{description}\n\n"
             "**Write the task decomposition NOW.** "
             "Do NOT read any more files. Produce:\n\n"
             "1. A `tasks.md` summary listing 2-5 feature slices.\n"

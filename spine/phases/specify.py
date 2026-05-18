@@ -51,6 +51,13 @@ async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = 
     Returns:
         Partial state update with artifacts and status.
     """
+    # SPECIFY is the first phase in spec/critical_spec workflows — it is the
+    # ONLY phase that receives the raw work description.  The specification
+    # artifact it produces captures and expands on the description, so
+    # downstream phases (PLAN, TASKS, IMPLEMENT, VERIFY) work from artifacts
+    # on disk instead.  The only additional input to any phase beyond prior
+    # artifacts should be review feedback (from critic gates, verify agent,
+    # or human review).
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")

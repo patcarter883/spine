@@ -69,7 +69,9 @@ class WorkflowState(TypedDict, total=False):
 
     work_id: str
     work_type: str
-    description: str
+    description: str  # Original work description — only used by SPECIFY (first spec
+                      # phase) and TASKS (first quick-workflow phase). Downstream
+                      # phases work from artifacts on disk, not the raw description.
     current_phase: str
     phase_index: int
     retry_count: Annotated[dict, _merge_dicts]

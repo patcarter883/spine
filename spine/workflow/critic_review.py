@@ -155,12 +155,17 @@ async def agent_critic_check(
         )
 
         # Format the review request
+        # The original description is NOT included here — the critic reviews
+        # the artifact itself, which already captures and expands on the
+        # description.  Including the raw description biases the critic toward
+        # the original wording rather than evaluating the artifact's quality
+        # independently.  The only additional context beyond artifacts should be
+        # review feedback (from critic gates, verify agent, or human review).
         from spine.agents.artifacts import _artifact_path
 
         reviewed_path = _artifact_path(work_id, reviewed_phase)
         prompt = (
             f"Review the output of the {reviewed_phase} phase.\n\n"
-            f"Work description: {state.get('description', '')}\n\n"
             f"{artifact_preview}"
             f"Full artifact content is available on disk at "
             f"`{reviewed_path}/` — use `read_file` to "

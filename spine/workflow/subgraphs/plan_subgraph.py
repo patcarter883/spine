@@ -32,8 +32,12 @@ async def _run_plan_agent(
     state: PlanSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the plan Deep Agent within the subgraph."""
-    description = state.get("description", "")
+    """Run the plan Deep Agent within the subgraph.
+
+    The original work description is NOT included in the prompt — the
+    specification artifact from SPECIFY already captures and expands on
+    it.  PLAN works from the spec on disk, not the raw description.
+    """
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     workspace_root = state.get("workspace_root", ".")
@@ -49,7 +53,6 @@ async def _run_plan_agent(
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         prompt = (
             "Create a detailed implementation plan based on the specification.\n\n"
-            f"## Work Description\n{description}\n\n"
             f"Read the specification from `{spec_path}/specification.md`.\n\n"
             f"Write the plan to `{plan_path}/plan.md` using `write_file`."
         )
