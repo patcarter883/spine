@@ -409,3 +409,71 @@ class UIApi:
         """
         worker = get_worker(self._config)
         return worker.reset_stuck_items()
+
+    # ── Planning methods ──
+
+    def list_plans(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """List planning work items.
+
+        Args:
+            status: Optional filter by status.
+            limit: Max results.
+
+        Returns:
+            List of plan work item dicts.
+        """
+        from spine.work.dispatcher import list_plans as _list_plans
+
+        return _list_plans(status=status, limit=limit, config=self._config)
+
+    def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        """Get a single planning work item by ID."""
+        plans = self.list_plans(limit=1000)
+        for p in plans:
+            if p.get("id") == plan_id:
+                return p
+        return None
+
+    def get_plan_artifacts(self, plan_id: str) -> dict[str, str]:
+        """Get plan artifacts as {name: content}."""
+        artifacts: dict[str, str] = {}
+        for phase in ("specify", "plan", "critic"):
+            try:
+                arts = self.get_artifacts(plan_id, phase=phase)
+                artifacts.update(arts)
+            except Exception:
+                pass
+        return artifacts
+
+    def split_plan(
+        self,
+        plan_id: str,
+        tasks_text: str | None = None,
+        description_override: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Split an approved plan into execution work items.
+
+        Args:
+            plan_id: The approved planning work item ID.
+            tasks_text: Optional raw tasks text (default: read from disk).
+            description_override: If provided, overrides per-task descriptions.
+
+        Returns:
+            List of spawned work item dicts.
+        """
+        import asyncio
+        import concurrent.futures
+
+        from spine.work.dispatcher import split_work_plan as _split
+
+        def _run():
+            return asyncio.run(
+                _split(plan_id, tasks_text=tasks_text, description_override=description_override, config=self._config)
+            )
+
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        future = executor.submit(_run)
+        return future.result(timeout=120)
