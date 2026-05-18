@@ -1050,6 +1050,196 @@ async def restart_work(
     )
 
 
+async def restart_from_phase(
+    work_id: str,
+    phase_name: str,
+    config: SpineConfig | None = None,
+    clear_artifacts: bool = False,
+) -> dict[str, Any]:
+    """Restart a stalled/failed/running work item from a specific phase.
+
+    Unlike ``restart_work`` (which always starts from phase 0), this
+    rebuilds the graph so that ``START`` routes directly to the requested
+    phase.  Earlier phases are skipped; their artifacts are preserved
+    unless ``clear_artifacts`` is set.
+
+    Workflow:
+        1. Validate that the work item exists and is in a restartable status.
+        2. Validate that ``phase_name`` is a valid node for the work type.
+        3. Optionally clear on-disk artifacts for phases at or after the
+           target phase (earlier artifacts are always preserved).
+        4. Purge the LangGraph checkpoint so the graph starts fresh.
+        5. Rebuild the workflow graph with ``start_from_phase`` routing.
+        6. Re-invoke the graph with accumulated state from prior phases.
+
+    Args:
+        work_id: The work item ID to restart.
+        phase_name: The phase node to start from (e.g. ``"implement"``).
+        config: Optional SpineConfig.
+        clear_artifacts: If True, delete on-disk artifacts for the target
+            phase and all subsequent phases. Artifacts from earlier phases
+            are always preserved so they can be reused.
+
+    Returns:
+        A dict with keys ``work_id``, ``status``, ``work_type``, ``phase_name``.
+
+    Raises:
+        ValueError: If the work item is not in a restartable status,
+            the phase name is invalid, or the work item is not found.
+    """
+    if config is None:
+        config = SpineConfig.load()
+    config.ensure_dirs()
+
+    db = _get_work_db(config)
+
+    # ── Validate work item ──
+    try:
+        entry = db["work_entries"].get(work_id)
+    except sqlite_utils.db.NotFoundError:
+        raise ValueError(f"Work item '{work_id}' not found")
+
+    status = entry.get("status", "")
+    restartable = (
+        TaskStatus.RUNNING.value,
+        TaskStatus.STALLED.value,
+        TaskStatus.NEEDS_REVIEW.value,
+        TaskStatus.FAILED.value,
+    )
+    if status not in restartable:
+        raise ValueError(
+            f"Work item '{work_id}' is in '{status}' status — "
+            f"only {restartable} items can be restarted from a phase."
+        )
+
+    work_type = entry.get("work_type", "spec")
+    description = entry.get("description", "")
+
+    # ── Validate phase name ──
+    from spine.workflow.compose import get_restart_phases
+
+    valid_phases = get_restart_phases(work_type)
+    if phase_name not in valid_phases:
+        raise ValueError(
+            f"Phase '{phase_name}' is not valid for work type '{work_type}'. "
+            f"Valid phases: {valid_phases}"
+        )
+
+    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
+    artifact_store = ArtifactStore(base_path=config.artifact_path)
+
+    audit.log_event(
+        work_id,
+        "work_restarted_from_phase",
+        "dispatcher",
+        {
+            "previous_status": status,
+            "phase_name": phase_name,
+            "clear_artifacts": clear_artifacts,
+        },
+    )
+
+    # ── Optionally clear on-disk artifacts for target phase onwards ──
+    if clear_artifacts:
+        from spine.workflow.compose import WORKFLOW_SEQUENCES
+
+        sequence = WORKFLOW_SEQUENCES.get(work_type, [])
+        # Find the index of the target phase and clear from there onward
+        target_idx = next(
+            (i for i, (name, _) in enumerate(sequence) if name == phase_name),
+            len(sequence),
+        )
+        phases_to_clear = {
+            name for i, (name, _) in enumerate(sequence) if i >= target_idx
+        }
+        work_dir = Path(artifact_store._base) / work_id
+        if work_dir.exists():
+            for phase_dir in work_dir.iterdir():
+                if phase_dir.is_dir() and phase_dir.name in phases_to_clear:
+                    for f in phase_dir.rglob("*"):
+                        if f.is_file():
+                            f.unlink()
+                    logger.info(
+                        f"[{work_id}] Cleared artifacts for phase: {phase_dir.name}"
+                    )
+
+    # Purge LangGraph checkpoint so the graph starts fresh
+    from spine.persistence.checkpoint import CheckpointStore
+
+    checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+    saver = await checkpoint_store.get_checkpointer()
+    await saver.adelete_thread(work_id)
+    logger.info(f"[{work_id}] Purged checkpoint for restart from phase '{phase_name}'")
+
+    # ── Rebuild initial state (preserving prior artifacts) ──
+    # Load existing artifacts from disk so downstream phases can reuse them
+    existing_artifacts: dict[str, dict[str, str]] = {}
+    work_dir = Path(artifact_store._base) / work_id
+    if work_dir.exists():
+        for phase_dir in work_dir.iterdir():
+            if phase_dir.is_dir():
+                phase_artifacts: dict[str, str] = {}
+                for f in phase_dir.rglob("*"):
+                    if f.is_file():
+                        try:
+                            phase_artifacts[f.name] = f.read_text(encoding="utf-8")
+                        except (UnicodeDecodeError, OSError):
+                            # Skip binary/unreadable artifacts
+                            pass
+                if phase_artifacts:
+                    existing_artifacts[phase_dir.name] = phase_artifacts
+
+    # Find the phase_index for the target phase
+    from spine.workflow.compose import WORKFLOW_SEQUENCES as _SEQ
+
+    phase_seq = _SEQ.get(work_type, [])
+    phase_index = next(
+        (i for i, (name, _) in enumerate(phase_seq) if name == phase_name),
+        0,
+    )
+
+    initial_state: dict[str, Any] = {
+        "work_id": work_id,
+        "work_type": work_type,
+        "description": description,
+        "current_phase": phase_name,
+        "phase_index": phase_index,
+        "retry_count": {},
+        "max_retries": config.max_critic_retries,
+        "artifacts": existing_artifacts,
+        "feedback": [],
+        "status": "running",
+        "prompt_request": None,
+        "critic_reviewing": "",
+        "workspace_root": config.workspace_root,
+    }
+
+    # Mark as running in the work entries DB
+    db["work_entries"].update(
+        work_id,
+        {
+            "status": TaskStatus.RUNNING.value,
+            "current_phase": phase_name,
+            "updated_at": datetime.now().isoformat(),
+            "result": "{}",
+        },
+    )
+
+    # ── Rebuild and re-run the workflow graph from the target phase ──
+    return await _run_workflow_graph(
+        work_id=work_id,
+        work_type=work_type,
+        config=config,
+        db=db,
+        audit=audit,
+        artifact_store=artifact_store,
+        initial_state=initial_state,
+        checkpoint_store=checkpoint_store,
+        is_restart=True,
+        start_from_phase=phase_name,
+    )
+
+
 # ── Shared workflow execution logic (used by submit_work, resume_work, restart_work) ──
 
 
@@ -1064,15 +1254,21 @@ async def _run_workflow_graph(
     initial_state: dict[str, Any],
     checkpoint_store: CheckpointStore,
     is_restart: bool = False,
+    start_from_phase: str | None = None,
 ) -> dict[str, Any]:
     """Run a workflow graph to completion, streaming updates.
 
     This shared helper avoids the ~100-line duplication between
-    ``submit_work``, ``resume_work``, and ``restart_work``.
+    ``submit_work``, ``resume_work``, ``restart_work``, and
+    ``restart_from_phase``.
     """
     from spine.workflow.compose import build_workflow_graph
 
-    graph = build_workflow_graph(work_type, checkpointer=await checkpoint_store.get_checkpointer())
+    graph = build_workflow_graph(
+        work_type,
+        checkpointer=await checkpoint_store.get_checkpointer(),
+        start_from_phase=start_from_phase,
+    )
 
     thread_config = {
         "configurable": {

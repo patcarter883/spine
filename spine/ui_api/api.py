@@ -397,6 +397,77 @@ class UIApi:
             "action": "restart",
         }
 
+    def restart_from_phase(
+        self,
+        work_id: str,
+        phase_name: str,
+        clear_artifacts: bool = False,
+    ) -> dict[str, Any]:
+        """Restart a work item from a specific phase.
+
+        Unlike ``restart_work`` (which starts from phase 0), this
+        rebuilds the graph so that the START edge routes directly
+        to the requested phase. Earlier phases and their artifacts
+        are preserved.
+
+        Non-blocking: runs the restart in the background via
+        RalphLoopWorker's executor and returns immediately.
+
+        Args:
+            work_id: The work item ID to restart.
+            phase_name: The phase to start from (e.g. ``"implement"``).
+            clear_artifacts: If True, delete on-disk artifacts for the
+                target phase and all subsequent phases. Earlier artifacts
+                are always preserved.
+
+        Returns:
+            Dict with work_id, status, phase_name, and action.
+        """
+        from spine.work.dispatcher import restart_from_phase as _async_restart
+
+        import concurrent.futures
+
+        # Mark the work entry as running immediately so the UI
+        # shows progress right away.
+        self._mark_running(work_id)
+
+        def _run() -> None:
+            import asyncio
+
+            asyncio.run(
+                _async_restart(work_id, phase_name, self._config, clear_artifacts=clear_artifacts)
+            )
+
+        # Submit to the worker's executor (or a fresh one)
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        executor.submit(_run)
+
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.RUNNING.value,
+            "phase_name": phase_name,
+            "action": "restart_from_phase",
+        }
+
+    def get_restart_phases(self, work_type: str) -> list[str]:
+        """Return valid phase names for restart_from_phase for a work type.
+
+        Filters out critic nodes since restarting into a critic doesn't
+        make sense. Used by the UI to populate the phase dropdown.
+
+        Args:
+            work_type: One of the valid WorkType values.
+
+        Returns:
+            Sorted list of non-critic phase names.
+        """
+        from spine.workflow.compose import get_restart_phases as _get_phases
+
+        return _get_phases(work_type)
+
     def reset_stuck_items(self) -> int:
         """Reset any queue items stuck in 'running' back to 'pending'.
 

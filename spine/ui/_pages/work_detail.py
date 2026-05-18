@@ -243,6 +243,46 @@ def render(api: UIApi) -> None:
     # NOTE: These are NOT inside a fragment so that text_area input
     # is preserved and not cleared on fragment re-renders.
     status = entry.get("status", "unknown")
+    work_type = entry.get("work_type", "quick")
+    current_phase = entry.get("current_phase", "")
+
+    # Helper: render "Restart from Phase" section
+    def _render_restart_from_phase(work_id: str, work_type: str, current_phase: str) -> None:
+        """Render a phase selector and restart-from-phase button."""
+        valid_phases = api.get_restart_phases(work_type)
+        if not valid_phases:
+            return
+
+        # Default to the current phase if it's valid, otherwise the first phase
+        default_idx = 0
+        if current_phase in valid_phases:
+            default_idx = valid_phases.index(current_phase)
+
+        selected_phase = st.selectbox(
+            "Restart from phase",
+            valid_phases,
+            index=default_idx,
+            key=f"restart_phase_{work_id}",
+            help="Select which phase to re-run from. Earlier phases and their artifacts are preserved.",
+        )
+        clear = st.checkbox(
+            "Clear artifacts from this phase onward",
+            key=f"clear_phase_artifacts_{work_id}",
+            help="Delete on-disk artifacts for the selected phase and later. "
+            "Earlier artifacts are always preserved.",
+        )
+        if st.button(
+            f"▶ Restart from {selected_phase}",
+            key=f"restart_phase_btn_{work_id}",
+        ):
+            result = api.restart_from_phase(work_id, selected_phase, clear_artifacts=clear)
+            st.success(
+                f"Restarted from **{selected_phase}**! "
+                f"Status: {result['status']} | Action: {result['action']}. "
+                "The workflow will continue from the selected phase."
+            )
+            st.rerun()
+
     if status == "needs_review":
         st.warning("This work item needs human review.")
 
@@ -294,6 +334,10 @@ def render(api: UIApi) -> None:
                     st.rerun()
 
         st.divider()
+        st.caption("Or restart from a specific phase (discarding accumulated feedback):")
+        _render_restart_from_phase(work_id, work_type, current_phase)
+
+        st.divider()
         st.caption("Or restart from phase 0 (discarding accumulated feedback):")
         if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
             clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
@@ -306,18 +350,30 @@ def render(api: UIApi) -> None:
     elif status == "running":
         st.info("Work is currently in progress. Updates will appear automatically.")
 
-        if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
-            clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
-            result = api.restart_work(work_id, clear_artifacts=clear)
-            st.success(
-                f"Restarted! Status: {result['status']} | Action: {result['action']}. "
-                "The workflow will re-run from the beginning."
-            )
-            st.rerun()
+        with st.expander("🔄 Restart options"):
+            _render_restart_from_phase(work_id, work_type, current_phase)
+
+            st.divider()
+            if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
+                clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+                result = api.restart_work(work_id, clear_artifacts=clear)
+                st.success(
+                    f"Restarted! Status: {result['status']} | Action: {result['action']}. "
+                    "The workflow will re-run from the beginning."
+                )
+                st.rerun()
 
     elif status == "stalled":
         st.warning("This work item has stalled (no progress within the timeout).")
 
+        st.subheader("Restart Options")
+        st.caption(
+            "Restart from a specific phase to resume from where the stall occurred, "
+            "or restart from phase 0 to re-run the entire workflow."
+        )
+        _render_restart_from_phase(work_id, work_type, current_phase)
+
+        st.divider()
         if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
             clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
             result = api.restart_work(work_id, clear_artifacts=clear)

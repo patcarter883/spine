@@ -441,6 +441,7 @@ def _gate_node_name(source_node: str, next_node: str) -> str:
 def build_workflow_graph(
     work_type: str,
     checkpointer: BaseCheckpointSaver | None = None,
+    start_from_phase: str | None = None,
 ) -> Any:
     """Build a compiled LangGraph StateGraph for the given work type.
 
@@ -454,8 +455,13 @@ def build_workflow_graph(
     critic instances in a single workflow (e.g. critical_spec has 3).
 
     Args:
-        work_type: One of "quick", "critical_quick", "spec", "critical_spec".
+        work_type: One of "quick", "critical_quick", "spec", "critical_spec",
+            "plan", "plan_spec".
         checkpointer: Optional BaseCheckpointSaver for persistence.
+        start_from_phase: Optional phase name to start execution from.
+            When set, the START edge routes directly to this phase instead
+            of the first phase in the sequence. Used by restart_from_phase
+            to resume a stalled job partway through the workflow.
 
     Returns:
         A compiled StateGraph ready for ``.invoke()`` or ``.stream()``.
@@ -470,6 +476,15 @@ def build_workflow_graph(
 
     phase_seq = WORKFLOW_SEQUENCES[work_type]
     registry = get_registry()
+
+    # Validate start_from_phase if provided
+    if start_from_phase is not None:
+        valid_nodes = {name for name, _ in phase_seq}
+        if start_from_phase not in valid_nodes:
+            raise ValueError(
+                f"Phase '{start_from_phase}' is not a valid node for work type "
+                f"'{work_type}'. Valid nodes: {sorted(valid_nodes)}"
+            )
 
     # ── Build the graph ──
     graph = StateGraph(WorkflowState)
@@ -608,7 +623,10 @@ def build_workflow_graph(
         )
 
     # Wire the graph
-    graph.add_edge(START, phase_seq[0][0])
+    if start_from_phase:
+        graph.add_edge(START, start_from_phase)
+    else:
+        graph.add_edge(START, phase_seq[0][0])
 
     for i, (node_name, reviewed_phase) in enumerate(phase_seq):
             is_last = i == len(phase_seq) - 1
@@ -708,3 +726,28 @@ def _make_critic_node(
         return result
 
     return critic_node
+
+
+def get_restart_phases(work_type: str) -> list[str]:
+    """Return the list of valid phase names for restart_from_phase.
+
+    Filters out critic nodes since restarting into a critic doesn't
+    make sense — the critic is always called after its reviewed phase.
+
+    Args:
+        work_type: One of the valid WorkType values.
+
+    Returns:
+        Sorted list of non-critic phase names from the workflow sequence.
+
+    Raises:
+        ValueError: If the work_type is not recognised.
+    """
+    if work_type not in WORKFLOW_SEQUENCES:
+        raise ValueError(
+            f"Unknown work type '{work_type}'. Must be one of: {list(WORKFLOW_SEQUENCES.keys())}"
+        )
+    return sorted(
+        name for name, _ in WORKFLOW_SEQUENCES[work_type]
+        if not name.startswith(PhaseName.CRITIC.value)
+    )
