@@ -83,14 +83,14 @@ async def _get_phase_checkpointer(
 # These are fallbacks — the subgraph wrapper reads SpineConfig.phase_timeouts
 # at invocation time so users can override via config.yaml.
 _PHASE_TIMEOUTS: dict[str, int] = {
-    "specify": 600,
-    "plan": 600,
-    "tasks": 900,
-    "implement": 1800,
-    "verify": 600,
-    "critic": 300,
+    "specify": 0,
+    "plan": 0,
+    "tasks": 0,
+    "implement": 0,
+    "verify": 0,
+    "critic": 0,
 }
-_DEFAULT_PHASE_TIMEOUT = 900
+_DEFAULT_PHASE_TIMEOUT = 0
 
 
 def _resolve_timeout(phase: str, config: RunnableConfig | None = None) -> int:
@@ -218,8 +218,9 @@ def make_subgraph_node(
         work_id = parent_state.get("work_id", "unknown")
         timeout = _resolve_timeout(phase_name, config)
 
+        timeout_label = f"timeout={timeout}s" if timeout > 0 else "no timeout"
         logger.info(
-            f"[{work_id}] [{phase_name}] subgraph starting (timeout={timeout}s)"
+            f"[{work_id}] [{phase_name}] subgraph starting ({timeout_label})"
         )
 
         try:
@@ -262,11 +263,12 @@ def make_subgraph_node(
                             exc_info=True,
                         )
 
-            # Invoke with timeout
-            result = await asyncio.wait_for(
-                active_subgraph.ainvoke(subgraph_input, subgraph_config),
-                timeout=timeout,
-            )
+            # Invoke with or without timeout (0 = no timeout)
+            raw_coro = active_subgraph.ainvoke(subgraph_input, subgraph_config)
+            if timeout > 0:
+                result = await asyncio.wait_for(raw_coro, timeout=timeout)
+            else:
+                result = await raw_coro
 
             # Map subgraph result back to parent state
             parent_update = result_mapper(result, parent_state)

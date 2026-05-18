@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_tasks(
+    state: WorkflowState, config: Optional[RunnableConfig] = None
+) -> dict[str, Any]:
     """Execute the TASKS phase.
 
     Delegates to the tasks Deep Agent, which decomposes the plan into
@@ -52,7 +54,7 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
     Returns:
         Partial state update with task artifacts.
     """
-    description = state.get("description", "")
+    description = state.get("description", "")  # noqa: F841
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.TASKS.value, 0)
@@ -77,57 +79,71 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
         # The agent needs the full work_id-scoped path to write slice files.
         tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
 
-        prompt_lines = [
-            "Break the plan into smaller, executable feature slices "
-            "with clear dependencies.",
-            "",
-            "## Work Description",
-            description,
-            "",
-            f"## Artifact Output Directory\n"
-            f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
-            f"Use this relative path with `write_file` — do NOT construct absolute paths.\n",
-        ]
+        prompt_lines = []
         if has_spec:
-            prompt_lines.extend([
-                "Prior artifacts are available on disk:",
-                f"- Specification: `{spec_path}/specification.md`",
-                f"- Plan: `{plan_path}/plan.md`",
-                "",
-                "Read them with `read_file` before decomposing.",
-                "",
-            ])
+            # Spec/critical_spec: work from spec + plan artifacts, not the
+            # original description (already captured and expanded in them).
+            prompt_lines.extend(
+                [
+                    "Break the plan into smaller, executable feature slices "
+                    "with clear dependencies.",
+                    "",
+                    "Prior artifacts are available on disk:",
+                    f"- Specification: `{spec_path}/specification.md`",
+                    f"- Plan: `{plan_path}/plan.md`",
+                    "",
+                    "Read them with `read_file` before decomposing.",
+                    "",
+                ]
+            )
         else:
-            prompt_lines.extend([
-                "This is a quick workflow — no specification or plan artifacts "
-                "exist. Work from the task description directly.",
-                "",
-                "Use researcher subagents via the interpreter (`eval`) to "
-                "explore the codebase in parallel — your system prompt has "
-                "the detailed strategy. Focus 2-3 researchers on the modules "
-                "most relevant to this task, then synthesize into slices.",
-                "",
-                "Spend at most 2-3 turns on exploration before writing. "
-                "Better to produce slices with partial knowledge than none at all.",
-                "",
-            ])
-        prompt_lines.extend([
-            f"## Instructions\n"
-            f"1. Explore the codebase (use researcher subagents via the interpreter\n"
-            f"   for parallel exploration, or `read_file`/`grep` for quick checks).\n"
-            f"2. After exploring, write individual `slice-<name>.md` files using\n"
-            f"   `write_file` to `{tasks_artifact_dir}/slice-<name>.md`.\n"
-            f"3. Write a summary `tasks.md` to `{tasks_artifact_dir}/tasks.md`\n"
-            f"   that references each slice.\n"
-            f"4. **You MUST call `write_file`** — do not just describe the slices\n"
-            f"   in conversation. Write them to disk.\n"
-            f"5. Write a `codebase-map.md` to `{tasks_artifact_dir}/codebase-map.md` that captures your exploration findings:\n"
-            f"   - File paths with descriptions (what each file does)\n"
-            f"   - Key classes and functions (names, signatures)\n"
-            f"   - Import chains between relevant modules\n"
-            f"   - Conventions discovered (naming, patterns, error handling)\n"
-            f"   This map will be read by the implement and verify phases — it saves them from re-exploring the codebase.\n",
-        ])
+            # Quick/critical_quick: no prior artifacts — work from the
+            # original description and explore the codebase.
+            prompt_lines.extend(
+                [
+                    "Break the work description into smaller, executable "
+                    "feature slices with clear dependencies.",
+                    "",
+                    "## Work Description",
+                    description,
+                    "",
+                    "Use researcher subagents via the interpreter (`eval`) to "
+                    "explore the codebase in parallel — your system prompt has "
+                    "the detailed strategy. Focus 2-3 researchers on the modules "
+                    "most relevant to this task, then synthesize into slices.",
+                    "",
+                    "Spend at most 2-3 turns on exploration before writing. "
+                    "Better to produce slices with partial knowledge than none at all.",
+                    "",
+                ]
+            )
+
+        prompt_lines.extend(
+            [
+                f"## Artifact Output Directory\n"
+                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
+                f"Use this relative path with `write_file` — do NOT construct absolute paths.\n",
+            ]
+        )
+        prompt_lines.extend(
+            [
+                f"## Instructions\n"
+                f"1. Explore the codebase (use researcher subagents via the interpreter\n"
+                f"   for parallel exploration, or `read_file`/`grep` for quick checks).\n"
+                f"2. After exploring, write individual `slice-<name>.md` files using\n"
+                f"   `write_file` to `{tasks_artifact_dir}/slice-<name>.md`.\n"
+                f"3. Write a summary `tasks.md` to `{tasks_artifact_dir}/tasks.md`\n"
+                f"   that references each slice.\n"
+                f"4. **You MUST call `write_file`** — do not just describe the slices\n"
+                f"   in conversation. Write them to disk.\n"
+                f"5. Write a `codebase-map.md` to `{tasks_artifact_dir}/codebase-map.md` that captures your exploration findings:\n"
+                f"   - File paths with descriptions (what each file does)\n"
+                f"   - Key classes and functions (names, signatures)\n"
+                f"   - Import chains between relevant modules\n"
+                f"   - Conventions discovered (naming, patterns, error handling)\n"
+                f"   This map will be read by the implement and verify phases — it saves them from re-exploring the codebase.\n",
+            ]
+        )
         prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
@@ -154,7 +170,9 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
         # DeepSeek-v4-flash), the last message content is chain-of-thought
         # reasoning that should NOT become an artifact.
         disk_artifacts = scan_artifact_dir(
-            workspace_root, work_id, PhaseName.TASKS.value,
+            workspace_root,
+            work_id,
+            PhaseName.TASKS.value,
             max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
         )
 
@@ -206,7 +224,9 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
             )
             # Scan disk again after retry
             disk_artifacts = scan_artifact_dir(
-                workspace_root, work_id, PhaseName.TASKS.value,
+                workspace_root,
+                work_id,
+                PhaseName.TASKS.value,
                 max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
             )
 
@@ -232,18 +252,20 @@ async def call_tasks(state: WorkflowState, config: Optional[RunnableConfig] = No
                     "artifacts": {PhaseName.TASKS.value: {}},
                     "current_phase": PhaseName.TASKS.value,
                     "status": "needs_review",
-                    "feedback": [{
-                        "status": "needs_review",
-                        "tier": "structural",
-                        "reason": (
-                            "Tasks agent produced no output after retry. "
-                            "The model may need human guidance to decompose this work."
-                        ),
-                        "suggestions": [
-                            "Provide more specific instructions in the work description",
-                            "Use a spec/critical_spec workflow type instead of quick",
-                        ],
-                    }],
+                    "feedback": [
+                        {
+                            "status": "needs_review",
+                            "tier": "structural",
+                            "reason": (
+                                "Tasks agent produced no output after retry. "
+                                "The model may need human guidance to decompose this work."
+                            ),
+                            "suggestions": [
+                                "Provide more specific instructions in the work description",
+                                "Use a spec/critical_spec workflow type instead of quick",
+                            ],
+                        }
+                    ],
                     "prompt_request": None,
                 }
 

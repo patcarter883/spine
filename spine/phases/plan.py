@@ -23,13 +23,19 @@ from spine.agents.plan_agent import build_plan_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
-from spine.agents.artifacts import materialize_artifacts, materialize_phase_artifacts, _artifact_path
+from spine.agents.artifacts import (
+    materialize_artifacts,
+    materialize_phase_artifacts,
+    _artifact_path,
+)
 from spine.workflow.registry import get_registry
 
 logger = logging.getLogger(__name__)
 
 
-async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_plan(
+    state: WorkflowState, config: Optional[RunnableConfig] = None
+) -> dict[str, Any]:
     """Execute the PLAN phase.
 
     Delegates to the plan Deep Agent, which designs the technical architecture
@@ -42,7 +48,7 @@ async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = Non
     Returns:
         Partial state update with plan artifacts.
     """
-    description = state.get("description", "")
+    description = state.get("description", "")  # noqa: F841
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
@@ -57,11 +63,12 @@ async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = Non
         # Materialize prior artifacts to disk
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — specification is on disk at work_id-scoped path
+        # Build prompt — specification is on disk at work_id-scoped path.
+        # The original description is intentionally NOT re-included — the
+        # specification file already captures and expands on it.
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         prompt = (
-            f"Create a detailed technical plan based on the specification.\n\n"
-            f"## Work Description\n{description}\n\n"
+            "Create a detailed technical plan based on the specification.\n\n"
             f"The full specification is available on disk at "
             f"`{spec_path}/specification.md` — read it with "
             f"`read_file` before planning.\n\n"
@@ -89,7 +96,9 @@ async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = Non
 
         # Materialize this phase's artifacts to disk immediately
         phase_artifacts = {"plan.md": plan_content}
-        materialize_phase_artifacts(PhaseName.PLAN.value, phase_artifacts, workspace_root, work_id=work_id)
+        materialize_phase_artifacts(
+            PhaseName.PLAN.value, phase_artifacts, workspace_root, work_id=work_id
+        )
 
         return {
             "artifacts": {PhaseName.PLAN.value: phase_artifacts},
@@ -109,6 +118,8 @@ async def call_plan(state: WorkflowState, config: Optional[RunnableConfig] = Non
                 "phase": PhaseName.PLAN.value,
             },
         }
+
+
 _registry = get_registry()
 _registry.register(
     name=PhaseName.PLAN.value,

@@ -42,7 +42,9 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_verify(
+    state: WorkflowState, config: Optional[RunnableConfig] = None
+) -> dict[str, Any]:
     """Execute the VERIFY phase.
 
     Delegates to the verify Deep Agent, which reviews all artifacts
@@ -55,7 +57,7 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
     Returns:
         Partial state update with verification artifacts and final status.
     """
-    description = state.get("description", "")
+    # description intentionally not needed for verify — work from artifacts
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     workspace_root = state.get("workspace_root", ".")
@@ -68,9 +70,8 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
         # Materialize prior artifacts to disk
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — all prior artifacts are on disk, NOT inlined.
-        # Skip spec/plan references for quick workflows that lack them.
-        has_spec = "spec" in work_type
+        # Build prompt — work from the feature slices, not the original
+        # description (already captured and expanded in the upstream artifacts).
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
@@ -81,17 +82,9 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
             "Check that all feature slices are implemented correctly, "
             "the plan was followed, and the original task is complete.",
             "",
-            "## Original Requirements",
-            description,
-            "",
             "Prior artifacts are available on disk — read them as needed:",
-        ]
-        if has_spec:
-            prompt_lines.extend([
-                f"- Specification: `{spec_path}/specification.md`",
-                f"- Plan: `{plan_path}/plan.md`",
-            ])
-        prompt_lines.extend([
+            f"- Specification: `{spec_path}/specification.md`",
+            f"- Plan: `{plan_path}/plan.md`",
             f"- Feature Slices: `{tasks_path}/tasks.md`",
             f"- Codebase map: `{tasks_path}/codebase-map.md`",
             f"- Implementation: `{impl_path}/implementation.md`",
@@ -112,7 +105,7 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
             "`Promise.allSettled(tools.task(...))`. Synthesize the "
             "verification report from subagent results in code — do NOT "
             "re-read each slice file manually into conversation.",
-        ])
+        ]
         prompt = "\n".join(prompt_lines)
 
         ctx = build_context(state, PhaseName.VERIFY)
@@ -130,7 +123,9 @@ async def call_verify(state: WorkflowState, config: Optional[RunnableConfig] = N
 
         # ── Collect artifacts from disk (agent writes via write_file) ─────
         disk_artifacts = scan_artifact_dir(
-            workspace_root, work_id, PhaseName.VERIFY.value,
+            workspace_root,
+            work_id,
+            PhaseName.VERIFY.value,
             max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
         )
 

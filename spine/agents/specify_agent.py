@@ -58,9 +58,6 @@ def build_specify_agent(
         "4. Interfaces — API endpoints, data models, contracts\n"
         "5. Success criteria — measurable outcomes\n\n"
         "Be specific and technical. Avoid vague language.\n\n"
-        "Prior artifacts from earlier phases are available on disk — "
-        "use `read_file` and `grep` to inspect them when needed. "
-        "Do NOT load everything into context at once.\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
         "```python\n"
         + f'globalThis.context = {{"work_id": "{work_id}", "phase": "specify", "artifact_dir": ".spine/artifacts/{work_id}/specify"}};\\n'

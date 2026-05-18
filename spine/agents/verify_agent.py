@@ -67,6 +67,26 @@ def build_verify_agent(
         "- Checklist of each feature slice and its status\n"
         "- Any gaps or issues found\n"
         "- Write verification.md to disk\n\n"
+        "## Subagent Dispatch — CRITICAL\n"
+        "When dispatching a `slice-verifier` subagent, the task description "
+        "MUST be self-contained. The subagent starts with an empty context — "
+        "it cannot see your conversation history. Compose the description from:\n"
+        "1. The full content of the slice file (read it first, then embed it)\n"
+        "2. Relevant entries from codebase-map.md for files this slice touches\n"
+        "3. The list of files to verify\n"
+        "4. The acceptance criteria from the slice\n\n"
+        "Example task() call:\n"
+        "```\n"
+        "tools.task({\n"
+        '  subagent_type: "slice-verifier",\n'
+        "  description: `Verify slice: cli-plan-commands\\n\\n`\n"
+        "    + `## Slice Definition\\n${sliceContent}\\n\\n`\n"
+        "    + `## Files to Verify\\n- spine/cli/__init__.py\\n`\n"
+        "    + `## Acceptance Criteria\\n1. spine plan ...\\n`\n"
+        "})\n"
+        "```\n"
+        "Do NOT just pass the slice name — the subagent will have to "
+        "re-read everything from scratch.\n\n"
         "## Rules\n"
         "- Batch reads: never read one file at a time\n"
         "- Use eval for parallel subagent dispatch\n"
@@ -79,9 +99,7 @@ def build_verify_agent(
         + build_current_phase_write_prompt(
             work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
         )
-        + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
-        )
+        + build_artifact_prompt(state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id)
     )
 
     agent = build_phase_agent(

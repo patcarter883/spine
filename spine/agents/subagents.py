@@ -46,9 +46,7 @@ class ResearchFindings(BaseModel):
     """Structured output from the researcher subagent."""
 
     summary: str = Field(description="Concise summary of findings (2-3 paragraphs)")
-    patterns: list[str] = Field(
-        description="Notable patterns, conventions, or idioms discovered"
-    )
+    patterns: list[str] = Field(description="Notable patterns, conventions, or idioms discovered")
     file_map: dict[str, str] = Field(
         description="Mapping of important file paths to brief descriptions"
     )
@@ -63,12 +61,8 @@ class SliceResult(BaseModel):
     status: str = Field(description="One of: implemented, partial, blocked")
     files_modified: list[str] = Field(description="Files that were modified")
     files_created: list[str] = Field(description="Files that were created")
-    test_results: str = Field(
-        description="Summary of test/lint outcomes for this slice"
-    )
-    issues: list[str] = Field(
-        description="Unresolved issues or blockers (empty if none)"
-    )
+    test_results: str = Field(description="Summary of test/lint outcomes for this slice")
+    issues: list[str] = Field(description="Unresolved issues or blockers (empty if none)")
 
 
 class CheckItem(BaseModel):
@@ -83,15 +77,9 @@ class VerificationResult(BaseModel):
     """Structured output from the slice-verifier subagent."""
 
     verdict: str = Field(description="One of: VERIFIED, NOT_VERIFIED")
-    checklist: list[CheckItem] = Field(
-        description="Verification checklist results"
-    )
-    gaps: list[str] = Field(
-        description="Gaps or missing items found (empty if none)"
-    )
-    recommendations: list[str] = Field(
-        description="Suggested improvements (empty if none)"
-    )
+    checklist: list[CheckItem] = Field(description="Verification checklist results")
+    gaps: list[str] = Field(description="Gaps or missing items found (empty if none)")
+    recommendations: list[str] = Field(description="Suggested improvements (empty if none)")
 
 
 # ── Subagent descriptions ──────────────────────────────────────────────
@@ -146,48 +134,52 @@ SUBAGENT_PROMPTS: dict[str, str] = {
     "slice-implementer": (
         "YOU MUST USE TOOLS. Do not describe changes — make them with "
         "write_file and edit_file, then verify with execute.\n"
-        "You are a code implementer. Your job is to implement the single "
-        "feature slice described in the task.\n\n"
+        "You are a code implementer. Your task description contains "
+        "the full slice definition, relevant codebase context, and "
+        "files to modify — read it carefully before starting.\n\n"
         "Guidelines:\n"
-        "1. Read the slice definition, codebase-map.md, and any referenced prior artifacts "
-        "(batch reads).\n"
-        "2. Write clean, well-documented code following project conventions.\n"
-        "3. Include appropriate type annotations and docstrings.\n"
-        "4. Handle errors gracefully.\n"
-        "5. Run tests and linters for your slice.\n"
-        "6. Fix any errors found.\n"
-        "7. Report exactly what you changed and any remaining issues.\n"
-        "8. Batch reads: read 3-5 files per turn, not one at a time.\n\n"
+        "1. Review the slice definition, acceptance criteria, and "
+        "codebase context provided in your task description.\n"
+        "2. Read any additional source files you need to inspect "
+        "(batch reads — ≥3 files per turn).\n"
+        "3. Write clean, well-documented code following project conventions.\n"
+        "4. Include appropriate type annotations and docstrings.\n"
+        "5. Handle errors gracefully.\n"
+        "6. Run tests and linters for your slice.\n"
+        "7. Fix any errors found.\n"
+        "8. Report exactly what you changed and any remaining issues.\n\n"
         "Focus on this slice only — do not modify files outside its scope.\n"
         "If you are blocked by a missing dependency from another slice, "
         "report it as an issue rather than trying to implement that "
         "dependency.\n\n"
         "End with a structured result:\n"
         "```json\n"
-        "{\"status\": \"implemented|partial|blocked\", \"files_modified\": [...], "
-        "\"files_created\": [...], \"test_results\": \"...\", \"issues\": [...]}\n"
+        '{"status": "implemented|partial|blocked", "files_modified": [...], '
+        '"files_created": [...], "test_results": "...", "issues": [...]}\n'
         "```\n"
     ),
     "slice-verifier": (
         "YOU MUST USE TOOLS. Do not verify from memory — inspect actual files "
         "and run actual tests.\n"
-        "You are a verification engineer. Your job is to verify the single "
-        "feature slice described in the task against its acceptance criteria.\n\n"
+        "You are a verification engineer. Your task description contains "
+        "the full slice definition, acceptance criteria, and files to verify — "
+        "read it carefully before starting.\n\n"
         "Guidelines:\n"
-        "1. Read the slice definition, codebase-map.md, and its acceptance criteria.\n"
-        "2. Inspect the implemented files — use read_file and ls.\n"
+        "1. Review the slice definition and acceptance criteria from your "
+        "task description.\n"
+        "2. Inspect the implemented files — use read_file and ls "
+        "(batch reads — ≥3 files per turn).\n"
         "3. Run relevant tests and linters.\n"
         "4. Check each acceptance criterion individually.\n"
-        "5. Produce a structured verification report.\n"
-        "6. Batch reads: read 3-5 files per turn, not one at a time.\n\n"
+        "5. Produce a structured verification report.\n\n"
         "IMPORTANT: You are report-only. Do not fix issues you find.\n"
         "If a test fails or a criterion is not met, record it in the "
         "checklist and gaps. Your job is to provide evidence, not to repair.\n\n"
         "End with a structured verification result:\n"
         "```json\n"
-        "{\"verdict\": \"VERIFIED|NOT_VERIFIED\", \"checklist\": "
-        "[{\"criterion\": \"...\", \"passed\": true, \"detail\": \"...\"}], "
-        "\"gaps\": [...], \"recommendations\": [...]}\n"
+        '{"verdict": "VERIFIED|NOT_VERIFIED", "checklist": '
+        '[{"criterion": "...", "passed": true, "detail": "..."}], '
+        '"gaps": [...], "recommendations": [...]}\n'
         "```\n"
     ),
 }
@@ -281,10 +273,7 @@ def build_subagent_spec(
         ValueError: If the subagent name is not recognised.
     """
     if name not in SUBAGENT_DESCRIPTIONS:
-        raise ValueError(
-            f"Unknown subagent {name!r}. "
-            f"Available: {sorted(SUBAGENT_DESCRIPTIONS)}"
-        )
+        raise ValueError(f"Unknown subagent {name!r}. Available: {sorted(SUBAGENT_DESCRIPTIONS)}")
 
     from spine.agents.helpers import resolve_model
     from spine.agents.skills_resolver import resolve_memory

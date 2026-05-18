@@ -41,7 +41,9 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_implement(
+    state: WorkflowState, config: Optional[RunnableConfig] = None
+) -> dict[str, Any]:
     """Execute the IMPLEMENT phase.
 
     Delegates to the implement Deep Agent, which writes code for each
@@ -54,7 +56,7 @@ async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] 
     Returns:
         Partial state update with implementation artifacts.
     """
-    description = state.get("description", "")
+    description = state.get("description", "")  # noqa: F841 — reserved for feedback context
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0)
@@ -80,34 +82,26 @@ async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] 
             "Implement the feature slices described below. Write clean, "
             "production-quality code for each slice.",
             "",
-            "## Work Description",
-            description,
-            "",
+            "## Task Input",
+            "Work from the feature slice files and codebase map produced by the TASKS phase.",
         ]
         if has_spec:
-            prompt_lines.extend([
-                "Prior artifacts are available on disk — read them as needed:",
-                f"- Specification: `{spec_path}/specification.md`",
-                f"- Plan: `{plan_path}/plan.md`",
-                f"- Feature Slices: `{tasks_path}/tasks.md`",
+            prompt_lines.extend(
+                [
+                    f"- Specification: `{spec_path}/specification.md`",
+                    f"- Plan: `{plan_path}/plan.md`",
+                ]
+            )
+        prompt_lines.extend(
+            [
+                f"- Feature Slices: `{tasks_path}/tasks.md` and each `slice-*.md`",
                 f"- Codebase map: `{tasks_path}/codebase-map.md`",
                 "",
-            ])
-        else:
-            prompt_lines.extend([
-                "Prior artifacts are available on disk — read them as needed:",
-                f"- Feature Slices: `{tasks_path}/tasks.md`",
-                f"- Codebase map: `{tasks_path}/codebase-map.md`",
+                "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
+                "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
                 "",
-            ])
-        prompt_lines.extend([
-            "Use `read_file` and `grep` to inspect them. Do NOT load "
-            "everything into context at once.",
-            "",
-            "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
-            "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
-            "",
-        ])
+            ]
+        )
         prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
@@ -135,7 +129,9 @@ async def call_implement(state: WorkflowState, config: Optional[RunnableConfig] 
         # NOT the extracted LLM response.  For thinking models the response
         # is chain-of-thought reasoning.
         disk_artifacts = scan_artifact_dir(
-            workspace_root, work_id, PhaseName.IMPLEMENT.value,
+            workspace_root,
+            work_id,
+            PhaseName.IMPLEMENT.value,
             max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
         )
 

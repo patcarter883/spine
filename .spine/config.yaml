@@ -8,17 +8,13 @@ providers:
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
     enabled: true
-  - name: lfm
-    type: deepagents-model
-    model: openrouter:z-ai/glm-5.1
-    enabled: true
   - name: laguna-m1
     type: deepagents-model
-    model: openrouter:qwen/qwen3.6-plus
+    model: openrouter:poolside/laguna-m.1:free
     enabled: true
   - name: laguna-xs2
     type: deepagents-model
-    model: openrouter:qwen/qwen3-coder-next
+    model: openrouter:poolside/laguna-xs.2:free
     enabled: true
   - name: local
     type: deepagents-model
@@ -32,17 +28,17 @@ providers:
     specify:
       provider: frontier
     plan:
-      provider: lfm
+      provider: frontier
 
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: laguna-m1
-      temperature: 0.3           # freezes just the temp override
+      provider: local
+      temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: laguna-xs2
+      provider: local
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: laguna-m1              # short timeout for verify
+      provider: local              # short timeout for verify

@@ -48,8 +48,6 @@ def build_plan_agent(
         "Be specific about file paths, class names, and interfaces. "
         "The plan must be actionable — another developer should be able "
         "to implement directly from this document.\n\n"
-        "Prior artifacts from earlier phases are available on disk — "
-        "use `read_file` and `grep` to inspect them when needed.\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
         "```python\n"
         + f'globalThis.context = {{"work_id": "{work_id}", "phase": "plan", "artifact_dir": ".spine/artifacts/{work_id}/plan"}};\\n'
@@ -57,9 +55,7 @@ def build_plan_agent(
         + build_current_phase_write_prompt(
             work_id, PhaseName.PLAN.value, expected_files=["plan.md"]
         )
-        + build_artifact_prompt(
-            state.get("artifacts", {}), PhaseName.PLAN.value, work_id=work_id
-        )
+        + build_artifact_prompt(state.get("artifacts", {}), PhaseName.PLAN.value, work_id=work_id)
     )
 
     agent = build_phase_agent(
