@@ -319,6 +319,17 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
+    WorkType.PLAN.value: [
+        (PhaseName.SPECIFY.value, None),
+        (PhaseName.PLAN.value, None),
+        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
+    ],
+    WorkType.PLAN_SPEC.value: [
+        (PhaseName.SPECIFY.value, None),
+        (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
+        (PhaseName.PLAN.value, None),
+        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
+    ],
 }
 
 
@@ -557,11 +568,21 @@ def build_workflow_graph(
             graph.add_node(node_name, phase_def.call_fn)
 
     # Add human review interrupt node (once, not per gate)
+    # Build the human_review conditional-edge map.  The router can return:
+    #   - a phase node name (rework or approve → that node),
+    #   - "abort" → END,
+    #   - END (approve past last phase).
+    # Every possible return value must appear in the map or LangGraph raises
+    # KeyError at runtime.
+    _hr_ends: dict[str, str] = {"abort": END, END: END}
+    for name, _ in phase_seq:
+        _hr_ends[name] = name
+
     graph.add_node("human_review", _human_review_interrupt)
     graph.add_conditional_edges(
         "human_review",
         _make_human_review_router(phase_seq),
-        {END: END},
+        _hr_ends,
     )
 
     # Add artifact gate nodes and their outgoing conditional edges.

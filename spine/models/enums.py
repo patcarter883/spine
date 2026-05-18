@@ -23,6 +23,8 @@ class WorkType(str, Enum):
     CRITICAL_QUICK = "critical_quick"
     SPEC = "spec"
     CRITICAL_SPEC = "critical_spec"
+    PLAN = "plan"
+    PLAN_SPEC = "plan_spec"
 
 
 class ReviewStatus(str, Enum):

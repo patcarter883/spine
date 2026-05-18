@@ -121,6 +121,7 @@ async def submit_work(
     config: SpineConfig | None = None,
     created_at: str | None = None,
     work_id: str | None = None,
+    plan_id: str | None = None,
 ) -> dict[str, Any]:
     """Submit a new work item for processing.
 
@@ -136,7 +137,8 @@ async def submit_work(
 
     Args:
         description: The work description / prompt.
-        work_type: One of "quick", "critical_quick", "spec", "critical_spec".
+        work_type: One of "quick", "critical_quick", "spec", "critical_spec",
+            "plan", or "plan_spec".
         config: Optional SpineConfig (loads from default if not provided).
         created_at: Optional ISO timestamp for the work entry's ``created_at``
             field.  When ``None`` (default), uses the current time.
@@ -145,6 +147,8 @@ async def submit_work(
             the ID so the queue row can display the correct work_id while
             the job is still running, instead of falling back to the queue
             sequence number.
+        plan_id: Optional reference to an approved planning work item
+            whose spec/plan this execution derives from.
 
     Returns:
         A dict with keys: ``work_id``, ``status``, ``work_type``.
@@ -171,6 +175,14 @@ async def submit_work(
 
     # Record the work entry
     db = _get_work_db(config)
+
+    # Ensure the plan_id column exists (migration for existing databases)
+    if "plan_id" not in db["work_entries"].columns_dict:
+        try:
+            db["work_entries"].add_column("plan_id", str)
+        except Exception:
+            logger.warning("Could not add plan_id column — may already exist", exc_info=True)
+
     db["work_entries"].insert(
         {
             "id": work_id,
@@ -181,6 +193,7 @@ async def submit_work(
             "created_at": now,
             "updated_at": now,
             "result": "{}",
+            "plan_id": plan_id,
         }
     )
 
@@ -208,6 +221,7 @@ async def submit_work(
             "prompt_request": None,
             "critic_reviewing": "",
             "workspace_root": config.workspace_root,
+            "plan_id": plan_id,
         }
 
         thread_config = {
@@ -1353,6 +1367,131 @@ def update_work_status(
         updates["current_phase"] = current_phase
 
     db["work_entries"].update(work_id, updates)
+
+
+# ── Split a plan into execution work items ──
+
+
+async def split_work_plan(
+    plan_id: str,
+    tasks_text: str | None = None,
+    description_override: str | None = None,
+    work_type_override: str = "quick",
+    config: SpineConfig | None = None,
+) -> list[dict[str, Any]]:
+    """Split an approved planning work item into execution tasks.
+
+    Reads the tasks artifact produced by the plan workflow (or the
+    caller-supplied ``tasks_text``), parses it into individual work items,
+    and submits each one as a new execution work item with ``plan_id`` set
+    to the source plan's ID.
+
+    Args:
+        plan_id: The ID of the approved planning work item.
+        tasks_text: Optional raw tasks text.  When ``None``, reads the
+            tasks.md artifact from disk.
+        description_override: If provided, all spawned tasks use this
+            description instead of the description extracted from sections.
+        work_type_override: The work_type for spawned items (default "quick").
+        config: Optional SpineConfig.
+
+    Returns:
+        A list of dicts, each with ``work_id``, ``status``, ``work_type``,
+        and ``description`` for the spawned items.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    # Get tasks text from artifact if not provided
+    if tasks_text is None:
+        artifacts = ArtifactStore(base_path=config.artifact_path)
+        tasks_path = artifacts.artifact_path(plan_id, "tasks", "tasks.md")
+        try:
+            tasks_text = Path(tasks_path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            tasks_path = artifacts.artifact_path(plan_id, "tasks", "tasks.txt")
+            tasks_text = Path(tasks_path).read_text(encoding="utf-8")
+
+    # Parse tasks — each section starting with ## or # followed by text
+    # becomes a separate work item. Simple heuristic: split on
+    # lines that look like "# Section" or "## Section".
+    sections: list[tuple[str, str]] = []
+    current_title: str | None = None
+    current_lines: list[str] = []
+
+    for line in tasks_text.splitlines():
+        if line.startswith(("### ", "## ", "# ")) and not line.startswith("# Slice") and not line.startswith("# Tasks"):
+            # Save previous section
+            if current_title is not None:
+                sections.append((current_title, "\n".join(current_lines).strip()))
+            # Extract new section title
+            current_title = line.lstrip("# ").strip().split("\n")[0]
+            current_lines = []
+        elif current_title is not None:
+            current_lines.append(line)
+
+    # Don't forget the last section
+    if current_title is not None and current_lines:
+        sections.append((current_title, "\n".join(current_lines).strip()))
+
+    spawned: list[dict[str, Any]] = []
+    for title, content in sections:
+        description = description_override or f"{title}: {content[:500]}"
+        result = await submit_work(
+            description=description,
+            work_type=work_type_override,
+            config=config,
+            plan_id=plan_id,
+        )
+        spawned.append({
+            **result,
+            "description": description[:200],
+        })
+
+    # Update the plan work entry with spawned task IDs
+    db = _get_work_db(config)
+    db["work_entries"].update(
+        plan_id,
+        {
+            "result": json.dumps({
+                "split": True,
+                "spawned_ids": [s["work_id"] for s in spawned],
+            }),
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+
+    return spawned
+
+
+def list_plans(
+    status: str | None = None,
+    limit: int = 50,
+    config: SpineConfig | None = None,
+) -> list[dict[str, Any]]:
+    """List planning work items (work_type = 'plan' or 'plan_spec').
+
+    Args:
+        status: Optional filter by status (e.g. 'completed', 'needs_review').
+        limit: Maximum number of results to return.
+        config: Optional SpineConfig.
+
+    Returns:
+        List of planning work item dicts.
+    """
+    if config is None:
+        config = SpineConfig.load()
+
+    db = _get_work_db(config)
+    conditions = "work_type IN ('plan', 'plan_spec')"
+    params: dict[str, Any] = {"limit": limit}
+
+    if status:
+        conditions += " AND status = :status"
+        params["status"] = status
+
+    sql = f"SELECT * FROM work_entries WHERE {conditions} ORDER BY created_at DESC LIMIT :limit"
+    return list(db.query(sql, params))
 
 
 # ── Resume work ──

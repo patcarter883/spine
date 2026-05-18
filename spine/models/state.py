@@ -82,3 +82,4 @@ class WorkflowState(TypedDict, total=False):
     workspace_root: str  # Project root directory for deep agent backends
     phase_results: Annotated[dict, _merge_dicts]  # phase → PhaseResult
     needs_review_phase: str | None  # Which phase triggered human review
+    plan_id: str | None  # Optional reference to an approved planning work item
