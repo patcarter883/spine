@@ -74,18 +74,15 @@ class RalphLoopWorker:
             existing_cols = {c.name for c in queue_table.columns}
             if "work_id" not in existing_cols and hasattr(queue_table, "add_column"):
                 queue_table.add_column("work_id", str)  # type: ignore[union-attr]
-            if "plan_id" not in existing_cols and hasattr(queue_table, "add_column"):
-                queue_table.add_column("plan_id", str)
 
         return db
 
-    def enqueue(self, description: str, work_type: str = "spec", plan_id: str | None = None) -> int:
+    def enqueue(self, description: str, work_type: str = "spec") -> int:
         """Add a work item to the queue.
 
         Args:
             description: The work description.
             work_type: One of the valid work types.
-            plan_id: Optional reference to an approved planning work item.
 
         Returns:
             The queue item ID.
@@ -99,7 +96,6 @@ class RalphLoopWorker:
                 "started_at": "",
                 "completed_at": "",
                 "result": "",
-                "plan_id": plan_id,
             }
         )
         logger.info(f"Enqueued work item {row.last_pk}: {description[:80]}")
@@ -187,7 +183,6 @@ class RalphLoopWorker:
                         config=self.config,
                         created_at=item.get("enqueued_at"),
                         work_id=work_id,
-                        plan_id=item.get("plan_id"),
                     )
                 )
 
