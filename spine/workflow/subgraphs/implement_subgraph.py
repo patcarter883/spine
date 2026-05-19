@@ -34,8 +34,11 @@ async def _run_implement_agent(
     state: ImplementSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the implement Deep Agent within the subgraph."""
-    description = state.get("description", "")
+    """Run the implement Deep Agent within the subgraph.
+
+    The original work description is NOT included — IMPLEMENT works from
+    the feature slices and codebase map on disk, not the raw description.
+    """
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     workspace_root = state.get("workspace_root", ".")
@@ -56,9 +59,6 @@ async def _run_implement_agent(
         prompt_lines = [
             "Implement the feature slices described below. Write clean, "
             "production-quality code for each slice.",
-            "",
-            "## Work Description",
-            description,
             "",
         ]
         if has_spec:

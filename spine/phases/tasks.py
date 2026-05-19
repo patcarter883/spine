@@ -54,7 +54,11 @@ async def call_tasks(
     Returns:
         Partial state update with task artifacts.
     """
-    description = state.get("description", "")  # noqa: F841
+    # TASKS is the first phase in quick workflows (no prior spec/plan exist),
+    # so the original description is used directly for quick/critical_quick.
+    # For spec/critical_spec workflows, the description is NOT used — TASKS
+    # works from the specification and plan artifacts on disk instead.
+    description = state.get("description", "")  # noqa: F841 — used in quick-workflow branch below
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.TASKS.value, 0)
@@ -199,7 +203,6 @@ async def call_tasks(
                 work_id,
             )
             retry_prompt = (
-                f"## Work Description\n{description}\n\n"
                 "**Write the task decomposition NOW.** "
                 "Do NOT read any more files — you have already gathered "
                 "enough context. Produce:\n\n"

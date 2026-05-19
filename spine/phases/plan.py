@@ -41,6 +41,10 @@ async def call_plan(
     Delegates to the plan Deep Agent, which designs the technical architecture
     based on the specification. If reworking, includes prior feedback.
 
+    The original work description is NOT passed to PLAN — the specification
+    artifact from SPECIFY already captures and expands on it.  The only
+    additional input beyond prior artifacts is review feedback.
+
     Args:
         state: The current workflow state.
         config: LangGraph runtime config.
@@ -48,7 +52,6 @@ async def call_plan(
     Returns:
         Partial state update with plan artifacts.
     """
-    description = state.get("description", "")  # noqa: F841
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
     retry_count = state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)

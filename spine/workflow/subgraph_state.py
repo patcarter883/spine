@@ -17,7 +17,8 @@ class BaseSubgraphState(TypedDict, total=False):
     phase: str
     work_id: str
     work_type: str
-    description: str
+    description: str  # Only used by SPECIFY (always) and TASKS (quick workflows).
+                      # Other phases work from prior artifacts on disk.
     workspace_root: str
     retry_count: int
     feedback: list
