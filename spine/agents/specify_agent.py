@@ -59,9 +59,9 @@ def build_specify_agent(
         "5. Success criteria — measurable outcomes\n\n"
         "Be specific and technical. Avoid vague language.\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
-        "```python\n"
-        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "specify", "artifact_dir": ".spine/artifacts/{work_id}/specify"}};\\n'
-        + "```\n\n"
+        "```js\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "specify", "artifact_dir": ".spine/artifacts/{work_id}/specify"}};\n'
+        + "```\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.SPECIFY.value, expected_files=["specification.md"]
         )

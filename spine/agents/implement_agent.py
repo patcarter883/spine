@@ -100,8 +100,8 @@ def build_implement_agent(
         "- Never re-read a file you already have in context\n"
         "- After 2 failed attempts at the same fix, stop and re-analyze\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
-        "```python\n"
-        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "implement", "artifact_dir": ".spine/artifacts/{work_id}/implement"}};\\n'
+        "```js\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "implement", "artifact_dir": ".spine/artifacts/{work_id}/implement"}};\n'
         + "```\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]

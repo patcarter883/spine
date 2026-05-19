@@ -201,7 +201,7 @@ def _render_approval_actions(api: UIApi, work_id: str, status: str) -> None:
 
     with col2:
         if st.button("🔄 Request Revision", key=f"revise_{work_id}"):
-            feedback = st.text_input("Feedback", key=f"feedback_{work_id}")
+            feedback = st.text_area("Feedback", key=f"feedback_{work_id}")
             if feedback and st.button("Submit Revision", key=f"submit_rev_{work_id}"):
                 result = asyncio.run(
                     api.approve_plan(work_id, action="request_revision", feedback=feedback)

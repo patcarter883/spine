@@ -278,7 +278,9 @@ def build_artifact_prompt(
         "**RLM tip:** At the start of this phase, run one `eval` call to "
         "load the artifact paths into interpreter state (e.g. "
         "`globalThis.artifactPaths = {...}`). Refer to those variables in "
-        "subsequent eval calls instead of repeating paths in conversation."
+        "subsequent eval calls instead of repeating paths in conversation. "
+        "Remember: PTC tool names are camelCase (`tools.readFile`) and "
+        "return native values — `readFile` returns a string, not an object."
     )
 
     for phase in phase_order:

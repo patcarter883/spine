@@ -61,7 +61,10 @@ Don't pound the same broken approach.
 searches, make all calls in one response instead of sequentially.
 - **Use the interpreter (eval) for orchestration.** When processing ≥3 files \
 or dispatching ≥2 subagents, write a JS program in eval that reads files, \
-dispatches work, and returns only the synthesis.
+dispatches work, and returns only the synthesis. \
+PTC tool names are camelCase (`tools.readFile`), arguments are snake_case \
+(`{file_path: '...'}`), and return values are native JS types — \
+`readFile` returns a string, not an object.
 
 ## Tools
 
@@ -78,7 +81,9 @@ were evicted — cache them in eval instead.
 - **Never re-read a file in the same phase.** If context editing evicts a \
 prior read result, recover from eval: \
 `globalThis.files = globalThis.files || {}; globalThis.files['path'] = content;`. \
-Retrieve from eval instead of calling read_file again.
+Retrieve from eval instead of calling read_file again. \
+Remember: `tools.readFile(...)` returns a string directly — store the string, \
+not an object with `.content`.
 
 ## Workflow Context
 

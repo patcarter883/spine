@@ -133,8 +133,8 @@ def build_tasks_agent(
         "Conversation-only output is lost — the next phase has nothing to "
         "implement.\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
-        "```python\n"
-        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "tasks", "artifact_dir": ".spine/artifacts/{work_id}/tasks"}};\\n'
+        "```js\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "tasks", "artifact_dir": ".spine/artifacts/{work_id}/tasks"}};\n'
         + "```\n\n"
         + build_artifact_prompt(state.get("artifacts", {}), PhaseName.TASKS.value, work_id=work_id)
     )

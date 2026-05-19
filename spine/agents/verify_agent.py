@@ -93,8 +93,8 @@ def build_verify_agent(
         "- Inspect actual code, not just the implementation summary\n"
         "- Run tests — do not assume they pass\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
-        "```python\n"
-        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "verify", "artifact_dir": ".spine/artifacts/{work_id}/verify"}};\\n'
+        "```js\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "verify", "artifact_dir": ".spine/artifacts/{work_id}/verify"}};\n'
         + "```\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]

@@ -72,17 +72,16 @@ from spine.agents.context import SpineContext
 from spine.agents.helpers import resolve_model, debug_enabled
 from spine.agents.interpreter import build_interpreter_middleware, interpreter_enabled
 
-# ── Per-phase recursion limits ──────────────────────────────────────
-# Lower than the old 9_999 default to prevent runaway token spend.
-# SPECIFY/PLAN are exploration-heavy; IMPLEMENT/VERIFY are code-heavy.
-PHASE_RECURSION_LIMITS: dict[str, int] = {
-    PhaseName.SPECIFY.value: 250,
-    PhaseName.PLAN.value: 250,
-    PhaseName.TASKS.value: 200,
-    PhaseName.IMPLEMENT.value: 500,
-    PhaseName.VERIFY.value: 300,
-    PhaseName.CRITIC.value: 100,
-}
+# ── Recursion limit ─────────────────────────────────────────────────
+# Removed per-phase limits (2026-05). Each SPINE phase runs an entire
+# Deep Agent loop inside one LangGraph node — the agent's own internal
+# recursion (model→tools→model cycles) all counts toward the LangGraph
+# recursion counter.  Per-phase caps like 200 were too low for agents
+# that make 5-10 tool calls per turn over many turns, causing
+# GraphRecursionError before the agent could finish its work.
+#
+# The default 9_999 is safe — real runaway loops hit the LLM token
+# budget or the stall timeout long before 9_999 LangGraph steps.
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +294,7 @@ def build_phase_agent(
         name=f"spine-{phase.value}",
     ).with_config(
         {
-            "recursion_limit": PHASE_RECURSION_LIMITS.get(phase.value, 9_999),
+            "recursion_limit": 9999,
             "metadata": {
                 "ls_integration": "spine",
                 "lc_agent_name": f"spine-{phase.value}",

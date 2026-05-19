@@ -300,9 +300,9 @@ PHASE_RECURSION_LIMITS: dict[str, int] = {
 }
 ```
 
-Then replace the hardcoded `9_999`:
+Then replace the hardcoded `9999`:
 ```python
-"recursion_limit": PHASE_RECURSION_LIMITS.get(phase.value, 9_999),
+"recursion_limit": PHASE_RECURSION_LIMITS.get(phase.value, 9999),
 ```
 
 **Step 2: Test**

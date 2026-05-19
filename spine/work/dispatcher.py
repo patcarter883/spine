@@ -411,6 +411,12 @@ async def submit_work(
         ):
             final_status = "needs_review"
 
+        # Planning work types must end as "awaiting_approval" so users
+        # can review before execution tasks are spawned.
+        plan_types = ("plan", "plan_spec", "plan_only", "critical_plan_only")
+        if work_type in plan_types and final_status == "completed":
+            final_status = "awaiting_approval"
+
         # Save artifacts to disk
         for phase, phase_artifacts in result_artifacts.items():
             for name, content in phase_artifacts.items():
@@ -1803,7 +1809,7 @@ async def approve_and_spawn(
         db["work_entries"].update(
             plan_id,
             {
-                "status": TaskStatus.AWAITING_APPROVAL.value,
+                "status": TaskStatus.NEEDS_REVIEW.value,
                 "updated_at": datetime.now().isoformat(),
                 "result": json.dumps({"action": "revision_requested", "feedback": feedback}),
             },
@@ -1811,7 +1817,189 @@ async def approve_and_spawn(
         audit.log_event(
             plan_id, "plan_revision_requested", "dispatcher", {"feedback": feedback}
         )
-        return {"plan_id": plan_id, "status": "awaiting_revision", "spawned_ids": []}
+
+        # Re-run the plan workflow with the user's feedback
+        from spine.workflow.compose import build_workflow_graph
+        from spine.persistence.checkpoint import CheckpointStore
+
+        work_type = entry.get("work_type", "plan")
+        description = entry.get("description", "")
+        artifacts_store = ArtifactStore(base_path=config.artifact_path)
+        checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+        checkpointer = await checkpoint_store.get_checkpointer()
+        graph = build_workflow_graph(work_type, checkpointer=checkpointer)
+
+        saved_state = await checkpoint_store.get_state(plan_id)
+        if saved_state:
+            prior_artifacts = saved_state.get("artifacts", {})
+            prior_feedback = saved_state.get("feedback", [])
+            prior_retry_count = saved_state.get("retry_count", {})
+        else:
+            prior_artifacts, prior_feedback, prior_retry_count = {}, [], {}
+
+        human_review_entry = {
+            "status": "needs_revision",
+            "tier": "human",
+            "reason": feedback or "Revision requested",
+            "suggestions": [],
+        }
+        all_feedback = list(prior_feedback) + [human_review_entry]
+
+        resume_state: dict[str, Any] = {
+            "work_id": plan_id,
+            "work_type": work_type,
+            "description": description,
+            "current_phase": "",
+            "phase_index": 0,
+            "retry_count": prior_retry_count,
+            "max_retries": config.max_critic_retries,
+            "artifacts": prior_artifacts,
+            "feedback": all_feedback,
+            "status": "running",
+            "prompt_request": None,
+            "critic_reviewing": "",
+            "workspace_root": config.workspace_root,
+        }
+
+        thread_config = {
+            "configurable": {
+                "thread_id": plan_id,
+                "spine_config": config,
+            }
+        }
+
+        stalled = False
+        import os as _os
+
+        stall_timeout = _os.environ.get("SPINE_STALL_TIMEOUT")
+        stall_timer: Any = None
+        stall_task: Any = None
+        stall_timeout_val = int(stall_timeout or "120")
+
+        async def _stall_timer_fn(to: int) -> None:
+            try:
+                await asyncio.sleep(to)
+            except asyncio.CancelledError:
+                pass
+
+        async def _stream_graph() -> dict[str, Any]:
+            nonlocal stalled, stall_timer, stall_task
+            result: dict[str, Any] = dict(resume_state)
+            stream_timeout = stall_timeout_val + 5
+
+            if stall_timeout_val > 0:
+                stall_task = asyncio.ensure_future(_stall_timer_fn(stream_timeout))
+                stall_task.add_done_callback(lambda t: setattr(_globals := type("", (), {}), "stalled", True) or None)
+
+            async for chunk in graph.astream(
+                resume_state, thread_config,
+                stream_mode=["updates", "messages"], subgraphs=True, version="v2",
+            ):
+                if stall_task and not stall_task.done():
+                    stall_task.cancel()
+                    try:
+                        await stall_task
+                    except asyncio.CancelledError:
+                        pass
+                    if stall_timeout_val > 0:
+                        stall_task = asyncio.ensure_future(_stall_timer_fn(stream_timeout))
+
+                if not isinstance(chunk, dict) or chunk.get("type") != "updates":
+                    continue
+                ns = chunk.get("ns", ())
+                if ns != ():
+                    continue
+                data = chunk.get("data", {})
+                for node_name, node_output in data.items():
+                    node_artifacts = node_output.get("artifacts")
+                    if node_artifacts and isinstance(node_artifacts, dict):
+                        existing = result.get("artifacts", {})
+                        if not isinstance(existing, dict):
+                            existing = {}
+                        merged = {**existing, **node_artifacts}
+                        for key in set(existing) & set(node_artifacts):
+                            if isinstance(existing[key], dict) and isinstance(node_artifacts[key], dict):
+                                merged[key] = {**existing[key], **node_artifacts[key]}
+                        node_output = {**node_output, "artifacts": merged}
+                    node_feedback = node_output.get("feedback")
+                    if node_feedback and isinstance(node_feedback, list):
+                        existing_fb = result.get("feedback", [])
+                        if not isinstance(existing_fb, list):
+                            existing_fb = []
+                        node_output = {**node_output, "feedback": existing_fb + node_feedback}
+                    result.update(node_output)
+                    phase = node_output.get("current_phase", "")
+                    status = node_output.get("status", "")
+                    if phase or status:
+                        _update_work_progress(db, plan_id, phase, status)
+                        logger.info(f"[{plan_id}] Resume: Phase {phase or node_name} → {status}")
+                        audit.log_event(plan_id, "phase_completed", node_name, {"phase": phase, "status": status})
+                    if node_artifacts and isinstance(node_artifacts, dict):
+                        for art_phase, phase_arts in node_artifacts.items():
+                            if not isinstance(phase_arts, dict):
+                                continue
+                            for art_name, art_content in phase_arts.items():
+                                if art_content is not None:
+                                    artifacts_store.save_artifact(plan_id, art_phase, art_name, str(art_content))
+
+            if stall_task and not stall_task.done():
+                stall_task.cancel()
+            return result
+
+        if stall_timeout_val > 0:
+            try:
+                result = await asyncio.wait_for(_stream_graph(), timeout=stall_timeout_val + 10)
+            except (asyncio.TimeoutError, Exception) as exc:
+                stalled = True
+                result = result if 'result' in dir() else {}
+                if isinstance(exc, asyncio.TimeoutError):
+                    logger.error(f"Resume of work {plan_id} stalled after {stall_timeout_val}s")
+                    db["work_entries"].update(plan_id, {
+                        "status": TaskStatus.STALLED.value, "current_phase": result.get("current_phase", ""),
+                        "updated_at": datetime.now().isoformat(),
+                        "result": json.dumps({"error": f"stalled after {stall_timeout_val}s", "stalled": True}),
+                    })
+                    audit.log_event(plan_id, "work_failed", "dispatcher", {"error": "stalled", "stalled": True})
+                    try:
+                        from spine.ui.ws_bus import get_bus
+                        get_bus().publish_sync("work_failed", {"work_id": plan_id, "error": "stalled"})
+                    except Exception:
+                        pass
+                    return {"plan_id": plan_id, "status": TaskStatus.STALLED.value, "spawned_ids": []}
+                raise
+
+        final_status = result.get("status", "completed")
+        final_phase = result.get("current_phase", "")
+        result_artifacts = result.get("artifacts", {})
+        feedback = result.get("feedback", [])
+        if final_status == "running":
+            final_status = "completed"
+        if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
+            final_status = "needs_review"
+        plan_types_check = ("plan", "plan_spec", "plan_only", "critical_plan_only")
+        if work_type in plan_types_check and final_status == "completed":
+            final_status = "awaiting_approval"
+
+        db["work_entries"].update(
+            plan_id,
+            {
+                "status": final_status,
+                "current_phase": final_phase,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps({
+                    "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
+                    "feedback_count": len(feedback),
+                    "prompt_request": result.get("prompt_request"),
+                }),
+            },
+        )
+        audit.log_event(plan_id, "work_completed", final_phase, {"status": final_status, "resumed": True})
+        try:
+            from spine.ui.ws_bus import get_bus
+            get_bus().publish_sync("work_completed", {"work_id": plan_id, "status": final_status})
+        except Exception:
+            pass
+        return {"plan_id": plan_id, "status": final_status, "spawned_ids": []}
 
     # Approve the plan
     db["work_entries"].update(

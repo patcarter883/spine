@@ -21,6 +21,43 @@ turns. Use it to keep intermediate data OUT of the model context.
 | Single file read | NO | Just use read_file directly |
 | Writing a file | NO | Use write_file tool directly |
 
+## PTC API — How to call tools from eval
+
+Tools are exposed on `globalThis.tools` using **camelCase** names.
+Arguments use the original **snake_case** parameter names from the tool schema.
+
+```typescript
+// Tool name mapping:
+//   read_file  → tools.readFile
+//   write_file → tools.writeFile
+//   edit_file  → tools.editFile
+//   grep       → tools.grep
+//   glob       → tools.glob
+//   ls         → tools.ls
+//   task       → tools.task
+```
+
+**Return values are native JS types** — strings are strings, arrays are arrays,
+objects are objects. Do NOT access `.content` on the result.
+
+```typescript
+// ✅ CORRECT — readFile returns a string
+const config = await tools.readFile({ file_path: 'pyproject.toml' });
+console.log('Lines:', config.split('\n').length);
+
+// ❌ WRONG — result is not an object with .content
+const config = await tools.readFile({ file_path: 'pyproject.toml' });
+console.log(config.content);  // undefined!
+```
+
+```typescript
+// ✅ CORRECT — parameter is file_path (snake_case)
+const src = await tools.readFile({ file_path: 'src/main.py' });
+
+// ❌ WRONG — parameter is not path
+const src = await tools.readFile({ path: 'src/main.py' });  // undefined!
+```
+
 ## Pattern 1: Batch file inspection
 
 Instead of reading files one at a time (5 turns × 34K tokens = 170K tokens),
@@ -28,7 +65,7 @@ do this:
 
 ```js
 // Read tasks artifact and extract slice names
-const tasks = await tools.read_file({path: '.spine/artifacts/WORK_ID/tasks/tasks.md'});
+const tasks = await tools.readFile({ file_path: '.spine/artifacts/WORK_ID/tasks/tasks.md' });
 const sliceMatches = tasks.match(/slice-\w+/g);
 const uniqueSlices = [...new Set(sliceMatches)];
 console.log('Slices:', uniqueSlices.join(', '));
@@ -78,31 +115,41 @@ console.log(summaries.join('\\n\\n'));
 
 The PTC allowlist includes filesystem tools for codebase exploration directly from eval:
 
-- **`read_file`** — read file contents
-- **`grep`** — search file contents (regex)
-- **`glob`** — find files by pattern
-- **`ls`** — list directory contents
-- **`write_file`** — write files to disk
-- **`edit_file`** — make targeted edits to files
+- **`tools.readFile`** — read file contents (returns **string**)
+- **`tools.grep`** — search file contents (regex)
+- **`tools.glob`** — find files by pattern
+- **`tools.ls`** — list directory contents
+- **`tools.writeFile`** — write files to disk
+- **`tools.editFile`** — make targeted edits to files
 
 Use these to inspect and transform files without leaving the interpreter:
 
 ```js
 // Batch-read multiple files from eval
-const config = await tools.read_file({path: 'pyproject.toml'});
-const readme = await tools.read_file({path: 'README.md'});
+const config = await tools.readFile({ file_path: 'pyproject.toml' });
+const readme = await tools.readFile({ file_path: 'README.md' });
 console.log('Config length:', config.length);
 
 // Search for patterns across the codebase
-const matches = await tools.grep({pattern: 'PhaseName', path: 'spine/'});
+const matches = await tools.grep({ pattern: 'PhaseName', path: 'spine/' });
 console.log('PhaseName occurrences:', matches);
 
 // Find files by glob pattern
-const testFiles = await tools.glob({pattern: 'tests/**/*.py'});
+const testFiles = await tools.glob({ pattern: 'tests/**/*.py' });
 console.log('Test files:', testFiles);
 ```
 
 These complement the `task` tool — use filesystem tools for direct inspection and `task` for subagent delegation.
+
+## Common errors and fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `SyntaxError: redeclaration of 'X'` | `const X = ...` used the same name in a previous eval | Use `let` instead of `const`, or use a different variable name. QuickJS state persists across eval calls. |
+| `TypeError: cannot read property 'X' of undefined` | Accessing `.content` or `.data` on a tool result | PTC returns native values. `readFile` returns a string, not an object. Use the result directly. |
+| `ReferenceError: window is not defined` | Using `window.*` instead of `globalThis.*` | Use `globalThis` — QuickJS has no `window` object. |
+| `<result>null</result>` | Variable evaluated to undefined/null | Make sure your eval code ends with an expression that returns a value, or use `console.log()` and return a summary string. |
+| `TypeError: tools.X is not a function` | Using snake_case tool name | Tool names are camelCase: `tools.readFile`, `tools.writeFile`, `tools.editFile`. |
 
 ## Critical rules
 
@@ -111,3 +158,5 @@ These complement the `task` tool — use filesystem tools for direct inspection 
 3. **Subagent descriptions must be self-contained.** Include file paths and reference codebase-map.md, not "read the slice I mentioned earlier."
 4. **Keep eval output under 4000 chars.** The runtime truncates at max_result_chars.
 5. **Variables persist across turns.** Store intermediate results in `globalThis.results = ...`.
+6. **Tool names are camelCase, arguments are snake_case.** `tools.readFile({ file_path: '...' })` not `tools.read_file({ path: '...' })`.
+7. **Tool results are native JS values.** `readFile` returns a string — no `.content` access needed.

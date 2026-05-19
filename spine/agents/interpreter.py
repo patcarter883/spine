@@ -37,7 +37,12 @@ QuickJS environment
 The eval tool runs inside **QuickJS**, a server-side JS sandbox. Key globals:
 
 - ``globalThis`` — the global object (NOT ``window`` — that's browser-only)
-- ``globalThis.tools`` — PTC-accessible DA tools (based on allowlist)
+- ``globalThis.tools`` — PTC-accessible DA tools (based on allowlist).
+  Tool names are **camelCase** (``tools.readFile``, ``tools.writeFile``,
+  ``tools.editFile``, ``tools.task``), while argument keys retain the
+  original **snake_case** from the tool schema (``{file_path: '...'}``,
+  not ``{filePath: '...'}``). Return values are native JS types —
+  ``readFile`` returns a string, not an object with ``.content``.
 - ``globalThis.console`` — captured console output
 - ``globalThis.context`` — seeded by SPINE phase prompts with work_id, phase,
   artifact_dir

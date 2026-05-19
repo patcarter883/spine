@@ -49,8 +49,8 @@ def build_plan_agent(
         "The plan must be actionable — another developer should be able "
         "to implement directly from this document.\n\n"
         "When the interpreter is available, seed it with context on your first turn:\n"
-        "```python\n"
-        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "plan", "artifact_dir": ".spine/artifacts/{work_id}/plan"}};\\n'
+        "```js\n"
+        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "plan", "artifact_dir": ".spine/artifacts/{work_id}/plan"}};\n'
         + "```\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.PLAN.value, expected_files=["plan.md"]

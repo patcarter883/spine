@@ -4,9 +4,17 @@ spine:
 
 providers:
   llm:
-  - name: frontier
+  - name: glm
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
+    enabled: true
+  - name: qwen3.6-35b
+    type: deepagents-model
+    model: openrouter:qwen/qwen3.6-35b-a3b
+    enabled: true
+  - name: deepseek-v4-flash
+    type: deepagents-model
+    model: openrouter:deepseek/deepseek-v4-flash
     enabled: true
   - name: laguna-m1
     type: deepagents-model
@@ -26,19 +34,19 @@ providers:
   phases:
     # Heavy reasoning → frontier model (via reference)
     specify:
-      provider: frontier
+      provider: glm
     plan:
-      provider: frontier
+      provider: glm
 
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: local
+      provider: qwen3.6-35b
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: local
+      provider: deepseek-v4-flash
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: local              # short timeout for verify
+      provider: qwen3.6-35b              # short timeout for verify
