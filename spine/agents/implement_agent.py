@@ -70,10 +70,11 @@ def build_implement_agent(
         "- If 1 slice or dependent work: implement directly with "
         "write_file/edit_file (batch related edits in one response)\n"
         "- After each wave, run tests with execute\n\n"
-        "### Phase 4: Verify (1-2 turns)\n"
-        "- Run the full test suite\n"
-        "- Fix any failures\n"
-        "- Write implementation.md summary to disk\n\n"
+        "### Phase 4: Report (1 turn)\n"
+        "Write implementation.md summary to disk with:\n"
+        "- Files changed and what was modified\n"
+        "- Test results summary\n"
+        "- Any remaining issues or warnings\n\n"
         "## Subagent Dispatch — CRITICAL\n"
         "When dispatching a `slice-implementer` subagent, the task description "
         "MUST be self-contained. The subagent starts with an empty context — "
@@ -102,7 +103,7 @@ def build_implement_agent(
         "When the interpreter is available, seed it with context on your first turn:\n"
         "```js\n"
         + f'globalThis.context = {{"work_id": "{work_id}", "phase": "implement", "artifact_dir": ".spine/artifacts/{work_id}/implement"}};\n'
-        + "```\n\n"
+        + "```\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]
         )

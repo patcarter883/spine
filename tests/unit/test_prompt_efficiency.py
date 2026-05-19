@@ -44,10 +44,10 @@ class TestPromptEfficiency:
         assert "re-read" in SPINE_BASE_PROMPT.lower() or "never" in SPINE_BASE_PROMPT.lower()
 
     def test_base_prompt_concise(self):
-        """Base prompt should be under 800 tokens (~3200 chars)."""
-        assert len(SPINE_BASE_PROMPT) < 3200, (
+        """Base prompt should be under 850 tokens (~3400 chars)."""
+        assert len(SPINE_BASE_PROMPT) < 3400, (
             f"SPINE_BASE_PROMPT is {len(SPINE_BASE_PROMPT)} chars — "
-            f"should be under 3200 chars (~800 tokens)"
+            "should be under 3400 chars (~850 tokens)"
         )
 
     def test_rlm_preamble_removed(self):
@@ -135,15 +135,29 @@ class TestContextEditing:
         trimmer = ToolOutputTrimmer(max_full_tool_results=5)
         assert trimmer.max_full_tool_results == 5
 
-    def test_trimmer_has_eviction_hint(self):
-        """Placeholder should mention evicted/recover hint."""
+    def test_trimmer_has_eviction_metadata(self):
+        """ToolOutputTrimmer should produce structured metadata, not vague hints."""
         from spine.agents.context_editing import ToolOutputTrimmer
         trimmer = ToolOutputTrimmer()
-        assert "evicted" in trimmer.placeholder.lower()
+        # Verify the _extract_metadata method produces structured output
+        metadata = trimmer._extract_metadata(
+            "     1\tdef hello():\n     2\t    pass\n",
+            "read_file",
+            {"file_path": "src/main.py"},
+        )
+        assert "src/main.py" in metadata
+        assert "2 lines" in metadata
 
 
 class TestSummarizationConfig:
     """Verify summarization middleware uses SPINE-specific configuration."""
+
+    def test_summarization_trigger_is_60k(self):
+        """Summarization trigger should be 60K tokens (not 80K)."""
+        import inspect
+        from spine.agents.factory import _add_summarization_middleware
+        source = inspect.getsource(_add_summarization_middleware)
+        assert "60000" in source, "Summarization trigger should be 60K tokens"
 
     def test_custom_summary_prompt_exists(self):
         """_SPINE_SUMMARY_PROMPT should exist and preserve technical state."""

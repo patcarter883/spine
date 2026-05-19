@@ -438,7 +438,9 @@ def _add_summarization_middleware(
     """Add DA summarization middleware with SPINE-specific configuration.
 
     Three key design decisions:
-    1. Token-based trigger (80K) — model-independent, leaves 48K buffer.
+    1. Token-based trigger (60K) — keeps KV cache under 50% on 128K models.
+       Earlier compression means smaller summaries and less agent re-reading.
+       Previous 80K trigger left cache at 62.5% before summarization kicked in.
     2. Custom state-extraction summary prompt — preserves file paths,
        errors, slice objectives, and offloaded history path.
     3. Keep window of 20 messages — covers full edit-test-fix cycle.
@@ -453,7 +455,7 @@ def _add_summarization_middleware(
             auto_mw = create_summarization_middleware(
                 model,
                 backend,
-                trigger=("tokens", 80000),
+                trigger=("tokens", 60000),
                 keep=("messages", 20),
                 summary_prompt=_SPINE_SUMMARY_PROMPT,
             )

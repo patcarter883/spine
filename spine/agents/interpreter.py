@@ -82,14 +82,17 @@ logger = logging.getLogger(__name__)
 # ── PTC allowlists per phase ────────────────────────────────────────────
 # Maps SPINE phase names to the list of DA tools that the interpreter
 # is allowed to call programmatically. Each phase exposes "task" for
-# subagent delegation plus filesystem tools (read_file, grep, glob, ls,
-# write_file, edit_file) for codebase exploration and artifact I/O.
+# read_file removed from PTC allowlist (2026-05). Under virtual_mode=True,
+# tools.readFile() returns null for project .py source files — the agent
+# must fall back to the native read_file tool, wasting a turn. Reserve eval
+# for orchestration (ls, glob, grep, subagent dispatch) and use native
+# read_file for source code content with batch reads (≥3 files per turn).
 
 _PTC_ALLOWLISTS: dict[str, list[str | Any]] = {
-    PhaseName.SPECIFY.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
-    PhaseName.TASKS.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
-    PhaseName.IMPLEMENT.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
-    PhaseName.VERIFY.value: ["task", "read_file", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.SPECIFY.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.TASKS.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.IMPLEMENT.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.VERIFY.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
     # CRITIC and PLAN don't need PTC — they review/plan, not orchestrate.
 }
 

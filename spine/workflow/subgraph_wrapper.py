@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from spine.models.state import WorkflowState
+from spine.workflow.phase_progress import mark_phase_started
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,10 @@ def make_subgraph_node(
     ) -> dict[str, Any]:
         work_id = parent_state.get("work_id", "unknown")
         timeout = _resolve_timeout(phase_name, config)
+
+        # Mark the phase as started so the UI shows the correct phase
+        # immediately, before the subgraph begins executing.
+        mark_phase_started(parent_state, phase_name)
 
         timeout_label = f"timeout={timeout}s" if timeout > 0 else "no timeout"
         logger.info(

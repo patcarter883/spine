@@ -51,7 +51,7 @@ def build_plan_agent(
         "When the interpreter is available, seed it with context on your first turn:\n"
         "```js\n"
         + f'globalThis.context = {{"work_id": "{work_id}", "phase": "plan", "artifact_dir": ".spine/artifacts/{work_id}/plan"}};\n'
-        + "```\n\n"
+        + "```\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.PLAN.value, expected_files=["plan.md"]
         )

@@ -125,6 +125,14 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "CRITICAL: Return a concise structured summary. Do NOT return raw file "
         "contents — summarize findings, key facts, and relevant code signatures "
         "only. The parent agent needs your analysis, not the raw source.\n\n"
+        "MINIMUM OUTPUT REQUIREMENTS:\n"
+        "- You MUST read at least 2 files before producing your summary.\n"
+        "- If you cannot read files (tool errors, permission issues), report that "
+        "as your summary with the error details — do NOT return empty results.\n"
+        "- Your file_map MUST contain at least 1 entry.\n"
+        "- Your summary MUST be at least 2 sentences.\n"
+        "- If you produce empty results, you WILL be re-dispatched, wasting time "
+        "and tokens. Do the work correctly the first time.\n\n"
         "Your output MUST follow the ResearchFindings schema:\n"
         "- summary: concise paragraph summarizing findings\n"
         "- patterns: notable patterns, conventions, or idioms discovered\n"
@@ -229,12 +237,25 @@ SUBAGENT_TOOLS: dict[str, list[str]] = {
     "slice-verifier": _READ_AND_EXECUTE_TOOLS,
 }
 
+# ── Re-research prompt for empty researcher results ────────────────────
+# When a researcher subagent returns empty results (no file_map, no patterns),
+# re-dispatch with this suffix appended to the task description.
+
+_RE_RESEARCH_PROMPT_SUFFIX = (
+    "\n\n⚠ RE-DISPATCH: A previous researcher returned empty results for this "
+    "task. This is your second chance. You MUST:\n"
+    "1. Read at least 3 files relevant to the task description.\n"
+    "2. Produce a file_map with at least 2 entries.\n"
+    "3. If files cannot be found, explain what you searched and what went wrong.\n"
+    "Do NOT return empty results again."
+)
+
 # ── Which phases use which subagents ────────────────────────────────────
 
 PHASE_SUBAGENTS: dict[str, list[str]] = {
     PhaseName.SPECIFY.value: ["researcher"],
     PhaseName.TASKS.value: ["researcher"],
-    PhaseName.IMPLEMENT.value: ["slice-implementer"],
+    PhaseName.IMPLEMENT.value: ["slice-implementer"],  # No verifier — dedicated verify phase is authoritative
     PhaseName.VERIFY.value: ["slice-verifier"],
     # PLAN, CRITIC — single-agent, no subagents
 }

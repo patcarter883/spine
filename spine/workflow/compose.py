@@ -37,6 +37,13 @@ from langgraph.types import interrupt
 
 from spine.models.enums import PhaseName, ReviewStatus, WorkType
 from spine.models.state import WorkflowState
+from spine.phases.critic import call_critic
+from spine.phases.implement import call_implement
+from spine.phases.plan import call_plan
+from spine.phases.specify import call_specify
+from spine.phases.tasks import call_tasks
+from spine.phases.verify import call_verify
+from spine.workflow.phase_progress import mark_phase_started
 from spine.workflow.registry import get_registry
 from spine.workflow.critic_review import critic_router
 from spine.workflow.artifact_gate import (
@@ -572,14 +579,28 @@ def build_workflow_graph(
                 subgraph = builder_fn().compile()
                 state_mapper = _STATE_MAPPERS[node_name]
                 result_mapper = _RESULT_MAPPERS[node_name]
+
+                def _build_node(
+                    phase: str,
+                    sub: Any,
+                    sm: Any,
+                    rm: Any,
+                ) -> Any:
+                    return make_subgraph_node(
+                        sub,
+                        phase,
+                        sm,
+                        rm,
+                        use_per_phase_checkpointer=True,
+                    )
+
                 graph.add_node(
                     node_name,
-                    make_subgraph_node(
-                        subgraph,
+                    _build_node(
                         node_name,
+                        subgraph,
                         state_mapper,
                         result_mapper,
-                        use_per_phase_checkpointer=True,
                     ),
                 )
             else:
@@ -594,11 +615,11 @@ def build_workflow_graph(
                         f"Phase '{node_name}' has no call_fn or subgraph_node_fn"
                     )
         else:
-            # Legacy phase node
+            # Legacy phase node — wrap with phase-start tracking
             phase_def = registry.require(node_name)
             if phase_def.call_fn is None:
                 raise ValueError(f"Phase '{node_name}' has no call_fn (legacy mode)")
-            graph.add_node(node_name, phase_def.call_fn)
+            graph.add_node(node_name, _make_legacy_node(node_name, phase_def.call_fn))
 
     # Add human review interrupt node (once, not per gate)
     # Build the human_review conditional-edge map.  The router can return:
@@ -737,6 +758,7 @@ def _make_critic_node(
 
     async def critic_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict:
         """Critic node that reviews a specific phase."""
+        mark_phase_started(state, node_name)
         # Inject which phase this critic reviews into state
         # so _get_reviewed_phase and critic_router can use it
         augmented_state = {**state, "critic_reviewing": reviewed_phase}
@@ -744,6 +766,34 @@ def _make_critic_node(
         return result
 
     return critic_node
+
+
+def _make_legacy_node(
+    phase_name: str,
+    call_fn: Any,
+) -> Any:
+    """Create a legacy node function with phase-start tracking.
+
+    Wraps the generic phase call function so it marks the phase as
+    started before executing. This ensures the UI shows the correct
+    phase immediately.
+
+    Args:
+        phase_name: The phase identifier (e.g. "specify", "plan").
+        call_fn: The async call function for this phase.
+
+    Returns:
+        An async node function that marks the phase started, then calls
+        the original phase function.
+    """
+
+    async def legacy_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict:
+        """Legacy node wrapper with phase-start tracking."""
+        mark_phase_started(state, phase_name)
+        result = await call_fn(state, config)
+        return result
+
+    return legacy_node
 
 
 def get_restart_phases(work_type: str) -> list[str]:

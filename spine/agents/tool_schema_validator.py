@@ -270,6 +270,22 @@ class ToolSchemaValidator(AgentMiddleware):
         if tool is None:
             return await handler(request)
 
+        # Pre-validation: edit_file with empty old_string is always an error
+        if tool_name == "edit_file":
+            old_string = args.get("old_string", "")
+            if not old_string:
+                rebound = self._increment_rebound(tool_name)
+                if rebound > self.max_rebound:
+                    return await handler(request)
+                return self._make_error_message(
+                    tool_name,
+                    tool_call_id,
+                    "edit_file: old_string cannot be empty — it matches every "
+                    "location in the file (2308+ matches observed in production). "
+                    "Use write_file instead if you want to replace the entire file "
+                    "content.",
+                )
+
         # Validate arguments against the tool's input schema
         error, _exc = self._validate_args(tool, args)
         if error is None:

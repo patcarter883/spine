@@ -112,6 +112,57 @@ def _update_work_progress(
         pass
 
 
+# ── Phase-start update (public) ──────────────────────────────────────────
+# Called at the START of each phase node so the UI shows the correct phase
+# while work is in progress.
+
+
+def get_work_db(config: SpineConfig) -> sqlite_utils.Database:
+    """Get or create the work entries database.
+
+    Public alias for ``_get_work_db`` so other modules can open the DB
+    without importing a private function.
+
+    Args:
+        config: The SPINE configuration.
+
+    Returns:
+        A ``sqlite_utils.Database`` handle for the ``work_entries`` table.
+    """
+    return _get_work_db(config)
+
+
+def update_work_phase_started(
+    db: sqlite_utils.Database,
+    work_id: str,
+    current_phase: str,
+) -> None:
+    """Update work_entries to mark a phase as started (status='running').
+
+    Called at the START of each phase node so the UI shows the correct
+    phase while work is in progress.
+
+    Args:
+        db: The work database handle.
+        work_id: The work item ID.
+        current_phase: The phase that is about to start.
+    """
+    _update_work_progress(db, work_id, current_phase, "running")
+
+    # Publish a dedicated phase_started event so UI can distinguish
+    # start from completion.
+    try:
+        from spine.ui.ws_bus import get_bus
+
+        get_bus().publish_sync(
+            "phase_started",
+            {"work_id": work_id, "current_phase": current_phase, "status": "running"},
+        )
+    except Exception:
+        # Bus may not be initialised (CLI-only mode) — that's fine.
+        pass
+
+
 # ── Submit work ──
 
 
