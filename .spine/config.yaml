@@ -37,16 +37,18 @@ providers:
       provider: glm
     plan:
       provider: glm
+    tasks:
+      provider: local
 
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: qwen3.6-35b
+      provider: local
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: deepseek-v4-flash
+      provider: local
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: qwen3.6-35b              # short timeout for verify
+      provider: local             # short timeout for verify
