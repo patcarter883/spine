@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -187,3 +186,101 @@ class TestSpineConfig:
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"
         assert config.max_critic_retries == 3
+
+    # ── MCP config parsing ────────────────────────────────────────────
+
+    def test_mcp_servers_default_empty(self) -> None:
+        """Config without mcp_servers should have empty dict."""
+        config = SpineConfig()
+        assert config.mcp_servers == {}
+
+    def test_mcp_servers_from_config_file(self, temp_dir: Path) -> None:
+        """mcp_servers should be parsed correctly from YAML."""
+        config_data = {
+            "mcp_servers": {
+                "codebase-index": {
+                    "command": "mcp-codebase-index",
+                    "args": [],
+                    "env": {"PROJECT_ROOT": "/test"},
+                    "timeout": 120,
+                    "connect_timeout": 60,
+                }
+            }
+        }
+        config_file = temp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(config_data, f)
+
+        config = SpineConfig.load(str(config_file))
+        assert "codebase-index" in config.mcp_servers
+        server = config.mcp_servers["codebase-index"]
+        assert server["command"] == "mcp-codebase-index"
+        assert server["env"]["PROJECT_ROOT"] == "/test"
+        assert server["timeout"] == 120
+        assert server["connect_timeout"] == 60
+
+    def test_mcp_servers_defaults_for_missing_keys(self, temp_dir: Path) -> None:
+        """Missing optional MCP server keys should get defaults."""
+        config_data = {
+            "mcp_servers": {
+                "minimal": {
+                    "command": "my-server",
+                }
+            }
+        }
+        config_file = temp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(config_data, f)
+
+        config = SpineConfig.load(str(config_file))
+        server = config.mcp_servers["minimal"]
+        assert server["command"] == "my-server"
+        assert server["args"] == []
+        assert server["env"] == {}
+        assert server["timeout"] == 120
+        assert server["connect_timeout"] == 60
+
+    def test_mcp_servers_env_override(self, temp_dir: Path) -> None:
+        """SPINE_MCP_SERVERS env var should merge with config."""
+        config_data = {
+            "mcp_servers": {
+                "server-a": {"command": "cmd-a"},
+            }
+        }
+        config_file = temp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(config_data, f)
+
+        os.environ["SPINE_MCP_SERVERS"] = '{"server-b": {"command": "cmd-b"}}'
+        try:
+            config = SpineConfig.load(str(config_file))
+            assert "server-a" in config.mcp_servers
+            assert "server-b" in config.mcp_servers
+            assert config.mcp_servers["server-b"]["command"] == "cmd-b"
+        finally:
+            del os.environ["SPINE_MCP_SERVERS"]
+
+    def test_mcp_servers_env_override_ignores_invalid_json(self, temp_dir: Path) -> None:
+        """Invalid JSON in SPINE_MCP_SERVERS should be ignored gracefully."""
+        os.environ["SPINE_MCP_SERVERS"] = "not valid json"
+        try:
+            config = SpineConfig.load()
+            assert isinstance(config.mcp_servers, dict)
+        finally:
+            del os.environ["SPINE_MCP_SERVERS"]
+
+    def test_mcp_servers_skips_non_dict_entries(self, temp_dir: Path) -> None:
+        """Non-dict server configs should be silently skipped."""
+        config_data = {
+            "mcp_servers": {
+                "good": {"command": "cmd"},
+                "bad": "just a string, not a dict",
+            }
+        }
+        config_file = temp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(config_data, f)
+
+        config = SpineConfig.load(str(config_file))
+        assert "good" in config.mcp_servers
+        assert "bad" not in config.mcp_servers

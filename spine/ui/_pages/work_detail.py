@@ -276,11 +276,16 @@ def render(api: UIApi) -> None:
             key=f"restart_phase_btn_{work_id}",
         ):
             result = api.restart_from_phase(work_id, selected_phase, clear_artifacts=clear)
-            st.success(
-                f"Restarted from **{selected_phase}**! "
-                f"Status: {result['status']} | Action: {result['action']}. "
-                "The workflow will continue from the selected phase."
-            )
+            if result.get("status") == "skipped":
+                # Work is already running - show info message with details
+                message = result.get("message", "This task is already running.")
+                st.info(f"Restart skipped: {message}")
+            else:
+                st.success(
+                    f"Restarted from **{selected_phase}**! "
+                    f"Status: {result['status']} | Action: {result['action']}. "
+                    "The workflow will continue from the selected phase."
+                )
             st.rerun()
 
     if status == "needs_review":

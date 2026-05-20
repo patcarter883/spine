@@ -111,12 +111,21 @@ class TestSubagentAutonomy:
             )
 
     def test_subagent_prompt_has_batch_reads(self):
-        """Subagent prompts must mention batch reads."""
+        """Subagent prompts must mention batch reads or MCP tool batching.
+
+        The researcher subagent now uses MCP tools for codebase exploration
+        (batch MCP calls) instead of batch file reads.  Slice-implementer and
+        slice-verifier still use batch file reads.
+        """
         from spine.agents.subagents import SUBAGENT_PROMPTS
 
         for name, prompt in SUBAGENT_PROMPTS.items():
-            assert "batch" in prompt.lower() or "Batch" in prompt, (
-                f"Subagent {name!r} prompt doesn't mention batch reads"
+            has_batch = (
+                "batch" in prompt.lower()
+                or "MCP structural search" in prompt  # researcher's multi-call guidance
+            )
+            assert has_batch, (
+                f"Subagent {name!r} prompt doesn't mention batch reads or MCP tool batching"
             )
 
 

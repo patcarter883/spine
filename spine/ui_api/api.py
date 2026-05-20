@@ -8,6 +8,7 @@ principle: CLI and UI share the same backend code paths.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from spine.config import SpineConfig
@@ -188,7 +189,118 @@ class UIApi:
             "work_type": self._config.work_type,
             "queue_backend": self._config.queue_backend,
             "workspace_root": self._config.workspace_root,
+            "mcp_servers": self._config.mcp_servers,
         }
+
+    def update_mcp_server(
+        self, server_name: str, config: dict[str, Any]
+    ) -> bool:
+        """Update or add an MCP server configuration.
+
+        Writes the updated ``mcp_servers`` section back to
+        ``.spine/config.yaml``, preserving all other config keys.
+
+        Args:
+            server_name: MCP server name (e.g. ``"codebase-index"``).
+            config: Server config dict with keys ``command``, ``args``,
+                ``env``, ``timeout``, ``connect_timeout``.
+
+        Returns:
+            ``True`` if the save succeeded, ``False`` otherwise.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    all_config = yaml.safe_load(f) or {}
+            else:
+                all_config = {}
+            mcp_servers = all_config.get("mcp_servers", {})
+            mcp_servers[server_name] = config
+            all_config["mcp_servers"] = mcp_servers
+            with open(config_path, "w") as f:
+                yaml.dump(all_config, f, default_flow_style=False, sort_keys=False)
+            # Reload config so the in-memory instance reflects changes
+            self._config = SpineConfig.load()
+            return True
+        except Exception:
+            logger.exception("Failed to save MCP server config for '%s'", server_name)
+            return False
+
+    def test_mcp_connection(self, server_name: str) -> dict[str, Any]:
+        """Test connection to an MCP server and return tool info.
+
+        Args:
+            server_name: MCP server name as configured.
+
+        Returns:
+            Dict with ``connected`` (bool), ``tool_count`` (int),
+            ``tool_names`` (list[str]), and ``error`` (str or None).
+        """
+        cfg = self._config.mcp_servers.get(server_name)
+        if not cfg:
+            return {"connected": False, "tool_count": 0, "tool_names": [], "error": "No config found"}
+
+        try:
+            from spine.mcp.client import MCPClient
+
+            client = MCPClient(
+                name=server_name,
+                command=cfg.get("command", ""),
+                args=cfg.get("args", []),
+                env=cfg.get("env", {}),
+                timeout=cfg.get("timeout", 120),
+                connect_timeout=cfg.get("connect_timeout", 60),
+            )
+            client.connect()
+            tools = client.list_tools()
+            tool_names = [t["name"] for t in tools]
+            client.close()
+            return {
+                "connected": True,
+                "tool_count": len(tools),
+                "tool_names": tool_names,
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "connected": False,
+                "tool_count": 0,
+                "tool_names": [],
+                "error": str(e),
+            }
+
+    def remove_mcp_server(self, server_name: str) -> bool:
+        """Remove an MCP server from the configuration.
+
+        Args:
+            server_name: MCP server name to remove.
+
+        Returns:
+            ``True`` if the save succeeded, ``False`` otherwise.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    all_config = yaml.safe_load(f) or {}
+            else:
+                all_config = {}
+            mcp_servers = all_config.get("mcp_servers", {})
+            if server_name in mcp_servers:
+                del mcp_servers[server_name]
+                all_config["mcp_servers"] = mcp_servers
+                with open(config_path, "w") as f:
+                    yaml.dump(all_config, f, default_flow_style=False, sort_keys=False)
+                self._config = SpineConfig.load()
+            return True
+        except Exception:
+            logger.exception("Failed to remove MCP server '%s'", server_name)
+            return False
 
     # ── Worker ──
 
@@ -443,7 +555,9 @@ class UIApi:
                 are always preserved.
 
         Returns:
-            Dict with work_id, status, phase_name, and action.
+            Dict with work_id, status, phase_name, action, and optionally
+            message. When status is "skipped", the message explains why
+            the restart was not initiated (e.g., work already running).
         """
         from spine.work.dispatcher import restart_from_phase as _async_restart
 

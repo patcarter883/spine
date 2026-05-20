@@ -8,6 +8,7 @@ LangGraph, Deep Agents, and LangSmith tracing without manual sourcing.
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -83,6 +84,7 @@ class SpineConfig:
         "critic": 0,
     })
     default_timeout: int = 0
+    mcp_servers: dict = field(default_factory=dict)
 
     @staticmethod
     def _find_workspace_root() -> str:
@@ -154,6 +156,27 @@ class SpineConfig:
 
         spine = config.get("spine", {})
 
+        # ── MCP servers ──────────────────────────────────────────────
+        mcp_servers: dict[str, dict] = {}
+        raw_mcp = config.get("mcp_servers", {})
+        for name, server_cfg in raw_mcp.items():
+            if not isinstance(server_cfg, dict):
+                continue
+            mcp_servers[name] = {
+                "command": server_cfg.get("command", ""),
+                "args": server_cfg.get("args", []),
+                "env": server_cfg.get("env", {}),
+                "timeout": server_cfg.get("timeout", 120),
+                "connect_timeout": server_cfg.get("connect_timeout", 60),
+            }
+        # Allow env var override (JSON string)
+        env_mcp = os.environ.get("SPINE_MCP_SERVERS")
+        if env_mcp:
+            try:
+                mcp_servers.update(json.loads(env_mcp))
+            except json.JSONDecodeError:
+                pass
+
         # Resolve workspace_root: use Path.resolve() to get the canonical
         # (case-correct) absolute path.  On case-sensitive Linux, a typo
         # like /home/pat/projects vs /home/pat/Projects would silently
@@ -213,6 +236,7 @@ class SpineConfig:
                 "SPINE_TOOL_SCHEMA_VALIDATION",
                 str(spine.get("tool_schema_validation", True)).lower(),
             ) not in ("0", "false", "no"),
+            mcp_servers=mcp_servers,
         )
 
     def resolve_model(self, phase: str | None = None) -> str:

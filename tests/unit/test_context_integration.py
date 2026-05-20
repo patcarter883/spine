@@ -451,11 +451,12 @@ class TestResearcherMinOutput:
         )
 
     def test_researcher_prompt_requires_at_least_2_files(self) -> None:
-        """The researcher must read at least 2 files before producing output."""
+        """The researcher must use at least 2 MCP tools (or read 2 files) before reporting."""
         prompt = SUBAGENT_PROMPTS["researcher"]
-        assert "at least 2 files" in prompt, (
-            "Researcher prompt must require reading at least 2 files"
-        )
+        assert (
+            "at least 2 MCP tools" in prompt
+            or "at least 2 files" in prompt
+        ), "Researcher prompt must require tool use before reporting"
 
     def test_researcher_prompt_requires_file_map_entry(self) -> None:
         """The researcher must produce a file_map with at least 1 entry."""

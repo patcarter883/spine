@@ -30,5 +30,8 @@ test_root.py.langgraph_api/
 # LangGraph dev server runtime
 .langgraph_api/
 
+# MCP codebase index cache (local build artifact)
+.codebase-index-cache.pkl
+
 # Scratch files
 test_root.py

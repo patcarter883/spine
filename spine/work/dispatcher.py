@@ -1205,6 +1205,16 @@ async def restart_from_phase(
 
     db = _get_work_db(config)
 
+    # ── Check if this task is already running ──
+    # Only block restart if the active task is the same work_id being restarted.
+    # This allows other tasks to proceed while one is already running.
+    from spine.work.ralph_worker import get_worker
+
+    worker = get_worker(config)
+    active = worker.get_active()
+    if active is not None and active.get("id") == work_id:
+        return {"status": "skipped", "message": "This task is already running"}
+
     # ── Validate work item ──
     try:
         entry = db["work_entries"].get(work_id)

@@ -2,6 +2,19 @@ spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
 
+# ── MCP Servers ──────────────────────────────────────────────────
+# Model Context Protocol servers for external tool integration.
+# mcp-codebase-index provides 18 structural codebase query tools
+# (symbol lookup, dependency analysis, change impact assessment).
+mcp_servers:
+  codebase-index:
+    command: mcp-codebase-index
+    args: []
+    env:
+      PROJECT_ROOT: /home/pat/Projects/spine
+    timeout: 120
+    connect_timeout: 60
+
 providers:
   llm:
   - name: glm

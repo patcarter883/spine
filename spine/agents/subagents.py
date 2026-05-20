@@ -112,12 +112,39 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "You are a codebase researcher. Your job is to investigate the area "
         "of the codebase described in the task and report back with structured "
         "findings.\n\n"
+        "## Codebase navigation — USE MCP TOOLS FIRST\n"
+        "You have MCP codebase index tools for efficient structural navigation. "
+        "These answer symbol-level questions in sub-millisecond time with "
+        "minimal token usage — ALWAYS use them before reading files.\n\n"
+        "| Question | Tool to use |\n"
+        "|----------|-------------|\n"
+        "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
+        "| What does function X call? | `mcp_codebase-index_get_dependencies` |\n"
+        "| Who calls function X? | `mcp_codebase-index_get_dependents` |\n"
+        "| What breaks if I change X? | `mcp_codebase-index_get_change_impact` |\n"
+        "| How does X connect to Y? | `mcp_codebase-index_get_call_chain` |\n"
+        "| Show me function X's code | `mcp_codebase-index_get_function_source` |\n"
+        "| What files match pattern X? | `mcp_codebase-index_list_files` |\n"
+        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n"
+        "| High-level project overview | `mcp_codebase-index_get_project_summary` |\n\n"
         "## Tool surface\n"
-        "- `search_codebase` — find files by keyword/topic queries. "
-        "Use this FIRST for each research area — it returns ranked files with "
-        "content previews. Much faster than ls → glob → read_file chains.\n"
-        "- `read_file` — read specific files. Use offset/limit for large files.\n"
-        "- `ls`, `glob`, `grep` — traditional filesystem tools for targeted lookups.\n\n"
+        "### Primary (use these FIRST)\n"
+        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type)\n"
+        "- `mcp_codebase-index_get_function_source` — get full function source\n"
+        "- `mcp_codebase-index_get_dependencies` — what a symbol calls/uses\n"
+        "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol\n"
+        "- `mcp_codebase-index_get_change_impact` — direct + transitive dependents\n"
+        "- `mcp_codebase-index_get_call_chain` — BFS path between two symbols\n"
+        "- `mcp_codebase-index_search_codebase` — regex search across all files\n"
+        "- `mcp_codebase-index_list_files` — list files matching a glob pattern\n"
+        "- `mcp_codebase-index_get_project_summary` — file count, packages, top symbols\n"
+        "- `mcp_codebase-index_get_classes` — list classes with methods and bases\n"
+        "- `mcp_codebase-index_get_functions` — list functions with params\n"
+        "- `mcp_codebase-index_get_imports` — list imports for a file\n\n"
+        "### Fallback (only when MCP tools don't have what you need)\n"
+        "- `search_codebase` — multi-query keyword file search with content previews\n"
+        "- `read_file` — read specific files (use offset/limit for large files)\n"
+        "- `ls`, `glob`, `grep` — traditional filesystem tools for targeted lookups\n\n"
         "## Path conventions (CRITICAL)\n"
         "All paths MUST be relative from the project workspace root:\n"
         "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
@@ -125,19 +152,23 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- **NEVER** use absolute paths like `/home/user/project/...` — they "
         "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
         "## Research workflow (3-5 turns)\n"
-        "1. **Batch-search first (1 turn):** Call `search_codebase` with 3-5 "
-        "queries from the task description. Get ranked results with previews.\n"
-        "2. **Batch-read key files (1 turn):** Read ≥3 files per turn. Do NOT "
-        "read one file at a time — every pair of reads costs a full LLM turn.\n"
-        "3. **Targeted follow-up (1-2 turns):** If previews don't have line-level "
-        "detail you need, grep or read_file with offset to get specific sections.\n"
+        "1. **MCP structural search (1 turn):** Call `mcp_codebase-index_get_project_summary` "
+        "for orientation, then `mcp_codebase-index_find_symbol` to locate key symbols "
+        "mentioned in the task. Use `mcp_codebase-index_get_dependencies` to trace "
+        "relationships. This replaces 5-10 sequential read_file calls and saves tokens.\n"
+        "2. **Targeted MCP follow-up (1 turn):** Call `mcp_codebase-index_get_function_source` "
+        "to see the actual code of key symbols. Use `mcp_codebase-index_get_dependents` if "
+        "you need to know what calls a particular function.\n"
+        "3. **Fallback search only if needed (0-1 turns):** If you need content-level "
+        "pattern matching the MCP tools don't provide, use `search_codebase` or `grep`. "
+        "This should be RARE — MCP tools cover 90% of research needs.\n"
         "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
         "summarize key facts, signatures, conventions, and patterns.\n\n"
         "## Hard limits\n"
-        "- You MUST read at least 2 files before producing your summary.\n"
+        "- You MUST call at least 2 MCP tools before falling back to read_file.\n"
         "- Your file_map MUST contain at least 1 entry.\n"
         "- Your summary MUST be at least 2 sentences.\n"
-        "- Total turns: 3-5. More than 5 read/ls/grep calls without producing "
+        "- Total turns: 3-5. More than 5 calls without producing "
         "output means you're over-exploring — report what you have.\n"
         "- If you cannot read files (tool errors, permission issues), report that "
         "with the error details — do NOT return empty results.\n"
@@ -313,6 +344,33 @@ PHASE_SUBAGENTS: dict[str, list[str]] = {
 # ── Factory functions ──────────────────────────────────────────────────
 
 
+def _inject_mcp_tools(tools: list, workspace_root: str) -> None:
+    """Inject MCP codebase-index tools into a subagent's tool list.
+
+    Loads MCP tools from the SpineConfig, wrapping each as a LangChain
+    ``BaseTool``.  Errors during MCP tool loading are logged and swallowed
+    — subagents fall back to filesystem tools if MCP is unavailable.
+
+    Args:
+        tools: The subagent's tool list (mutated in place).
+        workspace_root: Project root for PROJECT_ROOT env injection.
+    """
+    try:
+        from spine.config import SpineConfig
+        from spine.mcp.client import get_mcp_tools
+
+        config = SpineConfig.load()
+        mcp_tools = get_mcp_tools(
+            config.mcp_servers,
+            cache_key=f"subagent-researcher-{workspace_root}",
+            workspace_root=workspace_root,
+        )
+        tools.extend(mcp_tools)
+        logger.debug("Injected %d MCP tools into researcher subagent", len(mcp_tools))
+    except Exception:
+        logger.debug("MCP tool injection skipped for researcher subagent", exc_info=True)
+
+
 def build_subagent_spec(
     name: str,
     phase: PhaseName,
@@ -393,6 +451,16 @@ def build_subagent_spec(
     # use multi-query codebase search instead of sequential ls/glob/grep/read_file.
     if "search_codebase" in allowed_tool_names:
         tools.append(SearchCodebaseTool(workspace_root=workspace_root))
+
+    # ── Inject MCP codebase-index tools for researcher subagents ─
+    # Researchers do codebase exploration — MCP tools (find_symbol,
+    # get_dependencies, get_change_impact, etc.) are MUCH more
+    # token-efficient than reading entire files.  Only inject for
+    # the researcher subagent type; slice-implementer/verifier have
+    # different tooling needs and the orchestrator dispatches them
+    # with full context in the task description.
+    if name == "researcher":
+        _inject_mcp_tools(tools, workspace_root)
 
     # ── Build spec ───────────────────────────────────────────────
     spec: dict[str, Any] = {
