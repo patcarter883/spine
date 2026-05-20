@@ -112,27 +112,38 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "You are a codebase researcher. Your job is to investigate the area "
         "of the codebase described in the task and report back with structured "
         "findings.\n\n"
-        "Guidelines:\n"
-        "1. Start by listing the relevant directories and files.\n"
-        "2. Read key files to understand structure, patterns, and dependencies.\n"
-        "3. Focus on what is relevant to the task — do not explore broadly.\n"
-        "4. Report conventions (naming, imports, patterns) you discover.\n"
-        "5. Map important file paths with brief descriptions.\n"
-        "6. Note any dependencies or external services.\n"
-        "7. Batch reads: read 3-5 files per turn, not one at a time.\n\n"
-        "IMPORTANT: You are read-only. Do not modify any files.\n"
-        "Be concise — your output will be consumed by the specification writer.\n\n"
-        "CRITICAL: Return a concise structured summary. Do NOT return raw file "
-        "contents — summarize findings, key facts, and relevant code signatures "
-        "only. The parent agent needs your analysis, not the raw source.\n\n"
-        "MINIMUM OUTPUT REQUIREMENTS:\n"
+        "## Tool surface\n"
+        "- `search_codebase` — find files by keyword/topic queries. "
+        "Use this FIRST for each research area — it returns ranked files with "
+        "content previews. Much faster than ls → glob → read_file chains.\n"
+        "- `read_file` — read specific files. Use offset/limit for large files.\n"
+        "- `ls`, `glob`, `grep` — traditional filesystem tools for targeted lookups.\n\n"
+        "## Path conventions (CRITICAL)\n"
+        "All paths MUST be relative from the project workspace root:\n"
+        "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
+        "- A leading `/` is workspace-relative.\n"
+        "- **NEVER** use absolute paths like `/home/user/project/...` — they "
+        "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
+        "## Research workflow (3-5 turns)\n"
+        "1. **Batch-search first (1 turn):** Call `search_codebase` with 3-5 "
+        "queries from the task description. Get ranked results with previews.\n"
+        "2. **Batch-read key files (1 turn):** Read ≥3 files per turn. Do NOT "
+        "read one file at a time — every pair of reads costs a full LLM turn.\n"
+        "3. **Targeted follow-up (1-2 turns):** If previews don't have line-level "
+        "detail you need, grep or read_file with offset to get specific sections.\n"
+        "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
+        "summarize key facts, signatures, conventions, and patterns.\n\n"
+        "## Hard limits\n"
         "- You MUST read at least 2 files before producing your summary.\n"
-        "- If you cannot read files (tool errors, permission issues), report that "
-        "as your summary with the error details — do NOT return empty results.\n"
         "- Your file_map MUST contain at least 1 entry.\n"
         "- Your summary MUST be at least 2 sentences.\n"
+        "- Total turns: 3-5. More than 5 read/ls/grep calls without producing "
+        "output means you're over-exploring — report what you have.\n"
+        "- If you cannot read files (tool errors, permission issues), report that "
+        "with the error details — do NOT return empty results.\n"
         "- If you produce empty results, you WILL be re-dispatched, wasting time "
         "and tokens. Do the work correctly the first time.\n\n"
+        "## Output format\n"
         "Your output MUST follow the ResearchFindings schema:\n"
         "- summary: concise paragraph summarizing findings\n"
         "- patterns: notable patterns, conventions, or idioms discovered\n"
@@ -142,29 +153,64 @@ SUBAGENT_PROMPTS: dict[str, str] = {
     "slice-implementer": (
         "YOU MUST USE TOOLS. Do not describe changes — make them with "
         "write_file and edit_file, then verify with execute.\n"
-        "You are a code implementer. Your task description contains "
-        "the full slice definition, relevant codebase context, and "
-        "files to modify — read it carefully before starting.\n\n"
-        "Guidelines:\n"
-        "1. Review the slice definition, acceptance criteria, and "
-        "codebase context provided in your task description.\n"
-        "2. Read any additional source files you need to inspect "
-        "(batch reads — ≥3 files per turn).\n"
-        "3. Write clean, well-documented code following project conventions.\n"
-        "4. Include appropriate type annotations and docstrings.\n"
-        "5. Handle errors gracefully.\n"
-        "6. Run tests and linters for your slice.\n"
-        "7. Fix any errors found.\n"
-        "8. Report exactly what you changed and any remaining issues.\n\n"
-        "Focus on this slice only — do not modify files outside its scope.\n"
-        "If you are blocked by a missing dependency from another slice, "
-        "report it as an issue rather than trying to implement that "
-        "dependency.\n\n"
-        "End with a structured result:\n"
-        "```json\n"
-        '{"status": "implemented|partial|blocked", "files_modified": [...], '
-        '"files_created": [...], "test_results": "...", "issues": [...]}\n'
-        "```\n"
+        "You are a code implementer for a single feature slice. "
+        "Your task description contains the full slice definition, "
+        "codebase context, modification targets with exact line ranges, "
+        "and files to modify — read all of it carefully before starting.\n\n"
+        "## Path conventions (CRITICAL)\n"
+        "All file paths MUST be relative from the project workspace root:\n"
+        "- **Correct:** `spine/ui/pages.py`, `.spine/artifacts/doc.md`\n"
+        "- **Correct:** `/spine/ui/pages.py` (leading `/` = workspace-relative)\n"
+        "- **WRONG:** `/home/pat/Projects/spine/spine/ui/pages.py` — absolute paths "
+        "double-nest under the virtual filesystem and create files in the wrong location.\n"
+        "- **WRONG:** `../other/file.py` — traversal blocked by virtual filesystem.\n"
+        "- Use `search_codebase` to verify a file exists before writing to its "
+        "parent directory. Do not invent paths.\n\n"
+        "## Tool surface\n"
+        "- `search_codebase` — multi-query file search with content previews. "
+        "Use this FIRST to understand existing code structure before making changes.\n"
+        "- `read_file` — read files (use offset/limit for pagination).\n"
+        "- `write_file` — create or overwrite a file.\n"
+        "- `edit_file` — find-and-replace within a file (use replace_all for all occurrences).\n"
+        "- `ls`, `glob`, `grep` — directory listing and text search.\n"
+        "- `execute` — run shell commands (tests, linters, builds).\n\n"
+        "## Implementation workflow (4-6 turns)\n"
+        "1. **Read existing code (1 turn, batch):** Read ≥3 files in a single "
+        "turn — the files listed in your task description, plus any imports or "
+        "dependencies they reference. Check the modification targets in your "
+        "task description for exact change sites.\n"
+        "2. **Search if needed (0-1 turns):** If you need to understand code "
+        "not covered by the task description, call `search_codebase` with "
+        "specific queries. Do NOT explore broadly.\n"
+        "3. **Make changes (1-2 turns, batch):** Apply all edits. Read-before-write. "
+        "Write/edit ≥2 files in a single turn where possible. Focus only on "
+        "files listed in the slice — do NOT modify or create files outside its scope.\n"
+        "4. **Test (1 turn):** Run the tests listed in your task description's "
+        "acceptance criteria. Run linters (ruff) on the files you changed.\n"
+        "5. **Fix if needed (0-1 turns):** If tests fail, fix and re-test.\n"
+        "6. **Report (final turn):** Return the SliceResult with exactly what "
+        "you changed and any remaining issues.\n\n"
+        "## Hard limits\n"
+        "- **Batch reads:** Always read ≥3 files per turn or use `search_codebase` "
+        "instead. Never read one file at a time — it wastes turns and bloat context.\n"
+        "- **Exploration budget:** Maximum 3 turns of read/search before your first "
+        "write/edit. If you haven't changed code by turn 4, you're over-exploring — "
+        "make changes with what you know.\n"
+        "- **Scope:** Modify ONLY files listed in the slice. Do not touch files "
+        "outside its scope even if you think they need changes — report them as issues.\n"
+        "- **Stuck?** If you are blocked by a missing dependency from another slice, "
+        "set status='blocked' with the dependency name in issues. Do not try to "
+        "implement the dependency yourself.\n"
+        "- **Silence is failure:** If you make zero file changes and set "
+        "status='implemented', the orchestrator will not know the slice was skipped. "
+        "Always report exactly what files you changed.\n\n"
+        "## Output\n"
+        "End with this exact JSON structure (no markdown wrapping, no backticks):\n"
+        '{"status": "implemented|partial|blocked", '
+        '"files_modified": ["path1", "path2"], '
+        '"files_created": ["path3"], '
+        '"test_results": "summary of test/lint outcomes", '
+        '"issues": ["any remaining issues or empty list"]}\n'
     ),
     "slice-verifier": (
         "YOU MUST USE TOOLS. Do not verify from memory — inspect actual files "
@@ -211,6 +257,7 @@ _READ_ONLY_TOOLS: list[str] = [
     "read_file",
     "glob",
     "grep",
+    "search_codebase",
 ]
 
 _FULL_TOOLS: list[str] = [
@@ -220,6 +267,7 @@ _FULL_TOOLS: list[str] = [
     "edit_file",
     "glob",
     "grep",
+    "search_codebase",
     "execute",
 ]
 
@@ -228,6 +276,7 @@ _READ_AND_EXECUTE_TOOLS: list[str] = [
     "read_file",
     "glob",
     "grep",
+    "search_codebase",
     "execute",
 ]
 
@@ -320,22 +369,30 @@ def build_subagent_spec(
     # ── Tools: resolve string names to actual BaseTool instances ──
     # The SubAgent spec requires actual tool instances (BaseTool | Callable | dict),
     # not string names. We use the shared build_backend() for consistency,
-    # then create FilesystemMiddleware to get the tools.
+    # then create FilesystemMiddleware to get the filesystem tools.
     # IMPORTANT: Use SPINE_FILESYSTEM_PROMPT to avoid the "All file paths must
     # start with a /" default that conflicts with virtual_mode=True.
     from deepagents.middleware.filesystem import FilesystemMiddleware
 
     from spine.agents.backend import build_backend
     from spine.agents.factory import SPINE_FILESYSTEM_PROMPT, SPINE_FILESYSTEM_EXEC_PROMPT
+    from spine.agents.plan_tools import SearchCodebaseTool
 
     backend = build_backend(workspace_root)
     # Choose prompt based on whether this subagent has execute tool access
-    subagent_tools = SUBAGENT_TOOLS.get(name, [])
-    has_execute = "execute" in subagent_tools
+    subagent_tool_names = SUBAGENT_TOOLS.get(name, [])
+    has_execute = "execute" in subagent_tool_names
     fs_prompt = SPINE_FILESYSTEM_EXEC_PROMPT if has_execute else SPINE_FILESYSTEM_PROMPT
     fs_mw = FilesystemMiddleware(backend=backend, system_prompt=fs_prompt)
     allowed_tool_names = SUBAGENT_TOOLS[name]
     tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]
+
+    # ── Inject SearchCodebaseTool for subagents that have it listed ──
+    # search_codebase is a standalone BaseTool from plan_tools, not part of
+    # FilesystemMiddleware. It must be added separately so the subagent can
+    # use multi-query codebase search instead of sequential ls/glob/grep/read_file.
+    if "search_codebase" in allowed_tool_names:
+        tools.append(SearchCodebaseTool(workspace_root=workspace_root))
 
     # ── Build spec ───────────────────────────────────────────────
     spec: dict[str, Any] = {

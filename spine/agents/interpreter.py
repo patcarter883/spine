@@ -53,19 +53,30 @@ All prompts and skills must use ``globalThis.*`` instead.
 PTC allowlists per phase
 ------------------------
 Each SPINE phase gets a different set of tools exposed in the interpreter
-via the ``ptc`` (programmatic tool calling) allowlist:
+via the ``ptc`` (programmatic tool calling) allowlist. These MUST match
+the actual tool names present in ``request.tools`` when the interpreter's
+``_prepare_for_call`` runs (SubAgentMiddleware is now before the
+interpreter — see factory.py ordering constraint).
 
-- SPECIFY: ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
-- TASKS:   ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
-- IMPLEMENT: ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
-- VERIFY:  ``task``, ``read_file``, ``grep``, ``glob``, ``ls``, ``write_file``, ``edit_file``
-- CRITIC:  (none) — the critic reviews output, it doesn't orchestrate.
+- SPECIFY: ``task``, ``read_work_context``, ``write_specification``
+- TASKS:   ``task``, ``search_codebase``, ``read_prior_artifacts``, ``write_tasks_artifacts``
+- IMPLEMENT: ``task``, ``read_slice_files``, ``write_implementation_report``
+- VERIFY:  ``task``, ``grep``, ``glob``, ``ls``, ``write_file`` (still uses FilesystemMiddleware)
+- CRITIC / PLAN: (none) — single-agent phases, no subagent orchestration.
 
 When using PTC to call the ``task`` tool, use the named subagent for the
-current phase (e.g. ``researcher`` for SPECIFY, ``slice-implementer`` for
+current phase (e.g. ``researcher`` for SPECIFY/TASKS, ``slice-implementer`` for
 IMPLEMENT, ``slice-verifier`` for VERIFY) instead of ``general-purpose``.
 The named subagents have tailored system prompts, tool restrictions, and
 structured response formats that produce better results.
+
+IMPORTANT: If ``filter_tools_for_ptc`` finds zero matching names in
+``request.tools``, the PTC prompt addendum renders empty and QuickJS
+never binds ``globalThis.tools`` — every ``tools.*`` call in eval fails
+with ``TypeError: not a function``. This is the root cause of trace
+``019e44fd`` TASKS phase eval failures: the old allowlist referenced
+``grep``/``glob``/``ls``/``write_file``/``edit_file`` which don't exist
+when ``skip_filesystem_middleware=True``.
 
 Call ``build_interpreter_middleware(phase_name)`` to get the right config.
 """
@@ -81,19 +92,26 @@ from spine.models.enums import PhaseName
 logger = logging.getLogger(__name__)
 
 # ── PTC allowlists per phase ────────────────────────────────────────────
-# Maps SPINE phase names to the list of DA tools that the interpreter
-# is allowed to call programmatically. Each phase exposes "task" for
-# read_file removed from PTC allowlist (2026-05). Under virtual_mode=True,
-# tools.readFile() returns null for project .py source files — the agent
-# must fall back to the native read_file tool, wasting a turn. Reserve eval
-# for orchestration (ls, glob, grep, subagent dispatch) and use native
-# read_file for source code content with batch reads (≥3 files per turn).
+# Maps SPINE phase names to the list of tools that the interpreter
+# is allowed to call programmatically via globalThis.tools in QuickJS.
+#
+# CRITICAL: These tool names MUST exactly match tools present in
+# request.tools when the interpreter runs. With skip_filesystem_middleware=True
+# on orchestrator phases, the old generic filesystem tools (ls, glob, grep,
+# read_file, write_file, edit_file) are not available. Match these to the
+# custom tool names from specify_tools, plan_tools, implement_tools, and
+# tasks_tools. Also include "task" (from SubAgentMiddleware) for subagent
+# dispatch.
+#
+# If filter_tools_for_ptc finds zero matching names, the PTC prompt renders
+# empty and QuickJS never gets globalThis.tools bindings — every
+# tools.task() call fails with "TypeError: not a function".
 
 _PTC_ALLOWLISTS: dict[str, list[str | Any]] = {
-    PhaseName.SPECIFY.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
-    PhaseName.TASKS.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
-    PhaseName.IMPLEMENT.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
-    PhaseName.VERIFY.value: ["task", "grep", "glob", "ls", "write_file", "edit_file"],
+    PhaseName.SPECIFY.value: ["task", "read_work_context", "write_specification"],
+    PhaseName.TASKS.value: ["task", "search_codebase", "read_prior_artifacts", "write_tasks_artifacts"],
+    PhaseName.IMPLEMENT.value: ["task", "read_slice_files", "write_implementation_report"],
+    PhaseName.VERIFY.value: ["task", "grep", "glob", "ls", "write_file"],  # VERIFY still uses FilesystemMiddleware
     # CRITIC and PLAN don't need PTC — they review/plan, not orchestrate.
 }
 
@@ -163,10 +181,15 @@ def build_interpreter_middleware(
     )
     _PTC_REPLACEMENT = (
         "### PTC Note\n"
-        "Tools are pre-bound on `globalThis.tools` using camelCase "
-        "(e.g. `tools.readFile`, `tools.writeFile`, `tools.task`). "
-        "Return values are native JS — strings, arrays, objects. "
-        "Do NOT call `require()` or access `fs`."
+        "Tools are pre-bound on `globalThis.tools` using camelCase. "
+        "Tool names: `tools.task` (subagent dispatch), plus "
+        "phase-specific custom tools (e.g. `tools.searchCodebase`, "
+        "`tools.readSliceFiles`, `tools.writeImplementationReport`, "
+        "`tools.readWorkContext`, `tools.writeSpecification`). "
+        "Return values are native JS types — strings, arrays, objects. "
+        "Do NOT call `require()` or access `fs`. "
+        "Do NOT use old filesystem tool names like `ls`, `glob`, `grep`, "
+        "`readFile`, `writeFile` — they do not exist in PTC on orchestrator phases."
     )
 
     class SpineInterpreterMiddleware(CodeInterpreterMiddleware):

@@ -443,11 +443,11 @@ class TestResearcherMinOutput:
     requirements to prevent empty-result re-dispatches."""
 
     def test_researcher_prompt_has_minimum_output_section(self) -> None:
-        """The researcher prompt must contain a 'MINIMUM OUTPUT REQUIREMENTS'
-        section."""
+        """The researcher prompt must contain 'Hard limits' section that enforces
+        minimum output requirements."""
         prompt = SUBAGENT_PROMPTS["researcher"]
-        assert "MINIMUM OUTPUT REQUIREMENTS" in prompt, (
-            "Researcher prompt must include a MINIMUM OUTPUT REQUIREMENTS section"
+        assert "Hard limits" in prompt, (
+            "Researcher prompt must include a Hard limits section"
         )
 
     def test_researcher_prompt_requires_at_least_2_files(self) -> None:

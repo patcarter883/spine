@@ -98,25 +98,32 @@ SPINE_FILESYSTEM_PROMPT = """\
 
 You have access to a virtual filesystem rooted at the project workspace.
 
-**Path conventions (CRITICAL — violations break artifact storage):**
-- Use **relative paths** from the workspace root: `.spine/artifacts/file.md`, `src/main.py`.
-- A leading `/` is treated as workspace-relative (e.g. `/src/main.py` resolves correctly).
-- **NEVER use absolute paths** like `/home/user/project/src/main.py` — the filesystem
-  treats them as virtual paths relative to the workspace root, so they get double-nested
-  and your files end up at the wrong location. Always use `src/main.py` or `/src/main.py`.
-- Path traversal (`..`, `~`) is blocked by the virtual filesystem.
-- Use pagination (offset/limit) when reading large files.
+**Path conventions — VIOLATIONS BREAK EVERYTHING:**
+- Use **relative paths** from the workspace root: `.spine/artifacts/file.md`, `spine/ui/pages.py`.
+- A leading `/` is treated as workspace-relative (e.g. `/spine/ui/pages.py` resolves correctly).
+- **NEVER use absolute Linux paths** like `/home/user/project/spine/ui/pages.py` — the
+  virtual filesystem treats `/home/user/...` as a virtual path, so it gets double-nested
+  under the workspace root and your files land at a path that does not exist and will never
+  be found by subsequent phases. Write `spine/ui/pages.py` NOT `/home/pat/Projects/spine/spine/ui/pages.py`.
+- **Path traversal** (`..`, `~`) is BLOCKED. Use relative paths only.
+- **Verify paths exist** before modifying: use `ls` on parent directories, or `search_codebase`
+  if available. Do not invent paths like `src/main.py` or `api/routes.py` — confirm they exist
+  or that the parent directory exists for new files.
+- Use **offset/limit** when reading large files. Read only what you need.
 
 Tools:
 - ls: list files in a directory
 - read_file: read a file (supports offset/limit for large files, plus images/PDFs)
-- write_file: create or overwrite a file
+- write_file: create or overwrite a file at a relative path
 - edit_file: find-and-replace within a file (supports replace_all)
 - glob: find files matching a pattern (e.g. `**/*.py`)
 - grep: search file contents with multiple output modes
 
-## Large Tool Results
+## Batch reads
+Never read one file per turn. Always batch: read ≥3 files or use search_codebase
+instead. Sequential single-file reads waste turns and bloat context.
 
+## Large Tool Results
 When a tool result is too large, it may be offloaded to `/large_tool_results/<tool_call_id>` \
 instead of being returned inline. Use `read_file` to inspect in chunks, or `grep` within \
 `/large_tool_results/` to search across offloaded results."""
@@ -128,6 +135,7 @@ SPINE_FILESYSTEM_EXEC_PROMPT = SPINE_FILESYSTEM_PROMPT + """
 You have access to an `execute` tool for running shell commands.
 Use it for commands, scripts, tests, builds, and other shell operations.
 Commands run in the workspace root directory.
+All paths in commands MUST be relative (e.g. `pytest tests/unit/` NOT `pytest /home/user/project/tests/unit/`).
 
 - execute: run a shell command (returns output and exit code)"""
 
