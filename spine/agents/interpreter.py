@@ -73,6 +73,7 @@ Call ``build_interpreter_middleware(phase_name)`` to get the right config.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from spine.models.enums import PhaseName
@@ -156,30 +157,37 @@ def build_interpreter_middleware(
             phase_name,
         )
 
+    _TS_BLOCK_RE = re.compile(
+        r"### API Reference — `tools` namespace\b.*",
+        re.DOTALL,
+    )
+    _PTC_REPLACEMENT = (
+        "### PTC Note\n"
+        "Tools are pre-bound on `globalThis.tools` using camelCase "
+        "(e.g. `tools.readFile`, `tools.writeFile`, `tools.task`). "
+        "Return values are native JS — strings, arrays, objects. "
+        "Do NOT call `require()` or access `fs`."
+    )
+
     class SpineInterpreterMiddleware(CodeInterpreterMiddleware):
-        """Strips redundant TypeScript schemas injected by langchain-quickjs."""
+        """Strips the verbose TypeScript schema block injected by langchain-quickjs.
 
-        async def before_model(
-            self, messages: list[Any], *, tools: list[Any], **kwargs: Any
-        ) -> dict[str, Any]:
-            result = await super().before_model(messages, tools=tools, **kwargs)
-            out_msgs = result.get("messages", messages)
+        ``_prepare_for_call`` returns a str (the prompt addendum) that
+        includes a full TS signature block for every PTC tool.  We strip
+        that block and replace it with a two-line summary before the
+        addendum is appended to the system message, saving ~3 K tokens
+        on every model call.
+        """
 
-            import re
-
-            for m in out_msgs:
-                if hasattr(m, "content") and isinstance(m.content, str):
-                    if "API Reference" in m.content and "tools namespace" in m.content:
-                        # Scrub the TypeScript definitions section. It starts with the header
-                        # and ends exactly at the last typescript block closure in that section.
-                        m.content = re.sub(
-                            r"### API Reference — `tools` namespace.*?(```typescript.*?```\s*)+",
-                            "### PTC Note\nTools are pre-bound on `globalThis.tools` using camelCase (e.g. `tools.readFile`). Return values are native JS. Do not json parse.",
-                            m.content,
-                            flags=re.DOTALL,
-                        )
-
-            return result
+        async def awrap_model_call(self, request, handler):
+            # _prepare_for_call → str (prompt addendum, may contain TS block)
+            prompt: str = self._prepare_for_call(request)
+            clean_prompt = _TS_BLOCK_RE.sub(_PTC_REPLACEMENT, prompt)
+            return await handler(
+                request.override(
+                    system_message=self._extend(request.system_message, clean_prompt)
+                )
+            )
 
     middleware = SpineInterpreterMiddleware(
         memory_limit=memory_limit,

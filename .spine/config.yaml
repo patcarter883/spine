@@ -30,7 +30,7 @@ providers:
     enabled: true
   - name: local
     type: deepagents-model
-    model: openai:model
+    model: openai:Qwen3.6-35B-A3B-GGUF
     base_url: 'http://localhost:8000/v1'
     api_key: 'vllm'
     enabled: true
@@ -48,7 +48,7 @@ providers:
     plan:
       provider: deepseek-v4-pro
     tasks:
-      provider: pat
+      provider: local
     # Implementation → local vLLM, but colder temperature for code
     implement:
       provider: pat

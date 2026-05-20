@@ -474,7 +474,10 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     # Context editing: trim old tool results — all phases benefit from trimming
     # SPECIFY/PLAN can accumulate 80+ read_file results, same as IMPLEMENT/VERIFY
     from spine.agents.context_editing import ToolOutputTrimmer
-    middleware.append(ToolOutputTrimmer(max_full_tool_results=20))
+    
+    # Aggressively middle-truncate tool outputs for orchestrator phases to avoid bloat
+    trim_limit = 5 if phase.value in ["specify", "plan", "implement", "tasks"] else 20
+    middleware.append(ToolOutputTrimmer(max_full_tool_results=trim_limit))
 
 
 def _add_summarization_middleware(
@@ -513,7 +516,7 @@ def _add_summarization_middleware(
 
             logger.debug(
                 "Added summarization middleware "
-                "(trigger=80K tokens, keep=20 msgs, custom prompt)"
+                "(trigger=60K tokens, keep=20 msgs, custom prompt)"
             )
         except Exception as exc:
             logger.debug(
