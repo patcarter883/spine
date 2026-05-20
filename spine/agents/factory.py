@@ -183,6 +183,8 @@ def build_phase_agent(
     response_format: Any | None = None,
     is_subagent: bool = False,
     allowed_tools: list[str] | None = None,
+    extra_tools: list[Any] | None = None,
+    skip_filesystem_middleware: bool = False,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -210,6 +212,14 @@ def build_phase_agent(
         is_subagent: When True, skips artifact materialization and
             interpreter/summarization middleware (subagents are leaf
             agents, not orchestrators).
+        extra_tools: Additional BaseTool instances injected directly into
+            create_agent(tools=[...]). These sit alongside tools from
+            middleware. Use for custom orchestrator tools (e.g. ReadSliceFilesTool)
+            that replace generic filesystem access.
+        skip_filesystem_middleware: When True, FilesystemMiddleware is omitted
+            entirely. Pair with extra_tools to replace all filesystem access
+            with purpose-built tools, removing any generic read/write fallback
+            from the model's tool surface.
 
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
@@ -279,6 +289,7 @@ def build_phase_agent(
         memory=memory,
         skills=skills,
         allowed_tools=allowed_tools,
+        skip_filesystem_middleware=skip_filesystem_middleware,
     )
 
     # ── Context schema ───────────────────────────────────────────────
@@ -288,7 +299,7 @@ def build_phase_agent(
     agent = create_agent(
         model,
         system_prompt=final_system_prompt,
-        tools=[],  # All tools come from middleware
+        tools=list(extra_tools) if extra_tools else [],  # Custom tools + middleware tools
         middleware=middleware,
         response_format=response_format,
         context_schema=context_schema,
@@ -324,6 +335,7 @@ def _build_middleware_stack(
     memory: list[str] | None,
     skills: list[str] | None,
     allowed_tools: list[str] | None = None,
+    skip_filesystem_middleware: bool = False,
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
@@ -334,7 +346,7 @@ def _build_middleware_stack(
 
     1.  TodoListMiddleware         — task planning state
     2.  SkillsMiddleware           — progressive skill disclosure
-    3.  FilesystemMiddleware       — filesystem tools with SPINE custom prompt
+    3.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
     4.  CodeInterpreterMiddleware  — eval tool (when enabled)
     5.  SubAgentMiddleware         — task delegation (when subagents present)
     6.  SummarizationMiddleware    — context compression
@@ -355,22 +367,29 @@ def _build_middleware_stack(
         middleware.append(SkillsMiddleware(backend=backend, sources=skills))
 
     # 3. Filesystem — core tool surface with custom SPINE prompt
-    #    This is the key change from create_deep_agent: we provide a
-    #    custom system_prompt that uses relative paths instead of
-    #    DA's default "All file paths must start with a /".
-    fs_prompt = _get_filesystem_prompt(backend)
-    fs_mw = FilesystemMiddleware(
-        backend=backend,
-        system_prompt=fs_prompt,
-        custom_tool_descriptions=tool_desc_overrides,
-    )
-    # Optional tool filter — when the phase declares an allowed_tools
-    # whitelist, drop everything else from the middleware's tool list.
-    # Used by orchestrator phases (implement, verify) to physically
-    # prevent the orchestrator from writing source code itself.
-    if allowed_tools is not None:
-        _filter_filesystem_tools(fs_mw, allowed_tools, phase)
-    middleware.append(fs_mw)
+    #    Skipped when skip_filesystem_middleware=True, which is used by
+    #    the implement orchestrator to replace generic filesystem access
+    #    with purpose-built tools (ReadSliceFilesTool, WriteImplementationReportTool)
+    #    that enforce dispatch-only behaviour at the tool level.
+    if not skip_filesystem_middleware:
+        fs_prompt = _get_filesystem_prompt(backend)
+        fs_mw = FilesystemMiddleware(
+            backend=backend,
+            system_prompt=fs_prompt,
+            custom_tool_descriptions=tool_desc_overrides,
+        )
+        # Optional tool filter — when the phase declares an allowed_tools
+        # whitelist, drop everything else from the middleware's tool list.
+        # Used by orchestrator phases (implement, verify) to physically
+        # prevent the orchestrator from writing source code itself.
+        if allowed_tools is not None:
+            _filter_filesystem_tools(fs_mw, allowed_tools, phase)
+        middleware.append(fs_mw)
+    else:
+        logger.debug(
+            "Phase %s: FilesystemMiddleware skipped (skip_filesystem_middleware=True)",
+            phase.value,
+        )
 
     # 4. Interpreter (eval tool) — only for top-level phase agents
     if has_interpreter:

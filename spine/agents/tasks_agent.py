@@ -1,13 +1,28 @@
 """SPINE tasks agent — Deep Agent for the TASKS (decomposition) phase.
 
-Uses the shared :func:`build_phase_agent` factory. Structured
-explore→decompose workflow with conditional researcher subagent dispatch
-for quick workflows (no prior spec/plan exist).
+Researches the codebase via ``search_codebase`` (and optional researcher
+subagents), then writes all decomposition artifacts atomically via
+``write_tasks_artifacts``.
 
-The TASKS phase is upstream of two restricted orchestrator phases
-(IMPLEMENT, VERIFY) that depend on the artifacts produced here. The
-codebase-map.md it produces must be detailed enough that downstream
-subagents can locate exact code without re-exploring.
+Tool surface (complete list):
+- ``read_prior_artifacts`` — loads spec/plan artifacts (spec workflows only)
+- ``search_codebase`` — multi-query targeted file search (replaces ls/glob/grep/read_file)
+- ``write_tasks_artifacts`` — atomic write of slices + tasks.md + codebase-map.md
+- ``task`` (via SubAgentMiddleware) — dispatches researcher subagents
+- ``eval`` (via CodeInterpreterMiddleware) — parallel subagent dispatch
+
+No generic filesystem tools (ls, read_file, glob, grep, write_file,
+edit_file, execute). The agent cannot read files directly — it uses
+``search_codebase`` for targeted lookup. Researcher subagents do deep
+exploration. ``write_tasks_artifacts`` is the only write surface and
+calling it ends the phase.
+
+Design rationale (trace 019e4483 analysis):
+- With generic fs tools: 87 read_file calls, same files re-read 38×,
+  no researcher dispatch, continued reading 20+ min AFTER writing.
+- ``search_codebase`` answers "what code is relevant?" in one call.
+- ``write_tasks_artifacts`` makes partial-output impossible and provides
+  a clear phase-completion signal the agent can't ignore.
 """
 
 from __future__ import annotations
@@ -17,9 +32,10 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from spine.agents.artifacts import build_artifact_prompt
+from spine.agents.artifacts import _artifact_path
 from spine.agents.factory import build_phase_agent
 from spine.agents.subagents import build_phase_subagents
+from spine.agents.tasks_tools import build_tasks_agent_tools
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 
@@ -33,20 +49,16 @@ def _build_subagents(
 ) -> list[Any] | None:
     """Resolve subagent specs for the TASKS phase.
 
-    Returns researcher subagents when the workflow type includes ``spec``
-    or ``quick`` (both need codebase exploration), **unless** the quick
-    workflow is trivial (short UI-only description). Returns ``None`` for
-    trivial quick workflows and for rework passes where prior context
-    already exists.
+    Returns researcher subagents for workflows that need codebase
+    exploration, None for trivial quick tasks.
     """
     work_type = state.get("work_type", "")
     if "quick" in work_type and "critical" not in work_type:
         description = state.get("description", "")
-        # Skip researcher dispatch for trivial quick tasks to save tokens
         if len(description) < 150:
             logger.info(
                 "[%s] TASKS: skipping researcher subagents for trivial quick task "
-                "(description %d chars)",
+                "(%d chars)",
                 state.get("work_id", ""),
                 len(description),
             )
@@ -62,9 +74,6 @@ def build_tasks_agent(
 ) -> Any:
     """Build the Deep Agent for the TASKS phase.
 
-    Decomposes the work description into feature slices and produces the
-    codebase-map.md that downstream IMPLEMENT and VERIFY phases depend on.
-
     Args:
         state: The current workflow state.
         config: LangGraph runtime config.
@@ -73,16 +82,33 @@ def build_tasks_agent(
         A compiled Deep Agent ready for invocation.
     """
     work_id = state.get("work_id", "")
+    workspace_root = state.get("workspace_root", ".")
     work_type = state.get("work_type", "")
+    description = state.get("description", "")
+    feedback_raw = state.get("feedback", [])
+    feedback = [str(f) for f in feedback_raw] if feedback_raw else []
     is_quick = "quick" in work_type
-    tasks_artifact_dir = f".spine/artifacts/{work_id}/tasks"
+
+    tasks_dir = f".spine/artifacts/{work_id}/tasks"
+
+    # Prior phase dirs for read_prior_artifacts (spec workflows only)
+    prior_phase_dirs = _resolve_prior_phase_dirs(state, work_id)
+
+    agent_tools = build_tasks_agent_tools(
+        workspace_root=workspace_root,
+        work_id=work_id,
+        prior_phase_dirs=prior_phase_dirs,
+        description=description,
+        work_type=work_type,
+        feedback=feedback,
+    )
 
     system_prompt = _build_tasks_prompt(
         work_id=work_id,
-        tasks_dir=tasks_artifact_dir,
+        tasks_dir=tasks_dir,
         is_quick=is_quick,
-    ) + build_artifact_prompt(
-        state.get("artifacts", {}), PhaseName.TASKS.value, work_id=work_id
+        has_prior_artifacts=bool(prior_phase_dirs),
+        is_rework=bool(feedback),
     )
 
     agent = build_phase_agent(
@@ -90,102 +116,136 @@ def build_tasks_agent(
         config=config,
         phase=PhaseName.TASKS,
         system_prompt=system_prompt,
-        add_summarization=True,  # TASKS can be long-running with researcher subagents
+        add_summarization=True,
         subagents=_build_subagents(PhaseName.TASKS, state, config),
+        extra_tools=agent_tools,
+        skip_filesystem_middleware=True,
     )
 
     return agent
 
 
-# ── Prompt builder ─────────────────────────────────────────────────────
+def _resolve_prior_phase_dirs(
+    state: WorkflowState,
+    work_id: str,
+) -> dict[str, str]:
+    """Map phases with existing artifacts to their directories."""
+    artifacts = state.get("artifacts", {}) or {}
+    dirs: dict[str, str] = {}
+    for phase, phase_artifacts in artifacts.items():
+        if phase_artifacts and isinstance(phase_artifacts, dict):
+            dirs[phase] = _artifact_path(work_id, phase)
+    return dirs
 
 
-def _build_tasks_prompt(*, work_id: str, tasks_dir: str, is_quick: bool) -> str:
-    """Build the tasks decomposition system prompt."""
+def _build_tasks_prompt(
+    *,
+    work_id: str,
+    tasks_dir: str,
+    is_quick: bool,
+    has_prior_artifacts: bool,
+    is_rework: bool,
+) -> str:
+    rework_note = (
+        "\n**This is a REWORK pass.** `read_prior_artifacts` will include "
+        "prior feedback. Address all feedback points in your decomposition.\n"
+        if is_rework
+        else ""
+    )
+
     if is_quick:
-        explore_section = (
-            "### Step 1 — Explore (1-2 turns)\n"
-            "Quick workflow — no prior spec or plan exists. Dispatch 2-3 "
-            "`researcher` subagents in parallel inside one `eval` call via "
-            "`Promise.all(tools.task(...))`. Each researcher investigates "
-            "ONE module relevant to the work description.\n\n"
-            "Subagent_type MUST be `researcher` (only valid type at this phase).\n\n"
+        step1 = (
+            "### Step 1 — Dispatch researcher subagents in parallel (1 eval turn)\n"
+            "This is a quick workflow — no spec/plan exists. Your FIRST action "
+            "MUST be an `eval` call that dispatches 2-3 `researcher` subagents "
+            "in parallel via `Promise.allSettled`. Each researcher investigates "
+            "ONE module or area relevant to the work description.\n\n"
+            "Do NOT call `search_codebase` or explore yourself before dispatching "
+            "researchers — they do the exploration. You orchestrate and synthesize.\n\n"
+            "Researcher dispatch pattern:\n"
+            "```js\n"
+            "// Your FIRST eval call must look like this:\n"
+            "const desc = '<work description>';\n"
+            "const results = await Promise.allSettled([\n"
+            "  tools.task({subagent_type: 'researcher',\n"
+            "    description: `Research area 1 for: ${desc}\\n"
+            "Investigate: <specific module/file/concern>`}),\n"
+            "  tools.task({subagent_type: 'researcher',\n"
+            "    description: `Research area 2 for: ${desc}\\n"
+            "Investigate: <specific module/file/concern>`}),\n"
+            "]);\n"
+            "globalThis.research = results.map(r => r.value || r.reason);\n"
+            "console.log('Researchers done:', results.map(r => r.status));\n"
+            "```\n\n"
+            "### Step 1b — Targeted follow-up (0-1 turns, optional)\n"
+            "If researcher results reference specific files you need line-level "
+            "detail for (e.g. a change site), call `search_codebase` with the "
+            "exact function names or symbols. Maximum 1-2 `search_codebase` calls.\n\n"
+        )
+    elif has_prior_artifacts:
+        step1 = (
+            "### Step 1 — Load prior artifacts (1 turn)\n"
+            "Call `read_prior_artifacts` with no arguments. It returns the "
+            "full specification and plan from prior phases.\n"
+            "```js\n"
+            "globalThis.ctx = JSON.parse(result);\n"
+            "// ctx.artifacts.specify, ctx.artifacts.plan\n"
+            "```\n\n"
+            "### Step 1b — Search codebase for modification targets (1 turn)\n"
+            "Call `search_codebase` with queries derived from the plan's "
+            "module structure and API designs. Find the exact files and "
+            "functions you'll need to modify.\n\n"
         )
     else:
-        explore_section = (
-            "### Step 1 — Read prior artifacts (1 turn)\n"
-            "Batch-read the spec and plan artifacts in one response. Do not "
-            "re-explore — the plan already contains the design.\n\n"
+        step1 = (
+            "### Step 1 — Search codebase (1 turn)\n"
+            "Call `search_codebase` with 3-5 queries relevant to the work. "
+            "Find the exact files that need to change and the functions "
+            "around the change sites.\n\n"
         )
 
     return (
-        "You are a task decomposition specialist. Break the work description "
-        "into executable feature slices and produce a codebase map that "
-        "downstream IMPLEMENT and VERIFY orchestrators will rely on.\n\n"
-        "Filesystem is rooted at the workspace; use relative paths.\n\n"
-        "## Why codebase-map.md matters\n"
-        "The IMPLEMENT and VERIFY phases are DISPATCH-ONLY orchestrators — "
-        "they cannot edit files themselves. They give your codebase-map.md "
-        "directly to subagents. If the map lacks file paths, line ranges, "
-        "or modification targets, subagents will waste turns re-exploring.\n\n"
-        "## Workspace grounding — CRITICAL\n"
-        "You are working on the **specific project in your workspace**, not a "
-        "generic software project. Every file path you write in any artifact "
-        "MUST refer to a file that actually exists in the workspace (for files "
-        "to modify) or a directory that exists (for new files).\n\n"
-        "**Before writing any slice or codebase-map.md:**\n"
-        "Use `glob` or `ls` to confirm that at least 3 file paths from your "
-        "researchers' findings exist on disk. If no researcher-identified paths "
-        "exist in the workspace, STOP — you are working on the wrong project or "
-        "have the wrong workspace root. Re-read `./` with `ls` to orient yourself "
-        "before writing anything.\n\n"
-        "**Forbidden:** Do NOT invent generic paths like `src/main.py`, "
-        "`api/routes.py`, `web/components/`, or any path you have not confirmed "
-        "exists (for modifications) or whose parent directory you have not "
-        "confirmed exists (for new files). An artifact gate will reject slices "
-        "that reference non-existent workspace paths.\n\n"
-        "## Workflow\n\n"
-        f"{explore_section}"
-        "### Step 1b — Verify workspace grounding (1 turn)\n"
-        "After researchers complete, pick 3 file paths from their `file_map` "
-        "and confirm they exist: `glob` them or `ls` their parent directory. "
-        "If none exist, `ls ./` and re-orient before proceeding.\n\n"
-        "### Step 2 — Decompose (1-2 turns)\n"
-        f"Write to `{tasks_dir}/`:\n"
-        "- One `slice-<name>.md` per feature slice (DAG-ordered by deps)\n"
-        "- `tasks.md` — index of slices, dependency waves, file change matrix\n"
-        "- `codebase-map.md` — see required sections below\n\n"
-        "Each slice must include: name, description, files to modify/create, "
-        "dependencies, acceptance criteria, complexity estimate.\n\n"
-        "## codebase-map.md — Required Sections\n"
-        "1. **Files** — path → 1-line description → line count\n"
-        "2. **Key Functions** — `name(args) → ret  [L<start>-<end>]` + 1-line desc.\n"
-        "   Example: `submit_work(description, work_type, config) → dict  "
-        "[L367-420]  — creates work entry and starts graph`\n"
-        "3. **Import Chains** — which modules import which\n"
-        "4. **Conventions** — naming, patterns, error handling\n"
-        "5. **Modification Targets** — for each file to be modified, a 3-5 "
-        "line code snippet around the change site with its line range. "
-        "This is what subagents will use to locate exact insertion points.\n\n"
-        "Example modification target:\n"
-        "```python\n"
-        "# spine/work/dispatcher.py [L407-420]\n"
-        "        if any(\n"
-        '            isinstance(f, dict) and f.get("status") == "needs_review"\n'
-        "            for f in feedback\n"
-        "        ):\n"
-        '            final_status = "needs_review"\n'
-        "```\n\n"
-        "## Rules\n"
-        "- You MUST call `write_file` for every artifact. Conversation-only "
-        "output is lost; the next phase has nothing to dispatch.\n"
-        "- Batch reads — read ≥3 files per turn.\n"
-        "- Spend at most 2-3 turns exploring; then write.\n"
-        "- All file paths in slice files MUST be real workspace paths "
-        "(confirmed to exist, or inside a confirmed-existing directory).\n\n"
-        "## Eval Context Seed (first eval call)\n"
+        "You are the TASKS phase agent. Your job is to decompose the work "
+        "into executable feature slices with a precise codebase map that "
+        "downstream IMPLEMENT and VERIFY orchestrators depend on.\n\n"
+        f"{rework_note}"
+        "## Your tool surface (complete list)\n"
+        "- `read_prior_artifacts` — loads spec/plan artifacts. No args.\n"
+        "- `search_codebase` — find files by keyword/topic queries.\n"
+        "- `write_tasks_artifacts` — writes all artifacts atomically. "
+        "Call this ONCE. It is the ONLY write tool.\n"
+        "- `task` (via eval) — dispatches a `researcher` subagent.\n"
+        "- `eval` — JavaScript REPL for parallel dispatch and caching.\n\n"
+        "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
+        "`edit_file`, or `execute`. Do not attempt to call them.\n\n"
+        "## Workflow (~3 turns total)\n\n"
+        f"{step1}"
+        "### Step 2 — Call write_tasks_artifacts (1 turn)\n"
+        "Synthesize everything into one `write_tasks_artifacts` call. "
+        "Provide:\n"
+        "- `slices`: list of slice objects, each with name, description, "
+        "files_to_modify, files_to_create, dependencies, acceptance_criteria, "
+        "complexity, modification_targets\n"
+        "- `overview`: 2-4 sentence summary of the decomposition\n"
+        "- `dependency_waves`: which slices run in parallel vs. sequentially\n"
+        "- `codebase_map`: ALL five required sections (Files, Key Functions, "
+        "Import Chains, Conventions, Modification Targets)\n\n"
+        "**PHASE IS COMPLETE AFTER write_tasks_artifacts.** "
+        "Do NOT make any further tool calls after it returns. "
+        "Do NOT read more files, do NOT verify your output, do NOT run any checks. "
+        "The tool writes all files atomically — they are correct by construction.\n\n"
+        "## Critical rules\n"
+        "- Dispatch researchers FIRST (quick workflows) or load artifacts FIRST "
+        "(spec workflows). Do not invent file paths from memory.\n"
+        "- Every `files_to_modify` path MUST appear in `search_codebase` or "
+        "researcher results. Do not invent paths like `src/main.py`.\n"
+        "- `modification_targets` MUST include actual code snippets from "
+        "search results — not placeholder text.\n"
+        "- Call `write_tasks_artifacts` exactly ONCE with ALL slices together.\n"
+        "- After `write_tasks_artifacts` returns, stop immediately.\n\n"
+        "## Eval context seed\n"
         "```js\n"
-        f"globalThis.context = {{work_id: \"{work_id}\", "
-        f"phase: \"tasks\", artifact_dir: \"{tasks_dir}\"}};\n"
+        f'globalThis.context = {{work_id: "{work_id}", '
+        f'phase: "tasks", tasks_dir: "{tasks_dir}"}};\n'
         "```\n\n"
     )

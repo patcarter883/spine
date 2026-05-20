@@ -4,19 +4,31 @@ This phase is the **orchestrator**: its only job is to dispatch one
 ``slice-implementer`` subagent per feature slice and synthesize their
 results into ``implementation.md``. It does NOT touch source code.
 
-Design rationale (see trace 743e5acb assessment):
+Design rationale (see trace 743e5acb and 019e4447 assessments):
 
 - Letting a single agent implement N slices serially causes runaway
-  context growth (the trace 743e5acb implement phase grew prompts from
-  17K → 84K tokens over 160 LLM calls, with the same files re-read up
-  to 29 times).
+  context growth (trace 743e5acb grew prompts from 17K → 84K tokens
+  over 160 LLM calls, same files re-read up to 29 times; trace 019e4447
+  hit the 73K hard context limit after 181 LLM turns with 0 eval calls).
 - One subagent per slice gives each subagent a fresh, small context.
-  The orchestrator's context stays bounded by the slice count, not the
-  slice complexity.
-- The orchestrator is dispatch-only by tool restriction
-  (``allowed_tools``), so the FilesystemMiddleware physically does not
-  expose ``edit_file`` or ``execute``. The model cannot accidentally
-  start patching files even if instructions get muddled.
+  The orchestrator's context stays bounded by the slice count, not slice
+  complexity.
+- The orchestrator is dispatch-only by **tool design**, not just by
+  instruction. Generic filesystem tools (ls, read_file, glob, grep,
+  write_file) are replaced entirely with two purpose-built tools:
+
+  * ``read_slice_files`` — loads all slice definitions and the codebase
+    map in a single call. Eliminates multi-turn exploration; the
+    orchestrator has no need for ``ls``/``glob``/``grep``/``read_file``.
+  * ``write_implementation_report`` — the only write surface. Accepts
+    a structured result dict and writes to the fixed implementation.md
+    path. Cannot write source files.
+
+  With these tools the model's only valid actions are:
+  (1) call ``read_slice_files`` once,
+  (2) call ``eval`` to dispatch subagents in parallel,
+  (3) call ``write_implementation_report`` to synthesize.
+  There is literally nothing else to do.
 """
 
 from __future__ import annotations
@@ -31,20 +43,25 @@ from spine.agents.artifacts import (
     list_slice_files,
 )
 from spine.agents.factory import build_phase_agent
+from spine.agents.implement_tools import build_implement_orchestrator_tools
 from spine.agents.subagents import build_phase_subagents
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 
-# ── Tool allowlist ─────────────────────────────────────────────────────
-# Orchestrator role: no edit_file, no execute. The orchestrator reads
-# slice files, dispatches subagents, and writes implementation.md only.
-# Source-code mutation belongs to slice-implementer subagents.
-_IMPLEMENT_ORCHESTRATOR_TOOLS: list[str] = [
+# ── Tool allowlist (legacy — kept for reference) ────────────────────────
+# Previously the orchestrator used FilesystemMiddleware with an allowlist
+# that kept only read-only tools + write_file. This still allowed a weak
+# model to fall back to 100+ sequential read_file calls (trace 019e4447:
+# 181 LLM turns, 106 read_file calls, context overflow at 73K tokens).
+#
+# The new approach (below) replaces FilesystemMiddleware entirely with
+# two purpose-built tools. Kept here for historical reference only.
+_IMPLEMENT_ORCHESTRATOR_TOOLS_LEGACY: list[str] = [
     "ls",
     "read_file",
     "glob",
     "grep",
-    "write_file",  # for implementation.md only; orchestrator MUST NOT touch source
+    "write_file",
 ]
 
 
@@ -108,6 +125,16 @@ def build_implement_agent(
         state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
     )
 
+    # ── Build custom orchestrator tools ───────────────────────────────
+    # Replace generic filesystem tools with two purpose-built tools that
+    # enforce dispatch-only behaviour at the tool level. FilesystemMiddleware
+    # is skipped entirely — the orchestrator cannot call ls/glob/read_file/
+    # write_file/grep/edit_file/execute even if it tries.
+    orchestrator_tools = build_implement_orchestrator_tools(
+        workspace_root=workspace_root,
+        work_id=work_id,
+    )
+
     agent = build_phase_agent(
         state=state,
         config=config,
@@ -115,7 +142,8 @@ def build_implement_agent(
         system_prompt=system_prompt,
         add_summarization=True,
         subagents=_build_subagents(PhaseName.IMPLEMENT, state, config),
-        allowed_tools=_IMPLEMENT_ORCHESTRATOR_TOOLS,
+        extra_tools=orchestrator_tools,
+        skip_filesystem_middleware=True,
     )
 
     return agent
@@ -154,83 +182,83 @@ def _build_orchestrator_prompt(
         )
     else:
         dispatch_note = (
-            "Slice files not yet discovered. Use `glob` to list "
-            f"`{tasks_dir}/slice-*.md`, then dispatch one subagent per slice."
+            "No slices were pre-discovered. Call `read_slice_files` — it will "
+            "return whatever slice files exist. If it returns none, write a "
+            "`write_implementation_report` with an empty slice_results list "
+            "and a summary explaining the tasks phase produced no slices."
         )
 
     return (
         "You are the IMPLEMENT phase orchestrator. You do NOT write source "
         "code yourself — you dispatch one `slice-implementer` subagent per "
-        "feature slice and synthesize their results into a single report.\n\n"
-        "Your tools are restricted: you have `ls`, `read_file`, `glob`, "
-        "`grep`, `write_file`, `task`, and `eval`. You do NOT have "
-        "`edit_file` or `execute`. This is intentional — source-code "
-        "mutation belongs to subagents.\n\n"
-        "## Expected tool errors (BY DESIGN — do not recover)\n"
-        "If you attempt to call `edit_file` or `execute`, you will see a "
-        "'tool not found' or 'unknown tool' error. This is **not a bug** — "
-        "your toolset is deliberately filtered. Do not try alternative "
-        "tools or attempt to work around the restriction. Dispatch a "
-        "`slice-implementer` subagent instead — they have those tools.\n\n"
-        "## Workflow (3 steps, ~5 turns total)\n\n"
-        "### Step 1 — Read slice definitions and codebase map\n"
-        f"In ONE turn, batch-read these files:\n"
-        f"- `{tasks_dir}/codebase-map.md` (architecture, file paths, conventions)\n"
-        f"- Each slice file listed below\n\n"
-        f"{slice_inventory}\n\n"
-        "**If `codebase-map.md` is missing or empty:** Do NOT explore the "
-        "workspace to reconstruct it. The tasks phase was incomplete. Proceed "
-        "directly to Step 2 using the slice files only. If slice files reference "
-        "paths that don't exist, note that in `implementation.md` and dispatch "
-        "subagents anyway — let each subagent report what it finds. Do NOT spend "
-        "more than 2 read/ls turns before dispatching.\n\n"
-        "### Step 2 — Dispatch slice-implementer subagents in parallel\n"
+        "feature slice and synthesize their results.\n\n"
+        "## Your tool surface (complete list)\n"
+        "- `read_slice_files` — loads all slice definitions + codebase map "
+        "in ONE call. No arguments needed. Call this FIRST.\n"
+        "- `write_implementation_report` — writes implementation.md. Call "
+        "this LAST after all subagents complete.\n"
+        "- `task` (via eval) — dispatches a slice-implementer subagent.\n"
+        "- `eval` — JavaScript REPL for parallel subagent dispatch.\n\n"
+        "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
+        "`edit_file`, or `execute`. These tools do not exist in your session. "
+        "Do not attempt to call them. There is nothing to explore — "
+        "`read_slice_files` gives you everything you need.\n\n"
+        "## Workflow (3 steps, ~3 turns total)\n\n"
+        "### Step 1 — Call read_slice_files (1 turn)\n"
+        "Call `read_slice_files` with no arguments. It returns a JSON object:\n"
+        "```\n"
+        "{\n"
+        '  "slices": {"slice-foo.md": "<full content>", ...},\n'
+        '  "codebase_map": "<full content of codebase-map.md>",\n'
+        '  "slice_count": N,\n'
+        '  "tasks_dir": "<path>"\n'
+        "}\n"
+        "```\n"
+        "Store the result in eval: `globalThis.slices = result;`\n\n"
+        "### Step 2 — Dispatch subagents in parallel (1 eval turn)\n"
         f"{dispatch_note}\n\n"
-        "Each `task` description MUST be fully self-contained — the "
-        "subagent has an empty context and cannot see your conversation. "
-        "Embed:\n"
-        "1. The full text of the slice file\n"
-        "2. The codebase-map.md sections relevant to this slice's files\n"
-        "3. The list of files to modify/create\n"
-        "4. Acceptance criteria from the slice\n\n"
-        "Dispatch pattern (do this inside one `eval` call):\n"
+        "Use a single `eval` call with `Promise.allSettled` to dispatch all "
+        "slices in parallel. Each task description MUST be fully self-contained "
+        "— the subagent has an empty context and cannot see your conversation. "
+        "Embed the full slice content, relevant codebase map sections, files "
+        "to modify, and acceptance criteria.\n\n"
+        "Dispatch pattern:\n"
         "```js\n"
-        "const sliceFiles = [/* slice filenames */];\n"
-        "const dispatches = sliceFiles.map(async (name) => {\n"
-        "  const slice = await tools.read_file({file_path: "
-        f"`{tasks_dir}/${{name}}`}});\n"
-        "  return tools.task({\n"
-        '    subagent_type: "slice-implementer",  // ONLY valid type\n'
-        "    description: `Implement slice: ${name}\\n\\n`\n"
-        "      + `## Slice Definition\\n${slice.content}\\n\\n`\n"
-        "      + `## Codebase Map (relevant excerpts)\\n${mapExcerpts}\\n`,\n"
-        "  });\n"
-        "});\n"
+        "// Step 1 result is in globalThis.slices\n"
+        "const data = globalThis.slices;\n"
+        "const map = data.codebase_map || '';\n"
+        "const dispatches = Object.entries(data.slices).map(([name, content]) =>\n"
+        "  tools.task({\n"
+        '    subagent_type: "slice-implementer",\n'
+        "    description: `Implement slice: ${name}\\n\\n"
+        "## Slice Definition\\n${content}\\n\\n"
+        "## Codebase Map\\n${map}`,\n"
+        "  })\n"
+        ");\n"
         "const results = await Promise.allSettled(dispatches);\n"
         "globalThis.sliceResults = results;\n"
         "console.log(JSON.stringify(results.map(r => r.status)));\n"
         "```\n\n"
-        "### Step 3 — Synthesize implementation.md\n"
-        f"Write `{impl_dir}/implementation.md` with `write_file`. Include:\n"
-        "- One section per slice with the subagent's reported status\n"
-        "- Aggregated list of files modified / created across all slices\n"
-        "- Any slice that returned `blocked` or `partial` (verbatim issues)\n"
-        "- Aggregated test results if subagents ran tests\n\n"
+        "### Step 3 — Call write_implementation_report (1 turn)\n"
+        "Parse globalThis.sliceResults and call `write_implementation_report` "
+        "with:\n"
+        "- `slice_results`: list of dicts, one per slice, each with "
+        "`slice_name`, `status` (implemented|partial|blocked), "
+        "`files_modified`, `files_created`, `test_results`, `issues`\n"
+        "- `summary`: overall summary of what was implemented\n\n"
         "## Strict Rules\n"
-        "- You MUST NOT call `edit_file`, `write_file` on source files, or "
-        "`execute`. Your toolset is filtered — these tools are not available.\n"
+        "- You MUST call `read_slice_files` FIRST. Do not skip it.\n"
         "- You MUST dispatch one `slice-implementer` subagent per slice. "
-        "Do not attempt to implement slices inline.\n"
-        "- The ONLY valid `subagent_type` is `slice-implementer`. Do NOT "
-        "request `general-purpose` — it does not exist.\n"
-        "- Subagent dispatch MUST happen inside `eval` so multiple "
-        "subagents run in parallel via `Promise.allSettled`. Sequential "
-        "tool calls from conversation are not parallel.\n"
-        "- `implementation.md` is REQUIRED — without it the phase fails.\n"
-        "- **Exploration budget:** If you have made ≥3 `read_file`/`ls`/`glob` "
-        "calls without dispatching any subagent, stop exploring and dispatch "
-        "with what you have. Do not spend more turns discovering context.\n\n"
-        "## Eval Context Seed (first eval call)\n"
+        "Do not attempt to implement slices yourself.\n"
+        "- The ONLY valid `subagent_type` is `slice-implementer`.\n"
+        "- Subagent dispatch MUST happen inside `eval` with "
+        "`Promise.allSettled` for parallelism.\n"
+        "- You MUST call `write_implementation_report` to complete the phase. "
+        "Without it the phase has no artifact and fails.\n"
+        "- Total turns: ~3. More than 5 turns without dispatching subagents "
+        "means something has gone wrong — stop and write the report with "
+        "whatever results you have.\n\n"
+        "## Eval context seed\n"
         "```js\n"
         f"globalThis.context = {{work_id: \"{work_id}\", "
         f"phase: \"implement\", tasks_dir: \"{tasks_dir}\", "

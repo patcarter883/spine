@@ -434,25 +434,35 @@ class TestAgentBuilderIntegration:
     def test_filesystem_middleware_uses_spine_prompt(
         self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:
-        """FilesystemMiddleware should use the SPINE custom prompt with relative-path guidance."""
+        """Specify agent should use custom tools (no FilesystemMiddleware).
+
+        Since specify now uses skip_filesystem_middleware=True and injects
+        purpose-built tools (read_work_context, write_specification) via
+        extra_tools, FilesystemMiddleware should NOT be in the stack.
+        The custom tools replace all filesystem access.
+        """
         mock_ca.return_value = _mock_create_agent()
         from spine.agents.specify_agent import build_specify_agent
 
         build_specify_agent(_make_state())
         call_kwargs = mock_ca.call_args[1]
+
+        # FilesystemMiddleware is intentionally absent
         middleware = call_kwargs.get("middleware", [])
         fs_mw = next(
             (m for m in middleware if "FilesystemMiddleware" in type(m).__name__),
             None,
         )
-        assert fs_mw is not None, "FilesystemMiddleware should be in the stack"
-        fs_prompt = getattr(fs_mw, "_custom_system_prompt", "") or getattr(fs_mw, "_system_prompt", "") or getattr(fs_mw, "system_prompt", "")
-        assert "relative paths" in fs_prompt.lower(), (
-            "FilesystemMiddleware prompt should mention 'relative paths'"
+        assert fs_mw is None, (
+            "FilesystemMiddleware should NOT be in the specify stack — "
+            "custom tools (read_work_context, write_specification) replace it"
         )
-        assert "double-nested" in fs_prompt, (
-            "FilesystemMiddleware prompt should warn about double-nesting"
-        )
+
+        # Custom tools should be injected via create_agent tools= argument
+        tools = call_kwargs.get("tools", [])
+        tool_names = {getattr(t, "name", "") for t in tools}
+        assert "read_work_context" in tool_names, "read_work_context tool must be present"
+        assert "write_specification" in tool_names, "write_specification tool must be present"
 
 
 class TestPTCAllowlists:

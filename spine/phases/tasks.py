@@ -73,79 +73,70 @@ async def call_tasks(
         # Materialize prior artifacts to disk
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — plan and spec are on disk (work_id-scoped paths).
-        # Skip spec/plan references for quick workflows that lack them.
+        # Build prompt — plan and spec are loaded via read_prior_artifacts tool.
+        # Quick workflows get a researcher dispatch imperative;
+        # spec workflows get a simpler "load artifacts then decompose" message.
         has_spec = "spec" in work_type  # only spec/critical_spec produce specify+plan
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
 
         # ── Compute the exact artifact output path ──
-        # The agent needs the full work_id-scoped path to write slice files.
+        # Used in the completion reminder in the user message.
         tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
 
         prompt_lines = []
         if has_spec:
-            # Spec/critical_spec: work from spec + plan artifacts, not the
-            # original description (already captured and expanded in them).
             prompt_lines.extend(
                 [
-                    "Break the plan into smaller, executable feature slices "
-                    "with clear dependencies.",
-                    "",
-                    "Prior artifacts are available on disk:",
-                    f"- Specification: `{spec_path}/specification.md`",
-                    f"- Plan: `{plan_path}/plan.md`",
-                    "",
-                    "Read them with `read_file` before decomposing.",
+                    "Call `read_prior_artifacts` first (no arguments) to load "
+                    "the specification and plan. Then call `search_codebase` "
+                    "to find modification targets. Then call `write_tasks_artifacts`.",
                     "",
                 ]
             )
         else:
             # Quick/critical_quick: no prior artifacts — work from the
-            # original description and explore the codebase.
+            # original description. First action must be parallel researcher
+            # dispatch via eval — the user message makes this explicit.
+            desc_preview = description[:120].replace("'", "\\'")
+            researcher_line1 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 1>'}}),"
+            researcher_line2 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 2>'}}),"
             prompt_lines.extend(
                 [
-                    "Break the work description into smaller, executable "
-                    "feature slices with clear dependencies.",
-                    "",
                     "## Work Description",
                     description,
                     "",
-                    "Use researcher subagents via the interpreter (`eval`) to "
-                    "explore the codebase in parallel — your system prompt has "
-                    "the detailed strategy. Focus 2-3 researchers on the modules "
-                    "most relevant to this task, then synthesize into slices.",
+                    "## Your first action MUST be an eval call",
+                    "Dispatch 2-3 `researcher` subagents in parallel via "
+                    "`Promise.allSettled` inside a single `eval` call. "
+                    "Do NOT call `search_codebase` or explore yourself first. "
+                    "Each researcher investigates ONE area of the codebase "
+                    "relevant to the work description above.",
                     "",
-                    "Spend at most 2-3 turns on exploration before writing. "
-                    "Better to produce slices with partial knowledge than none at all.",
+                    "```js",
+                    "// FIRST TURN — dispatch researchers in parallel:",
+                    "const results = await Promise.allSettled([",
+                    "  tools.task({subagent_type: 'researcher',",
+                    researcher_line1,
+                    "  tools.task({subagent_type: 'researcher',",
+                    researcher_line2,
+                    "]);",
+                    "globalThis.research = results.map(r => r.value || r.reason);",
+                    "```",
+                    "",
+                    "After researchers complete, call `write_tasks_artifacts` "
+                    "with all slices, tasks summary, dependency waves, and codebase map. "
+                    "Total turns: ~2-3.",
                     "",
                 ]
             )
 
         prompt_lines.extend(
             [
-                f"## Artifact Output Directory\n"
-                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
-                f"Use this relative path with `write_file` — do NOT construct absolute paths.\n",
-            ]
-        )
-        prompt_lines.extend(
-            [
-                f"## Instructions\n"
-                f"1. Explore the codebase (use researcher subagents via the interpreter\n"
-                f"   for parallel exploration, or `read_file`/`grep` for quick checks).\n"
-                f"2. After exploring, write individual `slice-<name>.md` files using\n"
-                f"   `write_file` to `{tasks_artifact_dir}/slice-<name>.md`.\n"
-                f"3. Write a summary `tasks.md` to `{tasks_artifact_dir}/tasks.md`\n"
-                f"   that references each slice.\n"
-                f"4. **You MUST call `write_file`** — do not just describe the slices\n"
-                f"   in conversation. Write them to disk.\n"
-                f"5. Write a `codebase-map.md` to `{tasks_artifact_dir}/codebase-map.md` that captures your exploration findings:\n"
-                f"   - File paths with descriptions (what each file does)\n"
-                f"   - Key classes and functions (names, signatures)\n"
-                f"   - Import chains between relevant modules\n"
-                f"   - Conventions discovered (naming, patterns, error handling)\n"
-                f"   This map will be read by the implement and verify phases — it saves them from re-exploring the codebase.\n",
+                f"## Completion",
+                f"When research is done, call `write_tasks_artifacts` once with all slices, "
+                f"the overview, dependency waves, and the full codebase map. "
+                f"Artifacts are written to `{tasks_artifact_dir}/` automatically — "
+                f"you do not need to specify paths. After it returns, STOP.",
+                "",
             ]
         )
         prompt = "\n".join(prompt_lines)
