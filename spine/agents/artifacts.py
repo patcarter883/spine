@@ -387,3 +387,38 @@ def build_inline_artifact_prompt(
             lines.append(f"```\n{content_str}\n```")
 
     return "\n".join(lines) + "\n\n"
+
+
+# ── Slice discovery ─────────────────────────────────────────────────────
+
+
+def list_slice_files(workspace_root: str, work_id: str) -> list[str]:
+    """List slice-*.md filenames produced by the TASKS phase, sorted.
+
+    Returns slice filenames (not full paths) in the tasks artifact
+    directory ``.spine/artifacts/{work_id}/tasks/``. Empty list if the
+    directory does not exist or contains no slice files.
+
+    Used by IMPLEMENT and VERIFY agents to inject the slice inventory
+    directly into the system prompt so the orchestrator does not need
+    to spend turns discovering slices via ls/glob.
+
+    Args:
+        workspace_root: Project workspace root.
+        work_id: Work item identifier.
+
+    Returns:
+        Sorted list of slice filenames (e.g. ``["slice-foo.md",
+        "slice-bar.md"]``). Sorting makes the injected list stable.
+    """
+    if not workspace_root or not work_id:
+        return []
+    tasks_dir = Path(workspace_root) / ".spine" / "artifacts" / work_id / "tasks"
+    if not tasks_dir.is_dir():
+        return []
+    try:
+        slices = sorted(p.name for p in tasks_dir.glob("slice-*.md") if p.is_file())
+    except OSError as exc:
+        logger.debug("Could not list slice files in %s: %s", tasks_dir, exc)
+        return []
+    return slices

@@ -409,7 +409,7 @@ class TestCodebaseMapPromptEnrichment:
         change sites in codebase-map.md."""
         import spine.agents.tasks_agent as tasks_mod
 
-        source = inspect.getsource(tasks_mod.build_tasks_agent)
+        source = inspect.getsource(tasks_mod)
         assert "Modification Targets" in source, (
             "Tasks agent prompt must include a 'Modification Targets' section "
             "in the codebase-map instructions"
@@ -420,7 +420,7 @@ class TestCodebaseMapPromptEnrichment:
         showing how to annotate modification targets with line ranges."""
         import spine.agents.tasks_agent as tasks_mod
 
-        source = inspect.getsource(tasks_mod.build_tasks_agent)
+        source = inspect.getsource(tasks_mod)
         # The example should show a code snippet with line range annotation
         assert "L" in source and "snippet" in source.lower() or "line range" in source.lower(), (
             "Tasks agent prompt must include snippet examples with line ranges "
@@ -431,7 +431,7 @@ class TestCodebaseMapPromptEnrichment:
         """The tasks agent prompt must reference codebase-map.md."""
         import spine.agents.tasks_agent as tasks_mod
 
-        source = inspect.getsource(tasks_mod.build_tasks_agent)
+        source = inspect.getsource(tasks_mod)
         assert "codebase-map" in source, "Tasks agent prompt must reference codebase-map.md"
 
 

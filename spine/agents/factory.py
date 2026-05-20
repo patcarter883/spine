@@ -182,6 +182,7 @@ def build_phase_agent(
     subagents: list[Any] | None = None,
     response_format: Any | None = None,
     is_subagent: bool = False,
+    allowed_tools: list[str] | None = None,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -277,6 +278,7 @@ def build_phase_agent(
         subagents=subagents,
         memory=memory,
         skills=skills,
+        allowed_tools=allowed_tools,
     )
 
     # ── Context schema ───────────────────────────────────────────────
@@ -321,6 +323,7 @@ def _build_middleware_stack(
     subagents: list[Any] | None,
     memory: list[str] | None,
     skills: list[str] | None,
+    allowed_tools: list[str] | None = None,
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
@@ -356,11 +359,18 @@ def _build_middleware_stack(
     #    custom system_prompt that uses relative paths instead of
     #    DA's default "All file paths must start with a /".
     fs_prompt = _get_filesystem_prompt(backend)
-    middleware.append(FilesystemMiddleware(
+    fs_mw = FilesystemMiddleware(
         backend=backend,
         system_prompt=fs_prompt,
         custom_tool_descriptions=tool_desc_overrides,
-    ))
+    )
+    # Optional tool filter — when the phase declares an allowed_tools
+    # whitelist, drop everything else from the middleware's tool list.
+    # Used by orchestrator phases (implement, verify) to physically
+    # prevent the orchestrator from writing source code itself.
+    if allowed_tools is not None:
+        _filter_filesystem_tools(fs_mw, allowed_tools, phase)
+    middleware.append(fs_mw)
 
     # 4. Interpreter (eval tool) — only for top-level phase agents
     if has_interpreter:
@@ -410,6 +420,43 @@ def _build_middleware_stack(
         ))
 
     return middleware
+
+
+def _filter_filesystem_tools(
+    fs_mw: Any,
+    allowed_tools: list[str],
+    phase: PhaseName,
+) -> None:
+    """Restrict a FilesystemMiddleware to only expose the named tools.
+
+    Mutates the middleware's ``tools`` list in place. Used by orchestrator
+    phases (implement, verify) that must dispatch work to subagents rather
+    than touch source code themselves.
+
+    Args:
+        fs_mw: The FilesystemMiddleware instance to filter.
+        allowed_tools: Tool names to keep (e.g. ``["ls", "read_file",
+            "glob", "grep", "write_file"]``). Tools not in this list are
+            dropped from the middleware.
+        phase: Phase name, used only for logging.
+    """
+    if not hasattr(fs_mw, "tools"):
+        logger.warning(
+            "Phase %s: FilesystemMiddleware has no .tools attribute; "
+            "cannot apply allowed_tools filter (%s)",
+            phase.value, allowed_tools,
+        )
+        return
+
+    allowed = set(allowed_tools)
+    original_names = [t.name for t in fs_mw.tools]
+    fs_mw.tools = [t for t in fs_mw.tools if t.name in allowed]
+    kept = [t.name for t in fs_mw.tools]
+    dropped = [n for n in original_names if n not in allowed]
+    logger.debug(
+        "Phase %s: filtered filesystem tools — kept=%s dropped=%s",
+        phase.value, kept, dropped,
+    )
 
 
 def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:

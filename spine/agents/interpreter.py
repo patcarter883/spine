@@ -156,7 +156,32 @@ def build_interpreter_middleware(
             phase_name,
         )
 
-    middleware = CodeInterpreterMiddleware(
+    class SpineInterpreterMiddleware(CodeInterpreterMiddleware):
+        """Strips redundant TypeScript schemas injected by langchain-quickjs."""
+
+        async def before_model(
+            self, messages: list[Any], *, tools: list[Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            result = await super().before_model(messages, tools=tools, **kwargs)
+            out_msgs = result.get("messages", messages)
+
+            import re
+
+            for m in out_msgs:
+                if hasattr(m, "content") and isinstance(m.content, str):
+                    if "API Reference" in m.content and "tools namespace" in m.content:
+                        # Scrub the TypeScript definitions section. It starts with the header
+                        # and ends exactly at the last typescript block closure in that section.
+                        m.content = re.sub(
+                            r"### API Reference — `tools` namespace.*?(```typescript.*?```\s*)+",
+                            "### PTC Note\nTools are pre-bound on `globalThis.tools` using camelCase (e.g. `tools.readFile`). Return values are native JS. Do not json parse.",
+                            m.content,
+                            flags=re.DOTALL,
+                        )
+
+            return result
+
+    middleware = SpineInterpreterMiddleware(
         memory_limit=memory_limit,
         timeout=timeout,
         max_ptc_calls=max_ptc_calls,
@@ -196,6 +221,7 @@ def interpreter_enabled() -> bool:
     else:
         try:
             from spine.config import SpineConfig
+
             enabled = SpineConfig.load().interpreter_enabled
         except Exception:
             enabled = False

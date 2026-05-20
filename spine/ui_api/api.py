@@ -468,6 +468,55 @@ class UIApi:
 
         return _get_phases(work_type)
 
+    def stop_work(self, work_id: str) -> dict[str, Any]:
+        """Stop a running work item.
+
+        Cancels the queue item (if pending) or marks the running work as
+        cancelled. Also purges the LangGraph checkpoint so the work can
+        be restarted cleanly if needed.
+
+        Non-blocking: runs the stop in the background via RalphLoopWorker's
+        executor and returns immediately.
+
+        Args:
+            work_id: The work item ID to stop.
+
+        Returns:
+            Dict with work_id, status, and action.
+        """
+        import concurrent.futures
+
+        def _run() -> None:
+            worker = get_worker(self._config)
+            # Try to cancel a pending item first
+            active = worker.get_active()
+            if active and active.get("work_id") == work_id:
+                # Running item — cancel by work_id
+                worker.cancel_running(work_id)
+            else:
+                # Try to find and cancel pending item by work_id
+                # (work_id is stored in queue items after submission)
+                db = worker._get_db()
+                item = db["queue"].rows_where(
+                    "work_id = ? AND status = ?",
+                    [work_id, "pending"],
+                    limit=1,
+                )
+                item = item[0] if item else None
+                if item:
+                    worker.cancel_item(item["id"])
+
+        executor = getattr(get_worker(self._config), "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(_run)
+
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.RUNNING.value,
+            "action": "stop",
+        }
+
     def reset_stuck_items(self) -> int:
         """Reset any queue items stuck in 'running' back to 'pending'.
 

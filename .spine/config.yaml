@@ -16,6 +16,10 @@ providers:
     type: deepagents-model
     model: openrouter:deepseek/deepseek-v4-flash
     enabled: true
+  - name: deepseek-v4-pro
+    type: deepagents-model
+    model: openrouter:deepseek/deepseek-v4-pro
+    enabled: true
   - name: laguna-m1
     type: deepagents-model
     model: openrouter:poolside/laguna-m.1:free
@@ -30,23 +34,30 @@ providers:
     base_url: 'http://localhost:8000/v1'
     api_key: 'vllm'
     enabled: true
+  - name: pat
+    type: deepagents-model
+    model: openai:model
+    base_url: 'http://10.50.1.51:8000/v1'
+    api_key: 'vllm'
+    enabled: true
   
   phases:
     # Heavy reasoning → frontier model (via reference)
     specify:
-      provider: glm
+      provider: deepseek-v4-pro
     plan:
-      provider: glm
-
+      provider: deepseek-v4-pro
+    tasks:
+      provider: pat
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: qwen3.6-35b
+      provider: pat
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: deepseek-v4-flash
+      provider: pat
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: qwen3.6-35b              # short timeout for verify
+      provider: local              # short timeout for verify
