@@ -213,15 +213,23 @@ def _build_tasks_prompt(
         "- `read_prior_artifacts` — loads spec/plan artifacts. No args.\n"
         "### Codebase exploration (use MCP tools FIRST)\n"
         "MCP codebase-index tools answer symbol-level questions in "
-        "sub-milliseconds with minimal token usage:\n"
-        "- `mcp_codebase-index_find_symbol` — locate symbol definition\n"
-        "- `mcp_codebase-index_get_function_source` — get function source\n"
-        "- `mcp_codebase-index_get_dependencies` — what a symbol calls\n"
-        "- `mcp_codebase-index_get_dependents` — who calls a symbol\n"
-        "- `mcp_codebase-index_get_change_impact` — what breaks if you change\n"
-        "- `mcp_codebase-index_search_codebase` — regex search across all files\n"
-        "- `mcp_codebase-index_list_files` — list files by glob pattern\n"
-        "- `mcp_codebase-index_get_project_summary` — high-level overview\n"
+        "sub-milliseconds with minimal token usage.\n"
+        "Call with native kwargs (no tool_input wrapper):\n"
+        "- `mcp_codebase-index_find_symbol` — locate symbol. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_function_source` — get function source. "
+        'Call: `{"name": "func_name"}`\n'
+        "- `mcp_codebase-index_get_dependencies` — what a symbol calls. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_dependents` — who calls a symbol. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_change_impact` — what breaks if you change. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_search_codebase` — regex search across all files. "
+        'Call: `{"pattern": "regex", "max_results": 20}`\n'
+        "- `mcp_codebase-index_list_files` — list files by glob. "
+        'Call: `{"pattern": "*.py"}`\n'
+        "- `mcp_codebase-index_get_project_summary` — high-level overview. No args.\n"
         "### Fallback search\n"
         "- `search_codebase` — find files by keyword/topic queries with "
         "content previews. Use for content-level queries MCP doesn't cover.\n"

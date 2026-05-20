@@ -163,11 +163,10 @@ class SpineConfig:
             if not isinstance(server_cfg, dict):
                 continue
             mcp_servers[name] = {
+                "transport": server_cfg.get("transport", "stdio"),
                 "command": server_cfg.get("command", ""),
                 "args": server_cfg.get("args", []),
                 "env": server_cfg.get("env", {}),
-                "timeout": server_cfg.get("timeout", 120),
-                "connect_timeout": server_cfg.get("connect_timeout", 60),
             }
         # Allow env var override (JSON string)
         env_mcp = os.environ.get("SPINE_MCP_SERVERS")

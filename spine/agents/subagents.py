@@ -129,18 +129,30 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "| High-level project overview | `mcp_codebase-index_get_project_summary` |\n\n"
         "## Tool surface\n"
         "### Primary (use these FIRST)\n"
-        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type)\n"
-        "- `mcp_codebase-index_get_function_source` — get full function source\n"
-        "- `mcp_codebase-index_get_dependencies` — what a symbol calls/uses\n"
-        "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol\n"
-        "- `mcp_codebase-index_get_change_impact` — direct + transitive dependents\n"
-        "- `mcp_codebase-index_get_call_chain` — BFS path between two symbols\n"
-        "- `mcp_codebase-index_search_codebase` — regex search across all files\n"
-        "- `mcp_codebase-index_list_files` — list files matching a glob pattern\n"
-        "- `mcp_codebase-index_get_project_summary` — file count, packages, top symbols\n"
-        "- `mcp_codebase-index_get_classes` — list classes with methods and bases\n"
-        "- `mcp_codebase-index_get_functions` — list functions with params\n"
-        "- `mcp_codebase-index_get_imports` — list imports for a file\n\n"
+        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type). "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_function_source` — get full function source. "
+        'Call with `{"name": "func_name"}`.\n'
+        "- `mcp_codebase-index_get_dependencies` — what a symbol calls/uses. "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol. "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_change_impact` — direct + transitive dependents. "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_call_chain` — BFS path between two symbols. "
+        'Call with `{"from_name": "A", "to_name": "B"}`.\n'
+        "- `mcp_codebase-index_search_codebase` — regex search across all files. "
+        'Call with `{"pattern": "regex", "max_results": 20}`.\n'
+        "- `mcp_codebase-index_list_files` — list files matching a glob pattern. "
+        'Call with `{"pattern": "*.py"}`.\n'
+        "- `mcp_codebase-index_get_project_summary` — file count, packages, top symbols. "
+        "No arguments needed.\n"
+        "- `mcp_codebase-index_get_classes` — list classes with methods and bases. "
+        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
+        "- `mcp_codebase-index_get_functions` — list functions with params. "
+        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
+        "- `mcp_codebase-index_get_imports` — list imports for a file. "
+        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n\n'
         "### Fallback (only when MCP tools don't have what you need)\n"
         "- `search_codebase` — multi-query keyword file search with content previews\n"
         "- `read_file` — read specific files (use offset/limit for large files)\n"

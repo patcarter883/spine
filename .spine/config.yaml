@@ -8,12 +8,11 @@ spine:
 # (symbol lookup, dependency analysis, change impact assessment).
 mcp_servers:
   codebase-index:
+    transport: stdio
     command: mcp-codebase-index
     args: []
     env:
       PROJECT_ROOT: /home/pat/Projects/spine
-    timeout: 120
-    connect_timeout: 60
 
 providers:
   llm:

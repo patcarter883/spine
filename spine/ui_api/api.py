@@ -232,6 +232,9 @@ class UIApi:
     def test_mcp_connection(self, server_name: str) -> dict[str, Any]:
         """Test connection to an MCP server and return tool info.
 
+        Uses ``MultiServerMCPClient`` from ``langchain-mcp-adapters``
+        for stateless MCP tool discovery.
+
         Args:
             server_name: MCP server name as configured.
 
@@ -244,20 +247,26 @@ class UIApi:
             return {"connected": False, "tool_count": 0, "tool_names": [], "error": "No config found"}
 
         try:
-            from spine.mcp.client import MCPClient
+            import asyncio
 
-            client = MCPClient(
-                name=server_name,
-                command=cfg.get("command", ""),
-                args=cfg.get("args", []),
-                env=cfg.get("env", {}),
-                timeout=cfg.get("timeout", 120),
-                connect_timeout=cfg.get("connect_timeout", 60),
-            )
-            client.connect()
-            tools = client.list_tools()
-            tool_names = [t["name"] for t in tools]
-            client.close()
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+
+            adapter_cfg = {
+                "transport": cfg.get("transport", "stdio"),
+                "command": cfg["command"],
+            }
+            if cfg.get("args"):
+                adapter_cfg["args"] = cfg["args"]
+            if cfg.get("env"):
+                adapter_cfg["env"] = cfg["env"]
+
+            client = MultiServerMCPClient({server_name: adapter_cfg})
+
+            async def _discover():
+                return await client.get_tools()
+
+            tools = asyncio.run(_discover())
+            tool_names = [t.name for t in tools]
             return {
                 "connected": True,
                 "tool_count": len(tools),

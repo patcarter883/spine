@@ -132,16 +132,25 @@ def _build_plan_prompt(
         "No arguments. Call this FIRST.\n"
         "### Codebase exploration (use MCP tools FIRST)\n"
         "MCP codebase-index tools answer symbol-level questions in "
-        "sub-milliseconds with minimal token usage:\n"
-        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type)\n"
-        "- `mcp_codebase-index_get_function_source` — get full source of a function\n"
-        "- `mcp_codebase-index_get_dependencies` — what a symbol calls\n"
-        "- `mcp_codebase-index_get_dependents` — who calls a symbol\n"
-        "- `mcp_codebase-index_get_change_impact` — what breaks if you change a symbol\n"
-        "- `mcp_codebase-index_get_call_chain` — execution path between two symbols\n"
-        "- `mcp_codebase-index_search_codebase` — regex search across all files\n"
-        "- `mcp_codebase-index_list_files` — list files matching a glob pattern\n"
-        "- `mcp_codebase-index_get_project_summary` — high-level overview\n"
+        "sub-milliseconds with minimal token usage.\n"
+        "Call with native kwargs (no tool_input wrapper):\n"
+        "- `mcp_codebase-index_find_symbol` — locate symbol. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_function_source` — get function source. "
+        'Call: `{"name": "func_name"}`\n'
+        "- `mcp_codebase-index_get_dependencies` — what a symbol calls. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_dependents` — who calls a symbol. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_change_impact` — what breaks if you change a symbol. "
+        'Call: `{"name": "symbol_name"}`\n'
+        "- `mcp_codebase-index_get_call_chain` — path between two symbols. "
+        'Call: `{"from_name": "A", "to_name": "B"}`\n'
+        "- `mcp_codebase-index_search_codebase` — regex search across all files. "
+        'Call: `{"pattern": "regex", "max_results": 20}`\n'
+        "- `mcp_codebase-index_list_files` — list files by glob. "
+        'Call: `{"pattern": "*.py"}`\n'
+        "- `mcp_codebase-index_get_project_summary` — high-level overview. No args.\n"
         "- `mcp_codebase-index_get_functions` / `get_classes` — list symbols\n"
         "### Fallback search\n"
         "- `search_codebase` — find files by keyword/topic queries with "

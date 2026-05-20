@@ -1,302 +1,110 @@
-"""MCP client: connect to MCP servers via stdio, discover tools, execute calls.
+"""MCP tool loader for SPINE using langchain-mcp-adapters.
 
-Manages MCP server lifecycle — spawn subprocess, establish session, discover tools,
-execute tool calls — using the ``mcp`` Python SDK's stdio client transport.
+Wraps LangChain's ``MultiServerMCPClient`` to load MCP tools from the
+SPINE config.  Tools are namespaced with the server name to prevent
+collisions (e.g. ``mcp_codebase-index_find_symbol``).
 
-All public methods are synchronous (blocking) but use an internal asyncio
-event loop for the MCP protocol, which is inherently async.
+The ``MultiServerMCPClient`` is stateless by default — each tool call
+creates a fresh MCP session, executes, and cleans up.  This is correct
+for SPINE's multi-agent architecture where different subagents may
+call MCP tools concurrently from different event loops.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-from contextlib import AsyncExitStack
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from langchain_core.tools import BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 logger = logging.getLogger(__name__)
 
 
-class MCPClient:
-    """Manages a single MCP server connection via stdio transport.
+def _convert_server_config(spine_server: dict[str, Any]) -> dict[str, Any]:
+    """Convert SPINE server config to langchain-mcp-adapters format.
 
-    Handles process lifecycle (spawn, connect, close) and tool discovery.
-    All calls are blocking but use an internal event loop for the MCP protocol.
-
-    Args:
-        name: Human-readable server name (e.g. ``"codebase-index"``).
-        command: Executable to spawn (e.g. ``"mcp-codebase-index"``).
-        args: Optional list of arguments passed to the command.
-        env: Extra environment variables for the subprocess (merged with
-            a filtered copy of the current environment).
-        timeout: Per-tool-call timeout in seconds (default 120).
-        connect_timeout: Timeout for initial connection and tool discovery
-            (default 60).
+    SPINE config: {'command': '...', 'args': [...], 'env': {...}, ...}
+    Adapter config: {'transport': 'stdio', 'command': '...', 'args': [...], ...}
     """
-
-    def __init__(
-        self,
-        name: str,
-        command: str,
-        args: list[str] | None = None,
-        env: dict[str, str] | None = None,
-        timeout: int = 120,
-        connect_timeout: int = 60,
-    ):
-        self.name = name
-        self.command = command
-        self.args = args or []
-        self.env = env or {}
-        self.timeout = timeout
-        self.connect_timeout = connect_timeout
-        self._session: ClientSession | None = None
-        self._exit_stack: AsyncExitStack | None = None
-        self._tools: list[dict[str, Any]] = []
-        self._connected = False
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    # ── Connection lifecycle ────────────────────────────────────────
-
-    def connect(self) -> None:
-        """Start the MCP server subprocess and establish a session.
-
-        Spawns the configured command as a subprocess, connects via stdio,
-        initializes the MCP session, and discovers available tools via
-        ``list_tools()``.
-
-        Raises:
-            Exception: If the server process fails to start, the connection
-                times out, or tool discovery fails.
-        """
-        if self._connected:
-            return
-
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-
-        # Build the subprocess environment: filtered copy of current
-        # environment + user-specified overrides.
-        child_env = os.environ.copy()
-        child_env.update(self.env)
-
-        server_params = StdioServerParameters(
-            command=self.command,
-            args=self.args,
-            env=child_env,
-        )
-
-        async def _connect() -> None:
-            self._exit_stack = AsyncExitStack()
-            transport = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read_stream, write_stream = transport
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await self._session.initialize()
-            result = await self._session.list_tools()
-            self._tools = [tool.model_dump() for tool in result.tools]
-
-        try:
-            loop.run_until_complete(
-                asyncio.wait_for(_connect(), timeout=self.connect_timeout)
-            )
-            self._connected = True
-            logger.info(
-                "MCP server '%s' connected: %d tools discovered",
-                self.name,
-                len(self._tools),
-            )
-        except Exception:
-            self.close()
-            raise
-
-    def close(self) -> None:
-        """Close the MCP session and terminate the server process.
-
-        Idempotent — safe to call multiple times or on an unconnected client.
-        """
-        self._connected = False
-        self._tools = []
-        if self._exit_stack:
-            try:
-                self._loop.run_until_complete(self._exit_stack.aclose())
-            except Exception:
-                pass
-            self._exit_stack = None
-            self._session = None
-        if self._loop and not self._loop.is_closed():
-            self._loop.close()
-            self._loop = None
-
-    # ── Tool discovery ──────────────────────────────────────────────
-
-    def list_tools(self) -> list[dict[str, Any]]:
-        """Return discovered tools as raw dicts.
-
-        Each dict has keys: ``name``, ``description``, ``inputSchema``.
-
-        Returns:
-            List of tool descriptors.  Empty if not yet connected.
-        """
-        if not self._connected:
-            self.connect()
-        return list(self._tools)
-
-    # ── Tool execution ───────────────────────────────────────────────
-
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        """Execute an MCP tool and return the result as a string.
-
-        Args:
-            name: MCP tool name (unprefixed — as returned by ``list_tools``).
-            arguments: Keyword arguments matching the tool's input schema.
-
-        Returns:
-            The tool's text response as a single string.
-
-        Raises:
-            RuntimeError: If the tool returns an error.
-            Exception: On connection failure or timeout.
-        """
-        if not self._connected:
-            self.connect()
-
-        async def _call() -> str:
-            assert self._session is not None
-            result = await self._session.call_tool(name, arguments=arguments)
-            if result.isError:
-                raise RuntimeError(
-                    f"MCP tool '{name}' returned error: {result.content}"
-                )
-            parts: list[str] = []
-            for content in result.content:
-                if hasattr(content, "text"):
-                    parts.append(content.text)
-                elif hasattr(content, "data"):
-                    parts.append(f"[binary data: {len(content.data)} bytes]")
-            return "\n".join(parts) if parts else str(result.content)
-
-        try:
-            return self._loop.run_until_complete(
-                asyncio.wait_for(_call(), timeout=self.timeout)
-            )
-        except Exception:
-            logger.exception("MCP tool '%s' (server '%s') failed", name, self.name)
-            raise
-
-    # ── Context manager ─────────────────────────────────────────────
-
-    def __enter__(self) -> MCPClient:
-        self.connect()
-        return self
-
-    def __exit__(self, *args: object) -> bool:
-        self.close()
-        return False
+    adapter: dict[str, Any] = {
+        "transport": spine_server.get("transport", "stdio"),
+        "command": spine_server["command"],
+        "args": spine_server.get("args", []),
+    }
+    if spine_server.get("env"):
+        adapter["env"] = spine_server["env"]
+    return adapter
 
 
-# ── Multi-server manager ─────────────────────────────────────────────────
+def _namespace_tool(tool: BaseTool, server_name: str) -> BaseTool:
+    """Add server-name prefix to a tool to prevent collisions.
 
-class MCPClientManager:
-    """Manages multiple MCP server connections.
-
-    Loads server configs and creates/reuses ``MCPClient`` instances.
-    Intended to be instantiated once per cache key (e.g. work item ID)
-    and shared across phase agents within that work item.
-
-    Args:
-        server_configs: Dict mapping server name → config dict with keys
-            ``command``, ``args``, ``env``, ``timeout``, ``connect_timeout``.
+    The adapter returns tools with their original names (e.g. ``find_symbol``).
+    We prefix with ``mcp_{server_name}_`` so tools from different servers
+    don't collide and prompts can reference them unambiguously.
     """
+    # Create a copy with a namespaced name
+    import copy
 
-    def __init__(self, server_configs: dict[str, dict[str, Any]]):
-        self._clients: dict[str, MCPClient] = {}
-        self._server_configs = server_configs
-
-    def get_client(self, server_name: str) -> MCPClient:
-        """Get or create a client for the named server.
-
-        Args:
-            server_name: Server name as it appears in the config.
-
-        Returns:
-            A connected ``MCPClient`` instance.
-
-        Raises:
-            KeyError: If no config exists for the given server name.
-        """
-        if server_name not in self._clients:
-            cfg = self._server_configs.get(server_name)
-            if not cfg:
-                raise KeyError(f"No config for MCP server '{server_name}'")
-            client = MCPClient(
-                name=server_name,
-                command=cfg["command"],
-                args=cfg.get("args", []),
-                env=cfg.get("env", {}),
-                timeout=cfg.get("timeout", 120),
-                connect_timeout=cfg.get("connect_timeout", 60),
-            )
-            client.connect()
-            self._clients[server_name] = client
-        return self._clients[server_name]
-
-    def get_all_tools(self) -> list[Any]:
-        """Return all tools from all connected servers as ``MCPTool`` instances.
-
-        Returns:
-            List of ``MCPTool`` dataclass instances, one per discovered tool
-            across all managed servers.
-        """
-        from spine.mcp.tools import MCPTool
-
-        all_tools: list[Any] = []
-        for name in self._server_configs:
-            client = self.get_client(name)
-            for tool_dict in client.list_tools():
-                tool = MCPTool(
-                    server_name=name,
-                    name=tool_dict["name"],
-                    description=tool_dict.get("description", ""),
-                    input_schema=tool_dict.get("inputSchema", {}),
-                    client=client,
-                )
-                all_tools.append(tool)
-        return all_tools
-
-    def close_all(self) -> None:
-        """Close all managed server connections."""
-        for client in self._clients.values():
-            client.close()
-        self._clients.clear()
+    namespaced = copy.copy(tool)
+    namespaced.name = f"mcp_{server_name}_{tool.name}"
+    # Preserve original metadata
+    if hasattr(tool, "metadata") and tool.metadata:
+        namespaced.metadata = dict(tool.metadata)  # type: ignore[attr-defined]
+        namespaced.metadata["mcp_server"] = server_name  # type: ignore[attr-defined]
+        namespaced.metadata["mcp_tool"] = tool.name  # type: ignore[attr-defined]
+    return namespaced
 
 
-# ── Module-level cache ───────────────────────────────────────────────────
+# ── Module-level client (initialised once, reused for tool loading) ──
 
-_MCP_CACHE: dict[str, MCPClientManager] = {}
+_client: MultiServerMCPClient | None = None
+_client_config_hash: int = 0
+
+
+def _get_client(server_configs: dict[str, dict[str, Any]]) -> MultiServerMCPClient:
+    """Get or create the MultiServerMCPClient for the given configs."""
+    global _client, _client_config_hash
+
+    config_hash = hash(frozenset(
+        (k, frozenset((fk, str(fv)) for fk, fv in v.items()))
+        for k, v in server_configs.items()
+    ))
+
+    if _client is None or config_hash != _client_config_hash:
+        adapter_configs = {
+            name: _convert_server_config(cfg)
+            for name, cfg in server_configs.items()
+        }
+        _client = MultiServerMCPClient(adapter_configs)
+        _client_config_hash = config_hash
+        logger.info("MCP client created for %d server(s)", len(adapter_configs))
+
+    return _client
 
 
 def get_mcp_tools(
     server_configs: dict[str, dict[str, Any]] | None,
     cache_key: str = "default",
     workspace_root: str | None = None,
-) -> list[Any]:
+) -> list[BaseTool]:
     """Load MCP tools from server configs, returning LangChain tools.
 
-    Tools are cached per *cache_key* (typically the work item ID) so the
-    same MCP server connections are reused across phase agents within a
-    single work item.
+    Uses ``MultiServerMCPClient`` from ``langchain-mcp-adapters`` to
+    connect to configured MCP servers and convert all discovered tools
+    to LangChain ``BaseTool`` instances.  Tools are namespaced with
+    the server name prefix (e.g. ``mcp_codebase-index_find_symbol``).
+
+    The adapter is stateless — each tool invocation creates a fresh
+    MCP session.  This is safe for SPINE's multi-agent architecture
+    where subagents may call MCP tools from different event loops.
 
     Args:
         server_configs: Dict of server_name → {command, args, env, ...}.
             If ``None`` or empty, returns an empty list.
-        cache_key: Key for client manager reuse (use ``work_id``).
+        cache_key: Ignored (kept for backward compat with custom client).
         workspace_root: Optional project root to set as ``PROJECT_ROOT``
             in server environments that don't have it configured.
 
@@ -306,22 +114,53 @@ def get_mcp_tools(
     if not server_configs:
         return []
 
-    # Auto-inject PROJECT_ROOT for codebase-indexer servers that
-    # don't have it explicitly configured in their env.
+    # Auto-inject PROJECT_ROOT for servers that don't have it configured
     if workspace_root:
         for _name, cfg in server_configs.items():
             env = cfg.setdefault("env", {})
             env.setdefault("PROJECT_ROOT", str(workspace_root))
 
-    global _MCP_CACHE
-    if cache_key not in _MCP_CACHE:
-        mgr = MCPClientManager(server_configs)
-        _MCP_CACHE[cache_key] = mgr
+    try:
+        client = _get_client(server_configs)
+        tools = _run_async(client.get_tools())
+    except Exception:
+        logger.warning("Failed to load MCP tools", exc_info=True)
+        return []
+
+    # Namespace tools to prevent collisions between servers.
+    # The adapter returns tools from all servers without server tags.
+    # For a single server: all tools get that server's prefix.
+    # For multiple servers: we'd need per-server get_tools() calls;
+    # for now, prefix with the first server name which is correct
+    # for the common single-server (codebase-index) case.
+    primary_server = next(iter(server_configs)) if server_configs else None
+    namespaced: list[BaseTool] = []
+    if primary_server:
+        for tool in tools:
+            namespaced.append(_namespace_tool(tool, primary_server))
+
+    logger.info("Loaded %d MCP tools from %d server(s)", len(namespaced), len(server_configs))
+    return namespaced
+
+
+def _run_async(coro: Any) -> Any:
+    """Run an async coroutine in a sync context.
+
+    Creates a fresh event loop to avoid conflicts with running loops
+    (e.g. when called from within a LangGraph subgraph that already
+    has an active event loop).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        # Running inside an event loop — run in a separate thread
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result(timeout=60)
     else:
-        mgr = _MCP_CACHE[cache_key]
-
-    mcp_tools = mgr.get_all_tools()
-    from spine.mcp.tools import mcp_tool_to_langchain
-
-    lc_tools = [mcp_tool_to_langchain(t) for t in mcp_tools]
-    return lc_tools
+        return asyncio.run(coro)

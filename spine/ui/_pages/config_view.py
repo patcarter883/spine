@@ -35,6 +35,8 @@ def render(api: UIApi) -> None:
             col1, col2, col3 = st.columns([2, 1, 1])
 
             with col1:
+                transport = server_cfg.get("transport", "stdio")
+                st.markdown(f"**Transport:** `{transport}`")
                 st.markdown(f"**Command:** `{server_cfg.get('command', '?')}`")
                 args = server_cfg.get("args", [])
                 if args:
@@ -44,7 +46,6 @@ def render(api: UIApi) -> None:
                     st.markdown("**Environment:**")
                     for k, v in env_vars.items():
                         st.markdown(f"- `{k}` = `{v}`")
-                st.markdown(f"**Timeout:** {server_cfg.get('timeout', 120)}s | **Connect timeout:** {server_cfg.get('connect_timeout', 60)}s")
 
             with col2:
                 if st.button("🧪 Test Connection", key=f"test_{server_name}"):
@@ -72,6 +73,12 @@ def render(api: UIApi) -> None:
 
     with st.form("add_mcp_server"):
         new_name = st.text_input("Server Name", placeholder="e.g., my-codebase-index")
+        new_transport = st.selectbox(
+            "Transport",
+            options=["stdio", "http"],
+            index=0,
+            help="stdio: local subprocess. http: remote server.",
+        )
         new_command = st.text_input(
             "Command",
             placeholder="e.g., mcp-codebase-index",
@@ -86,17 +93,14 @@ def render(api: UIApi) -> None:
             placeholder="/path/to/project",
             help="The directory to index. Defaults to workspace root if empty.",
         )
-        new_timeout = st.number_input("Timeout (seconds)", value=120, min_value=10, max_value=600)
-        new_connect_timeout = st.number_input("Connect Timeout (seconds)", value=60, min_value=5, max_value=300)
 
         submitted = st.form_submit_button("Add Server", type="primary")
         if submitted and new_name and new_command:
             server_cfg = {
+                "transport": new_transport,
                 "command": new_command,
                 "args": new_args.split() if new_args else [],
                 "env": {"PROJECT_ROOT": new_project_root} if new_project_root else {},
-                "timeout": new_timeout,
-                "connect_timeout": new_connect_timeout,
             }
             if api.update_mcp_server(new_name, server_cfg):
                 st.toast(f"Added MCP server '{new_name}'", icon="✅")
@@ -124,6 +128,7 @@ def render(api: UIApi) -> None:
         "queue_backend": "Queue backend for RalphLoopWorker (sqlite or redis).",
         "mcp_servers": (
             "Model Context Protocol servers for external tool integration. "
+            "Uses langchain-mcp-adapters (MultiServerMCPClient). "
             "mcp-codebase-index provides 18 structural codebase query tools "
             "(symbol lookup, dependency analysis, change impact assessment)."
         ),

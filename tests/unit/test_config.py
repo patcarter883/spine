@@ -199,11 +199,10 @@ class TestSpineConfig:
         config_data = {
             "mcp_servers": {
                 "codebase-index": {
+                    "transport": "stdio",
                     "command": "mcp-codebase-index",
                     "args": [],
                     "env": {"PROJECT_ROOT": "/test"},
-                    "timeout": 120,
-                    "connect_timeout": 60,
                 }
             }
         }
@@ -214,10 +213,9 @@ class TestSpineConfig:
         config = SpineConfig.load(str(config_file))
         assert "codebase-index" in config.mcp_servers
         server = config.mcp_servers["codebase-index"]
+        assert server["transport"] == "stdio"
         assert server["command"] == "mcp-codebase-index"
         assert server["env"]["PROJECT_ROOT"] == "/test"
-        assert server["timeout"] == 120
-        assert server["connect_timeout"] == 60
 
     def test_mcp_servers_defaults_for_missing_keys(self, temp_dir: Path) -> None:
         """Missing optional MCP server keys should get defaults."""
@@ -234,11 +232,10 @@ class TestSpineConfig:
 
         config = SpineConfig.load(str(config_file))
         server = config.mcp_servers["minimal"]
+        assert server["transport"] == "stdio"
         assert server["command"] == "my-server"
         assert server["args"] == []
         assert server["env"] == {}
-        assert server["timeout"] == 120
-        assert server["connect_timeout"] == 60
 
     def test_mcp_servers_env_override(self, temp_dir: Path) -> None:
         """SPINE_MCP_SERVERS env var should merge with config."""

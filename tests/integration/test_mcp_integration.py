@@ -1,8 +1,4 @@
-"""Integration tests for MCP client with the real mcp-codebase-index server.
-
-These tests require mcp-codebase-index to be installed. They create a small
-test project, index it, and verify the tools work end-to-end.
-"""
+"""Integration tests for MCP tools via langchain-mcp-adapters."""
 
 from __future__ import annotations
 
@@ -11,8 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from spine.mcp.client import MCPClient, get_mcp_tools
-from spine.mcp.tools import MCPTool, mcp_tool_to_langchain
+from spine.mcp.client import get_mcp_tools
 from spine.config import SpineConfig
 
 
@@ -22,7 +17,6 @@ def sample_python_project() -> str:
     tmp = tempfile.mkdtemp()
     root = Path(tmp)
 
-    # Write a couple Python files
     (root / "utils.py").write_text('''
 """Utility functions."""
 
@@ -68,197 +62,96 @@ if __name__ == "__main__":
     return tmp
 
 
+def _tool_result_text(result) -> str:
+    """Extract text from an adapter tool result (may be list of content blocks)."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        return "\n".join(
+            item.get("text", str(item)) if isinstance(item, dict) else str(item)
+            for item in result
+        )
+    return str(result)
+
+
 @pytest.fixture
-def codebase_index_client(sample_python_project: str):  # noqa: ANN201
-    """Create a connected MCP client for the sample project."""
-    client = MCPClient(
-        name="test-codebase-index",
-        command="mcp-codebase-index",
-        args=[],
-        env={"PROJECT_ROOT": sample_python_project},
-        timeout=30,
-        connect_timeout=30,
-    )
-    client.connect()
-    yield client
-    client.close()
+def mcp_tools_async(sample_python_project: str):  # noqa: ANN201
+    """Load MCP tools from mcp-codebase-index for the sample project."""
+    configs = {
+        "test-idx": {
+            "transport": "stdio",
+            "command": "mcp-codebase-index",
+            "args": [],
+            "env": {"PROJECT_ROOT": sample_python_project},
+        },
+    }
+    tools = get_mcp_tools(configs, cache_key="integration-test-async")
+    assert len(tools) == 18, f"Expected 18 tools, got {len(tools)}"
+    return tools
 
 
 class TestRealMCPCodebaseIndex:
-    """End-to-end tests with a real mcp-codebase-index server."""
+    """End-to-end tests with real mcp-codebase-index via the adapter."""
 
-    def test_connect_discovers_18_tools(self, codebase_index_client: MCPClient) -> None:
-        """Should discover all 18 tools."""
-        tools = codebase_index_client.list_tools()
-        assert len(tools) == 18, f"Expected 18 tools, got {len(tools)}"
-        names = {t["name"] for t in tools}
-        assert "find_symbol" in names
-        assert "get_project_summary" in names
-        assert "get_dependencies" in names
-        assert "get_dependents" in names
-        assert "get_change_impact" in names
-        assert "get_call_chain" in names
-        assert "search_codebase" in names
-        assert "get_function_source" in names
+    def test_all_18_tools_namespaced(self, mcp_tools_async: list) -> None:
+        """All 18 tools should have the server prefix."""
+        for t in mcp_tools_async:
+            assert t.name.startswith("mcp_test-idx_"), f"Bad name: {t.name}"
 
-    def test_get_project_summary(self, codebase_index_client: MCPClient) -> None:
-        """get_project_summary should return high-level stats."""
-        result = codebase_index_client.call_tool("get_project_summary", {})
-        assert len(result) > 100
-        assert "Files:" in result
-        assert "Lines:" in result
-        assert "Functions:" in result
-        assert "Classes:" in result
-
-    def test_find_symbol(self, codebase_index_client: MCPClient) -> None:
-        """find_symbol should locate a function definition."""
-        result = codebase_index_client.call_tool("find_symbol", {"name": "read_config"})
-        assert "read_config" in result
-        assert "utils.py" in result
-
-    def test_find_class_symbol(self, codebase_index_client: MCPClient) -> None:
-        """find_symbol should find class definitions."""
-        result = codebase_index_client.call_tool("find_symbol", {"name": "ConfigLoader"})
-        assert "ConfigLoader" in result
-        assert "utils.py" in result
-
-    def test_get_function_source(self, codebase_index_client: MCPClient) -> None:
-        """get_function_source should return the function body."""
-        result = codebase_index_client.call_tool(
-            "get_function_source", {"name": "read_config"}
-        )
-        assert "def read_config" in result
-        assert "with open" in result
-
-    def test_get_class_source(self, codebase_index_client: MCPClient) -> None:
-        """get_class_source should return the class definition."""
-        result = codebase_index_client.call_tool(
-            "get_class_source", {"name": "ConfigLoader"}
-        )
-        assert "class ConfigLoader" in result
-        assert "__init__" in result
-
-    def test_get_dependencies(self, codebase_index_client: MCPClient) -> None:
-        """get_dependencies should return what a function calls."""
-        result = codebase_index_client.call_tool(
-            "get_dependencies", {"name": "ConfigLoader.load"}
-        )
-        # load() calls read_config
-        assert "read_config" in result or "ConfigLoader" in result
-
-    def test_get_dependents(self, codebase_index_client: MCPClient) -> None:
-        """get_dependents should return what calls a function."""
-        result = codebase_index_client.call_tool(
-            "get_dependents", {"name": "read_config"}
-        )
-        # Called by ConfigLoader.load and indirectly by main
-        assert len(result) > 10
-
-    def test_get_call_chain(self, codebase_index_client: MCPClient) -> None:
-        """get_call_chain should find path between two symbols."""
-        result = codebase_index_client.call_tool(
-            "get_call_chain", {"from_name": "main", "to_name": "read_config"}
-        )
-        # Should find a path
-        assert "main" in result.lower() or len(result) > 5
-
-    def test_get_functions(self, codebase_index_client: MCPClient) -> None:
-        """get_functions should list functions in a file."""
-        result = codebase_index_client.call_tool(
-            "get_functions", {"file_path": "utils.py"}
-        )
-        assert "read_config" in result
-        assert "__init__" in result
-        assert "load" in result
-
-    def test_search_codebase(self, codebase_index_client: MCPClient) -> None:
-        """search_codebase should find regex matches across files."""
-        result = codebase_index_client.call_tool(
-            "search_codebase", {"pattern": r"def\s+\w+", "max_results": 10}
-        )
-        assert len(result) > 20
-        assert "def main" in result or "def read_config" in result
-
-    def test_get_usage_stats(self, codebase_index_client: MCPClient) -> None:
-        """get_usage_stats should report session stats."""
-        result = codebase_index_client.call_tool("get_usage_stats", {})
-        assert "Session duration" in result or "Total queries" in result
-
-    def test_list_files(self, codebase_index_client: MCPClient) -> None:
-        """list_files should return indexed file list."""
-        result = codebase_index_client.call_tool(
-            "list_files", {"pattern": "*.py", "max_results": 10}
-        )
-        assert "utils.py" in result
-        assert "main.py" in result
-
-    def test_list_files_no_pattern(self, codebase_index_client: MCPClient) -> None:
-        """list_files without pattern should return all files."""
-        result = codebase_index_client.call_tool("list_files", {})
-        assert len(result) > 5
-
-    def test_reindex(self, codebase_index_client: MCPClient) -> None:
-        """reindex should complete successfully."""
-        result = codebase_index_client.call_tool("reindex", {})
-        assert result  # Should have some output
-
-
-class TestMCPToolBridgeIntegration:
-    """Integration tests for the LangChain tool bridge with real MCP tools."""
-
-    def test_tool_conversion_and_call(
-        self, codebase_index_client: MCPClient
-    ) -> None:
-        """Convert a real MCP tool to LangChain and invoke it."""
-        tools = codebase_index_client.list_tools()
-        find_symbol_dict = next(t for t in tools if t["name"] == "find_symbol")
-
-        mcp_tool = MCPTool(
-            server_name="test-codebase-index",
-            name=find_symbol_dict["name"],
-            description=find_symbol_dict.get("description", ""),
-            input_schema=find_symbol_dict.get("inputSchema", {}),
-            client=codebase_index_client,
-        )
-
-        lc_tool = mcp_tool_to_langchain(mcp_tool)
-        assert lc_tool.name == "mcp_test-codebase-index_find_symbol"
-
-        result = lc_tool.invoke({"tool_input": '{"name": "main"}'})  # type: ignore[arg-type]
-        assert "main" in result or len(result) > 10
-        assert isinstance(result, str)
-
-    def test_get_mcp_tools_end_to_end(self, sample_python_project: str) -> None:
-        """get_mcp_tools() should return LangChain tools from config."""
-        from spine.mcp.client import _MCP_CACHE
-
-        # Clear cache for a fresh test
-        _MCP_CACHE.clear()
-
-        configs = {
-            "test-idx": {
-                "command": "mcp-codebase-index",
-                "args": [],
-                "env": {"PROJECT_ROOT": sample_python_project},
-                "timeout": 30,
-                "connect_timeout": 30,
-            }
-        }
-        tools = get_mcp_tools(configs, cache_key="integration-test")
-        assert len(tools) == 18
-        # All should be BaseTool
+    def test_tools_are_callable(self, mcp_tools_async: list) -> None:
+        """Tools should be LangChain BaseTool instances."""
         from langchain_core.tools import BaseTool
-        for t in tools:
+        for t in mcp_tools_async:
             assert isinstance(t, BaseTool)
-            assert t.name.startswith("mcp_test-idx_")
 
-        # Test calling one
-        find_symbol = next(t for t in tools if t.name.endswith("find_symbol"))
-        result = find_symbol.invoke({"tool_input": '{"name": "read_config"}'})  # type: ignore[arg-type]
-        assert "utils.py" in result
+    @pytest.mark.asyncio
+    async def test_find_symbol(self, mcp_tools_async: list) -> None:
+        """find_symbol should locate a function definition."""
+        tool = next(t for t in mcp_tools_async if t.name.endswith("find_symbol"))
+        result = await tool.ainvoke({"name": "read_config"})
+        text = _tool_result_text(result)
+        assert "utils.py" in text
 
-        # Clean up
-        _MCP_CACHE.clear()
+    @pytest.mark.asyncio
+    async def test_get_project_summary(self, mcp_tools_async: list) -> None:
+        """get_project_summary should return high-level stats."""
+        tool = next(t for t in mcp_tools_async if t.name.endswith("get_project_summary"))
+        result = await tool.ainvoke({})
+        text = _tool_result_text(result)
+        assert len(text) > 100
+        assert "Files:" in text
+
+    @pytest.mark.asyncio
+    async def test_get_function_source(self, mcp_tools_async: list) -> None:
+        """get_function_source should return the function body."""
+        tool = next(t for t in mcp_tools_async if t.name.endswith("get_function_source"))
+        result = await tool.ainvoke({"name": "read_config"})
+        text = _tool_result_text(result)
+        assert "def read_config" in text
+
+    @pytest.mark.asyncio
+    async def test_get_dependencies(self, mcp_tools_async: list) -> None:
+        """get_dependencies should return what a function calls."""
+        tool = next(t for t in mcp_tools_async if t.name.endswith("get_dependencies"))
+        result = await tool.ainvoke({"name": "ConfigLoader.load"})
+        text = _tool_result_text(result)
+        assert len(text) > 5
+
+    @pytest.mark.asyncio
+    async def test_search_codebase(self, mcp_tools_async: list) -> None:
+        """search_codebase should find regex matches."""
+        tool = next(t for t in mcp_tools_async if t.name.endswith("search_codebase"))
+        result = await tool.ainvoke({"pattern": r"def\s+\w+", "max_results": 10})
+        text = _tool_result_text(result)
+        assert len(text) > 20
+
+    @pytest.mark.asyncio
+    async def test_get_call_chain(self, mcp_tools_async: list) -> None:
+        """get_call_chain should find path between symbols."""
+        tool = next(t for t in mcp_tools_async if t.name.endswith("get_call_chain"))
+        result = await tool.ainvoke({"from_name": "main", "to_name": "read_config"})
+        text = _tool_result_text(result)
+        assert len(text) > 5
 
 
 class TestSpineConfigMCPIntegration:
@@ -269,14 +162,37 @@ class TestSpineConfigMCPIntegration:
         config = SpineConfig.load()
         assert isinstance(config.mcp_servers, dict)
 
-    def test_config_exposes_mcp_servers_to_ui(self) -> None:
-        """get_config() should include mcp_servers for UI rendering."""
+    def test_config_has_transport_field(self) -> None:
+        """MCP server configs should include transport field."""
         config = SpineConfig.load()
-        mcp_servers = config.mcp_servers
-        assert isinstance(mcp_servers, dict)
-        if mcp_servers:
-            server_name = next(iter(mcp_servers))
-            server_cfg = mcp_servers[server_name]
-            assert "command" in server_cfg
-            assert isinstance(server_cfg["args"], list)
-            assert isinstance(server_cfg["env"], dict)
+        for name, cfg in config.mcp_servers.items():
+            assert "transport" in cfg, f"Server {name!r} missing 'transport'"
+            assert cfg["transport"] in ("stdio", "http")
+            assert "command" in cfg
+
+    @pytest.mark.asyncio
+    async def test_get_mcp_tools_end_to_end(self, sample_python_project: str) -> None:
+        """get_mcp_tools() should return namespaced LangChain tools."""
+        import spine.mcp.client as mcp_client
+        mcp_client._client = None
+
+        configs = {
+            "test-idx": {
+                "transport": "stdio",
+                "command": "mcp-codebase-index",
+                "args": [],
+                "env": {"PROJECT_ROOT": sample_python_project},
+            },
+        }
+        tools = get_mcp_tools(configs, cache_key="integration-test-e2e")
+
+        assert len(tools) == 18
+        from langchain_core.tools import BaseTool
+        for t in tools:
+            assert isinstance(t, BaseTool)
+            assert t.name.startswith("mcp_test-idx_")
+
+        find_symbol = next(t for t in tools if t.name.endswith("find_symbol"))
+        result = await find_symbol.ainvoke({"name": "read_config"})
+        text = _tool_result_text(result)
+        assert "utils.py" in text

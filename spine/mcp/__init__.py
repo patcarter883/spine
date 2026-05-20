@@ -1,17 +1,10 @@
-"""SPINE MCP client — connects to MCP servers and bridges tools into LangChain.
+"""SPINE MCP — loads MCP tools via langchain-mcp-adapters.
 
-Provides MCP session management (spawn, connect, tool discovery, tool execution)
-and automatic conversion of discovered MCP tools to LangChain ``BaseTool`` instances
-for injection into phase agents.
+Thin wrapper around LangChain's ``MultiServerMCPClient`` that loads
+MCP tools from the SPINE config and namespaces them with the server
+name to prevent collisions.
 """
 
-from spine.mcp.client import MCPClient, MCPClientManager, get_mcp_tools
-from spine.mcp.tools import MCPTool, mcp_tool_to_langchain
+from spine.mcp.client import get_mcp_tools
 
-__all__ = [
-    "MCPClient",
-    "MCPClientManager",
-    "MCPTool",
-    "get_mcp_tools",
-    "mcp_tool_to_langchain",
-]
+__all__ = ["get_mcp_tools"]
