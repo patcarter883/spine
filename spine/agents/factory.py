@@ -234,6 +234,21 @@ def build_phase_agent(
     backend = build_backend(workspace_root)
     work_id = state.get("work_id", "")
 
+    # ── MCP tools ──────────────────────────────────────────────────────
+    from spine.config import SpineConfig
+    from spine.mcp.client import get_mcp_tools
+
+    mcp_tools: list = []
+    try:
+        config_obj = SpineConfig.load()
+        mcp_tools = get_mcp_tools(
+            config_obj.mcp_servers,
+            cache_key=work_id or "default",
+            workspace_root=workspace_root,
+        )
+    except Exception:
+        logger.debug("MCP tool loading failed (non-fatal)", exc_info=True)
+
     # ── Resolve profile for prompt assembly ──────────────────────────
     # The HarnessProfile is registered per-provider by ensure_spine_profiles().
     # It holds base_system_prompt (SPINE_BASE_PROMPT) and tool_description_overrides.
@@ -255,6 +270,21 @@ def build_phase_agent(
         final_system_prompt: str = base_prompt
     else:
         final_system_prompt = system_prompt + "\n\n" + base_prompt
+
+    # ── MCP tool guidance ────────────────────────────────────────────
+    if mcp_tools:
+        mcp_names = [getattr(t, "name", "?") for t in mcp_tools]
+        mcp_guidance = (
+            "\n\n## Codebase Navigation Tools (MCP)\n"
+            "You have access to MCP tools for efficient codebase navigation. "
+            "Use these for symbol lookup, dependency analysis, and change impact "
+            "assessment. They are MUCH more token-efficient than reading entire "
+            "files with glob/grep/read — use them FIRST when exploring the codebase.\n"
+            f"Available MCP tools: {', '.join(mcp_names[:10])}"
+        )
+        if len(mcp_names) > 10:
+            mcp_guidance += f" and {len(mcp_names) - 10} more"
+        final_system_prompt += mcp_guidance
 
     # ── Memory ───────────────────────────────────────────────────────
     memory = resolve_memory(workspace_root, phase=phase.value)
@@ -296,10 +326,13 @@ def build_phase_agent(
     context_schema = SpineContext
 
     # ── Construct the agent ──────────────────────────────────────────
+    all_tools = list(extra_tools) if extra_tools else []
+    all_tools.extend(mcp_tools)
+
     agent = create_agent(
         model,
         system_prompt=final_system_prompt,
-        tools=list(extra_tools) if extra_tools else [],  # Custom tools + middleware tools
+        tools=all_tools,  # Custom tools + MCP tools + middleware tools
         middleware=middleware,
         response_format=response_format,
         context_schema=context_schema,
@@ -347,8 +380,8 @@ def _build_middleware_stack(
     1.  TodoListMiddleware         — task planning state
     2.  SkillsMiddleware           — progressive skill disclosure
     3.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
-    4.  CodeInterpreterMiddleware  — eval tool (when enabled)
-    5.  SubAgentMiddleware         — task delegation (when subagents present)
+    4.  SubAgentMiddleware         — task delegation (BEFORE interpreter so tools.task is PTC-visible)
+    5.  CodeInterpreterMiddleware  — eval tool (when enabled); sees task tool from step 4
     6.  SummarizationMiddleware    — context compression
     7.  PatchToolCallsMiddleware   — tool call normalization
     8.  SPINE-specific middleware  — ToolSchemaValidator, ToolOutputTrimmer
@@ -356,6 +389,13 @@ def _build_middleware_stack(
     10. Profile extra_middleware
     11. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
     12. MemoryMiddleware           — AGENTS.md injection (when memory present)
+
+    CRITICAL ordering constraint: SubAgentMiddleware (4) MUST precede
+    CodeInterpreterMiddleware (5). The interpreter's PTC system calls
+    filter_tools_for_ptc(request.tools, ptc_allowlist) to bind tools onto
+    globalThis.tools in the QuickJS sandbox. If SubAgentMiddleware hasn't
+    run yet, `task` is not in request.tools and tools.task is undefined,
+    causing "TypeError: not a function" on every tools.task() call in eval.
     """
     middleware: list[Any] = []
 
@@ -391,17 +431,25 @@ def _build_middleware_stack(
             phase.value,
         )
 
-    # 4. Interpreter (eval tool) — only for top-level phase agents
-    if has_interpreter:
-        middleware.append(build_interpreter_middleware(phase.value))
-
-    # 5. Subagent delegation — when subagent specs are provided
+    # 4. Subagent delegation — MUST come before interpreter so that the
+    #    `task` tool is in request.tools when CodeInterpreterMiddleware's
+    #    _prepare_for_call runs filter_tools_for_ptc. If SubAgentMiddleware
+    #    is after the interpreter, `task` is not yet in the tool registry
+    #    and tools.task resolves to undefined in the QuickJS sandbox,
+    #    causing "TypeError: not a function" on every Promise.allSettled call.
     if subagents:
         middleware.append(SubAgentMiddleware(
             backend=backend,
             subagents=subagents,
             task_description=tool_desc_overrides.get("task"),
         ))
+
+    # 5. Interpreter (eval tool) — only for top-level phase agents.
+    #    SubAgentMiddleware must be above this in the stack (position 4)
+    #    so that the `task` tool is visible to PTC when the interpreter
+    #    installs its globalThis.tools bindings.
+    if has_interpreter:
+        middleware.append(build_interpreter_middleware(phase.value))
 
     # 6. Summarization — context compression for long-running phases
     if add_summarization and not is_subagent:
