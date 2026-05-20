@@ -72,7 +72,7 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
         icon = _PHASE_EMOJI.get(phase, "⚙️")
         # Pretty label: "critic_plan" → "𝘊 Plan", "specify" → "Specify"
         if phase.startswith("critic_"):
-            label = f"𝘊 {phase[len('critic_'):].title()}"
+            label = f"𝘊 {phase[len('critic_') :].title()}"
         else:
             label = phase.title()
         if current_idx < 0:
@@ -121,16 +121,13 @@ def _render_active_job(api: UIApi) -> None:
         return
 
     if not active:
-        st.markdown(
-            ":gray[No active job — queue is idle or all jobs completed]"
-        )
+        st.markdown(":gray[No active job — queue is idle or all jobs completed]")
         # Reset stuck items button (useful even when no active job)
         if st.button("🔄 Reset stuck running items", key="reset_stuck"):
             reset_count = api.reset_stuck_items()
             if reset_count:
                 st.success(
-                    f"Reset {reset_count} stuck item(s) back to pending. "
-                    "They will be reprocessed."
+                    f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed."
                 )
             else:
                 st.info("No stuck running items found.")
@@ -154,8 +151,7 @@ def _render_active_job(api: UIApi) -> None:
 
     st.subheader("🔄 Active Job")
     st.caption(
-        f"Work ID: `{display_id}`"
-        + (f"  ·  Queue #{queue_id}" if work_id and queue_id else "")
+        f"Work ID: `{display_id}`" + (f"  ·  Queue #{queue_id}" if work_id and queue_id else "")
     )
 
     # Description
@@ -169,6 +165,14 @@ def _render_active_job(api: UIApi) -> None:
     meta[2].metric("Status", status.title())
     phase_label = current_phase.replace("critic_", "𝘊 ").title() if current_phase else "Starting"
     meta[3].metric("Current Phase", phase_label)
+
+    # Stop button for active running job
+    if work_id:
+        st.divider()
+        if st.button("⏹ Stop Work", key=f"stop_work_{work_id}"):
+            result = api.stop_work(work_id)
+            st.success(f"Stop requested for work `{work_id}`. The job will be cancelled.")
+            st.rerun()
 
     # Phase progress bar
     phases = _PHASE_SEQUENCE.get(work_type, [])
@@ -206,8 +210,7 @@ def _render_active_job(api: UIApi) -> None:
         reset_count = api.reset_stuck_items()
         if reset_count:
             st.success(
-                f"Reset {reset_count} stuck item(s) back to pending. "
-                "They will be reprocessed."
+                f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed."
             )
         else:
             st.info("No stuck running items found.")
@@ -225,10 +228,16 @@ def _render_pending(api: UIApi) -> None:
     else:
         for item in pending:
             with st.container(border=True):
-                pc1, pc2, pc3 = st.columns([4, 1, 2])
+                pc1, pc2, pc3, pc4 = st.columns([4, 1, 2, 1])
                 pc1.markdown(f"**{item.get('description', '')[:120]}**")
                 pc2.write(item.get("work_type", ""))
                 pc3.caption(f"Enqueued {format_duration(item.get('enqueued_at'))} ago")
+                # Stop button for pending items
+                work_id = item.get("work_id")
+                if work_id and pc4.button("⏹ Stop", key=f"stop_pending_{item.get('id')}"):
+                    api.stop_work(work_id)
+                    st.success(f"Stop requested for work `{work_id}`.")
+                    st.rerun()
 
 
 @st.fragment(run_every=_POLL_INTERVAL)

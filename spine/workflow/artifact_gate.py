@@ -18,9 +18,19 @@ end the workflow with ``status = "running"`` → ``"completed"``.
 When the gate passes, it returns ``status = "running"`` unchanged and routes
 to the next phase node. When it fails, it sets ``status = "needs_review"``,
 adds a feedback entry, and routes to END.
+
+Extended checks for tasks→implement:
+- ``codebase-map.md`` must exist on disk (not just tasks.md).
+- At least one file path referenced in any slice-*.md must exist in the
+  workspace. If every path in every slice is missing, the tasks agent most
+  likely hallucinated a fictional project skeleton and the output is useless
+  for implement. Route to needs_review immediately rather than letting
+  implement spend 30+ turns discovering the problem itself.
 """
 
 import logging
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -47,6 +57,110 @@ def _has_meaningful_artifacts(state: WorkflowState, required_phase: str) -> bool
             return True
 
     return False
+
+
+def _check_tasks_quality(
+    workspace_root: str,
+    work_id: str,
+) -> tuple[bool, str]:
+    """Validate tasks-phase artifact quality beyond mere presence.
+
+    Performs two additional checks specific to the tasks→implement gate:
+
+    1. **codebase-map.md existence** — Without it the implement orchestrator
+       has no pre-built context and falls back to a 20+ turn exploration spiral.
+
+    2. **Slice path grounding** — Parses every ``slice-*.md`` file and extracts
+       paths listed under "Files to Modify/Create" or "Files to Modify" headings.
+       If at least one extracted path exists in the workspace the check passes.
+       If *no* paths exist the tasks agent almost certainly hallucinated a
+       generic project skeleton (e.g. ``src/main.py``, ``api/routes.py``) rather
+       than grounding in the real codebase.
+
+    Returns:
+        ``(passed, reason)`` — ``passed=True`` means gate should proceed;
+        ``reason`` is a human-readable explanation on failure (empty on pass).
+    """
+    root = Path(workspace_root)
+    tasks_dir = root / ".spine" / "artifacts" / work_id / "tasks"
+
+    if not tasks_dir.is_dir():
+        # Tasks dir doesn't exist — let the main gate handle this
+        return True, ""
+
+    # ── Check 1: codebase-map.md must exist ─────────────────────────────
+    codebase_map = tasks_dir / "codebase-map.md"
+    if not codebase_map.exists():
+        return (
+            False,
+            "tasks phase did not produce codebase-map.md. "
+            "The IMPLEMENT orchestrator needs this file to dispatch subagents "
+            "without entering a workspace exploration spiral. "
+            "Re-run TASKS to produce a proper codebase map.",
+        )
+
+    # ── Check 2: slice file paths must be grounded in the workspace ──────
+    slice_files = sorted(tasks_dir.glob("slice-*.md"))
+    if not slice_files:
+        # No slices — let main gate catch "no meaningful artifacts"
+        return True, ""
+
+    all_candidate_paths: list[str] = []
+    # Patterns that introduce file paths in slice files:
+    #   - "- `path/to/file.py`"  (backtick)
+    #   - "- path/to/file.py"    (bare)
+    #   - "Files to Modify:\n- path"
+    _path_re = re.compile(
+        r"[`'\"]?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)[`'\"]?",
+    )
+
+    for sf in slice_files:
+        try:
+            text = sf.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # Collect paths from lines that look like file listings
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("-") and ":" not in line:
+                continue
+            for match in _path_re.finditer(line):
+                candidate = match.group(1)
+                # Skip very short tokens and obvious non-paths
+                if len(candidate) < 4 or candidate.startswith("."):
+                    continue
+                # Must contain a directory separator or look like a real file
+                if "/" in candidate or candidate.count(".") == 1:
+                    all_candidate_paths.append(candidate)
+
+    if not all_candidate_paths:
+        # Could not extract any paths — pass (no false-positive gate)
+        return True, ""
+
+    # Check whether at least one candidate path exists in workspace
+    found_any = False
+    for candidate in all_candidate_paths:
+        # Try both the path as-is and without leading slash
+        for try_path in (candidate, candidate.lstrip("/")):
+            if (root / try_path).exists():
+                found_any = True
+                break
+        if found_any:
+            break
+
+    if not found_any:
+        sampled = all_candidate_paths[:5]
+        return (
+            False,
+            f"tasks phase slice files reference paths that do not exist in the "
+            f"workspace (sampled: {sampled}). "
+            "This indicates the tasks agent produced a hallucinated project "
+            "skeleton rather than grounding slices in the actual codebase. "
+            "Re-run TASKS — the agent must verify that file paths exist before "
+            "writing slice artifacts.",
+        )
+
+    return True, ""
 
 
 def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
@@ -103,6 +217,44 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
                     "disk at .spine/artifacts/%s/%s/. Proceeding anyway.",
                     work_id, required_phase, work_id, required_phase,
                 )
+
+            # ── Extended quality checks for tasks→implement ──────────────
+            # Run these only when the basic presence check passes — we don't
+            # want to add I/O overhead to gates that already failed.
+            if required_phase == PhaseName.TASKS.value:
+                try:
+                    quality_ok, quality_reason = _check_tasks_quality(
+                        workspace_root, work_id
+                    )
+                except Exception as exc:
+                    # Quality check errors must never crash the gate
+                    logger.warning(
+                        "[%s] Tasks quality check raised unexpectedly: %s "
+                        "(proceeding anyway)",
+                        work_id, exc,
+                    )
+                    quality_ok = True
+                    quality_reason = ""
+
+                if not quality_ok:
+                    reason = f"Artifact gate (quality): {quality_reason}"
+                    logger.warning(
+                        "[%s] %s Flagging for human review.", work_id, reason
+                    )
+                    return {
+                        "current_phase": required_phase,
+                        "status": "needs_review",
+                        "feedback": [
+                            {
+                                "status": "needs_review",
+                                "tier": "structural",
+                                "reason": reason,
+                                "suggestions": [],
+                            }
+                        ],
+                        "prompt_request": None,
+                    }
+
             logger.debug(
                 "[%s] Artifact gate passed for %s → %s",
                 work_id, required_phase, next_node,

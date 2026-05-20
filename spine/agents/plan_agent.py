@@ -48,10 +48,16 @@ def build_plan_agent(
         "Be specific about file paths, class names, and interfaces. "
         "The plan must be actionable — another developer should be able "
         "to implement directly from this document.\n\n"
-        "When the interpreter is available, seed it with context on your first turn:\n"
+        "When the interpreter is available, you MUST dispatch subagents in parallel "
+        "using `Promise.all` on your first turn if research is needed. Do not chatter. Example:\n"
         "```js\n"
         + f'globalThis.context = {{"work_id": "{work_id}", "phase": "plan", "artifact_dir": ".spine/artifacts/{work_id}/plan"}};\n'
+        + "await Promise.all([\n"
+        + '  task("plan_researcher", "Map the project file structure..."),\n'
+        + '  task("plan_researcher", "Find module boundaries...")\n'
+        + "]);\n"
         + "```\n"
+        "Avoid reading files natively if a subagent can do it. Wait for subagent results, then `write_file`.\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.PLAN.value, expected_files=["plan.md"]
         )

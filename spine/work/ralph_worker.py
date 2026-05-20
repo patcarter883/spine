@@ -188,8 +188,12 @@ class RalphLoopWorker:
 
                 # Derive the queue item status from the work result so
                 # the queue page can distinguish failed from completed.
-                work_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
-                queue_status = work_status if work_status in ("failed", "needs_review") else "completed"
+                work_status = (
+                    result.get("status", "completed") if isinstance(result, dict) else "completed"
+                )
+                queue_status = (
+                    work_status if work_status in ("failed", "needs_review") else "completed"
+                )
                 work_id = result.get("work_id") if isinstance(result, dict) else None
 
                 update_payload: dict[str, Any] = {
@@ -254,9 +258,7 @@ class RalphLoopWorker:
         from spine.persistence.checkpoint import CheckpointStore
 
         db = self._get_db()
-        stuck = list(
-            db["queue"].rows_where("status = ?", ["running"], order_by="started_at")
-        )
+        stuck = list(db["queue"].rows_where("status = ?", ["running"], order_by="started_at"))
         if not stuck:
             return 0
 
@@ -309,7 +311,10 @@ class RalphLoopWorker:
         """
         rows = list(
             self._get_db()["queue"].rows_where(
-                "status = ?", ["pending"], order_by="enqueued_at DESC", limit=limit,
+                "status = ?",
+                ["pending"],
+                order_by="enqueued_at DESC",
+                limit=limit,
             )
         )
         return rows
@@ -322,7 +327,10 @@ class RalphLoopWorker:
         """
         rows = list(
             self._get_db()["queue"].rows_where(
-                "status = ?", ["running"], order_by="started_at", limit=1,
+                "status = ?",
+                ["running"],
+                order_by="started_at",
+                limit=1,
             )
         )
         return rows[0] if rows else None
@@ -338,11 +346,91 @@ class RalphLoopWorker:
         """
         rows = list(
             self._get_db()["queue"].rows_where(
-                "status IN (?, ?)", ["completed", "failed"],
-                order_by="completed_at DESC", limit=limit,
+                "status IN (?, ?)",
+                ["completed", "failed"],
+                order_by="completed_at DESC",
+                limit=limit,
             )
         )
         return rows
+
+    def cancel_item(self, item_id: int) -> bool:
+        """Cancel a pending queue item.
+
+        Args:
+            item_id: The queue item ID to cancel.
+
+        Returns:
+            True if the item was cancelled, False if not found or not pending.
+        """
+        db = self._get_db()
+        item = db["queue"].get(item_id)
+        if not item:
+            return False
+
+        if item["status"] != "pending":
+            return False
+
+        db["queue"].update(
+            item_id,
+            {
+                "status": "cancelled",
+                "completed_at": datetime.now().isoformat(),
+                "result": json.dumps({"cancelled": True}),
+            },
+        )
+        logger.info(f"Cancelled queue item {item_id}")
+        return True
+
+    def cancel_running(self, work_id: str) -> bool:
+        """Cancel a running work item by work_id.
+
+        This marks the queue item as cancelled and purges the LangGraph
+        checkpoint so the graph can be restarted cleanly if needed.
+
+        Args:
+            work_id: The work ID to cancel.
+
+        Returns:
+            True if a running item was cancelled, False if not found.
+        """
+        from spine.persistence.checkpoint import CheckpointStore
+
+        db = self._get_db()
+        # Find the queue item by work_id
+        item = db["queue"].rows_where(
+            "work_id = ? AND status = ?",
+            [work_id, "running"],
+            limit=1,
+        )
+        item = item[0] if item else None
+
+        if not item:
+            return False
+
+        item_id = item["id"]
+        # Mark as cancelled
+        db["queue"].update(
+            item_id,
+            {
+                "status": "cancelled",
+                "completed_at": datetime.now().isoformat(),
+                "result": json.dumps({"cancelled": True, "work_id": work_id}),
+            },
+        )
+
+        # Purge the checkpoint
+        checkpoint_store = CheckpointStore(db_path=self.config.checkpoint_path)
+        import asyncio
+
+        try:
+            saver = asyncio.run(checkpoint_store.get_checkpointer())
+            asyncio.run(saver.apurge({"configurable": {"thread_id": work_id}}))
+        except Exception:
+            pass
+
+        logger.info(f"Cancelled running work {work_id} (queue item {item_id})")
+        return True
 
 
 def get_worker(config: SpineConfig | None = None) -> RalphLoopWorker:

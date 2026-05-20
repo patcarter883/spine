@@ -73,6 +73,7 @@ Call ``build_interpreter_middleware(phase_name)`` to get the right config.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from spine.models.enums import PhaseName
@@ -156,7 +157,39 @@ def build_interpreter_middleware(
             phase_name,
         )
 
-    middleware = CodeInterpreterMiddleware(
+    _TS_BLOCK_RE = re.compile(
+        r"### API Reference — `tools` namespace\b.*",
+        re.DOTALL,
+    )
+    _PTC_REPLACEMENT = (
+        "### PTC Note\n"
+        "Tools are pre-bound on `globalThis.tools` using camelCase "
+        "(e.g. `tools.readFile`, `tools.writeFile`, `tools.task`). "
+        "Return values are native JS — strings, arrays, objects. "
+        "Do NOT call `require()` or access `fs`."
+    )
+
+    class SpineInterpreterMiddleware(CodeInterpreterMiddleware):
+        """Strips the verbose TypeScript schema block injected by langchain-quickjs.
+
+        ``_prepare_for_call`` returns a str (the prompt addendum) that
+        includes a full TS signature block for every PTC tool.  We strip
+        that block and replace it with a two-line summary before the
+        addendum is appended to the system message, saving ~3 K tokens
+        on every model call.
+        """
+
+        async def awrap_model_call(self, request, handler):
+            # _prepare_for_call → str (prompt addendum, may contain TS block)
+            prompt: str = self._prepare_for_call(request)
+            clean_prompt = _TS_BLOCK_RE.sub(_PTC_REPLACEMENT, prompt)
+            return await handler(
+                request.override(
+                    system_message=self._extend(request.system_message, clean_prompt)
+                )
+            )
+
+    middleware = SpineInterpreterMiddleware(
         memory_limit=memory_limit,
         timeout=timeout,
         max_ptc_calls=max_ptc_calls,
@@ -196,6 +229,7 @@ def interpreter_enabled() -> bool:
     else:
         try:
             from spine.config import SpineConfig
+
             enabled = SpineConfig.load().interpreter_enabled
         except Exception:
             enabled = False

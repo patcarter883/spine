@@ -58,10 +58,16 @@ def build_specify_agent(
         "4. Interfaces — API endpoints, data models, contracts\n"
         "5. Success criteria — measurable outcomes\n\n"
         "Be specific and technical. Avoid vague language.\n\n"
-        "When the interpreter is available, seed it with context on your first turn:\n"
+        "When the interpreter is available, you MUST dispatch subagents in parallel "
+        "using `Promise.all` on your first turn. Do not chatter. Example:\n"
         "```js\n"
         + f'globalThis.context = {{"work_id": "{work_id}", "phase": "specify", "artifact_dir": ".spine/artifacts/{work_id}/specify"}};\n'
+        + "await Promise.all([\n"
+        + '  task("specify_researcher", "Research the API architecture..."),\n'
+        + '  task("specify_researcher", "Research the database schema...")\n'
+        + "]);\n"
         + "```\n"
+        "Avoid reading files natively if a subagent can do it. Wait for subagent results, then `write_file`.\n\n"
         + build_current_phase_write_prompt(
             work_id, PhaseName.SPECIFY.value, expected_files=["specification.md"]
         )

@@ -1,8 +1,13 @@
 """SPINE verify agent — Deep Agent for the VERIFY phase.
 
-Uses the shared :func:`build_phase_agent` factory with summarization
-middleware enabled (VERIFY can be long-running across many slices).
-Structured gather→verify→report workflow with parallel subagent dispatch.
+Same orchestrator pattern as the implement phase: dispatch one
+``slice-verifier`` per feature slice, synthesize results into
+``verification.md``. The orchestrator does not verify slices inline.
+
+Tool restriction: orchestrator gets read-only filesystem tools plus
+``write_file`` (for ``verification.md`` only). ``execute`` is excluded
+— if a real test run is needed, that's the subagent's job. ``edit_file``
+is excluded because verify must never mutate code.
 """
 
 from __future__ import annotations
@@ -10,11 +15,27 @@ from __future__ import annotations
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
+
+from spine.agents.artifacts import (
+    build_artifact_prompt,
+    build_current_phase_write_prompt,
+    list_slice_files,
+)
+from spine.agents.factory import build_phase_agent
+from spine.agents.subagents import build_phase_subagents
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-from spine.agents.factory import build_phase_agent
-from spine.agents.artifacts import build_artifact_prompt, build_current_phase_write_prompt
-from spine.agents.subagents import build_phase_subagents
+
+# ── Tool allowlist ─────────────────────────────────────────────────────
+# Verify orchestrator: read-only + write_file for verification.md.
+# Test execution belongs to slice-verifier subagents (they have execute).
+_VERIFY_ORCHESTRATOR_TOOLS: list[str] = [
+    "ls",
+    "read_file",
+    "glob",
+    "grep",
+    "write_file",  # for verification.md only
+]
 
 
 def _build_subagents(
@@ -32,8 +53,9 @@ def build_verify_agent(
 ) -> Any:
     """Build the Deep Agent for the VERIFY phase.
 
-    Creates a deep agent configured for verification with summarization
-    middleware for long-running multi-slice verification.
+    Always builds a dispatch-only orchestrator. All actual verification
+    work (reading source, running tests, checking acceptance criteria)
+    is delegated to ``slice-verifier`` subagents.
 
     Args:
         state: The current workflow state.
@@ -43,52 +65,37 @@ def build_verify_agent(
         A compiled Deep Agent ready for invocation.
     """
     work_id = state.get("work_id", "")
-    tasks_path = f".spine/artifacts/{work_id}/tasks"
+    workspace_root = state.get("workspace_root", ".")
+    tasks_dir = f".spine/artifacts/{work_id}/tasks"
+    verify_dir = f".spine/artifacts/{work_id}/verify"
+    impl_dir = f".spine/artifacts/{work_id}/implement"
 
-    system_prompt = (
-        "You are a verification engineer. Review the implementation "
-        "against the specification, plan, and feature slices.\n\n"
-        "Your filesystem is rooted at the project workspace. "
-        "Use relative paths (e.g. `src/main.py`, `.spine/artifacts/...`).\n\n"
-        "## Workflow (follow this order)\n\n"
-        "### Phase 1: Gather (1-2 turns)\n"
-        "Batch-read ALL relevant artifacts and source files in ONE response:\n"
-        "- Read tasks.md and all slice files\n"
-        f"- Read the codebase map (if available): `{tasks_path}/codebase-map.md`\n"
-        "- Read the implementation summary\n"
-        "- Read the actual source files that were modified\n\n"
-        "### Phase 2: Verify (1-2 turns) — MANDATORY PARALLEL\n"
-        "When there are ≥2 slices, you MUST dispatch one slice-verifier "
-        "subagent per slice via `Promise.allSettled(tools.task(...))` from "
-        "eval. Do NOT verify all slices inline — parallel verification is "
-        "required to keep context lean. Each subagent gets a fresh, small "
-        "context instead of bloating your conversation.\n"
-        "When there is exactly 1 slice: verify directly using read_file and "
-        "execute.\n\n"
-        "### Phase 3: Report (1 turn)\n"
-        "Synthesize findings into a verification report:\n"
-        "- VERIFIED or NOT VERIFIED status\n"
-        "- Checklist of each feature slice and its status\n"
-        "- Any gaps or issues found\n"
-        "- Write verification.md to disk\n\n"
-        "## Subagent Dispatch — MANDATORY FOR ≥2 SLICES\n"
-        "Failure to dispatch slice-verifier subagents when there are ≥2 slices "
-        "violates the workflow contract. The slice-verifier subagents have "
-        "isolated contexts and return compact results. Verifying all slices "
-        "inline bloats your conversation and wastes tokens.\n\n"
-        "## Rules\n"
-        "- Batch reads: never read one file at a time\n"
-        "- Use eval for parallel subagent dispatch\n"
-        "- Inspect actual code, not just the implementation summary\n"
-        "- Run tests — do not assume they pass\n\n"
-        "When the interpreter is available, seed it with context on your first turn:\n"
-        "```js\n"
-        + f'globalThis.context = {{"work_id": "{work_id}", "phase": "verify", "artifact_dir": ".spine/artifacts/{work_id}/verify"}};\n'
-        + "```\n"
-        + build_current_phase_write_prompt(
-            work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
+    # ── Slice inventory ───────────────────────────────────────────────
+    slice_files = list_slice_files(workspace_root, work_id)
+    slice_count = len(slice_files)
+
+    if slice_count == 0:
+        slice_inventory = (
+            "⚠ No slice-*.md files found in tasks/ directory. "
+            "Use `ls` + `glob` to locate slice files before proceeding."
         )
-        + build_artifact_prompt(state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id)
+    else:
+        slice_inventory = (
+            f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
+            + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
+        )
+
+    system_prompt = _build_orchestrator_prompt(
+        work_id=work_id,
+        tasks_dir=tasks_dir,
+        verify_dir=verify_dir,
+        impl_dir=impl_dir,
+        slice_inventory=slice_inventory,
+        slice_count=slice_count,
+    ) + build_current_phase_write_prompt(
+        work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
+    ) + build_artifact_prompt(
+        state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
     )
 
     agent = build_phase_agent(
@@ -96,8 +103,116 @@ def build_verify_agent(
         config=config,
         phase=PhaseName.VERIFY,
         system_prompt=system_prompt,
-        add_summarization=True,  # VERIFY can be long-running
+        add_summarization=True,
         subagents=_build_subagents(PhaseName.VERIFY, state, config),
+        allowed_tools=_VERIFY_ORCHESTRATOR_TOOLS,
     )
 
     return agent
+
+
+# ── Prompt builder ─────────────────────────────────────────────────────
+
+
+def _build_orchestrator_prompt(
+    *,
+    work_id: str,
+    tasks_dir: str,
+    verify_dir: str,
+    impl_dir: str,
+    slice_inventory: str,
+    slice_count: int,
+) -> str:
+    """Build the verify orchestrator system prompt."""
+    if slice_count == 1:
+        dispatch_note = (
+            "There is 1 slice. Dispatch a single `slice-verifier` for "
+            "consistency — same context-management benefit."
+        )
+    elif slice_count >= 2:
+        dispatch_note = (
+            f"There are {slice_count} slices. Dispatch all of them in "
+            "parallel via `Promise.allSettled(tools.task(...))` inside one "
+            "`eval` call."
+        )
+    else:
+        dispatch_note = (
+            "Slice files not yet discovered. Use `glob` to list "
+            f"`{tasks_dir}/slice-*.md`, then dispatch one subagent per slice."
+        )
+
+    return (
+        "You are the VERIFY phase orchestrator. You do NOT inspect source "
+        "code yourself — you dispatch one `slice-verifier` subagent per "
+        "feature slice and synthesize their verdicts into a single report.\n\n"
+        "Your tools are restricted to read-only filesystem operations plus "
+        "`write_file` (reserved for `verification.md`), `task`, and `eval`. "
+        "You do NOT have `edit_file` or `execute` — verify never mutates "
+        "code, and test execution belongs to subagents.\n\n"
+        "## Expected tool errors (BY DESIGN — do not recover)\n"
+        "If you attempt to call `edit_file` or `execute`, you will see a "
+        "'tool not found' or 'unknown tool' error. This is **not a bug** — "
+        "your toolset is deliberately filtered. Do not try alternative "
+        "tools or attempt to work around the restriction. Dispatch a "
+        "`slice-verifier` subagent instead — they can run tests.\n\n"
+        "## Workflow (3 steps, ~5 turns total)\n\n"
+        "### Step 1 — Read context\n"
+        "In ONE turn, batch-read:\n"
+        f"- `{tasks_dir}/codebase-map.md`\n"
+        f"- `{impl_dir}/implementation.md` (what was actually implemented)\n"
+        "- Each slice file listed below\n\n"
+        f"{slice_inventory}\n\n"
+        "### Step 2 — Dispatch slice-verifier subagents in parallel\n"
+        f"{dispatch_note}\n\n"
+        "Each `task` description MUST be fully self-contained. Embed:\n"
+        "1. The full slice text (acceptance criteria, files to verify)\n"
+        "2. Relevant excerpts from implementation.md (what the implementer "
+        "reported for this slice)\n"
+        "3. Codebase-map.md excerpts for files involved in this slice\n\n"
+        "Dispatch pattern (do this inside one `eval` call):\n"
+        "```js\n"
+        "const sliceFiles = [/* slice filenames */];\n"
+        "const dispatches = sliceFiles.map(async (name) => {\n"
+        "  const slice = await tools.read_file({file_path: "
+        f"`{tasks_dir}/${{name}}`}});\n"
+        "  return tools.task({\n"
+        '    subagent_type: "slice-verifier",  // ONLY valid type\n'
+        "    description: `Verify slice: ${name}\\n\\n`\n"
+        "      + `## Slice Definition\\n${slice.content}\\n\\n`\n"
+        "      + `## Implementation Report Excerpt\\n${implExcerpt}\\n`,\n"
+        "  });\n"
+        "});\n"
+        "const results = await Promise.allSettled(dispatches);\n"
+        "globalThis.verifyResults = results;\n"
+        "console.log(JSON.stringify(results.map(r => "
+        "({status: r.status, verdict: r.value?.verdict}))));\n"
+        "```\n\n"
+        "### Step 3 — Synthesize verification.md\n"
+        f"Write `{verify_dir}/verification.md` with `write_file`.\n\n"
+        "The first line MUST be one of:\n"
+        "- `VERIFIED` — every slice's subagent returned VERIFIED\n"
+        "- `PASSED` — synonym for VERIFIED\n"
+        "- `FAILED` — at least one slice was NOT_VERIFIED, or any subagent "
+        "raised an exception\n\n"
+        "Follow with:\n"
+        "- One section per slice with the subagent's verdict and checklist\n"
+        "- Aggregated gaps and recommendations\n"
+        "- If FAILED: a clear list of which slices failed and why\n\n"
+        "## Strict Rules\n"
+        "- You MUST NOT call `edit_file`, `execute`, or `write_file` on "
+        "anything other than `verification.md`. Your toolset is filtered.\n"
+        "- You MUST dispatch one `slice-verifier` subagent per slice. "
+        "Do not attempt to verify slices inline.\n"
+        "- The ONLY valid `subagent_type` is `slice-verifier`. Do NOT "
+        "request `general-purpose` — it does not exist.\n"
+        "- Subagent dispatch MUST happen inside `eval` so subagents run "
+        "in parallel via `Promise.allSettled`. Sequential conversation "
+        "tool calls are not parallel.\n"
+        "- `verification.md` is REQUIRED — without it the phase fails.\n\n"
+        "## Eval Context Seed (first eval call)\n"
+        "```js\n"
+        f"globalThis.context = {{work_id: \"{work_id}\", "
+        f"phase: \"verify\", tasks_dir: \"{tasks_dir}\", "
+        f"verify_dir: \"{verify_dir}\", impl_dir: \"{impl_dir}\"}};\n"
+        "```\n\n"
+    )

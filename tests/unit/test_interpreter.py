@@ -230,7 +230,7 @@ class TestAgentBuilderIntegration:
         call_kwargs = mock_ca.call_args[1]
         middleware = call_kwargs.get("middleware", [])
         assert not any(
-            "CodeInterpreter" in type(m).__name__
+            "Interpreter" in type(m).__name__
             for m in middleware
         )
 
@@ -248,7 +248,7 @@ class TestAgentBuilderIntegration:
         call_kwargs = mock_ca.call_args[1]
         middleware = call_kwargs.get("middleware", [])
         assert any(
-            "CodeInterpreter" in type(m).__name__
+            "Interpreter" in type(m).__name__
             for m in middleware
         )
 
