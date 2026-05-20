@@ -135,6 +135,28 @@ class UIApi:
         """
         return self._artifacts.load_artifact(work_id, phase, name)
 
+    def get_feedback(self, work_id: str) -> list[dict[str, Any]]:
+        """Get feedback entries for a work item.
+
+        Returns feedback entries that indicate why review is needed.
+        Only returns entries with status "needs_review".
+
+        Args:
+            work_id: The work item ID.
+
+        Returns:
+            List of feedback dicts with keys: status, tier, reason, suggestions.
+        """
+        entry = self.get_work(work_id)
+        if entry is None:
+            return []
+        result = entry.get("result", {})
+        if isinstance(result, dict):
+            feedback = result.get("feedback", [])
+            if isinstance(feedback, list):
+                return feedback
+        return []
+
     # ── Audit operations ──
 
     def get_audit_log(

@@ -1,7 +1,8 @@
-"""Tests for UIApi.get_queue_overview() ordering behavior."""
+"""Tests for UIApi.get_queue_overview() ordering behavior and get_feedback()."""
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -176,3 +177,87 @@ class TestUIApiGetQueueOverviewOrdering:
             overview = api.get_queue_overview()
             assert len(overview["pending"]) == 1
             assert len(overview["recent"]) == 1
+
+
+class TestUIApiGetFeedback:
+    """Tests for get_feedback() method."""
+
+    def test_get_feedback_returns_empty_for_nonexistent_work(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+
+            _init_queue_db(config)
+            api = UIApi(config)
+
+            feedback = api.get_feedback("nonexistent")
+            assert feedback == []
+
+    def test_get_feedback_returns_feedback_when_present(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+
+            _init_queue_db(config)
+            api = UIApi(config)
+
+            # Create a work entry with feedback in the result
+            from spine.work.dispatcher import get_work_db
+            work_db = get_work_db(config)
+            feedback = [
+                {
+                    "status": "needs_review",
+                    "tier": "structural",
+                    "reason": "Test reason for review",
+                    "suggestions": ["Suggestion 1", "Suggestion 2"],
+                }
+            ]
+            work_db["work_entries"].insert(
+                {
+                    "id": "test-work-123",
+                    "description": "Test work",
+                    "work_type": "quick",
+                    "status": "needs_review",
+                    "current_phase": "implement",
+                    "created_at": "2024-01-01T00:00:00",
+                    "updated_at": "2024-01-01T00:00:00",
+                    "result": json.dumps({"feedback": feedback}),
+                }
+            )
+
+            result = api.get_feedback("test-work-123")
+            assert len(result) == 1
+            assert result[0]["status"] == "needs_review"
+            assert result[0]["tier"] == "structural"
+            assert result[0]["reason"] == "Test reason for review"
+            assert result[0]["suggestions"] == ["Suggestion 1", "Suggestion 2"]
+
+    def test_get_feedback_returns_empty_when_no_feedback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+
+            _init_queue_db(config)
+            api = UIApi(config)
+
+            from spine.work.dispatcher import get_work_db
+            work_db = get_work_db(config)
+            # Work entry with no feedback in result
+            work_db["work_entries"].insert(
+                {
+                    "id": "test-work-456",
+                    "description": "Test work",
+                    "work_type": "quick",
+                    "status": "completed",
+                    "current_phase": "verify",
+                    "created_at": "2024-01-01T00:00:00",
+                    "updated_at": "2024-01-01T00:00:00",
+                    "result": json.dumps({"artifacts": {}}),
+                }
+            )
+
+            result = api.get_feedback("test-work-456")
+            assert result == []

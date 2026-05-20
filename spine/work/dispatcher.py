@@ -474,6 +474,12 @@ async def submit_work(
                 if content is not None:
                     artifacts.save_artifact(work_id, phase, name, str(content))
 
+        # Filter feedback to only include needs_review entries for display
+        needs_review_feedback = [
+            f for f in feedback
+            if isinstance(f, dict) and f.get("status") == "needs_review"
+        ]
+
         db["work_entries"].update(
             work_id,
             {
@@ -484,6 +490,7 @@ async def submit_work(
                     {
                         "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
                         "feedback_count": len(feedback),
+                        "feedback": needs_review_feedback,
                         "prompt_request": result.get("prompt_request"),
                     }
                 ),
@@ -1840,6 +1847,13 @@ async def approve_and_spawn(
     if work_type not in ("plan", "plan_spec", "plan_only", "critical_plan_only"):
         raise ValueError(
             f"Work item '{plan_id}' is not a planning work type (got '{work_type}')"
+        )
+
+    # Validate status is awaiting_approval before allowing approval
+    if entry.get("status") != "awaiting_approval":
+        raise ValueError(
+            f"Work item '{plan_id}' is in '{entry.get('status')}' status, "
+            f"not 'awaiting_approval'. Only awaiting_approval items can be approved."
         )
 
     # Handle rejection

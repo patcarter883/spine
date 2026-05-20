@@ -286,6 +286,26 @@ def render(api: UIApi) -> None:
     if status == "needs_review":
         st.warning("This work item needs human review.")
 
+        # ── Review feedback display ──
+        feedback = api.get_feedback(work_id)
+        if feedback:
+            st.subheader("Review needed")
+            for fb in feedback:
+                if isinstance(fb, dict):
+                    reason = fb.get("reason", "No reason provided")
+                    tier = fb.get("tier", "unknown")
+                    suggestions = fb.get("suggestions", [])
+
+                    st.markdown(f"**Reason:** {reason}")
+                    st.caption(f"Review tier: {tier}")
+
+                    if suggestions:
+                        st.markdown("**Suggestions:**")
+                        for suggestion in suggestions:
+                            st.markdown(f"- {suggestion}")
+
+                    st.divider()
+
         # Show two resume options: interrupt-based (preferred) and legacy
         st.subheader("Resume Options")
         st.caption(

@@ -109,10 +109,9 @@ def _render_review_tab(api: UIApi) -> None:
     with col1:
         status_filter = st.selectbox(
             "Status Filter",
-            options=["awaiting_approval", "completed", "needs_review", "all"],
+            options=["awaiting_approval", "needs_review", "all"],
             format_func=lambda x: {
                 "awaiting_approval": "Awaiting Approval",
-                "completed": "Completed (Approved)",
                 "needs_review": "Needs Review",
                 "all": "All Planning Work",
             }.get(x, x),
@@ -146,11 +145,12 @@ def _render_planning_item(api: UIApi, item: dict) -> None:
         with col1:
             st.markdown(f"**{work_id[:8]}** · {description[:60]}...")
         with col2:
+            # Status emoji mapping for planning work items
+            # Shows clear visual distinction for each planning state
             status_emoji = {
-                "awaiting_approval": "⏳",
-                "completed": "✅",
-                "approved": "✅",
-                "needs_review": "👁️",
+                "awaiting_approval": "⏳",  # Awaiting human approval
+                "approved": "✅",  # Approved and ready to spawn
+                "needs_review": "👁️",  # Needs human review
             }.get(status, "❓")
             st.markdown(f"{status_emoji} `{status}`")
 
@@ -180,7 +180,7 @@ def _render_planning_item(api: UIApi, item: dict) -> None:
                 st.markdown(detail["artifacts"][plan_key])
 
         # Approval actions
-        if status in ("awaiting_approval", "needs_review", "completed"):
+        if status in ("awaiting_approval", "needs_review", "approved"):
             st.markdown("---")
             _render_approval_actions(api, work_id, status)
 

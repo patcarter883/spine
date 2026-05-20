@@ -48,7 +48,7 @@ providers:
     plan:
       provider: deepseek-v4-pro
     tasks:
-      provider: local
+      provider: laguna-m1
     # Implementation → local vLLM, but colder temperature for code
     implement:
       provider: pat
@@ -60,4 +60,4 @@ providers:
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: local              # short timeout for verify
+      provider: laguna-m1              # short timeout for verify
