@@ -46,7 +46,7 @@ providers:
     enabled: true
   - name: local
     type: deepagents-model
-    model: openai:Gemma-4-26B-A4B-it-GGUF
+    model: openai:model
     base_url: 'http://localhost:8000/v1'
     api_key: 'vllm'
     enabled: true
@@ -60,19 +60,19 @@ providers:
   phases:
     # Heavy reasoning → frontier model (via reference)
     specify:
-      provider: gemini-3.5-flash
+      provider: deepseek-v4-pro
     plan:
-      provider: gemini-3.5-flash
+      provider: deepseek-v4-pro
     tasks:
-      provider: deepseek-v4-flash
+      provider: local
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: laguna-xs2
+      provider: local
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: laguna-xs2
+      provider: local
 
     # Verification → local vLLM model with custom endpoint
     verify:

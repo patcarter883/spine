@@ -606,9 +606,9 @@ def build_workflow_graph(
                 # Fallback to legacy for phases not yet migrated
                 phase_def = registry.require(node_name)
                 if phase_def.subgraph_node_fn:
-                    graph.add_node(node_name, phase_def.subgraph_node_fn)
+                    graph.add_node(node_name, _make_legacy_node(node_name, phase_def.subgraph_node_fn))
                 elif phase_def.call_fn:
-                    graph.add_node(node_name, phase_def.call_fn)
+                    graph.add_node(node_name, _make_legacy_node(node_name, phase_def.call_fn))
                 else:
                     raise ValueError(
                         f"Phase '{node_name}' has no call_fn or subgraph_node_fn"
@@ -760,7 +760,7 @@ def _make_critic_node(
 
     async def critic_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict:
         """Critic node that reviews a specific phase."""
-        mark_phase_started(state, node_name)
+        mark_phase_started(state, f"critic_{reviewed_phase}")
         # Inject which phase this critic reviews into state
         # so _get_reviewed_phase and critic_router can use it
         augmented_state = {**state, "critic_reviewing": reviewed_phase}
