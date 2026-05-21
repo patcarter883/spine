@@ -99,6 +99,12 @@ def _is_transient_error(exc: Exception) -> bool:
         if str(code) in exc_str:
             return True
 
+    # ── OpenRouter upstream/provider failures ──
+    # OpenRouter stream errors raise ValueError. When they indicate an upstream
+    # provider error, these are typically transient provider overloads or timeouts.
+    if "provider returned error" in exc_str or "openrouter api returned an error" in exc_str:
+        return True
+
     # ── httpx transport errors ────────────────────────────────────────
     # Distinguish between transient errors (connection refused, timeout)
     # and mid-stream drops (server started responding then disconnected).

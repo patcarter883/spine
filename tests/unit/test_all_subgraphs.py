@@ -226,8 +226,7 @@ class TestSubgraphResultMappers:
             "phase_status": "error",
         }
         result = _tasks_result_mapper(subgraph_result, {"work_id": "test"})
-        assert result["status"] == "needs_review"
-        assert result["needs_review_phase"] == "tasks"
+        assert result["status"] == "failed"
 
     def test_implement_result_mapper_success(self):
         from spine.workflow.compose import _implement_result_mapper

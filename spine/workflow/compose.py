@@ -202,8 +202,7 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
             }
         ]
     elif phase_status == "error":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.VERIFY.value
+        base["status"] = "failed"
     return base
 
 
@@ -215,8 +214,7 @@ def _implement_result_mapper(subgraph_result: dict, parent_state: WorkflowState)
         base["status"] = "needs_review"
         base["needs_review_phase"] = PhaseName.IMPLEMENT.value
     elif phase_status == "error":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.IMPLEMENT.value
+        base["status"] = "failed"
     return base
 
 
@@ -228,8 +226,7 @@ def _tasks_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> 
         base["status"] = "needs_review"
         base["needs_review_phase"] = PhaseName.TASKS.value
     elif phase_status == "error":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.TASKS.value
+        base["status"] = "failed"
     return base
 
 
@@ -241,8 +238,7 @@ def _specify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -
         base["status"] = "needs_review"
         base["needs_review_phase"] = PhaseName.SPECIFY.value
     elif phase_status == "error":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.SPECIFY.value
+        base["status"] = "failed"
     return base
 
 
@@ -254,8 +250,7 @@ def _plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> d
         base["status"] = "needs_review"
         base["needs_review_phase"] = PhaseName.PLAN.value
     elif phase_status == "error":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.PLAN.value
+        base["status"] = "failed"
     return base
 
 
@@ -291,6 +286,8 @@ def _critic_result_mapper(reviewed_phase: str):
         elif phase_status == ReviewStatus.NEEDS_REVISION.value:
             # Router will check retry count and route accordingly
             base["status"] = "running"
+        elif phase_status == "error":
+            base["status"] = "failed"
         
         return base
     return mapper
@@ -455,6 +452,8 @@ def _phase_status_router(state: WorkflowState) -> str:
     status = state.get("status", "running")
     if status == "needs_review":
         return "needs_review"
+    if status == "failed":
+        return "failed"
     return "proceed"
 
 
@@ -695,6 +694,7 @@ def build_workflow_graph(
                         "passed": critic_proceed_target,
                         "needs_revision": pre_critic,  # rework loop
                         "needs_review": "human_review",  # interrupt for human
+                        "failed": END,
                     },
                 )
             elif has_gate and next_node:
@@ -714,6 +714,7 @@ def build_workflow_graph(
                     {
                         "proceed": next_node,
                         "needs_review": "human_review",
+                        "failed": END,
                     },
                 )
             else:
@@ -725,6 +726,7 @@ def build_workflow_graph(
                     {
                         "proceed": END,
                         "needs_review": "human_review",
+                        "failed": END,
                     },
                 )
 

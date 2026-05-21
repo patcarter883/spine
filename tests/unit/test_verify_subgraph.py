@@ -245,5 +245,4 @@ class TestVerifyStateAndResult:
             "phase_status": "error",
         }
         result = _verify_result_mapper(subgraph_result, {"work_id": "test"})
-        assert result["status"] == "needs_review"
-        assert result["needs_review_phase"] == "verify"
+        assert result["status"] == "failed"

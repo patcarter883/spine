@@ -241,6 +241,7 @@ def critic_router(state: WorkflowState) -> str:
     - ``"passed"`` → proceed to next phase
     - ``"needs_revision"`` → rework the previous phase (if retries remain)
     - ``"needs_review"`` → flag for human review (stop workflow)
+    - ``"failed"`` → stop workflow as failed
 
     Args:
         state: The current workflow state (already updated by call_critic).
@@ -248,6 +249,9 @@ def critic_router(state: WorkflowState) -> str:
     Returns:
         A routing key string for the conditional edge.
     """
+    if state.get("status") == "failed":
+        return "failed"
+
     reviewed_phase = _get_reviewed_phase(state)
 
     # The last feedback entry was written by call_critic — use it directly.
