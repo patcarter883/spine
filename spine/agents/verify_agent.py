@@ -85,14 +85,7 @@ def build_verify_agent(
             + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
         )
 
-    system_prompt = _build_orchestrator_prompt(
-        work_id=work_id,
-        tasks_dir=tasks_dir,
-        verify_dir=verify_dir,
-        impl_dir=impl_dir,
-        slice_inventory=slice_inventory,
-        slice_count=slice_count,
-    ) + build_current_phase_write_prompt(
+    system_prompt = _build_orchestrator_prompt() + build_current_phase_write_prompt(
         work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
     ) + build_artifact_prompt(
         state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
@@ -114,33 +107,8 @@ def build_verify_agent(
 # ── Prompt builder ─────────────────────────────────────────────────────
 
 
-def _build_orchestrator_prompt(
-    *,
-    work_id: str,
-    tasks_dir: str,
-    verify_dir: str,
-    impl_dir: str,
-    slice_inventory: str,
-    slice_count: int,
-) -> str:
+def _build_orchestrator_prompt() -> str:
     """Build the verify orchestrator system prompt."""
-    if slice_count == 1:
-        dispatch_note = (
-            "There is 1 slice. Dispatch a single `slice-verifier` for "
-            "consistency — same context-management benefit."
-        )
-    elif slice_count >= 2:
-        dispatch_note = (
-            f"There are {slice_count} slices. Dispatch all of them in "
-            "parallel via `Promise.allSettled(tools.task(...))` inside one "
-            "`eval` call."
-        )
-    else:
-        dispatch_note = (
-            "Slice files not yet discovered. Use `glob` to list "
-            f"`{tasks_dir}/slice-*.md`, then dispatch one subagent per slice."
-        )
-
     return (
         "You are the VERIFY phase orchestrator. You do NOT inspect source "
         "code yourself — you dispatch one `slice-verifier` subagent per "
@@ -157,13 +125,9 @@ def _build_orchestrator_prompt(
         "`slice-verifier` subagent instead — they can run tests.\n\n"
         "## Workflow (3 steps, ~5 turns total)\n\n"
         "### Step 1 — Read context\n"
-        "In ONE turn, batch-read:\n"
-        f"- `{tasks_dir}/codebase-map.md`\n"
-        f"- `{impl_dir}/implementation.md` (what was actually implemented)\n"
-        "- Each slice file listed below\n\n"
-        f"{slice_inventory}\n\n"
+        "In ONE turn, batch-read the codebase-map.md tasks file and implementation files.\n"
+        "Refer to Step 1 & Step 2 guidelines preloaded in your user context pre-prompt.\n\n"
         "### Step 2 — Dispatch slice-verifier subagents in parallel\n"
-        f"{dispatch_note}\n\n"
         "Each `task` description MUST be fully self-contained. Embed:\n"
         "1. The full slice text (acceptance criteria, files to verify)\n"
         "2. Relevant excerpts from implementation.md (what the implementer "
@@ -174,7 +138,7 @@ def _build_orchestrator_prompt(
         "const sliceFiles = [/* slice filenames */];\n"
         "const dispatches = sliceFiles.map(async (name) => {\n"
         "  const slice = await tools.read_file({file_path: "
-        f"`{tasks_dir}/${{name}}`}});\n"
+        "`tools.readFile` returns a string directly.\n`});\n"
         "  return tools.task({\n"
         '    subagent_type: "slice-verifier",  // ONLY valid type\n'
         "    description: `Verify slice: ${name}\\n\\n`\n"
@@ -188,7 +152,7 @@ def _build_orchestrator_prompt(
         "({status: r.status, verdict: r.value?.verdict}))));\n"
         "```\n\n"
         "### Step 3 — Synthesize verification.md\n"
-        f"Write `{verify_dir}/verification.md` with `write_file`.\n\n"
+        "Write verification.md report.\n\n"
         "The first line MUST be one of:\n"
         "- `VERIFIED` — every slice's subagent returned VERIFIED\n"
         "- `PASSED` — synonym for VERIFIED\n"
@@ -210,9 +174,7 @@ def _build_orchestrator_prompt(
         "tool calls are not parallel.\n"
         "- `verification.md` is REQUIRED — without it the phase fails.\n\n"
         "## Eval Context Seed (first eval call)\n"
-        "```js\n"
-        f"globalThis.context = {{work_id: \"{work_id}\", "
-        f"phase: \"verify\", tasks_dir: \"{tasks_dir}\", "
-        f"verify_dir: \"{verify_dir}\", impl_dir: \"{impl_dir}\"}};\n"
-        "```\n\n"
+        "Access session-specific context properties via `globalThis.context` "
+        "preloaded in your workspace environment on first turn (e.g., "
+        "use `globalThis.context.work_id` or `globalThis.context.tasks_dir` inside eval).\n\n"
     )

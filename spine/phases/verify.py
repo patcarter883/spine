@@ -72,6 +72,43 @@ async def call_verify(
 
         # Build prompt — work from the feature slices, not the original
         # description (already captured and expanded in the upstream artifacts).
+        verify_dir = f".spine/artifacts/{work_id}/verify"
+        tasks_dir = f".spine/artifacts/{work_id}/tasks"
+        impl_dir = f".spine/artifacts/{work_id}/implement"
+        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'verify', tasks_dir: '{tasks_dir}', verify_dir: '{verify_dir}', impl_dir: '{impl_dir}'}};\n\n"
+
+        from spine.agents.artifacts import list_slice_files
+        slice_files = list_slice_files(workspace_root, work_id)
+        slice_count = len(slice_files)
+
+        if slice_count == 0:
+            slice_inventory = (
+                "⚠ No slice-*.md files found in tasks/ directory. "
+                "Use `ls` + `glob` to locate slice files before proceeding."
+            )
+        else:
+            slice_inventory = (
+                f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
+                + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
+            )
+
+        if slice_count == 1:
+            dispatch_note = (
+                "There is 1 slice. Dispatch a single `slice-verifier` for "
+                "consistency — same context-management benefit."
+            )
+        elif slice_count >= 2:
+            dispatch_note = (
+                f"There are {slice_count} slices. Dispatch all of them in "
+                "parallel via `Promise.allSettled(tools.task(...))` inside one "
+                "`eval` call."
+            )
+        else:
+            dispatch_note = (
+                "Slice files not yet discovered. Use `glob` to list "
+                f"`{tasks_dir}/slice-*.md`, then dispatch one subagent per slice."
+            )
+
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
@@ -99,6 +136,12 @@ async def call_verify(
             "`read_file` — the implementation summary may not reflect "
             "the actual state of the code.",
             "",
+            "## Slice Inventory",
+            slice_inventory,
+            "",
+            "## Step 2 Guidelines",
+            dispatch_note,
+            "",
             "**RLM parallel verify pattern:** Use `eval` to read the "
             "tasks artifact, extract the slice list, then dispatch a "
             "`slice-verifier` subagent per slice via "
@@ -106,7 +149,7 @@ async def call_verify(
             "verification report from subagent results in code — do NOT "
             "re-read each slice file manually into conversation.",
         ]
-        prompt = "\n".join(prompt_lines)
+        prompt = context_seed + "\n".join(prompt_lines)
 
         ctx = build_context(state, PhaseName.VERIFY)
 

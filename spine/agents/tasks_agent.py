@@ -103,13 +103,7 @@ def build_tasks_agent(
         feedback=feedback,
     )
 
-    system_prompt = _build_tasks_prompt(
-        work_id=work_id,
-        tasks_dir=tasks_dir,
-        is_quick=is_quick,
-        has_prior_artifacts=bool(prior_phase_dirs),
-        is_rework=bool(feedback),
-    )
+    system_prompt = _build_tasks_prompt()
 
     agent = build_phase_agent(
         state=state,
@@ -138,77 +132,11 @@ def _resolve_prior_phase_dirs(
     return dirs
 
 
-def _build_tasks_prompt(
-    *,
-    work_id: str,
-    tasks_dir: str,
-    is_quick: bool,
-    has_prior_artifacts: bool,
-    is_rework: bool,
-) -> str:
-    rework_note = (
-        "\n**This is a REWORK pass.** `read_prior_artifacts` will include "
-        "prior feedback. Address all feedback points in your decomposition.\n"
-        if is_rework
-        else ""
-    )
-
-    if is_quick:
-        step1 = (
-            "### Step 1 — Dispatch researcher subagents in parallel (1 eval turn)\n"
-            "This is a quick workflow — no spec/plan exists. Your FIRST action "
-            "MUST be an `eval` call that dispatches 2-3 `researcher` subagents "
-            "in parallel via `Promise.allSettled`. Each researcher investigates "
-            "ONE module or area relevant to the work description.\n\n"
-            "Do NOT call `search_codebase` or explore yourself before dispatching "
-            "researchers — they do the exploration. You orchestrate and synthesize.\n\n"
-            "Researcher dispatch pattern:\n"
-            "```js\n"
-            "// Your FIRST eval call must look like this:\n"
-            "const desc = '<work description>';\n"
-            "const results = await Promise.allSettled([\n"
-            "  tools.task({subagent_type: 'researcher',\n"
-            "    description: `Research area 1 for: ${desc}\\n"
-            "Investigate: <specific module/file/concern>`}),\n"
-            "  tools.task({subagent_type: 'researcher',\n"
-            "    description: `Research area 2 for: ${desc}\\n"
-            "Investigate: <specific module/file/concern>`}),\n"
-            "]);\n"
-            "globalThis.research = results.map(r => r.value || r.reason);\n"
-            "console.log('Researchers done:', results.map(r => r.status));\n"
-            "```\n\n"
-            "### Step 1b — Targeted follow-up (0-1 turns, optional)\n"
-            "If researcher results reference specific files you need line-level "
-            "detail for (e.g. a change site), call `search_codebase` with the "
-            "exact function names or symbols. Maximum 1-2 `search_codebase` calls.\n\n"
-        )
-    elif has_prior_artifacts:
-        step1 = (
-            "### Step 1 — Load prior artifacts (1 turn)\n"
-            "Call `read_prior_artifacts` with no arguments. It returns the "
-            "full specification and plan from prior phases.\n"
-            "```js\n"
-            "globalThis.ctx = JSON.parse(result);\n"
-            "// ctx.artifacts.specify, ctx.artifacts.plan\n"
-            "```\n\n"
-            "### Step 1b — Search codebase for modification targets (1 turn)\n"
-            "Call `search_codebase` with queries derived from the plan's "
-            "module structure and API designs. Find the exact files and "
-            "functions you'll need to modify.\n\n"
-        )
-    else:
-        step1 = (
-            "### Step 1 — Search codebase (1 turn)\n"
-            "Call `search_codebase` with 3-5 queries relevant to the work. "
-            "Find the exact files that need to change and the functions "
-            "around the change sites.\n\n"
-        )
-
+def _build_tasks_prompt() -> str:
     return (
         "You are the TASKS phase agent. Your job is to decompose the work "
         "into executable feature slices with a precise codebase map that "
         "downstream IMPLEMENT and VERIFY orchestrators depend on.\n\n"
-        f"{rework_note}"
         "## Your tool surface (complete list)\n"
         "- `read_prior_artifacts` — loads spec/plan artifacts. No args.\n"
         "### Codebase exploration (use MCP tools FIRST)\n"
@@ -241,7 +169,7 @@ def _build_tasks_prompt(
         "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
         "`edit_file`, or `execute`. Do not attempt to call them.\n\n"
         "## Workflow (~3 turns total)\n\n"
-        f"{step1}"
+        "Refer to Step 1 & Step 1b guidelines preloaded in your user context pre-prompt.\n\n"
         "### Step 2 — Call write_tasks_artifacts (1 turn)\n"
         "Synthesize everything into one `write_tasks_artifacts` call. "
         "Provide:\n"
@@ -266,8 +194,7 @@ def _build_tasks_prompt(
         "- Call `write_tasks_artifacts` exactly ONCE with ALL slices together.\n"
         "- After `write_tasks_artifacts` returns, stop immediately.\n\n"
         "## Eval context seed\n"
-        "```js\n"
-        f'globalThis.context = {{work_id: "{work_id}", '
-        f'phase: "tasks", tasks_dir: "{tasks_dir}"}};\n'
-        "```\n\n"
+        "Access session-specific context properties via `globalThis.context` "
+        "preloaded in your workspace environment on first turn (e.g., "
+        "use `globalThis.context.work_id` or `globalThis.context.tasks_dir` inside eval).\n\n"
     )

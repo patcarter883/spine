@@ -76,6 +76,39 @@ async def call_implement(
 
         # Build prompt — all prior artifacts are on disk, NOT inlined.
         # Skip spec/plan references for quick workflows that lack them.
+        impl_dir = f".spine/artifacts/{work_id}/implement"
+        tasks_dir = f".spine/artifacts/{work_id}/tasks"
+        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'implement', tasks_dir: '{tasks_dir}', impl_dir: '{impl_dir}'}};\n\n"
+
+        rework_prefix = ""
+        if retry_count > 0:
+            rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior implementation. Address all points from the critic feedback.\n\n"
+
+        from spine.agents.artifacts import list_slice_files
+        slice_files = list_slice_files(workspace_root, work_id)
+        slice_count = len(slice_files)
+
+        if slice_count == 1:
+            dispatch_note = (
+                "There is 1 slice. Dispatch a single `slice-implementer` for "
+                "consistency — same context-management benefit, no orchestrator "
+                "drift between work items."
+            )
+        elif slice_count >= 2:
+            dispatch_note = (
+                f"There are {slice_count} slices. Dispatch all of them in "
+                "parallel via `Promise.allSettled(tools.task(...))` inside a "
+                "single `eval` call. Do NOT dispatch sequentially — the whole "
+                "point of subagent dispatch is parallel isolated contexts."
+            )
+        else:
+            dispatch_note = (
+                "No slices were pre-discovered. Call `read_slice_files` — it will "
+                "return whatever slice files exist. If it returns none, write a "
+                "`write_implementation_report` with an empty slice_results list "
+                "and a summary explaining the tasks phase produced no slices."
+            )
+
         has_spec = "spec" in work_type
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
@@ -103,9 +136,12 @@ async def call_implement(
                 "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
                 "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
                 "",
+                "## Step 2 Guidelines",
+                dispatch_note,
+                "",
             ]
         )
-        prompt = "\n".join(prompt_lines)
+        prompt = context_seed + rework_prefix + "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"

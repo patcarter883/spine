@@ -114,12 +114,7 @@ def build_implement_agent(
             + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
         )
 
-    system_prompt = _build_orchestrator_prompt(
-        work_id=work_id,
-        tasks_dir=tasks_dir,
-        slice_inventory=slice_inventory,
-        slice_count=slice_count,
-    ) + build_current_phase_write_prompt(
+    system_prompt = _build_orchestrator_prompt() + build_current_phase_write_prompt(
         work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]
     ) + build_artifact_prompt(
         state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
@@ -152,42 +147,12 @@ def build_implement_agent(
 # ── Prompt builder ─────────────────────────────────────────────────────
 
 
-def _build_orchestrator_prompt(
-    *,
-    work_id: str,
-    tasks_dir: str,
-    slice_inventory: str,
-    slice_count: int,
-) -> str:
+def _build_orchestrator_prompt() -> str:
     """Build the orchestrator system prompt.
 
     Kept under ~3KB so the bulk of the prompt is the SPINE base prompt
     and per-call AGENTS.md memory injection, not phase boilerplate.
     """
-    impl_dir = f".spine/artifacts/{work_id}/implement"
-
-    # Singular/plural language and parallel dispatch wording
-    if slice_count == 1:
-        dispatch_note = (
-            "There is 1 slice. Dispatch a single `slice-implementer` for "
-            "consistency — same context-management benefit, no orchestrator "
-            "drift between work items."
-        )
-    elif slice_count >= 2:
-        dispatch_note = (
-            f"There are {slice_count} slices. Dispatch all of them in "
-            "parallel via `Promise.allSettled(tools.task(...))` inside a "
-            "single `eval` call. Do NOT dispatch sequentially — the whole "
-            "point of subagent dispatch is parallel isolated contexts."
-        )
-    else:
-        dispatch_note = (
-            "No slices were pre-discovered. Call `read_slice_files` — it will "
-            "return whatever slice files exist. If it returns none, write a "
-            "`write_implementation_report` with an empty slice_results list "
-            "and a summary explaining the tasks phase produced no slices."
-        )
-
     return (
         "You are the IMPLEMENT phase orchestrator. You do NOT write source "
         "code yourself — you dispatch one `slice-implementer` subagent per "
@@ -216,7 +181,7 @@ def _build_orchestrator_prompt(
         "```\n"
         "Store the result in eval: `globalThis.slices = result;`\n\n"
         "### Step 2 — Dispatch subagents in parallel (1 eval turn)\n"
-        f"{dispatch_note}\n\n"
+        "Refer to Step 2 guidelines preloaded in your workspace environment on first turn.\n\n"
         "Use a single `eval` call with `Promise.allSettled` to dispatch all "
         "slices in parallel. Each task description MUST be fully self-contained "
         "— the subagent has an empty context and cannot see your conversation. "
@@ -259,9 +224,7 @@ def _build_orchestrator_prompt(
         "means something has gone wrong — stop and write the report with "
         "whatever results you have.\n\n"
         "## Eval context seed\n"
-        "```js\n"
-        f"globalThis.context = {{work_id: \"{work_id}\", "
-        f"phase: \"implement\", tasks_dir: \"{tasks_dir}\", "
-        f"impl_dir: \"{impl_dir}\"}};\n"
-        "```\n\n"
+        "Access session-specific context properties via `globalThis.context` "
+        "preloaded in your workspace environment on first turn (e.g., "
+        "use `globalThis.context.work_id` or `globalThis.context.tasks_dir` inside eval).\n\n"
     )

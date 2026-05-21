@@ -74,7 +74,14 @@ async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = 
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build the prompt — prior artifacts are on disk, not inlined
-        prompt = f"Create a detailed specification for the following work:\n\n{description}"
+        spec_dir = f".spine/artifacts/{work_id}/specify"
+        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', spec_dir: '{spec_dir}'}};\n\n"
+        
+        rework_prefix = ""
+        if retry_count > 0:
+            rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior specification. Address all points from the critic feedback.\n\n"
+            
+        prompt = context_seed + rework_prefix + f"Create a detailed specification for the following work:\n\n{description}"
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"

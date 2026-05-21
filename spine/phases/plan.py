@@ -69,12 +69,32 @@ async def call_plan(
         # Build prompt — specification is on disk at work_id-scoped path.
         # The original description is intentionally NOT re-included — the
         # specification file already captures and expands on it.
+        plan_dir = f".spine/artifacts/{work_id}/plan"
+        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'plan', plan_dir: '{plan_dir}'}};\n\n"
+
+        rework_prefix = ""
+        if retry_count > 0:
+            rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior plan. Address all points from the critic feedback.\n\n"
+
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
+        
+        # Check if spec exists to formulate the exact dynamic spec instruction
+        has_spec = False
+        artifacts = state.get("artifacts", {}) or {}
+        if artifacts.get(PhaseName.SPECIFY.value):
+            has_spec = True
+
+        spec_instruction = (
+            f"The full specification is available on disk at `{spec_path}/specification.md` "
+            "— read it carefully with `read_file` — your plan must implement exactly what the spec describes.\n\n"
+            if has_spec else
+            "No prior specification exists (quick workflow). Work directly from the description returned by `read_prior_artifacts`.\n\n"
+        )
+
         prompt = (
-            "Create a detailed technical plan based on the specification.\n\n"
-            f"The full specification is available on disk at "
-            f"`{spec_path}/specification.md` — read it with "
-            f"`read_file` before planning.\n\n"
+            context_seed + rework_prefix +
+            "Create a detailed technical plan based on the specification.\n\n" +
+            spec_instruction
         )
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(

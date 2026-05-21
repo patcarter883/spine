@@ -116,6 +116,12 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "You have MCP codebase index tools for efficient structural navigation. "
         "These answer symbol-level questions in sub-millisecond time with "
         "minimal token usage — ALWAYS use them before reading files.\n\n"
+        "### Batching and Parallel Tool Calling (CRITICAL)\n"
+        "- **NEVER query symbols, function sources, or files sequentially turn-by-turn.** "
+        "If you need to look up 3 function sources or search multiple directories, generate "
+        "all those tool calls in parallel in a SINGLE response. This is highly efficient and avoids wasting turns.\n"
+        "- **Plan your queries:** In your first turn, identify 3-5 files or functions of interest, and "
+        "issue ALL lookup/search calls in parallel, instead of requesting them one-by-one sequentially.\n\n"
         "| Question | Tool to use |\n"
         "|----------|-------------|\n"
         "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
@@ -475,12 +481,19 @@ def build_subagent_spec(
         _inject_mcp_tools(tools, workspace_root)
 
     # ── Build spec ───────────────────────────────────────────────
+    from spine.agents.context_editing import ToolOutputTrimmer
+
+    # Subagents get a focused context trimmer to prevent their conversation history
+    # from growing unchecked during multi-turn searches and file reads.
+    subagent_middleware = [ToolOutputTrimmer(max_full_tool_results=5)]
+
     spec: dict[str, Any] = {
         "name": name,
         "description": SUBAGENT_DESCRIPTIONS[name],
         "system_prompt": SUBAGENT_PROMPTS[name],
         "model": model,
         "tools": tools,
+        "middleware": subagent_middleware,
     }
     # Only researcher gets response_format — structured summaries prevent
     # raw file contents from bloating the parent agent's context.

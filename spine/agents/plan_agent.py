@@ -65,12 +65,7 @@ def build_plan_agent(
         feedback=feedback,
     )
 
-    system_prompt = _build_plan_prompt(
-        work_id=work_id,
-        plan_dir=plan_dir,
-        has_spec=bool(prior_phase_dirs.get("specify")),
-        is_rework=bool(feedback),
-    )
+    system_prompt = _build_plan_prompt()
 
     agent = build_phase_agent(
         state=state,
@@ -98,35 +93,11 @@ def _resolve_prior_phase_dirs(
     return dirs
 
 
-def _build_plan_prompt(
-    *,
-    work_id: str,
-    plan_dir: str,
-    has_spec: bool,
-    is_rework: bool,
-) -> str:
-    rework_note = (
-        "\n**This is a REWORK pass.** `read_prior_artifacts` will include "
-        "the prior plan and the critic feedback. Revise to address all feedback.\n"
-        if is_rework
-        else ""
-    )
-
-    spec_note = (
-        "The `read_prior_artifacts` result will include the full specification "
-        "from the SPECIFY phase. Read it carefully — your plan must implement "
-        "exactly what the spec describes."
-        if has_spec
-        else
-        "No prior specification exists (quick workflow). Work directly from "
-        "the description returned by `read_prior_artifacts`."
-    )
-
+def _build_plan_prompt() -> str:
     return (
         "You are the PLAN phase agent. Your job is to create a detailed "
         "technical plan from the specification, grounded in the actual "
         "codebase structure.\n\n"
-        f"{rework_note}"
         "## Your tool surface (complete list)\n"
         "- `read_prior_artifacts` — loads spec and all prior artifacts. "
         "No arguments. Call this FIRST.\n"
@@ -165,7 +136,7 @@ def _build_plan_prompt(
         "Use MCP tools and `search_codebase` for all file discovery.\n\n"
         "## Workflow (3 steps, ~4 turns)\n\n"
         "### Step 1 — Call read_prior_artifacts (1 turn)\n"
-        f"{spec_note}\n\n"
+        "Call `read_prior_artifacts` with no arguments, store results and read carefully.\n"
         "```js\n"
         "globalThis.ctx = JSON.parse(result);\n"
         "// ctx.description, ctx.artifacts.specify, ctx.feedback\n"
@@ -208,8 +179,7 @@ def _build_plan_prompt(
         "- Total turns: ~4. If you have not called `write_plan` by turn 5, "
         "write it with what you have.\n\n"
         "## Eval context seed\n"
-        "```js\n"
-        f'globalThis.context = {{work_id: "{work_id}", '
-        f'phase: "plan", plan_dir: "{plan_dir}"}};\n'
-        "```\n\n"
+        "Access session-specific context properties via `globalThis.context` "
+        "preloaded in your workspace environment on first turn (e.g., "
+        "use `globalThis.context.work_id` or `globalThis.context.plan_dir` inside eval).\n\n"
     )

@@ -67,11 +67,7 @@ def build_specify_agent(
         feedback=feedback,
     )
 
-    system_prompt = _build_specify_prompt(
-        work_id=work_id,
-        spec_dir=spec_dir,
-        is_rework=bool(feedback),
-    ) + build_artifact_prompt(
+    system_prompt = _build_specify_prompt() + build_artifact_prompt(
         state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
     )
 
@@ -89,26 +85,12 @@ def build_specify_agent(
     return agent
 
 
-def _build_specify_prompt(
-    *,
-    work_id: str,
-    spec_dir: str,
-    is_rework: bool,
-) -> str:
-    rework_note = (
-        "\n**This is a REWORK pass.** `read_work_context` will include the "
-        "prior specification and the critic feedback. Revise the spec to "
-        "address all feedback points.\n"
-        if is_rework
-        else ""
-    )
-
+def _build_specify_prompt() -> str:
     return (
         "You are the SPECIFY phase orchestrator. Your job is to produce a "
         "detailed technical specification for the given work description "
         "by dispatching researcher subagents to explore the codebase, then "
         "synthesizing their findings into a structured specification.\n\n"
-        f"{rework_note}"
         "## Your tool surface (complete list)\n"
         "- `read_work_context` — loads work description, feedback, and prior "
         "spec. No arguments. Call this FIRST.\n"
@@ -164,8 +146,7 @@ def _build_specify_prompt(
         "- Total turns: ~3. More than 5 turns without calling "
         "`write_specification` means something has gone wrong.\n\n"
         "## Eval context seed\n"
-        "```js\n"
-        f'globalThis.context = {{work_id: "{work_id}", '
-        f'phase: "specify", spec_dir: "{spec_dir}"}};\n'
-        "```\n\n"
+        "Access session-specific context properties via `globalThis.context` "
+        "preloaded in your workspace environment on first turn (e.g., "
+        "use `globalThis.context.work_id` or `globalThis.context.spec_dir` inside eval).\n\n"
     )

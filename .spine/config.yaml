@@ -12,7 +12,7 @@ mcp_servers:
     command: mcp-codebase-index
     args: []
     env:
-      PROJECT_ROOT: /home/pat/Projects/spine
+      PROJECT_ROOT: /home/pat/projects/spine
 
 providers:
   llm:
@@ -40,6 +40,10 @@ providers:
     type: deepagents-model
     model: openrouter:poolside/laguna-xs.2:free
     enabled: true
+  - name: gemini-3.5-flash
+    type: deepagents-model
+    model: openrouter:google/gemini-3.5-flash
+    enabled: true
   - name: local
     type: deepagents-model
     model: openai:Gemma-4-26B-A4B-it-GGUF
@@ -56,20 +60,20 @@ providers:
   phases:
     # Heavy reasoning → frontier model (via reference)
     specify:
-      provider: deepseek-v4-pro
+      provider: gemini-3.5-flash
     plan:
-      provider: deepseek-v4-pro
+      provider: gemini-3.5-flash
     tasks:
-      provider: laguna-m1
+      provider: gemini-3.5-flash
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: pat
+      provider: laguna-xs2
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: pat
+      provider: laguna-xs2
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: laguna-m1              # short timeout for verify
+      provider: gemini-3.5-flash             # short timeout for verify

@@ -177,6 +177,53 @@ from disk — do not include full file contents in the summary.
 """
 
 
+# ── SpineProjectMemoryMiddleware ───────────────────────────────────────────
+
+
+class SpineProjectMemoryMiddleware(MemoryMiddleware):
+    """Custom project memory middleware that injects AGENTS.md conventions.
+
+    Bypasses deepagents' default, conversational `<memory_guidelines>` block
+    as SPINE agents run programmatically without an interactive user, saving
+    substantial context tokens and preventing early-yield confusion.
+    """
+
+    def modify_request(self, request: Any) -> Any:
+        from langchain_core.messages import SystemMessage
+        from deepagents.middleware._utils import append_to_system_message
+
+        contents = request.state.get("memory_contents", {})
+        if not contents:
+            return request
+
+        sections = []
+        for path in self.sources:
+            content = contents.get(path)
+            if content:
+                # Use a clean, concise XML enclosure for documentation injection
+                sections.append(
+                    f"<project_documentation path=\"{path}\">\n"
+                    f"{content}\n"
+                    f"</project_documentation>"
+                )
+
+        if not sections:
+            return request
+
+        memory_body = "\n\n".join(sections)
+        new_system_message = append_to_system_message(request.system_message, memory_body)
+
+        # Apply prompt caching breakpoint if Anthropic and enabled
+        if self._add_cache_control and type(request.model).__name__ == "ChatAnthropic" and hasattr(new_system_message, "content_blocks") and new_system_message.content_blocks:
+            blocks = list(new_system_message.content_blocks)
+            last_block: Any = blocks[-1]
+            base = last_block if isinstance(last_block, dict) else {}
+            blocks[-1] = {**base, "cache_control": {"type": "ephemeral"}}  # type: ignore[invalid-assignment]
+            new_system_message = SystemMessage(content_blocks=blocks)
+
+        return request.override(system_message=new_system_message)
+
+
 # ── Main factory function ────────────────────────────────────────────────
 
 def build_phase_agent(
@@ -488,7 +535,7 @@ def _build_middleware_stack(
 
     # 12. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
-        middleware.append(MemoryMiddleware(
+        middleware.append(SpineProjectMemoryMiddleware(
             backend=backend,
             sources=memory,
             add_cache_control=True,
@@ -572,14 +619,14 @@ def _add_summarization_middleware(
     """
     try:
         from deepagents.middleware.summarization import (
-            create_summarization_middleware,
+            SummarizationMiddleware,
             create_summarization_tool_middleware,
         )
 
         try:
-            auto_mw = create_summarization_middleware(
-                model,
-                backend,
+            auto_mw = SummarizationMiddleware(
+                model=model,
+                backend=backend,
                 trigger=("tokens", 60000),
                 keep=("messages", 20),
                 summary_prompt=_SPINE_SUMMARY_PROMPT,
