@@ -1,9 +1,9 @@
 """SPINE context editing middleware — trims old tool outputs.
 
-DA's built-in SummarizationMiddleware triggers at a configurable token
-threshold (default 80K for SPINE). Between triggers, tool results
-accumulate in full. This middleware trims old tool results earlier,
-keeping the conversation lean and reducing peak KV cache pressure.
+DA's built-in context management triggers at a configurable token
+threshold. Between triggers, tool results accumulate in full. This
+middleware trims old tool results earlier, keeping the conversation
+lean and reducing peak KV cache pressure.
 
 Strategy: When tool result count exceeds `max_full_tool_results`, replace
 old tool call results with a structured metadata placeholder that preserves
@@ -11,7 +11,7 @@ the key information an agent needs without the full content. Additionally,
 trim large arguments in AI messages that correspond to evicted tool results
 (e.g., write_file content, edit_file old/new strings).
 
-The offloaded conversation history (written by DA SummarizationMiddleware
+The offloaded conversation history (written by DA context management
 to /conversation_history/{thread_id}.md) serves as swap space — the
 agent can page back by reading that file if the placeholder strips
 out a crucial detail.

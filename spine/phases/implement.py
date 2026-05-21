@@ -4,7 +4,7 @@ The implement Deep Agent reads the tasks/feature slices (on disk) and
 generates code to implement each one. Prior artifacts are NOT inlined —
 the agent reads them on demand from the filesystem.
 
-Context engineering: summarization middleware enabled for long-running
+Context engineering: dispatch-only orchestrator patterns for long-running
 multi-slice implementation.
 
 Phase node functions are async to avoid event-loop binding errors when

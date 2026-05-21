@@ -135,7 +135,6 @@ def build_implement_agent(
         config=config,
         phase=PhaseName.IMPLEMENT,
         system_prompt=system_prompt,
-        add_summarization=True,
         subagents=_build_subagents(PhaseName.IMPLEMENT, state, config),
         extra_tools=orchestrator_tools,
         skip_filesystem_middleware=True,

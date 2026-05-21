@@ -30,7 +30,7 @@ everything SPINE currently builds by hand and gets wrong.
 
 | Pain Point | Root Cause | Deep Agents Solution |
 |------------|-----------|----------------------|
-| Context overflow on long tasks | Manual prompt building in `_build_task_prompt()` | `SummarizationMiddleware` auto-compacts at 85% context window |
+| Context overflow on long tasks | Manual prompt building in `_build_task_prompt()` | `ToolOutputTrimmer` auto-evicts old tool results |
 | Tool-call format errors from local models | No recovery — malformed JSON crashes the loop | `PatchToolCallsMiddleware` auto-corrects common malformations |
 | OpenCode + vLLM returns 3-24 tokens | Protocol mismatch between OpenCode's ACP and vLLM's OpenAI endpoint | Use `create_deep_agent()` directly with `langchain.chat_models.init_chat_model()` — bypass OpenCode entirely for local models |
 | Provider objects lost after checkpoint | Custom `ProviderSerializer` is fragile (msgpack format bugs) | Deep Agents passes providers through `config["configurable"]`, not state — same pattern we should adopt |
@@ -80,7 +80,7 @@ everything SPINE currently builds by hand and gets wrong.
 │                DEEP AGENTS RUNTIME LAYER                  │
 │  create_deep_agent() instances — one per phase           │
 │                                                          │
-│  • SummarizationMiddleware (auto context compaction)     │
+│  • ToolOutputTrimmer (auto tool result eviction)        │
 │  • SubAgentMiddleware (task tool for delegation)         │
 │  • FilesystemMiddleware (read/write/edit/ls/glob/grep)   │
 │  • PatchToolCallsMiddleware (tool-call error recovery)   │
@@ -475,7 +475,7 @@ These are different concerns:
 | Concern | Level | Mechanism |
 |---------|-------|-----------|
 | Tool-call error recovery | Agent loop | DA `PatchToolCallsMiddleware` |
-| Context compaction | Agent loop | DA `SummarizationMiddleware` |
+| Context compaction | Agent loop | DA `ToolOutputTrimmer` |
 | Subagent delegation | Agent loop | DA `SubAgentMiddleware` |
 | File permission enforcement | Agent loop | DA `FilesystemMiddleware` |
 | Phase entry/exit conditions | State machine | SPINE `_evaluate_entry_conditions()` |
@@ -568,8 +568,8 @@ prompt += f"## Technology Research\n{tech}\n\n"
 # ... etc
 ```
 
-This breaks down when context exceeds the model's window. The DA
-`SummarizationMiddleware` handles this automatically:
+This breaks down when context exceeds the model's window. SPINE's
+`ToolOutputTrimmer` handles this:
 
 - Monitors token usage per model call
 - When usage exceeds 85% of context window, compacts older messages:
@@ -582,7 +582,7 @@ This breaks down when context exceeds the model's window. The DA
 
 1. Remove `_build_task_prompt()` and all manual prompt assembly functions
 2. Pass structured context as the initial user message to the DA agent
-3. Let SummarizationMiddleware handle overflow automatically
+3. Let ToolOutputTrimmer handle overflow automatically
 4. Keep spec files on disk for persistence (backend=FilesystemBackend)
 
 ### 4.8 Subagent Delegation: FeatureSlices → SubAgent Specs
@@ -696,7 +696,7 @@ and OpenRouter (cloud fallback).
 | Remove `SwarmDAGExecutor` usage from planning | `state_machine.py` | 1h |
 
 **Deliverable:** Planning phase runs via DA with subagent delegation and
-critic gate middleware. Context overflow handled by SummarizationMiddleware.
+critic gate middleware. Context overflow handled by ToolOutputTrimmer.
 
 **Exit criteria:** `spine work "build a REST API for todo items"` completes
 PLANNING phase with APPROVED critic gate result, producing FeatureSlices.
@@ -829,10 +829,10 @@ won't see changes made by a parallel subagent.
 context.
 
 **Mitigation:**
-1. DA's SummarizationMiddleware keeps the most recent 10% of messages intact
+1. ToolOutputTrimmer keeps the most recent tool results intact as metadata
 2. Full conversation history is offloaded to the backend for retrieval
 3. SPINE's spec files remain on disk — the agent can always re-read them
-4. The `compact_conversation` tool lets the agent (or human) trigger compaction
+4. Agent can re-read files from disk instead of relying on context history
    manually before critical steps
 
 ### 7.4 Breaking State Format

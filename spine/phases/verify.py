@@ -4,7 +4,7 @@ The verify Deep Agent reviews the implementation against the specification,
 plan, and tasks. All prior artifacts are on disk (not inlined) — the agent
 reads them on demand with filesystem tools.
 
-Context engineering: summarization middleware enabled for long-running
+Context engineering: dispatch-only orchestrator pattern for long-running
 multi-slice verification. RLM parallel dispatch via eval+PTC for per-slice
 verification subagents.
 

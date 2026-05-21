@@ -41,21 +41,18 @@ Token budget for 128K context models (target: <60K prompt tokens at peak):
     │ Skills + memory (DA auto-injected)                 │ ~500     │
     │ Subagent specs (DA auto-injected)                  │ ~400     │
     │ Conversation history (grows, evicted by trimmer)   │ 0–50K    │
-    │ Summarization trigger                             │ 60K      │
     │ Trimmed tool results (structured metadata)         │ ~100/ea  │
     │ AI arg trimming (write_file/edit_file content)     │ ~50/ea   │
     ├───────────────────────────────────────────────────┼──────────┤
     │ Fixed overhead (prompt + schemas + skills)         │ ~4,250   │
-    │ Available for conversation before summarization     │ ~56K     │
-    │ Summarization keeps last 20 messages                │ ~15K     │
+    │ Available for conversation (target)                │ ~56K     │
     └───────────────────────────────────────────────────┴──────────┘
 
 Budget rules:
-1. Summarization triggers at 60K tokens (keeps KV cache <50%).
-2. ToolOutputTrimmer evicts old results to ~100-token structured metadata.
-3. AI arg trimming removes write_file/edit_file content from history.
-4. codebase-map.md (produced by tasks phase) eliminates re-exploration.
-5. Each phase starts with a fresh agent — no cross-phase history bloat.
+1. ToolOutputTrimmer evicts old results to ~100-token structured metadata.
+2. AI arg trimming removes write_file/edit_file content from history.
+3. codebase-map.md (produced by tasks phase) eliminates re-exploration.
+4. Each phase starts with a fresh agent — no cross-phase history bloat.
 
 Call :func:`ensure_spine_profiles` once at startup (from
 ``spine.agents.__init__`` or the CLI entry point) to activate.
@@ -127,10 +124,9 @@ prior read result, recover from eval: \
 Retrieve from eval instead of calling read_file again. \
 Remember: `tools.readFile(...)` returns a string directly — store the string, \
 not an object with `.content`.
-- **Token budget: 60K prompt token target.** After 60K tokens, \
-summarization compresses your conversation. Work efficiently: batch reads, \
-use eval for multi-step orchestration, and produce compact artifacts. \
-Evicted tool results appear as structured metadata like \
+- **Token budget: 60K prompt token target.** Work efficiently: batch reads,
+use eval for multi-step orchestration, and produce compact artifacts.
+Evicted tool results appear as structured metadata like
 `[read: path (N lines) — symbols]` — use these hints instead of re-reading.
 
 ## Workflow Context

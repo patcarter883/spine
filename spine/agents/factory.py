@@ -13,8 +13,6 @@ logic and adds the context engineering features:
   for progressive disclosure.
 - **Context schema** — ``SpineContext`` provides typed per-run context that
   propagates to subagents automatically.
-- **Summarization middleware** — for long-running phases, the agent can
-  proactively compress its context between tasks.
 
 ## Why ``create_agent`` instead of ``create_deep_agent``?
 
@@ -140,43 +138,6 @@ All paths in commands MUST be relative (e.g. `pytest tests/unit/` NOT `pytest /h
 - execute: run a shell command (returns output and exit code)"""
 
 
-# ── SPINE summarization summary prompt ───────────────────────────────────
-
-_SPINE_SUMMARY_PROMPT = """\
-You are summarizing the conversation history of an autonomous code agent \
-(inside a SPINE workflow phase). The agent is NOT a chatbot — it is a \
-phase executor that reads files, writes code, runs tests, and dispatches \
-subagents. Your summary MUST preserve the agent's working state so it \
-can continue seamlessly after compaction.
-
-PRESERVE these in your summary (in this order):
-
-1. **Active objective**: What is the agent currently working on? Include \
-the exact work description and which phase (tasks/implement/verify).
-
-2. **Files currently being modified**: List every relative file path the \
-agent has read or written. Mark which ones have UNCOMMITTED changes.
-
-3. **Unresolved errors**: Any compiler errors, linter failures, or test \
-failures the agent has NOT yet fixed. Include the exact error messages.
-
-4. **Feature slice status**: For each slice being implemented/verified, \
-note: slice name, status (not started / in progress / done), and any \
-blockers.
-
-5. **Subagent results**: Brief summary of any subagent (researcher, \
-slice-implementer, slice-verifier) results received.
-
-6. **Offloaded history path**: If the conversation was previously \
-compacted, the offloaded history file path is referenced in the summary \
-message. Preserve that path so the agent can page back if needed.
-
-STRIP: Narration ("I will now..."), planning chatter, and repeated \
-file contents that are available on disk. The agent can re-read files \
-from disk — do not include full file contents in the summary.
-"""
-
-
 # ── SpineProjectMemoryMiddleware ───────────────────────────────────────────
 
 
@@ -233,7 +194,6 @@ def build_phase_agent(
     system_prompt: str,
     *,
     extra_middleware: list[Any] | None = None,
-    add_summarization: bool = False,
     subagents: list[Any] | None = None,
     response_format: Any | None = None,
     is_subagent: bool = False,
@@ -245,7 +205,7 @@ def build_phase_agent(
 
     This is the single entry point for all phase agent construction.
     It handles model resolution, backend creation, full middleware assembly,
-    memory, skills, context schema, and summarization — so individual
+    memory, skills, and context schema — so individual
     phase builders don't have to.
 
     Uses ``create_agent`` directly with a custom middleware stack, giving
@@ -259,13 +219,11 @@ def build_phase_agent(
         phase: The phase being executed.
         system_prompt: Phase-specific system prompt (role + task framing).
         extra_middleware: Additional middleware to include.
-        add_summarization: Whether to add the summarization tool middleware
-            (recommended for IMPLEMENT and VERIFY).
         subagents: Optional subagent specs for this phase.
         response_format: Optional Pydantic model or ResponseFormat for
             structured output (DA ≥0.5.3).
         is_subagent: When True, skips artifact materialization and
-            interpreter/summarization middleware (subagents are leaf
+            interpreter middleware (subagents are leaf
             agents, not orchestrators).
         extra_tools: Additional BaseTool instances injected directly into
             create_agent(tools=[...]). These sit alongside tools from
@@ -365,7 +323,6 @@ def build_phase_agent(
         model=model,
         phase=phase,
         is_subagent=is_subagent,
-        add_summarization=add_summarization,
         has_interpreter=has_interpreter,
         extra_middleware=extra_middleware,
         tool_desc_overrides=tool_desc_overrides,
@@ -414,7 +371,6 @@ def _build_middleware_stack(
     model: Any,
     phase: PhaseName,
     is_subagent: bool,
-    add_summarization: bool,
     has_interpreter: bool,
     extra_middleware: list[Any] | None,
     tool_desc_overrides: dict[str, str],
@@ -437,13 +393,12 @@ def _build_middleware_stack(
     3.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
     4.  SubAgentMiddleware         — task delegation (BEFORE interpreter so tools.task is PTC-visible)
     5.  CodeInterpreterMiddleware  — eval tool (when enabled); sees task tool from step 4
-    6.  SummarizationMiddleware    — context compression
-    7.  PatchToolCallsMiddleware   — tool call normalization
-    8.  SPINE-specific middleware  — ToolSchemaValidator, ToolOutputTrimmer
-    9.  User extra_middleware
-    10. Profile extra_middleware
-    11. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
-    12. MemoryMiddleware           — AGENTS.md injection (when memory present)
+    6.  PatchToolCallsMiddleware   — tool call normalization
+    7.  SPINE-specific middleware  — ToolSchemaValidator, ToolOutputTrimmer
+    8.  User extra_middleware
+    9.  Profile extra_middleware
+    10. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
+    11. MemoryMiddleware           — AGENTS.md injection (when memory present)
 
     CRITICAL ordering constraint: SubAgentMiddleware (4) MUST precede
     CodeInterpreterMiddleware (5). The interpreter's PTC system calls
@@ -506,22 +461,18 @@ def _build_middleware_stack(
     if has_interpreter:
         middleware.append(build_interpreter_middleware(phase.value))
 
-    # 6. Summarization — context compression for long-running phases
-    if add_summarization and not is_subagent:
-        _add_summarization_middleware(middleware, model, backend)
-
-    # 7. Patch tool calls — normalisation
+    # 6. Patch tool calls — normalisation
     middleware.append(PatchToolCallsMiddleware())
 
-    # 8. SPINE-specific middleware (tool validation, context editing)
+    # 7. SPINE-specific middleware (tool validation, context editing)
     if not is_subagent:
         _add_spine_middleware(middleware, phase)
 
-    # 9. User-provided extra middleware
+    # 8. User-provided extra middleware
     if extra_middleware:
         middleware.extend(extra_middleware)
 
-    # 10. Profile extra middleware
+    # 9. Profile extra middleware
     if profile is not None:
         try:
             extra = profile.materialize_extra_middleware()
@@ -530,10 +481,10 @@ def _build_middleware_stack(
         except Exception:
             pass
 
-    # 11. Prompt caching (no-op for non-Anthropic models)
+    # 10. Prompt caching (no-op for non-Anthropic models)
     middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
 
-    # 12. Memory — AGENTS.md injection (when memory sources provided)
+    # 11. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
         middleware.append(SpineProjectMemoryMiddleware(
             backend=backend,
@@ -600,64 +551,6 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     # Aggressively middle-truncate tool outputs for orchestrator phases to avoid bloat
     trim_limit = 5 if phase.value in ["specify", "plan", "implement", "tasks"] else 20
     middleware.append(ToolOutputTrimmer(max_full_tool_results=trim_limit))
-
-
-def _add_summarization_middleware(
-    middleware: list[Any],
-    model: Any,
-    backend: Any,
-) -> None:
-    """Add DA summarization middleware with SPINE-specific configuration.
-
-    Three key design decisions:
-    1. Token-based trigger (60K) — keeps KV cache under 50% on 128K models.
-       Earlier compression means smaller summaries and less agent re-reading.
-       Previous 80K trigger left cache at 62.5% before summarization kicked in.
-    2. Custom state-extraction summary prompt — preserves file paths,
-       errors, slice objectives, and offloaded history path.
-    3. Keep window of 20 messages — covers full edit-test-fix cycle.
-    """
-    try:
-        from deepagents.middleware.summarization import (
-            SummarizationMiddleware,
-            create_summarization_tool_middleware,
-        )
-
-        try:
-            auto_mw = SummarizationMiddleware(
-                model=model,
-                backend=backend,
-                trigger=("tokens", 60000),
-                keep=("messages", 20),
-                summary_prompt=_SPINE_SUMMARY_PROMPT,
-            )
-            middleware.append(auto_mw)
-
-            tool_mw = create_summarization_tool_middleware(model, backend)
-            middleware.append(tool_mw)
-
-            logger.debug(
-                "Added summarization middleware "
-                "(trigger=60K tokens, keep=20 msgs, custom prompt)"
-            )
-        except Exception as exc:
-            logger.debug(
-                "Auto-summarization middleware failed, trying tool-only: %s", exc
-            )
-            try:
-                tool_mw = create_summarization_tool_middleware(model, backend)
-                middleware.append(tool_mw)
-                logger.debug("Added summarization tool middleware (fallback)")
-            except Exception as exc2:
-                logger.debug(
-                    "Summarization middleware could not be initialized "
-                    "(skipping): %s", exc2
-                )
-    except ImportError:
-        logger.debug(
-            "Summarization middleware not available "
-            "(requires deepagents >= 0.5.0)"
-        )
 
 
 # ── Profile helpers ──────────────────────────────────────────────────────

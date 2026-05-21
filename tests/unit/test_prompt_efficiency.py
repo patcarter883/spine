@@ -158,30 +158,7 @@ class TestContextEditing:
         assert "2 lines" in metadata
 
 
-class TestSummarizationConfig:
-    """Verify summarization middleware uses SPINE-specific configuration."""
-
-    def test_summarization_trigger_is_60k(self):
-        """Summarization trigger should be 60K tokens (not 80K)."""
-        import inspect
-        from spine.agents.factory import _add_summarization_middleware
-        source = inspect.getsource(_add_summarization_middleware)
-        assert "60000" in source, "Summarization trigger should be 60K tokens"
-
-    def test_custom_summary_prompt_exists(self):
-        """_SPINE_SUMMARY_PROMPT should exist and preserve technical state."""
-        from spine.agents.factory import _SPINE_SUMMARY_PROMPT
-        assert _SPINE_SUMMARY_PROMPT is not None
-        assert "file" in _SPINE_SUMMARY_PROMPT.lower()
-        assert "error" in _SPINE_SUMMARY_PROMPT.lower()
-        assert "slice" in _SPINE_SUMMARY_PROMPT.lower()
-        assert "offloaded" in _SPINE_SUMMARY_PROMPT.lower() or "history" in _SPINE_SUMMARY_PROMPT.lower()
-
-    def test_summary_prompt_not_chatbot_oriented(self):
-        """Summary prompt should NOT use chatbot framing."""
-        from spine.agents.factory import _SPINE_SUMMARY_PROMPT
-        assert "chat history" not in _SPINE_SUMMARY_PROMPT.lower()
-        assert "user's chat" not in _SPINE_SUMMARY_PROMPT.lower()
+# ── 3. Skills loading ───────────────────────────────────────────────────
 
 
 class TestCodebaseMap:

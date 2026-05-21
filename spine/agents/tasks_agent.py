@@ -110,7 +110,6 @@ def build_tasks_agent(
         config=config,
         phase=PhaseName.TASKS,
         system_prompt=system_prompt,
-        add_summarization=True,
         subagents=_build_subagents(PhaseName.TASKS, state, config),
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,

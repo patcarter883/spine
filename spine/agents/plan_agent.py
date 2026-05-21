@@ -85,7 +85,6 @@ def build_plan_agent(
         phase=PhaseName.PLAN,
         system_prompt=system_prompt,
         subagents=_build_subagents(PhaseName.PLAN, state, config),
-        add_summarization=True,
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
     )
