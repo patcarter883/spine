@@ -362,31 +362,38 @@ PHASE_SUBAGENTS: dict[str, list[str]] = {
 # ── Factory functions ──────────────────────────────────────────────────
 
 
-def _inject_mcp_tools(tools: list, workspace_root: str) -> None:
+def _inject_mcp_tools(tools: list, workspace_root: str, *, subagent_name: str = "researcher") -> None:
     """Inject MCP codebase-index tools into a subagent's tool list.
 
     Loads MCP tools from the SpineConfig, wrapping each as a LangChain
     ``BaseTool``.  Errors during MCP tool loading are logged and swallowed
     — subagents fall back to filesystem tools if MCP is unavailable.
 
+    The cache_key now includes the subagent name (researcher vs slice-implementer)
+    so the two subagents do not collide in the tool cache and both receive
+    the full MCP index surface — critical for preventing the 11× redundant
+    `dispatcher.py` reads seen in trace 019e486e.
+
     Args:
         tools: The subagent's tool list (mutated in place).
         workspace_root: Project root for PROJECT_ROOT env injection.
+        subagent_name: Calling subagent name (used for cache key + debug logs).
     """
     try:
         from spine.config import SpineConfig
         from spine.mcp.client import get_mcp_tools
 
         config = SpineConfig.load()
+        cache_key = f"subagent-{subagent_name}-{workspace_root}"
         mcp_tools = get_mcp_tools(
             config.mcp_servers,
-            cache_key=f"subagent-researcher-{workspace_root}",
+            cache_key=cache_key,
             workspace_root=workspace_root,
         )
         tools.extend(mcp_tools)
-        logger.debug("Injected %d MCP tools into researcher subagent", len(mcp_tools))
+        logger.debug("Injected %d MCP tools into %s subagent", len(mcp_tools), subagent_name)
     except Exception:
-        logger.debug("MCP tool injection skipped for researcher subagent", exc_info=True)
+        logger.debug("MCP tool injection skipped for %s subagent", subagent_name, exc_info=True)
 
 
 def build_subagent_spec(
@@ -470,15 +477,13 @@ def build_subagent_spec(
     if "search_codebase" in allowed_tool_names:
         tools.append(SearchCodebaseTool(workspace_root=workspace_root))
 
-    # ── Inject MCP codebase-index tools for researcher subagents ─
-    # Researchers do codebase exploration — MCP tools (find_symbol,
-    # get_dependencies, get_change_impact, etc.) are MUCH more
-    # token-efficient than reading entire files.  Only inject for
-    # the researcher subagent type; slice-implementer/verifier have
-    # different tooling needs and the orchestrator dispatches them
-    # with full context in the task description.
-    if name == "researcher":
-        _inject_mcp_tools(tools, workspace_root)
+    # ── Inject MCP codebase-index tools for researcher + slice-implementer ─
+    # Both subagents benefit enormously from structural queries instead of
+    # full-file reads (see trace 019e486e: 11× redundant dispatcher.py reads
+    # during implement).  MCP gives "where is X / who calls X" in milliseconds.
+    # slice-verifier is read+execute only and rarely needs deep navigation.
+    if name in ("researcher", "slice-implementer"):
+        _inject_mcp_tools(tools, workspace_root, subagent_name=name)
 
     # ── Build spec ───────────────────────────────────────────────
     from spine.agents.context_editing import ToolOutputTrimmer

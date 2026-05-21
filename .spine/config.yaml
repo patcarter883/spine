@@ -64,7 +64,7 @@ providers:
     plan:
       provider: gemini-3.5-flash
     tasks:
-      provider: gemini-3.5-flash
+      provider: deepseek-v4-flash
     # Implementation → local vLLM, but colder temperature for code
     implement:
       provider: laguna-xs2
@@ -76,4 +76,4 @@ providers:
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: gemini-3.5-flash             # short timeout for verify
+      provider: deepseek-v4-flash             # short timeout for verify

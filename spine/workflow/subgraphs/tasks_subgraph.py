@@ -72,7 +72,7 @@ async def _run_tasks_agent(
                 f"- Specification: `{spec_path}/specification.md`",
                 f"- Plan: `{plan_path}/plan.md`",
                 "",
-                "Read them with `read_file` before decomposing.",
+                "Call `read_prior_artifacts` first (no arguments) to load the specification and plan. Then call `search_codebase` or use MCP tools to research change sites.",
                 "",
             ])
         else:
