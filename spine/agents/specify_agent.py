@@ -57,8 +57,6 @@ def build_specify_agent(
     feedback_raw = state.get("feedback", [])
     feedback = [str(f) for f in feedback_raw] if feedback_raw else []
 
-    spec_dir = f".spine/artifacts/{work_id}/specify"
-
     orchestrator_tools = build_specify_orchestrator_tools(
         workspace_root=workspace_root,
         work_id=work_id,
@@ -115,18 +113,36 @@ def _build_specify_prompt() -> str:
         "inside a single `eval` call. Each task description must be fully "
         "self-contained — embed the work description and the specific area "
         "to investigate.\n\n"
+        "**CRITICAL: Each description MUST be ≥200 characters.** "
+        "Include: (1) the work description context, "
+        "(2) specific file paths or modules to investigate, "
+        "(3) what to look for (patterns, conventions, APIs, dependencies). "
+        "Bare topic names like \"Research X\" produce empty results and waste "
+        "the subagent turn — every thin dispatch costs you 3K tokens for "
+        "nothing.\n\n"
         "Dispatch pattern:\n"
         "```js\n"
         "const desc = globalThis.ctx.description;\n"
         "const results = await Promise.allSettled([\n"
         '  tools.task({subagent_type: "researcher",\n'
         "    description: `Research area 1 relevant to: ${desc}\\n"
-        "Investigate: <specific module/component>`}),\n"
+        "Investigate: <specific module/component>\\n"
+        "Look for: <what patterns, conventions, or APIs to find>`}),\n"
         '  tools.task({subagent_type: "researcher",\n'
         "    description: `Research area 2 relevant to: ${desc}\\n"
-        "Investigate: <specific module/component>`}),\n"
+        "Investigate: <specific module/component>\\n"
+        "Look for: <what patterns, conventions, or APIs to find>`}),\n"
         "]);\n"
         "globalThis.research = results;\n"
+        "```\n\n"
+        "Example of a GOOD description (≥300 chars):\n"
+        "```\n"
+        "Research SPINE's existing phase architecture for: ${desc}\\n"
+        "Investigate: spine/phases/*.py, spine/workflow/registry.py\\n"
+        "1. How are phases structured? Look at the call_* and build_* pattern\\n"
+        "2. How does PhaseRegistry.register() work? What does PhaseConfig contain?\\n"
+        "3. What edges does a PhaseConfig define (success/needs_review/error)?\\n"
+        "4. How do existing phases (specify, plan, implement) follow this pattern?\\n"
         "```\n\n"
         "Skip researcher dispatch if the work description is self-contained "
         "and requires no codebase knowledge (e.g. a standalone algorithm).\n\n"

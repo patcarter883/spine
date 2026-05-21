@@ -352,10 +352,11 @@ _RE_RESEARCH_PROMPT_SUFFIX = (
 
 PHASE_SUBAGENTS: dict[str, list[str]] = {
     PhaseName.SPECIFY.value: ["researcher"],
+    PhaseName.PLAN.value: ["researcher"],
     PhaseName.TASKS.value: ["researcher"],
     PhaseName.IMPLEMENT.value: ["slice-implementer"],  # No verifier — dedicated verify phase is authoritative
     PhaseName.VERIFY.value: ["slice-verifier"],
-    # PLAN, CRITIC — single-agent, no subagents
+    # CRITIC — single-agent, no subagents
 }
 
 

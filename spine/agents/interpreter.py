@@ -59,10 +59,11 @@ the actual tool names present in ``request.tools`` when the interpreter's
 interpreter — see factory.py ordering constraint).
 
 - SPECIFY: ``task``, ``read_work_context``, ``write_specification``
+- PLAN:    ``task``, ``search_codebase``, ``read_prior_artifacts``, ``write_plan``
 - TASKS:   ``task``, ``search_codebase``, ``read_prior_artifacts``, ``write_tasks_artifacts``
 - IMPLEMENT: ``task``, ``read_slice_files``, ``write_implementation_report``
 - VERIFY:  ``task``, ``grep``, ``glob``, ``ls``, ``write_file`` (still uses FilesystemMiddleware)
-- CRITIC / PLAN: (none) — single-agent phases, no subagent orchestration.
+- CRITIC: (none) — review-only, no orchestration.
 
 When using PTC to call the ``task`` tool, use the named subagent for the
 current phase (e.g. ``researcher`` for SPECIFY/TASKS, ``slice-implementer`` for
@@ -109,10 +110,11 @@ logger = logging.getLogger(__name__)
 
 _PTC_ALLOWLISTS: dict[str, list[str | Any]] = {
     PhaseName.SPECIFY.value: ["task", "read_work_context", "write_specification"],
+    PhaseName.PLAN.value: ["task", "search_codebase", "read_prior_artifacts", "write_plan"],
     PhaseName.TASKS.value: ["task", "search_codebase", "read_prior_artifacts", "write_tasks_artifacts"],
     PhaseName.IMPLEMENT.value: ["task", "read_slice_files", "write_implementation_report"],
     PhaseName.VERIFY.value: ["task", "grep", "glob", "ls", "write_file"],  # VERIFY still uses FilesystemMiddleware
-    # CRITIC and PLAN don't need PTC — they review/plan, not orchestrate.
+    # CRITIC doesn't need PTC — review-only, no orchestration.
 }
 
 
@@ -137,8 +139,8 @@ def build_interpreter_middleware(
     """Build a CodeInterpreterMiddleware configured for a SPINE phase.
 
     Creates a QuickJS interpreter with PTC enabled for phases that need
-    subagent orchestration (SPECIFY, TASKS, IMPLEMENT, VERIFY). Phases
-    without PTC (PLAN, CRITIC) get an interpreter for data transformation
+    subagent orchestration (SPECIFY, PLAN, TASKS, IMPLEMENT, VERIFY). Phases
+    without PTC (CRITIC) get an interpreter for data transformation
     only — no tool calling from code.
 
     The middleware is a DA ``AgentMiddleware`` instance, ready to pass to

@@ -288,7 +288,7 @@ class TestSubagentFactory:
         assert "slice-implementer" in PHASE_SUBAGENTS.get("implement", [])
         assert "slice-verifier" in PHASE_SUBAGENTS.get("verify", [])
         # Phases without subagents
-        assert PHASE_SUBAGENTS.get("plan") is None
+        assert "researcher" in PHASE_SUBAGENTS.get("plan", [])
         assert PHASE_SUBAGENTS.get("critic") is None
 
     def test_response_models_defined(self) -> None:

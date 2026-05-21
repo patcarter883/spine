@@ -62,12 +62,13 @@ class TestBuildInterpreterMiddleware:
         mw = build_interpreter_middleware("critic")
         assert mw._ptc is None
 
-    def test_plan_phase_gets_no_ptc(self) -> None:
-        """PLAN phase should have no PTC allowlist."""
+    def test_plan_phase_gets_ptc(self) -> None:
+        """PLAN phase should get 'task' in PTC allowlist (has researcher subagents)."""
         from spine.agents.interpreter import build_interpreter_middleware
 
         mw = build_interpreter_middleware("plan")
-        assert mw._ptc is None
+        assert mw._ptc is not None
+        assert "task" in mw._ptc
 
     def test_custom_memory_limit(self) -> None:
         """Custom memory_limit should be forwarded to middleware."""
@@ -472,7 +473,7 @@ class TestPTCAllowlists:
         """SPECIFY, TASKS, IMPLEMENT, VERIFY should all have 'task' in PTC."""
         from spine.agents.interpreter import _PTC_ALLOWLISTS
 
-        orchestration_phases = ["specify", "tasks", "implement", "verify"]
+        orchestration_phases = ["specify", "plan", "tasks", "implement", "verify"]
         for phase in orchestration_phases:
             assert phase in _PTC_ALLOWLISTS, f"Phase {phase!r} missing from PTC allowlists"
             assert "task" in _PTC_ALLOWLISTS[phase], (
@@ -480,8 +481,7 @@ class TestPTCAllowlists:
             )
 
     def test_review_phases_have_no_ptc(self) -> None:
-        """CRITIC and PLAN should have no PTC allowlist."""
+        """CRITIC should have no PTC allowlist (review-only, no subagents)."""
         from spine.agents.interpreter import _PTC_ALLOWLISTS
 
         assert "critic" not in _PTC_ALLOWLISTS
-        assert "plan" not in _PTC_ALLOWLISTS

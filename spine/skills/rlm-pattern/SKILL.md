@@ -8,8 +8,8 @@ phase: specify, tasks, implement, verify
 
 **Rule: Before making ≥3 manual tool calls, ask yourself: "Can I write one eval program that does this?"**
 
-The eval tool is a persistent QuickJS interpreter. Variables survive between
-turns. Use it to keep intermediate data OUT of the model context.
+The eval tool is a persistent **QuickJS** interpreter — NOT Node.js, NOT a browser.
+Variables survive between turns. Use it to keep intermediate data OUT of the model context.
 
 ## When to use eval
 
@@ -145,6 +145,8 @@ These complement the `task` tool — use filesystem tools for direct inspection 
 
 | Error | Cause | Fix |
 |-------|-------|-----|
+| `ReferenceError: 'require' is not defined` | Using `require('...')` — QuickJS has NO module system | Never use `require()`. Use `globalThis.tools` for PTC, store data in `globalThis`. |
+| `ReferenceError: 'import' is not defined` | Using `import ... from` — no ES modules in QuickJS | Never use `import`. All code runs in a single persistent global scope. |
 | `SyntaxError: redeclaration of 'X'` | `const X = ...` used the same name in a previous eval | Use `let` instead of `const`, or use a different variable name. QuickJS state persists across eval calls. |
 | `TypeError: cannot read property 'X' of undefined` | Accessing `.content` or `.data` on a tool result | PTC returns native values. `readFile` returns a string, not an object. Use the result directly. |
 | `ReferenceError: window is not defined` | Using `window.*` instead of `globalThis.*` | Use `globalThis` — QuickJS has no `window` object. |

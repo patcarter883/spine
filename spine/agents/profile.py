@@ -93,6 +93,22 @@ PTC tool names are camelCase (`tools.readFile`), arguments are snake_case \
 (`{file_path: '...'}`), and return values are native JS types — \
 `readFile` returns a string, not an object.
 
+## Interpreter Environment (QuickJS)
+
+The `eval` tool runs in **QuickJS**, a server-side JS sandbox — NOT Node.js.
+The following Node.js / browser APIs DO NOT exist and will throw errors:
+
+- ``require()`` — no module system
+- ``import`` / ``export`` — no ES modules
+- ``fs`` — no filesystem access (use PTC ``tools.readFile`` instead)
+- ``process`` — no Node.js process object
+- ``window`` — use ``globalThis`` instead (QuickJS has no browser globals)
+- ``fetch`` / ``XMLHttpRequest`` — no network access
+
+**Available:** ``globalThis`` (persistent state across turns), ``console.log``
+(for output), ``Promise``, ``async/await``, ``JSON``, and
+``globalThis.tools`` (PTC tool bindings, when enabled).
+
 ## Tools
 
 Tool descriptions are provided by the runtime. Follow these principles:
