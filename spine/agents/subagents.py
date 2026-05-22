@@ -396,6 +396,80 @@ def _inject_mcp_tools(tools: list, workspace_root: str, *, subagent_name: str = 
         logger.debug("MCP tool injection skipped for %s subagent", subagent_name, exc_info=True)
 
 
+# ── Model capability guards ────────────────────────────────────────────
+
+# Model name patterns for models that reject tool_choice="any"/"required"
+# when their thinking/reasoning mode is active.  These models crash with
+# HTTP 400 when create_agent forces tool_choice for structured output.
+_THINKING_MODEL_PATTERNS: tuple[str, ...] = (
+    "qwen3",    # Qwen 3.x series (thinking mode enabled by default)
+    "qwq",      # QwQ reasoning model
+    "deepseek-r",  # DeepSeek-R1 reasoning
+)
+
+
+def _extract_model_name(model: Any) -> str:
+    """Extract a lowercase model name string from a model spec or instance.
+
+    Handles:
+    - String specs: ``"openrouter:qwen/qwen3-235b-a22b:free"`` → ``"qwen/qwen3-235b-a22b"``
+    - String specs without org: ``"openai:gpt-4o"`` → ``"gpt-4o"``
+    - Pre-built instances with ``.model`` attr (ChatOpenRouter, ChatOpenAI)
+    - Pre-built instances with ``.model_name`` attr (ChatAnthropic)
+
+    Returns:
+        Lowercase model name with provider prefix and quality suffix stripped.
+    """
+    raw: str = ""
+    if isinstance(model, str):
+        raw = model
+    elif hasattr(model, "model_name"):
+        raw = str(model.model_name)
+    elif hasattr(model, "model"):
+        raw = str(model.model)
+
+    # Strip provider prefix (e.g. "openrouter:" or "openai:")
+    if ":" in raw:
+        raw = raw.split(":", 1)[1]
+    # Strip trailing quality suffix (:free, :beta, etc.) — these appear
+    # after the model name and contain only short alpha-only strings.
+    # Model names like "qwen3-235b-a22b" contain hyphens/digits, so a
+    # trailing segment with only letters + digits/periods is a quality tag.
+    while ":" in raw:
+        last_part = raw.rsplit(":", 1)[1]
+        # If the last segment contains no "/" and looks like a quality tag
+        # (short, no hyphens suggesting model version), strip it.
+        if "/" not in last_part and not any(c == "-" for c in last_part):
+            raw = raw.rsplit(":", 1)[0]
+        else:
+            break
+
+    return raw.lower()
+
+
+def _supports_forced_tool_choice(model: Any) -> bool:
+    """Check whether the model supports ``tool_choice="any"`` / ``"required"``.
+
+    DA's structured output (``ToolStrategy``) forces ``tool_choice="any"``
+    to guarantee the model calls the extraction tool.  Some models —
+    notably Qwen 3.x and QwQ in thinking/reasoning mode — reject this
+    parameter with a 400 error, crashing every researcher subagent.
+
+    When this returns ``False``, the caller should skip ``response_format``
+    and rely on prompt-based structured output instead.
+
+    Args:
+        model: A model string (``"openrouter:qwen/qwen3-235b-a22b"``) or
+            a pre-built ``BaseChatModel`` instance.
+
+    Returns:
+        ``True`` if the model supports forced tool choice, ``False`` if
+        the model is known to reject it.
+    """
+    name = _extract_model_name(model)
+    return not any(pattern in name for pattern in _THINKING_MODEL_PATTERNS)
+
+
 def build_subagent_spec(
     name: str,
     phase: PhaseName,
@@ -486,11 +560,13 @@ def build_subagent_spec(
         _inject_mcp_tools(tools, workspace_root, subagent_name=name)
 
     # ── Build spec ───────────────────────────────────────────────
-    from spine.agents.context_editing import ToolOutputTrimmer
-
-    # Subagents get a focused context trimmer to prevent their conversation history
-    # from growing unchecked during multi-turn searches and file reads.
-    subagent_middleware = [ToolOutputTrimmer(max_full_tool_results=5)]
+    # ToolOutputTrimmer REMOVED from the entire SPINE stack (2026-05 directive).
+    # It was aggressively discarding full file-read & execute outputs that
+    # leaf sub-agents (slice-implementer / slice-verifier) critically needed,
+    # directly causing the 40+:1 prompt:completion ratios seen in traces
+    # 019e486e… and 019e488f….
+    # Context control now comes ONLY from tight system prompts + summarization.
+    subagent_middleware: list[Any] = []
 
     spec: dict[str, Any] = {
         "name": name,
@@ -503,7 +579,13 @@ def build_subagent_spec(
     # Only researcher gets response_format — structured summaries prevent
     # raw file contents from bloating the parent agent's context.
     # slice-implementer and slice-verifier need free-form tool use.
-    if name == "researcher":
+    #
+    # Guard: DA's create_agent resolves AutoStrategy → ToolStrategy which
+    # forces tool_choice="any" (wire: "required").  Models with thinking/
+    # reasoning mode (Qwen3, QwQ, etc.) reject this parameter, crashing
+    # every researcher subagent with a 400 error.  Skip response_format
+    # for those models — the prompt already instructs JSON output.
+    if name == "researcher" and _supports_forced_tool_choice(model):
         spec["response_format"] = SUBAGENT_RESPONSE_MODELS[name]
     if memory:
         spec["memory"] = memory

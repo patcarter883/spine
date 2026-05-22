@@ -1,5 +1,11 @@
 """Custom tools for the TASKS phase agent.
 
+.. deprecated::
+    The TASKS phase tools are deprecated. New workflows should use the PLAN
+    phase tools for decomposition instead. This module is retained for
+    backward compatibility and will be removed in a future release.
+    ``SliceDefinition`` is kept for downstream consumers that reference it.
+
 Replaces generic filesystem tools with purpose-built tools that enforce
 the tasks agent's role: research the codebase, then write a complete
 structured decomposition in one atomic call. Nothing else.
@@ -129,6 +135,10 @@ class _WriteTasksArtifactsInput(BaseModel):
 
 class WriteTasksArtifactsTool(BaseTool):
     """Write all TASKS phase artifacts atomically in one call.
+
+    .. deprecated::
+        The TASKS phase is deprecated. This tool is retained for backward
+        compatibility only.
 
     This is the ONLY write tool available to the tasks agent.
     Accepts all required artifacts as structured arguments and writes:
@@ -262,6 +272,10 @@ def build_tasks_agent_tools(
     feedback: list[str] | None = None,
 ) -> list[BaseTool]:
     """Build the custom tool set for the tasks agent.
+
+    .. deprecated::
+        The TASKS phase tools are deprecated. Use the PLAN phase tools
+        for decomposition instead.
 
     Returns three tools:
     - ``read_prior_artifacts`` — loads spec/plan artifacts (spec workflows)

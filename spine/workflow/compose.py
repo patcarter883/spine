@@ -12,16 +12,16 @@ so they can write ``status = "needs_review"`` and feedback entries to state
 when they fail. This ensures the dispatcher detects the human-review condition
 instead of silently marking the work as completed.
 
-Currently, only the tasks→implement transition is gated.  Verify always runs
+Currently, only the plan→implement transition is gated.  Verify always runs
 after implement — if implement produced nothing, verify detects and reports
 that; there is no reason for a human review gate between those two phases.
 
 Phase sequences by WorkType:
-    quick:           TASKS → IMPLEMENT → VERIFY
-    critical_quick:  TASKS → CRITIC → IMPLEMENT → VERIFY
-    spec:            SPECIFY → PLAN → CRITIC → TASKS → IMPLEMENT → VERIFY
+    quick:           PLAN → IMPLEMENT → VERIFY
+    critical_quick:  PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+    spec:            SPECIFY → PLAN → CRITIC → IMPLEMENT → VERIFY
     critical_spec:   SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN →
-                     TASKS → CRITIC_TASKS → IMPLEMENT → VERIFY
+                     IMPLEMENT → VERIFY
     plan:            SPECIFY → PLAN → CRITIC_PLAN (planning only, no execution)
     plan_spec:       SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN
     plan_only:       SPECIFY → PLAN → CRITIC_PLAN (no spec critic)
@@ -153,7 +153,7 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.IMPLEMENT.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0),
-        "tasks_path": f".spine/artifacts/{work_id}/tasks",
+        "plan_path": f".spine/artifacts/{work_id}/plan",
     }
 
 
@@ -166,9 +166,8 @@ def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.VERIFY.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.VERIFY.value, 0),
-        "tasks_path": f".spine/artifacts/{work_id}/tasks",
+        "plan_path": f".spine/artifacts/{work_id}/plan",
         "spec_path": f".spine/artifacts/{work_id}/specify" if has_spec else None,
-        "plan_path": f".spine/artifacts/{work_id}/plan" if has_spec else None,
     }
 
 
@@ -299,13 +298,13 @@ def _critic_result_mapper(reviewed_phase: str):
 
 WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
     WorkType.QUICK.value: [
-        (PhaseName.TASKS.value, None),
+        (PhaseName.PLAN.value, None),
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
     WorkType.CRITICAL_QUICK.value: [
-        (PhaseName.TASKS.value, None),
-        (f"{PhaseName.CRITIC.value}_tasks", PhaseName.TASKS.value),
+        (PhaseName.PLAN.value, None),
+        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
@@ -313,7 +312,6 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (PhaseName.SPECIFY.value, None),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-        (PhaseName.TASKS.value, None),
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
@@ -322,8 +320,6 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-        (PhaseName.TASKS.value, None),
-        (f"{PhaseName.CRITIC.value}_tasks", PhaseName.TASKS.value),
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
@@ -514,7 +510,7 @@ def build_workflow_graph(
     graph = StateGraph(WorkflowState)
 
     # Collect which edges need artifact gates.
-    # We gate based on the *target* node: implement requires tasks artifacts.
+    # We gate based on the *target* node: implement requires plan artifacts.
     # Verify always runs after implement — it's the phase that confirms
     # implementation meets requirements.  If implement produced nothing,
     # verify can detect and report that; there is no reason for a human
@@ -525,7 +521,7 @@ def build_workflow_graph(
         if i < len(phase_seq) - 1:
             next_node_name = phase_seq[i + 1][0]
             if next_node_name == PhaseName.IMPLEMENT.value:
-                gate_edges[(node_name, next_node_name)] = PhaseName.TASKS.value
+                gate_edges[(node_name, next_node_name)] = PhaseName.PLAN.value
 
     # Add all phase/critic nodes
     for node_name, reviewed_phase in phase_seq:

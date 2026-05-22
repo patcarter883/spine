@@ -26,8 +26,15 @@ Extended checks for tasks→implement:
   likely hallucinated a fictional project skeleton and the output is useless
   for implement. Route to needs_review immediately rather than letting
   implement spend 30+ turns discovering the problem itself.
+
+Extended checks for plan→implement:
+- ``plan.json`` must exist on disk and be valid JSON.
+- ``feature_slices`` array must be non-empty.
+- Each feature slice must contain the required fields: id, title,
+  target_files, execution_requirements, dependencies, acceptance_criteria.
 """
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -163,6 +170,133 @@ def _check_tasks_quality(
     return True, ""
 
 
+# ── Required fields for each feature slice in plan.json ─────────────────
+_REQUIRED_SLICE_FIELDS: set[str] = {
+    "id",
+    "title",
+    "target_files",
+    "execution_requirements",
+    "dependencies",
+    "acceptance_criteria",
+}
+
+
+def _check_plan_quality(
+    workspace_root: str,
+    work_id: str,
+) -> tuple[bool, str]:
+    """Validate plan-phase artifact quality beyond mere presence.
+
+    Performs additional checks specific to the plan→implement gate:
+
+    1. **plan.json existence** — Without it the implement orchestrator has
+       no structured decomposition to drive slice-based implementation.
+
+    2. **Non-empty feature_slices** — The plan must contain at least one
+       feature slice for implement to execute.
+
+    3. **Slice field completeness** — Each feature slice must declare all
+       required fields (id, title, target_files, execution_requirements,
+       dependencies, acceptance_criteria) so implement can dispatch subagents
+       with sufficient context.
+
+    Returns:
+        ``(passed, reason)`` — ``passed=True`` means gate should proceed;
+        ``reason`` is a human-readable explanation on failure (empty on pass).
+    """
+    root = Path(workspace_root)
+    plan_dir = root / ".spine" / "artifacts" / work_id / "plan"
+
+    if not plan_dir.is_dir():
+        # Plan dir doesn't exist — let the main gate handle this
+        return True, ""
+
+    # ── Check 1: plan.json must exist ─────────────────────────────────────
+    plan_json_path = plan_dir / "plan.json"
+    if not plan_json_path.exists():
+        return (
+            False,
+            "plan phase did not produce plan.json. "
+            "The IMPLEMENT orchestrator needs a structured plan with "
+            "feature_slices to dispatch subagents. "
+            "Re-run PLAN to produce a proper plan.json.",
+        )
+
+    # ── Check 2: plan.json must be valid JSON ─────────────────────────────
+    try:
+        raw = plan_json_path.read_text(encoding="utf-8")
+        plan_data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return (
+            False,
+            f"plan.json is not valid JSON: {exc}. Re-run PLAN to produce a well-formed plan.json.",
+        )
+    except OSError as exc:
+        return (
+            False,
+            f"Could not read plan.json: {exc}. Re-run PLAN to produce a readable plan.json.",
+        )
+
+    if not isinstance(plan_data, dict):
+        return (
+            False,
+            f"plan.json top-level value must be a JSON object, "
+            f"got {type(plan_data).__name__}. "
+            "Re-run PLAN to produce a properly structured plan.json.",
+        )
+
+    # ── Check 3: feature_slices must be non-empty ─────────────────────────
+    feature_slices = plan_data.get("feature_slices")
+    if feature_slices is None:
+        return (
+            False,
+            "plan.json is missing the 'feature_slices' key. "
+            "The IMPLEMENT orchestrator requires a feature_slices array "
+            "to decompose work into executable slices. "
+            "Re-run PLAN to produce a plan with feature_slices.",
+        )
+
+    if not isinstance(feature_slices, list):
+        return (
+            False,
+            f"plan.json 'feature_slices' must be an array, "
+            f"got {type(feature_slices).__name__}. "
+            "Re-run PLAN to produce a plan with a proper feature_slices array.",
+        )
+
+    if len(feature_slices) == 0:
+        return (
+            False,
+            "plan.json 'feature_slices' is empty. "
+            "The IMPLEMENT orchestrator requires at least one feature slice "
+            "to execute. Re-run PLAN to produce a plan with feature slices.",
+        )
+
+    # ── Check 4: each slice must have required fields ─────────────────────
+    for idx, slice_data in enumerate(feature_slices):
+        if not isinstance(slice_data, dict):
+            return (
+                False,
+                f"plan.json feature_slices[{idx}] must be a JSON object, "
+                f"got {type(slice_data).__name__}. "
+                "Re-run PLAN to produce properly structured feature slices.",
+            )
+
+        missing = _REQUIRED_SLICE_FIELDS - set(slice_data.keys())
+        if missing:
+            slice_id = slice_data.get("id", f"index {idx}")
+            return (
+                False,
+                f"plan.json feature slice '{slice_id}' (index {idx}) is "
+                f"missing required fields: {sorted(missing)}. "
+                "Each feature slice must declare: id, title, target_files, "
+                "execution_requirements, dependencies, acceptance_criteria. "
+                "Re-run PLAN to produce complete feature slices.",
+            )
+
+    return True, ""
+
+
 def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
     """Create an artifact gate node function for the workflow graph.
 
@@ -184,9 +318,7 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
         A node function suitable for ``graph.add_node()``.
     """
 
-    def gate_node(
-        state: WorkflowState, config: Optional[RunnableConfig] = None
-    ) -> dict[str, Any]:
+    def gate_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
         work_id = state.get("work_id", "unknown")
         workspace_root = state.get("workspace_root", ".")
 
@@ -199,9 +331,8 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
         has_disk_artifacts = False
         try:
             from spine.agents.artifacts import validate_artifact_dir
-            has_disk_artifacts = validate_artifact_dir(
-                workspace_root, work_id, required_phase
-            )
+
+            has_disk_artifacts = validate_artifact_dir(workspace_root, work_id, required_phase)
         except Exception:
             # Don't let a disk check failure crash the gate — fall back
             # to the state check result.
@@ -215,7 +346,10 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
                 logger.warning(
                     "[%s] Artifact gate: %s has artifacts in state but not on "
                     "disk at .spine/artifacts/%s/%s/. Proceeding anyway.",
-                    work_id, required_phase, work_id, required_phase,
+                    work_id,
+                    required_phase,
+                    work_id,
+                    required_phase,
                 )
 
             # ── Extended quality checks for tasks→implement ──────────────
@@ -223,24 +357,53 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
             # want to add I/O overhead to gates that already failed.
             if required_phase == PhaseName.TASKS.value:
                 try:
-                    quality_ok, quality_reason = _check_tasks_quality(
-                        workspace_root, work_id
-                    )
+                    quality_ok, quality_reason = _check_tasks_quality(workspace_root, work_id)
                 except Exception as exc:
                     # Quality check errors must never crash the gate
                     logger.warning(
-                        "[%s] Tasks quality check raised unexpectedly: %s "
-                        "(proceeding anyway)",
-                        work_id, exc,
+                        "[%s] Tasks quality check raised unexpectedly: %s (proceeding anyway)",
+                        work_id,
+                        exc,
                     )
                     quality_ok = True
                     quality_reason = ""
 
                 if not quality_ok:
                     reason = f"Artifact gate (quality): {quality_reason}"
+                    logger.warning("[%s] %s Flagging for human review.", work_id, reason)
+                    return {
+                        "current_phase": required_phase,
+                        "status": "needs_review",
+                        "feedback": [
+                            {
+                                "status": "needs_review",
+                                "tier": "structural",
+                                "reason": reason,
+                                "suggestions": [],
+                            }
+                        ],
+                        "prompt_request": None,
+                    }
+
+            # ── Extended quality checks for plan→implement ───────────────
+            # Validate plan.json has structured feature_slices that implement
+            # can use to dispatch subagents.
+            if required_phase == PhaseName.PLAN.value:
+                try:
+                    quality_ok, quality_reason = _check_plan_quality(workspace_root, work_id)
+                except Exception as exc:
+                    # Quality check errors must never crash the gate
                     logger.warning(
-                        "[%s] %s Flagging for human review.", work_id, reason
+                        "[%s] Plan quality check raised unexpectedly: %s (proceeding anyway)",
+                        work_id,
+                        exc,
                     )
+                    quality_ok = True
+                    quality_reason = ""
+
+                if not quality_ok:
+                    reason = f"Artifact gate (quality): {quality_reason}"
+                    logger.warning("[%s] %s Flagging for human review.", work_id, reason)
                     return {
                         "current_phase": required_phase,
                         "status": "needs_review",
@@ -257,7 +420,9 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
 
             logger.debug(
                 "[%s] Artifact gate passed for %s → %s",
-                work_id, required_phase, next_node,
+                work_id,
+                required_phase,
+                next_node,
             )
             return {
                 "current_phase": required_phase,
@@ -274,7 +439,8 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
 
         logger.warning(
             "[%s] %s Flagging for human review.",
-            work_id, reason,
+            work_id,
+            reason,
         )
         return {
             "current_phase": required_phase,

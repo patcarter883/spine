@@ -86,6 +86,33 @@ from spine.agents.interpreter import build_interpreter_middleware, interpreter_e
 logger = logging.getLogger(__name__)
 
 
+# ── Model detection helpers ─────────────────────────────────────────────
+
+
+def _is_anthropic_model(model: Any) -> bool:
+    """Return True if the model is an Anthropic Claude instance or spec.
+
+    Used to conditionally include ``AnthropicPromptCachingMiddleware`` —
+    its ``cache_control`` breakpoints are only meaningful on Anthropic's
+    API.  On other providers (OpenRouter, OpenAI, local) the middleware
+    adds per-turn overhead with no benefit.
+
+    Args:
+        model: A model string (``"anthropic:claude-sonnet-4-20250514"``) or
+            a pre-built ``BaseChatModel`` instance.
+
+    Returns:
+        ``True`` when the model targets Anthropic.
+    """
+    # Pre-built ChatAnthropic instance
+    if hasattr(model, "__class__") and model.__class__.__name__ == "ChatAnthropic":
+        return True
+    # String model spec with anthropic provider prefix
+    if isinstance(model, str) and model.startswith("anthropic:"):
+        return True
+    return False
+
+
 # ── SPINE filesystem system prompt ───────────────────────────────────────
 # Replaces DA's default "All file paths must start with a /" prompt.
 # Under virtual_mode=True, paths are resolved relative to the workspace root.
@@ -439,7 +466,7 @@ def _build_middleware_stack(
     5.  CodeInterpreterMiddleware  — eval tool (when enabled); sees task tool from step 4
     6.  SummarizationMiddleware    — context compression
     7.  PatchToolCallsMiddleware   — tool call normalization
-    8.  SPINE-specific middleware  — ToolSchemaValidator, ToolOutputTrimmer
+    8.  SPINE-specific middleware  — ToolSchemaValidator only (ToolOutputTrimmer removed 2026-05)
     9.  User extra_middleware
     10. Profile extra_middleware
     11. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
@@ -530,8 +557,13 @@ def _build_middleware_stack(
         except Exception:
             pass
 
-    # 11. Prompt caching (no-op for non-Anthropic models)
-    middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+    # 11. Prompt caching — only for Anthropic models.
+    #     Non-Anthropic models (OpenRouter, OpenAI, local) don't support
+    #     Anthropic cache_control breakpoints.  Skip entirely to avoid
+    #     per-turn isinstance check overhead and misleading "ran 30 times"
+    #     metrics in traces.
+    if _is_anthropic_model(model):
+        middleware.append(AnthropicPromptCachingMiddleware())
 
     # 12. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
@@ -593,13 +625,9 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
         from spine.agents.tool_schema_validator import ToolSchemaValidator
         middleware.append(ToolSchemaValidator())
 
-    # Context editing: trim old tool results — all phases benefit from trimming
-    # SPECIFY/PLAN can accumulate 80+ read_file results, same as IMPLEMENT/VERIFY
-    from spine.agents.context_editing import ToolOutputTrimmer
-    
-    # Aggressively middle-truncate tool outputs for orchestrator phases to avoid bloat
-    trim_limit = 5 if phase.value in ["specify", "plan", "implement", "tasks"] else 20
-    middleware.append(ToolOutputTrimmer(max_full_tool_results=trim_limit))
+    # Note: ToolOutputTrimmer was removed (2026-05) — excessive trimming of
+    # filesystem results was causing agents to lose critical context during
+    # implementation/verification phases. Rely on summarization + lean prompts instead.
 
 
 def _add_summarization_middleware(

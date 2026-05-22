@@ -1,6 +1,7 @@
 spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
+  workspace_path: /home/pat/projects/spine-sandbox
 
 # ── MCP Servers ──────────────────────────────────────────────────
 # Model Context Protocol servers for external tool integration.
@@ -12,7 +13,7 @@ mcp_servers:
     command: mcp-codebase-index
     args: []
     env:
-      PROJECT_ROOT: /home/pat/projects/spine
+      PROJECT_ROOT: /home/pat/projects/spine-sandbox
 
 providers:
   llm:
@@ -20,9 +21,9 @@ providers:
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
     enabled: true
-  - name: qwen3.6-35b
+  - name: qwen3.7-max
     type: deepagents-model
-    model: openrouter:qwen/qwen3.6-35b-a3b
+    model: openrouter:qwen/qwen3.7-max
     enabled: true
   - name: deepseek-v4-flash
     type: deepagents-model
@@ -64,16 +65,16 @@ providers:
     plan:
       provider: deepseek-v4-pro
     tasks:
-      provider: local
+      provider: deepseek-v4-pro
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: local
+      provider: deepseek-v4-pro
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: local
+      provider: deepseek-v4-flash
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: deepseek-v4-flash             # short timeout for verify
+      provider: deepseek-v4-pro             # short timeout for verify

@@ -52,7 +52,7 @@ Token budget for 128K context models (target: <60K prompt tokens at peak):
 
 Budget rules:
 1. Summarization triggers at 60K tokens (keeps KV cache <50%).
-2. ToolOutputTrimmer evicts old results to ~100-token structured metadata.
+2. ToolOutputTrimmer was REMOVED (2026-05 directive). Context now managed via prompts + summarization only.
 3. AI arg trimming removes write_file/edit_file content from history.
 4. codebase-map.md (produced by tasks phase) eliminates re-exploration.
 5. Each phase starts with a fresh agent — no cross-phase history bloat.

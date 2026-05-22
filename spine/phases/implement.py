@@ -1,8 +1,12 @@
 """SPINE IMPLEMENT phase — generate code to implement feature slices.
 
-The implement Deep Agent reads the tasks/feature slices (on disk) and
-generates code to implement each one. Prior artifacts are NOT inlined —
-the agent reads them on demand from the filesystem.
+The implement Deep Agent reads the plan artifacts (plan.json with
+execution_waves) and dispatches slice-implementer subagents per wave.
+Slices within a wave run in parallel (independent); waves run
+sequentially (later waves depend on earlier ones).
+
+Prior artifacts are NOT inlined — the agent reads them on demand from
+the filesystem.
 
 Context engineering: summarization middleware enabled for long-running
 multi-slice implementation.
@@ -13,10 +17,9 @@ subagents inherit the parent checkpointer.
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
-
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
 
@@ -27,6 +30,7 @@ from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
+    list_slice_files,
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
@@ -39,6 +43,111 @@ logger = logging.getLogger(__name__)
 
 # Maximum characters of artifact content to store in WorkflowState.
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+
+# ── Dispatch note builders ────────────────────────────────────────────
+
+
+def _build_wave_dispatch_note(
+    execution_waves: list[list[dict]],
+) -> str:
+    """Build Step 2 instructions for wave-based dispatch.
+
+    Each execution wave contains independent slices that can run in
+    parallel. Waves themselves must run sequentially because later
+    waves depend on code produced by earlier ones.
+
+    Args:
+        execution_waves: Pre-sorted waves of slice dicts from the
+            scheduler.
+
+    Returns:
+        Markdown-formatted dispatch instructions for the orchestrator.
+    """
+    wave_count = len(execution_waves)
+    total_slices = sum(len(wave) for wave in execution_waves)
+
+    wave_summaries: list[str] = []
+    for i, wave in enumerate(execution_waves):
+        slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
+        wave_summaries.append(
+            f"  Wave {i + 1}: {', '.join(slice_ids)} "
+            f"({len(wave)} slice(s), parallel)"
+        )
+
+    return (
+        f"Slices are organized into **{wave_count} execution wave(s)** "
+        f"({total_slices} total slice(s)). "
+        f"Slices within a wave are independent and MUST run in parallel. "
+        f"Waves MUST run sequentially — do not start wave N+1 until "
+        f"all slices in wave N are complete.\n\n"
+        "**Wave structure:**\n"
+        + "\n".join(wave_summaries)
+        + "\n\n"
+        "**Dispatch pattern (wave-sequential):**\n"
+        "```js\n"
+        "// globalThis.planData is loaded from plan.json via read_slice_files\n"
+        "const data = globalThis.planData;\n"
+        "const waves = data.execution_waves;\n"
+        "const map = data.codebase_map || '';\n"
+        "globalThis.sliceResults = [];\n\n"
+        "for (let w = 0; w < waves.length; w++) {\n"
+        "  const wave = waves[w];\n"
+        "  const dispatches = wave.map(slice =>\n"
+        "    tools.task({\n"
+        '      subagent_type: "slice-implementer",\n'
+        "      description: `Implement slice: ${slice.id}\\n\\n"
+        "## Slice Definition\\n${JSON.stringify(slice, null, 2)}\\n\\n"
+        "## Codebase Map\\n${map}`,\n"
+        "    })\n"
+        "  );\n"
+        "  const results = await Promise.allSettled(dispatches);\n"
+        "  globalThis.sliceResults.push(...results);\n"
+        "  console.log(`Wave ${w+1} complete: ${results.map(r => r.status)}`);\n"
+        "}\n"
+        "```"
+    )
+
+
+def _build_legacy_dispatch_note(slice_count: int) -> str:
+    """Build Step 2 instructions for legacy (flat parallel) dispatch.
+
+    Used when ``execution_waves`` is absent from state (workflows that
+    still use the TASKS phase). All slices are dispatched in a single
+    parallel batch.
+
+    Args:
+        slice_count: Number of slice files discovered on disk.
+
+    Returns:
+        Markdown-formatted dispatch instructions for the orchestrator.
+    """
+    if slice_count == 0:
+        return (
+            "⚠ No slices found. Write the implementation report with "
+            "an empty result set."
+        )
+
+    return (
+        f"Dispatch all {slice_count} slices in parallel using a single "
+        "`eval` call with `Promise.allSettled`.\n\n"
+        "**Dispatch pattern:**\n"
+        "```js\n"
+        "const data = globalThis.slices;\n"
+        "const map = data.codebase_map || '';\n"
+        "const dispatches = Object.entries(data.slices).map(([name, content]) =>\n"
+        "  tools.task({\n"
+        '    subagent_type: "slice-implementer",\n'
+        "    description: `Implement slice: ${name}\\n\\n"
+        "## Slice Definition\\n${content}\\n\\n"
+        "## Codebase Map\\n${map}`,\n"
+        "  })\n"
+        ");\n"
+        "const results = await Promise.allSettled(dispatches);\n"
+        "globalThis.sliceResults = results;\n"
+        "console.log(JSON.stringify(results.map(r => r.status)));\n"
+        "```"
+    )
 
 
 async def call_implement(
@@ -78,36 +187,46 @@ async def call_implement(
         # Skip spec/plan references for quick workflows that lack them.
         impl_dir = f".spine/artifacts/{work_id}/implement"
         tasks_dir = f".spine/artifacts/{work_id}/tasks"
-        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'implement', tasks_dir: '{tasks_dir}', impl_dir: '{impl_dir}'}};\n\n"
+
+        # ── Resolve execution waves from state (preferred) or legacy ──
+        execution_waves = state.get("execution_waves")
+        has_waves = bool(execution_waves)
+        plan_dir = _artifact_path(work_id, PhaseName.PLAN.value)
+        plan_json_path = f"{plan_dir}/plan.json"
+
+        if has_waves:
+            total_slices = sum(len(wave) for wave in execution_waves)
+            wave_count = len(execution_waves)
+            logger.info(
+                f"[{work_id}] Dispatching {total_slices} slice(s) across "
+                f"{wave_count} wave(s) from execution_waves"
+            )
+            dispatch_note = _build_wave_dispatch_note(execution_waves)
+            waves_json = json.dumps(execution_waves, ensure_ascii=False)
+            context_seed = (
+                f"globalThis.context = {{work_id: '{work_id}', phase: 'implement', "
+                f"tasks_dir: '{tasks_dir}', impl_dir: '{impl_dir}', "
+                f"plan_json: '{plan_json_path}', mode: 'waves'}};\n"
+                f"globalThis.execution_waves = {waves_json};\n\n"
+            )
+        else:
+            # Legacy fallback: use list_slice_files from tasks phase
+            logger.info(
+                f"[{work_id}] No execution_waves in state — "
+                f"falling back to list_slice_files"
+            )
+            slice_files = list_slice_files(workspace_root, work_id)
+            slice_count = len(slice_files)
+            dispatch_note = _build_legacy_dispatch_note(slice_count)
+            context_seed = (
+                f"globalThis.context = {{work_id: '{work_id}', phase: 'implement', "
+                f"tasks_dir: '{tasks_dir}', impl_dir: '{impl_dir}', "
+                f"mode: 'legacy'}};\n\n"
+            )
 
         rework_prefix = ""
         if retry_count > 0:
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior implementation. Address all points from the critic feedback.\n\n"
-
-        from spine.agents.artifacts import list_slice_files
-        slice_files = list_slice_files(workspace_root, work_id)
-        slice_count = len(slice_files)
-
-        if slice_count == 1:
-            dispatch_note = (
-                "There is 1 slice. Dispatch a single `slice-implementer` for "
-                "consistency — same context-management benefit, no orchestrator "
-                "drift between work items."
-            )
-        elif slice_count >= 2:
-            dispatch_note = (
-                f"There are {slice_count} slices. Dispatch all of them in "
-                "parallel via `Promise.allSettled(tools.task(...))` inside a "
-                "single `eval` call. Do NOT dispatch sequentially — the whole "
-                "point of subagent dispatch is parallel isolated contexts."
-            )
-        else:
-            dispatch_note = (
-                "No slices were pre-discovered. Call `read_slice_files` — it will "
-                "return whatever slice files exist. If it returns none, write a "
-                "`write_implementation_report` with an empty slice_results list "
-                "and a summary explaining the tasks phase produced no slices."
-            )
 
         has_spec = "spec" in work_type
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
@@ -119,22 +238,45 @@ async def call_implement(
             "production-quality code for each slice.",
             "",
             "## Task Input",
-            "Work from the feature slice files and codebase map produced by the TASKS phase.",
         ]
+        if has_waves:
+            prompt_lines.extend(
+                [
+                    "Work from the plan artifacts produced by the PLAN phase.",
+                    f"- Plan: `{plan_path}/plan.md`",
+                    f"- Structured plan (JSON): `{plan_json_path}`",
+                    f"- Codebase map: included in `{plan_json_path}` under `codebase_map`",
+                    "",
+                    "The `plan.json` file contains structured `feature_slices` with "
+                    "id, title, target_files, execution_requirements, dependencies, "
+                    "acceptance_criteria, and complexity for each slice.",
+                ]
+            )
+        else:
+            prompt_lines.extend(
+                [
+                    "Work from the feature slice files and codebase map produced by the TASKS phase.",
+                ]
+            )
         if has_spec:
             prompt_lines.extend(
                 [
                     f"- Specification: `{spec_path}/specification.md`",
+                ]
+            )
+        if not has_waves:
+            prompt_lines.extend(
+                [
                     f"- Plan: `{plan_path}/plan.md`",
+                    f"- Feature Slices: `{tasks_path}/tasks.md` and each `slice-*.md`",
+                    f"- Codebase map: `{tasks_path}/codebase-map.md`",
                 ]
             )
         prompt_lines.extend(
             [
-                f"- Feature Slices: `{tasks_path}/tasks.md` and each `slice-*.md`",
-                f"- Codebase map: `{tasks_path}/codebase-map.md`",
                 "",
                 "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
-                "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
+                "discovered during planning. Use it instead of re-exploring the codebase.",
                 "",
                 "## Step 2 Guidelines",
                 dispatch_note,

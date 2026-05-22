@@ -399,6 +399,208 @@ class WritePlanTool(BaseTool):
         return self._run(**kwargs)
 
 
+# ── write_structured_plan ─────────────────────────────────────────────────
+
+_REQUIRED_SLICE_KEYS = {
+    "id",
+    "title",
+    "target_files",
+    "execution_requirements",
+    "dependencies",
+    "acceptance_criteria",
+    "complexity",
+}
+
+
+class _FeatureSliceInput(BaseModel):
+    """Schema for a single feature slice within a structured plan."""
+
+    id: str = Field(description="Unique identifier for the slice, e.g. 'add-user-auth'.")
+    title: str = Field(description="Human-readable title for the slice.")
+    target_files: list[str] = Field(
+        description="Files to modify or create for this slice.",
+        default_factory=list,
+    )
+    execution_requirements: str = Field(
+        description="What must be done to implement this slice.",
+    )
+    dependencies: list[str] = Field(
+        description="IDs of other slices this depends on (empty if none).",
+        default_factory=list,
+    )
+    acceptance_criteria: list[str] = Field(
+        description="Measurable criteria for this slice to be considered complete.",
+        min_length=1,
+    )
+    complexity: str = Field(
+        description="One of: small, medium, large.",
+        default="medium",
+    )
+
+
+class _StructuredWritePlanInput(BaseModel):
+    architecture_overview: str = Field(
+        description=(
+            "Components, data flow, and interfaces. Include a diagram or "
+            "structured breakdown of how the pieces fit together."
+        )
+    )
+    technology_choices: str = Field(
+        description="Technology/library choices with rationale."
+    )
+    feature_slices: list[dict[str, Any]] = Field(
+        description=(
+            "Array of feature slices. Each must have: id, title, target_files, "
+            "execution_requirements, dependencies, acceptance_criteria, complexity."
+        ),
+        min_length=1,
+    )
+    testing_strategy: str = Field(
+        description=(
+            "Test approach: which tests to add/modify, test file paths, "
+            "and how to verify correctness."
+        )
+    )
+    risks: str = Field(
+        default="",
+        description="Known risks, edge cases, or open questions. Optional.",
+    )
+    codebase_map: str = Field(
+        default="",
+        description=(
+            "Structured map of relevant codebase files, functions, and conventions "
+            "discovered during research."
+        ),
+    )
+
+
+class StructuredWritePlanTool(BaseTool):
+    """Write both plan.md (narrative) and plan.json (structured) artifacts.
+
+    Extends the plan output with a ``feature_slices`` array that captures
+    decomposition, dependencies, and acceptance criteria per slice.  The
+    human-readable ``plan.md`` is written alongside a machine-readable
+    ``plan.json`` so downstream phases (TASKS, IMPLEMENT) can consume
+    structured data without re-parsing markdown.
+    """
+
+    name: str = "write_structured_plan"
+    description: str = (
+        "Write the plan artifacts (plan.md + plan.json) with structured "
+        "feature slices. Use this instead of write_plan when you want to "
+        "include a slice decomposition with dependencies. Call after research "
+        "is complete."
+    )
+    args_schema: Optional[ArgsSchema] = _StructuredWritePlanInput
+
+    workspace_root: str = ""
+    plan_dir: str = ""
+
+    def _run(
+        self,
+        architecture_overview: str,
+        technology_choices: str,
+        feature_slices: list[dict[str, Any]],
+        testing_strategy: str,
+        risks: str = "",
+        codebase_map: str = "",
+    ) -> str:
+        # ── Validate feature_slices structure ─────────────────────────
+        validated_slices: list[_FeatureSliceInput] = []
+        errors: list[str] = []
+        for idx, sl in enumerate(feature_slices):
+            if not isinstance(sl, dict):
+                errors.append(f"Slice at index {idx} is not a dict.")
+                continue
+            missing = _REQUIRED_SLICE_KEYS - set(sl.keys())
+            if missing:
+                errors.append(
+                    f"Slice at index {idx} is missing keys: {', '.join(sorted(missing))}."
+                )
+                continue
+            try:
+                validated_slices.append(_FeatureSliceInput(**sl))
+            except Exception as exc:
+                errors.append(f"Slice at index {idx} validation error: {exc}")
+
+        if errors:
+            return "ERROR: Invalid feature_slices:\n" + "\n".join(errors)
+
+        # ── Prepare output directory ──────────────────────────────────
+        plan_path = Path(self.workspace_root) / self.plan_dir
+        plan_path.mkdir(parents=True, exist_ok=True)
+
+        # ── Build plan.md (narrative) ─────────────────────────────────
+        lines = [
+            "# Technical Plan\n",
+            "\n## Architecture Overview\n",
+            f"{architecture_overview.strip()}\n",
+            "\n## Technology Choices\n",
+            f"{technology_choices.strip()}\n",
+            "\n## Feature Slices\n",
+        ]
+
+        for sl in validated_slices:
+            deps = ", ".join(sl.dependencies) if sl.dependencies else "none"
+            lines.append(f"\n### {sl.id}: {sl.title}\n")
+            lines.append(f"**Complexity:** {sl.complexity}  \n")
+            lines.append(f"**Dependencies:** {deps}  \n")
+            lines.append(f"**Target files:** {', '.join(sl.target_files) or 'TBD'}\n\n")
+            lines.append(f"{sl.execution_requirements.strip()}\n\n")
+            lines.append("**Acceptance Criteria:**\n")
+            for ac in sl.acceptance_criteria:
+                lines.append(f"- {ac}\n")
+
+        lines.append("\n## Testing Strategy\n")
+        lines.append(f"{testing_strategy.strip()}\n")
+
+        if risks.strip():
+            lines.append("\n## Risks & Open Questions\n")
+            lines.append(f"{risks.strip()}\n")
+
+        if codebase_map.strip():
+            lines.append("\n## Codebase Map\n")
+            lines.append(f"{codebase_map.strip()}\n")
+
+        md_content = "".join(lines)
+
+        # ── Build plan.json (structured) ──────────────────────────────
+        json_data: dict[str, Any] = {
+            "architecture_overview": architecture_overview.strip(),
+            "technology_choices": technology_choices.strip(),
+            "feature_slices": [sl.model_dump() for sl in validated_slices],
+            "testing_strategy": testing_strategy.strip(),
+            "risks": risks.strip(),
+            "codebase_map": codebase_map.strip(),
+        }
+        json_content = json.dumps(json_data, indent=2, ensure_ascii=False)
+
+        # ── Write files ───────────────────────────────────────────────
+        md_path = plan_path / "plan.md"
+        json_path = plan_path / "plan.json"
+
+        try:
+            md_path.write_text(md_content, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: Could not write plan.md: {exc}"
+
+        try:
+            json_path.write_text(json_content, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: Could not write plan.json: {exc}"
+
+        slice_count = len(validated_slices)
+        return (
+            f"Plan artifacts written: {self.plan_dir}/plan.md "
+            f"({len(md_content)} chars), {self.plan_dir}/plan.json "
+            f"({len(json_content)} chars). "
+            f"{slice_count} feature slice(s) included."
+        )
+
+    async def _arun(self, **kwargs: Any) -> str:
+        return self._run(**kwargs)
+
+
 # ── Factory ───────────────────────────────────────────────────────────────
 
 
@@ -412,10 +614,12 @@ def build_plan_agent_tools(
 ) -> list[BaseTool]:
     """Build the custom tool set for the plan agent.
 
-    Returns three tools:
+    Returns four tools:
     - ``read_prior_artifacts``: loads spec + context in one call
     - ``search_codebase``: targeted multi-query file search
-    - ``write_plan``: structured write to plan.md
+    - ``write_plan``: structured write to plan.md (narrative only)
+    - ``write_structured_plan``: structured write to plan.md + plan.json
+      with feature slices and dependencies
 
     Together with ``eval`` (CodeInterpreterMiddleware), these replace all
     generic filesystem tools. No ls/glob/grep/read_file/write_file exposed.
@@ -430,7 +634,7 @@ def build_plan_agent_tools(
         feedback: List of prior feedback strings (for rework passes).
 
     Returns:
-        List of three BaseTool instances.
+        List of four BaseTool instances.
     """
     plan_dir = f".spine/artifacts/{work_id}/plan"
 
@@ -448,6 +652,10 @@ def build_plan_agent_tools(
             workspace_root=workspace_root,
         ),
         WritePlanTool(
+            workspace_root=workspace_root,
+            plan_dir=plan_dir,
+        ),
+        StructuredWritePlanTool(
             workspace_root=workspace_root,
             plan_dir=plan_dir,
         ),

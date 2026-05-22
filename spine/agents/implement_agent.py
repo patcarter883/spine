@@ -97,24 +97,49 @@ def build_implement_agent(
     workspace_root = state.get("workspace_root", ".")
     tasks_dir = f".spine/artifacts/{work_id}/tasks"
 
-    # ── Discover slice files at build time ────────────────────────────
-    # Inject the inventory directly into the prompt so the orchestrator
-    # does not need to spend a turn discovering slices via ls/glob.
-    slice_files = list_slice_files(workspace_root, work_id)
-    slice_count = len(slice_files)
+    # ── Determine dispatch mode: waves (preferred) or legacy ──────────
+    # When execution_waves is present in state (produced by the PLAN
+    # scheduler), slices come from plan.json and are dispatched per wave
+    # (parallel within, sequential across). Otherwise fall back to
+    # discovering slice-*.md files from the tasks/ directory.
+    execution_waves = state.get("execution_waves")
+    has_waves = bool(execution_waves)
 
-    if slice_count == 0:
+    if has_waves:
+        total_slices = sum(len(wave) for wave in execution_waves)
+        wave_count = len(execution_waves)
+        plan_dir = f".spine/artifacts/{work_id}/plan"
+        plan_json_path = f"{plan_dir}/plan.json"
         slice_inventory = (
-            "⚠ No slice-*.md files found in tasks/ directory. "
-            "Use `ls` + `glob` to locate slice files before proceeding."
+            f"{total_slices} slice(s) in {wave_count} execution wave(s) "
+            f"from `{plan_json_path}`.\n"
+            "Slices within each wave are independent (parallel); "
+            "waves run sequentially.\n"
         )
+        for i, wave in enumerate(execution_waves):
+            slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
+            slice_inventory += (
+                f"  Wave {i + 1}: {', '.join(slice_ids)} "
+                f"({len(wave)} slice(s))\n"
+            )
     else:
-        slice_inventory = (
-            f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
-            + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
-        )
+        # Legacy fallback: discover slice-*.md files from tasks/ dir
+        slice_files = list_slice_files(workspace_root, work_id)
+        slice_count = len(slice_files)
+        if slice_count == 0:
+            slice_inventory = (
+                "⚠ No slice-*.md files found in tasks/ directory. "
+                "Use `ls` + `glob` to locate slice files before proceeding."
+            )
+        else:
+            slice_inventory = (
+                f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
+                + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
+            )
 
-    system_prompt = _build_orchestrator_prompt() + build_current_phase_write_prompt(
+    system_prompt = _build_orchestrator_prompt(has_waves=has_waves)
+    system_prompt += slice_inventory + "\n\n"
+    system_prompt += build_current_phase_write_prompt(
         work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]
     ) + build_artifact_prompt(
         state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
@@ -147,12 +172,86 @@ def build_implement_agent(
 # ── Prompt builder ─────────────────────────────────────────────────────
 
 
-def _build_orchestrator_prompt() -> str:
+def _build_orchestrator_prompt(*, has_waves: bool = False) -> str:
     """Build the orchestrator system prompt.
 
     Kept under ~3KB so the bulk of the prompt is the SPINE base prompt
     and per-call AGENTS.md memory injection, not phase boilerplate.
+
+    Args:
+        has_waves: When True, the orchestrator works from plan.json
+            execution_waves (parallel within wave, sequential across
+            waves). When False, falls back to the legacy flat-parallel
+            dispatch from tasks/slice-*.md files.
     """
+    if has_waves:
+        return _build_wave_orchestrator_prompt()
+    return _build_legacy_orchestrator_prompt()
+
+
+def _build_wave_orchestrator_prompt() -> str:
+    """Orchestrator prompt for wave-based dispatch (plan.json mode)."""
+    return (
+        "You are the IMPLEMENT phase orchestrator. You do NOT write source "
+        "code yourself — you dispatch one `slice-implementer` subagent per "
+        "feature slice and synthesize their results.\n\n"
+        "## Your tool surface (complete list)\n"
+        "- `read_slice_files` — loads slice definitions + codebase map "
+        "in ONE call. No arguments needed. Call this FIRST.\n"
+        "- `write_implementation_report` — writes implementation.md. Call "
+        "this LAST after all subagents complete.\n"
+        "- `task` (via eval) — dispatches a slice-implementer subagent.\n"
+        "- `eval` — JavaScript REPL for subagent dispatch.\n\n"
+        "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
+        "`edit_file`, or `execute`. These tools do not exist in your session. "
+        "Do not attempt to call them. There is nothing to explore — "
+        "`read_slice_files` gives you everything you need.\n\n"
+        "## Dispatch mode: execution waves\n"
+        "Slices come from plan.json and are organized into execution waves. "
+        "Slices within a wave are independent and MUST run in parallel. "
+        "Waves MUST run sequentially — do not start wave N+1 until all "
+        "slices in wave N are complete.\n\n"
+        "## Workflow\n\n"
+        "### Step 1 — Call read_slice_files (1 turn)\n"
+        "Call `read_slice_files` with no arguments. It returns slice data "
+        "and the codebase map.\n"
+        "Store the result in eval: `globalThis.planData = result;`\n\n"
+        "### Step 2 — Dispatch subagents per wave\n"
+        "Refer to Step 2 guidelines preloaded in your user prompt. "
+        "Wave dispatch instructions are there.\n\n"
+        "Each task description MUST be fully self-contained — the subagent "
+        "has an empty context and cannot see your conversation. Embed the "
+        "full slice definition (from plan.json), relevant codebase map "
+        "sections, files to modify, dependencies, and acceptance criteria.\n\n"
+        "### Step 3 — Call write_implementation_report (1 turn)\n"
+        "Parse globalThis.sliceResults and call `write_implementation_report` "
+        "with:\n"
+        "- `slice_results`: list of dicts, one per slice, each with "
+        "`slice_name`, `status` (implemented|partial|blocked), "
+        "`files_modified`, `files_created`, `test_results`, `issues`\n"
+        "- `summary`: overall summary of what was implemented\n\n"
+        "## Strict Rules\n"
+        "- You MUST call `read_slice_files` FIRST. Do not skip it.\n"
+        "- You MUST dispatch one `slice-implementer` subagent per slice. "
+        "Do not attempt to implement slices yourself.\n"
+        "- The ONLY valid `subagent_type` is `slice-implementer`.\n"
+        "- Slices within a wave MUST be dispatched in parallel via "
+        "`Promise.allSettled`. Waves must be sequential.\n"
+        "- You MUST call `write_implementation_report` to complete the phase. "
+        "Without it the phase has no artifact and fails.\n"
+        "- Total turns: ~3. More than 5 turns without dispatching subagents "
+        "means something has gone wrong — stop and write the report with "
+        "whatever results you have.\n\n"
+        "## Eval context seed\n"
+        "Access session-specific context properties via `globalThis.context` "
+        "preloaded in your workspace environment on first turn (e.g., "
+        "use `globalThis.context.work_id`, `globalThis.context.plan_json`, "
+        "or `globalThis.execution_waves` inside eval).\n\n"
+    )
+
+
+def _build_legacy_orchestrator_prompt() -> str:
+    """Orchestrator prompt for legacy flat-parallel dispatch (tasks mode)."""
     return (
         "You are the IMPLEMENT phase orchestrator. You do NOT write source "
         "code yourself — you dispatch one `slice-implementer` subagent per "
@@ -187,23 +286,6 @@ def _build_orchestrator_prompt() -> str:
         "— the subagent has an empty context and cannot see your conversation. "
         "Embed the full slice content, relevant codebase map sections, files "
         "to modify, and acceptance criteria.\n\n"
-        "Dispatch pattern:\n"
-        "```js\n"
-        "// Step 1 result is in globalThis.slices\n"
-        "const data = globalThis.slices;\n"
-        "const map = data.codebase_map || '';\n"
-        "const dispatches = Object.entries(data.slices).map(([name, content]) =>\n"
-        "  tools.task({\n"
-        '    subagent_type: "slice-implementer",\n'
-        "    description: `Implement slice: ${name}\\n\\n"
-        "## Slice Definition\\n${content}\\n\\n"
-        "## Codebase Map\\n${map}`,\n"
-        "  })\n"
-        ");\n"
-        "const results = await Promise.allSettled(dispatches);\n"
-        "globalThis.sliceResults = results;\n"
-        "console.log(JSON.stringify(results.map(r => r.status)));\n"
-        "```\n\n"
         "### Step 3 — Call write_implementation_report (1 turn)\n"
         "Parse globalThis.sliceResults and call `write_implementation_report` "
         "with:\n"

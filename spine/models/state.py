@@ -90,3 +90,6 @@ class WorkflowState(TypedDict, total=False):
     spawned_work_ids: Annotated[list[str], operator.add]  # IDs of execution work
     # items spawned from this planning item. Empty for standalone execution items
     # and for planning items that haven't been approved yet.
+    execution_waves: list[list[dict]]  # Pre-sorted waves of slice dicts from the
+    # scheduler, consumed by IMPLEMENT to dispatch slices in dependency order.
+    # Each inner list is one wave of independent slices that can run concurrently.
