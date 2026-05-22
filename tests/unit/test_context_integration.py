@@ -21,7 +21,6 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from spine.agents.context_editing import ToolOutputTrimmer
-from spine.agents.factory import _add_summarization_middleware
 from spine.agents.interpreter import _PTC_ALLOWLISTS
 from spine.agents.subagents import SUBAGENT_PROMPTS
 from spine.agents.tool_schema_validator import ToolSchemaValidator
@@ -316,40 +315,7 @@ class TestEditFileEmptyOldString:
         assert result == "executed"
 
 
-# ── 3. Summarization trigger is 60K ─────────────────────────────────────
-
-
-class TestSummarizationTrigger:
-    """Verify the factory builds the summarization middleware with 60K trigger."""
-
-    def test_trigger_value_in_source(self) -> None:
-        """The _add_summarization_middleware source must contain 60000."""
-        source = inspect.getsource(_add_summarization_middleware)
-        assert "60000" in source, (
-            'Summarization trigger should be 60K tokens — expected trigger=("tokens", 60000)'
-        )
-
-    def test_trigger_not_80k(self) -> None:
-        """The old 80K trigger should no longer be present."""
-        source = inspect.getsource(_add_summarization_middleware)
-        assert "80000" not in source, "Summarization trigger should be 60K, not 80K"
-
-    def test_keep_window_is_20_messages(self) -> None:
-        """The keep window should be 20 messages."""
-        source = inspect.getsource(_add_summarization_middleware)
-        assert 'keep=("messages", 20)' in source or 'keep=("messages", 20)' in source, (
-            "Summarization keep window should be 20 messages"
-        )
-
-    def test_custom_summary_prompt_used(self) -> None:
-        """The factory must pass _SPINE_SUMMARY_PROMPT to the middleware."""
-        source = inspect.getsource(_add_summarization_middleware)
-        assert "_SPINE_SUMMARY_PROMPT" in source or "summary_prompt" in source, (
-            "Summarization middleware must use the custom SPINE summary prompt"
-        )
-
-
-# ── 4. PTC allowlist excludes read_file ─────────────────────────────────
+# ── 3. PTC allowlist excludes read_file ─────────────────────────────────
 
 
 class TestPTCAllowlistExcludesReadFile:
@@ -396,7 +362,7 @@ class TestPTCAllowlistExcludesReadFile:
             )
 
 
-# ── 5. codebase-map prompt enrichment ───────────────────────────────────
+# ── 4. codebase-map prompt enrichment ───────────────────────────────────
 
 
 class TestCodebaseMapPromptEnrichment:
@@ -435,7 +401,7 @@ class TestCodebaseMapPromptEnrichment:
         assert "codebase-map" in source, "Tasks agent prompt must reference codebase-map.md"
 
 
-# ── 6. Researcher minimum output requirements ───────────────────────────
+# ── 5. Researcher minimum output requirements ───────────────────────────
 
 
 class TestResearcherMinOutput:

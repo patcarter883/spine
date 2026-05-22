@@ -565,7 +565,7 @@ def build_subagent_spec(
     # leaf sub-agents (slice-implementer / slice-verifier) critically needed,
     # directly causing the 40+:1 prompt:completion ratios seen in traces
     # 019e486e… and 019e488f….
-    # Context control now comes ONLY from tight system prompts + summarization.
+    # Context control now comes ONLY from tight system prompts + read cache.
     subagent_middleware: list[Any] = []
 
     spec: dict[str, Any] = {

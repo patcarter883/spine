@@ -54,13 +54,13 @@ class TestInterruptRouter:
         assert self.router(state) == "plan"
 
     def test_router_approve(self):
-        # In critical_spec: tasks is at index 4, next is critic_tasks
+        # In critical_spec: plan is at index 2, next is critic_plan
         state = {
             "human_feedback": {"action": "approve"},
-            "needs_review_phase": "tasks",
+            "needs_review_phase": "plan",
         }
         result = self.router(state)
-        assert result == "critic_tasks"
+        assert result == "critic_plan"
 
     def test_router_abort_default(self):
         state = {"human_feedback": {}}

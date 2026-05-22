@@ -6,7 +6,8 @@ and phase-internal state don't leak into the parent graph's state.
 
 from __future__ import annotations
 
-from typing import Any
+from operator import add as _op_add
+from typing import Annotated, Any
 
 from typing_extensions import TypedDict
 
@@ -18,7 +19,7 @@ class BaseSubgraphState(TypedDict, total=False):
     work_id: str
     work_type: str
     description: str  # Only used by SPECIFY (always) and TASKS (quick workflows).
-                      # Other phases work from prior artifacts on disk.
+    # Other phases work from prior artifacts on disk.
     workspace_root: str
     retry_count: int
     feedback: list
@@ -32,9 +33,12 @@ class SpecifySubgraphState(BaseSubgraphState, total=False):
 
 
 class PlanSubgraphState(BaseSubgraphState, total=False):
-    """PLAN phase — reads spec, produces plan.md."""
+    """PLAN phase — reads spec (if available), produces plan.md + plan.json."""
 
-    spec_path: str
+    spec_path: str  # None for quick workflows (no SPECIFY phase)
+    has_spec: bool  # True when a specification artifact exists
+    plan_json: str  # Raw plan.json content (set by run_agent, read by save_artifacts)
+    execution_waves: list  # Computed after agent completes (for IMPLEMENT)
 
 
 class TasksSubgraphState(BaseSubgraphState, total=False):
@@ -45,9 +49,10 @@ class TasksSubgraphState(BaseSubgraphState, total=False):
 
 
 class ImplementSubgraphState(BaseSubgraphState, total=False):
-    """IMPLEMENT phase — reads tasks, writes code."""
+    """IMPLEMENT phase — reads plan artifacts, dispatches slice-implementers."""
 
-    tasks_path: str
+    plan_path: str
+    execution_waves: list  # Execution waves from PLAN phase (for wave dispatch)
 
 
 class VerifySubgraphState(BaseSubgraphState, total=False):
@@ -63,3 +68,24 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
 
     reviewed_phase: str
     reviewed_phase_path: str
+
+
+class ExplorationSubgraphState(BaseSubgraphState, total=False):
+    """Multi-node exploration → synthesis subgraph (SPECIFY, PLAN).
+
+    Accumulates findings across parallel explore rounds via
+    ``operator.add``, then routes to synthesis when research
+    is sufficient.
+    """
+
+    # Exploration loop control
+    research_round: int  # Current round number (0-based)
+    max_rounds: int  # Safety valve — max exploration rounds (default 3)
+    manager_decision: str  # "explore" | "done" — set by research_manager
+
+    # Accumulated research (operator.add reducer merges per-round findings)
+    topics: Annotated[list[str], _op_add]  # Areas being explored this round
+    findings: Annotated[list[dict], _op_add]  # ResearchFindings dicts from explore nodes
+
+    # Synthesis output
+    agent_response: str  # Final spec/plan text from synthesizer

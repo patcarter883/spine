@@ -1025,6 +1025,22 @@ wheels = [
 ]
 
 [[package]]
+name = "langgraph-cli"
+version = "0.4.26"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "httpx" },
+    { name = "langgraph-sdk" },
+    { name = "pathspec" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5d/94/6864c94fcc998d7b72f60a4166222f003483426446a10979c0215220dd65/langgraph_cli-0.4.26.tar.gz", hash = "sha256:d81867e45bc198f4c61a4064e8f347aba9e6ffa256db387d8daae594c59bf0f6", size = 1031744, upload-time = "2026-05-12T00:28:14.679Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/bc/04c66e9433e9cb2e9a764bbe08abda949224c214783aab5cb213fcabdd59/langgraph_cli-0.4.26-py3-none-any.whl", hash = "sha256:01a364b3e1b0efcef936d7a6608bd7b2c9372fbcd00e98762f44b2335696985b", size = 77464, upload-time = "2026-05-12T00:28:13.075Z" },
+]
+
+[[package]]
 name = "langgraph-prebuilt"
 version = "1.0.13"
 source = { registry = "https://pypi.org/simple" }
@@ -2573,6 +2589,7 @@ dependencies = [
     { name = "langchain-quickjs" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
+    { name = "langgraph-cli" },
     { name = "langgraph-supervisor" },
     { name = "mcp" },
     { name = "mcp-codebase-index" },
@@ -2610,6 +2627,7 @@ requires-dist = [
     { name = "langchain-quickjs", specifier = ">=0.1.0" },
     { name = "langgraph", specifier = ">=0.4.0" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.0.0" },
+    { name = "langgraph-cli", specifier = ">=0.4.26" },
     { name = "langgraph-supervisor", specifier = ">=0.0.13" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "mcp-codebase-index", specifier = ">=0.1.1" },

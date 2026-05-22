@@ -377,19 +377,6 @@ class TestAgentBuilderIntegration:
     @patch("spine.agents.factory.interpreter_enabled", return_value=False)
     @patch("spine.agents.factory.create_agent")
     @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
-    def test_implement_agent_requests_summarization(
-        self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
-    ) -> None:
-        """implement_agent should request summarization middleware."""
-        mock_ca.return_value = _mock_create_agent()
-        from spine.agents.implement_agent import build_implement_agent
-
-        build_implement_agent(_make_state(current_phase="implement"))
-        assert mock_ca.called
-
-    @patch("spine.agents.factory.interpreter_enabled", return_value=False)
-    @patch("spine.agents.factory.create_agent")
-    @patch("langchain_openrouter.chat_models.ChatOpenRouter.__init__", return_value=None)
     def test_agent_context_schema_is_spine_context(
         self, mock_or: MagicMock, mock_ca: MagicMock, mock_enabled: MagicMock
     ) -> None:

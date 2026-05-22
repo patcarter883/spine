@@ -75,10 +75,10 @@ class TestParentGraphWithSubgraphs:
         graph = build_workflow_graph("quick")
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
-        assert "tasks" in nodes
+        assert "plan" in nodes
         assert "implement" in nodes
         assert "verify" in nodes
-        assert "gate_tasks_to_implement" in nodes
+        assert "gate_plan_to_implement" in nodes
         # All phases should be subgraph nodes now
         assert any(n.startswith("gate_") for n in nodes)
 
@@ -87,8 +87,8 @@ class TestParentGraphWithSubgraphs:
         graph = build_workflow_graph("critical_quick")
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
-        assert "tasks" in nodes
-        assert "critic_tasks" in nodes
+        assert "plan" in nodes
+        assert "critic_plan" in nodes
         assert "implement" in nodes
         assert "verify" in nodes
 
@@ -100,7 +100,6 @@ class TestParentGraphWithSubgraphs:
         assert "specify" in nodes
         assert "plan" in nodes
         assert "critic_plan" in nodes
-        assert "tasks" in nodes
         assert "implement" in nodes
         assert "verify" in nodes
 
@@ -113,8 +112,6 @@ class TestParentGraphWithSubgraphs:
         assert "critic_specify" in nodes
         assert "plan" in nodes
         assert "critic_plan" in nodes
-        assert "tasks" in nodes
-        assert "critic_tasks" in nodes
         assert "implement" in nodes
         assert "verify" in nodes
 
@@ -123,7 +120,7 @@ class TestParentGraphWithSubgraphs:
         graph = build_workflow_graph("quick")
         mermaid = graph.get_graph().draw_mermaid()
         # All nodes should appear in the mermaid output
-        assert "tasks" in mermaid
+        assert "plan" in mermaid
         assert "implement" in mermaid
         assert "verify" in mermaid
 
@@ -163,6 +160,15 @@ class TestSubgraphStateMappers:
         result = _plan_state_mapper(parent, None)
         assert result["phase"] == "plan"
         assert result["spec_path"] == ".spine/artifacts/def/specify"
+        assert result["has_spec"] is True
+
+    def test_plan_state_mapper_quick(self):
+        from spine.workflow.compose import _plan_state_mapper
+        parent = {"work_id": "def", "work_type": "quick", "description": "d"}
+        result = _plan_state_mapper(parent, None)
+        assert result["phase"] == "plan"
+        assert result["spec_path"] == ""
+        assert result["has_spec"] is False
 
     def test_tasks_state_mapper_quick(self):
         from spine.workflow.compose import _tasks_state_mapper
@@ -184,7 +190,7 @@ class TestSubgraphStateMappers:
         parent = {"work_id": "abc", "work_type": "quick", "description": "d"}
         result = _implement_state_mapper(parent, None)
         assert result["phase"] == "implement"
-        assert result["tasks_path"] == ".spine/artifacts/abc/tasks"
+        assert result["plan_path"] == ".spine/artifacts/abc/plan"
 
     def test_critic_state_mapper(self):
         from spine.workflow.compose import _critic_state_mapper
@@ -275,7 +281,7 @@ class TestGraphBackwardsCompatibility:
             graph = build_workflow_graph("quick")
             assert graph is not None
             nodes = set(graph.get_graph().nodes.keys())
-            assert "tasks" in nodes
+            assert "plan" in nodes
             assert "implement" in nodes
             assert "verify" in nodes
         finally:

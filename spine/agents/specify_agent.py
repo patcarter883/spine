@@ -77,7 +77,6 @@ def build_specify_agent(
         phase=PhaseName.SPECIFY,
         system_prompt=system_prompt,
         subagents=_build_subagents(PhaseName.SPECIFY, state, config),
-        add_summarization=True,
         extra_tools=orchestrator_tools,
         skip_filesystem_middleware=True,
     )

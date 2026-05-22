@@ -5,6 +5,10 @@ The subgraph has two internal nodes:
 2. ``save_artifacts`` — scans disk for artifacts, determines phase status.
 
 State schema: ``ImplementSubgraphState`` — isolated from parent ``WorkflowState``.
+
+For quick workflows (no SPECIFY/TASKS phase), the agent works from
+``plan/plan.md`` and ``plan/plan.json`` artifacts produced by PLAN.
+For spec workflows, it also has ``specify/specification.md`` available.
 """
 
 import logging
@@ -44,6 +48,8 @@ async def _run_implement_agent(
     workspace_root = state.get("workspace_root", ".")
     retry_count = state.get("retry_count", 0)
     feedback = state.get("feedback", [])
+    execution_waves = state.get("execution_waves", [])
+    has_waves = bool(execution_waves)
 
     logger.info(f"[{work_id}] IMPLEMENT subgraph: run_agent starting")
 
@@ -52,51 +58,84 @@ async def _run_implement_agent(
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
         has_spec = "spec" in work_type
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
 
         prompt_lines = [
             "Implement the feature slices described below. Write clean, "
             "production-quality code for each slice.",
             "",
         ]
+
         if has_spec:
-            prompt_lines.extend([
-                "Prior artifacts are available on disk — read them as needed:",
-                f"- Specification: `{spec_path}/specification.md`",
-                f"- Plan: `{plan_path}/plan.md`",
-                f"- Feature Slices: `{tasks_path}/tasks.md`",
-                f"- Codebase map: `{tasks_path}/codebase-map.md`",
-                "",
-            ])
+            spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
+            tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
+            prompt_lines.extend(
+                [
+                    "Prior artifacts are available on disk — read them as needed:",
+                    f"- Specification: `{spec_path}/specification.md`",
+                    f"- Plan: `{plan_path}/plan.md`",
+                    f"- Feature Slices: `{tasks_path}/tasks.md`",
+                    f"- Codebase map: `{tasks_path}/codebase-map.md`",
+                    "",
+                ]
+            )
         else:
-            prompt_lines.extend([
-                "Prior artifacts are available on disk — read them as needed:",
-                f"- Feature Slices: `{tasks_path}/tasks.md`",
-                f"- Codebase map: `{tasks_path}/codebase-map.md`",
-                "",
-            ])
+            prompt_lines.extend(
+                [
+                    "Prior artifacts are available on disk — read them as needed:",
+                    f"- Plan (narrative): `{plan_path}/plan.md`",
+                    f"- Structured plan (JSON): `{plan_path}/plan.json`",
+                    "",
+                    "The `plan.json` file contains structured `feature_slices` with "
+                    "id, title, target_files, execution_requirements, dependencies, "
+                    "acceptance_criteria, and complexity for each slice.",
+                    "",
+                ]
+            )
+
         impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
-        prompt_lines.extend([
-            "Use `read_file` and `grep` to inspect them. Do NOT load "
-            "everything into context at once.",
-            "",
-            "Read the codebase map FIRST — it contains file paths, key functions, and conventions "
-            "discovered during the tasks phase. Use it instead of re-exploring the codebase.",
-            "",
-            "## Where to Write Your Output",
-            f"Write a summary of what you implemented to `{impl_path}/implementation.md` "
-            "using `write_file`. List every file you created or modified, with a one-line "
-            "description of each change.  This file is REQUIRED — without it, the workflow "
-            "treats the phase as failed.",
-            "",
-        ])
+        prompt_lines.extend(
+            [
+                "Use `read_file` and `grep` to inspect them. Do NOT load "
+                "everything into context at once.",
+                "",
+            ]
+        )
+        if has_waves:
+            prompt_lines.extend(
+                [
+                    "Execution waves have been pre-computed from the plan — slices are "
+                    "organized into waves where slices within a wave are independent "
+                    "and can run in parallel. Dispatch slice-implementer subagents "
+                    "per wave (parallel within wave, sequential across waves).",
+                    "",
+                ]
+            )
+        else:
+            prompt_lines.extend(
+                [
+                    "Read the codebase map FIRST — it contains file paths, key functions, "
+                    "and conventions discovered during planning. Use it instead of "
+                    "re-exploring the codebase.",
+                    "",
+                ]
+            )
+        prompt_lines.extend(
+            [
+                "## Where to Write Your Output",
+                f"Write a summary of what you implemented to `{impl_path}/implementation.md` "
+                "using `write_file`. List every file you created or modified, with a one-line "
+                "description of each change.  This file is REQUIRED — without it, the workflow "
+                "treats the phase as failed.",
+                "",
+            ]
+        )
         prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
-                for f in feedback if isinstance(f, dict)
+                for f in feedback
+                if isinstance(f, dict)
             )
             prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
@@ -142,7 +181,9 @@ async def _save_implement_artifacts(
         }
 
     disk_artifacts = scan_artifact_dir(
-        workspace_root, work_id, PhaseName.IMPLEMENT.value,
+        workspace_root,
+        work_id,
+        PhaseName.IMPLEMENT.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
     )
 

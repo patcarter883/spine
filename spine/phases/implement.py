@@ -8,8 +8,7 @@ sequentially (later waves depend on earlier ones).
 Prior artifacts are NOT inlined — the agent reads them on demand from
 the filesystem.
 
-Context engineering: summarization middleware enabled for long-running
-multi-slice implementation.
+Context engineering: read cache prevents re-reading files across subagent turns.
 
 Phase node functions are async to avoid event-loop binding errors when
 subagents inherit the parent checkpointer.

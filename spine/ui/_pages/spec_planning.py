@@ -13,7 +13,6 @@ import asyncio
 
 import streamlit as st
 
-from spine.models.enums import TaskStatus
 from spine.ui_api import UIApi
 
 
@@ -138,7 +137,6 @@ def _render_planning_item(api: UIApi, item: dict) -> None:
     work_id = item.get("id", "unknown")
     status = item.get("status", "unknown")
     description = item.get("description", "No description")
-    created_at = item.get("created_at", "unknown")
 
     with st.container(border=True):
         col1, col2 = st.columns([3, 1])
@@ -195,8 +193,14 @@ def _render_approval_actions(api: UIApi, work_id: str, status: str) -> None:
                 result = asyncio.run(api.approve_plan(work_id, action="approve"))
                 if "error" in result:
                     st.error(f"Failed: {result['error']}")
+                elif result.get("status") == "error":
+                    st.error(f"Failed: {result.get('error', 'Unknown error')}")
                 else:
-                    st.success(f"Approved! Spawned tasks: {len(result.get('spawned_ids', []))}")
+                    spawned = result.get("spawned_ids", [])
+                    if spawned:
+                        st.success(f"Approved! Spawned tasks: {len(spawned)}")
+                    else:
+                        st.success(f"Plan approved (status: {result.get('status', 'ok')})")
                     st.rerun()
 
     with col2:
@@ -208,18 +212,20 @@ def _render_approval_actions(api: UIApi, work_id: str, status: str) -> None:
                 )
                 if "error" in result:
                     st.error(f"Failed: {result['error']}")
+                elif result.get("status") == "error":
+                    st.error(f"Failed: {result.get('error', 'Unknown error')}")
                 else:
-                    st.info("Revision requested. The work will be rerun.")
+                    st.info(f"Revision requested. Status: {result.get('status', 'submitted')}")
                     st.rerun()
 
     with col3:
         if st.button("❌ Reject", key=f"reject_{work_id}"):
-            if st.confirm(f"Really reject work {work_id[:8]}?") or st.button(
-                "Confirm Reject", key=f"confirm_reject_{work_id}"
-            ):
+            if st.button("Confirm Reject", key=f"confirm_reject_{work_id}"):
                 result = asyncio.run(api.approve_plan(work_id, action="reject"))
                 if "error" in result:
                     st.error(f"Failed: {result['error']}")
+                elif result.get("status") == "error":
+                    st.error(f"Failed: {result.get('error', 'Unknown error')}")
                 else:
-                    st.info("Work rejected.")
+                    st.info(f"Work rejected. Status: {result.get('status', 'rejected')}")
                     st.rerun()

@@ -197,8 +197,7 @@ class TestVerifyStateAndResult:
         assert result["work_id"] == "abc"
         assert result["work_type"] == "quick"
         assert result["spec_path"] is None
-        assert result["plan_path"] is None
-        assert result["tasks_path"] == ".spine/artifacts/abc/tasks"
+        assert result["plan_path"] == ".spine/artifacts/abc/plan"
 
     def test_verify_state_mapper_spec_workflow(self):
         from spine.workflow.compose import _verify_state_mapper

@@ -1,20 +1,21 @@
-"""SPINE context editing middleware — trims old tool outputs.
+"""SPINE context editing middleware — read cache and tool output trimming.
 
-DA's built-in SummarizationMiddleware triggers at a configurable token
-threshold (default 80K for SPINE). Between triggers, tool results
-accumulate in full. This middleware trims old tool results earlier,
-keeping the conversation lean and reducing peak KV cache pressure.
+DA's built-in SummarizationMiddleware was removed (2026-05) — it was doing
+more harm than good, compressing context at inconvenient times and losing
+critical working state.
+
+The ReadCacheMiddleware replaces summarization: before every read_file call
+it checks a short-term cache in SpineContext. If the file was already read
+this phase, it returns a compact metadata summary instead of full content.
+The cache is shared across subagents, preventing re-read amnesia without
+changing the eviction strategy. ToolOutputTrimmer provides LRU-style
+eviction markers for old tool outputs.
 
 Strategy: When tool result count exceeds `max_full_tool_results`, replace
 old tool call results with a structured metadata placeholder that preserves
 the key information an agent needs without the full content. Additionally,
 trim large arguments in AI messages that correspond to evicted tool results
 (e.g., write_file content, edit_file old/new strings).
-
-The offloaded conversation history (written by DA SummarizationMiddleware
-to /conversation_history/{thread_id}.md) serves as swap space — the
-agent can page back by reading that file if the placeholder strips
-out a crucial detail.
 """
 
 from __future__ import annotations
@@ -58,6 +59,82 @@ def _count_lines(content: str) -> int:
     if not content:
         return 0
     return content.count("\n") + (0 if content.endswith("\n") else 1)
+
+
+# ---------------------------------------------------------------------------
+# ReadCacheMiddleware
+# ---------------------------------------------------------------------------
+
+
+class ReadCacheMiddleware(AgentMiddleware):
+    """Short-circuit re-reads by returning a cached metadata summary.
+
+    Before every ``read_file`` call, checks the ``read_cache`` dict on the
+    ``SpineContext`` (accessible via ``request.runtime.context``).  If the
+    file was already read this phase, returns a compact placeholder::
+
+        [cached: path.py (N lines) — read at turn T — def foo, class Bar]
+
+    The cache is shared across subagents via ``SpineContext`` propagation,
+    directly preventing re-read amnesia without an eviction strategy —
+    the existing ``ToolOutputTrimmer`` handles LRU eviction markers
+    independently.
+
+    On first read the file goes through normally; the metadata is extracted
+    and cached for future hits.
+    """
+
+    async def awrap_tool_call(self, request, handler):
+        if request.tool_call.get("name") != "read_file":
+            return await handler(request)
+
+        file_path = request.tool_call.get("args", {}).get("file_path", "")
+        if not file_path:
+            return await handler(request)
+
+        ctx = request.runtime.context
+        if ctx is None:
+            return await handler(request)
+
+        ctx.read_cache_turn += 1
+        turn = ctx.read_cache_turn
+
+        cache: dict = ctx.read_cache
+        if file_path in cache:
+            entry = cache[file_path]
+            return ToolMessage(
+                content=(
+                    f"[cached: {file_path} "
+                    f"({entry['n_lines']} lines) — "
+                    f"read at turn {entry['turn']} — "
+                    f"{entry['symbols']}]"
+                ),
+                tool_call_id=request.tool_call["id"],
+                name="read_file",
+            )
+
+        result = await handler(request)
+
+        content: str = ""
+        if isinstance(result, ToolMessage) and isinstance(result.content, str):
+            content = result.content
+        elif hasattr(result, "content") and isinstance(result.content, str):
+            content = result.content
+
+        if content:
+            n_lines = _count_lines(content)
+            symbols = _extract_symbols(content)
+            cache[file_path] = {
+                "n_lines": n_lines,
+                "symbols": ", ".join(symbols) if symbols else "no symbols",
+                "turn": turn,
+            }
+
+        return result
+
+    def wrap_tool_call(self, request, handler):
+        # SPINE uses async invoke; sync pass-through only.
+        return handler(request)
 
 
 # ---------------------------------------------------------------------------

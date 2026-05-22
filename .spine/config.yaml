@@ -1,7 +1,6 @@
 spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
-  workspace_path: /home/pat/projects/spine-sandbox
 
 # ── MCP Servers ──────────────────────────────────────────────────
 # Model Context Protocol servers for external tool integration.
@@ -13,7 +12,7 @@ mcp_servers:
     command: mcp-codebase-index
     args: []
     env:
-      PROJECT_ROOT: /home/pat/projects/spine-sandbox
+      PROJECT_ROOT: /home/pat/projects/spine
 
 providers:
   llm:

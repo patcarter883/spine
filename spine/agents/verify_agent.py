@@ -96,7 +96,6 @@ def build_verify_agent(
         config=config,
         phase=PhaseName.VERIFY,
         system_prompt=system_prompt,
-        add_summarization=True,
         subagents=_build_subagents(PhaseName.VERIFY, state, config),
         allowed_tools=_VERIFY_ORCHESTRATOR_TOOLS,
     )
