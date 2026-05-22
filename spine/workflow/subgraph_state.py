@@ -52,6 +52,7 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     """IMPLEMENT phase — reads plan artifacts, dispatches slice-implementers."""
 
     plan_path: str
+    gap_plan_path: str | None  # Set when re-running for a gap fix
     execution_waves: list  # Execution waves from PLAN phase (for wave dispatch)
 
 
@@ -68,6 +69,17 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
 
     reviewed_phase: str
     reviewed_phase_path: str
+
+
+class GapPlanSubgraphState(BaseSubgraphState, total=False):
+    """GAP_PLAN phase — reads verify feedback, produces gap_plan.md.
+
+    Does NOT re-explore the codebase — uses the existing codebase map
+    and plan artifacts from the original planning phase.
+    """
+
+    verify_path: str
+    plan_path: str
 
 
 class ExplorationSubgraphState(BaseSubgraphState, total=False):

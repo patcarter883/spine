@@ -20,6 +20,7 @@ import yaml
 # etc. are set before any LangGraph or Deep Agents code reads them.
 # It's safe to call multiple times (no-op if already loaded).
 
+
 def _load_dotenv() -> None:
     """Load .env from the project root if python-dotenv is available.
 
@@ -54,6 +55,7 @@ def _load_dotenv() -> None:
         # python-dotenv not installed — env vars must be set manually
         pass
 
+
 _load_dotenv()
 
 
@@ -75,14 +77,16 @@ class SpineConfig:
     workspace_root: str = ""
     interpreter_enabled: bool = False
     tool_schema_validation: bool = True
-    phase_timeouts: dict = field(default_factory=lambda: {
-        "specify": 0,
-        "plan": 0,
-        "tasks": 0,
-        "implement": 0,
-        "verify": 0,
-        "critic": 0,
-    })
+    phase_timeouts: dict = field(
+        default_factory=lambda: {
+            "specify": 0,
+            "plan": 0,
+            "tasks": 0,
+            "implement": 0,
+            "verify": 0,
+            "critic": 0,
+        }
+    )
     default_timeout: int = 0
     mcp_servers: dict = field(default_factory=dict)
 
@@ -184,9 +188,7 @@ class SpineConfig:
         #
         # Auto-detect by searching upward for .spine/ when neither the env
         # var nor the config file explicitly set a value.
-        raw_root = os.getenv(
-            "SPINE_WORKSPACE_ROOT", spine.get("workspace_root", None)
-        )
+        raw_root = os.getenv("SPINE_WORKSPACE_ROOT", spine.get("workspace_root", None))
         if raw_root is None:
             raw_root = cls._find_workspace_root()
         resolved_root = str(Path(raw_root).resolve())
@@ -198,6 +200,7 @@ class SpineConfig:
         root_path = Path(resolved_root)
         if not os.access(resolved_root, os.W_OK):
             import logging
+
             logging.getLogger(__name__).warning(
                 "workspace_root %s is not writable — agents will fail. "
                 "Set SPINE_WORKSPACE_ROOT or add 'workspace_root' to "
@@ -206,6 +209,7 @@ class SpineConfig:
             )
         elif not (root_path / ".spine").is_dir():
             import logging
+
             logging.getLogger(__name__).warning(
                 "workspace_root %s has no .spine/ directory — auto-detection "
                 "may have resolved to the wrong path. Consider setting "
@@ -230,11 +234,13 @@ class SpineConfig:
             workspace_root=resolved_root,
             interpreter_enabled=os.getenv(
                 "SPINE_INTERPRETER", str(spine.get("interpreter_enabled", False)).lower()
-            ) in ("1", "true", "yes"),
+            )
+            in ("1", "true", "yes"),
             tool_schema_validation=os.getenv(
                 "SPINE_TOOL_SCHEMA_VALIDATION",
                 str(spine.get("tool_schema_validation", True)).lower(),
-            ) not in ("0", "false", "no"),
+            )
+            not in ("0", "false", "no"),
             mcp_servers=mcp_servers,
         )
 
@@ -305,8 +311,13 @@ class SpineConfig:
 
     # ── Provider keys that phases can override locally ────────────────
     _PROVIDER_KEYS: tuple[str, ...] = (
-        "base_url", "api_key", "temperature", "max_tokens",
-        "max_completion_tokens", "request_timeout", "max_retries",
+        "base_url",
+        "api_key",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "request_timeout",
+        "max_retries",
     )
 
     def resolve_active_provider(self) -> dict | None:

@@ -65,8 +65,7 @@ async def call_tasks(
         Partial state update with task artifacts.
     """
     warnings.warn(
-        "The TASKS phase (call_tasks) is deprecated. "
-        "Use the PLAN phase for decomposition instead.",
+        "The TASKS phase (call_tasks) is deprecated. Use the PLAN phase for decomposition instead.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -103,7 +102,9 @@ async def call_tasks(
 
         prompt_lines = []
         if retry_count > 0:
-            prompt_lines.append("⚠ **REWORK PASS**: Your primary objective is to revise the prior tasks decomposition. Address all points from the critic feedback.\n\n")
+            prompt_lines.append(
+                "⚠ **REWORK PASS**: Your primary objective is to revise the prior tasks decomposition. Address all points from the critic feedback.\n\n"
+            )
 
         if has_spec:
             prompt_lines.extend(

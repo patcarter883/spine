@@ -14,6 +14,7 @@ class PhaseName(str, Enum):
     IMPLEMENT = "implement"
     VERIFY = "verify"
     CRITIC = "critic"
+    GAP_PLAN = "gap_plan"
 
 
 class WorkType(str, Enum):

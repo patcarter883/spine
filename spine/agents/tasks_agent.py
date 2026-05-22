@@ -62,8 +62,7 @@ def _build_subagents(
         description = state.get("description", "")
         if len(description) < 150:
             logger.info(
-                "[%s] TASKS: skipping researcher subagents for trivial quick task "
-                "(%d chars)",
+                "[%s] TASKS: skipping researcher subagents for trivial quick task (%d chars)",
                 state.get("work_id", ""),
                 len(description),
             )

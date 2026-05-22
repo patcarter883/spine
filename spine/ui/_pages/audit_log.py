@@ -51,11 +51,10 @@ def render(api: UIApi) -> None:
         timestamp = format_timestamp(event.get("timestamp"))
         details = event.get("details", {})
 
-        with st.expander(
-            f"[{timestamp}] {event_type} — {work_id} ({phase})"
-        ):
+        with st.expander(f"[{timestamp}] {event_type} — {work_id} ({phase})"):
             if st.button("View Details", key=f"view_audit_{work_id}_{event.get('timestamp', '')}"):
                 from spine.ui.pages import get as get_page
+
                 st.switch_page(get_page("work-detail"), query_params={"work_id": work_id})
             if details:
                 st.json(details)

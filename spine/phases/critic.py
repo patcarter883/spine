@@ -72,9 +72,7 @@ def _validate_plan_structure(
         return {
             "status": ReviewStatus.NEEDS_REVISION.value,
             "tier": "structural",
-            "reason": (
-                "plan.json must contain a non-empty 'feature_slices' array"
-            ),
+            "reason": ("plan.json must contain a non-empty 'feature_slices' array"),
             "suggestions": [
                 "Add at least one feature slice with id, title, target_files, "
                 "acceptance_criteria, and dependencies",
@@ -96,9 +94,7 @@ def _validate_plan_structure(
             errors.append(f"Slice at index {i} is missing 'id'")
 
         if not s.get("acceptance_criteria"):
-            errors.append(
-                f"Slice '{sid or i}' is missing 'acceptance_criteria'"
-            )
+            errors.append(f"Slice '{sid or i}' is missing 'acceptance_criteria'")
         if not s.get("target_files"):
             errors.append(f"Slice '{sid or i}' is missing 'target_files'")
 
@@ -121,9 +117,7 @@ def _validate_plan_structure(
         dep_graph[sid] = deps
         for dep_id in deps:
             if dep_id not in slice_ids:
-                dep_errors.append(
-                    f"Slice '{sid}' depends on unknown slice '{dep_id}'"
-                )
+                dep_errors.append(f"Slice '{sid}' depends on unknown slice '{dep_id}'")
 
     if dep_errors:
         return {
@@ -166,9 +160,7 @@ def _load_plan_json(
             pass
 
     # Fall back to disk
-    plan_path = (
-        Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
-    )
+    plan_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
     if plan_path.exists():
         try:
             return json.loads(plan_path.read_text(encoding="utf-8"))
@@ -205,7 +197,9 @@ def _has_cycle(graph: dict[str, list[str]]) -> bool:
     return any(color[n] == WHITE and dfs(n) for n in color)
 
 
-async def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_critic(
+    state: WorkflowState, config: Optional[RunnableConfig] = None
+) -> dict[str, Any]:
     """Execute the CRITIC phase node.
 
     Runs two-tier review and updates state with feedback and retry counts.
@@ -234,7 +228,9 @@ async def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = N
         retry_count = state.get("retry_count", {})
         current = retry_count.get(reviewed_phase, 0)
         phase_artifacts = {"review.md": structural_result["reason"]}
-        materialize_phase_artifacts(PhaseName.CRITIC.value, phase_artifacts, workspace_root, work_id=work_id)
+        materialize_phase_artifacts(
+            PhaseName.CRITIC.value, phase_artifacts, workspace_root, work_id=work_id
+        )
         return {
             "artifacts": {PhaseName.CRITIC.value: phase_artifacts},
             "feedback": [structural_result],
@@ -249,8 +245,7 @@ async def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = N
         plan_validation = _validate_plan_structure(state, workspace_root, work_id)
         if plan_validation is not None:
             logger.info(
-                f"[{work_id}] Plan structure validation failed: "
-                f"{plan_validation['reason']}"
+                f"[{work_id}] Plan structure validation failed: {plan_validation['reason']}"
             )
             retry_count = state.get("retry_count", {})
             current = retry_count.get(reviewed_phase, 0)
@@ -281,7 +276,9 @@ async def call_critic(state: WorkflowState, config: Optional[RunnableConfig] = N
 
     # Materialize this phase's artifacts to disk immediately
     phase_artifacts = {"review.md": agent_result["reason"]}
-    materialize_phase_artifacts(PhaseName.CRITIC.value, phase_artifacts, workspace_root, work_id=work_id)
+    materialize_phase_artifacts(
+        PhaseName.CRITIC.value, phase_artifacts, workspace_root, work_id=work_id
+    )
 
     return {
         "artifacts": {PhaseName.CRITIC.value: phase_artifacts},

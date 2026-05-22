@@ -47,9 +47,7 @@ def validate_feature_slices(slices: list[FeatureSlice]) -> None:
             the specific problem (duplicate IDs, missing dependencies, etc.).
     """
     if not slices:
-        raise ValueError(
-            "Slice plan must contain at least one feature slice."
-        )
+        raise ValueError("Slice plan must contain at least one feature slice.")
 
     # ── Check 1: Unique IDs ────────────────────────────────────────────
     seen_ids: dict[str, int] = {}
@@ -57,13 +55,9 @@ def validate_feature_slices(slices: list[FeatureSlice]) -> None:
         seen_ids.setdefault(slice_.id, 0)
         seen_ids[slice_.id] += 1
 
-    duplicates = {
-        sid: count for sid, count in seen_ids.items() if count > 1
-    }
+    duplicates = {sid: count for sid, count in seen_ids.items() if count > 1}
     if duplicates:
-        dup_list = ", ".join(
-            f"'{sid}' (x{c})" for sid, c in duplicates.items()
-        )
+        dup_list = ", ".join(f"'{sid}' (x{c})" for sid, c in duplicates.items())
         raise ValueError(f"Duplicate slice IDs found: {dup_list}")
 
     # ── Check 2: Non-empty required fields ─────────────────────────────
@@ -72,15 +66,11 @@ def validate_feature_slices(slices: list[FeatureSlice]) -> None:
         if not slice_.id.strip():
             raise ValueError("Slice has an empty id.")
         if not slice_.title.strip():
-            raise ValueError(
-                f"Slice '{slice_.id}' has an empty title."
-            )
+            raise ValueError(f"Slice '{slice_.id}' has an empty title.")
 
     # ── Check 3: Valid dependency references ───────────────────────────
     for slice_ in slices:
-        invalid_deps = [
-            d for d in slice_.dependencies if d not in all_ids
-        ]
+        invalid_deps = [d for d in slice_.dependencies if d not in all_ids]
         if invalid_deps:
             raise ValueError(
                 f"Slice '{slice_.id}' references unknown dependencies: "
@@ -88,16 +78,12 @@ def validate_feature_slices(slices: list[FeatureSlice]) -> None:
             )
 
     # ── Check 4: No cycles ─────────────────────────────────────────────
-    graph: dict[str, set[str]] = {
-        s.id: set(s.dependencies) for s in slices
-    }
+    graph: dict[str, set[str]] = {s.id: set(s.dependencies) for s in slices}
     try:
         sorter = TopologicalSorter(graph)
         sorter.prepare()  # Raises CycleError if cycle exists
     except CycleError as exc:
-        raise ValueError(
-            f"Dependency cycle detected among slices: {exc}"
-        ) from exc
+        raise ValueError(f"Dependency cycle detected among slices: {exc}") from exc
 
 
 def compute_execution_waves(
@@ -125,14 +111,10 @@ def compute_execution_waves(
     validate_feature_slices(feature_slices)
 
     # Build lookup from ID -> FeatureSlice for wave assembly.
-    slice_by_id: dict[str, FeatureSlice] = {
-        s.id: s for s in feature_slices
-    }
+    slice_by_id: dict[str, FeatureSlice] = {s.id: s for s in feature_slices}
 
     # Build dependency graph: {node: set of predecessors}.
-    graph: dict[str, set[str]] = {
-        s.id: set(s.dependencies) for s in feature_slices
-    }
+    graph: dict[str, set[str]] = {s.id: set(s.dependencies) for s in feature_slices}
 
     sorter = TopologicalSorter(graph)
     sorter.prepare()
@@ -183,9 +165,7 @@ def slices_to_state_dict(
     result: list[list[dict[str, Any]]] = []
 
     for wave in waves:
-        wave_dicts: list[dict[str, Any]] = [
-            asdict(slice_) for slice_ in wave
-        ]
+        wave_dicts: list[dict[str, Any]] = [asdict(slice_) for slice_ in wave]
         result.append(wave_dicts)
 
     return result

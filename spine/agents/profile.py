@@ -160,9 +160,7 @@ def ensure_spine_profiles() -> None:
     try:
         from deepagents import HarnessProfile, register_harness_profile
     except ImportError:
-        logger.debug(
-            "deepagents not installed — skipping SPINE HarnessProfile registration"
-        )
+        logger.debug("deepagents not installed — skipping SPINE HarnessProfile registration")
         return
 
     profile = HarnessProfile(base_system_prompt=SPINE_BASE_PROMPT)

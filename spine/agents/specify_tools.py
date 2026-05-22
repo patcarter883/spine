@@ -95,9 +95,7 @@ class ReadWorkContextTool(BaseTool):
 
 
 class _WriteSpecificationInput(BaseModel):
-    overview: str = Field(
-        description="Summary of what needs to be built (2-4 paragraphs)."
-    )
+    overview: str = Field(description="Summary of what needs to be built (2-4 paragraphs).")
     requirements: str = Field(
         description=(
             "Functional and non-functional requirements as a markdown list. "
@@ -125,9 +123,8 @@ class _WriteSpecificationInput(BaseModel):
     open_questions: str = Field(
         default="",
         description=(
-            "Any open questions or risks discovered during research. "
-            "Optional — omit if none."
-        )
+            "Any open questions or risks discovered during research. Optional — omit if none."
+        ),
     )
 
 
@@ -187,8 +184,7 @@ class WriteSpecificationTool(BaseTool):
             return f"ERROR: Could not write specification.md: {exc}"
 
         return (
-            f"specification.md written to {self.spec_dir}/specification.md "
-            f"({len(content)} chars)."
+            f"specification.md written to {self.spec_dir}/specification.md ({len(content)} chars)."
         )
 
     async def _arun(self, **kwargs: Any) -> str:

@@ -78,6 +78,7 @@ async def call_verify(
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'verify', tasks_dir: '{tasks_dir}', verify_dir: '{verify_dir}', impl_dir: '{impl_dir}'}};\n\n"
 
         from spine.agents.artifacts import list_slice_files
+
         slice_files = list_slice_files(workspace_root, work_id)
         slice_count = len(slice_files)
 
@@ -87,9 +88,8 @@ async def call_verify(
                 "Use `ls` + `glob` to locate slice files before proceeding."
             )
         else:
-            slice_inventory = (
-                f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
-                + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
+            slice_inventory = f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n" + "\n".join(
+                f"  - `{tasks_dir}/{name}`" for name in slice_files
             )
 
         if slice_count == 1:

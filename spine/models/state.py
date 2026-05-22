@@ -70,8 +70,8 @@ class WorkflowState(TypedDict, total=False):
     work_id: str
     work_type: str
     description: str  # Original work description — only used by SPECIFY (first spec
-                      # phase) and TASKS (first quick-workflow phase). Downstream
-                      # phases work from artifacts on disk, not the raw description.
+    # phase) and TASKS (first quick-workflow phase). Downstream
+    # phases work from artifacts on disk, not the raw description.
     current_phase: str
     phase_index: int
     retry_count: Annotated[dict, _merge_dicts]
@@ -93,3 +93,6 @@ class WorkflowState(TypedDict, total=False):
     execution_waves: list[list[dict]]  # Pre-sorted waves of slice dicts from the
     # scheduler, consumed by IMPLEMENT to dispatch slices in dependency order.
     # Each inner list is one wave of independent slices that can run concurrently.
+    verify_attempts: int  # How many gap-fix cycles attempted (starts at 0).
+    # Incremented by the verify result mapper when verification fails.
+    # After 2 cycles (3 total verify runs), the 3rd failure routes to human_review.

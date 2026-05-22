@@ -36,12 +36,10 @@ def render(api: UIApi) -> None:
         status = item.get("status", "unknown")
         icon = status_icon(status)
 
-        with st.expander(
-            f"{icon} {work_id} — "
-            f"{truncate(item.get('description', ''), 60)}"
-        ):
+        with st.expander(f"{icon} {work_id} — {truncate(item.get('description', ''), 60)}"):
             if st.button("View Details", key=f"view_{work_id}"):
                 from spine.ui.pages import get as get_page
+
                 st.switch_page(get_page("work-detail"), query_params={"work_id": work_id})
             col1, col2 = st.columns(2)
             col1.write(f"**Status:** {status}")

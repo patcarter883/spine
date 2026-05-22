@@ -156,7 +156,9 @@ When a tool result is too large, it may be offloaded to `/large_tool_results/<to
 instead of being returned inline. Use `read_file` to inspect in chunks, or `grep` within \
 `/large_tool_results/` to search across offloaded results."""
 
-SPINE_FILESYSTEM_EXEC_PROMPT = SPINE_FILESYSTEM_PROMPT + """
+SPINE_FILESYSTEM_EXEC_PROMPT = (
+    SPINE_FILESYSTEM_PROMPT
+    + """
 
 ## Execute Tool — execute
 
@@ -166,6 +168,7 @@ Commands run in the workspace root directory.
 All paths in commands MUST be relative (e.g. `pytest tests/unit/` NOT `pytest /home/user/project/tests/unit/`).
 
 - execute: run a shell command (returns output and exit code)"""
+)
 
 
 # ── SpineProjectMemoryMiddleware ───────────────────────────────────────────
@@ -193,9 +196,7 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
             if content:
                 # Use a clean, concise XML enclosure for documentation injection
                 sections.append(
-                    f"<project_documentation path=\"{path}\">\n"
-                    f"{content}\n"
-                    f"</project_documentation>"
+                    f'<project_documentation path="{path}">\n{content}\n</project_documentation>'
                 )
 
         if not sections:
@@ -205,7 +206,12 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
         new_system_message = append_to_system_message(request.system_message, memory_body)
 
         # Apply prompt caching breakpoint if Anthropic and enabled
-        if self._add_cache_control and type(request.model).__name__ == "ChatAnthropic" and hasattr(new_system_message, "content_blocks") and new_system_message.content_blocks:
+        if (
+            self._add_cache_control
+            and type(request.model).__name__ == "ChatAnthropic"
+            and hasattr(new_system_message, "content_blocks")
+            and new_system_message.content_blocks
+        ):
             blocks = list(new_system_message.content_blocks)
             last_block: Any = blocks[-1]
             base = last_block if isinstance(last_block, dict) else {}
@@ -216,6 +222,7 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
 
 
 # ── Main factory function ────────────────────────────────────────────────
+
 
 def build_phase_agent(
     state: WorkflowState,
@@ -396,6 +403,7 @@ def build_phase_agent(
 
 # ── Middleware stack builder ─────────────────────────────────────────────
 
+
 def _build_middleware_stack(
     *,
     backend: Any,
@@ -480,11 +488,13 @@ def _build_middleware_stack(
     #    and tools.task resolves to undefined in the QuickJS sandbox,
     #    causing "TypeError: not a function" on every Promise.allSettled call.
     if subagents:
-        middleware.append(SubAgentMiddleware(
-            backend=backend,
-            subagents=subagents,
-            task_description=tool_desc_overrides.get("task"),
-        ))
+        middleware.append(
+            SubAgentMiddleware(
+                backend=backend,
+                subagents=subagents,
+                task_description=tool_desc_overrides.get("task"),
+            )
+        )
 
     # 5. Interpreter (eval tool) — only for top-level phase agents.
     #    SubAgentMiddleware must be above this in the stack (position 4)
@@ -529,11 +539,13 @@ def _build_middleware_stack(
 
     # 12. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
-        middleware.append(SpineProjectMemoryMiddleware(
-            backend=backend,
-            sources=memory,
-            add_cache_control=True,
-        ))
+        middleware.append(
+            SpineProjectMemoryMiddleware(
+                backend=backend,
+                sources=memory,
+                add_cache_control=True,
+            )
+        )
 
     return middleware
 
@@ -560,7 +572,8 @@ def _filter_filesystem_tools(
         logger.warning(
             "Phase %s: FilesystemMiddleware has no .tools attribute; "
             "cannot apply allowed_tools filter (%s)",
-            phase.value, allowed_tools,
+            phase.value,
+            allowed_tools,
         )
         return
 
@@ -571,7 +584,9 @@ def _filter_filesystem_tools(
     dropped = [n for n in original_names if n not in allowed]
     logger.debug(
         "Phase %s: filtered filesystem tools — kept=%s dropped=%s",
-        phase.value, kept, dropped,
+        phase.value,
+        kept,
+        dropped,
     )
 
 
@@ -580,11 +595,14 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     import os as _os
 
     # Tool schema validation — rebound loop for self-correction
-    _validation_enabled = _os.getenv(
-        "SPINE_TOOL_SCHEMA_VALIDATION", "true"
-    ).lower() not in ("0", "false", "no")
+    _validation_enabled = _os.getenv("SPINE_TOOL_SCHEMA_VALIDATION", "true").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
     if _validation_enabled:
         from spine.agents.tool_schema_validator import ToolSchemaValidator
+
         middleware.append(ToolSchemaValidator())
 
     # Note: ToolOutputTrimmer was removed (2026-05) — excessive trimming of
@@ -602,10 +620,12 @@ def _build_read_cache_middleware() -> Any:
     propagation.
     """
     from spine.agents.context_editing import ReadCacheMiddleware
+
     return ReadCacheMiddleware()
 
 
 # ── Profile helpers ──────────────────────────────────────────────────────
+
 
 def _resolve_model_for_profile(model: Any) -> Any:
     """Resolve a model identifier to a BaseChatModel for profile lookup.
@@ -621,6 +641,7 @@ def _resolve_model_for_profile(model: Any) -> Any:
     if isinstance(model, str):
         try:
             from deepagents._models import resolve_model as da_resolve_model
+
             return da_resolve_model(model)
         except Exception:
             return model  # Return the string — _resolve_profile handles it
@@ -638,6 +659,7 @@ def _resolve_profile(model: Any, model_spec: str | None = None) -> Any:
     """
     try:
         from deepagents.profiles.harness.harness_profiles import _harness_profile_for_model
+
         return _harness_profile_for_model(model, model_spec)
     except (ImportError, Exception):
         return None

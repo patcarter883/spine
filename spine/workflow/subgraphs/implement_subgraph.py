@@ -59,12 +59,26 @@ async def _run_implement_agent(
 
         has_spec = "spec" in work_type
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
+        gap_plan_path = state.get("gap_plan_path", "")
 
         prompt_lines = [
             "Implement the feature slices described below. Write clean, "
             "production-quality code for each slice.",
             "",
         ]
+
+        if gap_plan_path:
+            prompt_lines.extend(
+                [
+                    "**Gap-Fix Mode:** You are re-running implementation to fix issues "
+                    "identified by verification. Read the gap plan for targeted fix "
+                    "instructions, then apply ONLY the changes specified in it. "
+                    "Preserve all other implementation work from the first pass.",
+                    "",
+                    f"- Gap Plan: `{gap_plan_path}/gap_plan.md`",
+                    "",
+                ]
+            )
 
         if has_spec:
             spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)

@@ -29,10 +29,23 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # File extensions worth reading when doing codebase search
-_CODE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".yaml", ".yml",
-                    ".toml", ".json", ".md", ".txt", ".sql", ".sh"}
-_MAX_FILE_PREVIEW = 3000   # chars per file returned in search results
-_MAX_SEARCH_FILES = 8      # max files to return per search query
+_CODE_EXTENSIONS = {
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".md",
+    ".txt",
+    ".sql",
+    ".sh",
+}
+_MAX_FILE_PREVIEW = 3000  # chars per file returned in search results
+_MAX_SEARCH_FILES = 8  # max files to return per search query
 
 
 # ── read_prior_artifacts ──────────────────────────────────────────────────
@@ -185,9 +198,17 @@ class SearchCodebaseTool(BaseTool):
         else:
             # Walk workspace, skip common non-code dirs
             skip_dirs = {
-                ".venv", "venv", ".git", "__pycache__", "node_modules",
-                ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist",
-                "build", ".spine",
+                ".venv",
+                "venv",
+                ".git",
+                "__pycache__",
+                "node_modules",
+                ".mypy_cache",
+                ".ruff_cache",
+                ".pytest_cache",
+                "dist",
+                "build",
+                ".spine",
             }
             for fpath in root.rglob("*"):
                 if fpath.is_file() and fpath.suffix in _CODE_EXTENSIONS:
@@ -223,18 +244,23 @@ class SearchCodebaseTool(BaseTool):
                 preview = "[could not read file]"
 
             rel = str(fpath.relative_to(root))
-            results.append({
-                "file": rel,
-                "score": score,
-                "match_lines": file_match_lines.get(fpath, [])[:6],
-                "preview": preview,
-            })
+            results.append(
+                {
+                    "file": rel,
+                    "score": score,
+                    "match_lines": file_match_lines.get(fpath, [])[:6],
+                    "preview": preview,
+                }
+            )
 
-        return json.dumps({
-            "queries_run": queries,
-            "total_files_found": total_found,
-            "results": results,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "queries_run": queries,
+                "total_files_found": total_found,
+                "results": results,
+            },
+            ensure_ascii=False,
+        )
 
     def _grep_files(
         self,
@@ -247,20 +273,27 @@ class SearchCodebaseTool(BaseTool):
 
         # Try rg first (fast)
         try:
-            cmd = ["rg", "-i", "--line-number",
-                   "--with-filename", "--max-count=5", query, str(root)]
-            out = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, cwd=str(root)
-            )
+            cmd = [
+                "rg",
+                "-i",
+                "--line-number",
+                "--with-filename",
+                "--max-count=5",
+                query,
+                str(root),
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=str(root))
             for line in out.stdout.splitlines():
                 parts = line.split(":", 2)
                 if len(parts) >= 3:
                     fpath = Path(parts[0])
                     if fpath in candidates:
-                        matched.setdefault(fpath, []).append({
-                            "line": parts[1],
-                            "text": parts[2][:120],
-                        })
+                        matched.setdefault(fpath, []).append(
+                            {
+                                "line": parts[1],
+                                "text": parts[2][:120],
+                            }
+                        )
             return matched
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass  # rg not available, fall back to Python
@@ -300,9 +333,7 @@ class _WritePlanInput(BaseModel):
             "structured breakdown of how the pieces fit together."
         )
     )
-    technology_choices: str = Field(
-        description="Technology/library choices with rationale."
-    )
+    technology_choices: str = Field(description="Technology/library choices with rationale.")
     module_structure: str = Field(
         description=(
             "File/module layout as a tree or table. Every new file must "
@@ -390,10 +421,7 @@ class WritePlanTool(BaseTool):
         except OSError as exc:
             return f"ERROR: Could not write plan.md: {exc}"
 
-        return (
-            f"plan.md written to {self.plan_dir}/plan.md "
-            f"({len(content)} chars)."
-        )
+        return f"plan.md written to {self.plan_dir}/plan.md ({len(content)} chars)."
 
     async def _arun(self, **kwargs: Any) -> str:
         return self._run(**kwargs)
@@ -445,9 +473,7 @@ class _StructuredWritePlanInput(BaseModel):
             "structured breakdown of how the pieces fit together."
         )
     )
-    technology_choices: str = Field(
-        description="Technology/library choices with rationale."
-    )
+    technology_choices: str = Field(description="Technology/library choices with rationale.")
     feature_slices: list[dict[str, Any]] = Field(
         description=(
             "Array of feature slices. Each must have: id, title, target_files, "

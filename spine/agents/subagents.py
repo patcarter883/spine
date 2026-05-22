@@ -353,7 +353,9 @@ _RE_RESEARCH_PROMPT_SUFFIX = (
 PHASE_SUBAGENTS: dict[str, list[str]] = {
     PhaseName.SPECIFY.value: ["researcher"],
     PhaseName.TASKS.value: ["researcher"],
-    PhaseName.IMPLEMENT.value: ["slice-implementer"],  # No verifier — dedicated verify phase is authoritative
+    PhaseName.IMPLEMENT.value: [
+        "slice-implementer"
+    ],  # No verifier — dedicated verify phase is authoritative
     PhaseName.VERIFY.value: ["slice-verifier"],
     # PLAN, CRITIC — single-agent, no subagents
 }
@@ -362,7 +364,9 @@ PHASE_SUBAGENTS: dict[str, list[str]] = {
 # ── Factory functions ──────────────────────────────────────────────────
 
 
-def _inject_mcp_tools(tools: list, workspace_root: str, *, subagent_name: str = "researcher") -> None:
+def _inject_mcp_tools(
+    tools: list, workspace_root: str, *, subagent_name: str = "researcher"
+) -> None:
     """Inject MCP codebase-index tools into a subagent's tool list.
 
     Loads MCP tools from the SpineConfig, wrapping each as a LangChain
@@ -402,8 +406,8 @@ def _inject_mcp_tools(tools: list, workspace_root: str, *, subagent_name: str = 
 # when their thinking/reasoning mode is active.  These models crash with
 # HTTP 400 when create_agent forces tool_choice for structured output.
 _THINKING_MODEL_PATTERNS: tuple[str, ...] = (
-    "qwen3",    # Qwen 3.x series (thinking mode enabled by default)
-    "qwq",      # QwQ reasoning model
+    "qwen3",  # Qwen 3.x series (thinking mode enabled by default)
+    "qwq",  # QwQ reasoning model
     "deepseek-r",  # DeepSeek-R1 reasoning
 )
 

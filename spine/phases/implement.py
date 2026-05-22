@@ -70,8 +70,7 @@ def _build_wave_dispatch_note(
     for i, wave in enumerate(execution_waves):
         slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
         wave_summaries.append(
-            f"  Wave {i + 1}: {', '.join(slice_ids)} "
-            f"({len(wave)} slice(s), parallel)"
+            f"  Wave {i + 1}: {', '.join(slice_ids)} ({len(wave)} slice(s), parallel)"
         )
 
     return (
@@ -80,9 +79,7 @@ def _build_wave_dispatch_note(
         f"Slices within a wave are independent and MUST run in parallel. "
         f"Waves MUST run sequentially — do not start wave N+1 until "
         f"all slices in wave N are complete.\n\n"
-        "**Wave structure:**\n"
-        + "\n".join(wave_summaries)
-        + "\n\n"
+        "**Wave structure:**\n" + "\n".join(wave_summaries) + "\n\n"
         "**Dispatch pattern (wave-sequential):**\n"
         "```js\n"
         "// globalThis.planData is loaded from plan.json via read_slice_files\n"
@@ -122,10 +119,7 @@ def _build_legacy_dispatch_note(slice_count: int) -> str:
         Markdown-formatted dispatch instructions for the orchestrator.
     """
     if slice_count == 0:
-        return (
-            "⚠ No slices found. Write the implementation report with "
-            "an empty result set."
-        )
+        return "⚠ No slices found. Write the implementation report with an empty result set."
 
     return (
         f"Dispatch all {slice_count} slices in parallel using a single "
@@ -211,8 +205,7 @@ async def call_implement(
         else:
             # Legacy fallback: use list_slice_files from tasks phase
             logger.info(
-                f"[{work_id}] No execution_waves in state — "
-                f"falling back to list_slice_files"
+                f"[{work_id}] No execution_waves in state — falling back to list_slice_files"
             )
             slice_files = list_slice_files(workspace_root, work_id)
             slice_count = len(slice_files)

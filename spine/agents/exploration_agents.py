@@ -87,6 +87,7 @@ async def run_research_manager(
     # Ensure we have a BaseChatModel instance for .ainvoke().
     if isinstance(model, str):
         from langchain.chat_models import init_chat_model
+
         model = init_chat_model(model)
 
     # Build the context for the manager
@@ -115,9 +116,7 @@ async def run_research_manager(
         topics = result.get("topics", [])
         if not isinstance(topics, list):
             topics = []
-        logger.info(
-            "[%s] Research manager: decision=%s topics=%s", work_id, decision, topics
-        )
+        logger.info("[%s] Research manager: decision=%s topics=%s", work_id, decision, topics)
         return {"manager_decision": decision, "topics": topics}
     except (json.JSONDecodeError, KeyError) as e:
         logger.warning(

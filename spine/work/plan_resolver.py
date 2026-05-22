@@ -125,7 +125,11 @@ def _extract_work_units(content: str, work_id: str) -> list[WorkUnit]:
         if line.startswith("## Work Units") or line.startswith("## Tasks"):
             in_work_section = True
             continue
-        if line.startswith("## ") and not line.startswith("## Work") and not line.startswith("## Tasks"):
+        if (
+            line.startswith("## ")
+            and not line.startswith("## Work")
+            and not line.startswith("## Tasks")
+        ):
             in_work_section = False
             continue
 
@@ -134,36 +138,44 @@ def _extract_work_units(content: str, work_id: str) -> list[WorkUnit]:
             if line.startswith("### "):
                 unit_title = line[4:].strip()
                 if unit_title:
-                    units.append(WorkUnit(
-                        title=unit_title,
-                        description=f"Work unit '{unit_title}' from plan {work_id}",
-                        priority="medium",
-                    ))
+                    units.append(
+                        WorkUnit(
+                            title=unit_title,
+                            description=f"Work unit '{unit_title}' from plan {work_id}",
+                            priority="medium",
+                        )
+                    )
             elif line.startswith("#### "):
                 # Sub-work unit, treat as a unit
                 unit_title = line[5:].strip()
                 if unit_title:
-                    units.append(WorkUnit(
-                        title=unit_title,
-                        description=f"Sub-work unit from plan {work_id}",
-                        priority="medium",
-                    ))
+                    units.append(
+                        WorkUnit(
+                            title=unit_title,
+                            description=f"Sub-work unit from plan {work_id}",
+                            priority="medium",
+                        )
+                    )
             elif line.startswith("- ") and not line.startswith("- ["):
                 # List item that might be a work unit
                 item = line[2:].strip()
                 if item and not item.startswith("["):  # Skip checkbox items
-                    units.append(WorkUnit(
-                        title=item,
-                        description=f"Task from plan {work_id}",
-                        priority="medium",
-                    ))
+                    units.append(
+                        WorkUnit(
+                            title=item,
+                            description=f"Task from plan {work_id}",
+                            priority="medium",
+                        )
+                    )
 
     # If no structured work units found, create a default one
     if not units:
-        units.append(WorkUnit(
-            title=f"Execute plan {work_id}",
-            description=f"Implement the plan defined in work item {work_id}",
-            priority="high",
-        ))
+        units.append(
+            WorkUnit(
+                title=f"Execute plan {work_id}",
+                description=f"Implement the plan defined in work item {work_id}",
+                priority="high",
+            )
+        )
 
     return units

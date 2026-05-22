@@ -45,6 +45,7 @@ _DEFAULT_MAX_ROUNDS = 3
 
 # ── Node: research_manager ───────────────────────────────────────────────
 
+
 async def _research_manager_node(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
@@ -61,6 +62,7 @@ async def _research_manager_node(
 
 
 # ── Router: research_manager → explore (Send) or synthesize ─────────────
+
 
 def _research_router(
     state: ExplorationSubgraphState,
@@ -86,6 +88,7 @@ def _research_router(
 
 # ── Node: explore ───────────────────────────────────────────────────────
 
+
 async def _explore_node(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
@@ -105,6 +108,7 @@ async def _explore_node(
 
 # ── Node: aggregate ────────────────────────────────────────────────────
 
+
 async def _aggregate_node(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
@@ -123,6 +127,7 @@ async def _aggregate_node(
 
 # ── Router: aggregate → loop (research_manager) or done (synthesize) ──
 
+
 def _sufficiency_router(
     state: ExplorationSubgraphState,
 ) -> Literal["loop", "done"]:
@@ -138,14 +143,13 @@ def _sufficiency_router(
     if decision == "done":
         return "done"
     if round_num >= max_rounds:
-        logger.info(
-            "Max rounds (%d) reached — proceeding to synthesis", max_rounds
-        )
+        logger.info("Max rounds (%d) reached — proceeding to synthesis", max_rounds)
         return "done"
     return "loop"
 
 
 # ── Node: synthesize (SPECIFY) ──────────────────────────────────────────
+
 
 async def _synthesize_specify(
     state: ExplorationSubgraphState,
@@ -221,9 +225,7 @@ async def _synthesize_specify(
         }
 
     except Exception as e:
-        logger.error(
-            "[%s] Synthesize (specify) failed: %s", work_id, e, exc_info=True
-        )
+        logger.error("[%s] Synthesize (specify) failed: %s", work_id, e, exc_info=True)
         return {
             "messages": [],
             "agent_response": f"Synthesis error: {e}",
@@ -262,6 +264,7 @@ def _format_findings(findings: list[dict]) -> str:
 
 # ── Node: save_artifacts ────────────────────────────────────────────────
 
+
 async def _save_exploration_artifacts(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
@@ -287,20 +290,14 @@ async def _save_exploration_artifacts(
     )
 
     if not disk_artifacts and agent_response.strip():
-        artifact_name = (
-            "specification.md"
-            if phase == PhaseName.SPECIFY.value
-            else "plan.md"
-        )
+        artifact_name = "specification.md" if phase == PhaseName.SPECIFY.value else "plan.md"
         materialize_phase_artifacts(
             phase,
             {artifact_name: agent_response},
             workspace_root,
             work_id=work_id,
         )
-        disk_artifacts = {
-            artifact_name: agent_response[:_MAX_ARTIFACT_STATE_CHARS]
-        }
+        disk_artifacts = {artifact_name: agent_response[:_MAX_ARTIFACT_STATE_CHARS]}
 
     return {
         "artifacts_output": disk_artifacts,
@@ -309,6 +306,7 @@ async def _save_exploration_artifacts(
 
 
 # ── Builder ──────────────────────────────────────────────────────────────
+
 
 def build_exploration_subgraph(
     phase: str = PhaseName.SPECIFY.value,
@@ -329,13 +327,9 @@ def build_exploration_subgraph(
         synthesizer = _synthesize_specify
     elif phase == PhaseName.PLAN.value:
         # PLAN synthesis — to be added in Phase 4 of the rollout.
-        raise NotImplementedError(
-            "PLAN exploration subgraph not yet implemented"
-        )
+        raise NotImplementedError("PLAN exploration subgraph not yet implemented")
     else:
-        raise ValueError(
-            f"Unsupported phase for exploration subgraph: {phase!r}"
-        )
+        raise ValueError(f"Unsupported phase for exploration subgraph: {phase!r}")
 
     builder = StateGraph(ExplorationSubgraphState)
 

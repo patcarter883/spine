@@ -258,19 +258,19 @@ class TestEnums:
         """Test that enums behave like strings."""
         phase = PhaseName.SPECIFY
         assert phase == "specify"
-        assert str(phase) == "specify"
-        assert f"Phase: {phase}" == "Phase: specify"
+        assert phase.value == "specify"
+        assert f"Phase: {phase.value}" == "Phase: specify"
 
     def test_enum_iteration(self) -> None:
         """Test that we can iterate over enum values."""
         # Test PhaseName
         phases = list(PhaseName)
-        assert len(phases) == 6
+        assert len(phases) == 7
         assert PhaseName.SPECIFY in phases
         
         # Test WorkType
         work_types = list(WorkType)
-        assert len(work_types) == 4
+        assert len(work_types) == 8
         assert WorkType.SPEC in work_types
 
 

@@ -61,6 +61,7 @@ from spine.workflow.subgraphs.specify_subgraph import build_specify_subgraph
 from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
 from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
 from spine.workflow.subgraphs.exploration_subgraph import build_exploration_subgraph
+from spine.workflow.subgraphs.gap_plan_subgraph import build_gap_plan_subgraph
 
 # ── Subgraph builder registry ──────────────────────────────────────────
 # Used by the per-phase checkpointer to recompile subgraphs at runtime
@@ -89,6 +90,7 @@ register_subgraph_builder(PhaseName.PLAN.value, build_plan_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_tasks", build_critic_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_plan", build_critic_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_specify", build_critic_subgraph)
+register_subgraph_builder(PhaseName.GAP_PLAN.value, build_gap_plan_subgraph)
 
 
 # Feature flags for per-phase subgraph migration.
@@ -100,6 +102,7 @@ _SUBGRAPH_ENABLED: dict[str, bool] = {
     PhaseName.SPECIFY.value: True,
     PhaseName.PLAN.value: True,
     PhaseName.CRITIC.value: True,
+    PhaseName.GAP_PLAN.value: True,
 }
 
 # Feature flags for exploration subgraph rollout.
@@ -162,11 +165,13 @@ def _tasks_state_mapper(parent_state: WorkflowState, config) -> dict:
 
 def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
+    verify_attempts = parent_state.get("verify_attempts", 0)
     return {
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.IMPLEMENT.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0),
         "plan_path": f".spine/artifacts/{work_id}/plan",
+        "gap_plan_path": f".spine/artifacts/{work_id}/gap_plan" if verify_attempts > 0 else None,
         "execution_waves": parent_state.get("execution_waves", []),
     }
 
@@ -202,12 +207,22 @@ def _critic_state_mapper(reviewed_phase: str):
 
 
 def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
-    """Map VerifySubgraphState output back to parent WorkflowState."""
+    """Map VerifySubgraphState output back to parent WorkflowState.
+
+    When verification fails (phase_status="needs_review"), checks
+    ``verify_attempts`` to decide between a gap-fix cycle and human review.
+    Up to 2 gap-fix cycles are attempted before escalating to human review.
+    """
     base = make_success_result_mapper(PhaseName.VERIFY.value)(subgraph_result, parent_state)
     phase_status = subgraph_result.get("phase_status", "")
     if phase_status == "needs_review":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.VERIFY.value
+        verify_attempts = parent_state.get("verify_attempts", 0)
+        if verify_attempts < 2:
+            base["status"] = "needs_gap_fix"
+            base["verify_attempts"] = verify_attempts + 1
+        else:
+            base["status"] = "needs_review"
+            base["needs_review_phase"] = PhaseName.VERIFY.value
         base["feedback"] = base.get("feedback", []) + [
             {
                 "status": "needs_review",
@@ -312,6 +327,23 @@ def _critic_result_mapper(reviewed_phase: str):
         return base
 
     return mapper
+
+
+def _gap_plan_state_mapper(parent_state: WorkflowState, config) -> dict:
+    """Map parent WorkflowState to GapPlanSubgraphState."""
+    work_id = parent_state.get("work_id", "")
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.GAP_PLAN.value,
+        "retry_count": 0,
+        "verify_path": f".spine/artifacts/{work_id}/verify",
+        "plan_path": f".spine/artifacts/{work_id}/plan",
+    }
+
+
+def _gap_plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
+    """Map GapPlanSubgraphState output back to parent WorkflowState."""
+    return make_success_result_mapper(PhaseName.GAP_PLAN.value)(subgraph_result, parent_state)
 
 
 # ── Phase sequences per work type ──
@@ -473,6 +505,29 @@ def _phase_status_router(state: WorkflowState) -> str:
     return "proceed"
 
 
+def _verify_router(state: WorkflowState) -> str:
+    """Post-verify conditional edge router.
+
+    Unlike the generic ``_phase_status_router``, this router can send a
+    failed verification into a ``gap_plan → implement → verify`` loop
+    instead of immediately flagging for human review.
+
+    Returns:
+        ``"passed"`` when verification succeeded,
+        ``"needs_gap_fix"`` when verification failed with gap attempts remaining,
+        ``"needs_review"`` when verification failed and gap attempts exhausted,
+        ``"failed"`` for hard errors.
+    """
+    status = state.get("status", "running")
+    if status == "needs_gap_fix":
+        return "needs_gap_fix"
+    if status == "needs_review":
+        return "needs_review"
+    if status == "failed":
+        return "failed"
+    return "passed"
+
+
 def _gate_node_name(source_node: str, next_node: str) -> str:
     """Derive a unique node name for a gate between two phases."""
     return f"gate_{source_node}_to_{next_node}"
@@ -596,6 +651,7 @@ def build_workflow_graph(
                 PhaseName.TASKS.value: _tasks_state_mapper,
                 PhaseName.SPECIFY.value: _specify_state_mapper,
                 PhaseName.PLAN.value: _plan_state_mapper,
+                PhaseName.GAP_PLAN.value: _gap_plan_state_mapper,
             }
             _RESULT_MAPPERS = {
                 PhaseName.VERIFY.value: _verify_result_mapper,
@@ -603,6 +659,7 @@ def build_workflow_graph(
                 PhaseName.TASKS.value: _tasks_result_mapper,
                 PhaseName.SPECIFY.value: _specify_result_mapper,
                 PhaseName.PLAN.value: _plan_result_mapper,
+                PhaseName.GAP_PLAN.value: _gap_plan_result_mapper,
             }
 
             builder_fn = _SUBGRAPH_BUILDER_REGISTRY.get(node_name)
@@ -662,6 +719,7 @@ def build_workflow_graph(
     _hr_ends: dict[str, str] = {"abort": END, END: END}
     for name, _ in phase_seq:
         _hr_ends[name] = name
+    _hr_ends[PhaseName.GAP_PLAN.value] = PhaseName.GAP_PLAN.value
 
     graph.add_node("human_review", _human_review_interrupt)
     graph.add_conditional_edges(
@@ -669,6 +727,21 @@ def build_workflow_graph(
         _make_human_review_router(phase_seq),
         _hr_ends,
     )
+
+    # Add gap_plan node — not in WORKFLOW_SEQUENCES because it's a
+    # conditional node reached via the verify_router, not a linear step.
+    if _SUBGRAPH_ENABLED.get(PhaseName.GAP_PLAN.value, False):
+        gap_subgraph = build_gap_plan_subgraph().compile()
+        graph.add_node(
+            PhaseName.GAP_PLAN.value,
+            make_subgraph_node(
+                gap_subgraph,
+                PhaseName.GAP_PLAN.value,
+                _gap_plan_state_mapper,
+                _gap_plan_result_mapper,
+                use_per_phase_checkpointer=True,
+            ),
+        )
 
     # Add artifact gate nodes and their outgoing conditional edges.
     # Gate nodes route to ``next_node`` on proceed or ``human_review`` on
@@ -734,6 +807,20 @@ def build_workflow_graph(
             # were registered in the gate-node loop above.
             gate_name = _gate_node_name(node_name, next_node)
             graph.add_edge(node_name, gate_name)
+        elif node_name == PhaseName.VERIFY.value:
+            # Verify uses its own router for gap-fix loop support.
+            # On passed → END. On needs_gap_fix → gap_plan → implement → verify.
+            # On needs_review (gap attempts exhausted) → human_review.
+            graph.add_conditional_edges(
+                node_name,
+                _verify_router,
+                {
+                    "passed": END,
+                    "needs_gap_fix": PhaseName.GAP_PLAN.value,
+                    "needs_review": "human_review",
+                    "failed": END,
+                },
+            )
         elif next_node is not None:
             # Status guard: if the phase produced needs_review, route
             # to human_review instead of charging into the next phase.
@@ -761,6 +848,9 @@ def build_workflow_graph(
                     "failed": END,
                 },
             )
+
+    # Wire gap_plan → implement (gap-fix loop: verify → gap_plan → implement → verify)
+    graph.add_edge(PhaseName.GAP_PLAN.value, PhaseName.IMPLEMENT.value)
 
     # Compile with optional checkpointer
     compile_kwargs: dict[str, Any] = {}

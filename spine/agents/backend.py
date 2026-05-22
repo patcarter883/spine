@@ -46,7 +46,7 @@ class _NormalizingLocalShellBackend(LocalShellBackend):
 
     def _resolve_path(self, key: str) -> Path:
         if self.virtual_mode and key.startswith(str(self.cwd)):
-            key = key[len(str(self.cwd)):].lstrip("/")
+            key = key[len(str(self.cwd)) :].lstrip("/")
         return super()._resolve_path(key)
 
 

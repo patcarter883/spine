@@ -224,7 +224,7 @@ class TestVerifyStateAndResult:
         assert result["current_phase"] == "verify"
         assert result["phase_results"]["verify"]["status"] == "success"
 
-    def test_verify_result_mapper_needs_review(self):
+    def test_verify_result_mapper_needs_gap_fix(self):
         from spine.workflow.compose import _verify_result_mapper
 
         subgraph_result = {
@@ -232,9 +232,35 @@ class TestVerifyStateAndResult:
             "phase_status": "needs_review",
         }
         result = _verify_result_mapper(subgraph_result, {"work_id": "test"})
+        # First failure with verify_attempts=0 → gap-fix cycle
+        assert result["status"] == "needs_gap_fix"
+        assert result["verify_attempts"] == 1
+        assert any(f.get("status") == "needs_review" for f in result["feedback"])
+
+    def test_verify_result_mapper_needs_review_after_max_gaps(self):
+        from spine.workflow.compose import _verify_result_mapper
+
+        subgraph_result = {
+            "artifacts_output": {},
+            "phase_status": "needs_review",
+        }
+        # Third failure with verify_attempts=2 → human review
+        result = _verify_result_mapper(subgraph_result, {"work_id": "test", "verify_attempts": 2})
         assert result["status"] == "needs_review"
         assert result["needs_review_phase"] == "verify"
         assert any(f.get("status") == "needs_review" for f in result["feedback"])
+
+    def test_verify_result_mapper_second_gap_fix(self):
+        from spine.workflow.compose import _verify_result_mapper
+
+        subgraph_result = {
+            "artifacts_output": {},
+            "phase_status": "needs_review",
+        }
+        # Second failure with verify_attempts=1 → still gap-fix
+        result = _verify_result_mapper(subgraph_result, {"work_id": "test", "verify_attempts": 1})
+        assert result["status"] == "needs_gap_fix"
+        assert result["verify_attempts"] == 2
 
     def test_verify_result_mapper_error(self):
         from spine.workflow.compose import _verify_result_mapper

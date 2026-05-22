@@ -124,6 +124,7 @@ def build_context(
 
     # Resolve the named subagent for this phase (for interpreter PTC)
     from spine.agents.subagents import PHASE_SUBAGENTS
+
     subagent_names = PHASE_SUBAGENTS.get(phase_name, [])
     active_subagent = subagent_names[0] if len(subagent_names) == 1 else ""
 

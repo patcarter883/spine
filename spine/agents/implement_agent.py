@@ -118,10 +118,7 @@ def build_implement_agent(
         )
         for i, wave in enumerate(execution_waves):
             slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
-            slice_inventory += (
-                f"  Wave {i + 1}: {', '.join(slice_ids)} "
-                f"({len(wave)} slice(s))\n"
-            )
+            slice_inventory += f"  Wave {i + 1}: {', '.join(slice_ids)} ({len(wave)} slice(s))\n"
     else:
         # Legacy fallback: discover slice-*.md files from tasks/ dir
         slice_files = list_slice_files(workspace_root, work_id)
@@ -132,9 +129,8 @@ def build_implement_agent(
                 "Use `ls` + `glob` to locate slice files before proceeding."
             )
         else:
-            slice_inventory = (
-                f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
-                + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
+            slice_inventory = f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n" + "\n".join(
+                f"  - `{tasks_dir}/{name}`" for name in slice_files
             )
 
     system_prompt = _build_orchestrator_prompt(has_waves=has_waves)
