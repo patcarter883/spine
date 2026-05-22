@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -21,6 +22,9 @@ from langchain_core.runnables import RunnableConfig
 from spine.agents.helpers import resolve_model
 
 logger = logging.getLogger(__name__)
+
+# Truncate spec content for PLAN explore agents to reasonable size
+_MAX_SPEC_CHARS = 8000
 
 # ── Research manager prompt ──────────────────────────────────────────────
 
@@ -58,6 +62,10 @@ async def run_research_manager(
     The manager has NO tools — it receives the description and accumulated
     findings as plain text and makes one decision: explore more areas or done.
 
+    When the phase is ``"plan"``, the specification content is read from
+    disk and included in the context so the manager bases its decisions on
+    spec requirements rather than just the work description.
+
     Args:
         state: The ExplorationSubgraphState.
         config: LangGraph runtime config.
@@ -71,6 +79,8 @@ async def run_research_manager(
     round_num = state.get("research_round", 0)
     max_rounds = state.get("max_rounds", 3)
     work_id = state.get("work_id", "unknown")
+    phase = state.get("phase", "specify")
+    workspace_root = state.get("workspace_root", ".")
 
     # Safety valve — if we've hit max rounds, force done
     if round_num >= max_rounds:
@@ -90,10 +100,28 @@ async def run_research_manager(
 
         model = init_chat_model(model)
 
-    # Build the context for the manager
+    # ── Build the context for the manager ────────────────────────────
+    # For PLAN phase: include the specification so the manager can decide
+    # research areas based on spec requirements, not just the description.
+    spec_section = ""
+    if phase == "plan":
+        spec_path = state.get("spec_path", "")
+        if spec_path:
+            full_path = Path(workspace_root) / spec_path / "specification.md"
+            if full_path.exists():
+                try:
+                    raw_spec = full_path.read_text(encoding="utf-8")
+                    spec_section = (
+                        f"## Specification (use this to guide research decisions)\n"
+                        f"{raw_spec[:_MAX_SPEC_CHARS]}\n\n"
+                    )
+                except OSError:
+                    pass
+
     findings_summary = _summarize_findings(findings)
     context = (
         f"## Work Description\n{description}\n\n"
+        f"{spec_section}"
         f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
         f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
         f"## Findings So Far\n{findings_summary}\n\n"
@@ -168,6 +196,10 @@ async def run_explore_node(
     subagent configuration (model, tools, MCP, response_format), then
     wraps it in a minimal agent for invocation.
 
+    When the phase is ``"plan"``, the specification content is read from
+    disk and injected into the subagent prompt so the researcher maps spec
+    requirements to codebase files rather than doing generic exploration.
+
     Args:
         state: The ExplorationSubgraphState.
         config: LangGraph runtime config.
@@ -183,15 +215,20 @@ async def run_explore_node(
     from spine.models.enums import PhaseName
 
     work_id = state.get("work_id", "unknown")
+    phase = state.get("phase", PhaseName.SPECIFY.value)
+    workspace_root = state.get("workspace_root", ".")
     topic_str = topic or "general codebase investigation"
 
-    logger.info("[%s] Explore node: researching topic=%r", work_id, topic_str)
+    logger.info("[%s] Explore node (phase=%s): researching topic=%r", work_id, phase, topic_str)
 
     try:
-        # Build the researcher subagent spec
+        # Determine which PhaseName to use for model/skill resolution
+        phase_enum = PhaseName.PLAN if phase == PhaseName.PLAN.value else PhaseName.SPECIFY
+
+        # Build the researcher subagent spec with the correct phase
         subagent_spec = build_subagent_spec(
             name="researcher",
-            phase=PhaseName.SPECIFY,
+            phase=phase_enum,
             state=state,  # type: ignore[arg-type]
             config=config,
         )
@@ -201,7 +238,7 @@ async def run_explore_node(
         agent = build_phase_agent(
             state=state,  # type: ignore[arg-type]
             config=config,
-            phase=PhaseName.SPECIFY,
+            phase=phase_enum,
             system_prompt=subagent_spec["system_prompt"],
             is_subagent=True,
             extra_tools=subagent_spec.get("tools", []),
@@ -209,13 +246,41 @@ async def run_explore_node(
             skip_filesystem_middleware=True,
         )
 
-        prompt = (
-            f"## Research Topic\n{topic_str}\n\n"
-            "Investigate this specific area of the codebase. "
-            "Use MCP tools first for structural navigation, "
-            "then fall back to read_file/glob/grep if needed. "
-            "Return your findings in the ResearchFindings format."
-        )
+        # ── Build the research prompt ─────────────────────────────────
+        # For PLAN phase: inject the specification content so the researcher
+        # maps spec requirements to codebase files, not just the generic topic.
+        spec_content = ""
+        if phase == PhaseName.PLAN.value:
+            spec_path = state.get("spec_path", "")
+            if spec_path:
+                full_path = Path(workspace_root) / spec_path / "specification.md"
+                if full_path.exists():
+                    try:
+                        spec_content = full_path.read_text(encoding="utf-8")
+                    except OSError:
+                        pass
+
+        if spec_content:
+            prompt = (
+                f"## Plan Research Topic: {topic_str}\n\n"
+                f"## Specification (read this FIRST — your research must map this to "
+                f"the codebase)\n\n{spec_content[:_MAX_SPEC_CHARS]}\n\n"
+                f"## Research Task\n"
+                f"For the topic '{topic_str}', find the existing codebase files, "
+                f"patterns, conventions, and dependencies that map to the specification "
+                f"sections above. Use MCP tools first for structural navigation, "
+                f"then fall back to read_file/glob/grep if needed. "
+                f"Return your findings in the ResearchFindings format with specific "
+                f"file paths and how they relate to the spec."
+            )
+        else:
+            prompt = (
+                f"## Research Topic\n{topic_str}\n\n"
+                f"Investigate this specific area of the codebase. "
+                f"Use MCP tools first for structural navigation, "
+                f"then fall back to read_file/glob/grep if needed. "
+                f"Return your findings in the ResearchFindings format."
+            )
 
         result = await ainvoke_with_retry(
             agent,

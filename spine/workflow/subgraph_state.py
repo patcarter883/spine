@@ -102,10 +102,8 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer
 
-    # PLAN-specific synthesis output
-    plan_json: str  # Raw plan.json content (only used in PLAN phase)
-    execution_waves: list  # Computed execution waves (only used in PLAN phase)
-
-    # PLAN-specific synthesis output
+    # PLAN-specific fields
+    spec_path: str  # Path to specification.md (for PLAN explore agents)
+    has_spec: bool  # True when a specification artifact exists
     plan_json: str  # Raw plan.json content (only used in PLAN phase)
     execution_waves: list  # Computed execution waves (only used in PLAN phase)
