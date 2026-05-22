@@ -1,5 +1,11 @@
 """Custom tools for the TASKS phase agent.
 
+.. deprecated::
+    The TASKS phase tools are deprecated. New workflows should use the PLAN
+    phase tools for decomposition instead. This module is retained for
+    backward compatibility and will be removed in a future release.
+    ``SliceDefinition`` is kept for downstream consumers that reference it.
+
 Replaces generic filesystem tools with purpose-built tools that enforce
 the tasks agent's role: research the codebase, then write a complete
 structured decomposition in one atomic call. Nothing else.
@@ -50,9 +56,7 @@ class SliceDefinition(BaseModel):
             "Used as the filename: slice-<name>.md"
         )
     )
-    description: str = Field(
-        description="What this slice implements and why."
-    )
+    description: str = Field(description="What this slice implements and why.")
     files_to_modify: list[str] = Field(
         description=(
             "Existing workspace files that will be changed. "
@@ -130,6 +134,10 @@ class _WriteTasksArtifactsInput(BaseModel):
 class WriteTasksArtifactsTool(BaseTool):
     """Write all TASKS phase artifacts atomically in one call.
 
+    .. deprecated::
+        The TASKS phase is deprecated. This tool is retained for backward
+        compatibility only.
+
     This is the ONLY write tool available to the tasks agent.
     Accepts all required artifacts as structured arguments and writes:
     - One ``slice-<name>.md`` per slice definition
@@ -160,10 +168,7 @@ class WriteTasksArtifactsTool(BaseTool):
         codebase_map: str,
     ) -> str:
         # Coerce dicts to SliceDefinition objects (pydantic may pass raw dicts)
-        parsed_slices = [
-            SliceDefinition(**s) if isinstance(s, dict) else s
-            for s in slices
-        ]
+        parsed_slices = [SliceDefinition(**s) if isinstance(s, dict) else s for s in slices]
 
         tasks_path = Path(self.workspace_root) / self.tasks_dir
         tasks_path.mkdir(parents=True, exist_ok=True)
@@ -237,9 +242,7 @@ class WriteTasksArtifactsTool(BaseTool):
         )
         written.append("codebase-map.md")
 
-        total = sum(
-            (tasks_path / f).stat().st_size for f in written if (tasks_path / f).exists()
-        )
+        total = sum((tasks_path / f).stat().st_size for f in written if (tasks_path / f).exists())
         return (
             f"Tasks artifacts written to {self.tasks_dir}/: {', '.join(written)}. "
             f"Total: {len(written)} files, {total:,} bytes. "
@@ -262,6 +265,10 @@ def build_tasks_agent_tools(
     feedback: list[str] | None = None,
 ) -> list[BaseTool]:
     """Build the custom tool set for the tasks agent.
+
+    .. deprecated::
+        The TASKS phase tools are deprecated. Use the PLAN phase tools
+        for decomposition instead.
 
     Returns three tools:
     - ``read_prior_artifacts`` — loads spec/plan artifacts (spec workflows)

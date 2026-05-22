@@ -250,7 +250,13 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
         kwargs["api_key"] = api_key
 
     # Pass through optional tuning fields if present
-    for key in ("temperature", "max_tokens", "max_completion_tokens", "max_retries", "request_timeout"):
+    for key in (
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_retries",
+        "request_timeout",
+    ):
         if key in provider_cfg:
             kwargs[key] = provider_cfg[key]
 
@@ -335,15 +341,16 @@ def extract_response(result: dict[str, Any]) -> str:
         if content and len(content.strip()) > 0:
             # Detect leaked thinking-model reasoning
             stripped = content.strip()
-            if stripped and not stripped[0].isupper() and stripped[0] not in ("#", "*", "-", "|", "`", "[", '"'):
+            if (
+                stripped
+                and not stripped[0].isupper()
+                and stripped[0] not in ("#", "*", "-", "|", "`", "[", '"')
+            ):
                 # Looks like reasoning, not a structured artifact
                 return ""
             return content
         # ── Fall back to reasoning_content for thinking models ─────────
-        reasoning = (
-            getattr(last, "additional_kwargs", {}).get("reasoning_content", "")
-            or ""
-        )
+        reasoning = getattr(last, "additional_kwargs", {}).get("reasoning_content", "") or ""
         if reasoning and len(reasoning.strip()) > 10:
             return reasoning.strip()
     return ""

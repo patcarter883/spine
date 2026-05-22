@@ -110,11 +110,21 @@ logger = logging.getLogger(__name__)
 
 _PTC_ALLOWLISTS: dict[str, list[str | Any]] = {
     PhaseName.SPECIFY.value: ["task", "read_work_context", "write_specification"],
-    PhaseName.PLAN.value: ["task", "search_codebase", "read_prior_artifacts", "write_plan"],
-    PhaseName.TASKS.value: ["task", "search_codebase", "read_prior_artifacts", "write_tasks_artifacts"],
+    PhaseName.TASKS.value: [
+        "task",
+        "search_codebase",
+        "read_prior_artifacts",
+        "write_tasks_artifacts",
+    ],
     PhaseName.IMPLEMENT.value: ["task", "read_slice_files", "write_implementation_report"],
-    PhaseName.VERIFY.value: ["task", "grep", "glob", "ls", "write_file"],  # VERIFY still uses FilesystemMiddleware
-    # CRITIC doesn't need PTC — review-only, no orchestration.
+    PhaseName.VERIFY.value: [
+        "task",
+        "grep",
+        "glob",
+        "ls",
+        "write_file",
+    ],  # VERIFY still uses FilesystemMiddleware
+    # CRITIC and PLAN don't need PTC — they review/plan, not orchestrate.
 }
 
 
@@ -209,9 +219,7 @@ def build_interpreter_middleware(
             prompt: str = self._prepare_for_call(request)
             clean_prompt = _TS_BLOCK_RE.sub(_PTC_REPLACEMENT, prompt)
             return await handler(
-                request.override(
-                    system_message=self._extend(request.system_message, clean_prompt)
-                )
+                request.override(system_message=self._extend(request.system_message, clean_prompt))
             )
 
     middleware = SpineInterpreterMiddleware(

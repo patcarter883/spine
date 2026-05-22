@@ -64,17 +64,19 @@ async def _run_tasks_agent(
         if has_spec:
             # Spec/critical_spec: work from spec + plan artifacts, not the
             # original description (already captured and expanded in them).
-            prompt_lines.extend([
-                "Break the plan into smaller, executable feature slices "
-                "with clear dependencies.",
-                "",
-                "Prior artifacts are available on disk:",
-                f"- Specification: `{spec_path}/specification.md`",
-                f"- Plan: `{plan_path}/plan.md`",
-                "",
-                "Call `read_prior_artifacts` first (no arguments) to load the specification and plan. Then call `search_codebase` or use MCP tools to research change sites.",
-                "",
-            ])
+            prompt_lines.extend(
+                [
+                    "Break the plan into smaller, executable feature slices "
+                    "with clear dependencies.",
+                    "",
+                    "Prior artifacts are available on disk:",
+                    f"- Specification: `{spec_path}/specification.md`",
+                    f"- Plan: `{plan_path}/plan.md`",
+                    "",
+                    "Call `read_prior_artifacts` first (no arguments) to load the specification and plan. Then call `search_codebase` or use MCP tools to research change sites.",
+                    "",
+                ]
+            )
         else:
             # Quick/critical_quick: no prior artifacts — work from the
             # original description. First action must be parallel researcher
@@ -82,56 +84,63 @@ async def _run_tasks_agent(
             desc_preview = description[:120].replace("'", "\\'")
             researcher_line1 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 1>'}}),"
             researcher_line2 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 2>'}}),"
-            prompt_lines.extend([
-                "Break the work description into smaller, executable "
-                "feature slices with clear dependencies.",
-                "",
-                "## Work Description",
-                description,
-                "",
-                "## Your first action MUST be an eval call",
-                "Dispatch 2-3 `researcher` subagents in parallel via "
-                "`Promise.allSettled` inside a single `eval` call. "
-                "Do NOT call codebase queries search/explore sequential turn-by-turn yourself first. "
-                "Each researcher investigates ONE area of the codebase "
-                "relevant to the work description above.",
-                "",
-                "```js",
-                "// FIRST TURN — dispatch researchers in parallel:",
-                "const results = await Promise.allSettled([",
-                "  tools.task({subagent_type: 'researcher',",
-                researcher_line1,
-                "  tools.task({subagent_type: 'researcher',",
-                researcher_line2,
-                "]);",
-                "globalThis.research = results.map(r => r.value || r.reason);",
-                "```",
-                "",
-                "After researchers complete, call `write_tasks_artifacts` "
-                "with all slices, tasks summary, dependency waves, and codebase map. "
-                "Total turns: ~2-3.",
-                "",
-            ])
+            prompt_lines.extend(
+                [
+                    "Break the work description into smaller, executable "
+                    "feature slices with clear dependencies.",
+                    "",
+                    "## Work Description",
+                    description,
+                    "",
+                    "## Your first action MUST be an eval call",
+                    "Dispatch 2-3 `researcher` subagents in parallel via "
+                    "`Promise.allSettled` inside a single `eval` call. "
+                    "Do NOT call codebase queries search/explore sequential turn-by-turn yourself first. "
+                    "Each researcher investigates ONE area of the codebase "
+                    "relevant to the work description above.",
+                    "",
+                    "```js",
+                    "// FIRST TURN — dispatch researchers in parallel:",
+                    "const results = await Promise.allSettled([",
+                    "  tools.task({subagent_type: 'researcher',",
+                    researcher_line1,
+                    "  tools.task({subagent_type: 'researcher',",
+                    researcher_line2,
+                    "]);",
+                    "globalThis.research = results.map(r => r.value || r.reason);",
+                    "```",
+                    "",
+                    "After researchers complete, call `write_tasks_artifacts` "
+                    "with all slices, tasks summary, dependency waves, and codebase map. "
+                    "Total turns: ~2-3.",
+                    "",
+                ]
+            )
 
-        prompt_lines.extend([
-            f"## Artifact Output Directory\n"
-            f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
-            f"This is relative to your workspace root (`{workspace_root}`).\n"
-            f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
-        ])
-        prompt_lines.extend([
-            "## Instructions\n"
-            "1. Explore the codebase (use researcher subagents in parallel via first-turn `eval` call).\n"
-            "2. After exploring, synthesize everything and write all slices, overview, and codebase-map "
-            "using `write_tasks_artifacts` once.\n"
-            "3. **You MUST call `write_tasks_artifacts` exactly ONCE** — do not call `write_file`.\n"
-            "4. Total phase length is ~2-3 turns. Stop immediately after `write_tasks_artifacts` returns.\n",
-        ])
+        prompt_lines.extend(
+            [
+                f"## Artifact Output Directory\n"
+                f"Write ALL artifact files (slice files AND tasks.md) to: `{tasks_artifact_dir}/`\n"
+                f"This is relative to your workspace root (`{workspace_root}`).\n"
+                f"Full path: `{workspace_root}/{tasks_artifact_dir}/`\n",
+            ]
+        )
+        prompt_lines.extend(
+            [
+                "## Instructions\n"
+                "1. Explore the codebase (use researcher subagents in parallel via first-turn `eval` call).\n"
+                "2. After exploring, synthesize everything and write all slices, overview, and codebase-map "
+                "using `write_tasks_artifacts` once.\n"
+                "3. **You MUST call `write_tasks_artifacts` exactly ONCE** — do not call `write_file`.\n"
+                "4. Total phase length is ~2-3 turns. Stop immediately after `write_tasks_artifacts` returns.\n",
+            ]
+        )
         prompt = "\n".join(prompt_lines)
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
-                for f in feedback if isinstance(f, dict)
+                for f in feedback
+                if isinstance(f, dict)
             )
             prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
@@ -178,7 +187,9 @@ async def _save_tasks_artifacts(
         }
 
     disk_artifacts = scan_artifact_dir(
-        workspace_root, work_id, PhaseName.TASKS.value,
+        workspace_root,
+        work_id,
+        PhaseName.TASKS.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
     )
 
@@ -226,7 +237,9 @@ async def _save_tasks_artifacts(
         )
         # Scan disk again after retry
         disk_artifacts = scan_artifact_dir(
-            workspace_root, work_id, PhaseName.TASKS.value,
+            workspace_root,
+            work_id,
+            PhaseName.TASKS.value,
             max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
         )
 

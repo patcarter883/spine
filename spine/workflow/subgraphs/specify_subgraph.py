@@ -91,7 +91,9 @@ async def _save_specify_artifacts(
         return {"artifacts_output": {}, "phase_status": existing_phase_status}
 
     disk_artifacts = scan_artifact_dir(
-        workspace_root, work_id, PhaseName.SPECIFY.value,
+        workspace_root,
+        work_id,
+        PhaseName.SPECIFY.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
     )
 

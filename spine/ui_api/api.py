@@ -192,9 +192,7 @@ class UIApi:
             "mcp_servers": self._config.mcp_servers,
         }
 
-    def update_mcp_server(
-        self, server_name: str, config: dict[str, Any]
-    ) -> bool:
+    def update_mcp_server(self, server_name: str, config: dict[str, Any]) -> bool:
         """Update or add an MCP server configuration.
 
         Writes the updated ``mcp_servers`` section back to
@@ -244,7 +242,12 @@ class UIApi:
         """
         cfg = self._config.mcp_servers.get(server_name)
         if not cfg:
-            return {"connected": False, "tool_count": 0, "tool_names": [], "error": "No config found"}
+            return {
+                "connected": False,
+                "tool_count": 0,
+                "tool_names": [],
+                "error": "No config found",
+            }
 
         try:
             import asyncio
@@ -729,8 +732,8 @@ class UIApi:
     ) -> dict[str, Any]:
         """Approve a planning work item and optionally spawn execution tasks.
 
-        Non-blocking: runs the approval in the background via RalphLoopWorker's
-        executor and returns immediately.
+        Awaits approve_and_spawn and returns its result directly.
+        If the operation fails, returns an error dict.
 
         Args:
             plan_id: The planning work item ID.
@@ -738,24 +741,19 @@ class UIApi:
             feedback: Optional feedback text.
 
         Returns:
-            Dict with plan_id, status, and spawned_ids (if approved).
+            Dict with plan_id, status, spawned_ids (if approved), and
+            error key on failure.
         """
         from spine.work.dispatcher import approve_and_spawn
 
-        import concurrent.futures
-
-        def _run() -> dict[str, Any]:
-            import asyncio
-
-            return asyncio.run(approve_and_spawn(plan_id, action, feedback, self._config))
-
-        executor = getattr(get_worker(self._config), "_executor", None)
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        executor.submit(_run)
-
-        return {
-            "plan_id": plan_id,
-            "status": "processing",
-            "action": action,
-        }
+        try:
+            result = await approve_and_spawn(plan_id, action, feedback, self._config)
+            return result
+        except Exception as e:
+            logger.exception(f"approve_plan failed for {plan_id}")
+            return {
+                "plan_id": plan_id,
+                "status": "error",
+                "action": action,
+                "error": str(e),
+            }

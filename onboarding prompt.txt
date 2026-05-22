@@ -1,0 +1,1 @@
+Initial greenfields project setup and brownfields project analysis and mapping features to produce guideline documents for overall project definition, coding styles and guidelines, project wide high level codemap, and any other requirements for structured assisted development by the spine framework. Implement a UI interface for these features as well.

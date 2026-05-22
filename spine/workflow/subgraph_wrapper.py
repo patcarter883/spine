@@ -80,6 +80,7 @@ async def _get_phase_checkpointer(
     logger.debug(f"[{work_id}] [{phase}] per-phase checkpointer: {db_path}")
     return saver
 
+
 # Per-phase timeout overrides (seconds). Default: _DEFAULT_PHASE_TIMEOUT.
 # These are fallbacks — the subgraph wrapper reads SpineConfig.phase_timeouts
 # at invocation time so users can override via config.yaml.
@@ -116,6 +117,7 @@ def _resolve_timeout(phase: str, config: RunnableConfig | None = None) -> int:
                 return int(spine_cfg.default_timeout)
     # Fallback to defaults
     return _PHASE_TIMEOUTS.get(phase, _DEFAULT_PHASE_TIMEOUT)
+
 
 # Max chars of artifact content to store in parent WorkflowState.
 _MAX_ARTIFACT_STATE_CHARS = 500
@@ -224,9 +226,7 @@ def make_subgraph_node(
         mark_phase_started(parent_state, phase_name)
 
         timeout_label = f"timeout={timeout}s" if timeout > 0 else "no timeout"
-        logger.info(
-            f"[{work_id}] [{phase_name}] subgraph starting ({timeout_label})"
-        )
+        logger.info(f"[{work_id}] [{phase_name}] subgraph starting ({timeout_label})")
 
         try:
             # Map parent state to subgraph input
@@ -249,6 +249,7 @@ def make_subgraph_node(
             active_subgraph = subgraph
             if use_per_phase_checkpointer:
                 from spine.workflow.compose import _SUBGRAPH_BUILDER_REGISTRY as builders
+
                 builder_fn = builders.get(phase_name)
                 # Critic subgraphs are parameterized (need reviewed_phase arg)
                 # and are lightweight — skip per-phase checkpointer for them.
@@ -284,9 +285,7 @@ def make_subgraph_node(
             return parent_update
 
         except asyncio.TimeoutError:
-            logger.error(
-                f"[{work_id}] [{phase_name}] subgraph timed out after {timeout}s"
-            )
+            logger.error(f"[{work_id}] [{phase_name}] subgraph timed out after {timeout}s")
             return _needs_review_update(
                 parent_state,
                 phase_name,
@@ -302,9 +301,7 @@ def make_subgraph_node(
             )
 
         except Exception as e:
-            logger.error(
-                f"[{work_id}] [{phase_name}] subgraph failed: {e}", exc_info=True
-            )
+            logger.error(f"[{work_id}] [{phase_name}] subgraph failed: {e}", exc_info=True)
             return _error_update(parent_state, phase_name, str(e))
 
     # Name for LangSmith Studio / debug
@@ -324,9 +321,7 @@ def make_success_result_mapper(phase: str) -> Callable:
         parent_state: dict,
     ) -> dict[str, Any]:
         artifacts = subgraph_result.get("artifacts_output", {})
-        artifact_names = (
-            list(artifacts.keys()) if isinstance(artifacts, dict) else []
-        )
+        artifact_names = list(artifacts.keys()) if isinstance(artifacts, dict) else []
 
         # Build artifact previews for parent state (truncated)
         artifact_previews = {}

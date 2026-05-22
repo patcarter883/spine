@@ -1,19 +1,20 @@
 """SPINE plan agent — Deep Agent for the PLAN phase.
 
 Reads the specification artifact and codebase structure, then writes
-the technical plan via the ``write_plan`` tool.
+the technical plan via the ``write_structured_plan`` tool, emitting a
+flat array of feature_slices with explicit dependencies.
 
 Tool surface (complete list):
 - ``read_prior_artifacts`` — loads specification + context in one call
 - ``search_codebase`` — multi-query codebase file search
-- ``write_plan`` — structured write to plan.md (only)
-- ``task`` (via SubAgentMiddleware) — dispatches researcher subagents
-- ``eval`` (via CodeInterpreterMiddleware) — parallel subagent dispatch, store results
+- ``write_structured_plan`` — structured write with feature_slices (only)
+- ``eval`` (via CodeInterpreterMiddleware) — orchestration / store results
 
 No generic filesystem tools (ls, read_file, glob, grep, write_file,
 edit_file, execute). The plan agent has targeted read access via
-``read_prior_artifacts`` + ``search_codebase`` + researcher subagents,
-and write access only to plan.md. It cannot browse the filesystem arbitrarily.
+``read_prior_artifacts`` + ``search_codebase``, and write access only
+through ``write_structured_plan``. It cannot browse the filesystem
+arbitrarily.
 
 PLAN dispatching: research subagents explore codebase areas in parallel
 via ``eval`` + ``Promise.allSettled``, matching the SPECIFY pattern.
@@ -84,7 +85,6 @@ def build_plan_agent(
         config=config,
         phase=PhaseName.PLAN,
         system_prompt=system_prompt,
-        subagents=_build_subagents(PhaseName.PLAN, state, config),
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
     )
@@ -109,7 +109,9 @@ def _build_plan_prompt() -> str:
     return (
         "You are the PLAN phase agent. Your job is to create a detailed "
         "technical plan from the specification, grounded in the actual "
-        "codebase structure.\n\n"
+        "codebase structure. The output is a flat array of feature_slices "
+        "with explicit dependencies that the downstream implementation "
+        "phase will execute.\n\n"
         "## Your tool surface (complete list)\n"
         "- `read_prior_artifacts` — loads spec and all prior artifacts. "
         "No arguments. Call this FIRST.\n"
@@ -146,8 +148,9 @@ def _build_plan_prompt() -> str:
         "content previews. Use for content-level queries the MCP "
         "tools don't cover.\n"
         "### Output\n"
-        "- `write_plan` — writes plan.md. Call this LAST. "
-        "This is the ONLY write tool.\n\n"
+        "- `write_structured_plan` — emits feature_slices with dependencies. "
+        "Call this LAST. This is the ONLY write tool.\n"
+        "- `eval` — JavaScript REPL for storing intermediate results.\n\n"
         "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
         "`edit_file`, or `execute`. Do not attempt to call them. "
         "Use MCP tools, researcher subagents, and `search_codebase` "
@@ -186,46 +189,55 @@ def _build_plan_prompt() -> str:
         "// Store reports:\n"
         "globalThis.reports = results.map(r => r.value);\n"
         "```\n\n"
-        "BEFORE dispatching, call `read_prior_artifacts` to understand "
-        "what was already discovered by the SPECIFY phase's researchers — "
-        "don't re-research areas the specification already covers well.\n\n"
-        "If the specification is simple and well-researched, skip researcher "
-        "dispatch and go directly to Step 3.\n\n"
-        "### Step 3 — Call write_plan (1 turn)\n"
-        "Synthesize spec + codebase research into the six required sections "
-        "and call `write_plan`:\n"
-        "- `architecture_overview`: components, data flow, interfaces\n"
-        "- `technology_choices`: libraries/tools with rationale\n"
-        "- `module_structure`: file/module layout (all paths must be real "
-        "workspace paths from research results)\n"
-        "- `api_designs`: function signatures, data models, schemas\n"
-        "- `implementation_order`: phases/waves with dependencies\n"
-        "- `testing_strategy`: test file paths, what to add/modify\n\n"
+        "### Step 3 — Call write_structured_plan (1 turn)\n"
+        "Synthesize spec + codebase research into a flat array of "
+        "`feature_slices` and call `write_structured_plan`. Each slice "
+        "represents one independently implementable unit of work.\n\n"
+        "#### feature_slices structure\n"
+        "Each slice MUST have ALL of the following fields:\n"
+        "- `id` (str): Unique short identifier, e.g. "
+        "'add-user-model', 'update-auth-middleware'.\n"
+        "- `title` (str): Human-readable one-line summary.\n"
+        "- `target_files` (list[str]): Every file path the slice will "
+        "create or modify. Paths MUST come from codebase exploration "
+        "results (MCP or `search_codebase`), or be new files inside a "
+        "directory confirmed to exist.\n"
+        "- `execution_requirements` (str): Detailed instructions for "
+        "what to implement — function signatures, logic, data models, "
+        "edge cases. Be specific enough that an isolated agent can "
+        "implement without re-reading the spec.\n"
+        "- `dependencies` (list[str]): IDs of slices that must be "
+        "completed before this one. Use an empty list for slices that "
+        "can run in parallel. Dependencies must form a DAG (no cycles).\n"
+        "- `acceptance_criteria` (str): Concrete test or verification "
+        "steps that prove the slice is correct. Include test file paths "
+        "and expected outcomes.\n"
+        "- `complexity` (str): One of 'small', 'medium', or 'large'.\n\n"
+        "#### Slice design rules\n"
+        "- Aim for 2–8 slices per plan. Fewer slices → less parallelism. "
+        "More slices → more coordination overhead.\n"
+        "- Each slice should be completable in a single implementation "
+        "turn (~30 files, ~2000 lines of changes).\n"
+        "- Group tightly-coupled changes into one slice to avoid "
+        "cross-slice coordination.\n"
+        "- Express dependencies explicitly via `dependencies` rather "
+        "than assuming ordering.\n"
+        "- Slices with no dependencies can be executed in parallel.\n\n"
+        "## Rework handling\n"
+        "If `feedback` is non-empty in the prior artifacts, this is a "
+        "rework pass. Address EVERY item in the feedback before calling "
+        "`write_structured_plan`. Adjust slice boundaries, add or remove "
+        "slices, or refine execution_requirements as needed.\n\n"
         "## Strict rules\n"
         "- Call `read_prior_artifacts` first — always.\n"
-        "- Every file path in the plan MUST come from MCP tools, "
-        "researcher subagent results, or `search_codebase` results, "
-        "or be a new file inside a directory confirmed to exist. "
-        "Do not invent paths like `src/main.py` without verification.\n"
-        "- Call `write_plan` exactly once, with all required fields.\n"
-        "- Total turns: ~4. More than 5 turns without calling "
-        "`write_plan` means something has gone wrong — "
-        "write it with what you have.\n\n"
-        "## Parallelism\n"
-        "- **RESEARCHER SUBAGENTS are your PRIMARY exploration method.** "
-        "Dispatch 2-4 researchers in parallel via `eval` + `Promise.allSettled` "
-        "for any non-trivial codebase investigation. Never call `task` "
-        "sequentially — it 4x's wall-clock time.\n"
-        "- USE MCP tools for narrow, targeted symbol lookups only — "
-        "after researchers have given you the broad picture.\n"
-        "- FALLBACK to `search_codebase` only when MCP and researchers "
-        "genuinely don't cover your need.\n\n"
-        "## Token budget\n"
-        "- This phase has a token budget (~500K for spec workflows). "
-        "If you've made >15 `search_codebase` calls, you're over-researching — "
-        "dispatch researchers instead or call `write_plan` with what you have.\n"
-        "- The specification already contains substantial research from "
-        "the SPECIFY phase. Do NOT re-discover what the spec already tells you.\n\n"
+        "- Every file path in the slices MUST come from MCP or "
+        "`search_codebase` results or be a new file inside a directory "
+        "confirmed to exist. Do not invent paths like `src/main.py` "
+        "without verification.\n"
+        "- Call `write_structured_plan` exactly once, with all required "
+        "fields on every slice.\n"
+        "- Total turns: ~4. If you have not called `write_structured_plan` "
+        "by turn 5, write it with what you have.\n\n"
         "## Eval context seed\n"
         "Access session-specific context properties via `globalThis.context` "
         "preloaded in your workspace environment on first turn (e.g., "

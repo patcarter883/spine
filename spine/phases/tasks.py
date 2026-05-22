@@ -1,5 +1,10 @@
 """SPINE TASKS phase — break the plan into executable feature slices.
 
+.. deprecated::
+    The TASKS phase is deprecated. Use the PLAN phase for decomposition
+    instead. This module is retained for backward compatibility and will
+    be removed in a future release.
+
 This is where decomposition occurs. The tasks Deep Agent reads the plan
 (on disk, not inlined) and breaks it into smaller, independent feature
 slices that can be implemented in parallel or sequentially.
@@ -11,6 +16,7 @@ subagents inherit the parent checkpointer.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any
 
 from typing import Optional
@@ -44,6 +50,10 @@ async def call_tasks(
 ) -> dict[str, Any]:
     """Execute the TASKS phase.
 
+    .. deprecated::
+        The TASKS phase is deprecated. Use the PLAN phase for decomposition
+        instead. This function is retained for backward compatibility.
+
     Delegates to the tasks Deep Agent, which decomposes the plan into
     feature slices with dependencies. If reworking, includes prior feedback.
 
@@ -54,6 +64,12 @@ async def call_tasks(
     Returns:
         Partial state update with task artifacts.
     """
+    warnings.warn(
+        "The TASKS phase (call_tasks) is deprecated. Use the PLAN phase for decomposition instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     # TASKS is the first phase in quick workflows (no prior spec/plan exist),
     # so the original description is used directly for quick/critical_quick.
     # For spec/critical_spec workflows, the description is NOT used — TASKS
@@ -86,7 +102,9 @@ async def call_tasks(
 
         prompt_lines = []
         if retry_count > 0:
-            prompt_lines.append("⚠ **REWORK PASS**: Your primary objective is to revise the prior tasks decomposition. Address all points from the critic feedback.\n\n")
+            prompt_lines.append(
+                "⚠ **REWORK PASS**: Your primary objective is to revise the prior tasks decomposition. Address all points from the critic feedback.\n\n"
+            )
 
         if has_spec:
             prompt_lines.extend(

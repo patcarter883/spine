@@ -32,7 +32,9 @@ async def _structural_check_node(
     result = structural_critic_check(pseudo_state, reviewed_phase)
     return {
         "structural_result": result,
-        "phase_status": "success" if result["status"] == ReviewStatus.PASSED.value else result["status"],
+        "phase_status": "success"
+        if result["status"] == ReviewStatus.PASSED.value
+        else result["status"],
     }
 
 

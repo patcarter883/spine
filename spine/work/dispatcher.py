@@ -456,10 +456,7 @@ async def submit_work(
 
         # Check if any feedback entry indicates needs_review (the critic
         # router sends to END when max retries are exceeded).
-        if any(
-            isinstance(f, dict) and f.get("status") == "needs_review"
-            for f in feedback
-        ):
+        if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
             final_status = "needs_review"
 
         # Planning work types must end as "awaiting_approval" so users
@@ -476,8 +473,7 @@ async def submit_work(
 
         # Filter feedback to only include needs_review entries for display
         needs_review_feedback = [
-            f for f in feedback
-            if isinstance(f, dict) and f.get("status") == "needs_review"
+            f for f in feedback if isinstance(f, dict) and f.get("status") == "needs_review"
         ]
 
         db["work_entries"].update(
@@ -557,8 +553,6 @@ async def submit_work(
         }
 
 
-
-
 # ── List planning work ──
 
 
@@ -604,6 +598,7 @@ async def list_plans(
     entries = list(db["work_entries"].search(where_clause, *args))
 
     return [dict(entry) for entry in entries]
+
 
 # ── Resume work ──
 
@@ -803,9 +798,7 @@ async def resume_work(
                 status = node_output.get("status", "")
                 if phase or status:
                     _update_work_progress(db, work_id, phase, status)
-                    logger.info(
-                        f"[{work_id}] Resume: Phase {phase or node_name} → {status}"
-                    )
+                    logger.info(f"[{work_id}] Resume: Phase {phase or node_name} → {status}")
                     audit.log_event(
                         work_id,
                         "phase_completed",
@@ -834,10 +827,7 @@ async def resume_work(
         if final_status == "running":
             final_status = "completed"
 
-        if any(
-            isinstance(f, dict) and f.get("status") == "needs_review"
-            for f in feedback
-        ):
+        if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
             final_status = "needs_review"
 
         db["work_entries"].update(
@@ -848,9 +838,7 @@ async def resume_work(
                 "updated_at": datetime.now().isoformat(),
                 "result": json.dumps(
                     {
-                        "artifacts": {
-                            k: list(v.keys()) for k, v in result_artifacts.items()
-                        },
+                        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
                         "feedback_count": len(feedback),
                         "prompt_request": result.get("prompt_request"),
                     }
@@ -895,9 +883,7 @@ async def resume_work(
                 "result": json.dumps({"error": str(e), "resumed": True}),
             },
         )
-        audit.log_event(
-            work_id, "work_failed", "dispatcher", {"error": str(e), "resumed": True}
-        )
+        audit.log_event(work_id, "work_failed", "dispatcher", {"error": str(e), "resumed": True})
 
         try:
             from spine.ui.ws_bus import get_bus
@@ -917,8 +903,8 @@ async def resume_work(
         }
 
 
-
 # ── Resume interrupted work (using Command + interrupt) ──
+
 
 async def resume_interrupted_work(
     work_id: str,
@@ -1271,9 +1257,7 @@ async def restart_from_phase(
             (i for i, (name, _) in enumerate(sequence) if name == phase_name),
             len(sequence),
         )
-        phases_to_clear = {
-            name for i, (name, _) in enumerate(sequence) if i >= target_idx
-        }
+        phases_to_clear = {name for i, (name, _) in enumerate(sequence) if i >= target_idx}
         work_dir = Path(artifact_store._base) / work_id
         if work_dir.exists():
             for phase_dir in work_dir.iterdir():
@@ -1281,9 +1265,7 @@ async def restart_from_phase(
                     for f in phase_dir.rglob("*"):
                         if f.is_file():
                             f.unlink()
-                    logger.info(
-                        f"[{work_id}] Cleared artifacts for phase: {phase_dir.name}"
-                    )
+                    logger.info(f"[{work_id}] Cleared artifacts for phase: {phase_dir.name}")
 
     # Purge LangGraph checkpoint so the graph starts fresh
     from spine.persistence.checkpoint import CheckpointStore
@@ -1456,9 +1438,7 @@ async def _run_workflow_graph(
                     existing = {}
                 merged = {**existing, **node_artifacts}
                 for key in set(existing) & set(node_artifacts):
-                    if isinstance(existing[key], dict) and isinstance(
-                        node_artifacts[key], dict
-                    ):
+                    if isinstance(existing[key], dict) and isinstance(node_artifacts[key], dict):
                         merged[key] = {**existing[key], **node_artifacts[key]}
                 node_output = {**node_output, "artifacts": merged}
 
@@ -1509,10 +1489,7 @@ async def _run_workflow_graph(
     if final_status == "running":
         final_status = "completed"
 
-    if any(
-        isinstance(f, dict) and f.get("status") == "needs_review"
-        for f in feedback
-    ):
+    if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
         final_status = "needs_review"
 
     result_payload = {
@@ -1738,7 +1715,11 @@ async def split_work_plan(
     current_lines: list[str] = []
 
     for line in tasks_text.splitlines():
-        if line.startswith(("### ", "## ", "# ")) and not line.startswith("# Slice") and not line.startswith("# Tasks"):
+        if (
+            line.startswith(("### ", "## ", "# "))
+            and not line.startswith("# Slice")
+            and not line.startswith("# Tasks")
+        ):
             # Save previous section
             if current_title is not None:
                 sections.append((current_title, "\n".join(current_lines).strip()))
@@ -1761,20 +1742,24 @@ async def split_work_plan(
             config=config,
             plan_id=plan_id,
         )
-        spawned.append({
-            **result,
-            "description": description[:200],
-        })
+        spawned.append(
+            {
+                **result,
+                "description": description[:200],
+            }
+        )
 
     # Update the plan work entry with spawned task IDs
     db = _get_work_db(config)
     db["work_entries"].update(
         plan_id,
         {
-            "result": json.dumps({
-                "split": True,
-                "spawned_ids": [s["work_id"] for s in spawned],
-            }),
+            "result": json.dumps(
+                {
+                    "split": True,
+                    "spawned_ids": [s["work_id"] for s in spawned],
+                }
+            ),
             "updated_at": datetime.now().isoformat(),
         },
     )
@@ -1855,9 +1840,7 @@ async def approve_and_spawn(
 
     work_type = entry.get("work_type", "")
     if work_type not in ("plan", "plan_spec", "plan_only", "critical_plan_only"):
-        raise ValueError(
-            f"Work item '{plan_id}' is not a planning work type (got '{work_type}')"
-        )
+        raise ValueError(f"Work item '{plan_id}' is not a planning work type (got '{work_type}')")
 
     # Validate status is awaiting_approval before allowing approval
     if entry.get("status") != "awaiting_approval":
@@ -1889,9 +1872,7 @@ async def approve_and_spawn(
                 "result": json.dumps({"action": "revision_requested", "feedback": feedback}),
             },
         )
-        audit.log_event(
-            plan_id, "plan_revision_requested", "dispatcher", {"feedback": feedback}
-        )
+        audit.log_event(plan_id, "plan_revision_requested", "dispatcher", {"feedback": feedback})
 
         # Re-run the plan workflow with the user's feedback
         from spine.workflow.compose import build_workflow_graph
@@ -1964,11 +1945,16 @@ async def approve_and_spawn(
 
             if stall_timeout_val > 0:
                 stall_task = asyncio.ensure_future(_stall_timer_fn(stream_timeout))
-                stall_task.add_done_callback(lambda t: setattr(_globals := type("", (), {}), "stalled", True) or None)
+                stall_task.add_done_callback(
+                    lambda t: setattr(_globals := type("", (), {}), "stalled", True) or None
+                )
 
             async for chunk in graph.astream(
-                resume_state, thread_config,
-                stream_mode=["updates", "messages"], subgraphs=True, version="v2",
+                resume_state,
+                thread_config,
+                stream_mode=["updates", "messages"],
+                subgraphs=True,
+                version="v2",
             ):
                 if stall_task and not stall_task.done():
                     stall_task.cancel()
@@ -1993,7 +1979,9 @@ async def approve_and_spawn(
                             existing = {}
                         merged = {**existing, **node_artifacts}
                         for key in set(existing) & set(node_artifacts):
-                            if isinstance(existing[key], dict) and isinstance(node_artifacts[key], dict):
+                            if isinstance(existing[key], dict) and isinstance(
+                                node_artifacts[key], dict
+                            ):
                                 merged[key] = {**existing[key], **node_artifacts[key]}
                         node_output = {**node_output, "artifacts": merged}
                     node_feedback = node_output.get("feedback")
@@ -2008,14 +1996,21 @@ async def approve_and_spawn(
                     if phase or status:
                         _update_work_progress(db, plan_id, phase, status)
                         logger.info(f"[{plan_id}] Resume: Phase {phase or node_name} → {status}")
-                        audit.log_event(plan_id, "phase_completed", node_name, {"phase": phase, "status": status})
+                        audit.log_event(
+                            plan_id,
+                            "phase_completed",
+                            node_name,
+                            {"phase": phase, "status": status},
+                        )
                     if node_artifacts and isinstance(node_artifacts, dict):
                         for art_phase, phase_arts in node_artifacts.items():
                             if not isinstance(phase_arts, dict):
                                 continue
                             for art_name, art_content in phase_arts.items():
                                 if art_content is not None:
-                                    artifacts_store.save_artifact(plan_id, art_phase, art_name, str(art_content))
+                                    artifacts_store.save_artifact(
+                                        plan_id, art_phase, art_name, str(art_content)
+                                    )
 
             if stall_task and not stall_task.done():
                 stall_task.cancel()
@@ -2026,21 +2021,36 @@ async def approve_and_spawn(
                 result = await asyncio.wait_for(_stream_graph(), timeout=stall_timeout_val + 10)
             except (asyncio.TimeoutError, Exception) as exc:
                 stalled = True
-                result = result if 'result' in dir() else {}
+                result = result if "result" in dir() else {}
                 if isinstance(exc, asyncio.TimeoutError):
                     logger.error(f"Resume of work {plan_id} stalled after {stall_timeout_val}s")
-                    db["work_entries"].update(plan_id, {
-                        "status": TaskStatus.STALLED.value, "current_phase": result.get("current_phase", ""),
-                        "updated_at": datetime.now().isoformat(),
-                        "result": json.dumps({"error": f"stalled after {stall_timeout_val}s", "stalled": True}),
-                    })
-                    audit.log_event(plan_id, "work_failed", "dispatcher", {"error": "stalled", "stalled": True})
+                    db["work_entries"].update(
+                        plan_id,
+                        {
+                            "status": TaskStatus.STALLED.value,
+                            "current_phase": result.get("current_phase", ""),
+                            "updated_at": datetime.now().isoformat(),
+                            "result": json.dumps(
+                                {"error": f"stalled after {stall_timeout_val}s", "stalled": True}
+                            ),
+                        },
+                    )
+                    audit.log_event(
+                        plan_id, "work_failed", "dispatcher", {"error": "stalled", "stalled": True}
+                    )
                     try:
                         from spine.ui.ws_bus import get_bus
-                        get_bus().publish_sync("work_failed", {"work_id": plan_id, "error": "stalled"})
+
+                        get_bus().publish_sync(
+                            "work_failed", {"work_id": plan_id, "error": "stalled"}
+                        )
                     except Exception:
                         pass
-                    return {"plan_id": plan_id, "status": TaskStatus.STALLED.value, "spawned_ids": []}
+                    return {
+                        "plan_id": plan_id,
+                        "status": TaskStatus.STALLED.value,
+                        "spawned_ids": [],
+                    }
                 raise
 
         final_status = result.get("status", "completed")
@@ -2061,31 +2071,27 @@ async def approve_and_spawn(
                 "status": final_status,
                 "current_phase": final_phase,
                 "updated_at": datetime.now().isoformat(),
-                "result": json.dumps({
-                    "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
-                    "feedback_count": len(feedback),
-                    "prompt_request": result.get("prompt_request"),
-                }),
+                "result": json.dumps(
+                    {
+                        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
+                        "feedback_count": len(feedback),
+                        "prompt_request": result.get("prompt_request"),
+                    }
+                ),
             },
         )
-        audit.log_event(plan_id, "work_completed", final_phase, {"status": final_status, "resumed": True})
+        audit.log_event(
+            plan_id, "work_completed", final_phase, {"status": final_status, "resumed": True}
+        )
         try:
             from spine.ui.ws_bus import get_bus
+
             get_bus().publish_sync("work_completed", {"work_id": plan_id, "status": final_status})
         except Exception:
             pass
         return {"plan_id": plan_id, "status": final_status, "spawned_ids": []}
 
-    # Approve the plan
-    db["work_entries"].update(
-        plan_id,
-        {
-            "status": TaskStatus.APPROVED.value,
-            "updated_at": datetime.now().isoformat(),
-        },
-    )
-    audit.log_event(plan_id, "plan_approved", "dispatcher", {})
-
+    # Approve the plan — load/spawn FIRST, then commit status atomically
     # Load the plan artifact
     plan_content = ""
     plan_path = artifacts.artifact_path(plan_id, "plan", "plan.md")
@@ -2128,6 +2134,16 @@ async def approve_and_spawn(
         )
         spawned_ids.append(result["work_id"])
 
+    # All validation and spawning succeeded — now commit the approved status
+    db["work_entries"].update(
+        plan_id,
+        {
+            "status": TaskStatus.APPROVED.value,
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+    audit.log_event(plan_id, "plan_approved", "dispatcher", {})
+
     # Update the plan entry with spawned work IDs
     db["work_entries"].update(
         plan_id,
@@ -2151,8 +2167,6 @@ async def approve_and_spawn(
         "spawned_ids": spawned_ids,
         "decomposition": decomposition.model_dump(),
     }
-
-
 
 
 # ── Resume work ──

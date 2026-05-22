@@ -29,10 +29,23 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # File extensions worth reading when doing codebase search
-_CODE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".yaml", ".yml",
-                    ".toml", ".json", ".md", ".txt", ".sql", ".sh"}
-_MAX_FILE_PREVIEW = 3000   # chars per file returned in search results
-_MAX_SEARCH_FILES = 8      # max files to return per search query
+_CODE_EXTENSIONS = {
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".md",
+    ".txt",
+    ".sql",
+    ".sh",
+}
+_MAX_FILE_PREVIEW = 3000  # chars per file returned in search results
+_MAX_SEARCH_FILES = 8  # max files to return per search query
 
 
 # ── read_prior_artifacts ──────────────────────────────────────────────────
@@ -185,9 +198,17 @@ class SearchCodebaseTool(BaseTool):
         else:
             # Walk workspace, skip common non-code dirs
             skip_dirs = {
-                ".venv", "venv", ".git", "__pycache__", "node_modules",
-                ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist",
-                "build", ".spine",
+                ".venv",
+                "venv",
+                ".git",
+                "__pycache__",
+                "node_modules",
+                ".mypy_cache",
+                ".ruff_cache",
+                ".pytest_cache",
+                "dist",
+                "build",
+                ".spine",
             }
             for fpath in root.rglob("*"):
                 if fpath.is_file() and fpath.suffix in _CODE_EXTENSIONS:
@@ -223,18 +244,23 @@ class SearchCodebaseTool(BaseTool):
                 preview = "[could not read file]"
 
             rel = str(fpath.relative_to(root))
-            results.append({
-                "file": rel,
-                "score": score,
-                "match_lines": file_match_lines.get(fpath, [])[:6],
-                "preview": preview,
-            })
+            results.append(
+                {
+                    "file": rel,
+                    "score": score,
+                    "match_lines": file_match_lines.get(fpath, [])[:6],
+                    "preview": preview,
+                }
+            )
 
-        return json.dumps({
-            "queries_run": queries,
-            "total_files_found": total_found,
-            "results": results,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "queries_run": queries,
+                "total_files_found": total_found,
+                "results": results,
+            },
+            ensure_ascii=False,
+        )
 
     def _grep_files(
         self,
@@ -247,20 +273,27 @@ class SearchCodebaseTool(BaseTool):
 
         # Try rg first (fast)
         try:
-            cmd = ["rg", "-i", "--line-number",
-                   "--with-filename", "--max-count=5", query, str(root)]
-            out = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, cwd=str(root)
-            )
+            cmd = [
+                "rg",
+                "-i",
+                "--line-number",
+                "--with-filename",
+                "--max-count=5",
+                query,
+                str(root),
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=str(root))
             for line in out.stdout.splitlines():
                 parts = line.split(":", 2)
                 if len(parts) >= 3:
                     fpath = Path(parts[0])
                     if fpath in candidates:
-                        matched.setdefault(fpath, []).append({
-                            "line": parts[1],
-                            "text": parts[2][:120],
-                        })
+                        matched.setdefault(fpath, []).append(
+                            {
+                                "line": parts[1],
+                                "text": parts[2][:120],
+                            }
+                        )
             return matched
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass  # rg not available, fall back to Python
@@ -300,9 +333,7 @@ class _WritePlanInput(BaseModel):
             "structured breakdown of how the pieces fit together."
         )
     )
-    technology_choices: str = Field(
-        description="Technology/library choices with rationale."
-    )
+    technology_choices: str = Field(description="Technology/library choices with rationale.")
     module_structure: str = Field(
         description=(
             "File/module layout as a tree or table. Every new file must "
@@ -390,9 +421,206 @@ class WritePlanTool(BaseTool):
         except OSError as exc:
             return f"ERROR: Could not write plan.md: {exc}"
 
+        return f"plan.md written to {self.plan_dir}/plan.md ({len(content)} chars)."
+
+    async def _arun(self, **kwargs: Any) -> str:
+        return self._run(**kwargs)
+
+
+# ── write_structured_plan ─────────────────────────────────────────────────
+
+_REQUIRED_SLICE_KEYS = {
+    "id",
+    "title",
+    "target_files",
+    "execution_requirements",
+    "dependencies",
+    "acceptance_criteria",
+    "complexity",
+}
+
+
+class _FeatureSliceInput(BaseModel):
+    """Schema for a single feature slice within a structured plan."""
+
+    id: str = Field(description="Unique identifier for the slice, e.g. 'add-user-auth'.")
+    title: str = Field(description="Human-readable title for the slice.")
+    target_files: list[str] = Field(
+        description="Files to modify or create for this slice.",
+        default_factory=list,
+    )
+    execution_requirements: str = Field(
+        description="What must be done to implement this slice.",
+    )
+    dependencies: list[str] = Field(
+        description="IDs of other slices this depends on (empty if none).",
+        default_factory=list,
+    )
+    acceptance_criteria: list[str] = Field(
+        description="Measurable criteria for this slice to be considered complete.",
+        min_length=1,
+    )
+    complexity: str = Field(
+        description="One of: small, medium, large.",
+        default="medium",
+    )
+
+
+class _StructuredWritePlanInput(BaseModel):
+    architecture_overview: str = Field(
+        description=(
+            "Components, data flow, and interfaces. Include a diagram or "
+            "structured breakdown of how the pieces fit together."
+        )
+    )
+    technology_choices: str = Field(description="Technology/library choices with rationale.")
+    feature_slices: list[dict[str, Any]] = Field(
+        description=(
+            "Array of feature slices. Each must have: id, title, target_files, "
+            "execution_requirements, dependencies, acceptance_criteria, complexity."
+        ),
+        min_length=1,
+    )
+    testing_strategy: str = Field(
+        description=(
+            "Test approach: which tests to add/modify, test file paths, "
+            "and how to verify correctness."
+        )
+    )
+    risks: str = Field(
+        default="",
+        description="Known risks, edge cases, or open questions. Optional.",
+    )
+    codebase_map: str = Field(
+        default="",
+        description=(
+            "Structured map of relevant codebase files, functions, and conventions "
+            "discovered during research."
+        ),
+    )
+
+
+class StructuredWritePlanTool(BaseTool):
+    """Write both plan.md (narrative) and plan.json (structured) artifacts.
+
+    Extends the plan output with a ``feature_slices`` array that captures
+    decomposition, dependencies, and acceptance criteria per slice.  The
+    human-readable ``plan.md`` is written alongside a machine-readable
+    ``plan.json`` so downstream phases (TASKS, IMPLEMENT) can consume
+    structured data without re-parsing markdown.
+    """
+
+    name: str = "write_structured_plan"
+    description: str = (
+        "Write the plan artifacts (plan.md + plan.json) with structured "
+        "feature slices. Use this instead of write_plan when you want to "
+        "include a slice decomposition with dependencies. Call after research "
+        "is complete."
+    )
+    args_schema: Optional[ArgsSchema] = _StructuredWritePlanInput
+
+    workspace_root: str = ""
+    plan_dir: str = ""
+
+    def _run(
+        self,
+        architecture_overview: str,
+        technology_choices: str,
+        feature_slices: list[dict[str, Any]],
+        testing_strategy: str,
+        risks: str = "",
+        codebase_map: str = "",
+    ) -> str:
+        # ── Validate feature_slices structure ─────────────────────────
+        validated_slices: list[_FeatureSliceInput] = []
+        errors: list[str] = []
+        for idx, sl in enumerate(feature_slices):
+            if not isinstance(sl, dict):
+                errors.append(f"Slice at index {idx} is not a dict.")
+                continue
+            missing = _REQUIRED_SLICE_KEYS - set(sl.keys())
+            if missing:
+                errors.append(
+                    f"Slice at index {idx} is missing keys: {', '.join(sorted(missing))}."
+                )
+                continue
+            try:
+                validated_slices.append(_FeatureSliceInput(**sl))
+            except Exception as exc:
+                errors.append(f"Slice at index {idx} validation error: {exc}")
+
+        if errors:
+            return "ERROR: Invalid feature_slices:\n" + "\n".join(errors)
+
+        # ── Prepare output directory ──────────────────────────────────
+        plan_path = Path(self.workspace_root) / self.plan_dir
+        plan_path.mkdir(parents=True, exist_ok=True)
+
+        # ── Build plan.md (narrative) ─────────────────────────────────
+        lines = [
+            "# Technical Plan\n",
+            "\n## Architecture Overview\n",
+            f"{architecture_overview.strip()}\n",
+            "\n## Technology Choices\n",
+            f"{technology_choices.strip()}\n",
+            "\n## Feature Slices\n",
+        ]
+
+        for sl in validated_slices:
+            deps = ", ".join(sl.dependencies) if sl.dependencies else "none"
+            lines.append(f"\n### {sl.id}: {sl.title}\n")
+            lines.append(f"**Complexity:** {sl.complexity}  \n")
+            lines.append(f"**Dependencies:** {deps}  \n")
+            lines.append(f"**Target files:** {', '.join(sl.target_files) or 'TBD'}\n\n")
+            lines.append(f"{sl.execution_requirements.strip()}\n\n")
+            lines.append("**Acceptance Criteria:**\n")
+            for ac in sl.acceptance_criteria:
+                lines.append(f"- {ac}\n")
+
+        lines.append("\n## Testing Strategy\n")
+        lines.append(f"{testing_strategy.strip()}\n")
+
+        if risks.strip():
+            lines.append("\n## Risks & Open Questions\n")
+            lines.append(f"{risks.strip()}\n")
+
+        if codebase_map.strip():
+            lines.append("\n## Codebase Map\n")
+            lines.append(f"{codebase_map.strip()}\n")
+
+        md_content = "".join(lines)
+
+        # ── Build plan.json (structured) ──────────────────────────────
+        json_data: dict[str, Any] = {
+            "architecture_overview": architecture_overview.strip(),
+            "technology_choices": technology_choices.strip(),
+            "feature_slices": [sl.model_dump() for sl in validated_slices],
+            "testing_strategy": testing_strategy.strip(),
+            "risks": risks.strip(),
+            "codebase_map": codebase_map.strip(),
+        }
+        json_content = json.dumps(json_data, indent=2, ensure_ascii=False)
+
+        # ── Write files ───────────────────────────────────────────────
+        md_path = plan_path / "plan.md"
+        json_path = plan_path / "plan.json"
+
+        try:
+            md_path.write_text(md_content, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: Could not write plan.md: {exc}"
+
+        try:
+            json_path.write_text(json_content, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: Could not write plan.json: {exc}"
+
+        slice_count = len(validated_slices)
         return (
-            f"plan.md written to {self.plan_dir}/plan.md "
-            f"({len(content)} chars)."
+            f"Plan artifacts written: {self.plan_dir}/plan.md "
+            f"({len(md_content)} chars), {self.plan_dir}/plan.json "
+            f"({len(json_content)} chars). "
+            f"{slice_count} feature slice(s) included."
         )
 
     async def _arun(self, **kwargs: Any) -> str:
@@ -412,10 +640,12 @@ def build_plan_agent_tools(
 ) -> list[BaseTool]:
     """Build the custom tool set for the plan agent.
 
-    Returns three tools:
+    Returns four tools:
     - ``read_prior_artifacts``: loads spec + context in one call
     - ``search_codebase``: targeted multi-query file search
-    - ``write_plan``: structured write to plan.md
+    - ``write_plan``: structured write to plan.md (narrative only)
+    - ``write_structured_plan``: structured write to plan.md + plan.json
+      with feature slices and dependencies
 
     Together with ``eval`` (CodeInterpreterMiddleware), these replace all
     generic filesystem tools. No ls/glob/grep/read_file/write_file exposed.
@@ -430,7 +660,7 @@ def build_plan_agent_tools(
         feedback: List of prior feedback strings (for rework passes).
 
     Returns:
-        List of three BaseTool instances.
+        List of four BaseTool instances.
     """
     plan_dir = f".spine/artifacts/{work_id}/plan"
 
@@ -448,6 +678,10 @@ def build_plan_agent_tools(
             workspace_root=workspace_root,
         ),
         WritePlanTool(
+            workspace_root=workspace_root,
+            plan_dir=plan_dir,
+        ),
+        StructuredWritePlanTool(
             workspace_root=workspace_root,
             plan_dir=plan_dir,
         ),

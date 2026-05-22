@@ -16,9 +16,7 @@ def render(api: UIApi) -> None:
     # ── Core settings ──────────────────────────────────────────────────
     st.subheader("Core Settings")
     with st.expander("View core configuration", expanded=False):
-        st.json({
-            k: v for k, v in config.items() if k != "mcp_servers"
-        })
+        st.json({k: v for k, v in config.items() if k != "mcp_servers"})
 
     # ── MCP Servers ────────────────────────────────────────────────────
     st.divider()

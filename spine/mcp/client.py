@@ -68,15 +68,15 @@ def _get_client(server_configs: dict[str, dict[str, Any]]) -> MultiServerMCPClie
     """Get or create the MultiServerMCPClient for the given configs."""
     global _client, _client_config_hash
 
-    config_hash = hash(frozenset(
-        (k, frozenset((fk, str(fv)) for fk, fv in v.items()))
-        for k, v in server_configs.items()
-    ))
+    config_hash = hash(
+        frozenset(
+            (k, frozenset((fk, str(fv)) for fk, fv in v.items())) for k, v in server_configs.items()
+        )
+    )
 
     if _client is None or config_hash != _client_config_hash:
         adapter_configs = {
-            name: _convert_server_config(cfg)
-            for name, cfg in server_configs.items()
+            name: _convert_server_config(cfg) for name, cfg in server_configs.items()
         }
         _client = MultiServerMCPClient(adapter_configs)
         _client_config_hash = config_hash

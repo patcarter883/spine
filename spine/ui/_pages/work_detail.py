@@ -326,8 +326,10 @@ def render(api: UIApi) -> None:
             key=f"action_{work_id}",
         )
         resume_action = (
-            "rework" if action.startswith("Rework")
-            else "approve" if action.startswith("Approve")
+            "rework"
+            if action.startswith("Rework")
+            else "approve"
+            if action.startswith("Approve")
             else "abort"
         )
         human_input = st.text_area(
@@ -341,9 +343,7 @@ def render(api: UIApi) -> None:
             if not human_input.strip() and resume_action != "abort":
                 st.error("Please provide feedback before resuming.")
             else:
-                result = api.resume_interrupted_work(
-                    work_id, resume_action, human_input.strip()
-                )
+                result = api.resume_interrupted_work(work_id, resume_action, human_input.strip())
                 st.success(f"Resumed! Status: {result['status']} | Action: {result['action']}")
                 st.rerun()
 
@@ -365,7 +365,9 @@ def render(api: UIApi) -> None:
         st.divider()
         st.caption("Or restart from phase 0 (discarding accumulated feedback):")
         if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
-            clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+            clear = st.checkbox(
+                "Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}"
+            )
             result = api.restart_work(work_id, clear_artifacts=clear)
             st.success(
                 f"Restarted! Status: {result['status']} | Action: {result['action']}. "
@@ -380,7 +382,10 @@ def render(api: UIApi) -> None:
 
             st.divider()
             if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
-                clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+                clear = st.checkbox(
+                    "Clear all artifacts (force full regeneration)",
+                    key=f"clear_artifacts_{work_id}",
+                )
                 result = api.restart_work(work_id, clear_artifacts=clear)
                 st.success(
                     f"Restarted! Status: {result['status']} | Action: {result['action']}. "
@@ -400,7 +405,9 @@ def render(api: UIApi) -> None:
 
         st.divider()
         if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
-            clear = st.checkbox("Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}")
+            clear = st.checkbox(
+                "Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}"
+            )
             result = api.restart_work(work_id, clear_artifacts=clear)
             st.success(
                 f"Restarted! Status: {result['status']} | Action: {result['action']}. "

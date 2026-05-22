@@ -158,9 +158,6 @@ class TestContextEditing:
         assert "2 lines" in metadata
 
 
-# ── 3. Skills loading ───────────────────────────────────────────────────
-
-
 class TestCodebaseMap:
     """Verify codebase map artifact support."""
 

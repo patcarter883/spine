@@ -105,7 +105,12 @@ pages = {
         st.Page(_queue, title="Queue", icon="🚦", url_path="queue"),
     ],
     "Planning": [
-        st.Page(lambda: _spec_planning_render(api), title="Spec & Planning", icon="📐", url_path="spec-planning"),
+        st.Page(
+            lambda: _spec_planning_render(api),
+            title="Spec & Planning",
+            icon="📐",
+            url_path="spec-planning",
+        ),
     ],
     "Work": [
         st.Page(_work_detail, title="Work Details", icon="🔍", url_path="work-detail"),

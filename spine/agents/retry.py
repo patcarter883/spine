@@ -195,7 +195,7 @@ def invoke_with_retry(
                 raise
 
             # Exponential backoff with jitter
-            delay = min(base_delay * (2 ** attempt), max_delay)
+            delay = min(base_delay * (2**attempt), max_delay)
             jitter = delay * 0.1  # ±10% jitter
             import random
 
@@ -288,7 +288,7 @@ async def ainvoke_with_retry(
                 raise
 
             # Exponential backoff with jitter
-            delay = min(base_delay * (2 ** attempt), max_delay)
+            delay = min(base_delay * (2**attempt), max_delay)
             jitter = delay * 0.1  # ±10% jitter
             import random
 

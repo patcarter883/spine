@@ -12,9 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def validate_artifact_dir(
-    workspace_root: str, work_id: str, phase: str
-) -> bool:
+def validate_artifact_dir(workspace_root: str, work_id: str, phase: str) -> bool:
     """Return True if artifacts exist at the expected path.
 
     Expected path: ``.spine/artifacts/{work_id}/{phase}/``
@@ -58,7 +56,4 @@ def validate_artifacts_for_work(
 
     Returns a dict mapping phase name to validation result.
     """
-    return {
-        phase: validate_artifact_dir(workspace_root, work_id, phase)
-        for phase in phases
-    }
+    return {phase: validate_artifact_dir(workspace_root, work_id, phase) for phase in phases}

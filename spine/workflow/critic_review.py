@@ -150,9 +150,7 @@ async def agent_critic_check(
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build a compact preview with paths to full files
-        artifact_preview = build_inline_artifact_prompt(
-            state, reviewed_phase, work_id=work_id
-        )
+        artifact_preview = build_inline_artifact_prompt(state, reviewed_phase, work_id=work_id)
 
         # Format the review request
         # The original description is NOT included here — the critic reviews

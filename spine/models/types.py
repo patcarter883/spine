@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -87,3 +88,89 @@ class PromptRequest:
     message: str
     phase: str
     context: dict = field(default_factory=dict)
+
+
+# ── Slice Planning Models ──
+
+
+@dataclass
+class FeatureSlice:
+    """A single, self-contained implementation slice within a structured plan.
+
+    Each slice declares its target files, dependencies on other slices, and
+    acceptance criteria so the orchestrator can topologically sort and execute
+    slices in the correct order.
+    """
+
+    id: str
+    title: str
+    target_files: list[str] = field(default_factory=list)
+    execution_requirements: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
+    complexity: str = "small"  # "small" | "medium" | "large"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this slice to a plain dict suitable for JSON encoding."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FeatureSlice:
+        """Deserialize a FeatureSlice from a plain dict.
+
+        Unknown keys are silently ignored so forward-compatible payloads
+        don't break older consumers.
+        """
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered)
+
+
+@dataclass
+class StructuredPlan:
+    """Machine-readable plan output composed of ordered feature slices.
+
+    Replaces the prose-based ``plan.md`` with a structured declaration
+    that the orchestrator can parse, validate, and topologically sort.
+    """
+
+    architecture_overview: str = ""
+    technology_choices: list[str] = field(default_factory=list)
+    feature_slices: list[FeatureSlice] = field(default_factory=list)
+    testing_strategy: str = ""
+    risks: list[str] = field(default_factory=list)
+    codebase_map: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self, *, indent: int = 2) -> str:
+        """Serialize the full plan to a JSON string.
+
+        Feature slices are serialized via their ``to_dict()`` method so
+        the roundtrip through ``from_json`` is lossless.
+        """
+        data = {
+            "architecture_overview": self.architecture_overview,
+            "technology_choices": self.technology_choices,
+            "feature_slices": [s.to_dict() for s in self.feature_slices],
+            "testing_strategy": self.testing_strategy,
+            "risks": self.risks,
+            "codebase_map": self.codebase_map,
+        }
+        return json.dumps(data, indent=indent)
+
+    @classmethod
+    def from_json(cls, raw: str) -> StructuredPlan:
+        """Deserialize a StructuredPlan from a JSON string.
+
+        Raises ``json.JSONDecodeError`` for malformed input and ``TypeError``
+        if the top-level value is not a JSON object.
+        """
+        data = json.loads(raw)
+        slices = [FeatureSlice.from_dict(s) for s in data.get("feature_slices", [])]
+        return cls(
+            architecture_overview=data.get("architecture_overview", ""),
+            technology_choices=data.get("technology_choices", []),
+            feature_slices=slices,
+            testing_strategy=data.get("testing_strategy", ""),
+            risks=data.get("risks", []),
+            codebase_map=data.get("codebase_map", {}),
+        )

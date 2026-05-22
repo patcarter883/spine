@@ -50,6 +50,14 @@ class SpineContext(BaseModel):
         is_rework: True if this is a rework (retry_count > 0).
         critic_feedback: Feedback from prior critic reviews (if reworking).
         artifact_paths: Mapping of phase name -> artifact file path on disk.
+        read_cache: Short-term read-file cache shared across subagents.
+            Maps relative file paths to ``{"n_lines": int, "symbols": str}``.
+            Populated by ``ReadCacheMiddleware`` on first read; subsequent
+            reads of the same path return a compact summary instead of
+            re-reading.
+        read_cache_turn: Monotonic turn counter incremented by the
+            ``ReadCacheMiddleware`` on every read_file call (hit or miss).
+            Used to stamp cache entries.
     """
 
     model_config = {"arbitrary_types_allowed": True}
@@ -62,6 +70,8 @@ class SpineContext(BaseModel):
     is_rework: bool = False
     critic_feedback: list[str] = Field(default_factory=list)
     artifact_paths: dict[str, str] = Field(default_factory=dict)
+    read_cache: dict[str, dict[str, object]] = Field(default_factory=dict)
+    read_cache_turn: int = 0
 
 
 def build_context(
@@ -114,6 +124,7 @@ def build_context(
 
     # Resolve the named subagent for this phase (for interpreter PTC)
     from spine.agents.subagents import PHASE_SUBAGENTS
+
     subagent_names = PHASE_SUBAGENTS.get(phase_name, [])
     active_subagent = subagent_names[0] if len(subagent_names) == 1 else ""
 

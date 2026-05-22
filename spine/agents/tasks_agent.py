@@ -1,5 +1,10 @@
 """SPINE tasks agent — Deep Agent for the TASKS (decomposition) phase.
 
+.. deprecated::
+    The TASKS phase agent is deprecated. Use the PLAN phase agent for
+    decomposition instead. This module is retained for backward
+    compatibility and will be removed in a future release.
+
 Researches the codebase via ``search_codebase`` (and optional researcher
 subagents), then writes all decomposition artifacts atomically via
 ``write_tasks_artifacts``.
@@ -57,8 +62,7 @@ def _build_subagents(
         description = state.get("description", "")
         if len(description) < 150:
             logger.info(
-                "[%s] TASKS: skipping researcher subagents for trivial quick task "
-                "(%d chars)",
+                "[%s] TASKS: skipping researcher subagents for trivial quick task (%d chars)",
                 state.get("work_id", ""),
                 len(description),
             )
@@ -73,6 +77,10 @@ def build_tasks_agent(
     config: RunnableConfig | None = None,
 ) -> Any:
     """Build the Deep Agent for the TASKS phase.
+
+    .. deprecated::
+        The TASKS phase agent is deprecated. Use the PLAN phase agent
+        for decomposition instead.
 
     Args:
         state: The current workflow state.

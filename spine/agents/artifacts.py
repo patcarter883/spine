@@ -142,7 +142,9 @@ def materialize_artifacts(
             # This prevents subsequent phases from overwriting full artifact files
             # with truncated versions from state.
             if file_path.exists() and len(content_str) < len(file_path.read_text(encoding="utf-8")):
-                logger.debug("Skipping materialize: disk has longer content than state for %s", file_path)
+                logger.debug(
+                    "Skipping materialize: disk has longer content than state for %s", file_path
+                )
                 continue
             file_path.write_text(content_str, encoding="utf-8")
             logger.debug("Materialized artifact: %s", file_path)
@@ -379,9 +381,7 @@ def build_inline_artifact_prompt(
             preview = content_str[:max_inline_chars] + "..."
             lines.append(f"### {name}")
             lines.append(f"```\n{preview}\n```")
-            lines.append(
-                f"Full content available at `{base_path}/{name}`"
-            )
+            lines.append(f"Full content available at `{base_path}/{name}`")
         else:
             lines.append(f"### {name}")
             lines.append(f"```\n{content_str}\n```")

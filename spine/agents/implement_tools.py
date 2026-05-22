@@ -89,7 +89,8 @@ class ReadSliceFilesTool(BaseTool):
         # Load all slice files
         try:
             slice_files = sorted(
-                p.name for p in tasks_path.iterdir()
+                p.name
+                for p in tasks_path.iterdir()
                 if p.is_file() and p.name.startswith("slice-") and p.name.endswith(".md")
             )
         except OSError as exc:

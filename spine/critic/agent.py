@@ -3,6 +3,9 @@
 Uses the shared :func:`build_phase_agent` factory.  The critic gets a
 preview of artifacts under review (short inline) with full content on
 disk, rather than inlining everything.
+
+When the reviewed phase is PLAN, the agent prompt is augmented with
+instructions to validate the structured ``plan.json`` format.
 """
 
 from __future__ import annotations
@@ -13,6 +16,39 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
+from spine.workflow.critic_review import _get_reviewed_phase
+
+
+# ── PLAN-specific review instructions appended to the system prompt ──────────
+_PLAN_REVIEW_INSTRUCTIONS = (
+    "## Structured Plan Validation (PLAN phase)\n\n"
+    "When reviewing the PLAN phase output you must also validate the structured\n"
+    "`plan.json` artifact in addition to any prose documents (plan.md).\n\n"
+    "Run `read_file` on the `plan.json` artifact and verify:\n\n"
+    "1. **feature_slices present and non-empty** — the top-level\n"
+    "   `feature_slices` array must exist and contain at least one slice.\n"
+    "2. **Required slice fields** — every slice object must have:\n"
+    "   - `id` — a unique string identifier\n"
+    "   - `title` — a short human-readable name\n"
+    "   - `target_files` — a non-empty list of file paths the slice will create\n"
+    "     or modify\n"
+    "   - `acceptance_criteria` — a non-empty list of verifiable conditions\n"
+    "     that define when the slice is complete\n"
+    "3. **Dependency integrity** — every ID listed in a slice's `dependencies`\n"
+    "   array must correspond to an existing slice `id` in the same plan.\n"
+    "   Flag typos, missing slices, or dangling references.\n"
+    "4. **No circular dependencies** — the dependency graph must form a DAG.\n"
+    "   If A depends on B and B depends on A (directly or transitively) the\n"
+    "   plan is invalid.\n"
+    "5. **Coverage** — the slices collectively address all requirements captured\n"
+    "   in the specification. Flag any requirement that is not covered by at\n"
+    "   least one slice.\n"
+    "6. **Slice granularity** — each slice should be implementable in a single\n"
+    "   pass (roughly one focused PR). Flag slices that look too large or\n"
+    "   that bundle unrelated changes.\n\n"
+    "If any check fails, respond with NEEDS_REVISION and list the specific\n"
+    "violations in your suggestions.\n\n"
+)
 
 
 def build_critic_agent(
@@ -24,6 +60,11 @@ def build_critic_agent(
     Creates a deep agent configured for quality review of phase outputs.
     The critic can inspect actual files on disk when reviewing artifacts.
 
+    When the reviewed phase is PLAN the system prompt is extended with
+    structured-plan validation instructions (feature_slices format,
+    dependency integrity, cycle detection, etc.) so the LLM-based tier-2
+    review complements the deterministic tier-1.5 structural check.
+
     Args:
         state: The current workflow state.
         config: LangGraph runtime config (may contain provider settings).
@@ -32,6 +73,7 @@ def build_critic_agent(
         A compiled Deep Agent ready for invocation.
     """
     workspace_root = state.get("workspace_root", ".")
+    reviewed_phase = _get_reviewed_phase(state)
 
     system_prompt = (
         "You are a quality reviewer. Review the output of a workflow "
@@ -55,6 +97,12 @@ def build_critic_agent(
         "Full artifact content is available on disk — use `read_file` to "
         "inspect details when needed."
     )
+
+    # Append structured-plan validation instructions when reviewing the PLAN
+    # phase. Other phases (specify, tasks, implement) keep the base prompt
+    # unchanged so existing behaviour is preserved.
+    if reviewed_phase == PhaseName.PLAN.value:
+        system_prompt = system_prompt + "\n\n" + _PLAN_REVIEW_INSTRUCTIONS
 
     agent = build_phase_agent(
         state=state,

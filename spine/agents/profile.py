@@ -41,18 +41,21 @@ Token budget for 128K context models (target: <60K prompt tokens at peak):
     │ Skills + memory (DA auto-injected)                 │ ~500     │
     │ Subagent specs (DA auto-injected)                  │ ~400     │
     │ Conversation history (grows, evicted by trimmer)   │ 0–50K    │
+    │ Read cache hits (replaces full content w/ summary) │ ~50/ea   │
     │ Trimmed tool results (structured metadata)         │ ~100/ea  │
     │ AI arg trimming (write_file/edit_file content)     │ ~50/ea   │
     ├───────────────────────────────────────────────────┼──────────┤
     │ Fixed overhead (prompt + schemas + skills)         │ ~4,250   │
-    │ Available for conversation (target)                │ ~56K     │
+    │ Available for conversation before compaction       │ ~56K     │
+    │ Read cache prevents re-read amplification          │ —        │
     └───────────────────────────────────────────────────┴──────────┘
 
 Budget rules:
-1. ToolOutputTrimmer evicts old results to ~100-token structured metadata.
-2. AI arg trimming removes write_file/edit_file content from history.
-3. codebase-map.md (produced by tasks phase) eliminates re-exploration.
-4. Each phase starts with a fresh agent — no cross-phase history bloat.
+1. Read cache prevents duplicate file reads, keeping context growth linear.
+2. ToolOutputTrimmer was REMOVED (2026-05 directive). Context now managed via prompts + read cache.
+3. AI arg trimming removes write_file/edit_file content from history.
+4. codebase-map.md (produced by tasks phase) eliminates re-exploration.
+5. Each phase starts with a fresh agent — no cross-phase history bloat.
 
 Call :func:`ensure_spine_profiles` once at startup (from
 ``spine.agents.__init__`` or the CLI entry point) to activate.
@@ -113,21 +116,18 @@ Tool descriptions are provided by the runtime. Follow these principles:
 - Test after write — run tests immediately after making changes.
 - Use `task` subagents for parallel work on independent slices.
 - Use `eval` to orchestrate multi-step workflows in code, not conversation.
-- **Context is L1 cache; conversation history is swap.** If a compaction \
-summary references an offloaded history file at \
-`/conversation_history/{thread_id}.md`, you can read_file that path to \
-page back specific details. Do NOT re-read source files just because they \
-were evicted — cache them in eval instead.
-- **Never re-read a file in the same phase.** If context editing evicts a \
-prior read result, recover from eval: \
-`globalThis.files = globalThis.files || {}; globalThis.files['path'] = content;`. \
-Retrieve from eval instead of calling read_file again. \
-Remember: `tools.readFile(...)` returns a string directly — store the string, \
-not an object with `.content`.
-- **Token budget: 60K prompt token target.** Work efficiently: batch reads,
-use eval for multi-step orchestration, and produce compact artifacts.
-Evicted tool results appear as structured metadata like
-`[read: path (N lines) — symbols]` — use these hints instead of re-reading.
+- **Context is L1 cache; conversation history is swap.** Before reading a file,
+  check if it's already been read this phase — the read cache in runtime
+  context stores a metadata summary of every file read.
+- **Never re-read a file in the same phase.** If a file is already cached,
+  use the cached summary (saved in the runtime context read_cache) instead of
+  calling read_file again. The cache includes line counts and symbol names
+  so you know what's in each file without re-reading.
+- **Token budget: 60K prompt token target.** After 60K tokens, the
+  read cache prevents duplicate file reads, keeping context growth linear.
+  Batch reads, use eval for multi-step orchestration, and produce compact
+  artifacts. Evicted tool results appear as structured metadata like
+  `[read: path (N lines) — symbols]` — use these hints instead of re-reading.
 
 ## Workflow Context
 
@@ -176,9 +176,7 @@ def ensure_spine_profiles() -> None:
     try:
         from deepagents import HarnessProfile, register_harness_profile
     except ImportError:
-        logger.debug(
-            "deepagents not installed — skipping SPINE HarnessProfile registration"
-        )
+        logger.debug("deepagents not installed — skipping SPINE HarnessProfile registration")
         return
 
     profile = HarnessProfile(base_system_prompt=SPINE_BASE_PROMPT)

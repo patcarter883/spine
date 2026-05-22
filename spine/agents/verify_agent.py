@@ -80,15 +80,16 @@ def build_verify_agent(
             "Use `ls` + `glob` to locate slice files before proceeding."
         )
     else:
-        slice_inventory = (
-            f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n"
-            + "\n".join(f"  - `{tasks_dir}/{name}`" for name in slice_files)
+        slice_inventory = f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n" + "\n".join(
+            f"  - `{tasks_dir}/{name}`" for name in slice_files
         )
 
-    system_prompt = _build_orchestrator_prompt() + build_current_phase_write_prompt(
-        work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
-    ) + build_artifact_prompt(
-        state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id
+    system_prompt = (
+        _build_orchestrator_prompt()
+        + build_current_phase_write_prompt(
+            work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
+        )
+        + build_artifact_prompt(state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id)
     )
 
     agent = build_phase_agent(

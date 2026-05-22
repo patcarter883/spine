@@ -13,6 +13,9 @@ logic and adds the context engineering features:
   for progressive disclosure.
 - **Context schema** — ``SpineContext`` provides typed per-run context that
   propagates to subagents automatically.
+- **Read cache** — ``ReadCacheMiddleware`` prevents re-read amnesia by
+  returning cached metadata summaries for already-read files. The cache
+  is shared across subagents via ``SpineContext``.
 
 ## Why ``create_agent`` instead of ``create_deep_agent``?
 
@@ -84,6 +87,33 @@ from spine.agents.interpreter import build_interpreter_middleware, interpreter_e
 logger = logging.getLogger(__name__)
 
 
+# ── Model detection helpers ─────────────────────────────────────────────
+
+
+def _is_anthropic_model(model: Any) -> bool:
+    """Return True if the model is an Anthropic Claude instance or spec.
+
+    Used to conditionally include ``AnthropicPromptCachingMiddleware`` —
+    its ``cache_control`` breakpoints are only meaningful on Anthropic's
+    API.  On other providers (OpenRouter, OpenAI, local) the middleware
+    adds per-turn overhead with no benefit.
+
+    Args:
+        model: A model string (``"anthropic:claude-sonnet-4-20250514"``) or
+            a pre-built ``BaseChatModel`` instance.
+
+    Returns:
+        ``True`` when the model targets Anthropic.
+    """
+    # Pre-built ChatAnthropic instance
+    if hasattr(model, "__class__") and model.__class__.__name__ == "ChatAnthropic":
+        return True
+    # String model spec with anthropic provider prefix
+    if isinstance(model, str) and model.startswith("anthropic:"):
+        return True
+    return False
+
+
 # ── SPINE filesystem system prompt ───────────────────────────────────────
 # Replaces DA's default "All file paths must start with a /" prompt.
 # Under virtual_mode=True, paths are resolved relative to the workspace root.
@@ -126,7 +156,9 @@ When a tool result is too large, it may be offloaded to `/large_tool_results/<to
 instead of being returned inline. Use `read_file` to inspect in chunks, or `grep` within \
 `/large_tool_results/` to search across offloaded results."""
 
-SPINE_FILESYSTEM_EXEC_PROMPT = SPINE_FILESYSTEM_PROMPT + """
+SPINE_FILESYSTEM_EXEC_PROMPT = (
+    SPINE_FILESYSTEM_PROMPT
+    + """
 
 ## Execute Tool — execute
 
@@ -136,6 +168,7 @@ Commands run in the workspace root directory.
 All paths in commands MUST be relative (e.g. `pytest tests/unit/` NOT `pytest /home/user/project/tests/unit/`).
 
 - execute: run a shell command (returns output and exit code)"""
+)
 
 
 # ── SpineProjectMemoryMiddleware ───────────────────────────────────────────
@@ -163,9 +196,7 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
             if content:
                 # Use a clean, concise XML enclosure for documentation injection
                 sections.append(
-                    f"<project_documentation path=\"{path}\">\n"
-                    f"{content}\n"
-                    f"</project_documentation>"
+                    f'<project_documentation path="{path}">\n{content}\n</project_documentation>'
                 )
 
         if not sections:
@@ -175,7 +206,12 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
         new_system_message = append_to_system_message(request.system_message, memory_body)
 
         # Apply prompt caching breakpoint if Anthropic and enabled
-        if self._add_cache_control and type(request.model).__name__ == "ChatAnthropic" and hasattr(new_system_message, "content_blocks") and new_system_message.content_blocks:
+        if (
+            self._add_cache_control
+            and type(request.model).__name__ == "ChatAnthropic"
+            and hasattr(new_system_message, "content_blocks")
+            and new_system_message.content_blocks
+        ):
             blocks = list(new_system_message.content_blocks)
             last_block: Any = blocks[-1]
             base = last_block if isinstance(last_block, dict) else {}
@@ -186,6 +222,7 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
 
 
 # ── Main factory function ────────────────────────────────────────────────
+
 
 def build_phase_agent(
     state: WorkflowState,
@@ -223,7 +260,7 @@ def build_phase_agent(
         response_format: Optional Pydantic model or ResponseFormat for
             structured output (DA ≥0.5.3).
         is_subagent: When True, skips artifact materialization and
-            interpreter middleware (subagents are leaf
+            interpreter/read-cache middleware (subagents are leaf
             agents, not orchestrators).
         extra_tools: Additional BaseTool instances injected directly into
             create_agent(tools=[...]). These sit alongside tools from
@@ -237,6 +274,7 @@ def build_phase_agent(
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
     """
+
     from spine.agents.backend import build_backend
     from spine.agents.artifacts import materialize_artifacts
     from spine.agents.skills_resolver import resolve_skills, resolve_memory
@@ -365,6 +403,7 @@ def build_phase_agent(
 
 # ── Middleware stack builder ─────────────────────────────────────────────
 
+
 def _build_middleware_stack(
     *,
     backend: Any,
@@ -393,12 +432,13 @@ def _build_middleware_stack(
     3.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
     4.  SubAgentMiddleware         — task delegation (BEFORE interpreter so tools.task is PTC-visible)
     5.  CodeInterpreterMiddleware  — eval tool (when enabled); sees task tool from step 4
-    6.  PatchToolCallsMiddleware   — tool call normalization
-    7.  SPINE-specific middleware  — ToolSchemaValidator, ToolOutputTrimmer
-    8.  User extra_middleware
-    9.  Profile extra_middleware
-    10. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
-    11. MemoryMiddleware           — AGENTS.md injection (when memory present)
+    6.  ReadCacheMiddleware        — prevents re-read amnesia via SpineContext cache
+    7.  PatchToolCallsMiddleware   — tool call normalization
+    8.  SPINE-specific middleware  — ToolSchemaValidator (ToolOutputTrimmer removed 2026-05)
+    9.  User extra_middleware
+    10. Profile extra_middleware
+    11. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
+    12. MemoryMiddleware           — AGENTS.md injection (when memory present)
 
     CRITICAL ordering constraint: SubAgentMiddleware (4) MUST precede
     CodeInterpreterMiddleware (5). The interpreter's PTC system calls
@@ -448,11 +488,13 @@ def _build_middleware_stack(
     #    and tools.task resolves to undefined in the QuickJS sandbox,
     #    causing "TypeError: not a function" on every Promise.allSettled call.
     if subagents:
-        middleware.append(SubAgentMiddleware(
-            backend=backend,
-            subagents=subagents,
-            task_description=tool_desc_overrides.get("task"),
-        ))
+        middleware.append(
+            SubAgentMiddleware(
+                backend=backend,
+                subagents=subagents,
+                task_description=tool_desc_overrides.get("task"),
+            )
+        )
 
     # 5. Interpreter (eval tool) — only for top-level phase agents.
     #    SubAgentMiddleware must be above this in the stack (position 4)
@@ -461,7 +503,13 @@ def _build_middleware_stack(
     if has_interpreter:
         middleware.append(build_interpreter_middleware(phase.value))
 
-    # 6. Patch tool calls — normalisation
+    # 6. Read cache — prevents re-reading already-seen files.  Checks
+    #    SpineContext.read_cache before allowing read_file to execute.
+    #    Only for top-level orchestrators, not subagent leaves.
+    if not is_subagent:
+        middleware.append(_build_read_cache_middleware())
+
+    # 7. Patch tool calls — normalisation
     middleware.append(PatchToolCallsMiddleware())
 
     # 7. SPINE-specific middleware (tool validation, context editing)
@@ -481,16 +529,23 @@ def _build_middleware_stack(
         except Exception:
             pass
 
-    # 10. Prompt caching (no-op for non-Anthropic models)
-    middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+    # 11. Prompt caching — only for Anthropic models.
+    #     Non-Anthropic models (OpenRouter, OpenAI, local) don't support
+    #     Anthropic cache_control breakpoints.  Skip entirely to avoid
+    #     per-turn isinstance check overhead and misleading "ran 30 times"
+    #     metrics in traces.
+    if _is_anthropic_model(model):
+        middleware.append(AnthropicPromptCachingMiddleware())
 
     # 11. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
-        middleware.append(SpineProjectMemoryMiddleware(
-            backend=backend,
-            sources=memory,
-            add_cache_control=True,
-        ))
+        middleware.append(
+            SpineProjectMemoryMiddleware(
+                backend=backend,
+                sources=memory,
+                add_cache_control=True,
+            )
+        )
 
     return middleware
 
@@ -517,7 +572,8 @@ def _filter_filesystem_tools(
         logger.warning(
             "Phase %s: FilesystemMiddleware has no .tools attribute; "
             "cannot apply allowed_tools filter (%s)",
-            phase.value, allowed_tools,
+            phase.value,
+            allowed_tools,
         )
         return
 
@@ -528,7 +584,9 @@ def _filter_filesystem_tools(
     dropped = [n for n in original_names if n not in allowed]
     logger.debug(
         "Phase %s: filtered filesystem tools — kept=%s dropped=%s",
-        phase.value, kept, dropped,
+        phase.value,
+        kept,
+        dropped,
     )
 
 
@@ -537,23 +595,37 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     import os as _os
 
     # Tool schema validation — rebound loop for self-correction
-    _validation_enabled = _os.getenv(
-        "SPINE_TOOL_SCHEMA_VALIDATION", "true"
-    ).lower() not in ("0", "false", "no")
+    _validation_enabled = _os.getenv("SPINE_TOOL_SCHEMA_VALIDATION", "true").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
     if _validation_enabled:
         from spine.agents.tool_schema_validator import ToolSchemaValidator
+
         middleware.append(ToolSchemaValidator())
 
-    # Context editing: trim old tool results — all phases benefit from trimming
-    # SPECIFY/PLAN can accumulate 80+ read_file results, same as IMPLEMENT/VERIFY
-    from spine.agents.context_editing import ToolOutputTrimmer
-    
-    # Aggressively middle-truncate tool outputs for orchestrator phases to avoid bloat
-    trim_limit = 5 if phase.value in ["specify", "plan", "implement", "tasks"] else 20
-    middleware.append(ToolOutputTrimmer(max_full_tool_results=trim_limit))
+    # Note: ToolOutputTrimmer was removed (2026-05) — excessive trimming of
+    # filesystem results was causing agents to lose critical context during
+    # implementation/verification phases. ReadCacheMiddleware now handles
+    # the re-read problem at source, while ToolOutputTrimmer is retired.
+
+
+def _build_read_cache_middleware() -> Any:
+    """Build the ReadCacheMiddleware that prevents re-reading files.
+
+    Each ``read_file`` call checks ``SpineContext.read_cache`` before executing.
+    If the file was already read this phase, returns a compact metadata summary
+    instead of re-reading. The cache is shared across subagents via context
+    propagation.
+    """
+    from spine.agents.context_editing import ReadCacheMiddleware
+
+    return ReadCacheMiddleware()
 
 
 # ── Profile helpers ──────────────────────────────────────────────────────
+
 
 def _resolve_model_for_profile(model: Any) -> Any:
     """Resolve a model identifier to a BaseChatModel for profile lookup.
@@ -569,6 +641,7 @@ def _resolve_model_for_profile(model: Any) -> Any:
     if isinstance(model, str):
         try:
             from deepagents._models import resolve_model as da_resolve_model
+
             return da_resolve_model(model)
         except Exception:
             return model  # Return the string — _resolve_profile handles it
@@ -586,6 +659,7 @@ def _resolve_profile(model: Any, model_spec: str | None = None) -> Any:
     """
     try:
         from deepagents.profiles.harness.harness_profiles import _harness_profile_for_model
+
         return _harness_profile_for_model(model, model_spec)
     except (ImportError, Exception):
         return None

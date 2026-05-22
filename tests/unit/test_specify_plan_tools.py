@@ -331,7 +331,7 @@ class TestWritePlanTool:
 
 
 class TestBuildPlanAgentTools:
-    def test_returns_three_tools(self, tmp_path):
+    def test_returns_four_tools(self, tmp_path):
         tools = build_plan_agent_tools(
             workspace_root=str(tmp_path),
             work_id="abc",
@@ -339,7 +339,7 @@ class TestBuildPlanAgentTools:
             work_type="spec",
             prior_phase_dirs={},
         )
-        assert len(tools) == 3
+        assert len(tools) == 4
         names = {t.name for t in tools}
         assert "read_prior_artifacts" in names
         assert "search_codebase" in names

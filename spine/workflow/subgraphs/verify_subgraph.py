@@ -71,40 +71,44 @@ async def _run_verify_agent(
             "Prior artifacts are available on disk — read them as needed:",
         ]
         if has_spec:
-            prompt_lines.extend([
-                f"- Specification: `{spec_path}/specification.md`",
-                f"- Plan: `{plan_path}/plan.md`",
-            ])
+            prompt_lines.extend(
+                [
+                    f"- Specification: `{spec_path}/specification.md`",
+                    f"- Plan: `{plan_path}/plan.md`",
+                ]
+            )
         verify_path = _artifact_path(work_id, PhaseName.VERIFY.value)
-        prompt_lines.extend([
-            f"- Feature Slices: `{tasks_path}/tasks.md`",
-            f"- Codebase map: `{tasks_path}/codebase-map.md`",
-            f"- Implementation: `{impl_path}/implementation.md`",
-            "",
-            "Use `read_file` and `grep` to inspect them. Do NOT load "
-            "everything into context at once.",
-            "",
-            "Read the codebase map FIRST — it contains file paths, key "
-            "functions, and conventions discovered during the tasks phase.",
-            "",
-            "Also inspect the actual code files on disk using `ls` and "
-            "`read_file` — the implementation summary may not reflect "
-            "the actual state of the code.",
-            "",
-            "## Where to Write Your Output",
-            f"Write your verification report to `{verify_path}/verification.md` "
-            "using `write_file`.  The report MUST begin with `VERIFIED` or `PASSED` "
-            "on the first line if the implementation meets requirements, or "
-            "`FAILED` followed by the issues found.  This file is REQUIRED — "
-            "without it, the workflow treats the phase as failed.",
-            "",
-            "**RLM parallel verify pattern:** Use `eval` to read the "
-            "tasks artifact, extract the slice list, then dispatch a "
-            "`slice-verifier` subagent per slice via "
-            "`Promise.allSettled(tools.task(...))`. Synthesize the "
-            "verification report from subagent results in code — do NOT "
-            "re-read each slice file manually into conversation.",
-        ])
+        prompt_lines.extend(
+            [
+                f"- Feature Slices: `{tasks_path}/tasks.md`",
+                f"- Codebase map: `{tasks_path}/codebase-map.md`",
+                f"- Implementation: `{impl_path}/implementation.md`",
+                "",
+                "Use `read_file` and `grep` to inspect them. Do NOT load "
+                "everything into context at once.",
+                "",
+                "Read the codebase map FIRST — it contains file paths, key "
+                "functions, and conventions discovered during the tasks phase.",
+                "",
+                "Also inspect the actual code files on disk using `ls` and "
+                "`read_file` — the implementation summary may not reflect "
+                "the actual state of the code.",
+                "",
+                "## Where to Write Your Output",
+                f"Write your verification report to `{verify_path}/verification.md` "
+                "using `write_file`.  The report MUST begin with `VERIFIED` or `PASSED` "
+                "on the first line if the implementation meets requirements, or "
+                "`FAILED` followed by the issues found.  This file is REQUIRED — "
+                "without it, the workflow treats the phase as failed.",
+                "",
+                "**RLM parallel verify pattern:** Use `eval` to read the "
+                "tasks artifact, extract the slice list, then dispatch a "
+                "`slice-verifier` subagent per slice via "
+                "`Promise.allSettled(tools.task(...))`. Synthesize the "
+                "verification report from subagent results in code — do NOT "
+                "re-read each slice file manually into conversation.",
+            ]
+        )
         prompt = "\n".join(prompt_lines)
 
         ctx = build_context(dict(state), PhaseName.VERIFY)  # type: ignore[dict-constructor]
@@ -156,7 +160,9 @@ async def _save_verify_artifacts(
 
     # Scan what the agent wrote to disk
     disk_artifacts = scan_artifact_dir(
-        workspace_root, work_id, PhaseName.VERIFY.value,
+        workspace_root,
+        work_id,
+        PhaseName.VERIFY.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
     )
 
@@ -174,15 +180,11 @@ async def _save_verify_artifacts(
             workspace_root,
             work_id=work_id,
         )
-        disk_artifacts = {
-            "verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]
-        }
+        disk_artifacts = {"verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]}
 
     # Determine status from verification content
     verify_text = next(iter(disk_artifacts.values()), "") if disk_artifacts else ""
-    is_verified = (
-        "VERIFIED" in verify_text.upper() or "PASSED" in verify_text.upper()
-    )
+    is_verified = "VERIFIED" in verify_text.upper() or "PASSED" in verify_text.upper()
 
     return {
         "artifacts_output": disk_artifacts,

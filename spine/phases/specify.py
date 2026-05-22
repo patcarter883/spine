@@ -37,7 +37,9 @@ from spine.workflow.registry import get_registry
 logger = logging.getLogger(__name__)
 
 
-async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+async def call_specify(
+    state: WorkflowState, config: Optional[RunnableConfig] = None
+) -> dict[str, Any]:
     """Execute the SPECIFY phase.
 
     Delegates to the specify Deep Agent, which generates a specification
@@ -76,12 +78,16 @@ async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = 
         # Build the prompt — prior artifacts are on disk, not inlined
         spec_dir = f".spine/artifacts/{work_id}/specify"
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', spec_dir: '{spec_dir}'}};\n\n"
-        
+
         rework_prefix = ""
         if retry_count > 0:
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior specification. Address all points from the critic feedback.\n\n"
-            
-        prompt = context_seed + rework_prefix + f"Create a detailed specification for the following work:\n\n{description}"
+
+        prompt = (
+            context_seed
+            + rework_prefix
+            + f"Create a detailed specification for the following work:\n\n{description}"
+        )
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
@@ -107,7 +113,9 @@ async def call_specify(state: WorkflowState, config: Optional[RunnableConfig] = 
 
         # Materialize this phase's artifacts to disk immediately
         phase_artifacts = {"specification.md": spec_content}
-        materialize_phase_artifacts(PhaseName.SPECIFY.value, phase_artifacts, workspace_root, work_id=work_id)
+        materialize_phase_artifacts(
+            PhaseName.SPECIFY.value, phase_artifacts, workspace_root, work_id=work_id
+        )
 
         return {
             "artifacts": {PhaseName.SPECIFY.value: phase_artifacts},

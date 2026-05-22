@@ -361,7 +361,7 @@ class TestPTCAllowlistExcludesReadFile:
             )
 
 
-# ── 5. codebase-map prompt enrichment ───────────────────────────────────
+# ── 4. codebase-map prompt enrichment ───────────────────────────────────
 
 
 class TestCodebaseMapPromptEnrichment:
@@ -400,7 +400,7 @@ class TestCodebaseMapPromptEnrichment:
         assert "codebase-map" in source, "Tasks agent prompt must reference codebase-map.md"
 
 
-# ── 6. Researcher minimum output requirements ───────────────────────────
+# ── 5. Researcher minimum output requirements ───────────────────────────
 
 
 class TestResearcherMinOutput:

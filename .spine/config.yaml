@@ -21,9 +21,9 @@ providers:
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
     enabled: true
-  - name: qwen3.6-35b
+  - name: qwen3.7-max
     type: deepagents-model
-    model: openrouter:qwen/qwen3.6-35b-a3b
+    model: openrouter:qwen/qwen3.7-max
     enabled: true
   - name: deepseek-v4-flash
     type: deepagents-model
@@ -67,10 +67,10 @@ providers:
     critic:
       provider: deepseek-v4-pro
     tasks:
-      provider: deepseek-v4-flash
+      provider: deepseek-v4-pro
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: deepseek-v4-flash
+      provider: deepseek-v4-pro
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
@@ -79,4 +79,4 @@ providers:
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: deepseek-v4-flash             # short timeout for verify
+      provider: deepseek-v4-pro             # short timeout for verify
