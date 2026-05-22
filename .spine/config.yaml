@@ -1,7 +1,6 @@
 spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
-  workspace_root: /home/pat/Projects/spine/../spine-sandbox
 
 # ── MCP Servers ──────────────────────────────────────────────────
 # Model Context Protocol servers for external tool integration.
@@ -13,7 +12,7 @@ mcp_servers:
     command: mcp-codebase-index
     args: []
     env:
-      PROJECT_ROOT: /home/pat/Projects/spine/../spine-sandbox
+      PROJECT_ROOT: /home/pat/Projects/spine
 
 providers:
   llm:
@@ -66,16 +65,16 @@ providers:
       provider: deepseek-v4-pro
     critic:
       provider: deepseek-v4-pro
-    tasks:
+    research_manager:
       provider: deepseek-v4-pro
     # Implementation → local vLLM, but colder temperature for code
     implement:
-      provider: deepseek-v4-pro
+      provider: local
       temperature: 0.6           # freezes just the temp override
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
-      provider: deepseek-v4-flash
+      provider: local
 
     # Verification → local vLLM model with custom endpoint
     verify:

@@ -104,7 +104,7 @@ _SUBGRAPH_ENABLED: dict[str, bool] = {
 # subgraph.  Default: SPECIFY enabled, PLAN pending implementation.
 _USE_EXPLORATION_SUBGRAPH: dict[str, bool] = {
     PhaseName.SPECIFY.value: True,
-    PhaseName.PLAN.value: False,
+    PhaseName.PLAN.value: True,
 }
 
 

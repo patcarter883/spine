@@ -21,7 +21,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
+import json
 import json as _json_mod
+from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -33,6 +35,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
+    _artifact_path,
 )
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
@@ -148,6 +151,124 @@ def _sufficiency_router(
     return "loop"
 
 
+# ── Node: synthesize (PLAN) ─────────────────────────────────────────────
+
+
+async def _synthesize_plan(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Synthesize research findings into a plan.
+
+    Uses the existing plan agent infrastructure — builds a Deep Agent
+    with the ``write_structured_plan`` tool and research findings as context.
+    Reads ``plan.json`` from disk after invocation and computes execution waves.
+    """
+    from spine.agents.plan_agent import build_plan_agent
+
+    description = state.get("description", "")
+    work_id = state.get("work_id", "unknown")
+    work_type = state.get("work_type", "")
+    workspace_root = state.get("workspace_root", ".")
+    findings = state.get("findings", [])
+    retry_count = state.get("retry_count", 0)
+    feedback = state.get("feedback", [])
+
+    logger.info(
+        "[%s] Synthesize (plan): %d findings available, retry=%d",
+        work_id,
+        len(findings),
+        retry_count,
+    )
+
+    try:
+        agent = build_plan_agent(dict(state), config)
+        materialize_artifacts(dict(state), workspace_root, work_id=work_id)
+
+        findings_text = _format_findings(findings)
+        rework_prefix = ""
+        if retry_count > 0:
+            rework_prefix = (
+                "⚠ **REWORK PASS**: Your primary objective is to revise "
+                "the prior plan. Address all points from the "
+                "critic feedback.\n\n"
+            )
+
+        spec_path = f".spine/artifacts/{work_id}/specify/specification.md"
+
+        prompt = (
+            f"{rework_prefix}Create a detailed technical plan with structured "
+            f"feature slices, incorporating the codebase research findings below.\n\n"
+            f"## Work Description\n{description}\n\n"
+            f"## Codebase Research Findings\n{findings_text}\n\n"
+            f"The full specification is available on disk at "
+            f"`{spec_path}` — read it carefully with `read_file`.\n\n"
+            f"After completing your research, call `write_structured_plan` to "
+            f"produce both `plan.md` (narrative) and `plan.json` (structured "
+            f"JSON with feature_slices).\n\n"
+            f"Write the plan artifacts to `{_artifact_path(work_id, PhaseName.PLAN.value)}/`."
+        )
+
+        if retry_count > 0 and feedback:
+            feedback_text = "\n".join(
+                f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
+                for f in feedback
+                if isinstance(f, dict)
+            )
+            prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
+
+        ctx = build_context(dict(state), PhaseName.PLAN)
+        result = await ainvoke_with_retry(
+            agent,
+            {"messages": [{"role": "user", "content": prompt}]},
+            phase_name=PhaseName.PLAN.value,
+            work_id=work_id,
+            work_type=work_type,
+            context=ctx,
+        )
+
+        # ── Read plan.json from disk (written by write_structured_plan) ──
+        plan_json_path = (
+            Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+        )
+        plan_json_str: str | None = None
+        execution_waves: list[list[dict]] = []
+
+        if plan_json_path.exists():
+            try:
+                raw = plan_json_path.read_text(encoding="utf-8")
+                plan_data = json.loads(raw)
+                plan_json_str = raw
+                logger.info("[%s] Read plan.json (%d chars)", work_id, len(raw))
+
+                wave_error: str | None = None
+                execution_waves, wave_error = _compute_waves(plan_data, work_id)
+
+                if wave_error is not None:
+                    logger.warning(
+                        "[%s] PLAN subgraph: wave computation error: %s",
+                        work_id,
+                        wave_error,
+                    )
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("[%s] Failed to read plan.json: %s", work_id, exc)
+
+        return {
+            "messages": result.get("messages", []),
+            "agent_response": extract_response(result),
+            "plan_json": plan_json_str,
+            "execution_waves": execution_waves,
+        }
+
+    except Exception as e:
+        logger.error("[%s] Synthesize (plan) failed: %s", work_id, e, exc_info=True)
+        return {
+            "messages": [],
+            "agent_response": f"Synthesis error: {e}",
+            "phase_status": "error",
+        }
+
+
 # ── Node: synthesize (SPECIFY) ──────────────────────────────────────────
 
 
@@ -233,6 +354,47 @@ async def _synthesize_specify(
         }
 
 
+def _compute_waves(
+    plan_data: dict[str, Any],
+    work_id: str,
+) -> tuple[list[list[dict]], str | None]:
+    """Compute execution waves from structured plan data.
+
+    Args:
+        plan_data: Parsed plan.json content.
+        work_id: Work item ID for logging.
+
+    Returns:
+        ``(waves, error_message)``. On success, error_message is None.
+    """
+    try:
+        from dataclasses import asdict
+
+        from spine.workflow.slice_scheduler import FeatureSlice, compute_execution_waves
+    except ImportError:
+        logger.debug("[%s] slice_scheduler not available", work_id)
+        return [], None
+
+    raw_slices = plan_data.get("feature_slices")
+    if not isinstance(raw_slices, list) or not raw_slices:
+        logger.debug("[%s] plan.json has no feature_slices", work_id)
+        return [], None
+
+    try:
+        scheduler_slices = [FeatureSlice.from_dict(sd) for sd in raw_slices]
+        waves = compute_execution_waves(scheduler_slices)
+        wave_dicts: list[list[dict]] = [[asdict(s) for s in wave] for wave in waves]
+        logger.info(
+            "[%s] Computed %d execution wave(s) with %d total slices",
+            work_id,
+            len(wave_dicts),
+            sum(len(w) for w in wave_dicts),
+        )
+        return wave_dicts, None
+    except (ValueError, KeyError, TypeError) as exc:
+        return [], str(exc)
+
+
 def _format_findings(findings: list[dict]) -> str:
     """Format accumulated findings for the synthesizer prompt.
 
@@ -299,10 +461,26 @@ async def _save_exploration_artifacts(
         )
         disk_artifacts = {artifact_name: agent_response[:_MAX_ARTIFACT_STATE_CHARS]}
 
-    return {
+    # PLAN-specific: merge plan.json into disk_artifacts if not already present
+    plan_json_str = state.get("plan_json")
+    execution_waves = state.get("execution_waves", [])
+
+    if isinstance(disk_artifacts, dict) and "plan.json" not in disk_artifacts:
+        plan_json_path = (
+            Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+        )
+        if plan_json_path.exists() and plan_json_str:
+            disk_artifacts["plan.json"] = plan_json_str[:_MAX_ARTIFACT_STATE_CHARS]
+
+    result: dict[str, Any] = {
         "artifacts_output": disk_artifacts,
         "phase_status": "success" if disk_artifacts else "needs_review",
     }
+
+    if execution_waves:
+        result["execution_waves"] = execution_waves
+
+    return result
 
 
 # ── Builder ──────────────────────────────────────────────────────────────
@@ -326,8 +504,7 @@ def build_exploration_subgraph(
     if phase == PhaseName.SPECIFY.value:
         synthesizer = _synthesize_specify
     elif phase == PhaseName.PLAN.value:
-        # PLAN synthesis — to be added in Phase 4 of the rollout.
-        raise NotImplementedError("PLAN exploration subgraph not yet implemented")
+        synthesizer = _synthesize_plan
     else:
         raise ValueError(f"Unsupported phase for exploration subgraph: {phase!r}")
 

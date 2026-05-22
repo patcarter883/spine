@@ -185,9 +185,13 @@ async def call_plan(
 
         spec_instruction = (
             f"The full specification is available on disk at `{spec_path}/specification.md` "
-            "— read it carefully with `read_file` — your plan must implement exactly what the spec describes.\n\n"
+            "and will also be loaded by `read_prior_artifacts` under "
+            "`artifacts.specify['specification.md']`. Use it as the source of truth "
+            "for ALL researcher dispatches — every subagent must receive the relevant "
+            "spec section so it can find the matching codebase files, patterns, and "
+            "conventions. Do NOT dispatch researchers with just the work description.\n\n"
             if has_spec
-            else "No prior specification exists (quick workflow). Work directly from the description returned by `read_prior_artifacts`.\n\n"
+            else "No prior specification exists (quick workflow). Work directly from the description returned by `read_prior_artifacts`. Do NOT dispatch researcher subagents unless the work description explicitly requires codebase exploration.\n\n"
         )
 
         prompt = (
