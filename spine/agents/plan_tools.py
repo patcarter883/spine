@@ -117,8 +117,7 @@ class ReadPriorArtifactsTool(BaseTool):
 
         if not result["artifacts"]:
             result["warning"] = (
-                "No prior artifacts found. This may be a quick workflow "
-                "with no specification phase — work directly from the description."
+                "No prior artifacts found — work directly from the description."
             )
 
         return json.dumps(result, ensure_ascii=False)

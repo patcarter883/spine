@@ -178,9 +178,8 @@ async def call_plan(
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
 
         # Check if spec exists to formulate the exact dynamic spec instruction
-        has_spec = False
-        artifacts = state.get("artifacts", {}) or {}
-        if artifacts.get(PhaseName.SPECIFY.value):
+        has_spec = True
+        if state.get("artifacts", {}).get(PhaseName.SPECIFY.value):
             has_spec = True
 
         spec_instruction = (
@@ -191,7 +190,7 @@ async def call_plan(
             "spec section so it can find the matching codebase files, patterns, and "
             "conventions. Do NOT dispatch researchers with just the work description.\n\n"
             if has_spec
-            else "No prior specification exists (quick workflow). Work directly from the description returned by `read_prior_artifacts`. Do NOT dispatch researcher subagents unless the work description explicitly requires codebase exploration.\n\n"
+            else "No prior artifacts found. Work directly from the description returned by `read_prior_artifacts`.\n\n"
         )
 
         prompt = (
