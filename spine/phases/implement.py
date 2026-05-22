@@ -220,7 +220,7 @@ async def call_implement(
         if retry_count > 0:
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior implementation. Address all points from the critic feedback.\n\n"
 
-        has_spec = "spec" in work_type
+        has_spec = True
         spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
         plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
         tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)

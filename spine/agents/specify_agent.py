@@ -116,7 +116,7 @@ def _build_specify_prompt() -> str:
         "Include: (1) the work description context, "
         "(2) specific file paths or modules to investigate, "
         "(3) what to look for (patterns, conventions, APIs, dependencies). "
-        "Bare topic names like \"Research X\" produce empty results and waste "
+        'Bare topic names like "Research X" produce empty results and waste '
         "the subagent turn — every thin dispatch costs you 3K tokens for "
         "nothing.\n\n"
         "Dispatch pattern:\n"

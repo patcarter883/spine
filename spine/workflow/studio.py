@@ -16,42 +16,21 @@ from __future__ import annotations
 from spine.workflow.compose import build_workflow_graph
 
 
-def spec_graph():
-    """SPEC workflow: specify → plan → critic_plan → tasks → implement → verify."""
-    return build_workflow_graph("spec")
+def task_graph():
+    """TASK workflow: specify → plan → critic_plan → implement → verify."""
+    return build_workflow_graph("task")
 
 
-def critical_spec_graph():
-    """CRITICAL_SPEC: specify → critic_specify → plan → critic_plan → tasks →
-    critic_tasks → implement → verify."""
-    return build_workflow_graph("critical_spec")
+def critical_task_graph():
+    """CRITICAL_TASK: specify → critic_specify → plan → critic_plan → implement → verify."""
+    return build_workflow_graph("critical_task")
 
 
-def quick_graph():
-    """QUICK workflow: tasks → implement → verify."""
-    return build_workflow_graph("quick")
+def reviewed_task_graph():
+    """REVIEWED_TASK: specify → plan → critic_plan → implement → verify (pauses for approval after critic_plan)."""
+    return build_workflow_graph("reviewed_task")
 
 
-def critical_quick_graph():
-    """CRITICAL_QUICK workflow: tasks → critic → implement → verify."""
-    return build_workflow_graph("critical_quick")
-
-
-def plan_graph():
-    """PLAN workflow: specify → plan → critic_plan (no tasks/execution)."""
-    return build_workflow_graph("plan")
-
-
-def plan_spec_graph():
-    """PLAN_SPEC workflow: specify → critic_specify → plan → critic_plan."""
-    return build_workflow_graph("plan_spec")
-
-
-def plan_only_graph():
-    """PLAN_ONLY workflow: specify → plan → critic_plan (no spec critic)."""
-    return build_workflow_graph("plan_only")
-
-
-def critical_plan_only_graph():
-    """CRITICAL_PLAN_ONLY: specify → critic_specify → plan → critic_plan."""
-    return build_workflow_graph("critical_plan_only")
+def critical_reviewed_task_graph():
+    """CRITICAL_REVIEWED_TASK: specify → critic_specify → plan → critic_plan → implement → verify (pauses for approval after critic_plan)."""
+    return build_workflow_graph("critical_reviewed_task")

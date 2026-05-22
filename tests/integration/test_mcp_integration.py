@@ -68,8 +68,7 @@ def _tool_result_text(result) -> str:
         return result
     if isinstance(result, list):
         return "\n".join(
-            item.get("text", str(item)) if isinstance(item, dict) else str(item)
-            for item in result
+            item.get("text", str(item)) if isinstance(item, dict) else str(item) for item in result
         )
     return str(result)
 
@@ -101,6 +100,7 @@ class TestRealMCPCodebaseIndex:
     def test_tools_are_callable(self, mcp_tools_async: list) -> None:
         """Tools should be LangChain BaseTool instances."""
         from langchain_core.tools import BaseTool
+
         for t in mcp_tools_async:
             assert isinstance(t, BaseTool)
 
@@ -174,6 +174,7 @@ class TestSpineConfigMCPIntegration:
     async def test_get_mcp_tools_end_to_end(self, sample_python_project: str) -> None:
         """get_mcp_tools() should return namespaced LangChain tools."""
         import spine.mcp.client as mcp_client
+
         mcp_client._client = None
 
         configs = {
@@ -188,6 +189,7 @@ class TestSpineConfigMCPIntegration:
 
         assert len(tools) == 18
         from langchain_core.tools import BaseTool
+
         for t in tools:
             assert isinstance(t, BaseTool)
             assert t.name.startswith("mcp_test-idx_")

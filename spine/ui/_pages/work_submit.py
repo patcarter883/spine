@@ -1,4 +1,4 @@
-"""SPINE Submit Work page — create new work items (Quick work only).
+"""SPINE Submit Work page — create new work items.
 
 For Spec & Planning work, use the Spec & Planning page instead.
 The submit work page is restricted to quick work types for direct execution.
@@ -18,7 +18,7 @@ def render(api: UIApi) -> None:
     st.markdown(
         "Enter a work description and choose a workflow type. "
         "SPINE will orchestrate the AI agent through the appropriate phases.\n\n"
-        "**Note:** This page is for **quick work types** only. "
+        "**Note:** This page is for **task workflow types** (direct execution). "
         "For Spec & Planning workflows (new feature planning, architecture), "
         "use the **Spec & Planning** page instead."
     )
@@ -32,10 +32,10 @@ def render(api: UIApi) -> None:
 
     work_type = st.selectbox(
         "Workflow Type",
-        options=["quick", "critical_quick"],
+        options=["task", "critical_task"],
         format_func=lambda x: {
-            "quick": "⚡ Quick Work (TASKS → IMPLEMENT → VERIFY)",
-            "critical_quick": "🔒 Critical Quick (TASKS → CRITIC → IMPLEMENT → VERIFY)",
+            "task": "⚡ Task (SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY)",
+            "critical_task": "🔒 Critical Task (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY)",
         }.get(x, x),
     )
 
@@ -61,14 +61,14 @@ def render(api: UIApi) -> None:
     st.subheader("Workflow Types Reference")
 
     workflow_data = {
-        "Type": ["Quick", "Critical Quick"],
+        "Type": ["Task", "Critical Task"],
         "Phases": [
-            "TASKS → IMPLEMENT → VERIFY",
-            "TASKS → CRITIC → IMPLEMENT → VERIFY",
+            "SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY",
+            "SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY",
         ],
         "Best For": [
-            "Simple tasks, quick fixes",
-            "Important quick tasks needing review",
+            "Standard tasks with full workflow",
+            "Important tasks needing extra critic review",
         ],
     }
     st.table(workflow_data)

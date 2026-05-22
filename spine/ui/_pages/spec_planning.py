@@ -1,7 +1,7 @@
 """SPINE Spec & Planning page — review and approve specifications and plans.
 
 This page is the interface for the planning workflow. Users can:
-1. Submit new planning work (spec+plan without tasks/execution)
+1. Submit new planning work (spec+plan with approval gate after critic_plan)
 2. View existing planning work items awaiting review
 3. Review and approve specifications and plans
 4. Spawn execution tasks from approved plans
@@ -56,14 +56,12 @@ def _render_submit_tab(api: UIApi) -> None:
 
     work_type = st.selectbox(
         "Planning Workflow",
-        options=["plan", "plan_spec", "plan_only", "critical_plan_only"],
+        options=["reviewed_task", "critical_reviewed_task"],
         format_func=lambda x: {
-            "plan": "📋 Plan (SPECIFY → PLAN → CRITIC_PLAN)",
-            "plan_spec": "📐 Plan with Spec Critic (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN)",
-            "plan_only": "📝 Plan Only (SPECIFY → PLAN → CRITIC_PLAN, no spec critic)",
-            "critical_plan_only": "🔒 Plan Only with Spec Critic (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN)",
+            "reviewed_task": "📋 Reviewed Task (SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY)",
+            "critical_reviewed_task": "📐 Critical Reviewed Task (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY)",
         }.get(x, x),
-        help="Choose the workflow intensity. Plan workflows stop after the plan phase - no tasks or execution are spawned automatically.",
+        help="Planning workflows pause for approval after the critic_plan phase. Once approved, they continue through implement and verify.",
     )
 
     if st.button("🚀 Submit Planning Work", type="primary", disabled=not description.strip()):
@@ -90,12 +88,10 @@ def _render_submit_tab(api: UIApi) -> None:
     st.markdown("""
     | Type | Phases | Use Case |
     |------|--------|----------|
-    | **plan** | SPECIFY → PLAN → CRITIC_PLAN | Standard planning with plan review |
-    | **plan_spec** | SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN | Full planning with spec review |
-    | **plan_only** | SPECIFY → PLAN → CRITIC_PLAN | Quick planning without spec critic |
-    | **critical_plan_only** | SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN | Critical planning with both reviews |
+    | **Reviewed Task** | SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY | Standard planning with plan review |
+    | **Critical Reviewed Task** | SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY | Full planning with spec critic review |
 
-    After a plan is approved, you can spawn execution tasks from it.
+    After a plan is approved, the workflow continues through implement and verify.
     """)
 
 
@@ -143,12 +139,10 @@ def _render_planning_item(api: UIApi, item: dict) -> None:
         with col1:
             st.markdown(f"**{work_id[:8]}** · {description[:60]}...")
         with col2:
-            # Status emoji mapping for planning work items
-            # Shows clear visual distinction for each planning state
             status_emoji = {
-                "awaiting_approval": "⏳",  # Awaiting human approval
-                "approved": "✅",  # Approved and ready to spawn
-                "needs_review": "👁️",  # Needs human review
+                "awaiting_approval": "⏳",
+                "approved": "✅",
+                "needs_review": "👁️",
             }.get(status, "❓")
             st.markdown(f"{status_emoji} `{status}`")
 

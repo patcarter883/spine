@@ -30,7 +30,6 @@ from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
-    _artifact_path,
 )
 from spine.workflow.registry import get_registry
 

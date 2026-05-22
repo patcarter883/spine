@@ -26,12 +26,14 @@ class TestConvertServerConfig:
 
     def test_full_config(self) -> None:
         """Full config should pass through all fields."""
-        result = _convert_server_config({
-            "transport": "http",
-            "command": "my-server",
-            "args": ["--verbose"],
-            "env": {"KEY": "val"},
-        })
+        result = _convert_server_config(
+            {
+                "transport": "http",
+                "command": "my-server",
+                "args": ["--verbose"],
+                "env": {"KEY": "val"},
+            }
+        )
         assert result["transport"] == "http"
         assert result["command"] == "my-server"
         assert result["args"] == ["--verbose"]
@@ -39,11 +41,13 @@ class TestConvertServerConfig:
 
     def test_empty_args_and_env_omitted(self) -> None:
         """Empty args should be present (required by adapter), empty env omitted."""
-        result = _convert_server_config({
-            "command": "cmd",
-            "args": [],
-            "env": {},
-        })
+        result = _convert_server_config(
+            {
+                "command": "cmd",
+                "args": [],
+                "env": {},
+            }
+        )
         assert result["transport"] == "stdio"
         assert result["command"] == "cmd"
         assert result["args"] == []
@@ -119,9 +123,7 @@ class TestGetMCPTools:
             configs = {
                 "idx": {"command": "idx", "args": [], "transport": "stdio"},
             }
-            result = get_mcp_tools(
-                configs, cache_key="test", workspace_root="/test/project"
-            )
+            result = get_mcp_tools(configs, cache_key="test", workspace_root="/test/project")
             assert isinstance(result, list)
             assert configs["idx"]["env"]["PROJECT_ROOT"] == "/test/project"
 

@@ -104,8 +104,8 @@ def _render_artifacts(api: UIApi, work_id: str) -> None:
         # filtering out critic nodes (artifacts are keyed by phase name).
         from spine.workflow.compose import WORKFLOW_SEQUENCES
 
-        work_type = entry.get("work_type", "quick")
-        sequence = WORKFLOW_SEQUENCES.get(work_type, WORKFLOW_SEQUENCES.get("quick", []))
+        work_type = entry.get("work_type", "task")
+        sequence = WORKFLOW_SEQUENCES.get(work_type, WORKFLOW_SEQUENCES.get("task", []))
         # Only non-critic nodes produce artifact directories
         node_index = {
             name: i for i, (name, _) in enumerate(sequence) if not name.startswith("critic")
@@ -243,7 +243,7 @@ def render(api: UIApi) -> None:
     # NOTE: These are NOT inside a fragment so that text_area input
     # is preserved and not cleared on fragment re-renders.
     status = entry.get("status", "unknown")
-    work_type = entry.get("work_type", "quick")
+    work_type = entry.get("work_type", "task")
     current_phase = entry.get("current_phase", "")
 
     # Helper: render "Restart from Phase" section

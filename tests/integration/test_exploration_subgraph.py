@@ -56,7 +56,7 @@ def test_exploration_state_schema_fields():
     state: ExplorationSubgraphState = {
         "phase": "specify",
         "work_id": "test-wk-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "Add dark mode toggle to settings",
         "workspace_root": "/tmp/test-project",
         "retry_count": 0,
@@ -86,7 +86,7 @@ def test_exploration_state_accumulates_findings():
     base: ExplorationSubgraphState = {
         "phase": "specify",
         "work_id": "test-wk-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "test",
         "workspace_root": "/tmp",
         "retry_count": 0,
@@ -120,7 +120,7 @@ def test_research_router_fan_out():
     state: ExplorationSubgraphState = {
         "phase": "specify",
         "work_id": "test-wk-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "test",
         "workspace_root": "/tmp",
         "retry_count": 0,
@@ -152,7 +152,7 @@ def test_research_router_done():
     state: ExplorationSubgraphState = {
         "phase": "specify",
         "work_id": "test-wk-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "test",
         "workspace_root": "/tmp",
         "retry_count": 0,
@@ -180,7 +180,7 @@ def test_sufficiency_router_loop():
     state: ExplorationSubgraphState = {
         "phase": "specify",
         "work_id": "test-wk-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "test",
         "workspace_root": "/tmp",
         "retry_count": 0,
@@ -207,7 +207,7 @@ def test_sufficiency_router_max_rounds():
     state: ExplorationSubgraphState = {
         "phase": "specify",
         "work_id": "test-wk-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "test",
         "workspace_root": "/tmp",
         "retry_count": 0,
@@ -239,9 +239,7 @@ def test_exploration_subgraph_registered_for_specify():
 
     if _USE_EXPLORATION_SUBGRAPH.get("specify", False):
         builder = get_subgraph_builder("specify")
-        assert builder is not None, (
-            "Exploration subgraph should be registered for specify"
-        )
+        assert builder is not None, "Exploration subgraph should be registered for specify"
 
 
 def test_workflow_graph_builds_with_exploration_subgraph():
@@ -250,5 +248,5 @@ def test_workflow_graph_builds_with_exploration_subgraph():
 
     # This builds the full workflow graph — if the exploration subgraph
     # override is active, it will be used for the specify node.
-    graph = build_workflow_graph("spec")
+    graph = build_workflow_graph("task")
     assert graph is not None

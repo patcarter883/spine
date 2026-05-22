@@ -12,7 +12,6 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -30,16 +29,18 @@ class TestUpdateWorkProgress:
         config.queue_path = str(Path(tmpdir) / "queue.db")
         config.ensure_dirs()
         db = _get_work_db(config)
-        db["work_entries"].insert({
-            "id": "test-work",
-            "description": "test",
-            "work_type": "quick",
-            "status": "running",
-            "current_phase": "",
-            "created_at": "2024-01-01T00:00:00",
-            "updated_at": "2024-01-01T00:00:00",
-            "result": "{}",
-        })
+        db["work_entries"].insert(
+            {
+                "id": "test-work",
+                "description": "test",
+                "work_type": "task",
+                "status": "running",
+                "current_phase": "",
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:00:00",
+                "result": "{}",
+            }
+        )
         return db
 
     def test_updates_phase_and_status(self):
@@ -55,7 +56,7 @@ class TestUpdateWorkProgress:
         """Simulate a workflow progressing through multiple phases."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db = self._make_db(tmpdir)
-            # Simulate the quick workflow: tasks → implement → verify
+            # Simulate the task workflow: tasks → implement → verify
             _update_work_progress(db, "test-work", "tasks", "running")
             _update_work_progress(db, "test-work", "implement", "running")
             _update_work_progress(db, "test-work", "verify", "completed")

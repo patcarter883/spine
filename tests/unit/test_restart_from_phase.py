@@ -18,7 +18,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from spine.config import SpineConfig
-from spine.work.dispatcher import _get_work_db
 
 
 @pytest.fixture
@@ -66,16 +65,18 @@ class TestRestartFromPhaseActiveTaskCheck:
 
     def _setup_work_entry(self, work_db, work_id: str = "test-work-1"):
         """Create a work entry in the database."""
-        work_db["work_entries"].insert({
-            "id": work_id,
-            "description": "test work",
-            "work_type": "spec",
-            "status": "running",
-            "current_phase": "implement",
-            "created_at": "2024-06-15T12:00:00",
-            "updated_at": "2024-06-15T13:00:00",
-            "result": "",
-        })
+        work_db["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": "test work",
+                "work_type": "task",
+                "status": "running",
+                "current_phase": "implement",
+                "created_at": "2024-06-15T12:00:00",
+                "updated_at": "2024-06-15T13:00:00",
+                "result": "",
+            }
+        )
 
     def test_no_active_task_returns_proceeds(self, tmp_config, work_db):
         """When no active task exists, restart_from_phase should proceed."""
@@ -91,9 +92,10 @@ class TestRestartFromPhaseActiveTaskCheck:
             # Mock the graph execution to avoid needing real LLM
             with patch(
                 "spine.work.dispatcher._run_workflow_graph",
-                return_value={"work_id": "test-work-1", "status": "completed", "work_type": "spec"},
+                return_value={"work_id": "test-work-1", "status": "completed", "work_type": "task"},
             ):
                 import asyncio
+
                 result = asyncio.run(restart_from_phase("test-work-1", "implement", tmp_config))
 
             # Should not be skipped - it should proceed to the workflow
@@ -112,9 +114,10 @@ class TestRestartFromPhaseActiveTaskCheck:
 
             with patch(
                 "spine.work.dispatcher._run_workflow_graph",
-                return_value={"work_id": "test-work-1", "status": "completed", "work_type": "spec"},
+                return_value={"work_id": "test-work-1", "status": "completed", "work_type": "task"},
             ):
                 import asyncio
+
                 result = asyncio.run(restart_from_phase("test-work-1", "implement", tmp_config))
 
             # Should not be skipped - different task is active
@@ -132,6 +135,7 @@ class TestRestartFromPhaseActiveTaskCheck:
             from spine.work.dispatcher import restart_from_phase
 
             import asyncio
+
             result = asyncio.run(restart_from_phase("test-work-1", "implement", tmp_config))
 
             assert result["status"] == "skipped"

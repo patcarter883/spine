@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spine.agents.tasks_tools import (
     WriteTasksArtifactsTool,
-    SliceDefinition,
     build_tasks_agent_tools,
 )
 from spine.agents.plan_tools import ReadPriorArtifactsTool, SearchCodebaseTool

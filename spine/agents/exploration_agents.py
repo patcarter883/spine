@@ -181,7 +181,6 @@ async def run_explore_node(
     from spine.agents.retry import ainvoke_with_retry
     from spine.agents.subagents import build_subagent_spec
     from spine.models.enums import PhaseName
-    from spine.models.state import WorkflowState as _WS  # noqa: N814
 
     work_id = state.get("work_id", "unknown")
     topic_str = topic or "general codebase investigation"

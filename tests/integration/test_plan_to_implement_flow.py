@@ -167,9 +167,7 @@ class TestPlanToImplementFlow:
         work_id = "e2e-plan-flow"
         plan_dir = tmp_path / ".spine" / "artifacts" / work_id / "plan"
         plan_dir.mkdir(parents=True)
-        (plan_dir / "plan.json").write_text(
-            json.dumps(plan_data, indent=2), encoding="utf-8"
-        )
+        (plan_dir / "plan.json").write_text(json.dumps(plan_data, indent=2), encoding="utf-8")
 
         # Read plan.json back (simulating what the implement phase does)
         raw = (plan_dir / "plan.json").read_text(encoding="utf-8")
@@ -194,9 +192,7 @@ class TestPlanToImplementFlow:
         work_id = "gate-valid-plan"
         plan_dir = tmp_path / ".spine" / "artifacts" / work_id / "plan"
         plan_dir.mkdir(parents=True)
-        (plan_dir / "plan.json").write_text(
-            json.dumps(plan_data, indent=2), encoding="utf-8"
-        )
+        (plan_dir / "plan.json").write_text(json.dumps(plan_data, indent=2), encoding="utf-8")
 
         gate_fn = make_artifact_gate_node("plan", "implement")
         state = {
@@ -255,15 +251,11 @@ class TestPlanToImplementFlow:
         assert state_dict["total_slices"] == 3
 
         # Wave 0: independent slices (models, config) — dispatched in parallel
-        wave_0_ids = sorted(
-            s["slice_id"] for s in state_dict["waves"][0]["slices"]
-        )
+        wave_0_ids = sorted(s["slice_id"] for s in state_dict["waves"][0]["slices"])
         assert wave_0_ids == ["config", "models"]
 
         # Wave 1: dependent slice (api) — dispatched after wave 0 completes
-        wave_1_ids = [
-            s["slice_id"] for s in state_dict["waves"][1]["slices"]
-        ]
+        wave_1_ids = [s["slice_id"] for s in state_dict["waves"][1]["slices"]]
         assert wave_1_ids == ["api"]
 
         # Verify wave indices are sequential
@@ -280,9 +272,7 @@ class TestPlanToImplementFlow:
         work_id = "gate-empty-plan"
         plan_dir = tmp_path / ".spine" / "artifacts" / work_id / "plan"
         plan_dir.mkdir(parents=True)
-        (plan_dir / "plan.json").write_text(
-            json.dumps(plan_data, indent=2), encoding="utf-8"
-        )
+        (plan_dir / "plan.json").write_text(json.dumps(plan_data, indent=2), encoding="utf-8")
 
         gate_fn = make_artifact_gate_node("plan", "implement")
         state = {

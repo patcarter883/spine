@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -145,7 +143,9 @@ class TestWriteImplementationReportTool:
             slice_results=[self._slice_result("alpha")],
             summary="Done.",
         )
-        impl_path = tmp_path / ".spine" / "artifacts" / "new-work" / "implement" / "implementation.md"
+        impl_path = (
+            tmp_path / ".spine" / "artifacts" / "new-work" / "implement" / "implementation.md"
+        )
         assert impl_path.exists()
 
     def test_blocked_slice_flagged(self, tmp_path):
@@ -154,7 +154,9 @@ class TestWriteImplementationReportTool:
         sr["issues"] = ["Missing dependency: auth_service"]
         tool._run(slice_results=[sr], summary="One slice blocked.")
 
-        content = (tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md").read_text()
+        content = (
+            tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md"
+        ).read_text()
         assert "❌" in content
         assert "blocked" in content
         assert "Missing dependency" in content
@@ -168,7 +170,9 @@ class TestWriteImplementationReportTool:
         ]
         tool._run(slice_results=slices, summary="Mixed results.")
 
-        content = (tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md").read_text()
+        content = (
+            tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md"
+        ).read_text()
         assert "Total slices: 3" in content
         assert "Implemented: 1" in content
         assert "Partial: 1" in content
@@ -186,7 +190,9 @@ class TestWriteImplementationReportTool:
         }
         tool._run(slice_results=[sr], summary="Done.")
 
-        content = (tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md").read_text()
+        content = (
+            tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md"
+        ).read_text()
         assert "src/a.py" in content
         assert "src/new.py" in content
         assert "Files Changed" in content
@@ -195,7 +201,9 @@ class TestWriteImplementationReportTool:
         tool = self._make_tool(tmp_path)
         result = tool._run(slice_results=[], summary="No slices.")
         assert "implementation.md written" in result
-        content = (tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md").read_text()
+        content = (
+            tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.md"
+        ).read_text()
         assert "Total slices: 0" in content
 
 

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 
 from spine.models.enums import ReviewStatus, TaskStatus, WorkType
 
@@ -42,7 +42,7 @@ class WorkSpawnSpec(BaseModel):
 
     title: str
     description: str
-    work_type: WorkType = WorkType.QUICK
+    work_type: WorkType = WorkType.TASK
     plan_id: str
     priority: str = "medium"  # "low" | "medium" | "high" | "critical"
 

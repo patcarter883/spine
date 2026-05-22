@@ -5,7 +5,7 @@ daemon thread and dequeues items for execution via ``submit_work()``.
 
 Usage:
     worker = get_worker()
-    worker.enqueue(description="Fix the login bug", work_type="quick")
+    worker.enqueue(description="Fix the login bug", work_type="task")
     worker.start()  # begins processing in background thread
 """
 
@@ -77,7 +77,7 @@ class RalphLoopWorker:
 
         return db
 
-    def enqueue(self, description: str, work_type: str = "spec") -> int:
+    def enqueue(self, description: str, work_type: str = "task") -> int:
         """Add a work item to the queue.
 
         Args:

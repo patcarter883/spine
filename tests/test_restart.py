@@ -8,11 +8,9 @@ This module covers:
 """
 
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -97,7 +95,7 @@ class TestRestartWork:
             {
                 "id": "done123",
                 "description": "done work",
-                "work_type": "spec",
+                "work_type": "task",
                 "status": "completed",
                 "current_phase": "verify",
                 "created_at": "2025-01-01T00:00:00",
@@ -119,7 +117,7 @@ class TestRestartWork:
             {
                 "id": "fail123",
                 "description": "failed work",
-                "work_type": "spec",
+                "work_type": "task",
                 "status": "failed",
                 "current_phase": "implement",
                 "created_at": "2025-01-01T00:00:00",
@@ -141,7 +139,7 @@ class TestRestartWork:
             {
                 "id": "run123",
                 "description": "running work",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": "running",
                 "current_phase": "tasks",
                 "created_at": "2025-01-01T00:00:00",
@@ -158,7 +156,7 @@ class TestRestartWork:
         mock_result = {
             "work_id": "run123",
             "status": "completed",
-            "work_type": "quick",
+            "work_type": "task",
             "restarted": True,
         }
 
@@ -180,7 +178,7 @@ class TestRestartWork:
             {
                 "id": "stall123",
                 "description": "stalled work",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": "stalled",
                 "current_phase": "implement",
                 "created_at": "2025-01-01T00:00:00",
@@ -194,7 +192,7 @@ class TestRestartWork:
         mock_result = {
             "work_id": "stall123",
             "status": "completed",
-            "work_type": "quick",
+            "work_type": "task",
             "restarted": True,
         }
 
@@ -216,7 +214,7 @@ class TestRestartWork:
             {
                 "id": "review123",
                 "description": "needs review work",
-                "work_type": "spec",
+                "work_type": "task",
                 "status": "needs_review",
                 "current_phase": "critic_plan",
                 "created_at": "2025-01-01T00:00:00",
@@ -230,7 +228,7 @@ class TestRestartWork:
         mock_result = {
             "work_id": "review123",
             "status": "completed",
-            "work_type": "spec",
+            "work_type": "task",
             "restarted": True,
         }
 
@@ -264,7 +262,7 @@ class TestRestartWork:
             {
                 "id": "run123",
                 "description": "test",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": "running",
                 "current_phase": "",
                 "created_at": "2025-01-01T00:00:00",
@@ -282,7 +280,7 @@ class TestRestartWork:
             return {
                 "work_id": "run123",
                 "status": "completed",
-                "work_type": "quick",
+                "work_type": "task",
                 "artifacts": {},
                 "feedback": [],
                 "prompt_request": None,
@@ -309,7 +307,7 @@ class TestRestartWork:
             {
                 "id": "run123",
                 "description": "test",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": "stalled",
                 "current_phase": "",
                 "created_at": "2025-01-01T00:00:00",
@@ -326,7 +324,7 @@ class TestRestartWork:
             return {
                 "work_id": "run123",
                 "status": "completed",
-                "work_type": "quick",
+                "work_type": "task",
                 "artifacts": {},
                 "feedback": [],
                 "prompt_request": None,
@@ -364,7 +362,7 @@ class TestResetStuckItems:
             {
                 "id": 1,
                 "description": "stuck item",
-                "work_type": "spec",
+                "work_type": "task",
                 "status": "running",
                 "enqueued_at": "2025-01-01T00:00:00",
                 "started_at": "2025-01-01T00:01:00",
@@ -376,7 +374,7 @@ class TestResetStuckItems:
             {
                 "id": 2,
                 "description": "pending item",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": "pending",
                 "enqueued_at": "2025-01-01T00:02:00",
                 "started_at": "",
@@ -407,8 +405,8 @@ class TestResetStuckItems:
             queue_db["queue"].insert(
                 {
                     "id": i + 1,
-                    "description": f"stuck item {i+1}",
-                    "work_type": "spec",
+                    "description": f"stuck item {i + 1}",
+                    "work_type": "task",
                     "status": "running",
                     "enqueued_at": "2025-01-01T00:00:00",
                     "started_at": f"2025-01-01T00:0{i}:00",
@@ -461,7 +459,7 @@ class TestUIApiRestart:
             {
                 "id": "ui-test-1",
                 "description": "test restart via UI",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": "stalled",
                 "current_phase": "implement",
                 "created_at": "2025-01-01T00:00:00",
@@ -479,7 +477,7 @@ class TestUIApiRestart:
             return_value={
                 "work_id": "ui-test-1",
                 "status": "completed",
-                "work_type": "quick",
+                "work_type": "task",
                 "restarted": True,
             },
         ):
@@ -501,7 +499,7 @@ class TestUIApiResetStuck:
             {
                 "id": 1,
                 "description": "stuck",
-                "work_type": "spec",
+                "work_type": "task",
                 "status": "running",
                 "enqueued_at": "2025-01-01T00:00:00",
                 "started_at": "2025-01-01T00:01:00",

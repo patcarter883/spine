@@ -10,7 +10,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -170,14 +169,7 @@ class TestMaterializeArtifacts:
             }
             materialize_artifacts(state, tmpdir, work_id="w1")
 
-            expected = (
-                Path(tmpdir)
-                / ".spine"
-                / "artifacts"
-                / "w1"
-                / "specify"
-                / "specification.md"
-            )
+            expected = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "specify" / "specification.md"
             assert expected.exists()
 
     def test_returns_flat_paths_without_work_id(self):
@@ -220,11 +212,7 @@ class TestBuildArtifactPrompt:
     def test_prompt_includes_work_id_in_paths(self):
         from spine.agents.artifacts import build_artifact_prompt
 
-        artifacts = {
-            "specify": {
-                "specification.md": "Spec content here."
-            }
-        }
+        artifacts = {"specify": {"specification.md": "Spec content here."}}
         prompt = build_artifact_prompt(artifacts, "plan", work_id="abc123")
 
         assert ".spine/artifacts/abc123/specify" in prompt
@@ -233,11 +221,7 @@ class TestBuildArtifactPrompt:
     def test_prompt_flat_paths_without_work_id(self):
         from spine.agents.artifacts import build_artifact_prompt
 
-        artifacts = {
-            "specify": {
-                "specification.md": "Spec content here."
-            }
-        }
+        artifacts = {"specify": {"specification.md": "Spec content here."}}
         prompt = build_artifact_prompt(artifacts, "plan", work_id="")
 
         # Should contain the flat path (with double slash due to empty work_id)
@@ -322,13 +306,7 @@ class TestBuildInlineArtifactPrompt:
     def test_no_work_id_flat_path(self):
         from spine.agents.artifacts import build_inline_artifact_prompt
 
-        state = {
-            "artifacts": {
-                "specify": {
-                    "specification.md": "A" * 600
-                }
-            }
-        }
+        state = {"artifacts": {"specify": {"specification.md": "A" * 600}}}
         prompt = build_inline_artifact_prompt(state, "specify", work_id="")
 
         # Should use flat path structure

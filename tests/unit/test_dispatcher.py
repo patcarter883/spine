@@ -31,7 +31,7 @@ class TestListWorkOrdering:
                 {
                     "id": "work-1",
                     "description": "oldest work",
-                    "work_type": "quick",
+                    "work_type": "task",
                     "status": "completed",
                     "current_phase": "verify",
                     "created_at": "2024-01-01T00:00:00",
@@ -41,7 +41,7 @@ class TestListWorkOrdering:
                 {
                     "id": "work-2",
                     "description": "middle work",
-                    "work_type": "spec",
+                    "work_type": "task",
                     "status": "completed",
                     "current_phase": "verify",
                     "created_at": "2024-06-15T12:00:00",
@@ -51,7 +51,7 @@ class TestListWorkOrdering:
                 {
                     "id": "work-3",
                     "description": "newest work",
-                    "work_type": "quick",
+                    "work_type": "task",
                     "status": "running",
                     "current_phase": "implement",
                     "created_at": "2024-12-31T23:59:59",
@@ -72,7 +72,7 @@ class TestListWorkOrdering:
             {
                 "id": "work-1",
                 "description": "only work",
-                "work_type": "quick",
+                "work_type": "task",
                 "status": status,
                 "current_phase": "verify",
                 "created_at": "2024-06-15T12:00:00",
@@ -160,7 +160,7 @@ class TestApproveAndSpawn:
         config: SpineConfig,
         plan_id: str = PLAN_ID,
         status: str = "awaiting_approval",
-        work_type: str = "plan",
+        work_type: str = "reviewed_task",
     ) -> None:
         """Insert a work entry for testing."""
         db = _get_work_db(config)
@@ -217,8 +217,8 @@ class TestApproveAndSpawn:
             )
 
             specs = [
-                {"description": "Slice 1: Do something", "work_type": "quick"},
-                {"description": "Slice 2: Do more", "work_type": "quick"},
+                {"description": "Slice 1: Do something", "work_type": "task"},
+                {"description": "Slice 2: Do more", "work_type": "task"},
             ]
 
             mock_artifact_store = MagicMock()
@@ -421,7 +421,7 @@ class TestApproveAndSpawn:
         """Trying to approve a non-planning work type raises ValueError."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self._make_config(tmpdir)
-            self._insert_plan_entry(config, work_type="quick")
+            self._insert_plan_entry(config, work_type="task")
 
             with (
                 patch("spine.work.dispatcher.ArtifactStore", MagicMock()),

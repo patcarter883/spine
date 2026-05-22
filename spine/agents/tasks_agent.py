@@ -54,22 +54,9 @@ def _build_subagents(
 ) -> list[Any] | None:
     """Resolve subagent specs for the TASKS phase.
 
-    Returns researcher subagents for workflows that need codebase
-    exploration, None for trivial quick tasks.
+    All work types now include specify+plan, so researcher subagents are always built.
     """
-    work_type = state.get("work_type", "")
-    if "quick" in work_type and "critical" not in work_type:
-        description = state.get("description", "")
-        if len(description) < 150:
-            logger.info(
-                "[%s] TASKS: skipping researcher subagents for trivial quick task (%d chars)",
-                state.get("work_id", ""),
-                len(description),
-            )
-            return None
-    if "quick" in work_type or "spec" in work_type:
-        return build_phase_subagents(phase, state, config)
-    return None
+    return build_phase_subagents(phase, state, config)
 
 
 def build_tasks_agent(
@@ -95,9 +82,6 @@ def build_tasks_agent(
     description = state.get("description", "")
     feedback_raw = state.get("feedback", [])
     feedback = [str(f) for f in feedback_raw] if feedback_raw else []
-    is_quick = "quick" in work_type
-
-    tasks_dir = f".spine/artifacts/{work_id}/tasks"
 
     # Prior phase dirs for read_prior_artifacts (spec workflows only)
     prior_phase_dirs = _resolve_prior_phase_dirs(state, work_id)

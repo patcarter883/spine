@@ -46,7 +46,9 @@ class TestSaveArtifactSidecar:
         assert meta["name"] == "tasks.md"
         assert meta["size"] == 19  # len("hello world content")
 
-    def test_sidecar_written_when_content_skipped(self, store: ArtifactStore, tmp_path: Path) -> None:
+    def test_sidecar_written_when_content_skipped(
+        self, store: ArtifactStore, tmp_path: Path
+    ) -> None:
         """BUG FIX: sidecar must be written even when overwrite-shorter guard fires.
 
         Scenario:
@@ -78,14 +80,16 @@ class TestSaveArtifactSidecar:
         # Size should reflect actual on-disk content, not truncated version
         assert meta["size"] == 5000
 
-    def test_sidecar_updated_when_content_overwritten(self, store: ArtifactStore, tmp_path: Path) -> None:
+    def test_sidecar_updated_when_content_overwritten(
+        self, store: ArtifactStore, tmp_path: Path
+    ) -> None:
         """When content IS written, sidecar size reflects the new content."""
         store.save_artifact("w1", "tasks", "tasks.md", "short")
-        store.save_artifact("w1", "tasks", "tasks.md", "much longer content here", overwrite_shorter=True)
-
-        meta = json.loads(
-            (tmp_path / "arts" / "w1" / "tasks" / "tasks.md.meta.json").read_text()
+        store.save_artifact(
+            "w1", "tasks", "tasks.md", "much longer content here", overwrite_shorter=True
         )
+
+        meta = json.loads((tmp_path / "arts" / "w1" / "tasks" / "tasks.md.meta.json").read_text())
         assert meta["size"] == 24  # len("much longer content here")
 
 

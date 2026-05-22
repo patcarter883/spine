@@ -18,6 +18,7 @@ from spine.work.ralph_worker import RalphLoopWorker
 def _reset_worker_singleton() -> None:
     """Reset the RalphLoopWorker singleton for test isolation."""
     import spine.work.ralph_worker as rw_mod
+
     rw_mod._WORKER_INSTANCE = None
 
 
@@ -41,38 +42,40 @@ class TestUIApiGetQueueOverviewOrdering:
 
             worker = _init_queue_db(config)
             db = worker._get_db()
-            db["queue"].insert_all([
-                {
-                    "id": 1,
-                    "description": "oldest",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 2,
-                    "description": "newest",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-12-31T23:59:59",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 3,
-                    "description": "middle",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-06-15T12:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-            ])
+            db["queue"].insert_all(
+                [
+                    {
+                        "id": 1,
+                        "description": "oldest",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 2,
+                        "description": "newest",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-12-31T23:59:59",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 3,
+                        "description": "middle",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-06-15T12:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                ]
+            )
 
             api = UIApi(config)
             overview = api.get_queue_overview()
@@ -94,28 +97,30 @@ class TestUIApiGetQueueOverviewOrdering:
 
             worker = _init_queue_db(config)
             db = worker._get_db()
-            db["queue"].insert_all([
-                {
-                    "id": 1,
-                    "description": "old completed",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-01-01T01:00:00",
-                    "result": "",
-                },
-                {
-                    "id": 2,
-                    "description": "new completed",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-06-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-06-01T01:00:00",
-                    "result": "",
-                },
-            ])
+            db["queue"].insert_all(
+                [
+                    {
+                        "id": 1,
+                        "description": "old completed",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-01-01T01:00:00",
+                        "result": "",
+                    },
+                    {
+                        "id": 2,
+                        "description": "new completed",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-06-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-06-01T01:00:00",
+                        "result": "",
+                    },
+                ]
+            )
 
             api = UIApi(config)
             overview = api.get_queue_overview()
@@ -150,28 +155,30 @@ class TestUIApiGetQueueOverviewOrdering:
 
             worker = _init_queue_db(config)
             db = worker._get_db()
-            db["queue"].insert_all([
-                {
-                    "id": 1,
-                    "description": "pending item",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-06-15T12:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 2,
-                    "description": "completed item",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-01-01T01:00:00",
-                    "result": "",
-                },
-            ])
+            db["queue"].insert_all(
+                [
+                    {
+                        "id": 1,
+                        "description": "pending item",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-06-15T12:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 2,
+                        "description": "completed item",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-01-01T01:00:00",
+                        "result": "",
+                    },
+                ]
+            )
 
             api = UIApi(config)
             overview = api.get_queue_overview()
@@ -205,6 +212,7 @@ class TestUIApiGetFeedback:
 
             # Create a work entry with feedback in the result
             from spine.work.dispatcher import get_work_db
+
             work_db = get_work_db(config)
             feedback = [
                 {
@@ -218,7 +226,7 @@ class TestUIApiGetFeedback:
                 {
                     "id": "test-work-123",
                     "description": "Test work",
-                    "work_type": "quick",
+                    "work_type": "task",
                     "status": "needs_review",
                     "current_phase": "implement",
                     "created_at": "2024-01-01T00:00:00",
@@ -244,13 +252,14 @@ class TestUIApiGetFeedback:
             api = UIApi(config)
 
             from spine.work.dispatcher import get_work_db
+
             work_db = get_work_db(config)
             # Work entry with no feedback in result
             work_db["work_entries"].insert(
                 {
                     "id": "test-work-456",
                     "description": "Test work",
-                    "work_type": "quick",
+                    "work_type": "task",
                     "status": "completed",
                     "current_phase": "verify",
                     "created_at": "2024-01-01T00:00:00",

@@ -188,8 +188,8 @@ async def submit_work(
 
     Args:
         description: The work description / prompt.
-        work_type: One of "quick", "critical_quick", "spec", "critical_spec",
-            "plan", or "plan_spec".
+        work_type: One of "task", "critical_task", "reviewed_task",
+            "critical_reviewed_task".
         config: Optional SpineConfig (loads from default if not provided).
         created_at: Optional ISO timestamp for the work entry's ``created_at``
             field.  When ``None`` (default), uses the current time.
@@ -461,7 +461,7 @@ async def submit_work(
 
         # Planning work types must end as "awaiting_approval" so users
         # can review before execution tasks are spawned.
-        plan_types = ("plan", "plan_spec", "plan_only", "critical_plan_only")
+        plan_types = ("reviewed_task", "critical_reviewed_task")
         if work_type in plan_types and final_status == "completed":
             final_status = "awaiting_approval"
 
@@ -564,7 +564,7 @@ async def list_plans(
     """List planning work items with optional status filter.
 
     This function retrieves work items that are planning workflows
-    (work_type in: plan, plan_spec, plan_only, critical_plan_only).
+    (work_type in: reviewed_task, critical_reviewed_task).
 
     Args:
         status: Optional status filter (e.g., 'awaiting_approval', 'completed', 'needs_review').
@@ -579,8 +579,8 @@ async def list_plans(
 
     db = _get_work_db(config)
 
-    # Planning work types
-    plan_types = ("plan", "plan_spec", "plan_only", "critical_plan_only")
+    # Planning work types (new names)
+    plan_types = ("reviewed_task", "critical_reviewed_task")
 
     # Query with optional status filter
     placeholders = ",".join(["?" for _ in plan_types])
@@ -1671,7 +1671,7 @@ async def split_work_plan(
     plan_id: str,
     tasks_text: str | None = None,
     description_override: str | None = None,
-    work_type_override: str = "quick",
+    work_type_override: str = "task",
     config: SpineConfig | None = None,
 ) -> list[dict[str, Any]]:
     """Split an approved planning work item into execution tasks.
@@ -1687,7 +1687,7 @@ async def split_work_plan(
             tasks.md artifact from disk.
         description_override: If provided, all spawned tasks use this
             description instead of the description extracted from sections.
-        work_type_override: The work_type for spawned items (default "quick").
+        work_type_override: The work_type for spawned items (default "task").
         config: Optional SpineConfig.
 
     Returns:
@@ -1839,7 +1839,7 @@ async def approve_and_spawn(
         raise ValueError(f"Plan '{plan_id}' not found")
 
     work_type = entry.get("work_type", "")
-    if work_type not in ("plan", "plan_spec", "plan_only", "critical_plan_only"):
+    if work_type not in ("reviewed_task", "critical_reviewed_task"):
         raise ValueError(f"Work item '{plan_id}' is not a planning work type (got '{work_type}')")
 
     # Validate status is awaiting_approval before allowing approval
@@ -2061,7 +2061,7 @@ async def approve_and_spawn(
             final_status = "completed"
         if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
             final_status = "needs_review"
-        plan_types_check = ("plan", "plan_spec", "plan_only", "critical_plan_only")
+        plan_types_check = ("reviewed_task", "critical_reviewed_task")
         if work_type in plan_types_check and final_status == "completed":
             final_status = "awaiting_approval"
 
@@ -2113,7 +2113,7 @@ async def approve_and_spawn(
 
     decomposition = await resolve_plan_to_units(
         plan_content=plan_content,
-        work_type="quick",  # Default to quick for spawned tasks
+        work_type="task",  # Default to task for spawned tasks
         state=state,
     )
 
@@ -2128,7 +2128,7 @@ async def approve_and_spawn(
     for spec in specs:
         result = await submit_work(
             description=spec["description"],
-            work_type=spec.get("work_type", "quick"),
+            work_type=spec.get("work_type", "task"),
             config=config,
             plan_id=plan_id,
         )

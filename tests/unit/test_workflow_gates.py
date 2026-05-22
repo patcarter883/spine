@@ -178,8 +178,7 @@ class TestArtifactGateNode:
         result = gate_fn(state)
         assert result["status"] == "needs_review"
         assert any(
-            isinstance(f, dict)
-            and "plan.json" in f.get("reason", "").lower()
+            isinstance(f, dict) and "plan.json" in f.get("reason", "").lower()
             for f in result.get("feedback", [])
         )
 
@@ -398,7 +397,7 @@ class TestWorkflowCompositionGates:
         """Verify always runs after implement — no artifact gate between them."""
         from spine.workflow.compose import build_workflow_graph
 
-        for work_type in ("quick", "critical_quick", "spec", "critical_spec"):
+        for work_type in ("task", "critical_task"):
             graph = build_workflow_graph(work_type)
             node_names = set(graph.get_graph().nodes.keys())
             # No gate node should exist between implement and verify
@@ -412,14 +411,12 @@ class TestWorkflowCompositionGates:
         """Implement is gated on plan artifacts — gate node must exist."""
         from spine.workflow.compose import build_workflow_graph
 
-        for work_type in ("quick", "critical_quick", "spec", "critical_spec"):
+        for work_type in ("task", "critical_task"):
             graph = build_workflow_graph(work_type)
             node_names = set(graph.get_graph().nodes.keys())
             # A gate node should exist between plan and implement
             gate_names = [
-                n
-                for n in node_names
-                if n.startswith("gate_") and "plan" in n and "implement" in n
+                n for n in node_names if n.startswith("gate_") and "plan" in n and "implement" in n
             ]
             assert len(gate_names) >= 1, (
                 f"work_type={work_type}: expected a gate node between plan and "

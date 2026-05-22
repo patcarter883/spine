@@ -8,11 +8,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 import asyncio
 
 
 # ── Subgraph state schema tests ──
+
 
 class TestSubgraphStateSchemas:
     """Tests for per-phase subgraph state schemas."""
@@ -23,7 +24,7 @@ class TestSubgraphStateSchemas:
         state: BaseSubgraphState = {
             "phase": "verify",
             "work_id": "abc123",
-            "work_type": "quick",
+            "work_type": "task",
             "description": "test",
             "workspace_root": "/tmp",
             "retry_count": 0,
@@ -85,6 +86,7 @@ class TestSubgraphStateSchemas:
 
 # ── Wrapper factory tests ──
 
+
 class TestMakeSubgraphNode:
     """Tests for make_subgraph_node wrapper factory."""
 
@@ -124,9 +126,7 @@ class TestMakeSubgraphNode:
         mock_subgraph = AsyncMock()
         mock_subgraph.ainvoke.side_effect = asyncio.CancelledError()
 
-        node_fn = make_subgraph_node(
-            mock_subgraph, "verify", lambda p, c: {}, lambda r, p: {}
-        )
+        node_fn = make_subgraph_node(mock_subgraph, "verify", lambda p, c: {}, lambda r, p: {})
 
         parent_state = {"work_id": "test123", "status": "running"}
         result = await node_fn(parent_state, None)
@@ -142,9 +142,7 @@ class TestMakeSubgraphNode:
         mock_subgraph = AsyncMock()
         mock_subgraph.ainvoke.side_effect = asyncio.TimeoutError()
 
-        node_fn = make_subgraph_node(
-            mock_subgraph, "verify", lambda p, c: {}, lambda r, p: {}
-        )
+        node_fn = make_subgraph_node(mock_subgraph, "verify", lambda p, c: {}, lambda r, p: {})
 
         parent_state = {"work_id": "test123", "status": "running"}
         result = await node_fn(parent_state, None)
@@ -159,9 +157,7 @@ class TestMakeSubgraphNode:
         mock_subgraph = AsyncMock()
         mock_subgraph.ainvoke.side_effect = RuntimeError("boom")
 
-        node_fn = make_subgraph_node(
-            mock_subgraph, "verify", lambda p, c: {}, lambda r, p: {}
-        )
+        node_fn = make_subgraph_node(mock_subgraph, "verify", lambda p, c: {}, lambda r, p: {})
 
         parent_state = {"work_id": "test123", "status": "running"}
         result = await node_fn(parent_state, None)
@@ -172,9 +168,7 @@ class TestMakeSubgraphNode:
     def test_node_function_name(self):
         from spine.workflow.subgraph_wrapper import make_subgraph_node
 
-        node_fn = make_subgraph_node(
-            None, "verify", lambda p, c: {}, lambda r, p: {}
-        )
+        node_fn = make_subgraph_node(None, "verify", lambda p, c: {}, lambda r, p: {})
         assert node_fn.__name__ == "verify_subgraph"
 
 
@@ -234,9 +228,7 @@ class TestErrorUpdate:
     def test_error_update_structure(self):
         from spine.workflow.subgraph_wrapper import _error_update
 
-        result = _error_update(
-            {"work_id": "test123"}, "implement", "something broke"
-        )
+        result = _error_update({"work_id": "test123"}, "implement", "something broke")
         assert result["status"] == "needs_review"
         assert result["current_phase"] == "implement"
         assert result["phase_results"]["implement"]["status"] == "error"

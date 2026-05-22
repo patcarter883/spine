@@ -35,8 +35,7 @@ def _import_slice_scheduler():
     deep agents, etc.) by loading the target module file directly.
     """
     module_path = (
-        Path(__file__).resolve().parent.parent.parent
-        / "spine" / "workflow" / "slice_scheduler.py"
+        Path(__file__).resolve().parent.parent.parent / "spine" / "workflow" / "slice_scheduler.py"
     )
     if not module_path.exists():
         pytest.skip(
@@ -322,10 +321,7 @@ class TestValidateFeatureSlices:
     def test_long_chain(self) -> None:
         """A long linear chain validates and produces N waves."""
         n = 20
-        slices = [
-            _slice(f"S{i}", deps=[f"S{i - 1}"] if i > 0 else [])
-            for i in range(n)
-        ]
+        slices = [_slice(f"S{i}", deps=[f"S{i - 1}"] if i > 0 else []) for i in range(n)]
         validate_feature_slices(slices)
         waves = compute_execution_waves(slices)
         assert len(waves) == n

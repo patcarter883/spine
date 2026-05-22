@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Generator
@@ -79,14 +78,7 @@ def sample_prompt_request() -> PromptRequest:
 def mock_openai_response() -> Dict[str, Any]:
     """Mock OpenAI API response for testing."""
     return {
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "Mocked response from OpenAI"
-                }
-            }
-        ]
+        "choices": [{"message": {"role": "assistant", "content": "Mocked response from OpenAI"}}]
     }
 
 
@@ -104,17 +96,11 @@ def sample_work_config() -> Dict[str, Any]:
             "checkpoint_path": ".spine/test.db",
             "artifact_path": ".spine/artifacts",
             "max_critic_retries": 2,
-            "work_type": "spec"
+            "work_type": "task",
         },
         "providers": {
-            "llm": [
-                {
-                    "enabled": True,
-                    "model": "openai:gpt-4o-mini",
-                    "api_key": "test-api-key"
-                }
-            ]
-        }
+            "llm": [{"enabled": True, "model": "openai:gpt-4o-mini", "api_key": "test-api-key"}]
+        },
     }
 
 
@@ -123,6 +109,7 @@ def sample_work_config() -> Dict[str, Any]:
 def event_loop():
     """Create an event loop for async tests."""
     import asyncio
+
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()

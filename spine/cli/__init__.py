@@ -27,8 +27,8 @@ def main() -> None:
 @click.option(
     "--type",
     "work_type",
-    type=click.Choice(["quick", "critical_quick", "spec", "critical_spec"]),
-    default="spec",
+    type=click.Choice(["task", "critical_task"]),
+    default="task",
     help="Workflow type to use.",
 )
 @click.option(

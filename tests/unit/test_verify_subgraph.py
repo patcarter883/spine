@@ -48,15 +48,19 @@ class TestRunVerifyAgent:
         mock_agent = AsyncMock()
         mock_agent.ainvoke.return_value = {
             "messages": [
-                MagicMock(content="VERIFIED", usage_metadata={"input_tokens": 100, "output_tokens": 50})
+                MagicMock(
+                    content="VERIFIED", usage_metadata={"input_tokens": 100, "output_tokens": 50}
+                )
             ]
         }
 
-        with patch("spine.workflow.subgraphs.verify_subgraph.build_verify_agent", return_value=mock_agent):
+        with patch(
+            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent", return_value=mock_agent
+        ):
             with patch("spine.workflow.subgraphs.verify_subgraph.materialize_artifacts"):
                 state = {
                     "work_id": "test123",
-                    "work_type": "quick",
+                    "work_type": "task",
                     "description": "test desc",
                     "workspace_root": "/tmp",
                     "messages": [],
@@ -66,19 +70,19 @@ class TestRunVerifyAgent:
                 assert result["agent_response"] == "VERIFIED"
 
     @pytest.mark.asyncio
-    async def test_run_agent_with_spec_workflow(self):
+    async def test_run_agent_with_task_workflow(self):
         from spine.workflow.subgraphs.verify_subgraph import _run_verify_agent
 
         mock_agent = AsyncMock()
-        mock_agent.ainvoke.return_value = {
-            "messages": [MagicMock(content="VERIFIED")]
-        }
+        mock_agent.ainvoke.return_value = {"messages": [MagicMock(content="VERIFIED")]}
 
-        with patch("spine.workflow.subgraphs.verify_subgraph.build_verify_agent", return_value=mock_agent):
+        with patch(
+            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent", return_value=mock_agent
+        ):
             with patch("spine.workflow.subgraphs.verify_subgraph.materialize_artifacts"):
                 state = {
                     "work_id": "test456",
-                    "work_type": "spec",
+                    "work_type": "task",
                     "description": "spec test",
                     "workspace_root": "/tmp",
                 }
@@ -89,12 +93,19 @@ class TestRunVerifyAgent:
     async def test_run_agent_se_error_sets_error_status(self):
         from spine.workflow.subgraphs.verify_subgraph import _run_verify_agent
 
-        with patch("spine.workflow.subgraphs.verify_subgraph.build_verify_agent", side_effect=RuntimeError("boom")):
-            state = {"work_id": "test", "work_type": "quick", "description": "d", "workspace_root": "."}
+        with patch(
+            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent",
+            side_effect=RuntimeError("boom"),
+        ):
+            state = {
+                "work_id": "test",
+                "work_type": "task",
+                "description": "d",
+                "workspace_root": ".",
+            }
             result = await _run_verify_agent(state)
             assert result.get("phase_status") == "error"
             assert "boom" in result["agent_response"]
-
 
 
 class TestSaveVerifyArtifacts:
@@ -102,7 +113,6 @@ class TestSaveVerifyArtifacts:
 
     @pytest.mark.asyncio
     async def test_save_artifacts_with_disk_files(self, tmp_path):
-        import asyncio
         from spine.workflow.subgraphs.verify_subgraph import _save_verify_artifacts
 
         # Create a fake artifact on disk
@@ -182,12 +192,12 @@ class TestSaveVerifyArtifacts:
 class TestVerifyStateAndResult:
     """Tests state mapping between parent and verify subgraph."""
 
-    def test_verify_state_mapper_quick_workflow(self):
+    def test_verify_state_mapper_task_workflow(self):
         from spine.workflow.compose import _verify_state_mapper
 
         parent = {
             "work_id": "abc",
-            "work_type": "quick",
+            "work_type": "task",
             "description": "fix bug",
             "workspace_root": "/projects/spine",
             "retry_count": {"verify": 0},
@@ -195,8 +205,8 @@ class TestVerifyStateAndResult:
         }
         result = _verify_state_mapper(parent, None)
         assert result["work_id"] == "abc"
-        assert result["work_type"] == "quick"
-        assert result["spec_path"] is None
+        assert result["work_type"] == "task"
+        assert result["spec_path"] == ".spine/artifacts/abc/specify"
         assert result["plan_path"] == ".spine/artifacts/abc/plan"
 
     def test_verify_state_mapper_spec_workflow(self):
@@ -204,7 +214,7 @@ class TestVerifyStateAndResult:
 
         parent = {
             "work_id": "def",
-            "work_type": "spec",
+            "work_type": "task",
             "description": "build feature",
             "workspace_root": "/projects/spine",
         }

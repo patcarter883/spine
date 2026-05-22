@@ -17,15 +17,14 @@ after implement — if implement produced nothing, verify detects and reports
 that; there is no reason for a human review gate between those two phases.
 
 Phase sequences by WorkType:
-    quick:           PLAN → IMPLEMENT → VERIFY
-    critical_quick:  PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
-    spec:            SPECIFY → PLAN → CRITIC → IMPLEMENT → VERIFY
-    critical_spec:   SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN →
-                     IMPLEMENT → VERIFY
-    plan:            SPECIFY → PLAN → CRITIC_PLAN (planning only, no execution)
-    plan_spec:       SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN
-    plan_only:       SPECIFY → PLAN → CRITIC_PLAN (no spec critic)
-    critical_plan_only: SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN
+    task:              SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+    critical_task:     SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+    reviewed_task:     SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+    critical_reviewed: SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+
+Note: reviewed_task and critical_reviewed_task share identical phase sequences
+with their non-reviewed counterparts. The difference is handled at the stream
+level via ``interrupt_after=["critic_plan"]`` in submit_work().
 """
 
 from typing import Any, Callable, Optional
@@ -37,12 +36,6 @@ from langgraph.types import interrupt
 
 from spine.models.enums import PhaseName, ReviewStatus, WorkType
 from spine.models.state import WorkflowState
-from spine.phases.critic import call_critic
-from spine.phases.implement import call_implement
-from spine.phases.plan import call_plan
-from spine.phases.specify import call_specify
-from spine.phases.tasks import call_tasks
-from spine.phases.verify import call_verify
 from spine.workflow.phase_progress import mark_phase_started
 from spine.workflow.registry import get_registry
 from spine.workflow.critic_review import critic_router
@@ -139,27 +132,25 @@ def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
 
 def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
-    work_type = parent_state.get("work_type", "")
-    has_spec = "spec" in work_type
+    # All work types now run specify, so has_spec is always True
     return {
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.PLAN.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0),
-        "spec_path": f".spine/artifacts/{work_id}/specify" if has_spec else "",
-        "has_spec": has_spec,
+        "spec_path": f".spine/artifacts/{work_id}/specify",
+        "has_spec": True,
     }
 
 
 def _tasks_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
-    work_type = parent_state.get("work_type", "")
-    has_spec = "spec" in work_type
+    # All work types now run specify, so has_spec is always True
     return {
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.TASKS.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.TASKS.value, 0),
-        "plan_path": f".spine/artifacts/{work_id}/plan" if has_spec else None,
-        "spec_path": f".spine/artifacts/{work_id}/specify" if has_spec else None,
+        "plan_path": f".spine/artifacts/{work_id}/plan",
+        "spec_path": f".spine/artifacts/{work_id}/specify",
     }
 
 
@@ -179,14 +170,13 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
 def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
     """Map parent WorkflowState to VerifySubgraphState."""
     work_id = parent_state.get("work_id", "")
-    work_type = parent_state.get("work_type", "")
-    has_spec = "spec" in work_type
+    # All work types now run specify, so has_spec is always True
     return {
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.VERIFY.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.VERIFY.value, 0),
         "plan_path": f".spine/artifacts/{work_id}/plan",
-        "spec_path": f".spine/artifacts/{work_id}/specify" if has_spec else None,
+        "spec_path": f".spine/artifacts/{work_id}/specify",
     }
 
 
@@ -349,27 +339,20 @@ def _gap_plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) 
 # ── Phase sequences per work type ──
 # Each tuple is (node_name, reviewed_phase_or_None).
 # For critic nodes, reviewed_phase tells the critic which phase to review.
+#
+# All 4 work types share identical phase sequences. The difference between
+# "reviewed" and non-reviewed types is handled at the stream level via
+# interrupt_after=["critic_plan"] in submit_work().
 
 WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
-    WorkType.QUICK.value: [
-        (PhaseName.PLAN.value, None),
-        (PhaseName.IMPLEMENT.value, None),
-        (PhaseName.VERIFY.value, None),
-    ],
-    WorkType.CRITICAL_QUICK.value: [
-        (PhaseName.PLAN.value, None),
-        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-        (PhaseName.IMPLEMENT.value, None),
-        (PhaseName.VERIFY.value, None),
-    ],
-    WorkType.SPEC.value: [
+    WorkType.TASK.value: [
         (PhaseName.SPECIFY.value, None),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
-    WorkType.CRITICAL_SPEC.value: [
+    WorkType.CRITICAL_TASK.value: [
         (PhaseName.SPECIFY.value, None),
         (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),
@@ -377,30 +360,20 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
-    # Plan workflows - stop after plan phase, no execution spawned automatically
-    WorkType.PLAN.value: [
+    WorkType.REVIEWED_TASK.value: [
         (PhaseName.SPECIFY.value, None),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
+        (PhaseName.IMPLEMENT.value, None),
+        (PhaseName.VERIFY.value, None),
     ],
-    WorkType.PLAN_SPEC.value: [
+    WorkType.CRITICAL_REVIEWED_TASK.value: [
         (PhaseName.SPECIFY.value, None),
         (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-    ],
-    # PLAN_ONLY and CRITICAL_PLAN_ONLY are aliases for PLAN and PLAN_SPEC
-    # Kept for backward compatibility with the original spec
-    WorkType.PLAN_ONLY.value: [
-        (PhaseName.SPECIFY.value, None),
-        (PhaseName.PLAN.value, None),
-        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-    ],
-    WorkType.CRITICAL_PLAN_ONLY.value: [
-        (PhaseName.SPECIFY.value, None),
-        (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
-        (PhaseName.PLAN.value, None),
-        (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
+        (PhaseName.IMPLEMENT.value, None),
+        (PhaseName.VERIFY.value, None),
     ],
 }
 
@@ -547,11 +520,11 @@ def build_workflow_graph(
     - Retry counting and needs_review escalation
 
     Critic nodes are named ``critic_{reviewed_phase}`` to allow multiple
-    critic instances in a single workflow (e.g. critical_spec has 3).
+    critic instances in a single workflow (e.g. critical_task has 2).
 
     Args:
-        work_type: One of "quick", "critical_quick", "spec", "critical_spec",
-            "plan", "plan_spec".
+        work_type: One of "task", "critical_task", "reviewed_task",
+            "critical_reviewed_task".
         checkpointer: Optional BaseCheckpointSaver for persistence.
         start_from_phase: Optional phase name to start execution from.
             When set, the START edge routes directly to this phase instead

@@ -13,27 +13,17 @@ import pytest
 class TestInterruptNodeExists:
     """Verify the human_review interrupt node is wired in all work types."""
 
-    def test_quick_workflow_has_human_review_node(self):
+    def test_task_workflow_has_human_review_node(self):
         from spine.workflow.compose import build_workflow_graph
-        graph = build_workflow_graph("quick")
+
+        graph = build_workflow_graph("task")
         nodes = set(graph.get_graph().nodes.keys())
         assert "human_review" in nodes, f"human_review not in {nodes}"
 
-    def test_critical_quick_has_human_review_node(self):
+    def test_critical_task_has_human_review_node(self):
         from spine.workflow.compose import build_workflow_graph
-        graph = build_workflow_graph("critical_quick")
-        nodes = set(graph.get_graph().nodes.keys())
-        assert "human_review" in nodes
 
-    def test_spec_has_human_review_node(self):
-        from spine.workflow.compose import build_workflow_graph
-        graph = build_workflow_graph("spec")
-        nodes = set(graph.get_graph().nodes.keys())
-        assert "human_review" in nodes
-
-    def test_critical_spec_has_human_review_node(self):
-        from spine.workflow.compose import build_workflow_graph
-        graph = build_workflow_graph("critical_spec")
+        graph = build_workflow_graph("critical_task")
         nodes = set(graph.get_graph().nodes.keys())
         assert "human_review" in nodes
 
@@ -44,7 +34,8 @@ class TestInterruptRouter:
     def setup_method(self):
         from spine.workflow.compose import _make_human_review_router
         from spine.workflow.compose import WORKFLOW_SEQUENCES
-        self.router = _make_human_review_router(WORKFLOW_SEQUENCES["critical_spec"])
+
+        self.router = _make_human_review_router(WORKFLOW_SEQUENCES["critical_task"])
 
     def test_router_rework(self):
         state = {
@@ -77,6 +68,7 @@ class TestInterruptNodeFunction:
     @pytest.mark.skip(reason="interrupt() requires a real graph runtime")
     def test_interrupt_returns_dict(self):
         from spine.workflow.compose import _human_review_interrupt
+
         state = {
             "needs_review_phase": "tasks",
             "feedback": [{"reason": "No artifacts", "suggestions": ["check"]}],
@@ -93,14 +85,16 @@ class TestCriticRoutesToHumanReview:
 
     def test_critic_routes_needs_review_to_human_review(self):
         from spine.workflow.compose import build_workflow_graph
-        graph = build_workflow_graph("critical_spec")
+
+        graph = build_workflow_graph("critical_task")
         mermaid = graph.get_graph().draw_mermaid()
         # The mermaid output should show critic nodes connecting to human_review
         assert "human_review" in mermaid
 
     def test_gate_routes_needs_review_to_human_review(self):
         from spine.workflow.compose import build_workflow_graph
-        graph = build_workflow_graph("quick")
+
+        graph = build_workflow_graph("task")
         mermaid = graph.get_graph().draw_mermaid()
         assert "human_review" in mermaid
 

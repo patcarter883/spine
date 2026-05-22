@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -144,7 +143,6 @@ class TestLocalProviderModel:
     def test_local_provider_with_base_url_returns_chat_model(self) -> None:
         """resolve_model should return a ChatOpenAI when the active provider
         has base_url and the model spec matches."""
-        from unittest.mock import MagicMock
 
         from langchain_core.language_models.chat_models import BaseChatModel
 

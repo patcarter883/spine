@@ -173,7 +173,7 @@ def _make_state(**overrides: object) -> dict:
     """Create a minimal WorkflowState dict for agent builder tests."""
     base: dict = {
         "work_id": "test-1",
-        "work_type": "spec",
+        "work_type": "task",
         "description": "Build a REST API",
         "current_phase": "specify",
         "phase_index": 0,
@@ -230,10 +230,7 @@ class TestAgentBuilderIntegration:
         build_specify_agent(_make_state())
         call_kwargs = mock_ca.call_args[1]
         middleware = call_kwargs.get("middleware", [])
-        assert not any(
-            "Interpreter" in type(m).__name__
-            for m in middleware
-        )
+        assert not any("Interpreter" in type(m).__name__ for m in middleware)
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=True)
     @patch("spine.agents.factory.create_agent")
@@ -248,10 +245,7 @@ class TestAgentBuilderIntegration:
         build_specify_agent(_make_state())
         call_kwargs = mock_ca.call_args[1]
         middleware = call_kwargs.get("middleware", [])
-        assert any(
-            "Interpreter" in type(m).__name__
-            for m in middleware
-        )
+        assert any("Interpreter" in type(m).__name__ for m in middleware)
 
     @patch("spine.agents.factory.interpreter_enabled", return_value=True)
     @patch("spine.agents.factory.create_agent")
@@ -270,7 +264,9 @@ class TestAgentBuilderIntegration:
             (m for m in middleware if "SkillsMiddleware" in type(m).__name__),
             None,
         )
-        assert skills_mw is not None, "SkillsMiddleware should be in the stack when skills are present"
+        assert skills_mw is not None, (
+            "SkillsMiddleware should be in the stack when skills are present"
+        )
         sources = getattr(skills_mw, "_sources", []) or getattr(skills_mw, "sources", [])
         skill_names = [s.split("/")[-1] for s in sources]
         assert "rlm-pattern" in skill_names

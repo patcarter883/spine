@@ -70,7 +70,7 @@ class SpineConfig:
     checkpoint_path: str = ".spine/spine.db"
     artifact_path: str = ".spine/artifacts"
     max_critic_retries: int = 3
-    work_type: str = "spec"
+    work_type: str = "task"
     providers: dict = field(default_factory=dict)
     queue_backend: str = "sqlite"
     queue_path: str = ".spine/queue.db"
@@ -227,7 +227,7 @@ class SpineConfig:
             max_critic_retries=int(
                 os.getenv("SPINE_MAX_CRITIC_RETRIES", spine.get("max_critic_retries", 3))
             ),
-            work_type=os.getenv("SPINE_WORK_TYPE", spine.get("work_type", "spec")),
+            work_type=os.getenv("SPINE_WORK_TYPE", spine.get("work_type", "task")),
             providers=config.get("providers", {}),
             queue_backend=os.getenv("SPINE_QUEUE_BACKEND", spine.get("queue_backend", "sqlite")),
             queue_path=os.getenv("SPINE_QUEUE_PATH", spine.get("queue_path", ".spine/queue.db")),

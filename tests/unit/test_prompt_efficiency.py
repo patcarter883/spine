@@ -53,6 +53,7 @@ class TestPromptEfficiency:
     def test_rlm_preamble_removed(self):
         """_RLM_PREAMBLE should no longer exist in factory.py."""
         from spine.agents import factory
+
         assert not hasattr(factory, "_RLM_PREAMBLE"), (
             "_RLM_PREAMBLE still exists in factory.py — should be removed"
         )
@@ -68,7 +69,7 @@ class TestSubagentAutonomy:
 
         state: WorkflowState = {
             "work_id": "test",
-            "work_type": "quick",
+            "work_type": "task",
             "description": "test",
             "workspace_root": "/tmp",
             "artifacts": {},
@@ -92,8 +93,7 @@ class TestSubagentAutonomy:
                 )
             if name == "researcher":
                 assert "response_format" in spec, (
-                    "Researcher subagent should have response_format "
-                    "for structured summaries"
+                    "Researcher subagent should have response_format for structured summaries"
                 )
             else:
                 assert "response_format" not in spec, (
@@ -135,18 +135,21 @@ class TestContextEditing:
     def test_trimmer_class_exists(self):
         """ToolOutputTrimmer should be importable."""
         from spine.agents.context_editing import ToolOutputTrimmer
+
         trimmer = ToolOutputTrimmer(max_full_tool_results=20)
         assert trimmer.max_full_tool_results == 20
 
     def test_trimmer_preserves_recent_results(self):
         """Trimmer should not trim results within the budget."""
         from spine.agents.context_editing import ToolOutputTrimmer
+
         trimmer = ToolOutputTrimmer(max_full_tool_results=5)
         assert trimmer.max_full_tool_results == 5
 
     def test_trimmer_has_eviction_metadata(self):
         """ToolOutputTrimmer should produce structured metadata, not vague hints."""
         from spine.agents.context_editing import ToolOutputTrimmer
+
         trimmer = ToolOutputTrimmer()
         # Verify the _extract_metadata method produces structured output
         metadata = trimmer._extract_metadata(
@@ -164,6 +167,7 @@ class TestCodebaseMap:
     def test_codebase_map_in_tasks_prompt(self):
         """Tasks agent system prompt should reference codebase-map.md."""
         import spine.agents.tasks_agent as mod
+
         source = open(mod.__file__).read()
         assert "codebase-map" in source, (
             "tasks_agent.py must reference codebase-map.md in its prompt"
@@ -172,6 +176,7 @@ class TestCodebaseMap:
     def test_codebase_map_in_implement_prompt(self):
         """Implement agent system prompt should reference codebase-map.md."""
         import spine.agents.implement_agent as mod
+
         source = open(mod.__file__).read()
         assert "codebase-map" in source, (
             "implement_agent.py must reference codebase-map.md in its prompt"
@@ -180,6 +185,7 @@ class TestCodebaseMap:
     def test_codebase_map_in_verify_prompt(self):
         """Verify agent system prompt should reference codebase-map.md."""
         import spine.agents.verify_agent as mod
+
         source = open(mod.__file__).read()
         assert "codebase-map" in source, (
             "verify_agent.py must reference codebase-map.md in its prompt"

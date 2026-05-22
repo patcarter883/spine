@@ -90,9 +90,7 @@ async def call_tasks(
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build prompt — plan and spec are loaded via read_prior_artifacts tool.
-        # Quick workflows get a researcher dispatch imperative;
-        # spec workflows get a simpler "load artifacts then decompose" message.
-        has_spec = "spec" in work_type  # only spec/critical_spec produce specify+plan
+        # All work types now run specify and plan, so prior artifacts are always available.
 
         # ── Compute the exact artifact output path ──
         # Used in the completion reminder in the user message.
@@ -106,55 +104,18 @@ async def call_tasks(
                 "⚠ **REWORK PASS**: Your primary objective is to revise the prior tasks decomposition. Address all points from the critic feedback.\n\n"
             )
 
-        if has_spec:
-            prompt_lines.extend(
-                [
-                    "Call `read_prior_artifacts` first (no arguments) to load "
-                    "the specification and plan. Then call `search_codebase` "
-                    "to find modification targets. Then call `write_tasks_artifacts`.",
-                    "",
-                ]
-            )
-        else:
-            # Quick/critical_quick: no prior artifacts — work from the
-            # original description. First action must be parallel researcher
-            # dispatch via eval — the user message makes this explicit.
-            desc_preview = description[:120].replace("'", "\\'")
-            researcher_line1 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 1>'}}),"
-            researcher_line2 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 2>'}}),"
-            prompt_lines.extend(
-                [
-                    "## Work Description",
-                    description,
-                    "",
-                    "## Your first action MUST be an eval call",
-                    "Dispatch 2-3 `researcher` subagents in parallel via "
-                    "`Promise.allSettled` inside a single `eval` call. "
-                    "Do NOT call `search_codebase` or explore yourself first. "
-                    "Each researcher investigates ONE area of the codebase "
-                    "relevant to the work description above.",
-                    "",
-                    "```js",
-                    "// FIRST TURN — dispatch researchers in parallel:",
-                    "const results = await Promise.allSettled([",
-                    "  tools.task({subagent_type: 'researcher',",
-                    researcher_line1,
-                    "  tools.task({subagent_type: 'researcher',",
-                    researcher_line2,
-                    "]);",
-                    "globalThis.research = results.map(r => r.value || r.reason);",
-                    "```",
-                    "",
-                    "After researchers complete, call `write_tasks_artifacts` "
-                    "with all slices, tasks summary, dependency waves, and codebase map. "
-                    "Total turns: ~2-3.",
-                    "",
-                ]
-            )
+        prompt_lines.extend(
+            [
+                "Call `read_prior_artifacts` first (no arguments) to load "
+                "the specification and plan. Then call `search_codebase` "
+                "to find modification targets. Then call `write_tasks_artifacts`.",
+                "",
+            ]
+        )
 
         prompt_lines.extend(
             [
-                f"## Completion",
+                "## Completion",
                 f"When research is done, call `write_tasks_artifacts` once with all slices, "
                 f"the overview, dependency waves, and the full codebase map. "
                 f"Artifacts are written to `{tasks_artifact_dir}/` automatically — "

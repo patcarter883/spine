@@ -10,11 +10,8 @@ Covers:
 
 from __future__ import annotations
 
-import importlib
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 # ── Isolate imports from the heavy spine.workflow package ────────────────
 # spine/workflow/__init__.py re-exports compose.py which in turn imports all
@@ -23,16 +20,13 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-import pytest
-
 
 def _import_artifact_gate():
     """Import spine.workflow.artifact_gate directly, avoiding __init__ side-effects."""
     import importlib.util
 
     module_path = (
-        Path(__file__).resolve().parent.parent.parent
-        / "spine" / "workflow" / "artifact_gate.py"
+        Path(__file__).resolve().parent.parent.parent / "spine" / "workflow" / "artifact_gate.py"
     )
     spec = importlib.util.spec_from_file_location(
         "spine.workflow.artifact_gate",
@@ -107,13 +101,10 @@ class TestCheckTasksQuality:
 
         # Generic hallucinated paths — none of these exist in tmp_path
         (tasks_dir / "slice-a.md").write_text(
-            "## Files to Modify\n"
-            "- src/main.py\n"
-            "- api/routes.py\n"
+            "## Files to Modify\n- src/main.py\n- api/routes.py\n"
         )
         (tasks_dir / "slice-b.md").write_text(
-            "## Files to Create\n"
-            "- web/components/feature_ui.js\n"
+            "## Files to Create\n- web/components/feature_ui.js\n"
         )
 
         ok, reason = _check_tasks_quality(str(tmp_path), "abc123")
@@ -133,8 +124,8 @@ class TestCheckTasksQuality:
 
         (tasks_dir / "slice-x.md").write_text(
             "## Files to Modify\n"
-            "- src/main.py\n"                   # hallucinated
-            "- spine/models/enums.py\n"          # real
+            "- src/main.py\n"  # hallucinated
+            "- spine/models/enums.py\n"  # real
         )
 
         ok, reason = _check_tasks_quality(str(tmp_path), "abc123")
@@ -154,8 +145,7 @@ class TestCheckTasksQuality:
         tasks_dir = self._make_tasks_dir(tmp_path)
         (tasks_dir / "codebase-map.md").write_text("# Codebase Map\n")
         (tasks_dir / "slice-ui.md").write_text(
-            "# UI Slice\nAdd a stop button to the queue page.\n"
-            "Acceptance: button is visible.\n"
+            "# UI Slice\nAdd a stop button to the queue page.\nAcceptance: button is visible.\n"
         )
 
         ok, reason = _check_tasks_quality(str(tmp_path), "abc123")
@@ -239,7 +229,9 @@ class TestArtifactGateQualityIntegration:
 
         assert result["status"] == "needs_review"
         feedback_reason = result["feedback"][0]["reason"]
-        assert "hallucinated" in feedback_reason.lower() or "do not exist" in feedback_reason.lower()
+        assert (
+            "hallucinated" in feedback_reason.lower() or "do not exist" in feedback_reason.lower()
+        )
 
     def test_quality_check_exception_does_not_crash_gate(self, tmp_path: Path) -> None:
         """Exceptions inside the quality check are caught; gate proceeds normally."""

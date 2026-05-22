@@ -18,16 +18,18 @@ class PhaseName(str, Enum):
 
 
 class WorkType(str, Enum):
-    """Work type determines the phase composition of the workflow."""
+    """Work type determines the phase composition of the workflow.
 
-    QUICK = "quick"
-    CRITICAL_QUICK = "critical_quick"
-    SPEC = "spec"
-    CRITICAL_SPEC = "critical_spec"
-    PLAN = "plan"
-    PLAN_SPEC = "plan_spec"
-    PLAN_ONLY = "plan_only"
-    CRITICAL_PLAN_ONLY = "critical_plan_only"
+    - TASK: specify -> plan -> critic_plan -> implement -> verify
+    - CRITICAL_TASK: specify -> critic_specify -> plan -> critic_plan -> implement -> verify
+    - REVIEWED_TASK: same as TASK but pauses for approval after critic_plan
+    - CRITICAL_REVIEWED_TASK: same as CRITICAL_TASK but pauses for approval after critic_plan
+    """
+
+    TASK = "task"
+    CRITICAL_TASK = "critical_task"
+    REVIEWED_TASK = "reviewed_task"
+    CRITICAL_REVIEWED_TASK = "critical_reviewed_task"
 
 
 class ReviewStatus(str, Enum):

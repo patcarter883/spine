@@ -46,14 +46,14 @@ def resolve_plan(plan_artifact_path: str, work_id: str) -> PlanDecomposition:
 
 async def resolve_plan_to_units(
     plan_content: str,
-    work_type: str = "quick",
+    work_type: str = "task",
     state: dict | None = None,
 ) -> PlanDecomposition:
     """Async wrapper for plan resolution compatible with Deep Agent patterns.
 
     Args:
         plan_content: The plan markdown content.
-        work_type: The work type for spawned items (default: "quick").
+        work_type: The work type for spawned items (default: "task").
         state: Optional state dict for Deep Agent compatibility.
 
     Returns:
@@ -88,7 +88,7 @@ def create_work_spawn_specs(
         spec = {
             "title": unit.title,
             "description": unit.description or base_description,
-            "work_type": WorkType.QUICK,
+            "work_type": WorkType.TASK,
             "plan_id": plan_id,
             "priority": unit.priority,
         }

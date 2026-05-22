@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from datetime import datetime
 
 from spine.models.enums import ReviewStatus, TaskStatus, PhaseName, WorkType
@@ -30,9 +29,9 @@ class TestTask:
             description="Test task description",
             status=TaskStatus.RUNNING,
             artifact_paths=["/path/to/artifact1.txt", "/path/to/artifact2.txt"],
-            error="Task failed with error"
+            error="Task failed with error",
         )
-        
+
         assert task.id == "full-task"
         assert task.description == "Test task description"
         assert task.status == TaskStatus.RUNNING
@@ -67,7 +66,7 @@ class TestArtifact:
             path="/path/to/artifact.txt",
             content="Test content",
             phase="test_phase",
-            produced_at=produced_at
+            produced_at=produced_at,
         )
 
         assert artifact.phase == "test_phase"
@@ -76,11 +75,7 @@ class TestArtifact:
     def test_artifact_string_content(self) -> None:
         """Test that artifact content is stored as string."""
         long_content = "A" * 10000
-        artifact = Artifact(
-            path="/path/to/artifact.txt",
-            content=long_content,
-            phase="test"
-        )
+        artifact = Artifact(path="/path/to/artifact.txt", content=long_content, phase="test")
 
         assert isinstance(artifact.content, str)
         assert artifact.content == long_content
@@ -92,11 +87,9 @@ class TestReviewFeedback:
     def test_review_feedback_creation(self) -> None:
         """Test creating review feedback with default values."""
         feedback = ReviewFeedback(
-            status=ReviewStatus.PASSED,
-            tier="structural",
-            reason="Test review passed"
+            status=ReviewStatus.PASSED, tier="structural", reason="Test review passed"
         )
-        
+
         assert feedback.status == ReviewStatus.PASSED
         assert feedback.tier == "structural"
         assert feedback.reason == "Test review passed"
@@ -109,9 +102,9 @@ class TestReviewFeedback:
             status=ReviewStatus.NEEDS_REVISION,
             tier="agent",
             reason="Needs improvement",
-            suggestions=suggestions
+            suggestions=suggestions,
         )
-        
+
         assert len(feedback.suggestions) == 3
         assert "Improve X" in feedback.suggestions
 
@@ -128,7 +121,7 @@ class TestPromptRequest:
     def test_prompt_request_creation(self) -> None:
         """Test creating a prompt request with default values."""
         request = PromptRequest(message="Please review this")
-        
+
         assert request.message == "Please review this"
         assert request.phase == ""
         assert request.context == {}
@@ -136,12 +129,8 @@ class TestPromptRequest:
     def test_prompt_request_with_all_fields(self) -> None:
         """Test creating a prompt request with all fields."""
         context = {"file_path": "/test.py", "line": 10}
-        request = PromptRequest(
-            message="Please review this code",
-            phase="verify",
-            context=context
-        )
-        
+        request = PromptRequest(message="Please review this code", phase="verify", context=context)
+
         assert request.message == "Please review this code"
         assert request.phase == "verify"
         assert request.context == context
@@ -154,9 +143,9 @@ class TestWorkflowState:
         """Test the _merge_dicts utility function."""
         left = {"a": 1, "b": 2}
         right = {"b": 3, "c": 4}
-        
+
         merged = _merge_dicts(left, right)
-        
+
         assert merged == {"a": 1, "b": 3, "c": 4}  # b from right overwrites left
 
     def test_merge_artifacts_deep_merge(self) -> None:
@@ -207,7 +196,7 @@ class TestWorkflowState:
         """Test that WorkflowState accepts expected fields."""
         state: WorkflowState = {
             "work_id": "test-123",
-            "work_type": "spec",
+            "work_type": "task",
             "description": "Test work",
             "current_phase": "specify",
             "phase_index": 0,
@@ -215,11 +204,11 @@ class TestWorkflowState:
             "max_retries": 3,
             "artifacts": {"specify": {"output.txt": "content"}},
             "feedback": [],
-            "status": "pending"
+            "status": "pending",
         }
-        
+
         assert state["work_id"] == "test-123"
-        assert state["work_type"] == "spec"
+        assert state["work_type"] == "task"
         assert state["retry_count"]["specify"] == 0
         assert state["artifacts"]["specify"]["output.txt"] == "content"
 
@@ -228,9 +217,9 @@ class TestWorkflowState:
         state: WorkflowState = {
             "work_id": "test-123",
             "description": "Test work",
-            "status": "running"
+            "status": "running",
         }
-        
+
         assert state["prompt_request"] is None
         assert state.get("nonexistent_field") is None
 
@@ -249,10 +238,10 @@ class TestEnums:
 
     def test_work_type_enum(self) -> None:
         """Test WorkType enum values."""
-        assert WorkType.QUICK == "quick"
-        assert WorkType.CRITICAL_QUICK == "critical_quick"
-        assert WorkType.SPEC == "spec"
-        assert WorkType.CRITICAL_SPEC == "critical_spec"
+        assert WorkType.TASK == "task"
+        assert WorkType.CRITICAL_TASK == "critical_task"
+        assert WorkType.REVIEWED_TASK == "reviewed_task"
+        assert WorkType.CRITICAL_REVIEWED_TASK == "critical_reviewed_task"
 
     def test_enum_string_behavior(self) -> None:
         """Test that enums behave like strings."""
@@ -267,11 +256,11 @@ class TestEnums:
         phases = list(PhaseName)
         assert len(phases) == 7
         assert PhaseName.SPECIFY in phases
-        
+
         # Test WorkType
         work_types = list(WorkType)
-        assert len(work_types) == 8
-        assert WorkType.SPEC in work_types
+        assert len(work_types) == 4
+        assert WorkType.TASK in work_types
 
 
 class TestModelValidation:
@@ -281,7 +270,7 @@ class TestModelValidation:
         """Test task ID validation (should be string)."""
         task = Task(id="test-id")
         assert isinstance(task.id, str)
-        
+
         # Test with numeric ID (should be converted to string)
         task_numeric = Task(id=123)
         assert task_numeric.id == "123"
@@ -290,7 +279,7 @@ class TestModelValidation:
         """Test artifact path validation."""
         artifact = Artifact(path="/valid/path.txt", content="test")
         assert artifact.path == "/valid/path.txt"
-        
+
         # Test with empty path
         artifact_empty = Artifact(path="", content="test")
         assert artifact_empty.path == ""
@@ -298,29 +287,17 @@ class TestModelValidation:
     def test_review_feedback_status_validation(self) -> None:
         """Test review feedback status validation."""
         # Should accept valid enum values
-        feedback = ReviewFeedback(
-            status=ReviewStatus.PASSED,
-            tier="structural",
-            reason="Test"
-        )
+        feedback = ReviewFeedback(status=ReviewStatus.PASSED, tier="structural", reason="Test")
         assert feedback.status == ReviewStatus.PASSED
-        
+
         # Should accept string equivalents
-        feedback_str = ReviewFeedback(
-            status="passed",
-            tier="structural",
-            reason="Test"
-        )
+        feedback_str = ReviewFeedback(status="passed", tier="structural", reason="Test")
         assert feedback_str.status == ReviewStatus.PASSED
 
     def test_prompt_request_context_validation(self) -> None:
         """Test prompt request context validation."""
         context = {"key": "value", "number": 42, "nested": {"inner": "data"}}
-        request = PromptRequest(
-            message="Test",
-            phase="test",
-            context=context
-        )
-        
+        request = PromptRequest(message="Test", phase="test", context=context)
+
         assert request.context == context
         assert isinstance(request.context, dict)

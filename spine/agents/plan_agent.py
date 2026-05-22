@@ -172,7 +172,7 @@ def _build_plan_prompt() -> str:
         "Include: (1) the specification context, "
         "(2) specific file paths or modules to investigate, "
         "(3) what to look for (patterns, conventions, APIs, dependencies). "
-        "Bare topic names like \"Research X\" produce empty results.\n\n"
+        'Bare topic names like "Research X" produce empty results.\n\n'
         "Dispatch pattern:\n"
         "```js\n"
         "const desc = globalThis.ctx.description;\n"

@@ -6,7 +6,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -37,7 +36,7 @@ class TestReadWorkContextTool:
         return ReadWorkContextTool(
             workspace_root=str(tmp_path),
             work_id=work_id,
-            work_type="spec",
+            work_type="task",
             description="Build a widget factory.",
             feedback=feedback or [],
             spec_dir=spec_dir,
@@ -48,7 +47,7 @@ class TestReadWorkContextTool:
         result = json.loads(tool._run())
         assert result["description"] == "Build a widget factory."
         assert result["work_id"] == "wk-spec"
-        assert result["work_type"] == "spec"
+        assert result["work_type"] == "task"
         assert result["feedback"] == []
         assert result["prior_spec"] == ""
 
@@ -108,7 +107,13 @@ class TestWriteSpecificationTool:
         tool = self._tool(tmp_path)
         tool._run(**self._full_args())
         content = (tmp_path / ".spine/artifacts/wk-s1/specify/specification.md").read_text()
-        for section in ["Overview", "Requirements", "Architecture", "Interfaces", "Success Criteria"]:
+        for section in [
+            "Overview",
+            "Requirements",
+            "Architecture",
+            "Interfaces",
+            "Success Criteria",
+        ]:
             assert section in content
 
     def test_open_questions_optional(self, tmp_path):
@@ -141,7 +146,7 @@ class TestBuildSpecifyOrchestratorTools:
             workspace_root=str(tmp_path),
             work_id="abc",
             description="desc",
-            work_type="spec",
+            work_type="task",
         )
         assert len(tools) == 2
         names = {t.name for t in tools}
@@ -153,7 +158,7 @@ class TestBuildSpecifyOrchestratorTools:
             workspace_root=str(tmp_path),
             work_id="x",
             description="d",
-            work_type="quick",
+            work_type="task",
             feedback=["fix this"],
         )
         read_tool = next(t for t in tools if t.name == "read_work_context")
@@ -176,7 +181,7 @@ class TestReadPriorArtifactsTool:
         return ReadPriorArtifactsTool(
             workspace_root=str(tmp_path),
             work_id=work_id,
-            work_type="spec",
+            work_type="task",
             description="Plan a widget.",
             feedback=[],
             plan_dir=f".spine/artifacts/{work_id}/plan",
@@ -251,10 +256,12 @@ class TestSearchCodebaseTool:
     def test_file_patterns_restrict_scope(self, tmp_path):
         self._setup_files(tmp_path)
         tool = self._tool(tmp_path)
-        result = json.loads(tool._run(
-            queries=["pass"],
-            file_patterns=["spine/agents/*.py"],
-        ))
+        result = json.loads(
+            tool._run(
+                queries=["pass"],
+                file_patterns=["spine/agents/*.py"],
+            )
+        )
         # Should only find files matching the pattern
         for r in result["results"]:
             assert "spine/agents/" in r["file"]
@@ -301,9 +308,14 @@ class TestWritePlanTool:
         tool = self._tool(tmp_path)
         tool._run(**self._full_args())
         content = (tmp_path / ".spine/artifacts/wk-pl/plan/plan.md").read_text()
-        for section in ["Architecture Overview", "Technology Choices",
-                        "Module Structure", "API Designs", "Implementation Order",
-                        "Testing Strategy"]:
+        for section in [
+            "Architecture Overview",
+            "Technology Choices",
+            "Module Structure",
+            "API Designs",
+            "Implementation Order",
+            "Testing Strategy",
+        ]:
             assert section in content
 
     def test_risks_section_optional(self, tmp_path):
@@ -336,7 +348,7 @@ class TestBuildPlanAgentTools:
             workspace_root=str(tmp_path),
             work_id="abc",
             description="desc",
-            work_type="spec",
+            work_type="task",
             prior_phase_dirs={},
         )
         assert len(tools) == 4
@@ -351,7 +363,7 @@ class TestBuildPlanAgentTools:
             workspace_root=str(tmp_path),
             work_id="x",
             description="d",
-            work_type="spec",
+            work_type="task",
             prior_phase_dirs=prior,
         )
         read_tool = next(t for t in tools if t.name == "read_prior_artifacts")
@@ -363,7 +375,7 @@ class TestBuildPlanAgentTools:
             workspace_root=str(tmp_path),
             work_id="y",
             description="d",
-            work_type="quick",
+            work_type="task",
             prior_phase_dirs={},
         )
         search_tool = next(t for t in tools if t.name == "search_codebase")

@@ -411,17 +411,14 @@ class TestResearcherMinOutput:
         """The researcher prompt must contain 'Hard limits' section that enforces
         minimum output requirements."""
         prompt = SUBAGENT_PROMPTS["researcher"]
-        assert "Hard limits" in prompt, (
-            "Researcher prompt must include a Hard limits section"
-        )
+        assert "Hard limits" in prompt, "Researcher prompt must include a Hard limits section"
 
     def test_researcher_prompt_requires_at_least_2_files(self) -> None:
         """The researcher must use at least 2 MCP tools (or read 2 files) before reporting."""
         prompt = SUBAGENT_PROMPTS["researcher"]
-        assert (
-            "at least 2 MCP tools" in prompt
-            or "at least 2 files" in prompt
-        ), "Researcher prompt must require tool use before reporting"
+        assert "at least 2 MCP tools" in prompt or "at least 2 files" in prompt, (
+            "Researcher prompt must require tool use before reporting"
+        )
 
     def test_researcher_prompt_requires_file_map_entry(self) -> None:
         """The researcher must produce a file_map with at least 1 entry."""

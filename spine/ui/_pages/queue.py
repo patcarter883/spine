@@ -19,16 +19,21 @@ _POLL_INTERVAL = 10
 # ── Helpers ──
 
 _PHASE_SEQUENCE: dict[str, list[str]] = {
-    "quick": ["tasks", "implement", "verify"],
-    "critical_quick": ["tasks", "critic_tasks", "implement", "verify"],
-    "spec": ["specify", "plan", "critic_plan", "tasks", "implement", "verify"],
-    "critical_spec": [
+    "task": ["specify", "plan", "critic_plan", "implement", "verify"],
+    "critical_task": [
         "specify",
         "critic_specify",
         "plan",
         "critic_plan",
-        "tasks",
-        "critic_tasks",
+        "implement",
+        "verify",
+    ],
+    "reviewed_task": ["specify", "plan", "critic_plan", "implement", "verify"],
+    "critical_reviewed_task": [
+        "specify",
+        "critic_specify",
+        "plan",
+        "critic_plan",
         "implement",
         "verify",
     ],

@@ -17,11 +17,11 @@ class TestSpineConfig:
     def test_default_config_values(self) -> None:
         """Test that default configuration values are set correctly."""
         config = SpineConfig()
-        
+
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"
         assert config.max_critic_retries == 3
-        assert config.work_type == "spec"
+        assert config.work_type == "task"
         assert config.queue_backend == "sqlite"
         assert config.queue_path == ".spine/queue.db"
         assert config.workspace_root == ""
@@ -33,28 +33,21 @@ class TestSpineConfig:
                 "checkpoint_path": ".spine/custom.db",
                 "artifact_path": ".spine/custom_artifacts",
                 "max_critic_retries": 5,
-                "work_type": "quick"
+                "work_type": "task",
             },
-            "providers": {
-                "llm": [
-                    {
-                        "enabled": True,
-                        "model": "openai:gpt-4o-mini"
-                    }
-                ]
-            }
+            "providers": {"llm": [{"enabled": True, "model": "openai:gpt-4o-mini"}]},
         }
-        
+
         config_file = temp_dir / "config.yaml"
         with open(config_file, "w") as f:
             yaml.dump(config_data, f)
-        
+
         config = SpineConfig.load(str(config_file))
-        
+
         assert config.checkpoint_path == ".spine/custom.db"
         assert config.artifact_path == ".spine/custom_artifacts"
         assert config.max_critic_retries == 5
-        assert config.work_type == "quick"
+        assert config.work_type == "task"
         assert len(config.providers["llm"]) == 1
         assert config.providers["llm"][0]["model"] == "openai:gpt-4o-mini"
 
@@ -63,10 +56,10 @@ class TestSpineConfig:
         config_file = temp_dir / "config.yaml"
         with open(config_file, "w") as f:
             yaml.dump({"spine": {"checkpoint_path": ".spine/file.db"}}, f)
-        
+
         # Set environment variable
         os.environ["SPINE_CHECKPOINT_PATH"] = ".spine/env.db"
-        
+
         try:
             config = SpineConfig.load(str(config_file))
             assert config.checkpoint_path == ".spine/env.db"
@@ -80,10 +73,10 @@ class TestSpineConfig:
         config.providers = {
             "llm": [
                 {"enabled": True, "model": "openai:gpt-4o-mini"},
-                {"enabled": False, "model": "openai:gpt-4o"}
+                {"enabled": False, "model": "openai:gpt-4o"},
             ]
         }
-        
+
         model = config.resolve_model()
         assert model == "openai:gpt-4o-mini"
 
@@ -91,9 +84,9 @@ class TestSpineConfig:
         """Test resolving model from environment variable."""
         config = SpineConfig()
         config.providers = {"llm": []}
-        
+
         os.environ["SPINE_MODEL"] = "openrouter:z-ai/glm-4.5-air:free"
-        
+
         try:
             model = config.resolve_model()
             assert model == "openrouter:z-ai/glm-4.5-air:free"
@@ -104,7 +97,7 @@ class TestSpineConfig:
         """Test that resolve_model raises ValueError when no model is configured."""
         config = SpineConfig()
         config.providers = {"llm": []}
-        
+
         with pytest.raises(ValueError, match="No LLM model configured"):
             config.resolve_model()
 
@@ -114,9 +107,9 @@ class TestSpineConfig:
         config.checkpoint_path = str(temp_dir / "checkpoints" / "test.db")
         config.artifact_path = str(temp_dir / "artifacts" / "subdir")
         config.queue_path = str(temp_dir / "queue" / "queue.db")
-        
+
         config.ensure_dirs()
-        
+
         assert Path(config.checkpoint_path).parent.exists()
         assert Path(config.artifact_path).parent.exists()
         assert Path(config.queue_path).parent.exists()
@@ -125,7 +118,7 @@ class TestSpineConfig:
         """Test loading config from nonexistent file uses defaults."""
         nonexistent_file = temp_dir / "nonexistent.yaml"
         config = SpineConfig.load(str(nonexistent_file))
-        
+
         # Should still have default values
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"
@@ -135,9 +128,9 @@ class TestSpineConfig:
         invalid_file = temp_dir / "invalid.yaml"
         with open(invalid_file, "w") as f:
             f.write("spine:\n    checkpoint_path: [invalid")
-        
+
         config = SpineConfig.load(str(invalid_file))
-        
+
         # Should fall back to defaults
         assert config.checkpoint_path == ".spine/spine.db"
 
@@ -145,21 +138,17 @@ class TestSpineConfig:
         """Test that providers configuration is properly merged."""
         config_data = {
             "providers": {
-                "llm": [
-                    {"enabled": True, "model": "openai:gpt-4o-mini"}
-                ],
-                "embedding": [
-                    {"enabled": True, "model": "openai:text-embedding-3-small"}
-                ]
+                "llm": [{"enabled": True, "model": "openai:gpt-4o-mini"}],
+                "embedding": [{"enabled": True, "model": "openai:text-embedding-3-small"}],
             }
         }
-        
+
         config_file = temp_dir / "config.yaml"
         with open(config_file, "w") as f:
             yaml.dump(config_data, f)
-        
+
         config = SpineConfig.load(str(config_file))
-        
+
         assert "llm" in config.providers
         assert "embedding" in config.providers
         assert len(config.providers["llm"]) == 1
@@ -167,8 +156,8 @@ class TestSpineConfig:
 
     def test_work_type_validation(self) -> None:
         """Test that work_type accepts valid values."""
-        valid_work_types = ["quick", "critical_quick", "spec", "critical_spec"]
-        
+        valid_work_types = ["task", "critical_task"]
+
         for work_type in valid_work_types:
             config = SpineConfig()
             config.work_type = work_type
@@ -179,9 +168,9 @@ class TestSpineConfig:
         empty_file = temp_dir / "empty.yaml"
         with open(empty_file, "w") as f:
             f.write("")
-        
+
         config = SpineConfig.load(str(empty_file))
-        
+
         # Should use all defaults
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"

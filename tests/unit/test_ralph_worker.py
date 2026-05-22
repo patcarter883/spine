@@ -20,6 +20,7 @@ class TestRalphLoopWorkerListPendingOrdering:
         """Create a RalphLoopWorker with an isolated database."""
         # Reset singleton for test isolation
         import spine.work.ralph_worker as rw_mod
+
         rw_mod._WORKER_INSTANCE = None
 
         config = SpineConfig()
@@ -42,18 +43,21 @@ class TestRalphLoopWorkerListPendingOrdering:
     def test_single_item_returns_that_item(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._make_worker(tmpdir)
-            self._insert_pending(worker, [
-                {
-                    "id": 1,
-                    "description": "only item",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-06-15T12:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-            ])
+            self._insert_pending(
+                worker,
+                [
+                    {
+                        "id": 1,
+                        "description": "only item",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-06-15T12:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                ],
+            )
             pending = worker.list_pending()
             assert len(pending) == 1
             assert pending[0]["id"] == 1
@@ -61,38 +65,41 @@ class TestRalphLoopWorkerListPendingOrdering:
     def test_multiple_items_ordered_newest_first(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._make_worker(tmpdir)
-            self._insert_pending(worker, [
-                {
-                    "id": 1,
-                    "description": "oldest",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 2,
-                    "description": "middle",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-06-15T12:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 3,
-                    "description": "newest",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-12-31T23:59:59",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-            ])
+            self._insert_pending(
+                worker,
+                [
+                    {
+                        "id": 1,
+                        "description": "oldest",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 2,
+                        "description": "middle",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-06-15T12:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 3,
+                        "description": "newest",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-12-31T23:59:59",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                ],
+            )
             pending = worker.list_pending()
             assert len(pending) == 3
             timestamps = [item["enqueued_at"] for item in pending]
@@ -107,38 +114,41 @@ class TestRalphLoopWorkerListPendingOrdering:
     def test_excludes_non_pending_items(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._make_worker(tmpdir)
-            self._insert_pending(worker, [
-                {
-                    "id": 1,
-                    "description": "pending item",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": "2024-06-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 2,
-                    "description": "completed item",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-                {
-                    "id": 3,
-                    "description": "failed item",
-                    "work_type": "quick",
-                    "status": "failed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
-            ])
+            self._insert_pending(
+                worker,
+                [
+                    {
+                        "id": 1,
+                        "description": "pending item",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": "2024-06-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 2,
+                        "description": "completed item",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                    {
+                        "id": 3,
+                        "description": "failed item",
+                        "work_type": "task",
+                        "status": "failed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                ],
+            )
             pending = worker.list_pending()
             assert len(pending) == 1
             assert pending[0]["id"] == 1
@@ -146,19 +156,22 @@ class TestRalphLoopWorkerListPendingOrdering:
     def test_list_pending_respects_limit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._make_worker(tmpdir)
-            self._insert_pending(worker, [
-                {
-                    "id": i,
-                    "description": f"item {i}",
-                    "work_type": "quick",
-                    "status": "pending",
-                    "enqueued_at": f"2024-06-{i:02d}T12:00:00",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                }
-                for i in range(1, 11)
-            ])
+            self._insert_pending(
+                worker,
+                [
+                    {
+                        "id": i,
+                        "description": f"item {i}",
+                        "work_type": "task",
+                        "status": "pending",
+                        "enqueued_at": f"2024-06-{i:02d}T12:00:00",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    }
+                    for i in range(1, 11)
+                ],
+            )
             pending = worker.list_pending(limit=3)
             assert len(pending) == 3
 
@@ -168,6 +181,7 @@ class TestRalphLoopWorkerListRecentCompletedOrdering:
 
     def _make_worker(self, tmpdir: str) -> RalphLoopWorker:
         import spine.work.ralph_worker as rw_mod
+
         rw_mod._WORKER_INSTANCE = None
 
         config = SpineConfig()
@@ -185,28 +199,30 @@ class TestRalphLoopWorkerListRecentCompletedOrdering:
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._make_worker(tmpdir)
             db = worker._get_db()
-            db["queue"].insert_all([
-                {
-                    "id": 1,
-                    "description": "old completed",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-01-01T01:00:00",
-                    "result": "",
-                },
-                {
-                    "id": 2,
-                    "description": "new completed",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-06-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-06-01T01:00:00",
-                    "result": "",
-                },
-            ])
+            db["queue"].insert_all(
+                [
+                    {
+                        "id": 1,
+                        "description": "old completed",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-01-01T01:00:00",
+                        "result": "",
+                    },
+                    {
+                        "id": 2,
+                        "description": "new completed",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-06-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-06-01T01:00:00",
+                        "result": "",
+                    },
+                ]
+            )
             recent = worker.list_recent_completed()
             assert len(recent) == 2
             timestamps = [item["completed_at"] for item in recent]
@@ -216,27 +232,29 @@ class TestRalphLoopWorkerListRecentCompletedOrdering:
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._make_worker(tmpdir)
             db = worker._get_db()
-            db["queue"].insert_all([
-                {
-                    "id": 1,
-                    "description": "failed item",
-                    "work_type": "quick",
-                    "status": "failed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-01-01T02:00:00",
-                    "result": '{"error": "bad"}',
-                },
-                {
-                    "id": 2,
-                    "description": "completed item",
-                    "work_type": "quick",
-                    "status": "completed",
-                    "enqueued_at": "2024-01-01T00:00:00",
-                    "started_at": "",
-                    "completed_at": "2024-01-01T01:00:00",
-                    "result": "",
-                },
-            ])
+            db["queue"].insert_all(
+                [
+                    {
+                        "id": 1,
+                        "description": "failed item",
+                        "work_type": "task",
+                        "status": "failed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-01-01T02:00:00",
+                        "result": '{"error": "bad"}',
+                    },
+                    {
+                        "id": 2,
+                        "description": "completed item",
+                        "work_type": "task",
+                        "status": "completed",
+                        "enqueued_at": "2024-01-01T00:00:00",
+                        "started_at": "",
+                        "completed_at": "2024-01-01T01:00:00",
+                        "result": "",
+                    },
+                ]
+            )
             recent = worker.list_recent_completed()
             assert len(recent) == 2
