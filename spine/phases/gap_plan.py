@@ -24,7 +24,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 from spine.workflow.registry import get_registry
 
@@ -58,10 +58,10 @@ async def call_gap_plan(
         agent = build_gap_plan_agent(state, config)
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        verify_path = _artifact_path(work_id, PhaseName.VERIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
-        gap_plan_path = _artifact_path(work_id, PhaseName.GAP_PLAN.value)
+        verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
+        gap_plan_path = artifact_path(work_id, PhaseName.GAP_PLAN.value)
 
         prompt = (
             f"Read the verification report at `{verify_path}/verification.md` "

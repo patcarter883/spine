@@ -101,7 +101,7 @@ def build_critic_agent(
     # Append structured-plan validation instructions when reviewing the PLAN
     # phase. Other phases (specify, tasks, implement) keep the base prompt
     # unchanged so existing behaviour is preserved.
-    if reviewed_phase == PhaseName.PLAN.value:
+    if PhaseName(reviewed_phase) == PhaseName.PLAN:
         system_prompt = system_prompt + "\n\n" + _PLAN_REVIEW_INSTRUCTIONS
 
     agent = build_phase_agent(

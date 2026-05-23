@@ -35,7 +35,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
@@ -206,7 +206,7 @@ async def _synthesize_plan(
             f"After completing your research, call `write_structured_plan` to "
             f"produce both `plan.md` (narrative) and `plan.json` (structured "
             f"JSON with feature_slices).\n\n"
-            f"Write the plan artifacts to `{_artifact_path(work_id, PhaseName.PLAN.value)}/`."
+            f"Write the plan artifacts to `{artifact_path(work_id, PhaseName.PLAN.value)}/`."
         )
 
         if retry_count > 0 and feedback:
@@ -452,7 +452,7 @@ async def _save_exploration_artifacts(
     )
 
     if not disk_artifacts and agent_response.strip():
-        artifact_name = "specification.md" if phase == PhaseName.SPECIFY.value else "plan.md"
+        artifact_name = "specification.md" if PhaseName(phase) == PhaseName.SPECIFY else "plan.md"
         materialize_phase_artifacts(
             phase,
             {artifact_name: agent_response},
@@ -501,11 +501,12 @@ def build_exploration_subgraph(
         runnable graph, or ``.compile(checkpointer=...)`` for per-phase
         checkpoint isolation.
     """
-    if phase == PhaseName.SPECIFY.value:
-        synthesizer = _synthesize_specify
-    elif phase == PhaseName.PLAN.value:
-        synthesizer = _synthesize_plan
-    else:
+    synthesizer_map = {
+        PhaseName.SPECIFY: _synthesize_specify,
+        PhaseName.PLAN: _synthesize_plan,
+    }
+    synthesizer = synthesizer_map.get(PhaseName(phase))
+    if synthesizer is None:
         raise ValueError(f"Unsupported phase for exploration subgraph: {phase!r}")
 
     builder = StateGraph(ExplorationSubgraphState)

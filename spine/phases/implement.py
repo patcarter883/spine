@@ -33,7 +33,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 from spine.workflow.registry import get_registry
 
@@ -184,7 +184,7 @@ async def call_implement(
         # ── Resolve execution waves from state (preferred) or legacy ──
         execution_waves = state.get("execution_waves")
         has_waves = bool(execution_waves)
-        plan_dir = _artifact_path(work_id, PhaseName.PLAN.value)
+        plan_dir = artifact_path(work_id, PhaseName.PLAN.value)
         plan_json_path = f"{plan_dir}/plan.json"
 
         if has_waves:
@@ -221,9 +221,9 @@ async def call_implement(
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior implementation. Address all points from the critic feedback.\n\n"
 
         has_spec = True
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
+        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
 
         prompt_lines = [
             "Implement the feature slices described below. Write clean, "

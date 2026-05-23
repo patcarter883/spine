@@ -29,7 +29,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from spine.models.enums import PhaseName
-from spine.agents.artifacts import _artifact_path
+from spine.agents.artifacts import artifact_path
 
 
 class SpineContext(BaseModel):
@@ -120,7 +120,7 @@ def build_context(
         PhaseName.IMPLEMENT.value,
     ):
         if artifacts.get(phase_key):
-            artifact_paths[phase_key] = _artifact_path(work_id, phase_key)
+            artifact_paths[phase_key] = artifact_path(work_id, phase_key)
 
     # Resolve the named subagent for this phase (for interpreter PTC)
     from spine.agents.subagents import PHASE_SUBAGENTS

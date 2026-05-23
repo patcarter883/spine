@@ -27,7 +27,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ async def _run_implement_agent(
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
         has_spec = "spec" in work_type
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
         gap_plan_path = state.get("gap_plan_path", "")
 
         prompt_lines = [
@@ -81,8 +81,8 @@ async def _run_implement_agent(
             )
 
         if has_spec:
-            spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
-            tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
+            spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
+            tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
             prompt_lines.extend(
                 [
                     "Prior artifacts are available on disk — read them as needed:",
@@ -107,7 +107,7 @@ async def _run_implement_agent(
                 ]
             )
 
-        impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
+        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
         prompt_lines.extend(
             [
                 "Use `read_file` and `grep` to inspect them. Do NOT load "

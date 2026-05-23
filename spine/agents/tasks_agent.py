@@ -37,7 +37,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from spine.agents.artifacts import _artifact_path
+from spine.agents.artifacts import artifact_path
 from spine.agents.factory import build_phase_agent
 from spine.agents.subagents import build_phase_subagents
 from spine.agents.tasks_tools import build_tasks_agent_tools
@@ -119,7 +119,7 @@ def _resolve_prior_phase_dirs(
     dirs: dict[str, str] = {}
     for phase, phase_artifacts in artifacts.items():
         if phase_artifacts and isinstance(phase_artifacts, dict):
-            dirs[phase] = _artifact_path(work_id, phase)
+            dirs[phase] = artifact_path(work_id, phase)
     return dirs
 
 

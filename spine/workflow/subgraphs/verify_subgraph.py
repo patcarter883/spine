@@ -23,7 +23,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,10 +58,10 @@ async def _run_verify_agent(
 
         # Build prompt referencing disk paths
         has_spec = "spec" in work_type
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
-        impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
+        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
+        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
 
         prompt_lines = [
             "Verify that the implementation meets the requirements. "
@@ -77,7 +77,7 @@ async def _run_verify_agent(
                     f"- Plan: `{plan_path}/plan.md`",
                 ]
             )
-        verify_path = _artifact_path(work_id, PhaseName.VERIFY.value)
+        verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
         prompt_lines.extend(
             [
                 f"- Feature Slices: `{tasks_path}/tasks.md`",

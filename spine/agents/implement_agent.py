@@ -208,15 +208,35 @@ def _build_wave_orchestrator_prompt() -> str:
         "slices in wave N are complete.\n\n"
         "## Workflow\n\n"
         "### Step 1 — Call read_slice_files (1 turn)\n"
-        "Call `read_slice_files` with no arguments. It returns slice data "
-        "and the codebase map.\n"
-        "Store the result in eval: `globalThis.planData = result;`\n\n"
+        "Call `read_slice_files` with no arguments. It returns a JSON object:\n"
+        "```\n"
+        "{\n"
+        '  "slices": {\n'
+        '    "add-user-model": {\n'
+        '      "id": "add-user-model",\n'
+        '      "title": "Add user model",\n'
+        '      "target_files": ["src/models/user.py"],\n'
+        '      "execution_requirements": "Create the User model class...",\n'
+        '      "dependencies": [],\n'
+        '      "acceptance_criteria": ["User.save() persists to DB"],\n'
+        '      "complexity": "medium"\n'
+        "    },\n"
+        "    ...\n"
+        "  },\n"
+        '  "codebase_map": "<full content of codebase_map field>",\n'
+        '  "slice_count": N,\n'
+        '  "plan_dir": "<path>"\n'
+        "}\n"
+        "```\n"
+        "Slices are keyed by their `id` field. Each value is the full "
+        "feature-slice dict. Store the result in eval: "
+        "`globalThis.planData = result;`\n\n"
         "### Step 2 — Dispatch subagents per wave\n"
         "Refer to Step 2 guidelines preloaded in your user prompt. "
         "Wave dispatch instructions are there.\n\n"
         "Each task description MUST be fully self-contained — the subagent "
         "has an empty context and cannot see your conversation. Embed the "
-        "full slice definition (from plan.json), relevant codebase map "
+        "full slice definition (from the slice dict), relevant codebase map "
         "sections, files to modify, dependencies, and acceptance criteria.\n\n"
         "### Step 3 — Call write_implementation_report (1 turn)\n"
         "Parse globalThis.sliceResults and call `write_implementation_report` "
@@ -246,7 +266,7 @@ def _build_wave_orchestrator_prompt() -> str:
 
 
 def _build_legacy_orchestrator_prompt() -> str:
-    """Orchestrator prompt for legacy flat-parallel dispatch (tasks mode)."""
+    """Orchestrator prompt for flat-parallel dispatch (plan.json mode)."""
     return (
         "You are the IMPLEMENT phase orchestrator. You do NOT write source "
         "code yourself — you dispatch one `slice-implementer` subagent per "
@@ -267,20 +287,33 @@ def _build_legacy_orchestrator_prompt() -> str:
         "Call `read_slice_files` with no arguments. It returns a JSON object:\n"
         "```\n"
         "{\n"
-        '  "slices": {"slice-foo.md": "<full content>", ...},\n'
-        '  "codebase_map": "<full content of codebase-map.md>",\n'
+        '  "slices": {\n'
+        '    "add-user-model": {\n'
+        '      "id": "add-user-model",\n'
+        '      "title": "Add user model",\n'
+        '      "target_files": ["src/models/user.py"],\n'
+        '      "execution_requirements": "Create the User model class...",\n'
+        '      "dependencies": [],\n'
+        '      "acceptance_criteria": ["User.save() persists to DB"],\n'
+        '      "complexity": "medium"\n'
+        "    },\n"
+        "    ...\n"
+        "  },\n"
+        '  "codebase_map": "<full content of codebase_map field>",\n'
         '  "slice_count": N,\n'
-        '  "tasks_dir": "<path>"\n'
+        '  "plan_dir": "<path>"\n'
         "}\n"
         "```\n"
-        "Store the result in eval: `globalThis.slices = result;`\n\n"
+        "Slices are keyed by their `id` field. Each value is the full "
+        "feature-slice dict. Store the result in eval: "
+        "`globalThis.planData = result;`\n\n"
         "### Step 2 — Dispatch subagents in parallel (1 eval turn)\n"
         "Refer to Step 2 guidelines preloaded in your workspace environment on first turn.\n\n"
         "Use a single `eval` call with `Promise.allSettled` to dispatch all "
         "slices in parallel. Each task description MUST be fully self-contained "
         "— the subagent has an empty context and cannot see your conversation. "
-        "Embed the full slice content, relevant codebase map sections, files "
-        "to modify, and acceptance criteria.\n\n"
+        "Embed the full slice definition (from the slice dict), relevant codebase "
+        "map sections, files to modify, and acceptance criteria.\n\n"
         "### Step 3 — Call write_implementation_report (1 turn)\n"
         "Parse globalThis.sliceResults and call `write_implementation_report` "
         "with:\n"
@@ -303,5 +336,5 @@ def _build_legacy_orchestrator_prompt() -> str:
         "## Eval context seed\n"
         "Access session-specific context properties via `globalThis.context` "
         "preloaded in your workspace environment on first turn (e.g., "
-        "use `globalThis.context.work_id` or `globalThis.context.tasks_dir` inside eval).\n\n"
+        "use `globalThis.context.work_id` or `globalThis.context.plan_dir` inside eval).\n\n"
     )

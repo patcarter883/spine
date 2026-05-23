@@ -33,7 +33,7 @@ from spine.agents.artifacts import (
     scan_artifact_dir,
     materialize_artifacts,
     materialize_phase_artifacts,
-    _artifact_path,
+    artifact_path,
 )
 from spine.workflow.registry import get_registry
 
@@ -94,7 +94,7 @@ async def call_tasks(
 
         # ── Compute the exact artifact output path ──
         # Used in the completion reminder in the user message.
-        tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
+        tasks_artifact_dir = artifact_path(work_id, PhaseName.TASKS.value)
         tasks_dir = f".spine/artifacts/{work_id}/tasks"
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'tasks', tasks_dir: '{tasks_dir}'}};\n\n"
 

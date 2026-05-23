@@ -36,7 +36,7 @@ from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
-    _artifact_path,
+    artifact_path,
 )
 from spine.workflow.registry import get_registry
 
@@ -175,7 +175,7 @@ async def call_plan(
         if retry_count > 0:
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior plan. Address all points from the critic feedback.\n\n"
 
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
+        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
 
         # Check if spec exists to formulate the exact dynamic spec instruction
         has_spec = True

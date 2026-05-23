@@ -65,7 +65,7 @@ providers:
       provider: deepseek-v4-pro
     critic:
       provider: deepseek-v4-pro
-    research_manager:
+    exploration:
       provider: deepseek-v4-pro
     # Implementation → local vLLM, but colder temperature for code
     implement:

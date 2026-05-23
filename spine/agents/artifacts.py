@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 ARTIFACTS_DIR = ".spine/artifacts"
 
 
-def _artifact_path(work_id: str, phase: str) -> str:
+def artifact_path(work_id: str, phase: str) -> str:
     """Build a work_id-scoped artifact directory path (relative to workspace).
 
     Args:
@@ -130,7 +130,7 @@ def materialize_artifacts(
         if not phase_artifacts or not isinstance(phase_artifacts, dict):
             continue
 
-        phase_dir = root / _artifact_path(work_id, phase_key)
+        phase_dir = root / artifact_path(work_id, phase_key)
         phase_dir.mkdir(parents=True, exist_ok=True)
 
         for filename, content in phase_artifacts.items():
@@ -149,7 +149,7 @@ def materialize_artifacts(
             file_path.write_text(content_str, encoding="utf-8")
             logger.debug("Materialized artifact: %s", file_path)
 
-        paths[phase_key] = _artifact_path(work_id, phase_key)
+        paths[phase_key] = artifact_path(work_id, phase_key)
 
     return paths
 
@@ -179,7 +179,7 @@ def scan_artifact_dir(
         Returns empty dict if the directory doesn't exist.
     """
     root = Path(workspace_root)
-    phase_dir = root / _artifact_path(work_id, phase)
+    phase_dir = root / artifact_path(work_id, phase)
     if not phase_dir.is_dir():
         return {}
 
@@ -216,7 +216,7 @@ def validate_artifact_dir(
         non-meta file.  False otherwise.
     """
     root = Path(workspace_root)
-    phase_dir = root / _artifact_path(work_id, phase)
+    phase_dir = root / artifact_path(work_id, phase)
     if not phase_dir.is_dir():
         return False
     files = [f for f in phase_dir.iterdir() if f.is_file() and not f.name.endswith(".meta.json")]
@@ -290,7 +290,7 @@ def build_artifact_prompt(
             continue
         phase_artifacts = artifacts.get(phase)
         if phase_artifacts and isinstance(phase_artifacts, dict):
-            path = _artifact_path(work_id, phase)
+            path = artifact_path(work_id, phase)
             phase_label = phase.upper()
             # List individual files in the phase directory
             filenames = list(phase_artifacts.keys())
@@ -323,7 +323,7 @@ def build_current_phase_write_prompt(
     Returns:
         A markdown-formatted instruction block.
     """
-    base_path = _artifact_path(work_id, current_phase)
+    base_path = artifact_path(work_id, current_phase)
     lines: list[str] = [
         "## Where to Write This Phase's Artifacts",
         "",
@@ -374,7 +374,7 @@ def build_inline_artifact_prompt(
         return ""
 
     lines: list[str] = ["## Artifacts Under Review"]
-    base_path = _artifact_path(work_id, current_phase)
+    base_path = artifact_path(work_id, current_phase)
     for name, content in phase_artifacts.items():
         content_str = str(content)
         if len(content_str) > max_inline_chars:

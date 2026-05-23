@@ -159,9 +159,9 @@ async def agent_critic_check(
         # the original wording rather than evaluating the artifact's quality
         # independently.  The only additional context beyond artifacts should be
         # review feedback (from critic gates, verify agent, or human review).
-        from spine.agents.artifacts import _artifact_path
+        from spine.agents.artifacts import artifact_path
 
-        reviewed_path = _artifact_path(work_id, reviewed_phase)
+        reviewed_path = artifact_path(work_id, reviewed_phase)
         prompt = (
             f"Review the output of the {reviewed_phase} phase.\n\n"
             f"{artifact_preview}"

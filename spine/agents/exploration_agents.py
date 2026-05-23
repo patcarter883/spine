@@ -79,7 +79,12 @@ async def run_research_manager(
     round_num = state.get("research_round", 0)
     max_rounds = state.get("max_rounds", 3)
     work_id = state.get("work_id", "unknown")
-    phase = state.get("phase", "specify")
+    phase = state.get("phase")
+    if phase is None:
+        raise ValueError(
+            "Exploration subgraph state missing 'phase' key. "
+            "This indicates a state mapper configuration error."
+        )
     workspace_root = state.get("workspace_root", ".")
 
     # Safety valve — if we've hit max rounds, force done
@@ -215,7 +220,12 @@ async def run_explore_node(
     from spine.models.enums import PhaseName
 
     work_id = state.get("work_id", "unknown")
-    phase = state.get("phase", PhaseName.SPECIFY.value)
+    phase = state.get("phase")
+    if phase is None:
+        raise ValueError(
+            "Explore node state missing 'phase' key. "
+            "This indicates a state mapper configuration error."
+        )
     workspace_root = state.get("workspace_root", ".")
     topic_str = topic or "general codebase investigation"
 
@@ -223,7 +233,7 @@ async def run_explore_node(
 
     try:
         # Determine which PhaseName to use for model/skill resolution
-        phase_enum = PhaseName.PLAN if phase == PhaseName.PLAN.value else PhaseName.SPECIFY
+        phase_enum = PhaseName(phase)
 
         # Build the researcher subagent spec with the correct phase
         subagent_spec = build_subagent_spec(
@@ -250,7 +260,7 @@ async def run_explore_node(
         # For PLAN phase: inject the specification content so the researcher
         # maps spec requirements to codebase files, not just the generic topic.
         spec_content = ""
-        if phase == PhaseName.PLAN.value:
+        if phase_enum == PhaseName.PLAN:
             spec_path = state.get("spec_path", "")
             if spec_path:
                 full_path = Path(workspace_root) / spec_path / "specification.md"

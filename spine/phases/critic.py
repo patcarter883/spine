@@ -241,7 +241,7 @@ async def call_critic(
         }
 
     # ── Tier 1.5: PLAN-specific structural validation ──
-    if reviewed_phase == PhaseName.PLAN.value:
+    if PhaseName(reviewed_phase) == PhaseName.PLAN:
         plan_validation = _validate_plan_structure(state, workspace_root, work_id)
         if plan_validation is not None:
             logger.info(

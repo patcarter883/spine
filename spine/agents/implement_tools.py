@@ -40,13 +40,20 @@ class _ReadSliceFilesInput(BaseModel):
 
 
 class ReadSliceFilesTool(BaseTool):
-    """Read all slice definitions and the codebase map in one call.
+    """Read all feature slice definitions and the codebase map in one call.
+
+    Reads ``plan.json`` from the plan artifact directory and extracts the
+    ``feature_slices`` array as per-slice definitions, plus the embedded
+    ``codebase_map`` field.
 
     Returns a JSON object containing:
-    - ``slices``: mapping of slice filename → full markdown content
-    - ``codebase_map``: content of codebase-map.md (empty string if missing)
+    - ``slices``: mapping of slice id → full feature-slice dict (id, title,
+      target_files, execution_requirements, dependencies, acceptance_criteria,
+      complexity)
+    - ``codebase_map``: content of the codebase_map field from plan.json
+      (empty string if missing)
     - ``slice_count``: number of slices found
-    - ``tasks_dir``: the tasks artifact directory path
+    - ``plan_dir``: the plan artifact directory path
 
     This is the only read tool the orchestrator needs. It eliminates
     multi-turn ls/glob/read_file exploration — everything is loaded at once.
@@ -55,62 +62,69 @@ class ReadSliceFilesTool(BaseTool):
     name: str = "read_slice_files"
     description: str = (
         "Read all feature slice definitions and the codebase map for this work item. "
-        "Returns all slice-*.md files and codebase-map.md in one call. "
+        "Loads plan.json from the plan directory and returns all feature_slices "
+        "plus the codebase map in one call. "
         "Call this FIRST — it gives you everything you need to dispatch subagents. "
         "No arguments required."
     )
     args_schema: Optional[ArgsSchema] = _ReadSliceFilesInput
 
     # Injected at build time — not part of the input schema
-    tasks_dir: str = ""
+    plan_dir: str = ""
     workspace_root: str = ""
 
     def _run(self, **kwargs: Any) -> str:  # noqa: ARG002
-        tasks_path = Path(self.workspace_root) / self.tasks_dir
+        plan_path = Path(self.workspace_root) / self.plan_dir
         result: dict[str, Any] = {
-            "tasks_dir": self.tasks_dir,
+            "plan_dir": self.plan_dir,
             "slice_count": 0,
             "slices": {},
             "codebase_map": "",
         }
 
-        if not tasks_path.exists():
-            result["error"] = f"Tasks directory not found: {self.tasks_dir}"
+        if not plan_path.exists():
+            result["error"] = f"Plan directory not found: {self.plan_dir}"
             return json.dumps(result)
 
-        # Load codebase map
-        map_path = tasks_path / "codebase-map.md"
-        if map_path.exists():
-            try:
-                result["codebase_map"] = map_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                logger.warning("Could not read codebase-map.md: %s", exc)
+        # Read plan.json
+        json_path = plan_path / "plan.json"
+        if not json_path.exists():
+            result["error"] = f"plan.json not found in {self.plan_dir}"
+            return json.dumps(result)
 
-        # Load all slice files
         try:
-            slice_files = sorted(
-                p.name
-                for p in tasks_path.iterdir()
-                if p.is_file() and p.name.startswith("slice-") and p.name.endswith(".md")
-            )
-        except OSError as exc:
-            result["error"] = f"Could not list tasks directory: {exc}"
+            plan_data = json.loads(json_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            result["error"] = f"Could not parse plan.json: {exc}"
             return json.dumps(result)
 
-        for fname in slice_files:
-            fpath = tasks_path / fname
-            try:
-                result["slices"][fname] = fpath.read_text(encoding="utf-8")
-            except OSError as exc:
-                result["slices"][fname] = f"[ERROR reading file: {exc}]"
-                logger.warning("Could not read slice file %s: %s", fname, exc)
+        # Extract codebase_map
+        codebase_map = plan_data.get("codebase_map", "")
+        if isinstance(codebase_map, dict):
+            # Serialize dicts back to a string so the return shape is consistent
+            codebase_map = json.dumps(codebase_map, indent=2, ensure_ascii=False)
+        result["codebase_map"] = codebase_map or ""
+
+        # Extract feature_slices and index by slice id
+        feature_slices = plan_data.get("feature_slices", [])
+        if not isinstance(feature_slices, list):
+            result["warning"] = "plan.json has no feature_slices array"
+            return json.dumps(result)
+
+        for sl in feature_slices:
+            if not isinstance(sl, dict):
+                continue
+            slice_id = sl.get("id")
+            if not slice_id:
+                continue
+            result["slices"][slice_id] = sl
 
         result["slice_count"] = len(result["slices"])
 
         if result["slice_count"] == 0:
             result["warning"] = (
-                "No slice-*.md files found in tasks directory. "
-                "Check that the TASKS phase completed successfully."
+                "plan.json has no feature_slices (or they lack 'id' fields). "
+                "Check that the PLAN phase completed successfully."
             )
 
         return json.dumps(result, ensure_ascii=False)
@@ -272,13 +286,13 @@ def build_implement_orchestrator_tools(
     Returns:
         List of two BaseTool instances ready for use.
     """
-    tasks_dir = f".spine/artifacts/{work_id}/tasks"
+    plan_dir = f".spine/artifacts/{work_id}/plan"
     impl_dir = f".spine/artifacts/{work_id}/implement"
 
     return [
         ReadSliceFilesTool(
             workspace_root=workspace_root,
-            tasks_dir=tasks_dir,
+            plan_dir=plan_dir,
         ),
         WriteImplementationReportTool(
             workspace_root=workspace_root,

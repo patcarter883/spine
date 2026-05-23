@@ -45,13 +45,13 @@ def build_gap_plan_agent(
     """
     work_id = state.get("work_id", "")
 
-    from spine.agents.artifacts import _artifact_path
+    from spine.agents.artifacts import artifact_path
 
-    verify_path = _artifact_path(work_id, PhaseName.VERIFY.value)
-    plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-    tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
-    impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
-    gap_plan_path = _artifact_path(work_id, PhaseName.GAP_PLAN.value)
+    verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
+    plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+    tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
+    impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
+    gap_plan_path = artifact_path(work_id, PhaseName.GAP_PLAN.value)
 
     system_prompt = (
         "You are the GAP_PLAN phase. Your job is to read the verification "

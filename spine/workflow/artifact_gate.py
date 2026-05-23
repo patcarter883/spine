@@ -355,7 +355,7 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
             # ── Extended quality checks for tasks→implement ──────────────
             # Run these only when the basic presence check passes — we don't
             # want to add I/O overhead to gates that already failed.
-            if required_phase == PhaseName.TASKS.value:
+            if PhaseName(required_phase) == PhaseName.TASKS:
                 try:
                     quality_ok, quality_reason = _check_tasks_quality(workspace_root, work_id)
                 except Exception as exc:
@@ -388,7 +388,7 @@ def make_artifact_gate_node(required_phase: str, next_node: str) -> Any:
             # ── Extended quality checks for plan→implement ───────────────
             # Validate plan.json has structured feature_slices that implement
             # can use to dispatch subagents.
-            if required_phase == PhaseName.PLAN.value:
+            if PhaseName(required_phase) == PhaseName.PLAN:
                 try:
                     quality_ok, quality_reason = _check_plan_quality(workspace_root, work_id)
                 except Exception as exc:
@@ -472,27 +472,4 @@ def artifact_gate_router(state: WorkflowState) -> str:
     return "needs_review"
 
 
-# ── Legacy helper (kept for backward compat with older compose.py) ─────
-def make_artifact_gate_fn(required_phase: str, next_node: str) -> Any:
-    """Create a gate function for a conditional edge (legacy).
 
-    .. deprecated::
-        Use :func:`make_artifact_gate_node` instead. The legacy version
-        cannot set state, so the dispatcher fails to detect needs_review.
-
-    Returns a callable with the signature ``(state) -> str`` that can be
-    used as a LangGraph conditional edge function.
-    """
-
-    def gate_fn(state: WorkflowState) -> str:
-        if _has_meaningful_artifacts(state, required_phase):
-            return "proceed"
-        work_id = state.get("work_id", "unknown")
-        logger.warning(
-            f"[{work_id}] Artifact gate: {required_phase} produced no "
-            f"meaningful artifacts, cannot proceed to {next_node}. "
-            f"Flagging for human review."
-        )
-        return "needs_review"
-
-    return gate_fn

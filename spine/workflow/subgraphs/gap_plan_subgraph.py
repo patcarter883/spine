@@ -23,7 +23,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,11 +49,11 @@ async def _run_gap_plan_agent(
         agent = build_gap_plan_agent(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        verify_path = _artifact_path(work_id, PhaseName.VERIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
-        impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
-        gap_plan_path = _artifact_path(work_id, PhaseName.GAP_PLAN.value)
+        verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
+        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
+        gap_plan_path = artifact_path(work_id, PhaseName.GAP_PLAN.value)
 
         prompt = (
             "Read the verification report to understand what issues were "

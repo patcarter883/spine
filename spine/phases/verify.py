@@ -31,7 +31,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 from spine.workflow.registry import get_registry
 
@@ -109,10 +109,10 @@ async def call_verify(
                 f"`{tasks_dir}/slice-*.md`, then dispatch one subagent per slice."
             )
 
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = _artifact_path(work_id, PhaseName.TASKS.value)
-        impl_path = _artifact_path(work_id, PhaseName.IMPLEMENT.value)
+        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
+        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
 
         prompt_lines = [
             "Verify that the implementation meets the requirements. "

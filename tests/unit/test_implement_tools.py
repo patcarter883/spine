@@ -27,44 +27,79 @@ class TestReadSliceFilesTool:
         return tasks, work_id
 
     def test_returns_slices_and_codebase_map(self, tmp_path):
-        tasks, work_id = self._make_tasks_dir(tmp_path)
-        (tasks / "slice-foo.md").write_text("# Slice Foo\nDo the foo thing.")
-        (tasks / "slice-bar.md").write_text("# Slice Bar\nDo the bar thing.")
-        (tasks / "codebase-map.md").write_text("# Map\n- src/main.py: entry point")
-        (tasks / "tasks.md").write_text("# Tasks\nOverview.")  # should be ignored
+        work_id = "test-work-01"
+        plan = tmp_path / ".spine" / "artifacts" / work_id / "plan"
+        plan.mkdir(parents=True)
+        (plan / "plan.json").write_text(
+            json.dumps({
+                "architecture_overview": "test",
+                "feature_slices": [
+                    {
+                        "id": "slice-foo",
+                        "title": "Foo",
+                        "target_files": ["src/foo.py"],
+                        "execution_requirements": "Do the foo thing.",
+                        "dependencies": [],
+                        "acceptance_criteria": ["foo works"],
+                        "complexity": "small",
+                    },
+                    {
+                        "id": "slice-bar",
+                        "title": "Bar",
+                        "target_files": ["src/bar.py"],
+                        "execution_requirements": "Do the bar thing.",
+                        "dependencies": ["slice-foo"],
+                        "acceptance_criteria": ["bar works"],
+                        "complexity": "medium",
+                    },
+                ],
+                "codebase_map": "# Map\n- src/main.py: entry point",
+            })
+        )
 
         tool = ReadSliceFilesTool(
             workspace_root=str(tmp_path),
-            tasks_dir=f".spine/artifacts/{work_id}/tasks",
+            plan_dir=f".spine/artifacts/{work_id}/plan",
         )
         result = json.loads(tool._run())
 
         assert result["slice_count"] == 2
-        assert "slice-foo.md" in result["slices"]
-        assert "slice-bar.md" in result["slices"]
-        assert "Do the foo thing." in result["slices"]["slice-foo.md"]
+        assert "slice-foo" in result["slices"]
+        assert "slice-bar" in result["slices"]
+        assert "Do the foo thing." in result["slices"]["slice-foo"]["execution_requirements"]
+        assert "Do the bar thing." in result["slices"]["slice-bar"]["execution_requirements"]
         assert "entry point" in result["codebase_map"]
-        assert result["tasks_dir"].endswith("tasks")
-        # tasks.md must NOT be included — not a slice-*.md
-        assert "tasks.md" not in result["slices"]
+        assert result["plan_dir"].endswith("plan")
+        # slice-foo should have all expected keys
+        slice_foo = result["slices"]["slice-foo"]
+        assert slice_foo["title"] == "Foo"
+        assert slice_foo["target_files"] == ["src/foo.py"]
+        assert slice_foo["dependencies"] == []
 
     def test_missing_codebase_map_returns_empty_string(self, tmp_path):
-        tasks, work_id = self._make_tasks_dir(tmp_path)
-        (tasks / "slice-alpha.md").write_text("# Alpha")
+        work_id = "test-work-01"
+        plan = tmp_path / ".spine" / "artifacts" / work_id / "plan"
+        plan.mkdir(parents=True)
+        (plan / "plan.json").write_text(
+            json.dumps({
+                "feature_slices": [{"id": "alpha", "title": "A", "target_files": [], "execution_requirements": "", "dependencies": [], "acceptance_criteria": [], "complexity": "small"}],
+                "codebase_map": "",
+            })
+        )
 
         tool = ReadSliceFilesTool(
             workspace_root=str(tmp_path),
-            tasks_dir=f".spine/artifacts/{work_id}/tasks",
+            plan_dir=f".spine/artifacts/{work_id}/plan",
         )
         result = json.loads(tool._run())
 
         assert result["codebase_map"] == ""
         assert result["slice_count"] == 1
 
-    def test_missing_tasks_dir_returns_error(self, tmp_path):
+    def test_missing_plan_dir_returns_error(self, tmp_path):
         tool = ReadSliceFilesTool(
             workspace_root=str(tmp_path),
-            tasks_dir=".spine/artifacts/nonexistent/tasks",
+            plan_dir=".spine/artifacts/nonexistent/plan",
         )
         result = json.loads(tool._run())
 
@@ -72,33 +107,46 @@ class TestReadSliceFilesTool:
         assert "not found" in result["error"].lower()
 
     def test_no_slices_returns_warning(self, tmp_path):
-        tasks, work_id = self._make_tasks_dir(tmp_path)
-        (tasks / "codebase-map.md").write_text("# Map")
-        # No slice-*.md files
+        work_id = "test-work-01"
+        plan = tmp_path / ".spine" / "artifacts" / work_id / "plan"
+        plan.mkdir(parents=True)
+        (plan / "plan.json").write_text(
+            json.dumps({"feature_slices": [], "codebase_map": "# Map"})
+        )
 
         tool = ReadSliceFilesTool(
             workspace_root=str(tmp_path),
-            tasks_dir=f".spine/artifacts/{work_id}/tasks",
+            plan_dir=f".spine/artifacts/{work_id}/plan",
         )
         result = json.loads(tool._run())
 
         assert result["slice_count"] == 0
         assert "warning" in result
 
-    def test_slices_sorted_alphabetically(self, tmp_path):
-        tasks, work_id = self._make_tasks_dir(tmp_path)
-        (tasks / "slice-z.md").write_text("Z")
-        (tasks / "slice-a.md").write_text("A")
-        (tasks / "slice-m.md").write_text("M")
+    def test_slices_ordered_by_plan_json(self, tmp_path):
+        work_id = "test-work-01"
+        plan = tmp_path / ".spine" / "artifacts" / work_id / "plan"
+        plan.mkdir(parents=True)
+        # Input order: a, m, z — dict keys should reflect plan.json order
+        (plan / "plan.json").write_text(
+            json.dumps({
+                "feature_slices": [
+                    {"id": "a-slice", "title": "A", "target_files": [], "execution_requirements": "", "dependencies": [], "acceptance_criteria": [], "complexity": "small"},
+                    {"id": "m-slice", "title": "M", "target_files": [], "execution_requirements": "", "dependencies": [], "acceptance_criteria": [], "complexity": "small"},
+                    {"id": "z-slice", "title": "Z", "target_files": [], "execution_requirements": "", "dependencies": [], "acceptance_criteria": [], "complexity": "small"},
+                ],
+            })
+        )
 
         tool = ReadSliceFilesTool(
             workspace_root=str(tmp_path),
-            tasks_dir=f".spine/artifacts/{work_id}/tasks",
+            plan_dir=f".spine/artifacts/{work_id}/plan",
         )
         result = json.loads(tool._run())
 
         keys = list(result["slices"].keys())
-        assert keys == sorted(keys)
+        # Keys preserve plan.json array order (JSON order)
+        assert keys == ["a-slice", "m-slice", "z-slice"]
 
 
 # ── WriteImplementationReportTool ─────────────────────────────────────────
@@ -231,7 +279,7 @@ class TestBuildImplementOrchestratorTools:
 
         assert isinstance(read_tool, ReadSliceFilesTool)
         assert isinstance(write_tool, WriteImplementationReportTool)
-        assert read_tool.tasks_dir == ".spine/artifacts/xyz/tasks"
+        assert read_tool.plan_dir == ".spine/artifacts/xyz/plan"
         assert write_tool.impl_dir == ".spine/artifacts/xyz/implement"
         assert read_tool.workspace_root == str(tmp_path)
         assert write_tool.workspace_root == str(tmp_path)

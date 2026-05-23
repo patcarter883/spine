@@ -23,7 +23,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    _artifact_path,
+    artifact_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,9 @@ async def _run_tasks_agent(
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
         has_spec = "spec" in work_type
-        spec_path = _artifact_path(work_id, PhaseName.SPECIFY.value)
-        plan_path = _artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_artifact_dir = _artifact_path(work_id, PhaseName.TASKS.value)
+        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
+        tasks_artifact_dir = artifact_path(work_id, PhaseName.TASKS.value)
 
         prompt_lines = []
 
