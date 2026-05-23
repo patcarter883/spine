@@ -28,6 +28,7 @@ from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
+    artifact_path,
     materialize_artifacts,
     materialize_phase_artifacts,
 )
@@ -75,7 +76,7 @@ async def call_specify(
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build the prompt — prior artifacts are on disk, not inlined
-        spec_dir = f".spine/artifacts/{work_id}/specify"
+        spec_dir = artifact_path(work_id, "specify")
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', spec_dir: '{spec_dir}'}};\n\n"
 
         rework_prefix = ""

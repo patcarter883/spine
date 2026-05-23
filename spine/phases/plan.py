@@ -54,7 +54,7 @@ def _read_plan_json(workspace_root: str, work_id: str) -> dict[str, Any] | None:
         Parsed plan.json dict, or None if the file doesn't exist or is
         invalid.
     """
-    plan_json_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+    plan_json_path = Path(artifact_path(work_id, "plan")) / "plan.json"
     if not plan_json_path.exists():
         logger.debug("[%s] plan.json not found at %s", work_id, plan_json_path)
         return None
@@ -168,7 +168,7 @@ async def call_plan(
         # Build prompt — specification is on disk at work_id-scoped path.
         # The original description is intentionally NOT re-included — the
         # specification file already captures and expands on it.
-        plan_dir = f".spine/artifacts/{work_id}/plan"
+        plan_dir = artifact_path(work_id, "plan")
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'plan', plan_dir: '{plan_dir}'}};\n\n"
 
         rework_prefix = ""

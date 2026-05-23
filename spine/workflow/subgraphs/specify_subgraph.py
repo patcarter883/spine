@@ -21,6 +21,7 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
+    artifact_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ async def _run_specify_agent(
         prompt = (
             "Write a formal specification for the work described below.\n\n"
             f"## Work Description\n{description}\n\n"
-            f"Write the specification to `.spine/artifacts/{work_id}/specify/specification.md` "
+            f"Write the specification to `{artifact_path(work_id, PhaseName.SPECIFY.value)}/specification.md` "
             "using `write_file`. "
             "The spec must include: scope, requirements, constraints, "
             "and acceptance criteria."

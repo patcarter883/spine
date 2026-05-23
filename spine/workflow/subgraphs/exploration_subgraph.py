@@ -194,7 +194,7 @@ async def _synthesize_plan(
                 "critic feedback.\n\n"
             )
 
-        spec_path = f".spine/artifacts/{work_id}/specify/specification.md"
+        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value) + "/specification.md"
 
         prompt = (
             f"{rework_prefix}Create a detailed technical plan with structured "
@@ -318,7 +318,7 @@ async def _synthesize_specify(
             f"## Work Description\n{description}\n\n"
             f"## Codebase Research Findings\n{findings_text}\n\n"
             f"Write the specification to "
-            f"`.spine/artifacts/{work_id}/specify/specification.md` "
+            f"`{artifact_path(work_id, PhaseName.SPECIFY.value)}/specification.md` "
             f"using `write_file`."
         )
 
@@ -434,7 +434,12 @@ async def _save_exploration_artifacts(
     """Save artifacts from the exploration subgraph to disk and state."""
     workspace_root = state.get("workspace_root", ".")
     work_id = state.get("work_id", "unknown")
-    phase = state.get("phase", PhaseName.SPECIFY.value)
+    phase = state.get("phase")
+    if phase is None:
+        raise ValueError(
+            "Exploration subgraph state missing 'phase' key. "
+            "This indicates a state mapper configuration error."
+        )
     agent_response = state.get("agent_response", "")
     existing_phase_status = state.get("phase_status", "")
 

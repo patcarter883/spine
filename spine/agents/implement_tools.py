@@ -29,6 +29,8 @@ from langchain_core.tools import BaseTool
 from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
+from spine.agents.artifacts import artifact_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -286,8 +288,8 @@ def build_implement_orchestrator_tools(
     Returns:
         List of two BaseTool instances ready for use.
     """
-    plan_dir = f".spine/artifacts/{work_id}/plan"
-    impl_dir = f".spine/artifacts/{work_id}/implement"
+    plan_dir = artifact_path(work_id, "plan")
+    impl_dir = artifact_path(work_id, "implement")
 
     return [
         ReadSliceFilesTool(

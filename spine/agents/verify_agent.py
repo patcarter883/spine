@@ -17,6 +17,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import (
+    artifact_path,
     build_artifact_prompt,
     build_current_phase_write_prompt,
     list_slice_files,
@@ -66,9 +67,9 @@ def build_verify_agent(
     """
     work_id = state.get("work_id", "")
     workspace_root = state.get("workspace_root", ".")
-    tasks_dir = f".spine/artifacts/{work_id}/tasks"
-    verify_dir = f".spine/artifacts/{work_id}/verify"
-    impl_dir = f".spine/artifacts/{work_id}/implement"
+    tasks_dir = artifact_path(work_id, "tasks")
+    verify_dir = artifact_path(work_id, "verify")
+    impl_dir = artifact_path(work_id, "implement")
 
     # ── Slice inventory ───────────────────────────────────────────────
     slice_files = list_slice_files(workspace_root, work_id)

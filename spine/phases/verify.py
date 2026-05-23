@@ -72,9 +72,9 @@ async def call_verify(
 
         # Build prompt — work from the feature slices, not the original
         # description (already captured and expanded in the upstream artifacts).
-        verify_dir = f".spine/artifacts/{work_id}/verify"
-        tasks_dir = f".spine/artifacts/{work_id}/tasks"
-        impl_dir = f".spine/artifacts/{work_id}/implement"
+        verify_dir = artifact_path(work_id, "verify")
+        tasks_dir = artifact_path(work_id, "tasks")
+        impl_dir = artifact_path(work_id, "implement")
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'verify', tasks_dir: '{tasks_dir}', verify_dir: '{verify_dir}', impl_dir: '{impl_dir}'}};\n\n"
 
         from spine.agents.artifacts import list_slice_files

@@ -27,6 +27,7 @@ from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+from spine.agents.artifacts import artifact_path
 
 # File extensions worth reading when doing codebase search
 _CODE_EXTENSIONS = {
@@ -661,7 +662,7 @@ def build_plan_agent_tools(
     Returns:
         List of four BaseTool instances.
     """
-    plan_dir = f".spine/artifacts/{work_id}/plan"
+    plan_dir = artifact_path(work_id, "plan")
 
     return [
         ReadPriorArtifactsTool(

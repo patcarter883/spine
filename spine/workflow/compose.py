@@ -43,6 +43,7 @@ from spine.workflow.artifact_gate import (
     make_artifact_gate_node,
     artifact_gate_router,
 )
+from spine.agents.artifacts import artifact_path
 from spine.workflow.subgraph_wrapper import (
     make_subgraph_node,
     make_success_result_mapper,
@@ -137,7 +138,7 @@ def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.PLAN.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0),
-        "spec_path": f".spine/artifacts/{work_id}/specify",
+        "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
         "has_spec": True,
     }
 
@@ -149,8 +150,8 @@ def _tasks_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.TASKS.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.TASKS.value, 0),
-        "plan_path": f".spine/artifacts/{work_id}/plan",
-        "spec_path": f".spine/artifacts/{work_id}/specify",
+        "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
+        "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
     }
 
 
@@ -161,8 +162,8 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.IMPLEMENT.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0),
-        "plan_path": f".spine/artifacts/{work_id}/plan",
-        "gap_plan_path": f".spine/artifacts/{work_id}/gap_plan" if verify_attempts > 0 else None,
+        "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
+        "gap_plan_path": artifact_path(work_id, PhaseName.GAP_PLAN.value) if verify_attempts > 0 else None,
         "execution_waves": parent_state.get("execution_waves", []),
     }
 
@@ -175,8 +176,8 @@ def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.VERIFY.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.VERIFY.value, 0),
-        "plan_path": f".spine/artifacts/{work_id}/plan",
-        "spec_path": f".spine/artifacts/{work_id}/specify",
+        "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
+        "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
     }
 
 
@@ -190,7 +191,7 @@ def _critic_state_mapper(reviewed_phase: str):
             "phase": PhaseName.CRITIC.value,
             "retry_count": parent_state.get("retry_count", {}).get(reviewed_phase, 0),
             "reviewed_phase": reviewed_phase,
-            "reviewed_phase_path": f".spine/artifacts/{work_id}/{reviewed_phase}",
+            "reviewed_phase_path": artifact_path(work_id, reviewed_phase),
         }
 
     return mapper
@@ -308,8 +309,15 @@ def _critic_result_mapper(reviewed_phase: str):
         if phase_status == ReviewStatus.NEEDS_REVIEW.value:
             base["status"] = "needs_review"
             base["needs_review_phase"] = reviewed_phase
+            # Increment retry count before routing to needs_review
+            retry_count = parent_state.get("retry_count", {})
+            current = retry_count.get(reviewed_phase, 0)
+            base["retry_count"] = {reviewed_phase: current + 1}
         elif phase_status == ReviewStatus.NEEDS_REVISION.value:
-            # Router will check retry count and route accordingly
+            # Increment retry count for rework loops
+            retry_count = parent_state.get("retry_count", {})
+            current = retry_count.get(reviewed_phase, 0)
+            base["retry_count"] = {reviewed_phase: current + 1}
             base["status"] = "running"
         elif phase_status == "error":
             base["status"] = "failed"
@@ -326,8 +334,8 @@ def _gap_plan_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.GAP_PLAN.value,
         "retry_count": 0,
-        "verify_path": f".spine/artifacts/{work_id}/verify",
-        "plan_path": f".spine/artifacts/{work_id}/plan",
+        "verify_path": artifact_path(work_id, PhaseName.VERIFY.value),
+        "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
     }
 
 

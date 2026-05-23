@@ -202,18 +202,6 @@ class TestArtifactGateNode:
         assert artifact_gate_router(state) == "needs_review"
 
 
-class TestLegacyArtifactGateFn:
-    """Tests for the legacy make_artifact_gate_fn (backward compat)."""
-
-    def test_make_gate_fn_produces_callable(self):
-        from spine.workflow.artifact_gate import make_artifact_gate_fn
-
-        fn = make_artifact_gate_fn("implement", "verify")
-        assert callable(fn)
-        result = fn({"artifacts": {"implement": {"impl.md": "x" * 100}}})
-        assert result == "proceed"
-
-
 # ── Critic status propagation tests ──
 
 

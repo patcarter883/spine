@@ -95,8 +95,7 @@ async def call_tasks(
         # ── Compute the exact artifact output path ──
         # Used in the completion reminder in the user message.
         tasks_artifact_dir = artifact_path(work_id, PhaseName.TASKS.value)
-        tasks_dir = f".spine/artifacts/{work_id}/tasks"
-        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'tasks', tasks_dir: '{tasks_dir}'}};\n\n"
+        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'tasks', tasks_dir: '{tasks_artifact_dir}'}};\n\n"
 
         prompt_lines = []
         if retry_count > 0:

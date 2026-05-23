@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 
 # Re-export shared tools so callers only need to import from tasks_tools
 from spine.agents.plan_tools import ReadPriorArtifactsTool, SearchCodebaseTool  # noqa: F401
+from spine.agents.artifacts import artifact_path
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +290,7 @@ def build_tasks_agent_tools(
     Returns:
         List of three BaseTool instances.
     """
-    tasks_dir = f".spine/artifacts/{work_id}/tasks"
+    tasks_dir = artifact_path(work_id, "tasks")
 
     return [
         ReadPriorArtifactsTool(

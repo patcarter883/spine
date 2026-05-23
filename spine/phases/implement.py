@@ -178,8 +178,8 @@ async def call_implement(
 
         # Build prompt — all prior artifacts are on disk, NOT inlined.
         # Skip spec/plan references for quick workflows that lack them.
-        impl_dir = f".spine/artifacts/{work_id}/implement"
-        tasks_dir = f".spine/artifacts/{work_id}/tasks"
+        impl_dir = artifact_path(work_id, "implement")
+        tasks_dir = artifact_path(work_id, "tasks")
 
         # ── Resolve execution waves from state (preferred) or legacy ──
         execution_waves = state.get("execution_waves")

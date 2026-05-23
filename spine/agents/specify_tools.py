@@ -24,6 +24,8 @@ from langchain_core.tools import BaseTool
 from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
+from spine.agents.artifacts import artifact_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -221,7 +223,7 @@ def build_specify_orchestrator_tools(
     Returns:
         List of two BaseTool instances.
     """
-    spec_dir = f".spine/artifacts/{work_id}/specify"
+    spec_dir = artifact_path(work_id, "specify")
 
     return [
         ReadWorkContextTool(

@@ -38,6 +38,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import (
+    artifact_path,
     build_artifact_prompt,
     build_current_phase_write_prompt,
     list_slice_files,
@@ -95,7 +96,7 @@ def build_implement_agent(
     """
     work_id = state.get("work_id", "")
     workspace_root = state.get("workspace_root", ".")
-    tasks_dir = f".spine/artifacts/{work_id}/tasks"
+    tasks_dir = artifact_path(work_id, "tasks")
 
     # ── Determine dispatch mode: waves (preferred) or legacy ──────────
     # When execution_waves is present in state (produced by the PLAN
@@ -108,7 +109,7 @@ def build_implement_agent(
     if has_waves:
         total_slices = sum(len(wave) for wave in execution_waves)
         wave_count = len(execution_waves)
-        plan_dir = f".spine/artifacts/{work_id}/plan"
+        plan_dir = artifact_path(work_id, "plan")
         plan_json_path = f"{plan_dir}/plan.json"
         slice_inventory = (
             f"{total_slices} slice(s) in {wave_count} execution wave(s) "
