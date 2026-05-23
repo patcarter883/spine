@@ -576,7 +576,7 @@ def build_workflow_graph(
     for i, (node_name, _reviewed_phase) in enumerate(phase_seq):
         if i < len(phase_seq) - 1:
             next_node_name = phase_seq[i + 1][0]
-            if PhaseName(next_node_name) == PhaseName.IMPLEMENT:
+            if next_node_name == PhaseName.IMPLEMENT.value:
                 gate_edges[(node_name, next_node_name)] = PhaseName.PLAN.value
 
     # ── Exploration subgraph override ──
@@ -788,7 +788,7 @@ def build_workflow_graph(
             # were registered in the gate-node loop above.
             gate_name = _gate_node_name(node_name, next_node)
             graph.add_edge(node_name, gate_name)
-        elif PhaseName(node_name) == PhaseName.VERIFY:
+        elif node_name == PhaseName.VERIFY.value:
             # Verify uses its own router for gap-fix loop support.
             # On passed → END. On needs_gap_fix → gap_plan → implement → verify.
             # On needs_review (gap attempts exhausted) → human_review.
