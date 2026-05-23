@@ -29,13 +29,14 @@ def test_exploration_subgraph_builds():
     assert graph is not None
 
 
-def test_exploration_subgraph_rejects_plan():
-    """PLAN exploration subgraph should raise NotImplementedError."""
+def test_exploration_subgraph_supports_plan():
+    """PLAN exploration subgraph should build and compile without errors."""
     from spine.workflow.subgraphs.exploration_subgraph import build_exploration_subgraph
     from spine.models.enums import PhaseName
 
-    with pytest.raises(NotImplementedError, match="PLAN exploration subgraph not yet"):
-        build_exploration_subgraph(phase=PhaseName.PLAN.value)
+    builder = build_exploration_subgraph(phase=PhaseName.PLAN.value)
+    graph = builder.compile()
+    assert graph is not None
 
 
 def test_exploration_subgraph_rejects_unknown_phase():

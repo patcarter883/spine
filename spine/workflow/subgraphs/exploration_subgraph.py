@@ -492,7 +492,7 @@ async def _save_exploration_artifacts(
 
 
 def build_exploration_subgraph(
-    phase: str = PhaseName.SPECIFY.value,
+    phase: str,
     max_rounds: int = _DEFAULT_MAX_ROUNDS,
 ) -> Any:
     """Build the multi-node exploration → synthesis subgraph.
