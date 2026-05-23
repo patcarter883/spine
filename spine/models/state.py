@@ -96,3 +96,10 @@ class WorkflowState(TypedDict, total=False):
     verify_attempts: int  # How many gap-fix cycles attempted (starts at 0).
     # Incremented by the verify result mapper when verification fails.
     # After 2 cycles (3 total verify runs), the 3rd failure routes to human_review.
+
+    # ── Phase Completion Invariants (prevent rework misinterpretation) ──
+    # These boolean flags track whether critical phase operations completed
+    # successfully, preventing the system from re-interpreting empty/failed
+    # artifacts as intentionally empty work.
+    gap_plan_produced: bool  # True when gap_plan.md was successfully created
+    exploration_executed: bool  # True when SPECIFY/PLAN research rounds ran

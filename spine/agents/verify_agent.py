@@ -4,10 +4,15 @@ Same orchestrator pattern as the implement phase: dispatch one
 ``slice-verifier`` per feature slice, synthesize results into
 ``verification.md``. The orchestrator does not verify slices inline.
 
-Tool restriction: orchestrator gets read-only filesystem tools plus
-``write_file`` (for ``verification.md`` only). ``execute`` is excluded
-— if a real test run is needed, that's the subagent's job. ``edit_file``
-is excluded because verify must never mutate code.
+Tool restriction: orchestrator gets purpose-built tools that enforce
+dispatch-only behavior:
+- ``read_verify_context`` — loads all verification inputs in one call
+- ``write_verification_report`` — writes verification.md (only write surface)
+- ``task`` (from SubAgentMiddleware)
+- ``eval`` (from CodeInterpreterMiddleware)
+
+Generic filesystem tools are excluded — the orchestrator cannot
+read arbitrary files or write source code.
 """
 
 from __future__ import annotations
@@ -20,23 +25,12 @@ from spine.agents.artifacts import (
     artifact_path,
     build_artifact_prompt,
     build_current_phase_write_prompt,
-    list_slice_files,
 )
 from spine.agents.factory import build_phase_agent
 from spine.agents.subagents import build_phase_subagents
+from spine.agents.verify_tools import build_verify_orchestrator_tools
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-
-# ── Tool allowlist ─────────────────────────────────────────────────────
-# Verify orchestrator: read-only + write_file for verification.md.
-# Test execution belongs to slice-verifier subagents (they have execute).
-_VERIFY_ORCHESTRATOR_TOOLS: list[str] = [
-    "ls",
-    "read_file",
-    "glob",
-    "grep",
-    "write_file",  # for verification.md only
-]
 
 
 def _build_subagents(
@@ -67,23 +61,9 @@ def build_verify_agent(
     """
     work_id = state.get("work_id", "")
     workspace_root = state.get("workspace_root", ".")
-    tasks_dir = artifact_path(work_id, "tasks")
-    verify_dir = artifact_path(work_id, "verify")
-    impl_dir = artifact_path(work_id, "implement")
 
-    # ── Slice inventory ───────────────────────────────────────────────
-    slice_files = list_slice_files(workspace_root, work_id)
-    slice_count = len(slice_files)
-
-    if slice_count == 0:
-        slice_inventory = (
-            "⚠ No slice-*.md files found in tasks/ directory. "
-            "Use `ls` + `glob` to locate slice files before proceeding."
-        )
-    else:
-        slice_inventory = f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n" + "\n".join(
-            f"  - `{tasks_dir}/{name}`" for name in slice_files
-        )
+    # ── Build custom tools ───────────────────────────────────────────────
+    custom_tools = build_verify_orchestrator_tools(workspace_root, work_id)
 
     system_prompt = (
         _build_orchestrator_prompt()
@@ -93,13 +73,16 @@ def build_verify_agent(
         + build_artifact_prompt(state.get("artifacts", {}), PhaseName.VERIFY.value, work_id=work_id)
     )
 
+    # ── Build agent with skip_filesystem_middleware ──────────────────────
+    # The custom tools replace generic filesystem access entirely.
     agent = build_phase_agent(
         state=state,
         config=config,
         phase=PhaseName.VERIFY,
         system_prompt=system_prompt,
         subagents=_build_subagents(PhaseName.VERIFY, state, config),
-        allowed_tools=_VERIFY_ORCHESTRATOR_TOOLS,
+        extra_tools=custom_tools,
+        skip_filesystem_middleware=True,  # Custom tools replace generic FS
     )
 
     return agent
@@ -114,68 +97,58 @@ def _build_orchestrator_prompt() -> str:
         "You are the VERIFY phase orchestrator. You do NOT inspect source "
         "code yourself — you dispatch one `slice-verifier` subagent per "
         "feature slice and synthesize their verdicts into a single report.\n\n"
-        "Your tools are restricted to read-only filesystem operations plus "
-        "`write_file` (reserved for `verification.md`), `task`, and `eval`. "
-        "You do NOT have `edit_file` or `execute` — verify never mutates "
-        "code, and test execution belongs to subagents.\n\n"
-        "## Expected tool errors (BY DESIGN — do not recover)\n"
-        "If you attempt to call `edit_file` or `execute`, you will see a "
-        "'tool not found' or 'unknown tool' error. This is **not a bug** — "
-        "your toolset is deliberately filtered. Do not try alternative "
-        "tools or attempt to work around the restriction. Dispatch a "
-        "`slice-verifier` subagent instead — they can run tests.\n\n"
-        "## Workflow (3 steps, ~5 turns total)\n\n"
+        "Your tools are restricted to purpose-built tools plus `task` and `eval`. "
+        "You do NOT have generic filesystem tools — your toolset is "
+        "deliberately minimal to enforce dispatch-only behavior.\n\n"
+        "## Tool surface\n"
+        "- `read_verify_context` — Call this FIRST. Returns all verification inputs "
+        "(slices, codebase_map, implementation.md) in one structured call. "
+        "No arguments needed.\n"
+        "- `write_verification_report` — Call this LAST. Accepts structured "
+        "verification results from subagents and writes verification.md. "
+        "This is the ONLY write surface.\n"
+        "- `task` — Dispatch one `slice-verifier` subagent per slice.\n"
+        "- `eval` — Run JS for parallel subagent dispatch.\n\n"
+        "## Workflow (2 steps)\n\n"
         "### Step 1 — Read context\n"
-        "In ONE turn, batch-read the codebase-map.md tasks file and implementation files.\n"
-        "Refer to Step 1 & Step 2 guidelines preloaded in your user context pre-prompt.\n\n"
-        "### Step 2 — Dispatch slice-verifier subagents in parallel\n"
-        "Each `task` description MUST be fully self-contained. Embed:\n"
-        "1. The full slice text (acceptance criteria, files to verify)\n"
-        "2. Relevant excerpts from implementation.md (what the implementer "
-        "reported for this slice)\n"
-        "3. Codebase-map.md excerpts for files involved in this slice\n\n"
-        "Dispatch pattern (do this inside one `eval` call):\n"
+        "Call `read_verify_context` to load slices, codebase_map, and implementation. "
+        "The result includes:\n"
+        "- `slices`: mapping of slice filename → full content\n"
+        "- `codebase_map`: codebase navigation guide\n"
+        "- `implementation`: full implementation.md content\n\n"
+        "### Step 2 — Dispatch and synthesize\n"
+        "Inside ONE `eval` call:\n"
+        "1. Store the context from Step 1 in interpreter state\n"
+        "2. Dispatch all slice-verifier subagents in parallel via `Promise.allSettled`\n"
+        "3. Collect results and call `write_verification_report`\n\n"
+        "Each `task` description MUST be self-contained. Embed:\n"
+        "1. The full slice text (acceptance criteria, target files)\n"
+        "2. Relevant implementation excerpt for this slice\n"
+        "3. Codebase-map excerpts for files involved\n\n"
+        "Dispatch pattern inside eval:\n"
         "```js\n"
-        "const sliceFiles = [/* slice filenames */];\n"
-        "const dispatches = sliceFiles.map(async (name) => {\n"
-        "  const slice = await tools.read_file({file_path: "
-        "`tools.readFile` returns a string directly.\n`});\n"
-        "  return tools.task({\n"
-        '    subagent_type: "slice-verifier",  // ONLY valid type\n'
-        "    description: `Verify slice: ${name}\\n\\n`\n"
-        "      + `## Slice Definition\\n${slice.content}\\n\\n`\n"
-        "      + `## Implementation Report Excerpt\\n${implExcerpt}\\n`,\n"
-        "  });\n"
-        "});\n"
+        "const {slices, codebase_map, implementation} = globalThis.verifyContext;\n"
+        "const sliceFiles = Object.keys(slices);\n"
+        "const dispatches = sliceFiles.map(name => \n"
+        "  tools.task({\n"
+        "    subagent_type: 'slice-verifier',\n"
+        "    description: `Verify slice: ${name}\n\n` +\n"
+        "      `## Slice Definition\n${slices[name]}\n` +\n"
+        "      `## Codebase Map\n${codebase_map}\n` +\n"
+        "      `## Implementation\n${implementation}\n`\n"
+        "  })\n"
+        ");\n"
         "const results = await Promise.allSettled(dispatches);\n"
         "globalThis.verifyResults = results;\n"
-        "console.log(JSON.stringify(results.map(r => "
-        "({status: r.status, verdict: r.value?.verdict}))));\n"
         "```\n\n"
-        "### Step 3 — Synthesize verification.md\n"
-        "Write verification.md report.\n\n"
-        "The first line MUST be one of:\n"
-        "- `VERIFIED` — every slice's subagent returned VERIFIED\n"
-        "- `PASSED` — synonym for VERIFIED\n"
-        "- `FAILED` — at least one slice was NOT_VERIFIED, or any subagent "
-        "raised an exception\n\n"
-        "Follow with:\n"
-        "- One section per slice with the subagent's verdict and checklist\n"
-        "- Aggregated gaps and recommendations\n"
-        "- If FAILED: a clear list of which slices failed and why\n\n"
+        "After eval, extract results and call `write_verification_report` with:\n"
+        "- `verification_results`: array of {slice_name, verdict, checklist, gaps, recommendations}\n"
+        "- `summary`: overall verification status\n\n"
         "## Strict Rules\n"
-        "- You MUST NOT call `edit_file`, `execute`, or `write_file` on "
-        "anything other than `verification.md`. Your toolset is filtered.\n"
-        "- You MUST dispatch one `slice-verifier` subagent per slice. "
-        "Do not attempt to verify slices inline.\n"
-        "- The ONLY valid `subagent_type` is `slice-verifier`. Do NOT "
-        "request `general-purpose` — it does not exist.\n"
-        "- Subagent dispatch MUST happen inside `eval` so subagents run "
-        "in parallel via `Promise.allSettled`. Sequential conversation "
-        "tool calls are not parallel.\n"
-        "- `verification.md` is REQUIRED — without it the phase fails.\n\n"
-        "## Eval Context Seed (first eval call)\n"
-        "Access session-specific context properties via `globalThis.context` "
-        "preloaded in your workspace environment on first turn (e.g., "
-        "use `globalThis.context.work_id` or `globalThis.context.tasks_dir` inside eval).\n\n"
+        "- You have NO generic filesystem tools. Call `read_verify_context` first.\n"
+        "- You MUST dispatch one `slice-verifier` subagent per slice.\n"
+        "- Do NOT attempt to verify slices inline — dispatch subagents.\n"
+        "- The ONLY valid `subagent_type` is `slice-verifier`.\n"
+        "- Subagent dispatch MUST happen inside `eval` for parallelism.\n"
+        "- `verification.md` is REQUIRED — the phase fails without it.\n"
     )

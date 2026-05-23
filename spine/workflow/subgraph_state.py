@@ -55,6 +55,10 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     gap_plan_path: str | None  # Set when re-running for a gap fix
     execution_waves: list  # Execution waves from PLAN phase (for wave dispatch)
 
+    # ── Phase Completion Invariants ──
+    slices_dispatched: bool  # True when slice-implementers were dispatched
+    implementation_files_written: bool  # True when code files were created
+
 
 class VerifySubgraphState(BaseSubgraphState, total=False):
     """VERIFY phase — confirms implementation."""
@@ -62,6 +66,10 @@ class VerifySubgraphState(BaseSubgraphState, total=False):
     tasks_path: str
     spec_path: str | None  # Only for spec/critical_spec workflows
     plan_path: str | None
+
+    # ── Phase Completion Invariants ──
+    verification_attempted: bool  # True when verify agent ran (vs. skipped)
+    verification_passed: bool  # True when verification confirmed passing
 
 
 class CriticSubgraphState(BaseSubgraphState, total=False):
@@ -101,6 +109,12 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer
+
+    # ── Phase Completion Invariants (prevent rework misinterpretation) ──
+    # Track whether the exploration loop actually executed vs. was skipped,
+    # and whether the synthesis produced valid output.
+    exploration_happened: bool  # True when research rounds executed (vs. skipped)
+    synthesis_completed: bool  # True when synthesizer produced valid output
 
     # PLAN-specific fields
     spec_path: str  # Path to specification.md (for PLAN explore agents)
