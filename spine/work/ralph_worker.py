@@ -22,6 +22,12 @@ from typing import Any
 import sqlite_utils
 
 from spine.config import SpineConfig
+from spine.models.enums import TaskStatus
+
+_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    s.value for s in TaskStatus
+    if s.value not in ("pending", "running")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +198,7 @@ class RalphLoopWorker:
                     result.get("status", "completed") if isinstance(result, dict) else "completed"
                 )
                 queue_status = (
-                    work_status if work_status in ("failed", "needs_review") else "completed"
+                    work_status if work_status in _TERMINAL_STATUSES else "completed"
                 )
                 work_id = result.get("work_id") if isinstance(result, dict) else None
 
@@ -243,7 +249,7 @@ class RalphLoopWorker:
                     pass
 
     def reset_stuck_items(self) -> int:
-        """Reset any queue items stuck in "running" back to "pending".
+        """Reset any queue items stuck in "running" or "stalled" back to "pending".
 
         When the worker or UI dies mid-execution, items remain in "running"
         status indefinitely.  This method resets them so they can be picked
@@ -258,7 +264,9 @@ class RalphLoopWorker:
         from spine.persistence.checkpoint import CheckpointStore
 
         db = self._get_db()
-        stuck = list(db["queue"].rows_where("status = ?", ["running"], order_by="started_at"))
+        stuck = list(db["queue"].rows_where(
+            "status IN (?, ?)", ["running", "stalled"], order_by="started_at"
+        ))
         if not stuck:
             return 0
 
@@ -285,7 +293,7 @@ class RalphLoopWorker:
             count += 1
             logger.info(f"Reset stuck queue item {item_id}")
 
-        logger.info(f"reset_stuck_items: reset {count}/{len(stuck)} running items")
+        logger.info(f"reset_stuck_items: reset {count}/{len(stuck)} running/stalled items")
         return count
 
     def queue_status(self) -> dict[str, int]:
@@ -336,7 +344,7 @@ class RalphLoopWorker:
         return rows[0] if rows else None
 
     def list_recent_completed(self, limit: int = 20) -> list[dict[str, Any]]:
-        """List recently completed/failed queue items.
+        """List recently terminated queue items (all non-pending, non-running statuses).
 
         Args:
             limit: Maximum number of items to return.
@@ -346,8 +354,8 @@ class RalphLoopWorker:
         """
         rows = list(
             self._get_db()["queue"].rows_where(
-                "status IN (?, ?)",
-                ["completed", "failed"],
+                "status NOT IN (?, ?)",
+                ["pending", "running"],
                 order_by="completed_at DESC",
                 limit=limit,
             )

@@ -34,7 +34,10 @@ def _execution_duration(api: UIApi, work_id: str, entry: dict[str, object], stat
     Returns:
         Human-readable duration string, or ``"—`` if insufficient data.
     """
-    terminal_statuses = ("completed", "failed", "needs_review")
+    terminal_statuses = (
+        "completed", "failed", "needs_review", "stalled",
+        "awaiting_approval", "approved", "rejected",
+    )
     audit_events = api.get_audit_log(work_id=work_id)
     if not audit_events:
         return format_duration(entry.get("created_at"), entry.get("updated_at"))
@@ -58,7 +61,7 @@ def _execution_duration(api: UIApi, work_id: str, entry: dict[str, object], stat
         )
         end_ts = end_event.get("timestamp") if end_event else None
         return format_duration(start_ts, end_ts)
-    elif status in ("running", "stalled"):
+    elif status == "running":
         # Live elapsed time since start
         return format_duration(start_ts)
     else:

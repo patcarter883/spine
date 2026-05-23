@@ -401,6 +401,12 @@ class UIApi:
             if key in entry and entry[key]:
                 active[key] = entry[key]
 
+        # Surface the work entry's status separately so the UI can detect
+        # stalled items while still trusting the queue table's authoritative
+        # status for queue lifecycle display.
+        if "status" in entry and entry["status"]:
+            active["work_status"] = entry["status"]
+
     # ── Resume operations ──
 
     def resume_work(

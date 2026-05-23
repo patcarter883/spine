@@ -100,10 +100,11 @@ def _render_summary(api: UIApi) -> None:
     overview = api.get_queue_overview()
     summary = overview.get("status_summary", {})
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Pending", summary.get("pending", 0))
     c2.metric("Running", summary.get("running", 0))
-    c3.metric("Completed", summary.get("completed", 0))
+    c3.metric("Failed", summary.get("failed", 0) + summary.get("stalled", 0))
+    c4.metric("Completed", summary.get("completed", 0))
 
 
 @st.fragment(run_every=_POLL_INTERVAL)
@@ -208,6 +209,31 @@ def _render_active_job(api: UIApi) -> None:
         if result:
             st.error("**Error:**")
             st.code(result)
+
+    # Timing-based stalled heuristic (fallback when enrichment fails)
+    if not active.get("work_status") and created_at:
+        try:
+            from datetime import datetime as _dt, timezone
+
+            start = _dt.fromisoformat(created_at)
+            elapsed = (
+                _dt.now(timezone.utc) - start.replace(tzinfo=timezone.utc)
+            ).total_seconds()
+            if elapsed > 300:
+                st.warning(
+                    f"⚠️ This job has been running for {int(elapsed)}s and may be stalled."
+                )
+        except Exception:
+            pass
+
+    # Stalled detection (RC4)
+    work_status = active.get("work_status")
+    if work_status == "stalled":
+        st.warning(
+            "⚠️ This job appears to be **stalled**. "
+            "The workflow hasn't produced output since the stall timeout. "
+            "Use the Reset button below to retry."
+        )
 
     # Reset stuck items button
     st.divider()
