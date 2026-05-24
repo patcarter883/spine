@@ -147,7 +147,7 @@ Providers are configured in `.spine/config.yaml` and resolved at runtime:
 Each phase runs inside its own nested LangGraph subgraph with per-phase SQLite checkpoints. This provides:
 
 - **Isolation**: A crash or CancelledError in one phase does not corrupt another phase's checkpoints
-- **Per-phase state**: Each subgraph has its own TypedDict state schema (e.g., `VerifySubgraphState`, `TasksSubgraphState`) separate from the parent `WorkflowState`
+- **Per-phase state**: Each subgraph has its own TypedDict state schema (e.g., `VerifySubgraphState`) separate from the parent `WorkflowState`
 - **State mapping**: State mappers transform parent state into subgraph state on entry; result mappers transform subgraph output back to parent state on exit
 
 Subgraph builders are registered at import time in `compose.py`:
@@ -155,7 +155,6 @@ Subgraph builders are registered at import time in `compose.py`:
 ```
 build_verify_subgraph    -> spine/workflow/subgraphs/verify_subgraph.py
 build_implement_subgraph -> spine/workflow/subgraphs/implement_subgraph.py
-build_tasks_subgraph     -> spine/workflow/subgraphs/tasks_subgraph.py
 build_specify_subgraph   -> spine/workflow/subgraphs/specify_subgraph.py
 build_plan_subgraph      -> spine/workflow/subgraphs/plan_subgraph.py
 build_critic_subgraph    -> spine/workflow/subgraphs/critic_subgraph.py
@@ -173,20 +172,19 @@ build_gap_plan_subgraph  -> spine/workflow/subgraphs/gap_plan_subgraph.py
 | `spine/workflow/registry.py` | PhaseRegistry - maps phase names to node functions and agent builders |
 | `spine/workflow/subgraph_wrapper.py` | `make_subgraph_node()` + `make_success_result_mapper()` - wraps subgraphs as parent nodes |
 | `spine/workflow/subgraph_state.py` | Per-phase subgraph TypedDict state schemas |
-| `spine/workflow/subgraphs/` | Phase subgraph implementations |
-| `spine/workflow/slice_scheduler.py` | Topological sort for feature slice execution waves via `graphlib.TopologicalSorter` |
-| `spine/workflow/phase_progress.py` | `mark_phase_started()` - marks work entries when a phase begins |
-| `spine/work/dispatcher.py` | `submit_work()`, `resume_work()`, `get_work_status()`, `list_work()` - unified CLI+UI entry points |
-| `spine/work/ralph_worker.py` | RalphLoopWorker - background queue processor (singleton) |
-| `spine/work/plan_resolver.py` | Parses plan artifacts into structured work units |
-| `spine/phases/specify.py` | SPECIFY phase node function + imports subgraph |
-| `spine/phases/plan.py` | PLAN phase node function + imports subgraph |
-| `spine/phases/tasks.py` | TASKS phase node function |
-| `spine/phases/implement.py` | IMPLEMENT phase node function |
-| `spine/phases/verify.py` | VERIFY phase node function |
-| `spine/phases/critic.py` | CRITIC phase node function |
-| `spine/phases/gap_plan.py` | GAP_PLAN phase node function |
-| `spine/agents/factory.py` | `build_phase_agent()` - single entry point for all phase agent construction |
+|| `spine/workflow/subgraphs/` | Phase subgraph implementations |
+|| `spine/workflow/slice_scheduler.py` | Topological sort for feature slice execution waves via `graphlib.TopologicalSorter` |
+|| `spine/workflow/phase_progress.py` | `mark_phase_started()` - marks work entries when a phase begins |
+|| `spine/work/dispatcher.py` | `submit_work()`, `resume_work()`, `get_work_status()`, `list_work()` - unified CLI+UI entry points |
+|| `spine/work/ralph_worker.py` | RalphLoopWorker - background queue processor (singleton) |
+|| `spine/work/plan_resolver.py` | Parses plan artifacts into structured work units |
+|| `spine/phases/specify.py` | SPECIFY phase node function + imports subgraph |
+|| `spine/phases/plan.py` | PLAN phase node function + imports subgraph |
+|| `spine/phases/implement.py` | IMPLEMENT phase node function |
+|| `spine/phases/verify.py` | VERIFY phase node function |
+|| `spine/phases/critic.py` | CRITIC phase node function |
+|| `spine/phases/gap_plan.py` | GAP_PLAN phase node function |
+|| `spine/agents/factory.py` | `build_phase_agent()` - single entry point for all phase agent construction |
 | `spine/agents/helpers.py` | `resolve_model()`, `debug_enabled()`, `extract_response()` - shared utilities |
 | `spine/agents/profile.py` | SPINE HarnessProfile - replaces DA base prompt with phase-executor framing |
 | `spine/agents/retry.py` | `invoke_with_retry()` - exponential backoff for transient LLM API errors |
@@ -203,8 +201,6 @@ build_gap_plan_subgraph  -> spine/workflow/subgraphs/gap_plan_subgraph.py
 | `spine/agents/specify_tools.py` | SPECIFY phase purpose-built tools |
 | `spine/agents/plan_agent.py` | PLAN phase agent builder |
 | `spine/agents/plan_tools.py` | PLAN phase purpose-built tools |
-| `spine/agents/tasks_agent.py` | TASKS phase agent builder |
-| `spine/agents/tasks_tools.py` | TASKS phase purpose-built tools |
 | `spine/agents/implement_agent.py` | IMPLEMENT phase agent builder |
 | `spine/agents/implement_tools.py` | IMPLEMENT phase purpose-built tools |
 | `spine/agents/verify_agent.py` | VERIFY phase agent builder |

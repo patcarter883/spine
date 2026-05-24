@@ -268,11 +268,9 @@ def render(api: UIApi) -> None:
         provider_names = ["(default)"] + [p.get("name", "unnamed") for p in llm_providers]
 
         phase_providers = api.get_phase_providers()
-
         phase_config = {
             "specify": ("📐 Specify", "specify"),
             "plan": ("📝 Plan", "plan"),
-            "tasks": ("📋 Tasks", "tasks"),
             "implement": ("🔨 Implement", "implement"),
             "verify": ("🔍 Verify", "verify"),
             "critic": ("🧐 Critic", "critic"),
