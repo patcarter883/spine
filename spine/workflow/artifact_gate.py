@@ -38,7 +38,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from langchain_core.runnables import RunnableConfig
 
@@ -470,6 +470,184 @@ def artifact_gate_router(state: WorkflowState) -> str:
     if state.get("status") == "running":
         return "proceed"
     return "needs_review"
+
+
+# ── Prerequisite Gate Node Functions ─────────────────────────────────────
+# These create LangGraph nodes that check phase completion invariants.
+# When the check fails, they return status="needs_review" so the workflow
+# routes to human_review instead of proceeding with empty artifacts.
+
+
+def make_prerequisite_gate_node(
+    check_fn: Callable[[WorkflowState], tuple[bool, str]],
+    target_phase: str,
+) -> Any:
+    """Create a prerequisite gate node that checks a phase completion flag.
+
+    The returned function has the LangGraph node signature
+    ``(state, config) -> partial_state_update``.
+
+    Args:
+        check_fn: A function that takes WorkflowState and returns (passed, reason).
+        target_phase: The phase that requires the prerequisite (for error messages).
+
+    Returns:
+        A node function suitable for ``graph.add_node()``.
+    """
+    phase_completion_flags = {
+        "plan": "spec_completed",
+        "implement": "plan_completed",
+        "verify": "implement_completed",
+        "gap_plan": "verification_attempted",
+    }
+
+    def gate_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
+        work_id = state.get("work_id", "unknown")
+
+        passed, reason = check_fn(state)
+
+        if passed:
+            logger.debug(
+                "[%s] Prerequisite gate passed for %s → proceeding",
+                work_id,
+                target_phase,
+            )
+            return {
+                "current_phase": target_phase,
+                "status": "running",
+                "prompt_request": None,
+            }
+
+        # Gate failed — flag for human review
+        logger.warning(
+            "[%s] Prerequisite gate FAILED for %s: %s",
+            work_id,
+            target_phase,
+            reason,
+        )
+        return {
+            "current_phase": target_phase,
+            "status": "needs_review",
+            "feedback": [
+                {
+                    "status": "needs_review",
+                    "tier": "structural",
+                    "reason": f"Prerequisite gate for {target_phase}: {reason}",
+                    "suggestions": [],
+                }
+            ],
+            "prompt_request": None,
+        }
+
+    # Give the function a readable name
+    gate_node.__name__ = f"gate_prereq_{target_phase}"
+    return gate_node
+
+
+# ── Phase Prerequisite Check Functions ──────────────────────────────────
+# These functions implement "fail-closed" gates that verify a preceding phase
+# completed successfully before allowing the next phase to run. They check
+# the state invariants (completion flags) that are set when phases complete.
+
+
+def _check_spec_prerequisite(state: WorkflowState) -> tuple[bool, str]:
+    """Check that SPECIFY phase completed before PLAN runs.
+
+    PLAN requires a valid specification artifact. This check ensures
+    the spec_completed flag is True, preventing PLAN from running on
+    empty or failed SPECIFY output.
+
+    Returns:
+        ``(passed, reason)`` — ``passed=True`` means PLAN should proceed;
+        ``reason`` is a human-readable explanation on failure.
+    """
+    spec_completed = state.get("spec_completed", False)
+
+    if spec_completed:
+        logger.debug("plan prerequisite: spec_completed=True, proceeding")
+        return True, ""
+
+    return (
+        False,
+        "PLAN phase requires SPECIFY to have completed successfully. "
+        "The specification artifact is missing or the SPECIFY phase did not finish. "
+        "Re-run SPECIFY or resolve the prior failure before proceeding.",
+    )
+
+
+def _check_plan_prerequisite(state: WorkflowState) -> tuple[bool, str]:
+    """Check that PLAN phase completed before IMPLEMENT runs.
+
+    IMPLEMENT requires a valid plan with feature_slices. This check ensures
+    the plan_completed flag is True, preventing IMPLEMENT from running on
+    empty or failed PLAN output.
+
+    Returns:
+        ``(passed, reason)`` — ``passed=True`` means IMPLEMENT should proceed;
+        ``reason`` is a human-readable explanation on failure.
+    """
+    plan_completed = state.get("plan_completed", False)
+
+    if plan_completed:
+        logger.debug("implement prerequisite: plan_completed=True, proceeding")
+        return True, ""
+
+    return (
+        False,
+        "IMPLEMENT phase requires PLAN to have completed successfully. "
+        "The plan artifact is missing or the PLAN phase did not finish. "
+        "Re-run PLAN or resolve the prior failure before proceeding.",
+    )
+
+
+def _check_implement_prerequisite(state: WorkflowState) -> tuple[bool, str]:
+    """Check that IMPLEMENT phase completed before VERIFY runs.
+
+    VERIFY requires implementation artifacts to validate. This check ensures
+    the implement_completed flag is True, preventing VERIFY from running on
+    empty or failed IMPLEMENT output.
+
+    Returns:
+        ``(passed, reason)`` — ``passed=True`` means VERIFY should proceed;
+        ``reason`` is a human-readable explanation on failure.
+    """
+    implement_completed = state.get("implement_completed", False)
+
+    if implement_completed:
+        logger.debug("verify prerequisite: implement_completed=True, proceeding")
+        return True, ""
+
+    return (
+        False,
+        "VERIFY phase requires IMPLEMENT to have completed successfully. "
+        "The implementation artifact is missing or the IMPLEMENT phase did not finish. "
+        "Re-run IMPLEMENT or resolve the prior failure before proceeding.",
+    )
+
+
+def _check_verify_prerequisite(state: WorkflowState) -> tuple[bool, str]:
+    """Check that VERIFY attempted (not necessarily passed) before GAP_PLAN runs.
+
+    GAP_PLAN requires the verification report (whether passed or failed) to
+    determine what gaps need remediation. This check ensures the
+    verification_attempted flag is True.
+
+    Returns:
+        ``(passed, reason)`` — ``passed=True`` means GAP_PLAN should proceed;
+        ``reason`` is a human-readable explanation on failure.
+    """
+    verification_attempted = state.get("verification_attempted", False)
+
+    if verification_attempted:
+        logger.debug("gap_plan prerequisite: verification_attempted=True, proceeding")
+        return True, ""
+
+    return (
+        False,
+        "GAP_PLAN phase requires VERIFY to have run at least once. "
+        "The verification artifact is missing or VERIFY did not execute. "
+        "Run VERIFY before GAP_PLAN can produce a remediation plan.",
+    )
 
 
 

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from spine.models.enums import ReviewStatus, TaskStatus, WorkType
+from typing import Literal
 
 
 # ── Work Unit Models (for plan decomposition) ──
@@ -141,36 +141,70 @@ class StructuredPlan:
     risks: list[str] = field(default_factory=list)
     codebase_map: dict[str, Any] = field(default_factory=dict)
 
-    def to_json(self, *, indent: int = 2) -> str:
-        """Serialize the full plan to a JSON string.
 
-        Feature slices are serialized via their ``to_dict()`` method so
-        the roundtrip through ``from_json`` is lossless.
-        """
-        data = {
-            "architecture_overview": self.architecture_overview,
-            "technology_choices": self.technology_choices,
-            "feature_slices": [s.to_dict() for s in self.feature_slices],
-            "testing_strategy": self.testing_strategy,
-            "risks": self.risks,
-            "codebase_map": self.codebase_map,
-        }
-        return json.dumps(data, indent=indent)
+# ── Specification and Gap Planning Models ──
 
-    @classmethod
-    def from_json(cls, raw: str) -> StructuredPlan:
-        """Deserialize a StructuredPlan from a JSON string.
 
-        Raises ``json.JSONDecodeError`` for malformed input and ``TypeError``
-        if the top-level value is not a JSON object.
-        """
-        data = json.loads(raw)
-        slices = [FeatureSlice.from_dict(s) for s in data.get("feature_slices", [])]
-        return cls(
-            architecture_overview=data.get("architecture_overview", ""),
-            technology_choices=data.get("technology_choices", []),
-            feature_slices=slices,
-            testing_strategy=data.get("testing_strategy", ""),
-            risks=data.get("risks", []),
-            codebase_map=data.get("codebase_map", {}),
-        )
+class Specification(BaseModel):
+    """Structured specification output from SPECIFY phase."""
+
+    title: str = Field(description="Specification title")
+    summary: str = Field(description="Executive summary (2-3 sentences)")
+    objectives: list[str] = Field(description="High-level goals", default_factory=list)
+    requirements: list[str] = Field(description="Functional requirements", default_factory=list)
+    constraints: list[str] = Field(
+        description="Non-functional constraints", default_factory=list
+    )
+    scope_inclusions: list[str] = Field(
+        description="Scope inclusions", default_factory=list
+    )
+    scope_exclusions: list[str] = Field(
+        description="Scope exclusions", default_factory=list
+    )
+    known_risks: list[str] = Field(description="Known risks", default_factory=list)
+
+
+class FixInstruction(BaseModel):
+    """Structured fix instruction for one gap."""
+
+    slice_id: str = Field(description="ID of the slice containing this gap")
+    file_path: str = Field(description="File path to modify")
+    change_type: Literal["add", "modify", "delete"] = Field(
+        description="Type of change to make"
+    )
+    specific_change: str = Field(
+        description="Precise description of what to change"
+    )
+    acceptance_criteria: list[str] = Field(
+        description="Acceptance criteria for the fix", default_factory=list
+    )
+    estimated_complexity: Literal["small", "medium", "large"] = Field(
+        default="small", description="Estimated complexity"
+    )
+
+
+class GapPlan(BaseModel):
+    """Structured gap plan output."""
+
+    verification_summary: str = Field(description="Summary of verification failures")
+    gaps_identified: int = Field(description="Number of gaps found")
+    fix_instructions: list[FixInstruction] = Field(
+        description="Structured fix instructions", default_factory=list
+    )
+    re_verify_slices: list[str] = Field(
+        description="Slice IDs that need re-verification", default_factory=list
+    )
+
+
+class CriticReview(BaseModel):
+    """Structured critic output."""
+
+    status: Literal["PASSED", "NEEDS_REVISION", "NEEDS_REVIEW"] = Field(
+        description="Review status"
+    )
+    tier: Literal["structural", "agent"] = Field(description="Review tier")
+    reason: str = Field(description="Reason for the review decision")
+    suggestions: list[str] = Field(default_factory=list, description="Suggestions for improvement")
+    score: int | None = Field(
+        default=None, description="Optional 1-10 quality score"
+    )

@@ -89,6 +89,7 @@ class SpineConfig:
     )
     default_timeout: int = 0
     mcp_servers: dict = field(default_factory=dict)
+    guided_decoding: bool = False
 
     @staticmethod
     def _find_workspace_root() -> str:
@@ -241,7 +242,24 @@ class SpineConfig:
                 str(spine.get("tool_schema_validation", True)).lower(),
             )
             not in ("0", "false", "no"),
+            phase_timeouts=spine.get(
+                "phase_timeouts",
+                {
+                    "specify": 0,
+                    "plan": 0,
+                    "tasks": 0,
+                    "implement": 0,
+                    "verify": 0,
+                    "critic": 0,
+                },
+            ),
+            default_timeout=int(spine.get("default_timeout", 0)),
             mcp_servers=mcp_servers,
+            guided_decoding=os.getenv(
+                "SPINE_GUIDED_DECODING",
+                str(spine.get("guided_decoding", False)).lower(),
+            )
+            in ("1", "true", "yes"),
         )
 
     def resolve_model(self, phase: str | None = None) -> str:
@@ -318,6 +336,7 @@ class SpineConfig:
         "max_completion_tokens",
         "request_timeout",
         "max_retries",
+        "guided_decoding",
     )
 
     def resolve_active_provider(self) -> dict | None:

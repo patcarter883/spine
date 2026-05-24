@@ -56,6 +56,13 @@ from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
 from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
 from spine.workflow.subgraphs.exploration_subgraph import build_exploration_subgraph
 from spine.workflow.subgraphs.gap_plan_subgraph import build_gap_plan_subgraph
+from spine.workflow.artifact_gate import (
+    make_prerequisite_gate_node,
+    _check_spec_prerequisite,
+    _check_plan_prerequisite,
+    _check_implement_prerequisite,
+    _check_verify_prerequisite,
+)
 
 # ── Subgraph builder registry ──────────────────────────────────────────
 # Used by the per-phase checkpointer to recompile subgraphs at runtime
@@ -224,6 +231,10 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
         ]
     elif phase_status == "error":
         base["status"] = "failed"
+    # Set completion invariants
+    base["verify_completed"] = phase_status == "success"
+    base["verification_attempted"] = True
+    base["verification_passed"] = phase_status == "success"
     return base
 
 
@@ -236,6 +247,10 @@ def _implement_result_mapper(subgraph_result: dict, parent_state: WorkflowState)
         base["needs_review_phase"] = PhaseName.IMPLEMENT.value
     elif phase_status == "error":
         base["status"] = "failed"
+    # Set completion invariants
+    base["implement_completed"] = phase_status == "success"
+    base["slices_dispatched"] = subgraph_result.get("slices_dispatched", False)
+    base["implementation_files_written"] = subgraph_result.get("implementation_files_written", False)
     return base
 
 
@@ -248,6 +263,9 @@ def _tasks_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> 
         base["needs_review_phase"] = PhaseName.TASKS.value
     elif phase_status == "error":
         base["status"] = "failed"
+    # Set completion invariants
+    base["tasks_completed"] = phase_status == "success"
+    base["work_units_count"] = len(subgraph_result.get("work_units", []))
     return base
 
 
@@ -260,6 +278,8 @@ def _specify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -
         base["needs_review_phase"] = PhaseName.SPECIFY.value
     elif phase_status == "error":
         base["status"] = "failed"
+    # Set completion invariants
+    base["spec_completed"] = phase_status == "success"
     return base
 
 
@@ -276,6 +296,9 @@ def _plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> d
     execution_waves = subgraph_result.get("execution_waves", [])
     if execution_waves:
         base["execution_waves"] = execution_waves
+    # Set completion invariants
+    base["plan_completed"] = phase_status == "success"
+    base["feature_slices_count"] = len(subgraph_result.get("feature_slices", []))
     return base
 
 
@@ -341,7 +364,17 @@ def _gap_plan_state_mapper(parent_state: WorkflowState, config) -> dict:
 
 def _gap_plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
     """Map GapPlanSubgraphState output back to parent WorkflowState."""
-    return make_success_result_mapper(PhaseName.GAP_PLAN.value)(subgraph_result, parent_state)
+    base = make_success_result_mapper(PhaseName.GAP_PLAN.value)(subgraph_result, parent_state)
+    phase_status = subgraph_result.get("phase_status", "")
+    if phase_status == "needs_review":
+        base["status"] = "needs_review"
+        base["needs_review_phase"] = PhaseName.GAP_PLAN.value
+    elif phase_status == "error":
+        base["status"] = "failed"
+    # Set completion invariants
+    base["gap_plan_completed"] = phase_status == "success"
+    base["gaps_identified"] = len(subgraph_result.get("gaps", []))
+    return base
 
 
 # ── Phase sequences per work type ──
@@ -723,6 +756,32 @@ def build_workflow_graph(
                 use_per_phase_checkpointer=True,
             ),
         )
+    else:
+        # Legacy gap_plan node — wrap with phase-start tracking
+        gap_plan_def = registry.require(PhaseName.GAP_PLAN.value)
+        if gap_plan_def.call_fn is None:
+            raise ValueError(f"Phase '{PhaseName.GAP_PLAN.value}' has no call_fn (legacy mode)")
+        graph.add_node(PhaseName.GAP_PLAN.value, _make_legacy_node(PhaseName.GAP_PLAN.value, gap_plan_def.call_fn))
+
+    # ── Prerequisite Gate Nodes ─────────────────────────────────────────
+    # These gates check phase completion invariants before allowing phases to run.
+    # They are wired inline with the graph edges to block empty progression.
+
+    # Gate: PLAN requires SPECIFY completed
+    prereq_gate_plan = make_prerequisite_gate_node(_check_spec_prerequisite, PhaseName.PLAN.value)
+    graph.add_node("prereq_gate_plan", prereq_gate_plan)
+
+    # Gate: IMPLEMENT requires PLAN completed
+    prereq_gate_implement = make_prerequisite_gate_node(_check_plan_prerequisite, PhaseName.IMPLEMENT.value)
+    graph.add_node("prereq_gate_implement", prereq_gate_implement)
+
+    # Gate: VERIFY requires IMPLEMENT completed
+    prereq_gate_verify = make_prerequisite_gate_node(_check_implement_prerequisite, PhaseName.VERIFY.value)
+    graph.add_node("prereq_gate_verify", prereq_gate_verify)
+
+    # Gate: GAP_PLAN requires VERIFY attempted
+    prereq_gate_gap_plan = make_prerequisite_gate_node(_check_verify_prerequisite, PhaseName.GAP_PLAN.value)
+    graph.add_node("prereq_gate_gap_plan", prereq_gate_gap_plan)
 
     # Add artifact gate nodes and their outgoing conditional edges.
     # Gate nodes route to ``next_node`` on proceed or ``human_review`` on
@@ -746,6 +805,11 @@ def build_workflow_graph(
             },
         )
 
+    # ── Prerequisite Gate Router ───────────────────────────────────────
+    def prereq_gate_router(state: WorkflowState) -> str:
+        """Route based on prerequisite gate check result."""
+        return state.get("status")  # "running" → proceed, "needs_review" → human_review
+
     # Wire the graph
     if start_from_phase:
         graph.add_edge(START, start_from_phase)
@@ -760,6 +824,20 @@ def build_workflow_graph(
         edge_key = (node_name, next_node) if next_node else None
         has_gate = edge_key in gate_edges if edge_key else False
 
+        # Determine the target for "proceed" (after phase succeeds)
+        # This includes both artifact gates AND prerequisite gates
+        def get_proceed_target(next_node_name: str | None) -> str:
+            """Get the target node, potentially routing through prerequisite gate."""
+            if next_node_name is None:
+                return END
+            # Map target phases to their prerequisite gates
+            prereq_gate = {
+                PhaseName.PLAN.value: "prereq_gate_plan",
+                PhaseName.IMPLEMENT.value: "prereq_gate_implement",
+                PhaseName.VERIFY.value: "prereq_gate_verify",
+            }
+            return prereq_gate.get(next_node_name, next_node_name)
+
         if node_name.startswith(PhaseName.CRITIC.value):
             # Critic node → conditional edge
             pre_critic = phase_seq[i - 1][0] if i > 0 else phase_seq[0][0]
@@ -769,7 +847,7 @@ def build_workflow_graph(
                 gate_name = _gate_node_name(node_name, next_node)
                 critic_proceed_target: str = gate_name
             elif not is_last and next_node:
-                critic_proceed_target = next_node
+                critic_proceed_target = get_proceed_target(next_node)
             else:
                 critic_proceed_target = END
 
@@ -784,20 +862,20 @@ def build_workflow_graph(
                 },
             )
         elif has_gate and next_node:
-            # Route to the gate node; its outgoing conditional edges
+            # Route to the artifact gate node; its outgoing conditional edges
             # were registered in the gate-node loop above.
             gate_name = _gate_node_name(node_name, next_node)
             graph.add_edge(node_name, gate_name)
         elif node_name == PhaseName.VERIFY.value:
             # Verify uses its own router for gap-fix loop support.
-            # On passed → END. On needs_gap_fix → gap_plan → implement → verify.
+            # On passed → END. On needs_gap_fix → prereq_gate_gap_plan → gap_plan → implement → verify.
             # On needs_review (gap attempts exhausted) → human_review.
             graph.add_conditional_edges(
                 node_name,
                 _verify_router,
                 {
                     "passed": END,
-                    "needs_gap_fix": PhaseName.GAP_PLAN.value,
+                    "needs_gap_fix": "prereq_gate_gap_plan",
                     "needs_review": "human_review",
                     "failed": END,
                 },
@@ -808,11 +886,13 @@ def build_workflow_graph(
             # Without this, a failing specify silently feeds an empty
             # plan, which feeds an empty critic, and so on — burning
             # tokens and exceeding budgets.
+            # Also route through prerequisite gate for the next phase.
+            target = get_proceed_target(next_node)
             graph.add_conditional_edges(
                 node_name,
                 _phase_status_router,
                 {
-                    "proceed": next_node,
+                    "proceed": target,
                     "needs_review": "human_review",
                     "failed": END,
                 },
@@ -829,6 +909,45 @@ def build_workflow_graph(
                     "failed": END,
                 },
             )
+
+    # Wire prerequisite gates to their target phases via conditional edges
+    # (failure routes to human_review, success routes to target phase)
+    graph.add_conditional_edges(
+        "prereq_gate_plan",
+        _phase_status_router,
+        {
+            "proceed": PhaseName.PLAN.value,
+            "needs_review": "human_review",
+            "failed": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "prereq_gate_implement",
+        _phase_status_router,
+        {
+            "proceed": PhaseName.IMPLEMENT.value,
+            "needs_review": "human_review",
+            "failed": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "prereq_gate_verify",
+        _phase_status_router,
+        {
+            "proceed": PhaseName.VERIFY.value,
+            "needs_review": "human_review",
+            "failed": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "prereq_gate_gap_plan",
+        _phase_status_router,
+        {
+            "proceed": PhaseName.GAP_PLAN.value,
+            "needs_review": "human_review",
+            "failed": END,
+        },
+    )
 
     # Wire gap_plan → implement (gap-fix loop: verify → gap_plan → implement → verify)
     graph.add_edge(PhaseName.GAP_PLAN.value, PhaseName.IMPLEMENT.value)

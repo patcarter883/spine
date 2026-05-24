@@ -199,6 +199,43 @@ async def agent_critic_check(
 def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
     """Parse the critic agent's response into a structured review dict.
 
+    First checks for structured output (CriticReview via response_format).
+    Falls back to keyword parsing for backwards compatibility.
+    """
+    # Try structured output first (from response_format=CriticReview)
+    structured = result.get("structured_response")
+    if structured is not None:
+        # Handle CriticReview Pydantic model
+        if isinstance(structured, dict):
+            status_raw = structured.get("status", "NEEDS_REVISION")
+            reason = structured.get("reason", "Structured review completed")
+            suggestions = structured.get("suggestions", [])
+        elif hasattr(structured, "model_dump"):
+            data = structured.model_dump()
+            status_raw = data.get("status", "NEEDS_REVISION")
+            reason = data.get("reason", "Structured review completed")
+            suggestions = data.get("suggestions", [])
+        else:
+            # Fallback for unexpected structured format
+            return _parse_agent_review_fallback(result, reviewed_phase)
+
+        # Normalize status to lowercase (CriticReview uses uppercase)
+        status = status_raw.lower() if isinstance(status_raw, str) else status_raw
+
+        return {
+            "status": status,
+            "tier": "agent",
+            "reason": reason,
+            "suggestions": suggestions,
+        }
+
+    # Fallback to keyword parsing for backwards compatibility
+    return _parse_agent_review_fallback(result, reviewed_phase)
+
+
+def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, Any]:
+    """Fallback keyword parser for unstructured critic agent responses.
+
     Looks for PASSED, NEEDS_REVISION, or NEEDS_REVIEW keywords in the response.
     Falls back to NEEDS_REVISION if unclear.
     """

@@ -17,6 +17,7 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
 from spine.workflow.critic_review import _get_reviewed_phase
+from spine.models.types import CriticReview
 
 
 # ── PLAN-specific review instructions appended to the system prompt ──────────
@@ -109,6 +110,7 @@ def build_critic_agent(
         config=config,
         phase=PhaseName.CRITIC,
         system_prompt=system_prompt,
+        response_format=CriticReview,
     )
 
     return agent

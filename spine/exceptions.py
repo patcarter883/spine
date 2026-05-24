@@ -47,3 +47,17 @@ class TransientAPIError(SpineError):
     def __init__(self, original: Exception) -> None:
         self.original = original
         super().__init__(f"Transient API error: {type(original).__name__}: {original}")
+
+
+class CriticalContractFailure(SpineError):
+    """A phase precondition or invariant was violated.
+
+    Raised when a required artifact is missing, a phase flag is incorrect,
+    or any other critical workflow contract is broken. This signals that
+    the workflow cannot progress safely without human intervention.
+    """
+
+    def __init__(self, phase: str, reason: str) -> None:
+        self.phase = phase
+        self.reason = reason
+        super().__init__(f"Critical contract failure in '{phase}': {reason}")
