@@ -49,12 +49,14 @@ providers:
     model: openai:model
     base_url: 'http://localhost:8000/v1'
     api_key: 'vllm'
+    guided_decoding: true
     enabled: true
   - name: pat
     type: deepagents-model
     model: openai:model
     base_url: 'http://10.50.1.51:8000/v1'
     api_key: 'vllm'
+    guided_decoding: true
     enabled: true
   
   phases:
@@ -71,10 +73,12 @@ providers:
     implement:
       provider: local
       temperature: 0.6           # freezes just the temp override
+      guided_decoding: true
 
     # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
       provider: local
+      guided_decoding: true
 
     # Verification → local vLLM model with custom endpoint
     verify:

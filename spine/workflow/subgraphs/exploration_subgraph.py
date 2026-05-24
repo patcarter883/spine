@@ -340,9 +340,23 @@ async def _synthesize_specify(
             context=ctx,
         )
 
+        # ── Read specification.json from disk (written by write_specification) ──
+        spec_json_path = (
+            Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
+        )
+        spec_json_str: str | None = None
+
+        if spec_json_path.exists():
+            try:
+                spec_json_str = spec_json_path.read_text(encoding="utf-8")
+                logger.info("[%s] Read specification.json (%d chars)", work_id, len(spec_json_str))
+            except (OSError) as exc:
+                logger.warning("[%s] Failed to read specification.json: %s", work_id, exc)
+
         return {
             "messages": result.get("messages", []),
             "agent_response": extract_response(result),
+            "specification_json": spec_json_str,
         }
 
     except Exception as e:
@@ -476,6 +490,15 @@ async def _save_exploration_artifacts(
         )
         if plan_json_path.exists() and plan_json_str:
             disk_artifacts["plan.json"] = plan_json_str[:_MAX_ARTIFACT_STATE_CHARS]
+
+    # SPECIFY-specific: merge specification.json into disk_artifacts
+    spec_json_str = state.get("specification_json")
+    if isinstance(disk_artifacts, dict) and "specification.json" not in disk_artifacts:
+        spec_json_path = (
+            Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
+        )
+        if spec_json_path.exists() and spec_json_str:
+            disk_artifacts["specification.json"] = spec_json_str[:_MAX_ARTIFACT_STATE_CHARS]
 
     result: dict[str, Any] = {
         "artifacts_output": disk_artifacts,

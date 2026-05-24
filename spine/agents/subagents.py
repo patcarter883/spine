@@ -507,7 +507,7 @@ def build_subagent_spec(
     if name not in SUBAGENT_DESCRIPTIONS:
         raise ValueError(f"Unknown subagent {name!r}. Available: {sorted(SUBAGENT_DESCRIPTIONS)}")
 
-    from spine.agents.helpers import resolve_model
+    from spine.agents.helpers import _supports_guided_decoding, resolve_model
     from spine.agents.skills_resolver import resolve_memory
 
     workspace_root = state.get("workspace_root", ".")
@@ -590,7 +590,13 @@ def build_subagent_spec(
     # reasoning mode (Qwen3, QwQ, etc.) reject this parameter, crashing
     # every researcher subagent with a 400 error.  Skip response_format
     # for those models — the prompt already instructs JSON output.
-    if name == "researcher" and _supports_forced_tool_choice(model):
+    #
+    # Local vLLM/sGLang servers support constrained decoding via guided_json
+    # even when forced_tool_choice is unsupported — the response_format
+    # schema is injected as guided_json in the model kwargs.
+    if name in SUBAGENT_RESPONSE_MODELS and (
+        _supports_forced_tool_choice(model) or _supports_guided_decoding(model)
+    ):
         spec["response_format"] = SUBAGENT_RESPONSE_MODELS[name]
     if memory:
         spec["memory"] = memory

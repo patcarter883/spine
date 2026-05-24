@@ -29,7 +29,9 @@ class BaseSubgraphState(TypedDict, total=False):
 
 
 class SpecifySubgraphState(BaseSubgraphState, total=False):
-    """SPECIFY phase — produces specification.md."""
+    """SPECIFY phase — produces specification.md + specification.json."""
+
+    specification_json: str  # Raw specification.json content (for downstream phases)
 
 
 class PlanSubgraphState(BaseSubgraphState, total=False):
@@ -70,6 +72,8 @@ class VerifySubgraphState(BaseSubgraphState, total=False):
     # ── Phase Completion Invariants ──
     verification_attempted: bool  # True when verify agent ran (vs. skipped)
     verification_passed: bool  # True when verification confirmed passing
+
+    verification_findings: list[dict]  # Structured VerificationResult objects from subagents
 
 
 class CriticSubgraphState(BaseSubgraphState, total=False):

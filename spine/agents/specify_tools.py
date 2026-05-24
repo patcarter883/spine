@@ -128,6 +128,15 @@ class _WriteSpecificationInput(BaseModel):
             "Any open questions or risks discovered during research. Optional — omit if none."
         ),
     )
+    specification_json: str | None = Field(
+        default=None,
+        description=(
+            "Structured JSON specification (must be valid JSON). "
+            "Use the Specification schema with keys: title, summary, "
+            "objectives, requirements, constraints, scope_inclusions, "
+            "scope_exclusions, known_risks."
+        ),
+    )
 
 
 class WriteSpecificationTool(BaseTool):
@@ -158,6 +167,7 @@ class WriteSpecificationTool(BaseTool):
         interfaces: str,
         success_criteria: str,
         open_questions: str = "",
+        specification_json: str | None = None,
     ) -> str:
         spec_path = Path(self.workspace_root) / self.spec_dir
         spec_path.mkdir(parents=True, exist_ok=True)
@@ -185,8 +195,17 @@ class WriteSpecificationTool(BaseTool):
         except OSError as exc:
             return f"ERROR: Could not write specification.md: {exc}"
 
+        json_msg = ""
+        if specification_json:
+            json_path = spec_path / "specification.json"
+            try:
+                json_path.write_text(specification_json, encoding="utf-8")
+                json_msg = f" + specification.json ({len(specification_json)} chars)"
+            except OSError as exc:
+                json_msg = f" (specification.json write FAILED: {exc})"
+
         return (
-            f"specification.md written to {self.spec_dir}/specification.md ({len(content)} chars)."
+            f"specification.md written to {self.spec_dir}/specification.md ({len(content)} chars){json_msg}."
         )
 
     async def _arun(self, **kwargs: Any) -> str:

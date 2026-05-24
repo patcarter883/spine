@@ -235,6 +235,9 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
     base["verify_completed"] = phase_status == "success"
     base["verification_attempted"] = True
     base["verification_passed"] = phase_status == "success"
+    vf = subgraph_result.get("verification_findings", [])
+    if vf:
+        base["verification_findings"] = vf
     return base
 
 
@@ -344,6 +347,12 @@ def _critic_result_mapper(reviewed_phase: str):
             base["status"] = "running"
         elif phase_status == "error":
             base["status"] = "failed"
+
+        # Set critic completion invariants
+        if reviewed_phase == PhaseName.SPECIFY.value:
+            base["critic_specify_completed"] = True
+        elif reviewed_phase == PhaseName.PLAN.value:
+            base["critic_plan_completed"] = True
 
         return base
 
@@ -796,11 +805,20 @@ def build_workflow_graph(
             gate_name,
             make_artifact_gate_node(required_phase, dst),
         )
+        # Route through prerequisite gate when target has one.
+        # Without this, critic_plan → gate_* → IMPLEMENT bypasses
+        # prereq_gate_implement, skipping the plan_completed invariant check.
+        prereq_gate_map = {
+            PhaseName.PLAN.value: "prereq_gate_plan",
+            PhaseName.IMPLEMENT.value: "prereq_gate_implement",
+            PhaseName.VERIFY.value: "prereq_gate_verify",
+        }
+        actual_dst = prereq_gate_map.get(dst, dst)
         graph.add_conditional_edges(
             gate_name,
             artifact_gate_router,
             {
-                "proceed": dst,
+                "proceed": actual_dst,
                 "needs_review": "human_review",
             },
         )

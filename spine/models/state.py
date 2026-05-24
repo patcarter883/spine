@@ -115,6 +115,7 @@ class WorkflowState(TypedDict, total=False):
     gap_plan_completed: bool  # True when GAP_PLAN phase completed successfully
 
     # Additional tracking fields
+    verification_findings: list[dict]  # Structured VerificationResult objects from subagents
     verification_attempted: bool  # True when VERIFY phase ran
     verification_passed: bool  # True when VERIFY phase passed
     implementation_files_written: bool  # True when IMPLEMENT wrote files

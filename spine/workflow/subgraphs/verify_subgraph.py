@@ -186,9 +186,18 @@ async def _save_verify_artifacts(
     verify_text = next(iter(disk_artifacts.values()), "") if disk_artifacts else ""
     is_verified = "VERIFIED" in verify_text.upper() or "PASSED" in verify_text.upper()
 
+    # Populate verification_findings from agent structured response
+    agent_result = state.get("messages", [])
+    verification_findings: list[dict] = []
+    if isinstance(agent_result, dict) and "structured_response" in agent_result:
+        sr = agent_result.get("structured_response", {})
+        if isinstance(sr, dict):
+            verification_findings = [sr]
+
     return {
         "artifacts_output": disk_artifacts,
         "phase_status": "success" if is_verified else "needs_review",
+        "verification_findings": verification_findings,
     }
 
 
