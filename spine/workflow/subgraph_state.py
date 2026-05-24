@@ -88,6 +88,7 @@ class GapPlanSubgraphState(BaseSubgraphState, total=False):
 
     verify_path: str
     plan_path: str
+    gap_plan_json: str  # Raw gap_plan.json content (for downstream phases)
 
 
 class ExplorationSubgraphState(BaseSubgraphState, total=False):

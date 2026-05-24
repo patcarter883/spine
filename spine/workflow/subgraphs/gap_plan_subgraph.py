@@ -8,6 +8,7 @@ State schema: ``GapPlanSubgraphState`` — isolated from parent ``WorkflowState`
 """
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -21,7 +22,6 @@ from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.artifacts import (
     materialize_artifacts,
-    materialize_phase_artifacts,
     scan_artifact_dir,
     artifact_path,
 )
@@ -37,7 +37,7 @@ async def _run_gap_plan_agent(
     """Run the gap_plan Deep Agent within the subgraph.
 
     Reads the verification report for failed items, references the
-    original plan and codebase map, and produces gap_plan.md.
+    original plan and codebase map, and produces gap_plan.md + gap_plan.json.
     """
     work_id = state.get("work_id", "unknown")
     work_type = state.get("work_type", "")
@@ -49,36 +49,20 @@ async def _run_gap_plan_agent(
         agent = build_gap_plan_agent(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
+        # Get artifact paths for context
         verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
         plan_path = artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
-        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
         gap_plan_path = artifact_path(work_id, PhaseName.GAP_PLAN.value)
 
         prompt = (
-            "Read the verification report to understand what issues were "
-            "found during verification. Then produce a gap_plan.md with "
-            "specific, targeted fix instructions.\n\n"
-            "## Artifacts Available on Disk\n"
+            "Your tools are ready. Call ``read_verification_findings`` FIRST "
+            "to load all verification inputs in one call. Then analyze the failures "
+            "and call ``write_structured_gap_plan`` with your remediation items.\n\n"
+            "## Artifact Paths for Reference\n"
             f"- Verification report: `{verify_path}/verification.md`\n"
             f"- Original plan: `{plan_path}/plan.md`\n"
-            f"- Codebase map: `{tasks_path}/codebase-map.md`\n"
-            f"- Tasks/slices: `{tasks_path}/tasks.md`\n"
-            f"- Implementation summary: `{impl_path}/implementation.md`\n\n"
-            "## Instructions\n"
-            "1. Read the verification report first (`{verify_path}/verification.md`).\n"
-            "2. For each failing slice, identify what needs to change by referencing "
-            "the codebase map (`{tasks_path}/codebase-map.md`).\n"
-            "3. Read the original plan (`{plan_path}/plan.md`) for context.\n"
-            "4. Produce a concise gap_plan.md with per-file fix instructions.\n\n"
-            "Do NOT re-explore the codebase or produce a full new plan.\n\n"
-            f"Write `gap_plan.md` to `{gap_plan_path}/gap_plan.md` using `write_file`.\n"
-            "This file is REQUIRED — without it the phase is treated as failed."
-        ).format(
-            verify_path=verify_path,
-            tasks_path=tasks_path,
-            plan_path=plan_path,
-            gap_plan_path=gap_plan_path,
+            f"- Codebase map: `{artifact_path(work_id, 'tasks')}/codebase-map.md`\n"
+            f"- Output: `{gap_plan_path}/gap_plan.md` and `{gap_plan_path}/gap_plan.json`\n"
         )
 
         ctx = build_context(dict(state), PhaseName.GAP_PLAN)
@@ -92,9 +76,19 @@ async def _run_gap_plan_agent(
             context=ctx,
         )
 
+        # Load gap_plan.json content for state propagation
+        gap_plan_json_path = Path(workspace_root) / gap_plan_path / "gap_plan.json"
+        gap_plan_json_content = ""
+        if gap_plan_json_path.exists():
+            try:
+                gap_plan_json_content = gap_plan_json_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
         return {
             "messages": result.get("messages", []),
             "agent_response": extract_response(result),
+            "gap_plan_json": gap_plan_json_content,
         }
 
     except Exception as e:
@@ -102,6 +96,7 @@ async def _run_gap_plan_agent(
         return {
             "messages": [],
             "agent_response": f"Agent error: {e}",
+            "gap_plan_json": "",
             "phase_status": "error",
         }
 
@@ -113,7 +108,6 @@ async def _save_gap_plan_artifacts(
     """Save artifacts from the gap_plan agent to disk and state."""
     workspace_root = state.get("workspace_root", ".")
     work_id = state.get("work_id", "unknown")
-    agent_response = state.get("agent_response", "")
     existing_phase_status = state.get("phase_status", "")
 
     if existing_phase_status in ("error", "needs_review"):
@@ -122,21 +116,13 @@ async def _save_gap_plan_artifacts(
             "phase_status": existing_phase_status,
         }
 
+    # Scan the gap_plan directory for artifacts (gap_plan.md and gap_plan.json)
     disk_artifacts = scan_artifact_dir(
         workspace_root,
         work_id,
         PhaseName.GAP_PLAN.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
     )
-
-    if not disk_artifacts and agent_response.strip():
-        materialize_phase_artifacts(
-            PhaseName.GAP_PLAN.value,
-            {"gap_plan.md": agent_response},
-            workspace_root,
-            work_id=work_id,
-        )
-        disk_artifacts = {"gap_plan.md": agent_response[:_MAX_ARTIFACT_STATE_CHARS]}
 
     return {
         "artifacts_output": disk_artifacts,
