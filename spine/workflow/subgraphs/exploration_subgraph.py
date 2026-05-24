@@ -84,7 +84,7 @@ def _research_router(
         logger.info("Research complete — routing to synthesize")
         return "synthesize"  # type: ignore[return-value]
 
-    sends = [Send("explore", {"topic": t, "phase": phase}) for t in topics]
+    sends = [Send("explore", {"topic": t, "phase": state.get("phase", "")}) for t in topics]
     logger.info("Dispatching %d explore node(s): %s", len(sends), topics)
     return sends
 
