@@ -19,7 +19,6 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import (
-    artifact_path,
     build_artifact_prompt,
     build_current_phase_write_prompt,
 )
@@ -94,7 +93,8 @@ def _build_orchestrator_prompt() -> str:
         "You are the VERIFY phase orchestrator. Dispatch one `slice-verifier` "
         "subagent per feature slice and synthesize their verdicts into a single report.\n\n"
         "## Your Tool Surface (ONLY these tools)\n"
-        "- `read_verify_context` — loads slices, codebase map, and implementation in ONE call. "
+        "- `read_verify_context` — loads structured slices (from plan.json), codebase map, "
+        "and structured implementation results (from implementation.json) in ONE call. "
         "No arguments needed. Call this FIRST.\n"
         "- `write_verification_report` — writes verification.md. Call this LAST.\n"
         "- `eval` — JavaScript REPL for subagent dispatch. Use `tools.task()` inside.\n\n"
@@ -102,9 +102,9 @@ def _build_orchestrator_prompt() -> str:
         "Call `read_verify_context` with no arguments. It returns:\n"
         "```json\n"
         "{\n"
-        '  "slices": {"slice-name.md": "full slice content", ...},\n'
+        '  "slices": {"<slice_id>": {"id": "<slice_id>", "files": [...], "description": "...", ...}},\n'
         '  "codebase_map": "<string>",\n'
-        '  "implementation": "<string>"\n'
+        '  "implementation": {"<structured implementation results dict>"}\n'
         "}\n"
         "```\n\n"
         "Store in eval: `globalThis.verifyContext = result;`\n\n"
@@ -112,14 +112,15 @@ def _build_orchestrator_prompt() -> str:
         "Complete ALL slices in a SINGLE eval call:\n"
         "```js\n"
         "const {slices, codebase_map, implementation} = globalThis.verifyContext;\n"
+        "const implStr = JSON.stringify(implementation, null, 2);\n"
         "const results = await Promise.allSettled(\n"
-        "  Object.keys(slices).map(name =>\n"
+        "  Object.entries(slices).map(([id, data]) =>\n"
         "    tools.task({\n"
         "      subagent_type: 'slice-verifier',\n"
-        "      description: `Verify slice: ${name}\n\n` +\n"
-        "        `## Slice Definition\n${slices[name]}\n` +\n"
-        "        `## Codebase Map\n${codebase_map}\n` +\n"
-        "        `## Implementation\n${implementation}\n`\n"
+        "      description: `Verify slice: ${id}\\n\\n` +\n"
+        "        `## Slice Definition\\n${JSON.stringify(data, null, 2)}\\n` +\n"
+        "        `## Codebase Map\\n${codebase_map}\\n` +\n"
+        "        `## Implementation\\n${implStr}\\n`\n"
         "    })\n"
         "  )\n"
         ");\n"

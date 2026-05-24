@@ -5,14 +5,16 @@ with purpose-built tools that enforce the orchestrator's dispatch-only role.
 
 Design rationale:
 - The orchestrator's job is exactly two things: (1) read slice definitions
-  and hand them to subagents, (2) write implementation.md from the results.
+  and hand them to subagents, (2) write implementation artifacts (implementation.md
+  and implementation.json) from the results.
 - Giving it generic filesystem tools lets a weak model fall back to doing
   the implementation itself (read file → edit file → read file → ...).
 - ``read_slice_files`` bundles everything the orchestrator needs in one call,
   eliminating multi-turn exploration entirely.
 - ``write_implementation_report`` is the only write surface: it only accepts
-  a structured report dict and writes to the fixed implementation.md path.
-  The orchestrator cannot write source files even if it tries.
+  a structured report dict and writes to the fixed implementation.md and
+  implementation.json paths. The orchestrator cannot write source files even
+  if it tries.
 
 Both tools are LangChain ``BaseTool`` subclasses so they slot directly into
 ``create_agent(tools=[...])`` or any middleware tool list.
@@ -174,17 +176,19 @@ class ReadSliceFilesTool(BaseTool):
 
 
 class WriteImplementationReportTool(BaseTool):
-    """Write the implementation.md synthesis report.
+    """Write the implementation.md synthesis report and implementation.json data.
 
     This is the ONLY write tool available to the orchestrator.
     It accepts structured results from slice-implementer subagents and
-    writes them to the fixed implementation.md path. The orchestrator
-    cannot write source files — this tool only touches implementation.md.
+    writes them to the fixed implementation.md and implementation.json paths.
+    The orchestrator cannot write source files — this tool only touches
+    implementation artifacts (implementation.md, implementation.json).
     """
 
     name: str = "write_implementation_report"
     description: str = (
-        "Write the implementation.md synthesis report from slice-implementer results. "
+        "Write the implementation.md synthesis report and implementation.json data "
+        "from slice-implementer results. "
         "This is the ONLY write tool available to you. "
         "Call this after all subagents have completed to produce the phase artifact. "
         "Requires: slice_results (list of per-slice result dicts with slice_name, "
@@ -212,6 +216,7 @@ class WriteImplementationReportTool(BaseTool):
         all_created: list[str] = []
         blocked: list[str] = []
         partial: list[str] = []
+        json_slices: list[dict[str, Any]] = []
 
         for sr in slice_results:
             # Support both dict (for testing) and _SliceResultItem (validated input)
@@ -253,6 +258,16 @@ class WriteImplementationReportTool(BaseTool):
             elif status == "partial":
                 partial.append(name)
 
+            # Collect for implementation.json
+            json_slices.append({
+                "slice_name": name,
+                "status": status,
+                "files_modified": modified,
+                "files_created": created,
+                "test_results": test_res,
+                "issues": issues,
+            })
+
         # Aggregated file list
         if all_modified or all_created:
             lines.append("## Files Changed\n")
@@ -275,6 +290,18 @@ class WriteImplementationReportTool(BaseTool):
         if blocked:
             lines.append(f"- Blocked: {len(blocked)} ({', '.join(blocked)})\n")
 
+        # Write implementation.json with the same structured data
+        json_data: dict[str, Any] = {
+            "summary": summary,
+            "slice_results": json_slices,
+        }
+        json_path = impl_path / "implementation.json"
+        json_str = json.dumps(json_data, indent=2, ensure_ascii=False)
+        try:
+            json_path.write_text(json_str, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: Could not write implementation.json: {exc}"
+
         content = "".join(lines)
         try:
             report_path.write_text(content, encoding="utf-8")
@@ -284,7 +311,8 @@ class WriteImplementationReportTool(BaseTool):
         return (
             f"implementation.md written to {self.impl_dir}/implementation.md "
             f"({len(content)} chars, {total} slices, {implemented} implemented, "
-            f"{len(partial)} partial, {len(blocked)} blocked)."
+            f"{len(partial)} partial, {len(blocked)} blocked) "
+            f"+ implementation.json ({len(json_str)} bytes)."
         )
 
     async def _arun(self, slice_results: list[_SliceResultItem] | list[dict[str, Any]], summary: str) -> str:

@@ -107,6 +107,8 @@ class WorkflowState(TypedDict, total=False):
     # Phase completion flags
     spec_completed: bool  # True when SPECIFY phase completed successfully
     plan_completed: bool  # True when PLAN phase completed successfully
+    execution_waves_present: bool  # True when execution_waves is non-empty (fail-closed
+    # invariant for IMPLEMENT prerequisite gate)
     tasks_completed: bool  # True when TASKS phase completed successfully
     implement_completed: bool  # True when IMPLEMENT phase completed successfully
     verify_completed: bool  # True when VERIFY phase completed successfully

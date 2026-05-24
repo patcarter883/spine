@@ -198,6 +198,32 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- patterns: notable patterns, conventions, or idioms discovered\n"
         "- file_map: mapping of important file paths to brief descriptions\n"
         "- dependencies: key dependencies, imports, or external services\n"
+
+        "\n\n## Amnesia Warning — Your Context IS Volatile\n"
+        "Your context window has a hard limit. As you explore the codebase with\n"
+        "MCP tools, previous search results WILL be deleted to make room for new\n"
+        "information. You MUST use the `commit_findings_and_clear_search` tool\n"
+        "before your context fills up.\n\n"
+        "### When to save findings\n"
+        "- After every 2-3 rounds of research — before starting the next batch\n"
+        "- When you've identified key files, symbols, or patterns worth preserving\n"
+        "- Before moving on to a new research topic\n"
+        "- If tool results are getting truncated by context limits\n\n"
+        "### How to use commit_findings_and_clear_search\n"
+        "```\n"
+        'commit_findings_and_clear_search(\n'
+        '    note="Brief natural-language summary of what you found",\n'
+        '    relevant_code="File paths, function names, code snippets, and patterns"\n'
+        ')\n'
+        "```\n"
+        "The system will:\n"
+        "1. Append your findings to a persistent scratchpad\n"
+        "2. Delete ALL prior search history from the context window\n"
+        "3. Only the scratchpad + new messages remain\n\n"
+        "### The scratchpad\n"
+        "After clearing, the scratchpad is injected back into subsequent turns.\n"
+        "The scratchpad IS your working memory — it survives context eviction.\n"
+        "Read it at the start of each new turn to pick up where you left off.\n"
     ),
     "slice-implementer": (
         "YOU MUST USE TOOLS. Do not describe changes — make them with "

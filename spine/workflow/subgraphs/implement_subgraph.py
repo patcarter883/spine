@@ -6,9 +6,10 @@ The subgraph has two internal nodes:
 
 State schema: ``ImplementSubgraphState`` — isolated from parent ``WorkflowState``.
 
-For quick workflows (no SPECIFY/TASKS phase), the agent works from
-``plan/plan.md`` and ``plan/plan.json`` artifacts produced by PLAN.
-For spec workflows, it also has ``specify/specification.md`` available.
+The orchestrator uses the ``read_slice_files`` tool to load slice definitions,
+codebase map, and plan metadata from ``plan.json`` in a single call. All
+dispatch is wave-based — ``execution_waves`` is enforced as a fail-closed
+invariant by the plan prerequisite gate before IMPLEMENT runs.
 """
 
 import logging
@@ -48,8 +49,6 @@ async def _run_implement_agent(
     workspace_root = state.get("workspace_root", ".")
     retry_count = state.get("retry_count", 0)
     feedback = state.get("feedback", [])
-    execution_waves = state.get("execution_waves", [])
-    has_waves = bool(execution_waves)
 
     logger.info(f"[{work_id}] IMPLEMENT subgraph: run_agent starting")
 
@@ -57,8 +56,6 @@ async def _run_implement_agent(
         agent = build_implement_agent(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        has_spec = "spec" in work_type
-        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
         gap_plan_path = state.get("gap_plan_path", "")
 
         prompt_lines = [
@@ -80,60 +77,30 @@ async def _run_implement_agent(
                 ]
             )
 
-        if has_spec:
-            spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
-            tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
-            prompt_lines.extend(
-                [
-                    "Prior artifacts are available on disk — read them as needed:",
-                    f"- Specification: `{spec_path}/specification.md`",
-                    f"- Plan: `{plan_path}/plan.md`",
-                    f"- Feature Slices: `{tasks_path}/tasks.md`",
-                    f"- Codebase map: `{tasks_path}/codebase-map.md`",
-                    "",
-                ]
-            )
-        else:
-            prompt_lines.extend(
-                [
-                    "Prior artifacts are available on disk — read them as needed:",
-                    f"- Plan (narrative): `{plan_path}/plan.md`",
-                    f"- Structured plan (JSON): `{plan_path}/plan.json`",
-                    "",
-                    "The `plan.json` file contains structured `feature_slices` with "
-                    "id, title, target_files, execution_requirements, dependencies, "
-                    "acceptance_criteria, and complexity for each slice.",
-                    "",
-                ]
-            )
+        # ── Always wave-based dispatch ──────────────────────────────────
+        # execution_waves is a fail-closed invariant. The prerequisite gate
+        # guarantees structured waves exist before IMPLEMENT runs. The
+        # read_slice_files tool (available to the orchestrator) loads
+        # everything from plan.json — no need to reference individual
+        # artifact files on disk.
+        prompt_lines.extend(
+            [
+                "Your `read_slice_files` tool loads everything from `plan.json`. "
+                "Do not read individual markdown files manually.",
+                "",
+            ]
+        )
 
         impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
         prompt_lines.extend(
             [
-                "Use `read_file` and `grep` to inspect them. Do NOT load "
-                "everything into context at once.",
+                "Execution waves have been pre-computed from the plan — slices are "
+                "organized into waves where slices within a wave are independent "
+                "and can run in parallel. Dispatch slice-implementer subagents "
+                "per wave (parallel within wave, sequential across waves).",
                 "",
             ]
         )
-        if has_waves:
-            prompt_lines.extend(
-                [
-                    "Execution waves have been pre-computed from the plan — slices are "
-                    "organized into waves where slices within a wave are independent "
-                    "and can run in parallel. Dispatch slice-implementer subagents "
-                    "per wave (parallel within wave, sequential across waves).",
-                    "",
-                ]
-            )
-        else:
-            prompt_lines.extend(
-                [
-                    "Read the codebase map FIRST — it contains file paths, key functions, "
-                    "and conventions discovered during planning. Use it instead of "
-                    "re-exploring the codebase.",
-                    "",
-                ]
-            )
         prompt_lines.extend(
             [
                 "## Where to Write Your Output",

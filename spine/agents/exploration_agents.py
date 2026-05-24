@@ -22,6 +22,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
+from spine.agents.garbage_collector import commit_findings_and_clear_search
 
 logger = logging.getLogger(__name__)
 
@@ -308,13 +309,17 @@ async def run_explore_node(
 
         # Build a minimal agent for this subagent — no filesystem middleware,
         # the tools are injected directly as extra_tools from the subagent spec.
+        # Add the GC tool to the researcher's toolbar so it can save findings
+        # and clear context when the window gets full.
+        extra_tools = list(subagent_spec.get("tools", []))
+        extra_tools.append(commit_findings_and_clear_search)
         agent = build_phase_agent(
             state=state,  # type: ignore[arg-type]
             config=config,
             phase=phase_enum,
             system_prompt=subagent_spec["system_prompt"],
             is_subagent=True,
-            extra_tools=subagent_spec.get("tools", []),
+            extra_tools=extra_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
         )
@@ -354,6 +359,11 @@ async def run_explore_node(
                 f"then fall back to read_file/glob/grep if needed. "
                 f"Return your findings in the ResearchFindings format."
             )
+
+        # Inject scratchpad into researcher prompt if available
+        scratchpad = state.get("scratchpad", "")
+        if scratchpad:
+            prompt = prompt + "\n\n## Working Memory Scratchpad\n" + scratchpad + "\n"
 
         result = await ainvoke_with_retry(
             agent,

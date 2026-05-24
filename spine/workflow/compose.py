@@ -135,6 +135,7 @@ def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.SPECIFY.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0),
+        "scratchpad": parent_state.get("scratchpad", ""),
     }
 
 
@@ -147,6 +148,7 @@ def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0),
         "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
         "has_spec": True,
+        "scratchpad": parent_state.get("scratchpad", ""),
     }
 
 

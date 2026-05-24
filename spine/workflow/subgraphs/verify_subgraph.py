@@ -7,6 +7,7 @@ The subgraph has two internal nodes:
 State schema: ``VerifySubgraphState`` — isolated from parent ``WorkflowState``.
 """
 
+import json
 import logging
 from typing import Any
 
@@ -56,60 +57,42 @@ async def _run_verify_agent(
         # Materialize prior artifacts to disk so agent can read them
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)  # type: ignore[dict-constructor]
 
-        # Build prompt referencing disk paths
-        has_spec = "spec" in work_type
-        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
-        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
-        tasks_path = artifact_path(work_id, PhaseName.TASKS.value)
-        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
+        # Build prompt using read_verify_context for structured loading
+        verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
 
         prompt_lines = [
             "Verify that the implementation meets the requirements. "
             "Check that all feature slices are implemented correctly, "
             "the plan was followed, and the original task is complete.",
             "",
-            "Prior artifacts are available on disk — read them as needed:",
+            "Use `read_verify_context` to load structured slice definitions "
+            "and implementation results in one call. Do NOT use `read_file`, "
+            "`grep`, or manually read individual markdown files (e.g., "
+            "`specification.md`, `plan.md`, `tasks.md`, `codebase-map.md`).",
+            "",
+            "Also inspect the actual code files on disk using `ls` and "
+            "`read_file` — the implementation summary may not reflect "
+            "the actual state of the code.",
+            "",
+            "## Where to Write Your Output",
+            f"Write your verification report to `{verify_path}/verification.md` "
+            "using `write_file`. The report MUST begin with `VERIFIED` or `PASSED` "
+            "on the first line if the implementation meets requirements, or "
+            "`FAILED` followed by the issues found. This file is REQUIRED — "
+            "without it, the workflow treats the phase as failed.",
+            "",
+            "Also write a structured `{0}/verification.json` with an "
+            "`overall_status` field set to \"VERIFIED\" or \"FAILED\". This "
+            "JSON file is the authoritative source for phase status.",
+            "",
+            "**RLM parallel verify pattern:** Use `eval` to read the "
+            "tasks artifact, extract the slice list, then dispatch a "
+            "`slice-verifier` subagent per slice via "
+            "`Promise.allSettled(tools.task(...))`. Synthesize the "
+            "verification report from subagent results in code — do NOT "
+            "re-read each slice file manually into conversation.",
         ]
-        if has_spec:
-            prompt_lines.extend(
-                [
-                    f"- Specification: `{spec_path}/specification.md`",
-                    f"- Plan: `{plan_path}/plan.md`",
-                ]
-            )
-        verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
-        prompt_lines.extend(
-            [
-                f"- Feature Slices: `{tasks_path}/tasks.md`",
-                f"- Codebase map: `{tasks_path}/codebase-map.md`",
-                f"- Implementation: `{impl_path}/implementation.md`",
-                "",
-                "Use `read_file` and `grep` to inspect them. Do NOT load "
-                "everything into context at once.",
-                "",
-                "Read the codebase map FIRST — it contains file paths, key "
-                "functions, and conventions discovered during the tasks phase.",
-                "",
-                "Also inspect the actual code files on disk using `ls` and "
-                "`read_file` — the implementation summary may not reflect "
-                "the actual state of the code.",
-                "",
-                "## Where to Write Your Output",
-                f"Write your verification report to `{verify_path}/verification.md` "
-                "using `write_file`.  The report MUST begin with `VERIFIED` or `PASSED` "
-                "on the first line if the implementation meets requirements, or "
-                "`FAILED` followed by the issues found.  This file is REQUIRED — "
-                "without it, the workflow treats the phase as failed.",
-                "",
-                "**RLM parallel verify pattern:** Use `eval` to read the "
-                "tasks artifact, extract the slice list, then dispatch a "
-                "`slice-verifier` subagent per slice via "
-                "`Promise.allSettled(tools.task(...))`. Synthesize the "
-                "verification report from subagent results in code — do NOT "
-                "re-read each slice file manually into conversation.",
-            ]
-        )
-        prompt = "\n".join(prompt_lines)
+        prompt = "\n".join(prompt_lines).format(verify_path)
 
         ctx = build_context(dict(state), PhaseName.VERIFY)  # type: ignore[dict-constructor]
 
@@ -182,9 +165,22 @@ async def _save_verify_artifacts(
         )
         disk_artifacts = {"verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]}
 
-    # Determine status from verification content
-    verify_text = next(iter(disk_artifacts.values()), "") if disk_artifacts else ""
-    is_verified = "VERIFIED" in verify_text.upper() or "PASSED" in verify_text.upper()
+    # Determine status from verification.json (authoritative source).
+    from pathlib import Path
+
+    verify_dir = Path(workspace_root) / artifact_path(work_id, PhaseName.VERIFY.value)
+    verify_json_path = verify_dir / "verification.json"
+    is_verified = False
+    if verify_json_path.exists():
+        try:
+            vdata = json.loads(verify_json_path.read_text())
+            is_verified = vdata.get("overall_status") == "VERIFIED"
+        except (json.JSONDecodeError, OSError):
+            logger.warning(
+                "[%s] verification.json exists but could not be parsed; "
+                "defaulting to unverified",
+                work_id,
+            )
 
     # Populate verification_findings from agent structured response
     agent_result = state.get("messages", [])

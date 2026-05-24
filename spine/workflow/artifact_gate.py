@@ -578,26 +578,41 @@ def _check_spec_prerequisite(state: WorkflowState) -> tuple[bool, str]:
 def _check_plan_prerequisite(state: WorkflowState) -> tuple[bool, str]:
     """Check that PLAN phase completed before IMPLEMENT runs.
 
-    IMPLEMENT requires a valid plan with feature_slices. This check ensures
-    the plan_completed flag is True, preventing IMPLEMENT from running on
-    empty or failed PLAN output.
+    IMPLEMENT requires a valid plan with feature_slices AND structured
+    ``execution_waves``. This check ensures both the ``plan_completed`` flag
+    is True AND ``execution_waves`` is non-empty, preventing IMPLEMENT from
+    running on empty or failed PLAN output.
+
+    This is a **fail-closed** gate: if either invariant is missing, the
+    workflow routes to ``needs_review`` rather than attempting implementation
+    with incomplete plan data.
 
     Returns:
         ``(passed, reason)`` — ``passed=True`` means IMPLEMENT should proceed;
         ``reason`` is a human-readable explanation on failure.
     """
     plan_completed = state.get("plan_completed", False)
+    execution_waves = state.get("execution_waves", [])
 
-    if plan_completed:
-        logger.debug("implement prerequisite: plan_completed=True, proceeding")
-        return True, ""
+    if not plan_completed:
+        return (
+            False,
+            "IMPLEMENT phase requires PLAN to have completed successfully. "
+            "The plan artifact is missing or the PLAN phase did not finish. "
+            "Re-run PLAN or resolve the prior failure before proceeding.",
+        )
 
-    return (
-        False,
-        "IMPLEMENT phase requires PLAN to have completed successfully. "
-        "The plan artifact is missing or the PLAN phase did not finish. "
-        "Re-run PLAN or resolve the prior failure before proceeding.",
-    )
+    if not execution_waves or len(execution_waves) == 0:
+        return (
+            False,
+            "IMPLEMENT phase requires structured execution_waves from the PLAN phase. "
+            "The PLAN completed but did not produce execution_waves — this is a "
+            "scheduler failure. Re-run PLAN to regenerate execution_waves from "
+            "the plan.json feature_slices.",
+        )
+
+    logger.debug("implement prerequisite: plan_completed=True, execution_waves present, proceeding")
+    return True, ""
 
 
 def _check_implement_prerequisite(state: WorkflowState) -> tuple[bool, str]:

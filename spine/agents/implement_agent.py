@@ -41,7 +41,6 @@ from spine.agents.artifacts import (
     artifact_path,
     build_artifact_prompt,
     build_current_phase_write_prompt,
-    list_slice_files,
 )
 from spine.agents.factory import build_phase_agent
 from spine.agents.implement_tools import build_implement_orchestrator_tools
@@ -96,45 +95,27 @@ def build_implement_agent(
     """
     work_id = state.get("work_id", "")
     workspace_root = state.get("workspace_root", ".")
-    tasks_dir = artifact_path(work_id, "tasks")
 
-    # ── Determine dispatch mode: waves (preferred) or legacy ──────────
-    # When execution_waves is present in state (produced by the PLAN
-    # scheduler), slices come from plan.json and are dispatched per wave
-    # (parallel within, sequential across). Otherwise fall back to
-    # discovering slice-*.md files from the tasks/ directory.
-    execution_waves = state.get("execution_waves")
-    has_waves = bool(execution_waves)
+    # ── Always wave-based dispatch ──────────────────────────────────────
+    # execution_waves is a fail-closed invariant (enforced by the plan
+    # prerequisite gate in artifact_gate.py). By this point we are
+    # guaranteed to have structured waves with at least one slice.
+    execution_waves = state.get("execution_waves", [])
+    total_slices = sum(len(wave) for wave in execution_waves)
+    wave_count = len(execution_waves)
+    plan_dir = artifact_path(work_id, "plan")
+    plan_json_path = f"{plan_dir}/plan.json"
+    slice_inventory = (
+        f"{total_slices} slice(s) in {wave_count} execution wave(s) "
+        f"from `{plan_json_path}`.\n"
+        "Slices within each wave are independent (parallel); "
+        "waves run sequentially.\n"
+    )
+    for i, wave in enumerate(execution_waves):
+        slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
+        slice_inventory += f"  Wave {i + 1}: {', '.join(slice_ids)} ({len(wave)} slice(s))\n"
 
-    if has_waves:
-        total_slices = sum(len(wave) for wave in execution_waves)
-        wave_count = len(execution_waves)
-        plan_dir = artifact_path(work_id, "plan")
-        plan_json_path = f"{plan_dir}/plan.json"
-        slice_inventory = (
-            f"{total_slices} slice(s) in {wave_count} execution wave(s) "
-            f"from `{plan_json_path}`.\n"
-            "Slices within each wave are independent (parallel); "
-            "waves run sequentially.\n"
-        )
-        for i, wave in enumerate(execution_waves):
-            slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
-            slice_inventory += f"  Wave {i + 1}: {', '.join(slice_ids)} ({len(wave)} slice(s))\n"
-    else:
-        # Legacy fallback: discover slice-*.md files from tasks/ dir
-        slice_files = list_slice_files(workspace_root, work_id)
-        slice_count = len(slice_files)
-        if slice_count == 0:
-            slice_inventory = (
-                "⚠ No slice-*.md files found in tasks/ directory. "
-                "Use `ls` + `glob` to locate slice files before proceeding."
-            )
-        else:
-            slice_inventory = f"{slice_count} slice file(s) found in `{tasks_dir}/`:\n" + "\n".join(
-                f"  - `{tasks_dir}/{name}`" for name in slice_files
-            )
-
-    system_prompt = _build_orchestrator_prompt(has_waves=has_waves)
+    system_prompt = _build_orchestrator_prompt()
     system_prompt += slice_inventory + "\n\n"
     system_prompt += build_current_phase_write_prompt(
         work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]
@@ -168,21 +149,18 @@ def build_implement_agent(
 # ── Prompt builder ─────────────────────────────────────────────────────
 
 
-def _build_orchestrator_prompt(*, has_waves: bool = False) -> str:
+def _build_orchestrator_prompt() -> str:
     """Build the orchestrator system prompt.
+
+    Always uses wave-based dispatch from plan.json execution_waves.
+    The legacy flat-parallel dispatch path has been removed — the plan
+    prerequisite gate now enforces execution_waves as a fail-closed
+    invariant before IMPLEMENT can run.
 
     Kept under ~3KB so the bulk of the prompt is the SPINE base prompt
     and per-call AGENTS.md memory injection, not phase boilerplate.
-
-    Args:
-        has_waves: When True, the orchestrator works from plan.json
-            execution_waves (parallel within wave, sequential across
-            waves). When False, falls back to the legacy flat-parallel
-            dispatch from tasks/slice-*.md files.
     """
-    if has_waves:
-        return _build_wave_orchestrator_prompt()
-    return _build_legacy_orchestrator_prompt()
+    return _build_wave_orchestrator_prompt()
 
 
 def _common_prompt_header() -> str:
@@ -273,27 +251,4 @@ def _build_wave_orchestrator_prompt() -> str:
     )
 
 
-def _build_legacy_orchestrator_prompt() -> str:
-    """Orchestrator prompt for flat-parallel dispatch (legacy mode)."""
-    return (
-        _common_prompt_header()
-        + "### Step 2 — Dispatch Subagents In Parallel (1 eval turn)\n"
-        "Complete ALL slices in a SINGLE eval call:\n"
-        "```js\n"
-        "const slices = Object.values(globalThis.planData.slices);\n"
-        "const promises = slices.map(s => tools.task({\n"
-        "  subagent_type: 'slice-implementer',\n"
-        "  description: `Slice: ${s.id}\n\n` +\n"
-        "    `Title: ${s.title}\n` +\n"
-        "    `Files: ${s.target_files.join(', ')}\n` +\n"
-        "    `Requirements: ${s.execution_requirements}\n` +\n"
-        "    `Acceptance Criteria: ${s.acceptance_criteria.join('; ')}`\n"
-        "}));\n"
-        "globalThis.sliceResults = await Promise.allSettled(promises);\n"
-        "```\n\n"
-        + _prompt_step_1_template()
-        + _prompt_step_3_template()
-        + "## Completion Rules\n"
-        "- Target ~3 total turns. If >5 turns without dispatching, write partial report.\n"
-        "- Access context in eval via `globalThis.context` (work_id, plan_dir).\n"
-    )
+

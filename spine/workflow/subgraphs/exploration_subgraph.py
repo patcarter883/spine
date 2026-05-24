@@ -40,6 +40,9 @@ from spine.agents.artifacts import (
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
+from spine.agents.garbage_collector import calculate_safe_eviction
+
+from langchain_core.messages import AIMessage
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
@@ -217,6 +220,10 @@ async def _synthesize_plan(
             )
             prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
 
+        scratchpad = state.get("scratchpad", "")
+        if scratchpad:
+            prompt += f"\n\n## Working Memory Scratchpad\n{scratchpad}\n"
+
         ctx = build_context(dict(state), PhaseName.PLAN)
         result = await ainvoke_with_retry(
             agent,
@@ -329,6 +336,10 @@ async def _synthesize_specify(
                 if isinstance(f, dict)
             )
             prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
+
+        scratchpad = state.get("scratchpad", "")
+        if scratchpad:
+            prompt += f"\n\n## Working Memory Scratchpad\n{scratchpad}\n"
 
         ctx = build_context(dict(state), PhaseName.SPECIFY)
         result = await ainvoke_with_retry(
@@ -511,6 +522,49 @@ async def _save_exploration_artifacts(
     return result
 
 
+# ── Node: eviction_check ───────────────────────────────────────────────
+
+
+async def _eviction_check_node(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Evict old search history when commit_findings was called.
+
+    Calls :func:`calculate_safe_eviction` to identify messages that can
+    be removed without breaking parallel-tool references, and extracts
+    committed findings from the Boundary AIMessage's tool_calls for the
+    scratchpad accumulator.
+    """
+    messages = state.get("messages", [])
+    evictions = calculate_safe_eviction(messages)
+
+    if not evictions:
+        return {}
+
+    # Extract committed findings from the Boundary AIMessage's tool_calls
+    scratchpad_entry = ""
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc.get("name") == "commit_findings_and_clear_search":
+                    args = tc.get("args", {})
+                    note = args.get("note", "")
+                    code = args.get("relevant_code", "")
+                    scratchpad_entry += (
+                        "## Saved Findings\n"
+                        f"**Summary:** {note}\n\n"
+                        f"**Key Code/Paths:**\n{code}\n\n"
+                        "---\n"
+                    )
+
+    logger.info("Evicting %d messages from exploration context", len(evictions))
+    return {
+        "messages": evictions,
+        "scratchpad": scratchpad_entry,
+    }
+
+
 # ── Builder ──────────────────────────────────────────────────────────────
 
 
@@ -542,6 +596,7 @@ def build_exploration_subgraph(
     builder.add_node("research_manager", _research_manager_node)
     builder.add_node("explore", _explore_node)
     builder.add_node("aggregate", _aggregate_node)
+    builder.add_node("eviction_check", _eviction_check_node)
     builder.add_node("synthesize", synthesizer)
     builder.add_node("save_artifacts", _save_exploration_artifacts)
 
@@ -557,9 +612,10 @@ def build_exploration_subgraph(
     # Explore → aggregate (fan-in — LangGraph waits for ALL Send targets)
     builder.add_edge("explore", "aggregate")
 
-    # Aggregate → loop to research_manager or done → synthesize
+    # Aggregate → eviction_check → sufficiency router (loop or synthesize)
+    builder.add_edge("aggregate", "eviction_check")
     builder.add_conditional_edges(
-        "aggregate",
+        "eviction_check",
         _sufficiency_router,
         {"loop": "research_manager", "done": "synthesize"},
     )

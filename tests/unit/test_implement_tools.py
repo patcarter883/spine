@@ -254,6 +254,24 @@ class TestWriteImplementationReportTool:
         ).read_text()
         assert "Total slices: 0" in content
 
+    def test_writes_implementation_json(self, tmp_path):
+        """Verify WriteImplementationReportTool writes implementation.json."""
+        tool = self._make_tool(tmp_path)
+        result = tool._run(
+            slice_results=[self._slice_result("s1")],
+            summary="JSON output test.",
+        )
+        assert "implementation.json" in result
+        json_path = (
+            tmp_path / ".spine" / "artifacts" / "wk-01" / "implement" / "implementation.json"
+        )
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert data["summary"] == "JSON output test."
+        assert len(data["slice_results"]) == 1
+        assert data["slice_results"][0]["slice_name"] == "s1"
+        assert data["slice_results"][0]["status"] == "implemented"
+
 
 # ── build_implement_orchestrator_tools ────────────────────────────────────
 

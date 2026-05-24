@@ -113,6 +113,7 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # Accumulated research (operator.add reducer merges per-round findings)
     topics: Annotated[list[str], _op_add]  # Areas being explored this round
     findings: Annotated[list[dict], _op_add]  # ResearchFindings dicts from explore nodes
+    scratchpad: Annotated[str, _op_add]  # Working memory accumulator for GC
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer

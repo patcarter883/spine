@@ -2,7 +2,7 @@
 
 The orchestrator's job is exactly two things: (1) read verification inputs
 (slices, plan, implementation) and hand them to subagents, (2) write
-verification.md from the subagent results.
+verification.md and verification.json from the subagent results.
 
 Two purpose-built tools enforce dispatch-only behavior:
 - ``read_verify_context`` — loads everything in one call, eliminating multi-turn exploration
@@ -23,7 +23,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
-from spine.agents.artifacts import artifact_path, list_slice_files
+from spine.agents.artifacts import artifact_path
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +40,15 @@ class ReadVerifyContextTool(BaseTool):
 
     name: str = "read_verify_context"
     description: str = (
-        "Read all verification inputs: slice definitions, codebase map, and "
-        "implementation report in one call. Loads plan.json from the plan "
-        "directory, slice files from tasks/, and implementation.md from implement/. "
-        "Call this FIRST — it gives you everything you need to dispatch subagents. "
-        "No arguments required."
+        "Read all verification inputs: structured slice definitions from plan.json, "
+        "codebase map, and structured implementation results from implementation.json "
+        "in one call. Call this FIRST — it gives you everything you need to dispatch "
+        "subagents. No arguments required."
     )
     args_schema: Optional[ArgsSchema] = _ReadVerifyContextInput
 
     # Injected at build time — not part of the input schema
     plan_dir: str = ""
-    tasks_dir: str = ""
     impl_dir: str = ""
     verify_dir: str = ""
     workspace_root: str = ""
@@ -59,107 +57,47 @@ class ReadVerifyContextTool(BaseTool):
         workspace = Path(self.workspace_root)
         result: dict[str, Any] = {
             "plan_dir": self.plan_dir,
-            "tasks_dir": self.tasks_dir,
             "impl_dir": self.impl_dir,
             "verify_dir": self.verify_dir,
             "slice_count": 0,
             "slices": {},
             "codebase_map": "",
-            "implementation": "",
+            "implementation": {},
         }
 
-        # Load plan.json for codebase_map
+        # Load plan.json for structured slice definitions + codebase_map
         plan_path = workspace / self.plan_dir / "plan.json"
         if plan_path.exists():
             try:
                 plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
-                codebase_map = plan_data.get("codebase_map", "")
-                if isinstance(codebase_map, dict):
-                    codebase_map = json.dumps(codebase_map, indent=2, ensure_ascii=False)
-                result["codebase_map"] = codebase_map or ""
+                # Store structured slices (dicts, not markdown strings)
+                for sl in plan_data.get("feature_slices", []):
+                    if isinstance(sl, dict) and sl.get("id"):
+                        result["slices"][sl["id"]] = sl  # structured dict, not markdown
+                # Store codebase_map
+                result["codebase_map"] = plan_data.get("codebase_map", "")
             except (json.JSONDecodeError, OSError) as exc:
-                result["plan_error"] = f"Could not parse plan.json: {exc}"
+                result["plan_error"] = str(exc)
         else:
             result["plan_error"] = f"plan.json not found in {self.plan_dir}"
 
-        # Load implementation.md
-        impl_path = workspace / self.impl_dir / "implementation.md"
-        if impl_path.exists():
+        # Load implementation.json for structured results
+        impl_json_path = workspace / self.impl_dir / "implementation.json"
+        if impl_json_path.exists():
             try:
-                result["implementation"] = impl_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                result["impl_error"] = f"Could not read implementation.md: {exc}"
+                result["implementation"] = json.loads(impl_json_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                result["impl_error"] = str(exc)
         else:
-            result["impl_error"] = f"implementation.md not found in {self.impl_dir}"
-
-        # Load slice files from tasks directory
-        tasks_path = workspace / self.tasks_dir
-        slice_files = list_slice_files(self.workspace_root, "")
-        # Filter to just the filenames for the tasks_dir (work_id already in path)
-        if tasks_path.exists():
-            try:
-                for slice_file in sorted(tasks_path.glob("slice-*.md")):
-                    if slice_file.is_file():
-                        result["slices"][slice_file.name] = slice_file.read_text(encoding="utf-8")
-            except OSError as exc:
-                result["slices_error"] = f"Could not list slice files: {exc}"
+            result["impl_error"] = f"implementation.json not found in {self.impl_dir}"
 
         result["slice_count"] = len(result["slices"])
 
         if result["slice_count"] == 0:
             result["warning"] = (
-                "No slice-*.md files found in tasks/ directory. "
-                "Check that the TASKS phase completed successfully."
+                "No feature_slices found in plan.json. "
+                "Check that the PLAN phase completed successfully."
             )
-
-        return json.dumps(result, ensure_ascii=False)
-
-    async def _arun(self, **kwargs: Any) -> str:
-        return self._run(**kwargs)
-
-
-# ── read_slice_files (verify variant) ─────────────────────────────────────
-
-
-class _ReadSliceFilesVerifyInput(BaseModel):
-    """No inputs needed — paths are fully determined by work_id at build time."""
-
-
-class ReadSliceFilesVerifyTool(BaseTool):
-    """Read all feature slice definitions for the VERIFY phase."""
-
-    name: str = "read_slice_files_verify"
-    description: str = (
-        "Read all slice definitions from the tasks directory for verification. "
-        "Loads each slice-*.md file and returns their contents. "
-        "No arguments required."
-    )
-    args_schema: Optional[ArgsSchema] = _ReadSliceFilesVerifyInput
-
-    # Injected at build time
-    tasks_dir: str = ""
-    workspace_root: str = ""
-
-    def _run(self, **kwargs: Any) -> str:  # noqa: ARG002
-        result: dict[str, Any] = {
-            "tasks_dir": self.tasks_dir,
-            "slice_count": 0,
-            "slices": {},
-        }
-
-        tasks_path = Path(self.workspace_root) / self.tasks_dir
-        if not tasks_path.exists():
-            result["error"] = f"Tasks directory not found: {self.tasks_dir}"
-            return json.dumps(result)
-
-        try:
-            for slice_file in sorted(tasks_path.glob("slice-*.md")):
-                if slice_file.is_file():
-                    result["slices"][slice_file.name] = slice_file.read_text(encoding="utf-8")
-        except OSError as exc:
-            result["error"] = f"Could not list slice files: {exc}"
-
-        result["slice_count"] = len(result["slices"])
 
         return json.dumps(result, ensure_ascii=False)
 
@@ -200,12 +138,13 @@ class _WriteVerificationReportInput(BaseModel):
 
 
 class WriteVerificationReportTool(BaseTool):
-    """Write the verification.md synthesis report."""
+    """Write verification.md and verification.json synthesis reports."""
 
     name: str = "write_verification_report"
     description: str = (
-        "Write the verification.md synthesis report from slice-verifier results. "
-        "Provide verification_results (list of per-slice result dicts) and summary. "
+        "Write verification.md and verification.json synthesis reports from "
+        "slice-verifier results. Provide verification_results (list of per-slice "
+        "result dicts) and summary. Both files are written to the verify directory. "
         "Call this after all subagents have completed."
     )
     args_schema: Optional[ArgsSchema] = _WriteVerificationReportInput
@@ -236,6 +175,7 @@ class WriteVerificationReportTool(BaseTool):
         not_verified_count = 0
         all_gaps: list[str] = []
         all_recommendations: list[str] = []
+        slice_data: list[dict[str, Any]] = []
 
         for vr in verification_results:
             name = vr.get("slice_name", "unknown")
@@ -243,6 +183,14 @@ class WriteVerificationReportTool(BaseTool):
             checklist = vr.get("checklist", [])
             gaps = vr.get("gaps", [])
             recommendations = vr.get("recommendations", [])
+
+            slice_data.append({
+                "slice_name": name,
+                "verdict": verdict,
+                "checklist": checklist,
+                "gaps": gaps,
+                "recommendations": recommendations,
+            })
 
             status_icon = "✅" if verdict == "VERIFIED" else "❌"
             lines.append(f"### {status_icon} {name} — {verdict}\n")
@@ -303,10 +251,27 @@ class WriteVerificationReportTool(BaseTool):
         except OSError as exc:
             return f"ERROR: Could not write verification.md: {exc}"
 
+        # Write verification.json
+        verify_json_path = verify_path / "verification.json"
+        json_data = {
+            "summary": summary,
+            "overall_status": overall_status,
+            "verification_results": slice_data,
+        }
+        try:
+            verify_json_path.write_text(
+                json.dumps(json_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return f"ERROR: Could not write verification.json: {exc}"
+
+        json_bytes = verify_json_path.stat().st_size
+
         return (
             f"verification.md written to {self.verify_dir}/verification.md "
             f"({len(content)} chars, {total} slices, {verified_count} verified, "
-            f"{not_verified_count} not verified)."
+            f"{not_verified_count} not verified) + verification.json ({json_bytes} bytes)."
         )
 
     async def _arun(
@@ -326,7 +291,7 @@ def build_verify_orchestrator_tools(
 
     Returns exactly two tools:
     - ``read_verify_context``: loads all verification inputs in one call
-    - ``write_verification_report``: writes the verification.md artifact
+    - ``write_verification_report``: writes the verification.md and verification.json artifacts
 
     Together with ``eval`` (via CodeInterpreterMiddleware), these are all the
     tools the orchestrator needs. No generic filesystem tools are exposed.
@@ -339,7 +304,6 @@ def build_verify_orchestrator_tools(
         List of BaseTool instances ready for use.
     """
     plan_dir = artifact_path(work_id, "plan")
-    tasks_dir = artifact_path(work_id, "tasks")
     impl_dir = artifact_path(work_id, "implement")
     verify_dir = artifact_path(work_id, "verify")
 
@@ -347,7 +311,6 @@ def build_verify_orchestrator_tools(
         ReadVerifyContextTool(
             workspace_root=workspace_root,
             plan_dir=plan_dir,
-            tasks_dir=tasks_dir,
             impl_dir=impl_dir,
             verify_dir=verify_dir,
         ),
