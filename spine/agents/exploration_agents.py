@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
 
@@ -25,6 +27,26 @@ logger = logging.getLogger(__name__)
 
 # Truncate spec content for PLAN explore agents to reasonable size
 _MAX_SPEC_CHARS = 8000
+
+# ── Research manager structured output model ─────────────────────────────
+
+
+class ResearchManagerDecision(BaseModel):
+    """Structured output from the research manager — explore more or done.
+
+    Used with ``model.with_structured_output()`` so the LLM returns a
+    validated instance instead of raw JSON that needs post-hoc parsing
+    and markdown-fence stripping.
+    """
+
+    decision: Literal["explore", "done"] = Field(
+        description="'explore' to continue research, 'done' when sufficient"
+    )
+    topics: list[str] = Field(
+        default_factory=list,
+        description="2-4 specific research topics if decision is 'explore', empty if 'done'",
+    )
+
 
 # ── Research manager prompt ──────────────────────────────────────────────
 
@@ -40,9 +62,6 @@ Given:
 Decide:
 - Are we done? (decision: "done") — all key areas have been investigated
 - Or do we need more? (decision: "explore") — return the next 2-4 topics
-
-Respond with ONLY a JSON object:
-{"decision": "explore" | "done", "topics": ["area1", "area2"]}
 
 Rules:
 - Never return more than 4 topics in a single round.
@@ -134,37 +153,76 @@ async def run_research_manager(
     )
 
     try:
-        response = await model.ainvoke(
-            [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)]
-        )
-        raw = response.content if hasattr(response, "content") else str(response)
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-        result = json.loads(raw)
-        decision = result.get("decision", "done")
-        topics = result.get("topics", [])
+        # Use structured output so the model enforces the decision schema.
+        # This eliminates JSON parsing failures, markdown-fence stripping
+        # bugs, and the "\n\n```json\n" prefix issue.  Falls back to raw
+        # parsing for models that don't support .with_structured_output().
+        try:
+            structured_model = model.with_structured_output(ResearchManagerDecision)
+        except (NotImplementedError, ValueError, AttributeError) as exc:
+            logger.debug(
+                "[%s] Model does not support structured output: %s — "
+                "falling back to raw JSON parsing",
+                work_id, exc,
+            )
+            structured_model = None
+
+        if structured_model is not None:
+            result = await structured_model.ainvoke(
+                [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)]
+            )
+            decision = result.decision
+            topics = list(result.topics) if result.topics else []
+        else:
+            # ── Raw JSON fallback ─────────────────────────────────────
+            response = await model.ainvoke(
+                [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)]
+            )
+            raw = response.content if hasattr(response, "content") else str(response)
+            # Handle content blocks (list of dicts from some model wrappers)
+            if isinstance(raw, list):
+                raw = "\n".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in raw
+                )
+            # Extract JSON from anywhere in the response — handles leading
+            # whitespace, code fences, and thinking/reasoning preamble.
+            json_match = re.search(
+                r'\{\s*"decision"\s*:\s*"(?:explore|done)"[^}]*\}', raw, re.DOTALL
+            )
+            if json_match:
+                result_dict = json.loads(json_match.group(0))
+                decision = result_dict.get("decision", "done")
+                topics = result_dict.get("topics", [])
+            else:
+                # Try stripping code fences with leading whitespace
+                stripped = raw.strip()
+                if stripped.startswith("```"):
+                    inner = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
+                    if inner.endswith("```"):
+                        inner = inner[:-3]
+                    result_dict = json.loads(inner.strip())
+                    decision = result_dict.get("decision", "done")
+                    topics = result_dict.get("topics", [])
+                else:
+                    raise json.JSONDecodeError("No JSON found in response", raw, 0)
+
         if not isinstance(topics, list):
             topics = []
         logger.info("[%s] Research manager: decision=%s topics=%s", work_id, decision, topics)
         return {"manager_decision": decision, "topics": topics}
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(
-            "[%s] Research manager failed to parse response: %s — defaulting to done",
-            work_id,
-            e,
-        )
-        return {"manager_decision": "done", "topics": []}
+
     except Exception as e:
         logger.warning(
-            "[%s] Research manager LLM call failed: %s — defaulting to done",
-            work_id,
-            e,
+            "[%s] Research manager failed: %s — defaulting to explore with one topic",
+            work_id, e,
         )
-        return {"manager_decision": "done", "topics": []}
+        # Fail-open: if we can't understand the response, do at least one
+        # exploration round rather than silently skipping all research.
+        return {
+            "manager_decision": "explore",
+            "topics": ["codebase structure and key files"],
+        }
 
 
 def _summarize_findings(findings: list[dict]) -> str:
