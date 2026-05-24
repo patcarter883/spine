@@ -142,7 +142,8 @@ def test_research_router_fan_out():
     assert len(result) == 2
     assert all(isinstance(s, Send) for s in result)
     assert result[0].node == "explore"
-    assert result[0].arg == {"topic": "auth-module"}
+    assert result[0].arg["topic"] == "auth-module"
+    assert result[0].arg["phase"] == "specify"
 
 
 def test_research_router_done():

@@ -371,3 +371,47 @@ def build_implement_orchestrator_tools(
             impl_dir=impl_dir,
         ),
     ]
+
+
+# ── Module-level utility (for subgraph synthesis nodes) ────────────────────
+
+
+def write_implementation_files(
+    slice_results: list[dict[str, Any]],
+    summary: str,
+    workspace_root: str,
+    impl_dir: str,
+) -> str:
+    """Write implementation.md and implementation.json to disk.
+
+    This is the module-level utility that synthesis nodes call directly
+    without instantiating the ``BaseTool`` subclass.  Used by the
+    ``_synthesize_implementation_node`` in the implement subgraph
+    instead of routing through a LangChain tool call.
+
+    Args:
+        slice_results: List of per-slice result dicts (slice_name, status,
+            files_modified, files_created, test_results, issues).
+        summary: Overall implementation summary string.
+        workspace_root: Absolute path to the project workspace root.
+        impl_dir: Relative artifact directory (e.g. ``".spine/artifacts/<id>/implement"``).
+
+    Returns:
+        Status string from ``WriteImplementationReportTool._run()``.
+    """
+    tool = WriteImplementationReportTool(
+        workspace_root=workspace_root,
+        impl_dir=impl_dir,
+    )
+    # Convert dicts to _SliceResultItem for validated processing
+    typed_results: list[_SliceResultItem] = []
+    for sr in slice_results:
+        typed_results.append(_SliceResultItem(
+            slice_name=sr.get("slice_name", "unknown"),
+            status=sr.get("status", "implemented"),
+            files_modified=sr.get("files_modified", []),
+            files_created=sr.get("files_created", []),
+            test_results=sr.get("test_results", ""),
+            issues=sr.get("issues", []),
+        ))
+    return tool._run(slice_results=typed_results, summary=summary)

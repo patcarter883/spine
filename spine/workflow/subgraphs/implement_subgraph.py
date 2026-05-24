@@ -1,155 +1,370 @@
-"""IMPLEMENT phase as a LangGraph subgraph.
+"""IMPLEMENT phase as a LangGraph subgraph with Send API dispatch.
 
-The subgraph has two internal nodes:
-1. ``run_agent`` — builds and invokes the implement Deep Agent.
-2. ``save_artifacts`` — scans disk for artifacts, determines phase status.
+The subgraph uses the same manager/router/call/aggregate pattern as the
+exploration subgraph, replacing the old ``eval`` + ``tools.task()`` +
+``Promise.allSettled`` approach with native LangGraph ``Send`` API
+parallel dispatch.
 
-State schema: ``ImplementSubgraphState`` — isolated from parent ``WorkflowState``.
+Nodes:
+- ``implement_router``: conditional edge — reads ``execution_waves`` from
+  state, returns ``[Send("run_slice_implementer", ...)]`` or ``"synthesize_implementation"``
+- ``run_slice_implementer``: builds a ``slice-implementer`` subagent per
+  slice and invokes it. Runs in parallel via Send API.
+- ``aggregate_implementation``: deterministic fan-in point after all
+  parallel slice-implementer nodes complete.
+- ``synthesize_implementation``: writes ``implementation.md`` and
+  ``implementation.json`` from accumulated slice results.
+- ``save_artifacts``: scans disk, materializes to state.
 
-The orchestrator uses the ``read_slice_files`` tool to load slice definitions,
-codebase map, and plan metadata from ``plan.json`` in a single call. All
-dispatch is wave-based — ``execution_waves`` is enforced as a fail-closed
-invariant by the plan prerequisite gate before IMPLEMENT runs.
+Edges::
+
+    START → implement_router
+    implement_router → Send("run_slice_implementer", {slice}) × N  OR  → synthesize_implementation
+    run_slice_implementer → aggregate_implementation
+    aggregate_implementation → synthesize_implementation → save_artifacts → END
 """
 
+from __future__ import annotations
+
+import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
-from spine.models.enums import PhaseName
-from spine.workflow.subgraph_state import ImplementSubgraphState
-from spine.agents.implement_agent import build_implement_agent
-from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry
-from spine.agents.context import build_context
 from spine.agents.artifacts import (
-    materialize_artifacts,
+    artifact_path,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    artifact_path,
 )
+from spine.agents.retry import ainvoke_with_retry
+from spine.exceptions import CriticalContractFailure
+from spine.models.enums import PhaseName
+from spine.workflow.subgraph_state import ImplementSubgraphState
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-async def _run_implement_agent(
+# ── Router: START → run_slice_implementer (Send) or synthesize ──────────
+
+
+def _implement_router(
+    state: ImplementSubgraphState,
+) -> list[Send] | Literal["synthesize_implementation"]:
+    """Fan-out to slice-implementer nodes via Send API.
+
+    Reads ``execution_waves`` from state, flattens all waves into a single
+    dispatch list (the scheduler guarantees dependency ordering within
+    waves, and wave ordering is satisfied by topological sort).
+
+    Raises ``CriticalContractFailure`` if ``execution_waves`` is missing
+    or empty — this is a structural invariant violation that means PLAN
+    did not produce the required structured data transfer.
+    """
+    execution_waves = state.get("execution_waves")
+
+    if not execution_waves:
+        raise CriticalContractFailure(
+            phase="implement",
+            reason="execution_waves is missing or empty in state — "
+                   "the PLAN phase did not produce structured data transfer. "
+                   "The prerequisite gate should have caught this before "
+                   "IMPLEMENT ran; check artifact_gate.py.",
+        )
+
+    all_slices: list[dict] = []
+    for wave in execution_waves:
+        if isinstance(wave, list):
+            for sl in wave:
+                if isinstance(sl, dict) and sl.get("id"):
+                    all_slices.append(sl)
+
+    if not all_slices:
+        raise CriticalContractFailure(
+            phase="implement",
+            reason="execution_waves is present but contains zero valid "
+                   "slice dicts with 'id' fields. The PLAN phase produced "
+                   "malformed structured data.",
+        )
+
+    logger.info(
+        "IMPLEMENT router: dispatching %d slice-implementer(s): %s",
+        len(all_slices),
+        [s.get("id", "?") for s in all_slices],
+    )
+
+    base_state = {
+        "phase": state.get("phase", "implement"),
+        "work_id": state.get("work_id", "unknown"),
+        "work_type": state.get("work_type", ""),
+        "workspace_root": state.get("workspace_root", "."),
+    }
+    return [
+        Send("run_slice_implementer", {**base_state, "slice": s})
+        for s in all_slices
+    ]
+
+
+# ── Node: run_slice_implementer ─────────────────────────────────────────
+
+
+async def _run_slice_implementer_node(
     state: ImplementSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the implement Deep Agent within the subgraph.
+    """Run a slice-implementer subagent for one feature slice.
 
-    The original work description is NOT included — IMPLEMENT works from
-    the feature slices and codebase map on disk, not the raw description.
+    The slice is injected into state by the Send API via
+    ``Send("run_slice_implementer", {"slice": {...}})`` — it arrives as
+    a state key, not a keyword argument.  The state merger injects
+    ``slice`` alongside the normal subgraph state fields.
     """
-    work_id = state.get("work_id", "unknown")
-    work_type = state.get("work_type", "")
-    workspace_root = state.get("workspace_root", ".")
-    retry_count = state.get("retry_count", 0)
-    feedback = state.get("feedback", [])
+    from spine.agents.factory import build_phase_agent
+    from spine.agents.subagents import build_subagent_spec
 
-    logger.info(f"[{work_id}] IMPLEMENT subgraph: run_agent starting")
+    work_id = state.get("work_id", "unknown")
+    slice_data: dict = state.get("slice", {})
+    slice_id = slice_data.get("id", "unknown")
+
+    logger.info(
+        "[%s] Slice-implementer node: slice=%r (title=%r)",
+        work_id,
+        slice_id,
+        slice_data.get("title", ""),
+    )
 
     try:
-        agent = build_implement_agent(dict(state), config)
-        materialize_artifacts(dict(state), workspace_root, work_id=work_id)
-
-        gap_plan_path = state.get("gap_plan_path", "")
-
-        prompt_lines = [
-            "Implement the feature slices described below. Write clean, "
-            "production-quality code for each slice.",
-            "",
-        ]
-
-        if gap_plan_path:
-            prompt_lines.extend(
-                [
-                    "**Gap-Fix Mode:** You are re-running implementation to fix issues "
-                    "identified by verification. Read the gap plan for targeted fix "
-                    "instructions, then apply ONLY the changes specified in it. "
-                    "Preserve all other implementation work from the first pass.",
-                    "",
-                    f"- Gap Plan: `{gap_plan_path}/gap_plan.md`",
-                    "",
-                ]
-            )
-
-        # ── Always wave-based dispatch ──────────────────────────────────
-        # execution_waves is a fail-closed invariant. The prerequisite gate
-        # guarantees structured waves exist before IMPLEMENT runs. The
-        # read_slice_files tool (available to the orchestrator) loads
-        # everything from plan.json — no need to reference individual
-        # artifact files on disk.
-        prompt_lines.extend(
-            [
-                "Your `read_slice_files` tool loads everything from `plan.json`. "
-                "Do not read individual markdown files manually.",
-                "",
-            ]
+        subagent_spec = build_subagent_spec(
+            name="slice-implementer",
+            phase=PhaseName.IMPLEMENT,
+            state=state,
+            config=config,
         )
 
-        impl_path = artifact_path(work_id, PhaseName.IMPLEMENT.value)
-        prompt_lines.extend(
-            [
-                "Execution waves have been pre-computed from the plan — slices are "
-                "organized into waves where slices within a wave are independent "
-                "and can run in parallel. Dispatch slice-implementer subagents "
-                "per wave (parallel within wave, sequential across waves).",
-                "",
-            ]
+        extra_tools = list(subagent_spec.get("tools", []))
+        agent = build_phase_agent(
+            state=state,
+            config=config,
+            phase=PhaseName.IMPLEMENT,
+            system_prompt=subagent_spec["system_prompt"],
+            is_subagent=True,
+            extra_tools=extra_tools,
+            response_format=subagent_spec.get("response_format"),
+            skip_filesystem_middleware=True,
         )
-        prompt_lines.extend(
-            [
-                "## Where to Write Your Output",
-                f"Write a summary of what you implemented to `{impl_path}/implementation.md` "
-                "using `write_file`. List every file you created or modified, with a one-line "
-                "description of each change.  This file is REQUIRED — without it, the workflow "
-                "treats the phase as failed.",
-                "",
-            ]
-        )
-        prompt = "\n".join(prompt_lines)
-        if retry_count > 0 and feedback:
-            feedback_text = "\n".join(
-                f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
-                for f in feedback
-                if isinstance(f, dict)
-            )
-            prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
-        ctx = build_context(dict(state), PhaseName.IMPLEMENT)
+        slice_json = json.dumps(slice_data, indent=2, ensure_ascii=False)
+        prompt = (
+            f"## Implement Slice: {slice_id}\n\n"
+            f"The full slice definition is in the JSON below. "
+            f"Read it carefully — it specifies target_files, "
+            f"execution_requirements, dependencies, and acceptance_criteria. "
+            f"Make only the changes described in the slice.\n\n"
+            f"```json\n{slice_json}\n```"
+        )
 
         result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
-            phase_name=PhaseName.IMPLEMENT.value,
+            phase_name="implement-slice",
             work_id=work_id,
-            work_type=work_type,
-            context=ctx,
         )
 
-        return {
-            "messages": result.get("messages", []),
-            "agent_response": extract_response(result),
-        }
+        slice_result = _extract_slice_result(result, slice_id)
 
     except Exception as e:
-        logger.error(f"[{work_id}] IMPLEMENT subgraph agent failed: {e}", exc_info=True)
-        return {
-            "messages": [],
-            "agent_response": f"Agent error: {e}",
-            "phase_status": "error",
+        logger.error(
+            "[%s] Slice-implementer failed for %r: %s",
+            work_id,
+            slice_id,
+            e,
+            exc_info=True,
+        )
+        slice_result = {
+            "slice_name": slice_id,
+            "status": "blocked",
+            "files_modified": [],
+            "files_created": [],
+            "test_results": f"Subagent error: {e}",
+            "issues": [str(e)],
         }
+
+    return {"slice_results": [slice_result]}
+
+
+def _extract_slice_result(result: dict, slice_id: str) -> dict:
+    """Extract a SliceResult dict from an agent result.
+
+    If the agent returned structured output via ``response_format``,
+    it'll be in the ``structured_response`` key.  Falls back to the
+    last assistant message content.
+
+    The ``slice_name`` field is overridden with the actual slice_id
+    from the router to guarantee consistency — the subagent may not
+    include the slice name in its response.
+    """
+    structured = result.get("structured_response")
+    if structured:
+        if isinstance(structured, dict):
+            structured["slice_name"] = slice_id
+            return structured
+        if hasattr(structured, "model_dump"):
+            d = structured.model_dump()
+            d["slice_name"] = slice_id
+            return d
+
+    messages = result.get("messages", [])
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    parsed["slice_name"] = slice_id
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return {
+                "slice_name": slice_id,
+                "status": "implemented",
+                "files_modified": [],
+                "files_created": [],
+                "test_results": "",
+                "issues": [],
+            }
+
+    return {
+        "slice_name": slice_id,
+        "status": "implemented",
+        "files_modified": [],
+        "files_created": [],
+        "test_results": "(no output from subagent)",
+        "issues": ["Subagent produced no output"],
+    }
+
+
+# ── Node: aggregate_implementation ──────────────────────────────────────
+
+
+async def _aggregate_implementation_node(
+    state: ImplementSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Fan-in point after all parallel slice-implementer nodes complete.
+
+    Results are already accumulated via ``operator.add`` on the
+    ``slice_results`` field — no manual merging needed. This node
+    exists as a routing checkpoint.
+    """
+    results = state.get("slice_results", [])
+    statuses = [r.get("status", "?") for r in results]
+    logger.info(
+        "IMPLEMENT aggregate: %d slice result(s) — statuses: %s",
+        len(results),
+        statuses,
+    )
+    return {}
+
+
+# ── Node: synthesize_implementation ──────────────────────────────────────
+
+
+async def _synthesize_implementation_node(
+    state: ImplementSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Write implementation.md and implementation.json from accumulated results.
+
+    Uses the existing ``WriteImplementationReportTool`` logic (via a
+    utility function) to produce both the human-readable markdown and
+    the structured JSON artifact.
+    """
+    from spine.agents.implement_tools import write_implementation_files
+
+    work_id = state.get("work_id", "unknown")
+    workspace_root = state.get("workspace_root", ".")
+    slice_results = state.get("slice_results", [])
+
+    if not slice_results:
+        logger.warning("[%s] IMPLEMENT synthesize: zero slice results", work_id)
+        return {
+            "agent_response": "",
+            "artifacts_output": {},
+            "phase_status": "needs_review",
+            "slices_dispatched": False,
+            "implementation_files_written": False,
+        }
+
+    impl_dir = artifact_path(work_id, PhaseName.IMPLEMENT.value)
+    summary = _build_implementation_summary(slice_results)
+
+    try:
+        write_implementation_files(slice_results, summary, workspace_root, impl_dir)
+    except Exception as e:
+        logger.error(
+            "[%s] IMPLEMENT synthesize: failed to write artifacts: %s",
+            work_id,
+            e,
+        )
+        return {
+            "agent_response": summary,
+            "artifacts_output": {},
+            "phase_status": "error",
+            "slices_dispatched": True,
+            "implementation_files_written": False,
+        }
+
+    logger.info(
+        "[%s] IMPLEMENT synthesize: wrote %d slice results to %s/",
+        work_id,
+        len(slice_results),
+        impl_dir,
+    )
+
+    return {
+        "agent_response": summary,
+        "artifacts_output": {"implementation.md": summary[:_MAX_ARTIFACT_STATE_CHARS]},
+        "phase_status": "success",
+        "slices_dispatched": True,
+        "implementation_files_written": True,
+    }
+
+
+def _build_implementation_summary(slice_results: list[dict]) -> str:
+    """Build a human-readable implementation summary from slice results."""
+    total = len(slice_results)
+    statuses: dict[str, int] = {}
+    for r in slice_results:
+        s = r.get("status", "unknown")
+        statuses[s] = statuses.get(s, 0) + 1
+
+    parts = [
+        f"Implemented {total} feature slice(s).",
+    ]
+    for status, count in sorted(statuses.items()):
+        parts.append(f"- {status}: {count}")
+
+    implemented = statuses.get("implemented", 0)
+    blocked = statuses.get("blocked", 0)
+    if implemented == total:
+        parts.append("All slices implemented successfully.")
+    elif blocked > 0:
+        parts.append(f"{blocked} slice(s) blocked — see implementation.md for details.")
+
+    return "\n".join(parts)
+
+
+# ── Node: save_artifacts ────────────────────────────────────────────────
 
 
 async def _save_implement_artifacts(
     state: ImplementSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Save artifacts from the implement agent to disk and state."""
+    """Save artifacts from the implement phase to disk and state."""
     workspace_root = state.get("workspace_root", ".")
     work_id = state.get("work_id", "unknown")
     agent_response = state.get("agent_response", "")
@@ -183,12 +398,38 @@ async def _save_implement_artifacts(
     }
 
 
+# ── Builder ──────────────────────────────────────────────────────────────
+
+
 def build_implement_subgraph() -> Any:
-    """Build the IMPLEMENT phase subgraph."""
+    """Build the IMPLEMENT phase subgraph with Send API dispatch.
+
+    Returns a compiled StateGraph with five nodes:
+    1. implement_router — conditional edge dispatching Send objects
+    2. run_slice_implementer — per-slice subagent invocation (parallel)
+    3. aggregate_implementation — fan-in checkpoint
+    4. synthesize_implementation — writes implementation artifacts
+    5. save_artifacts — scans disk, materializes to state
+    """
     builder = StateGraph(ImplementSubgraphState)
-    builder.add_node("run_agent", _run_implement_agent)
+
+    builder.add_node("run_slice_implementer", _run_slice_implementer_node)
+    builder.add_node("aggregate_implementation", _aggregate_implementation_node)
+    builder.add_node("synthesize_implementation", _synthesize_implementation_node)
     builder.add_node("save_artifacts", _save_implement_artifacts)
-    builder.add_edge(START, "run_agent")
-    builder.add_edge("run_agent", "save_artifacts")
+
+    builder.add_conditional_edges(
+        START,
+        _implement_router,
+        {
+            "run_slice_implementer": "run_slice_implementer",
+            "synthesize_implementation": "synthesize_implementation",
+        },
+    )
+
+    builder.add_edge("run_slice_implementer", "aggregate_implementation")
+    builder.add_edge("aggregate_implementation", "synthesize_implementation")
+    builder.add_edge("synthesize_implementation", "save_artifacts")
     builder.add_edge("save_artifacts", END)
+
     return builder

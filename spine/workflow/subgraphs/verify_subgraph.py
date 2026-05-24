@@ -1,147 +1,408 @@
-"""VERIFY phase as a LangGraph subgraph.
+"""VERIFY phase as a LangGraph subgraph with Send API dispatch.
 
-The subgraph has two internal nodes:
-1. ``run_agent`` — builds and invokes the verify Deep Agent.
-2. ``save_artifacts`` — scans disk for artifacts, determines phase status.
+The subgraph uses the same manager/router/call/aggregate pattern as the
+exploration and implement subgraphs, replacing the old ``eval`` +
+``tools.task()`` + ``Promise.allSettled`` approach with native LangGraph
+``Send`` API parallel dispatch.
 
-State schema: ``VerifySubgraphState`` — isolated from parent ``WorkflowState``.
+Nodes:
+- ``verify_router``: conditional edge — reads ``execution_waves`` from
+  state, returns ``[Send("run_slice_verifier", ...)]`` or
+  ``"synthesize_verification"``
+- ``run_slice_verifier``: builds a ``slice-verifier`` subagent per slice
+  and invokes it. Runs in parallel via Send API.
+- ``aggregate_verification``: deterministic fan-in point after all
+  parallel slice-verifier nodes complete.
+- ``synthesize_verification``: writes ``verification.md`` and
+  ``verification.json`` from accumulated verdicts, determines
+  ``overall_status``.
+- ``save_artifacts``: scans disk, materializes to state, determines
+  phase status from ``verification.json``.
+
+Edges::
+
+    START → verify_router
+    verify_router → Send("run_slice_verifier", {slice}) × N  OR  → synthesize_verification
+    run_slice_verifier → aggregate_verification
+    aggregate_verification → synthesize_verification → save_artifacts → END
 """
+
+from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
-from spine.models.enums import PhaseName
-from spine.workflow.subgraph_state import VerifySubgraphState
-from spine.agents.verify_agent import build_verify_agent
-from spine.agents.helpers import extract_response
-from spine.agents.retry import ainvoke_with_retry
-from spine.agents.context import build_context
 from spine.agents.artifacts import (
-    materialize_artifacts,
+    artifact_path,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    artifact_path,
 )
+from spine.agents.retry import ainvoke_with_retry
+from spine.exceptions import CriticalContractFailure
+from spine.models.enums import PhaseName
+from spine.workflow.subgraph_state import VerifySubgraphState
 
 logger = logging.getLogger(__name__)
-
-# Maximum characters of artifact content to store in state.
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-async def _run_verify_agent(
+# ── Router: START → run_slice_verifier (Send) or synthesize ─────────────
+
+
+def _verify_router(
+    state: VerifySubgraphState,
+) -> list[Send] | Literal["synthesize_verification"]:
+    """Fan-out to slice-verifier nodes via Send API.
+
+    Reads ``execution_waves`` from state, flattens all waves into a single
+    dispatch list (dependencies resolved by the scheduler during PLAN).
+
+    Raises ``CriticalContractFailure`` if ``execution_waves`` is missing
+    or empty — this is a structural invariant violation.
+    """
+    execution_waves = state.get("execution_waves")
+
+    if not execution_waves:
+        raise CriticalContractFailure(
+            phase="verify",
+            reason="execution_waves is missing or empty in state — "
+                   "the PLAN phase did not produce structured data transfer. "
+                   "The prerequisite gate should have caught this before "
+                   "VERIFY ran; check artifact_gate.py.",
+        )
+
+    all_slices: list[dict] = []
+    for wave in execution_waves:
+        if isinstance(wave, list):
+            for sl in wave:
+                if isinstance(sl, dict) and sl.get("id"):
+                    all_slices.append(sl)
+
+    if not all_slices:
+        raise CriticalContractFailure(
+            phase="verify",
+            reason="execution_waves is present but contains zero valid "
+                   "slice dicts with 'id' fields. The PLAN phase produced "
+                   "malformed structured data.",
+        )
+
+    logger.info(
+        "VERIFY router: dispatching %d slice-verifier(s): %s",
+        len(all_slices),
+        [s.get("id", "?") for s in all_slices],
+    )
+
+    base_state = {
+        "phase": state.get("phase", "verify"),
+        "work_id": state.get("work_id", "unknown"),
+        "work_type": state.get("work_type", ""),
+        "workspace_root": state.get("workspace_root", "."),
+    }
+    return [
+        Send("run_slice_verifier", {**base_state, "slice": s})
+        for s in all_slices
+    ]
+
+
+# ── Node: run_slice_verifier ────────────────────────────────────────────
+
+
+async def _run_slice_verifier_node(
     state: VerifySubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the verify Deep Agent within the subgraph.
+    """Run a slice-verifier subagent for one feature slice.
 
-    Builds the agent from the subgraph state, materializes prior artifacts,
-    constructs the prompt, and invokes with retry.  The original work
-    description is NOT included — VERIFY works from prior artifacts on
-    disk, not the raw description.
+    The slice is injected into state by the Send API via
+    ``Send("run_slice_verifier", {"slice": {...}})``.  The subagent
+    receives the slice definition, acceptance criteria, and access
+    to the filesystem to inspect the implemented code.
     """
-    work_id = state.get("work_id", "unknown")
-    work_type = state.get("work_type", "")
-    workspace_root = state.get("workspace_root", ".")
+    from spine.agents.factory import build_phase_agent
+    from spine.agents.subagents import build_subagent_spec
 
-    logger.info(f"[{work_id}] VERIFY subgraph: run_agent starting")
+    work_id = state.get("work_id", "unknown")
+    slice_data: dict = state.get("slice", {})
+    slice_id = slice_data.get("id", "unknown")
+
+    logger.info(
+        "[%s] Slice-verifier node: slice=%r (title=%r)",
+        work_id,
+        slice_id,
+        slice_data.get("title", ""),
+    )
 
     try:
-        # Build the agent — build_verify_agent expects a dict-like state
-        agent = build_verify_agent(dict(state), config)  # type: ignore[dict-constructor]
+        subagent_spec = build_subagent_spec(
+            name="slice-verifier",
+            phase=PhaseName.VERIFY,
+            state=state,
+            config=config,
+        )
 
-        # Materialize prior artifacts to disk so agent can read them
-        materialize_artifacts(dict(state), workspace_root, work_id=work_id)  # type: ignore[dict-constructor]
+        extra_tools = list(subagent_spec.get("tools", []))
+        agent = build_phase_agent(
+            state=state,
+            config=config,
+            phase=PhaseName.VERIFY,
+            system_prompt=subagent_spec["system_prompt"],
+            is_subagent=True,
+            extra_tools=extra_tools,
+            response_format=subagent_spec.get("response_format"),
+            skip_filesystem_middleware=True,
+        )
 
-        # Build prompt using read_verify_context for structured loading
-        verify_path = artifact_path(work_id, PhaseName.VERIFY.value)
-
-        prompt_lines = [
-            "Verify that the implementation meets the requirements. "
-            "Check that all feature slices are implemented correctly, "
-            "the plan was followed, and the original task is complete.",
-            "",
-            "Use `read_verify_context` to load structured slice definitions "
-            "and implementation results in one call. Do NOT use `read_file`, "
-            "`grep`, or manually read individual markdown files (e.g., "
-            "`specification.md`, `plan.md`, `tasks.md`, `codebase-map.md`).",
-            "",
-            "Also inspect the actual code files on disk using `ls` and "
-            "`read_file` — the implementation summary may not reflect "
-            "the actual state of the code.",
-            "",
-            "## Where to Write Your Output",
-            f"Write your verification report to `{verify_path}/verification.md` "
-            "using `write_file`. The report MUST begin with `VERIFIED` or `PASSED` "
-            "on the first line if the implementation meets requirements, or "
-            "`FAILED` followed by the issues found. This file is REQUIRED — "
-            "without it, the workflow treats the phase as failed.",
-            "",
-            "Also write a structured `{0}/verification.json` with an "
-            "`overall_status` field set to \"VERIFIED\" or \"FAILED\". This "
-            "JSON file is the authoritative source for phase status.",
-            "",
-            "**RLM parallel verify pattern:** Use `eval` to read the "
-            "tasks artifact, extract the slice list, then dispatch a "
-            "`slice-verifier` subagent per slice via "
-            "`Promise.allSettled(tools.task(...))`. Synthesize the "
-            "verification report from subagent results in code — do NOT "
-            "re-read each slice file manually into conversation.",
-        ]
-        prompt = "\n".join(prompt_lines).format(verify_path)
-
-        ctx = build_context(dict(state), PhaseName.VERIFY)  # type: ignore[dict-constructor]
+        slice_json = json.dumps(slice_data, indent=2, ensure_ascii=False)
+        prompt = (
+            f"## Verify Slice: {slice_id}\n\n"
+            f"The full slice definition is in the JSON below. "
+            f"Verify the implementation against these acceptance criteria. "
+            f"Inspect the actual code files on disk — do not trust that "
+            f"the implementation summary matches reality.\n\n"
+            f"```json\n{slice_json}\n```"
+        )
 
         result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
-            phase_name=PhaseName.VERIFY.value,
+            phase_name="verify-slice",
             work_id=work_id,
-            work_type=work_type,
-            context=ctx,
         )
 
-        verify_content = extract_response(result)
-        return {
-            "messages": result.get("messages", []),
-            "agent_response": verify_content,
-        }
+        verification_result = _extract_verification_result(result, slice_id)
 
     except Exception as e:
-        logger.error(f"[{work_id}] VERIFY subgraph agent failed: {e}", exc_info=True)
-        return {
-            "messages": [],
-            "agent_response": f"Agent error: {e}",
-            "phase_status": "error",
+        logger.error(
+            "[%s] Slice-verifier failed for %r: %s",
+            work_id,
+            slice_id,
+            e,
+            exc_info=True,
+        )
+        verification_result = {
+            "slice_name": slice_id,
+            "verdict": "NOT_VERIFIED",
+            "checklist": [
+                {
+                    "criterion": "Subagent execution",
+                    "passed": False,
+                    "detail": f"Verifier subagent crashed: {e}",
+                }
+            ],
+            "gaps": [f"Verification could not complete: {e}"],
+            "recommendations": ["Re-run verification for this slice"],
         }
+
+    return {"verification_results": [verification_result]}
+
+
+def _extract_verification_result(result: dict, slice_id: str) -> dict:
+    """Extract a VerificationResult dict from an agent result.
+
+    If the agent returned structured output via ``response_format``,
+    it'll be in the ``structured_response`` key.  Falls back to the
+    last assistant message content.
+
+    The ``slice_name`` field is overridden with the actual slice_id
+    from the router to guarantee consistency.
+    """
+    structured = result.get("structured_response")
+    if structured:
+        if isinstance(structured, dict):
+            structured["slice_name"] = slice_id
+            return structured
+        if hasattr(structured, "model_dump"):
+            d = structured.model_dump()
+            d["slice_name"] = slice_id
+            return d
+
+    messages = result.get("messages", [])
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    parsed["slice_name"] = slice_id
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return {
+                "slice_name": slice_id,
+                "verdict": "NOT_VERIFIED",
+                "checklist": [
+                    {
+                        "criterion": "Agent output",
+                        "passed": False,
+                        "detail": "Subagent produced unstructured output — verify manually",
+                    }
+                ],
+                "gaps": ["Unstructured output from subagent"],
+                "recommendations": [],
+            }
+
+    return {
+        "slice_name": slice_id,
+        "verdict": "NOT_VERIFIED",
+        "checklist": [
+            {
+                "criterion": "Agent output",
+                "passed": False,
+                "detail": "(no output from subagent)",
+            }
+        ],
+        "gaps": ["Subagent produced no output"],
+        "recommendations": [],
+    }
+
+
+# ── Node: aggregate_verification ───────────────────────────────────────
+
+
+async def _aggregate_verification_node(
+    state: VerifySubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Fan-in point after all parallel slice-verifier nodes complete.
+
+    Results are already accumulated via ``operator.add`` on the
+    ``verification_results`` field — no manual merging needed.
+    """
+    results = state.get("verification_results", [])
+    verdicts = [r.get("verdict", "?") for r in results]
+    logger.info(
+        "VERIFY aggregate: %d verification result(s) — verdicts: %s",
+        len(results),
+        verdicts,
+    )
+    return {}
+
+
+# ── Node: synthesize_verification ───────────────────────────────────────
+
+
+async def _synthesize_verification_node(
+    state: VerifySubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Write verification.md and verification.json from accumulated verdicts.
+
+    Uses the existing ``WriteVerificationReportTool`` logic (via a
+    utility function) to produce both the human-readable markdown and
+    the structured JSON artifact.
+    """
+    from spine.agents.verify_tools import write_verification_files
+
+    work_id = state.get("work_id", "unknown")
+    workspace_root = state.get("workspace_root", ".")
+    verification_results = state.get("verification_results", [])
+
+    if not verification_results:
+        logger.warning("[%s] VERIFY synthesize: zero slice verification results", work_id)
+        return {
+            "agent_response": "",
+            "artifacts_output": {},
+            "phase_status": "needs_review",
+            "verification_attempted": False,
+            "verification_passed": False,
+        }
+
+    verify_dir = artifact_path(work_id, PhaseName.VERIFY.value)
+    summary = _build_verification_summary(verification_results)
+
+    try:
+        write_verification_files(verification_results, summary, workspace_root, verify_dir)
+    except Exception as e:
+        logger.error(
+            "[%s] VERIFY synthesize: failed to write artifacts: %s",
+            work_id,
+            e,
+        )
+        return {
+            "agent_response": summary,
+            "artifacts_output": {},
+            "phase_status": "error",
+            "verification_attempted": True,
+            "verification_passed": False,
+        }
+
+    all_verified = all(
+        r.get("verdict") == "VERIFIED" for r in verification_results
+    )
+
+    logger.info(
+        "[%s] VERIFY synthesize: wrote %d slice verdicts to %s/ (all_verified=%s)",
+        work_id,
+        len(verification_results),
+        verify_dir,
+        all_verified,
+    )
+
+    return {
+        "agent_response": summary,
+        "artifacts_output": {"verification.md": summary[:_MAX_ARTIFACT_STATE_CHARS]},
+        "phase_status": "success" if all_verified else "needs_review",
+        "verification_attempted": True,
+        "verification_passed": all_verified,
+    }
+
+
+def _build_verification_summary(verification_results: list[dict]) -> str:
+    """Build a human-readable verification summary from slice verdicts."""
+    total = len(verification_results)
+    verdicts: dict[str, int] = {}
+    for r in verification_results:
+        v = r.get("verdict", "UNKNOWN")
+        verdicts[v] = verdicts.get(v, 0) + 1
+
+    verified = verdicts.get("VERIFIED", 0)
+    not_verified = total - verified
+
+    parts = [
+        f"Verification complete for {total} feature slice(s).",
+        f"- VERIFIED: {verified}",
+    ]
+    if not_verified:
+        parts.append(f"- NOT_VERIFIED: {not_verified}")
+
+    if not_verified == 0:
+        parts.append("All slices passed verification.")
+    else:
+        parts.append(f"{not_verified} slice(s) did not pass — see verification.md for details.")
+
+    return "\n".join(parts)
+
+
+# ── Node: save_artifacts ────────────────────────────────────────────────
 
 
 async def _save_verify_artifacts(
     state: VerifySubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Save artifacts from the verify agent to disk and state.
+    """Save artifacts from the verify phase to disk and state.
 
-    Scans the verify artifact directory for files written by the agent.
-    If none found, falls back to the agent response text.
+    Reads ``verification.json`` for authoritative phase status,
+    falling back to string-matching on ``verification.md`` content if
+    JSON is not available.
     """
     workspace_root = state.get("workspace_root", ".")
     work_id = state.get("work_id", "unknown")
     agent_response = state.get("agent_response", "")
     existing_phase_status = state.get("phase_status", "")
 
-    # If the agent node already set an error/needs_review status, preserve it
     if existing_phase_status in ("error", "needs_review"):
         return {
             "artifacts_output": {},
             "phase_status": existing_phase_status,
         }
 
-    # Scan what the agent wrote to disk
     disk_artifacts = scan_artifact_dir(
         workspace_root,
         work_id,
@@ -149,7 +410,6 @@ async def _save_verify_artifacts(
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
     )
 
-    # Fallback: if agent wrote nothing, use the extracted response
     if not disk_artifacts:
         verify_content = agent_response
         if not verify_content or len(verify_content.strip()) < 20:
@@ -166,8 +426,6 @@ async def _save_verify_artifacts(
         disk_artifacts = {"verification.md": verify_content[:_MAX_ARTIFACT_STATE_CHARS]}
 
     # Determine status from verification.json (authoritative source).
-    from pathlib import Path
-
     verify_dir = Path(workspace_root) / artifact_path(work_id, PhaseName.VERIFY.value)
     verify_json_path = verify_dir / "verification.json"
     is_verified = False
@@ -182,9 +440,8 @@ async def _save_verify_artifacts(
                 work_id,
             )
 
-    # Populate verification_findings from agent structured response
-    agent_result = state.get("messages", [])
     verification_findings: list[dict] = []
+    agent_result = state.get("messages", [])
     if isinstance(agent_result, dict) and "structured_response" in agent_result:
         sr = agent_result.get("structured_response", {})
         if isinstance(sr, dict):
@@ -197,20 +454,38 @@ async def _save_verify_artifacts(
     }
 
 
-def build_verify_subgraph() -> Any:
-    """Build the VERIFY phase subgraph.
+# ── Builder ──────────────────────────────────────────────────────────────
 
-    Returns a compiled StateGraph with two nodes:
-    1. run_agent — builds and invokes the verify Deep Agent.
-    2. save_artifacts — scans disk for artifacts written by the agent.
+
+def build_verify_subgraph() -> Any:
+    """Build the VERIFY phase subgraph with Send API dispatch.
+
+    Returns a compiled StateGraph with five nodes:
+    1. verify_router — conditional edge dispatching Send objects
+    2. run_slice_verifier — per-slice subagent invocation (parallel)
+    3. aggregate_verification — fan-in checkpoint
+    4. synthesize_verification — writes verification artifacts
+    5. save_artifacts — scans disk, materializes to state
     """
     builder = StateGraph(VerifySubgraphState)
 
-    builder.add_node("run_agent", _run_verify_agent)
+    builder.add_node("run_slice_verifier", _run_slice_verifier_node)
+    builder.add_node("aggregate_verification", _aggregate_verification_node)
+    builder.add_node("synthesize_verification", _synthesize_verification_node)
     builder.add_node("save_artifacts", _save_verify_artifacts)
 
-    builder.add_edge(START, "run_agent")
-    builder.add_edge("run_agent", "save_artifacts")
+    builder.add_conditional_edges(
+        START,
+        _verify_router,
+        {
+            "run_slice_verifier": "run_slice_verifier",
+            "synthesize_verification": "synthesize_verification",
+        },
+    )
+
+    builder.add_edge("run_slice_verifier", "aggregate_verification")
+    builder.add_edge("aggregate_verification", "synthesize_verification")
+    builder.add_edge("synthesize_verification", "save_artifacts")
     builder.add_edge("save_artifacts", END)
 
     return builder

@@ -764,12 +764,12 @@ class TestStateMappingConsistency:
 
         mapped = _plan_state_mapper(parent_state, None)
         assert mapped["has_spec"] is True
-        assert "plan" in mapped["spec_path"]
+        assert "specify" in mapped["spec_path"]
         assert mapped["phase"] == "plan"
         assert mapped["work_id"] == "wk-mapper-1"
 
     def test_verify_state_mapper_includes_all_artifact_paths(self):
-        """Verify state mapper includes spec_path and plan_path for verification."""
+        """Verify state mapper includes spec_path, plan_path, and execution_waves."""
         parent_state = {
             "work_id": "wk-mapper-2",
             "work_type": "task",
@@ -783,4 +783,4 @@ class TestStateMappingConsistency:
         assert mapped["phase"] == "verify"
         assert "plan" in mapped.get("plan_path", "")
         assert "specify" in mapped.get("spec_path", "")
-        assert mapped["has_spec"] is True
+        assert mapped.get("execution_waves") == []

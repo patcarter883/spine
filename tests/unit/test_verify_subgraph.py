@@ -1,4 +1,9 @@
-"""Tests for the VERIFY phase subgraph."""
+"""Tests for the VERIFY phase subgraph.
+
+Updated for Send API dispatch pattern — the verify subgraph now uses
+``verify_router`` → ``Send("run_slice_verifier", ...)`` → ``aggregate_verification``
+→ ``synthesize_verification`` → ``save_artifacts``.
+"""
 
 from __future__ import annotations
 
@@ -25,7 +30,9 @@ class TestVerifySubgraphCompilation:
 
         graph = build_verify_subgraph().compile()
         nodes = set(graph.get_graph().nodes.keys())
-        assert "run_agent" in nodes
+        assert "run_slice_verifier" in nodes
+        assert "aggregate_verification" in nodes
+        assert "synthesize_verification" in nodes
         assert "save_artifacts" in nodes
 
     def test_verify_subgraph_edges(self):
@@ -33,79 +40,110 @@ class TestVerifySubgraphCompilation:
 
         graph = build_verify_subgraph().compile()
         mermaid = graph.get_graph().draw_mermaid()
-        assert "run_agent" in mermaid
+        assert "run_slice_verifier" in mermaid
+        assert "aggregate_verification" in mermaid
+        assert "synthesize_verification" in mermaid
         assert "save_artifacts" in mermaid
         assert "__end__" in mermaid
 
 
-class TestRunVerifyAgent:
-    """Tests for the _run_verify_agent node within the subgraph."""
+class TestVerifyRouter:
+    """Tests for the _verify_router conditional edge function."""
+
+    def test_verify_router_raises_on_missing_execution_waves(self):
+        from spine.workflow.subgraphs.verify_subgraph import _verify_router
+        from spine.workflow.subgraph_state import VerifySubgraphState
+        from spine.exceptions import CriticalContractFailure
+
+        with pytest.raises(CriticalContractFailure, match="execution_waves"):
+            _verify_router(VerifySubgraphState(
+                work_id="test", phase="verify", workspace_root=".",
+            ))
+
+    def test_verify_router_raises_on_empty_execution_waves(self):
+        from spine.workflow.subgraphs.verify_subgraph import _verify_router
+        from spine.workflow.subgraph_state import VerifySubgraphState
+        from spine.exceptions import CriticalContractFailure
+
+        with pytest.raises(CriticalContractFailure, match="execution_waves"):
+            _verify_router(VerifySubgraphState(
+                work_id="test", phase="verify", workspace_root=".",
+                execution_waves=[],
+            ))
+
+    def test_verify_router_dispatches_sends(self):
+        from spine.workflow.subgraphs.verify_subgraph import _verify_router
+        from spine.workflow.subgraph_state import VerifySubgraphState
+        from langgraph.types import Send
+
+        result = _verify_router(VerifySubgraphState(
+            work_id="test", phase="verify", workspace_root="/tmp",
+            execution_waves=[[{"id": "s1", "title": "Slice 1"}]],
+        ))
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], Send)
+        assert result[0].node == "run_slice_verifier"
+        assert result[0].arg["slice"]["id"] == "s1"
+
+
+class TestRunSliceVerifier:
+    """Tests for the _run_slice_verifier_node."""
 
     @pytest.mark.asyncio
-    async def test_run_agent_success(self):
-        from spine.workflow.subgraphs.verify_subgraph import _run_verify_agent
+    async def test_run_verifier_node_success(self):
+        from spine.workflow.subgraphs.verify_subgraph import _run_slice_verifier_node
 
         mock_agent = AsyncMock()
         mock_agent.ainvoke.return_value = {
             "messages": [
                 MagicMock(
-                    content="VERIFIED", usage_metadata={"input_tokens": 100, "output_tokens": 50}
-                )
+                    content='{"verdict": "VERIFIED", "checklist": [{"criterion":"test","passed":true,"detail":"ok"}], "gaps": [], "recommendations": []}'
+                ),
             ]
         }
 
         with patch(
-            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent", return_value=mock_agent
+            "spine.agents.subagents.build_subagent_spec",
+            return_value={"system_prompt": "test prompt", "tools": [], "response_format": None},
         ):
-            with patch("spine.workflow.subgraphs.verify_subgraph.materialize_artifacts"):
+            with patch(
+                "spine.agents.factory.build_phase_agent",
+                return_value=mock_agent,
+            ):
                 state = {
                     "work_id": "test123",
                     "work_type": "task",
-                    "description": "test desc",
+                    "phase": "verify",
                     "workspace_root": "/tmp",
+                    "slice": {"id": "s1", "title": "Test Slice"},
                     "messages": [],
                 }
-                result = await _run_verify_agent(state)
-                assert "agent_response" in result
-                assert result["agent_response"] == "VERIFIED"
+                result = await _run_slice_verifier_node(state)
+                assert "verification_results" in result
+                assert len(result["verification_results"]) == 1
+                assert result["verification_results"][0]["verdict"] == "VERIFIED"
+                assert result["verification_results"][0]["slice_name"] == "s1"
 
     @pytest.mark.asyncio
-    async def test_run_agent_with_task_workflow(self):
-        from spine.workflow.subgraphs.verify_subgraph import _run_verify_agent
-
-        mock_agent = AsyncMock()
-        mock_agent.ainvoke.return_value = {"messages": [MagicMock(content="VERIFIED")]}
+    async def test_run_verifier_node_error_returns_not_verified(self):
+        from spine.workflow.subgraphs.verify_subgraph import _run_slice_verifier_node
 
         with patch(
-            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent", return_value=mock_agent
-        ):
-            with patch("spine.workflow.subgraphs.verify_subgraph.materialize_artifacts"):
-                state = {
-                    "work_id": "test456",
-                    "work_type": "task",
-                    "description": "spec test",
-                    "workspace_root": "/tmp",
-                }
-                result = await _run_verify_agent(state)
-                assert "agent_response" in result
-
-    @pytest.mark.asyncio
-    async def test_run_agent_se_error_sets_error_status(self):
-        from spine.workflow.subgraphs.verify_subgraph import _run_verify_agent
-
-        with patch(
-            "spine.workflow.subgraphs.verify_subgraph.build_verify_agent",
+            "spine.agents.subagents.build_subagent_spec",
             side_effect=RuntimeError("boom"),
         ):
             state = {
                 "work_id": "test",
                 "work_type": "task",
-                "description": "d",
+                "phase": "verify",
                 "workspace_root": ".",
+                "slice": {"id": "s-err"},
             }
-            result = await _run_verify_agent(state)
-            assert result.get("phase_status") == "error"
-            assert "boom" in result["agent_response"]
+            result = await _run_slice_verifier_node(state)
+            assert "verification_results" in result
+            assert result["verification_results"][0]["verdict"] == "NOT_VERIFIED"
+            assert result["verification_results"][0]["slice_name"] == "s-err"
 
 
 class TestSaveVerifyArtifacts:
@@ -115,10 +153,12 @@ class TestSaveVerifyArtifacts:
     async def test_save_artifacts_with_disk_files(self, tmp_path):
         from spine.workflow.subgraphs.verify_subgraph import _save_verify_artifacts
 
-        # Create a fake artifact on disk
         art_dir = tmp_path / ".spine" / "artifacts" / "test123" / "verify"
         art_dir.mkdir(parents=True)
         (art_dir / "verification.md").write_text("VERIFIED all slices")
+        (art_dir / "verification.json").write_text(
+            '{"overall_status": "VERIFIED", "summary": "All good"}'
+        )
 
         state = {
             "work_id": "test123",
@@ -137,6 +177,9 @@ class TestSaveVerifyArtifacts:
         art_dir = tmp_path / ".spine" / "artifacts" / "test456" / "verify"
         art_dir.mkdir(parents=True)
         (art_dir / "verification.md").write_text("Some issues found, not complete")
+        (art_dir / "verification.json").write_text(
+            '{"overall_status": "FAILED", "summary": "Issues found"}'
+        )
 
         state = {
             "work_id": "test456",
@@ -158,7 +201,9 @@ class TestSaveVerifyArtifacts:
             "phase_status": "",
         }
         result = await _save_verify_artifacts(state, None)
-        assert result["phase_status"] == "success"
+        # Without verification.json on disk, authoritative status defaults
+        # to unverified; phase_status becomes needs_review.
+        assert result["phase_status"] == "needs_review"
         assert "verification.md" in result["artifacts_output"]
 
     @pytest.mark.asyncio
@@ -192,7 +237,7 @@ class TestSaveVerifyArtifacts:
 class TestVerifyStateAndResult:
     """Tests state mapping between parent and verify subgraph."""
 
-    def test_verify_state_mapper_task_workflow(self):
+    def test_verify_state_mapper_includes_execution_waves(self):
         from spine.workflow.compose import _verify_state_mapper
 
         parent = {
@@ -208,8 +253,9 @@ class TestVerifyStateAndResult:
         assert result["work_type"] == "task"
         assert result["spec_path"] == ".spine/artifacts/abc/specify"
         assert result["plan_path"] == ".spine/artifacts/abc/plan"
+        assert result["execution_waves"] == []
 
-    def test_verify_state_mapper_spec_workflow(self):
+    def test_verify_state_mapper_passes_execution_waves(self):
         from spine.workflow.compose import _verify_state_mapper
 
         parent = {
@@ -217,10 +263,10 @@ class TestVerifyStateAndResult:
             "work_type": "task",
             "description": "build feature",
             "workspace_root": "/projects/spine",
+            "execution_waves": [[{"id": "s1"}, {"id": "s2"}]],
         }
         result = _verify_state_mapper(parent, None)
-        assert result["spec_path"] == ".spine/artifacts/def/specify"
-        assert result["plan_path"] == ".spine/artifacts/def/plan"
+        assert result["execution_waves"] == [[{"id": "s1"}, {"id": "s2"}]]
 
     def test_verify_result_mapper_success(self):
         from spine.workflow.compose import _verify_result_mapper
@@ -242,7 +288,6 @@ class TestVerifyStateAndResult:
             "phase_status": "needs_review",
         }
         result = _verify_result_mapper(subgraph_result, {"work_id": "test"})
-        # First failure with verify_attempts=0 → gap-fix cycle
         assert result["status"] == "needs_gap_fix"
         assert result["verify_attempts"] == 1
         assert any(f.get("status") == "needs_review" for f in result["feedback"])
@@ -254,7 +299,6 @@ class TestVerifyStateAndResult:
             "artifacts_output": {},
             "phase_status": "needs_review",
         }
-        # Third failure with verify_attempts=2 → human review
         result = _verify_result_mapper(subgraph_result, {"work_id": "test", "verify_attempts": 2})
         assert result["status"] == "needs_review"
         assert result["needs_review_phase"] == "verify"
@@ -267,7 +311,6 @@ class TestVerifyStateAndResult:
             "artifacts_output": {},
             "phase_status": "needs_review",
         }
-        # Second failure with verify_attempts=1 → still gap-fix
         result = _verify_result_mapper(subgraph_result, {"work_id": "test", "verify_attempts": 1})
         assert result["status"] == "needs_gap_fix"
         assert result["verify_attempts"] == 2

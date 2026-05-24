@@ -41,6 +41,7 @@ from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.garbage_collector import calculate_safe_eviction
+from spine.exceptions import CriticalContractFailure
 
 from langchain_core.messages import AIMessage
 
@@ -79,13 +80,40 @@ def _research_router(
     research is needed, or the string ``"synthesize"`` when done.
     LangGraph executes all Send targets in parallel within the same
     super-step and waits for all to complete before proceeding.
-    """
-    decision = state.get("manager_decision", "done")
-    topics: list[str] = state.get("topics", [])
 
-    if decision == "done" or not topics:
+    Raises ``CriticalContractFailure`` if structured data transfer from
+    the research_manager is incomplete — silent defaults to ``"done"``
+    mask upstream bugs that cause missing research.
+    """
+    decision = state.get("manager_decision")
+
+    if decision is None:
+        raise CriticalContractFailure(
+            phase="exploration",
+            reason="manager_decision is missing from state — "
+                   "the research_manager_node did not write structured output. "
+                   "This indicates a model invocation failure in the manager node.",
+        )
+
+    if decision == "done":
         logger.info("Research complete — routing to synthesize")
         return "synthesize"  # type: ignore[return-value]
+
+    if decision != "explore":
+        raise CriticalContractFailure(
+            phase="exploration",
+            reason=f"manager_decision has unexpected value {decision!r} — "
+                   f"expected 'explore' or 'done'. The research_manager_node "
+                   f"produced invalid structured output.",
+        )
+
+    topics: list[str] = state.get("topics", [])
+    if not topics:
+        raise CriticalContractFailure(
+            phase="exploration",
+            reason="manager_decision is 'explore' but topics list is empty — "
+                   "the research_manager_node produced malformed structured output.",
+        )
 
     sends = [Send("explore", {"topic": t, "phase": state.get("phase", "")}) for t in topics]
     logger.info("Dispatching %d explore node(s): %s", len(sends), topics)

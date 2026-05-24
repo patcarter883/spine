@@ -187,6 +187,7 @@ def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.VERIFY.value, 0),
         "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
         "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
+        "execution_waves": parent_state.get("execution_waves", []),
     }
 
 

@@ -1,34 +1,10 @@
 """SPINE implement agent — Deep Agent for the IMPLEMENT phase.
 
-This phase is the **orchestrator**: its only job is to dispatch one
-``slice-implementer`` subagent per feature slice and synthesize their
-results into ``implementation.md``. It does NOT touch source code.
-
-Design rationale (see trace 743e5acb and 019e4447 assessments):
-
-- Letting a single agent implement N slices serially causes runaway
-  context growth (trace 743e5acb grew prompts from 17K → 84K tokens
-  over 160 LLM calls, same files re-read up to 29 times; trace 019e4447
-  hit the 73K hard context limit after 181 LLM turns with 0 eval calls).
-- One subagent per slice gives each subagent a fresh, small context.
-  The orchestrator's context stays bounded by the slice count, not slice
-  complexity.
-- The orchestrator is dispatch-only by **tool design**, not just by
-  instruction. Generic filesystem tools (ls, read_file, glob, grep,
-  write_file) are replaced entirely with two purpose-built tools:
-
-  * ``read_slice_files`` — loads all slice definitions and the codebase
-    map in a single call. Eliminates multi-turn exploration; the
-    orchestrator has no need for ``ls``/``glob``/``grep``/``read_file``.
-  * ``write_implementation_report`` — the only write surface. Accepts
-    a structured result dict and writes to the fixed implementation.md
-    path. Cannot write source files.
-
-  With these tools the model's only valid actions are:
-  (1) call ``read_slice_files`` once,
-  (2) call ``eval`` to dispatch subagents in parallel,
-  (3) call ``write_implementation_report`` to synthesize.
-  There is literally nothing else to do.
+The IMPLEMENT phase is now dispatched via the Send API subgraph
+(spine/workflow/subgraphs/implement_subgraph.py).  This module is
+kept for the phase registry contract (``build_agent_fn``) and as a
+fallback when subgraphs are disabled via the ``_SUBGRAPH_ENABLED``
+feature flag.
 """
 
 from __future__ import annotations
@@ -38,8 +14,6 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import (
-    artifact_path,
-    build_artifact_prompt,
     build_current_phase_write_prompt,
 )
 from spine.agents.factory import build_phase_agent
@@ -47,22 +21,6 @@ from spine.agents.implement_tools import build_implement_orchestrator_tools
 from spine.agents.subagents import build_phase_subagents
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-
-# ── Tool allowlist (legacy — kept for reference) ────────────────────────
-# Previously the orchestrator used FilesystemMiddleware with an allowlist
-# that kept only read-only tools + write_file. This still allowed a weak
-# model to fall back to 100+ sequential read_file calls (trace 019e4447:
-# 181 LLM turns, 106 read_file calls, context overflow at 73K tokens).
-#
-# The new approach (below) replaces FilesystemMiddleware entirely with
-# two purpose-built tools. Kept here for historical reference only.
-_IMPLEMENT_ORCHESTRATOR_TOOLS_LEGACY: list[str] = [
-    "ls",
-    "read_file",
-    "glob",
-    "grep",
-    "write_file",
-]
 
 
 def _build_subagents(
@@ -80,54 +38,30 @@ def build_implement_agent(
 ) -> Any:
     """Build the Deep Agent for the IMPLEMENT phase.
 
-    Always builds a dispatch-only orchestrator. The orchestrator's only
-    tools are read-only filesystem access plus ``write_file`` (reserved
-    for ``implementation.md``). All code generation is delegated to
-    ``slice-implementer`` subagents via the ``task`` tool, dispatched in
-    parallel from ``eval``.
+    With the Send API subgraph enabled (default), this agent is not called
+    — the subgraph handles all dispatch via ``Send("run_slice_implementer", ...)``.
 
-    Args:
-        state: The current workflow state.
-        config: LangGraph runtime config.
-
-    Returns:
-        A compiled Deep Agent ready for invocation.
+    Kept for the phase registry contract and for when the
+    ``_SUBGRAPH_ENABLED`` feature flag is turned off.
     """
     work_id = state.get("work_id", "")
     workspace_root = state.get("workspace_root", ".")
 
-    # ── Always wave-based dispatch ──────────────────────────────────────
-    # execution_waves is a fail-closed invariant (enforced by the plan
-    # prerequisite gate in artifact_gate.py). By this point we are
-    # guaranteed to have structured waves with at least one slice.
     execution_waves = state.get("execution_waves", [])
     total_slices = sum(len(wave) for wave in execution_waves)
-    wave_count = len(execution_waves)
-    plan_dir = artifact_path(work_id, "plan")
-    plan_json_path = f"{plan_dir}/plan.json"
-    slice_inventory = (
-        f"{total_slices} slice(s) in {wave_count} execution wave(s) "
-        f"from `{plan_json_path}`.\n"
-        "Slices within each wave are independent (parallel); "
-        "waves run sequentially.\n"
-    )
-    for i, wave in enumerate(execution_waves):
-        slice_ids = [s.get("id", f"slice-{j}") for j, s in enumerate(wave)]
-        slice_inventory += f"  Wave {i + 1}: {', '.join(slice_ids)} ({len(wave)} slice(s))\n"
 
-    system_prompt = _build_orchestrator_prompt()
-    system_prompt += slice_inventory + "\n\n"
+    system_prompt = (
+        "You are the IMPLEMENT phase orchestrator. Your job is to dispatch "
+        "slice-implementer subagents per feature slice and synthesize their "
+        "results. Use `read_slice_files` to load slice definitions and the "
+        "codebase map, then dispatch subagents via `task` inside `eval`.\n\n"
+        f"Total slices to implement: {total_slices}\n\n"
+    )
+
     system_prompt += build_current_phase_write_prompt(
         work_id, PhaseName.IMPLEMENT.value, expected_files=["implementation.md"]
-    ) + build_artifact_prompt(
-        state.get("artifacts", {}), PhaseName.IMPLEMENT.value, work_id=work_id
     )
 
-    # ── Build custom orchestrator tools ───────────────────────────────
-    # Replace generic filesystem tools with two purpose-built tools that
-    # enforce dispatch-only behaviour at the tool level. FilesystemMiddleware
-    # is skipped entirely — the orchestrator cannot call ls/glob/read_file/
-    # write_file/grep/edit_file/execute even if it tries.
     orchestrator_tools = build_implement_orchestrator_tools(
         workspace_root=workspace_root,
         work_id=work_id,
@@ -144,111 +78,3 @@ def build_implement_agent(
     )
 
     return agent
-
-
-# ── Prompt builder ─────────────────────────────────────────────────────
-
-
-def _build_orchestrator_prompt() -> str:
-    """Build the orchestrator system prompt.
-
-    Always uses wave-based dispatch from plan.json execution_waves.
-    The legacy flat-parallel dispatch path has been removed — the plan
-    prerequisite gate now enforces execution_waves as a fail-closed
-    invariant before IMPLEMENT can run.
-
-    Kept under ~3KB so the bulk of the prompt is the SPINE base prompt
-    and per-call AGENTS.md memory injection, not phase boilerplate.
-    """
-    return _build_wave_orchestrator_prompt()
-
-
-def _common_prompt_header() -> str:
-    """Shared prompt header with tool surface and Step 1/3 instructions."""
-    return (
-        "You are the IMPLEMENT phase orchestrator. Your job is to dispatch one "
-        "`slice-implementer` subagent per feature slice and synthesize their "
-        "results.\n\n"
-        "## Your Tool Surface (ONLY these tools)\n"
-        "- `read_slice_files` — loads slice definitions + codebase map in ONE call. "
-        "No arguments needed. Call this FIRST.\n"
-        "- `write_implementation_report` — writes implementation.md. Call this LAST.\n"
-        "- `eval` — JavaScript REPL for subagent dispatch. Use `tools.task()` inside.\n\n"
-        "Use ONLY these tools. All other filesystem tools are intentionally omitted. "
-        "Call `read_slice_files` to load all slice definitions at once — do not "
-        "attempt to read individual files manually.\n\n"
-    )
-
-
-def _prompt_step_1_template() -> str:
-    """Shared Step 1: read_slice_files template."""
-    return (
-        "### Step 1 — Call read_slice_files\n"
-        "Call `read_slice_files` with no arguments. It returns:\n"
-        "```json\n"
-        "{\n"
-        '  "slices": {\n'
-        '    "slice-id": {"id", "title", "target_files", "execution_requirements", '
-        '"dependencies", "acceptance_criteria", "complexity"},\n'
-        "    ...\n"
-        "  },\n"
-        '  "codebase_map": "<string>",\n'
-        '  "slice_count": N,\n'
-        '  "plan_dir": "<path>"\n'
-        "}\n"
-        "```\n"
-        "Store in eval: `globalThis.planData = result;`\n\n"
-    )
-
-
-def _prompt_step_3_template() -> str:
-    """Shared Step 3: write_implementation_report template."""
-    return (
-        "### Step 3 — Call write_implementation_report\n"
-        "Parse `globalThis.sliceResults` and call `write_implementation_report` with:\n"
-        "- `slice_results`: list of dicts, one per slice, each with:\n"
-        "  - `slice_name`: slice identifier (e.g., 'add-user-model')\n"
-        "  - `status`: 'implemented', 'partial', or 'blocked'\n"
-        "  - `files_modified`: list of files changed\n"
-        "  - `files_created`: list of new files\n"
-        "  - `test_results`: summary of test/lint outcomes\n"
-        "  - `issues`: list of remaining issues\n"
-        "- `summary`: overall summary (min 10 characters) of what was implemented\n\n"
-    )
-
-
-def _build_wave_orchestrator_prompt() -> str:
-    """Orchestrator prompt for wave-based dispatch (plan.json mode)."""
-    return (
-        _common_prompt_header()
-        + "## Dispatch Mode: Execution Waves\n"
-        "Slices from plan.json are organized into execution waves. Slices within a "
-        "wave are independent (parallel dispatch). Waves run sequentially — wait "
-        "for wave N before starting wave N+1.\n\n"
-        "### Step 2 — Dispatch Subagents Per Wave (1 eval turn)\n"
-        "Complete ALL waves in a SINGLE eval call:\n"
-        "```js\n"
-        "globalThis.sliceResults = [];\n"
-        "const waves = globalThis.execution_waves || Object.values(globalThis.planData.slices);\n"
-        "for (const wave of waves) {\n"
-        "  const promises = wave.map(s => tools.task({\n"
-        "    subagent_type: 'slice-implementer',\n"
-        "    description: `Slice: ${s.id}\n\n` +\n"
-        "      `Title: ${s.title}\n` +\n"
-        "      `Files: ${s.target_files.join(', ')}\n` +\n"
-        "      `Requirements: ${s.execution_requirements}\n` +\n"
-        "      `Acceptance Criteria: ${s.acceptance_criteria.join('; ')}`\n"
-        "  }));\n"
-        "  const results = await Promise.allSettled(promises);\n"
-        "  globalThis.sliceResults.push(...results);\n"
-        "}\n"
-        "```\n\n"
-        + _prompt_step_1_template()
-        + _prompt_step_3_template()
-        + "## Completion Rules\n"
-        "- Target ~3 total turns. If >5 turns without dispatching, write partial report.\n"
-        "- Access context in eval via `globalThis.context` (work_id, plan_json, execution_waves).\n"
-    )
-
-
-

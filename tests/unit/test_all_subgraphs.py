@@ -22,7 +22,9 @@ class TestAllSubgraphsCompile:
         graph = build_verify_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
-        assert "run_agent" in nodes
+        assert "run_slice_verifier" in nodes
+        assert "aggregate_verification" in nodes
+        assert "synthesize_verification" in nodes
         assert "save_artifacts" in nodes
 
     def test_implement_subgraph_compiles(self):
@@ -31,7 +33,9 @@ class TestAllSubgraphsCompile:
         graph = build_implement_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
-        assert "run_agent" in nodes
+        assert "run_slice_implementer" in nodes
+        assert "aggregate_implementation" in nodes
+        assert "synthesize_implementation" in nodes
         assert "save_artifacts" in nodes
 
     def test_tasks_subgraph_compiles(self):

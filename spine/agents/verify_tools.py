@@ -319,3 +319,35 @@ def build_verify_orchestrator_tools(
             verify_dir=verify_dir,
         ),
     ]
+
+
+# ── Module-level utility (for subgraph synthesis nodes) ────────────────────
+
+
+def write_verification_files(
+    verification_results: list[dict[str, Any]],
+    summary: str,
+    workspace_root: str,
+    verify_dir: str,
+) -> str:
+    """Write verification.md and verification.json to disk.
+
+    Module-level utility that synthesis nodes call directly without
+    instantiating the ``BaseTool`` subclass.  Used by the
+    ``_synthesize_verification_node`` in the verify subgraph.
+
+    Args:
+        verification_results: List of per-slice verdict dicts (slice_name,
+            verdict, checklist, gaps, recommendations).
+        summary: Overall verification summary string.
+        workspace_root: Absolute path to the project workspace root.
+        verify_dir: Relative artifact directory (e.g. ``".spine/artifacts/<id>/verify"``).
+
+    Returns:
+        Status string from ``WriteVerificationReportTool._run()``.
+    """
+    tool = WriteVerificationReportTool(
+        workspace_root=workspace_root,
+        verify_dir=verify_dir,
+    )
+    return tool._run(verification_results=verification_results, summary=summary)

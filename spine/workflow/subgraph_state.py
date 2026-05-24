@@ -57,6 +57,9 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     gap_plan_path: str | None  # Set when re-running for a gap fix
     execution_waves: list  # Execution waves from PLAN phase (for wave dispatch)
 
+    # Accumulated per-slice results from parallel Send dispatch (operator.add)
+    slice_results: Annotated[list[dict], _op_add]
+
     # ── Phase Completion Invariants ──
     slices_dispatched: bool  # True when slice-implementers were dispatched
     implementation_files_written: bool  # True when code files were created
@@ -68,6 +71,10 @@ class VerifySubgraphState(BaseSubgraphState, total=False):
     tasks_path: str
     spec_path: str | None  # Only for spec/critical_spec workflows
     plan_path: str | None
+    execution_waves: list  # Execution waves from PLAN phase (for Send dispatch)
+
+    # Accumulated per-slice verdicts from parallel Send dispatch (operator.add)
+    verification_results: Annotated[list[dict], _op_add]
 
     # ── Phase Completion Invariants ──
     verification_attempted: bool  # True when verify agent ran (vs. skipped)
