@@ -190,6 +190,7 @@ class UIApi:
             "queue_backend": self._config.queue_backend,
             "workspace_root": self._config.workspace_root,
             "mcp_servers": self._config.mcp_servers,
+            "providers": self._config.providers,
         }
 
     def update_mcp_server(self, server_name: str, config: dict[str, Any]) -> bool:
@@ -313,6 +314,183 @@ class UIApi:
         except Exception:
             logger.exception("Failed to remove MCP server '%s'", server_name)
             return False
+
+    # ── Provider CRUD ──
+
+    def _save_config(self, all_config: dict) -> bool:
+        """Write *all_config* to ``.spine/config.yaml`` and reload.
+
+        Common helper for all provider/MCP configuration mutations.
+
+        Args:
+            all_config: The full configuration dict to persist.
+
+        Returns:
+            ``True`` on success, ``False`` on exception.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            with open(config_path, "w") as f:
+                yaml.dump(all_config, f, default_flow_style=False, sort_keys=False)
+            self._config = SpineConfig.load()
+            return True
+        except Exception:
+            logger.exception("Failed to save config")
+            return False
+
+    def get_providers(self) -> dict:
+        """Return the current provider configuration.
+
+        Returns:
+            Dict with ``llm`` (list of provider dicts) and ``phases`` (dict).
+        """
+        return self._config.providers
+
+    def add_llm_provider(self, name: str, provider_config: dict) -> bool:
+        """Add a new LLM provider to the configuration.
+
+        Args:
+            name: Provider name (also stored in the provider dict).
+            provider_config: Provider config dict (model, base_url, api_key, etc.).
+
+        Returns:
+            ``True`` if the save succeeded, ``False`` otherwise.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    all_config = yaml.safe_load(f) or {}
+            else:
+                all_config = {}
+            llm_list = all_config.get("providers", {}).get("llm", [])
+            if llm_list is None:
+                llm_list = []
+            entry = {**provider_config, "name": name}
+            llm_list.append(entry)
+            all_config.setdefault("providers", {})["llm"] = llm_list
+            return self._save_config(all_config)
+        except Exception:
+            logger.exception("Failed to add LLM provider '%s'", name)
+            return False
+
+    def update_llm_provider(self, name: str, provider_config: dict) -> bool:
+        """Update an existing LLM provider's configuration.
+
+        Fields in *provider_config* are merged into the existing provider
+        entry; other fields on the existing entry are preserved.
+
+        Args:
+            name: Provider name to find.
+            provider_config: Config dict with fields to update.
+
+        Returns:
+            ``True`` if the save succeeded, ``False`` otherwise.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    all_config = yaml.safe_load(f) or {}
+            else:
+                all_config = {}
+            llm_list = all_config.get("providers", {}).get("llm", [])
+            if llm_list is None:
+                llm_list = []
+            for entry in llm_list:
+                if isinstance(entry, dict) and entry.get("name") == name:
+                    entry.update(provider_config)
+                    break
+            else:
+                # Provider not found — create it
+                llm_list.append({**provider_config, "name": name})
+            all_config.setdefault("providers", {})["llm"] = llm_list
+            return self._save_config(all_config)
+        except Exception:
+            logger.exception("Failed to update LLM provider '%s'", name)
+            return False
+
+    def remove_llm_provider(self, name: str) -> bool:
+        """Remove an LLM provider and clean up phase references.
+
+        Args:
+            name: Provider name to remove.
+
+        Returns:
+            ``True`` if the save succeeded, ``False`` otherwise.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    all_config = yaml.safe_load(f) or {}
+            else:
+                all_config = {}
+            llm_list = all_config.get("providers", {}).get("llm", [])
+            if llm_list is None:
+                llm_list = []
+            all_config.setdefault("providers", {})["llm"] = [
+                entry for entry in llm_list
+                if not (isinstance(entry, dict) and entry.get("name") == name)
+            ]
+            # Clean up phase references that point to this provider
+            phases = all_config.get("providers", {}).get("phases", {})
+            if phases:
+                for phase_cfg in phases.values():
+                    if isinstance(phase_cfg, dict) and phase_cfg.get("provider") == name:
+                        del phase_cfg["provider"]
+            all_config.setdefault("providers", {})["phases"] = phases
+            return self._save_config(all_config)
+        except Exception:
+            logger.exception("Failed to remove LLM provider '%s'", name)
+            return False
+
+    def set_phase_provider(self, phase: str, config: dict) -> bool:
+        """Set (or update) the provider configuration for a phase.
+
+        Args:
+            phase: Phase name (e.g. ``"implement"``).
+            config: Phase config dict. May contain ``provider`` (reference
+                name) or direct keys like ``model``, ``base_url``,
+                ``api_key``, ``temperature``, etc.
+
+        Returns:
+            ``True`` if the save succeeded, ``False`` otherwise.
+        """
+        import yaml
+
+        config_path = ".spine/config.yaml"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    all_config = yaml.safe_load(f) or {}
+            else:
+                all_config = {}
+            phases = all_config.get("providers", {}).get("phases", {})
+            if phases is None:
+                phases = {}
+            phases[phase] = config
+            all_config.setdefault("providers", {})["phases"] = phases
+            return self._save_config(all_config)
+        except Exception:
+            logger.exception("Failed to set phase provider '%s'", phase)
+            return False
+
+    def get_phase_providers(self) -> dict:
+        """Return the phase-provider mapping.
+
+        Returns:
+            Dict of phase names to their provider configuration dicts.
+        """
+        return self._config.providers.get("phases", {})
 
     # ── Worker ──
 

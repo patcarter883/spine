@@ -81,6 +81,8 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
 
     reviewed_phase: str
     reviewed_phase_path: str
+    artifacts: dict  # Phase artifacts from parent WorkflowState — needed
+    # by structural_critic_check to verify artifacts exist.
 
 
 class GapPlanSubgraphState(BaseSubgraphState, total=False):

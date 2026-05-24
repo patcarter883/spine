@@ -199,6 +199,7 @@ def _critic_state_mapper(reviewed_phase: str):
             "retry_count": parent_state.get("retry_count", {}).get(reviewed_phase, 0),
             "reviewed_phase": reviewed_phase,
             "reviewed_phase_path": artifact_path(work_id, reviewed_phase),
+            "artifacts": parent_state.get("artifacts", {}),
         }
 
     return mapper

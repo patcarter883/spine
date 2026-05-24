@@ -153,59 +153,64 @@ async def run_research_manager(
     )
 
     try:
-        # Use structured output so the model enforces the decision schema.
-        # This eliminates JSON parsing failures, markdown-fence stripping
-        # bugs, and the "\n\n```json\n" prefix issue.  Falls back to raw
-        # parsing for models that don't support .with_structured_output().
+        # Use response_format kwarg to enforce JSON schema at the model
+        # level without leaking a Pydantic instance into LangGraph state
+        # (avoids the serializer warning that .with_structured_output() causes
+        # when the AIMessage.parsed field is checkpointed).
+        #
+        # Falls back to raw JSON extraction for providers that don't
+        # support response_format with json_schema.
+        schema = ResearchManagerDecision.model_json_schema()
+        response_format_kwarg = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "research_manager_decision",
+                "schema": schema,
+            },
+        }
+
         try:
-            structured_model = model.with_structured_output(ResearchManagerDecision)
-        except (NotImplementedError, ValueError, AttributeError) as exc:
+            response = await model.ainvoke(
+                [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)],
+                response_format=response_format_kwarg,
+            )
+        except (TypeError, ValueError) as exc:
             logger.debug(
-                "[%s] Model does not support structured output: %s — "
-                "falling back to raw JSON parsing",
+                "[%s] Model does not support response_format kwarg: %s — "
+                "falling back to raw JSON extraction",
                 work_id, exc,
             )
-            structured_model = None
-
-        if structured_model is not None:
-            result = await structured_model.ainvoke(
-                [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)]
-            )
-            decision = result.decision
-            topics = list(result.topics) if result.topics else []
-        else:
-            # ── Raw JSON fallback ─────────────────────────────────────
             response = await model.ainvoke(
                 [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)]
             )
-            raw = response.content if hasattr(response, "content") else str(response)
-            # Handle content blocks (list of dicts from some model wrappers)
-            if isinstance(raw, list):
-                raw = "\n".join(
-                    block.get("text", "") if isinstance(block, dict) else str(block)
-                    for block in raw
-                )
-            # Extract JSON from anywhere in the response — handles leading
-            # whitespace, code fences, and thinking/reasoning preamble.
-            json_match = re.search(
-                r'\{\s*"decision"\s*:\s*"(?:explore|done)"[^}]*\}', raw, re.DOTALL
+
+        raw = response.content if hasattr(response, "content") else str(response)
+        # Handle content blocks (list of dicts from some model wrappers)
+        if isinstance(raw, list):
+            raw = "\n".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in raw
             )
-            if json_match:
-                result_dict = json.loads(json_match.group(0))
-                decision = result_dict.get("decision", "done")
-                topics = result_dict.get("topics", [])
+        # Extract JSON from anywhere in the response — handles leading
+        # whitespace, code fences, and thinking/reasoning preamble.
+        json_match = re.search(
+            r'\{\s*"decision"\s*:\s*"(?:explore|done)"[^}]*\}', raw, re.DOTALL
+        )
+        if json_match:
+            result_dict = json.loads(json_match.group(0))
+        else:
+            # Try stripping code fences with leading whitespace
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                inner = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
+                if inner.endswith("```"):
+                    inner = inner[:-3]
+                result_dict = json.loads(inner.strip())
             else:
-                # Try stripping code fences with leading whitespace
-                stripped = raw.strip()
-                if stripped.startswith("```"):
-                    inner = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
-                    if inner.endswith("```"):
-                        inner = inner[:-3]
-                    result_dict = json.loads(inner.strip())
-                    decision = result_dict.get("decision", "done")
-                    topics = result_dict.get("topics", [])
-                else:
-                    raise json.JSONDecodeError("No JSON found in response", raw, 0)
+                raise json.JSONDecodeError("No JSON found in response", raw, 0)
+
+        decision = result_dict.get("decision", "done")
+        topics = result_dict.get("topics", [])
 
         if not isinstance(topics, list):
             topics = []
