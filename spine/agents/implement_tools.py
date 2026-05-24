@@ -40,6 +40,41 @@ logger = logging.getLogger(__name__)
 class _ReadSliceFilesInput(BaseModel):
     """No inputs needed — paths are fully determined by work_id at build time."""
 
+    model_config = {"extra": "forbid"}
+
+
+class _SliceResultItem(BaseModel):
+    """Per-slice result for implementation reporting."""
+
+    slice_name: str = Field(min_length=1, description="Slice identifier")
+    status: str = Field(
+        pattern="^(implemented|partial|blocked)$",
+        description="Completion status: implemented, partial, or blocked",
+    )
+    files_modified: list[str] = Field(
+        default_factory=list, description="Files that were modified"
+    )
+    files_created: list[str] = Field(
+        default_factory=list, description="Files that were created"
+    )
+    test_results: str = Field(
+        default="", description="Summary of test/lint outcomes for this slice"
+    )
+    issues: list[str] = Field(
+        default_factory=list, description="Unresolved issues or blockers"
+    )
+
+
+class _WriteImplementationReportInput(BaseModel):
+    slice_results: list[_SliceResultItem] = Field(
+        min_length=1,
+        description="List of result objects, one per slice. Each must have slice_name, status, files_modified, files_created, test_results, issues.",
+    )
+    summary: str = Field(
+        min_length=10,
+        description="Overall implementation summary: what was accomplished, any cross-slice issues, and overall readiness for verification.",
+    )
+
 
 class ReadSliceFilesTool(BaseTool):
     """Read all feature slice definitions and the codebase map in one call.
@@ -138,23 +173,6 @@ class ReadSliceFilesTool(BaseTool):
 # ── write_implementation_report ───────────────────────────────────────────
 
 
-class _WriteImplementationReportInput(BaseModel):
-    slice_results: list[dict[str, Any]] = Field(
-        description=(
-            "List of result objects, one per slice. Each must have: "
-            "'slice_name' (str), 'status' (implemented|partial|blocked), "
-            "'files_modified' (list[str]), 'files_created' (list[str]), "
-            "'test_results' (str), 'issues' (list[str])."
-        )
-    )
-    summary: str = Field(
-        description=(
-            "Overall implementation summary: what was accomplished, "
-            "any cross-slice issues, and overall readiness for verification."
-        )
-    )
-
-
 class WriteImplementationReportTool(BaseTool):
     """Write the implementation.md synthesis report.
 
@@ -169,7 +187,8 @@ class WriteImplementationReportTool(BaseTool):
         "Write the implementation.md synthesis report from slice-implementer results. "
         "This is the ONLY write tool available to you. "
         "Call this after all subagents have completed to produce the phase artifact. "
-        "Requires: slice_results (list of per-slice result dicts) and summary (str)."
+        "Requires: slice_results (list of per-slice result dicts with slice_name, "
+        "status, files_modified, files_created, test_results, issues) and summary (str, min 10 chars)."
     )
     args_schema: Optional[ArgsSchema] = _WriteImplementationReportInput
 
@@ -177,7 +196,7 @@ class WriteImplementationReportTool(BaseTool):
     impl_dir: str = ""
     workspace_root: str = ""
 
-    def _run(self, slice_results: list[dict[str, Any]], summary: str) -> str:
+    def _run(self, slice_results: list[_SliceResultItem], summary: str) -> str:
         impl_path = Path(self.workspace_root) / self.impl_dir
         impl_path.mkdir(parents=True, exist_ok=True)
 
@@ -195,12 +214,21 @@ class WriteImplementationReportTool(BaseTool):
         partial: list[str] = []
 
         for sr in slice_results:
-            name = sr.get("slice_name", "unknown")
-            status = sr.get("status", "unknown")
-            modified = sr.get("files_modified", [])
-            created = sr.get("files_created", [])
-            test_res = sr.get("test_results", "")
-            issues = sr.get("issues", [])
+            # Support both dict (for testing) and _SliceResultItem (validated input)
+            if isinstance(sr, dict):
+                name = sr.get("slice_name", "unknown")
+                status = sr.get("status", "unknown")
+                modified = sr.get("files_modified", [])
+                created = sr.get("files_created", [])
+                test_res = sr.get("test_results", "")
+                issues = sr.get("issues", [])
+            else:
+                name = sr.slice_name
+                status = sr.status
+                modified = sr.files_modified
+                created = sr.files_created
+                test_res = sr.test_results
+                issues = sr.issues
 
             status_icon = {"implemented": "✅", "partial": "⚠️", "blocked": "❌"}.get(status, "❓")
             lines.append(f"### {status_icon} {name} — {status}\n")
@@ -259,8 +287,22 @@ class WriteImplementationReportTool(BaseTool):
             f"{len(partial)} partial, {len(blocked)} blocked)."
         )
 
-    async def _arun(self, slice_results: list[dict[str, Any]], summary: str) -> str:
-        return self._run(slice_results=slice_results, summary=summary)
+    async def _arun(self, slice_results: list[_SliceResultItem] | list[dict[str, Any]], summary: str) -> str:
+        # Support both dict (for testing) and _SliceResultItem (validated input)
+        typed_results: list[_SliceResultItem] = []
+        for sr in slice_results:
+            if isinstance(sr, dict):
+                typed_results.append(_SliceResultItem(
+                    slice_name=sr.get("slice_name", "unknown"),
+                    status=sr.get("status", "implemented"),
+                    files_modified=sr.get("files_modified", []),
+                    files_created=sr.get("files_created", []),
+                    test_results=sr.get("test_results", ""),
+                    issues=sr.get("issues", []),
+                ))
+            else:
+                typed_results.append(sr)
+        return self._run(slice_results=typed_results, summary=summary)
 
 
 # ── Factory ───────────────────────────────────────────────────────────────

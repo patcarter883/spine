@@ -1,22 +1,15 @@
 """Custom tools for the VERIFY phase orchestrator.
 
-Replaces generic filesystem tools (ls, read_file, glob, grep, write_file)
-with purpose-built tools that enforce the orchestrator's dispatch-only role.
+The orchestrator's job is exactly two things: (1) read verification inputs
+(slices, plan, implementation) and hand them to subagents, (2) write
+verification.md from the subagent results.
 
-Design rationale:
-- The orchestrator's job is exactly two things: (1) read verification inputs
-  (slices, plan, implementation) and hand them to subagents, (2) write
-  verification.md from the subagent results.
-- Giving it generic filesystem tools lets a weak model fall back to doing
-  the verification itself (read file → run tests inline → ...).
-- `read_verify_context` bundles everything the orchestrator needs in one call,
-  eliminating multi-turn exploration entirely.
-- `write_verification_report` is the only write surface: it only accepts
-  structured verification results and writes to the fixed verification.md path.
-  The orchestrator cannot write source files even if it tries.
+Two purpose-built tools enforce dispatch-only behavior:
+- ``read_verify_context`` — loads everything in one call, eliminating multi-turn exploration
+- ``write_verification_report`` — only write surface; orchestrator cannot write source files
 
-Both tools are LangChain `BaseTool` subclasses so they slot directly into
-`create_agent(tools=[...])` or any middleware tool list.
+Both tools are LangChain ``BaseTool`` subclasses that slot directly into
+``create_agent(tools=[...])``.
 """
 
 from __future__ import annotations
@@ -43,20 +36,7 @@ class _ReadVerifyContextInput(BaseModel):
 
 
 class ReadVerifyContextTool(BaseTool):
-    """Read all verification inputs: slices, plan, codebase map, and implementation.
-
-    Reads from multiple artifact directories and returns a unified JSON object:
-    - ``slices``: mapping of slice filename → full slice content from tasks/
-    - ``plan_dir``: the plan artifact directory path
-    - ``codebase_map``: content of codebase_map field from plan.json (empty if missing)
-    - ``implementation``: full content of implementation.md (empty string if missing)
-    - ``impl_dir``: the implementation artifact directory path
-    - ``slice_count``: number of slice files found
-    - ``verify_dir``: the verify artifact directory path
-
-    This is the only read tool the orchestrator needs. It eliminates
-    multi-turn ls/glob/read_file exploration — everything is loaded at once.
-    """
+    """Read all verification inputs: slices, plan, codebase map, and implementation."""
 
     name: str = "read_verify_context"
     description: str = (
@@ -146,18 +126,7 @@ class _ReadSliceFilesVerifyInput(BaseModel):
 
 
 class ReadSliceFilesVerifyTool(BaseTool):
-    """Read all feature slice definitions for the VERIFY phase.
-
-    Similar to implement's ReadSliceFilesTool but reads slice-*.md files
-    directly from the tasks artifact directory instead of plan.json.
-    This is useful when the orchestrator needs just the slices without
-    implementation or plan context.
-
-    Returns a JSON object containing:
-    - ``slices``: mapping of slice filename → full slice content
-    - ``slice_count``: number of slices found
-    - ``tasks_dir``: the tasks artifact directory path
-    """
+    """Read all feature slice definitions for the VERIFY phase."""
 
     name: str = "read_slice_files_verify"
     description: str = (
@@ -231,20 +200,13 @@ class _WriteVerificationReportInput(BaseModel):
 
 
 class WriteVerificationReportTool(BaseTool):
-    """Write the verification.md synthesis report.
-
-    This is the ONLY write tool available to the orchestrator.
-    It accepts structured results from slice-verifier subagents and
-    writes them to the fixed verification.md path. The orchestrator
-    cannot write source files — this tool only touches verification.md.
-    """
+    """Write the verification.md synthesis report."""
 
     name: str = "write_verification_report"
     description: str = (
         "Write the verification.md synthesis report from slice-verifier results. "
-        "This is the ONLY write tool available — you cannot write other files. "
-        "Provide verification_results (list of per-slice verdict dicts) and summary. "
-        "Call this after all subagents have completed to produce the phase artifact."
+        "Provide verification_results (list of per-slice result dicts) and summary. "
+        "Call this after all subagents have completed."
     )
     args_schema: Optional[ArgsSchema] = _WriteVerificationReportInput
 
@@ -366,10 +328,8 @@ def build_verify_orchestrator_tools(
     - ``read_verify_context``: loads all verification inputs in one call
     - ``write_verification_report``: writes the verification.md artifact
 
-    Together with ``task`` (from SubAgentMiddleware) and ``eval`` (from
-    CodeInterpreterMiddleware), these are all the tools the orchestrator needs.
-    No generic filesystem tools are exposed — the orchestrator physically
-    cannot read arbitrary files or write source code.
+    Together with ``eval`` (via CodeInterpreterMiddleware), these are all the
+    tools the orchestrator needs. No generic filesystem tools are exposed.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

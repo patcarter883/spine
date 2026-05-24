@@ -185,178 +185,115 @@ def _build_orchestrator_prompt(*, has_waves: bool = False) -> str:
     return _build_legacy_orchestrator_prompt()
 
 
-def _build_wave_orchestrator_prompt() -> str:
-    """Orchestrator prompt for wave-based dispatch (plan.json mode)."""
+def _common_prompt_header() -> str:
+    """Shared prompt header with tool surface and Step 1/3 instructions."""
     return (
         "You are the IMPLEMENT phase orchestrator. Your job is to dispatch one "
         "`slice-implementer` subagent per feature slice and synthesize their "
         "results.\n\n"
-        "## Your tool surface (complete list)\n"
-        "- `read_slice_files` — loads slice definitions + codebase map "
-        "in ONE call. No arguments needed. Call this FIRST.\n"
-        "- `write_implementation_report` — writes implementation.md. Call "
-        "this LAST after all subagents complete.\n"
-        "- `eval` — JavaScript REPL for subagent dispatch. "
-        "Call `tools.task()` INSIDE eval for parallel dispatch.\n\n"
-        "Your tools are restricted to `read_slice_files`, `write_implementation_report`, "
-        "`task`, and `eval`. This is enforced by tool design — you cannot call "
-        "`ls`, `read_file`, `glob`, `grep`, `write_file`, `edit_file`, or `execute`. "
-        "Use `read_slice_files` to load all slice definitions at once.\n\n"
-        "## Dispatch mode: execution waves\n"
-        "Slices come from plan.json and are organized into execution waves. "
-        "Slices within a wave are independent and run in parallel. "
-        "Waves run sequentially — wait for wave N to complete before starting wave N+1.\n\n"
-        "## Workflow\n\n"
-        "### Step 1 — Call read_slice_files (1 turn)\n"
-        "Call `read_slice_files` with no arguments. It returns a JSON object:\n"
-        "```\n"
+        "## Your Tool Surface (ONLY these tools)\n"
+        "- `read_slice_files` — loads slice definitions + codebase map in ONE call. "
+        "No arguments needed. Call this FIRST.\n"
+        "- `write_implementation_report` — writes implementation.md. Call this LAST.\n"
+        "- `eval` — JavaScript REPL for subagent dispatch. Use `tools.task()` inside.\n\n"
+        "Use ONLY these tools. All other filesystem tools are intentionally omitted. "
+        "Call `read_slice_files` to load all slice definitions at once — do not "
+        "attempt to read individual files manually.\n\n"
+    )
+
+
+def _prompt_step_1_template() -> str:
+    """Shared Step 1: read_slice_files template."""
+    return (
+        "### Step 1 — Call read_slice_files\n"
+        "Call `read_slice_files` with no arguments. It returns:\n"
+        "```json\n"
         "{\n"
         '  "slices": {\n'
-        '    "add-user-model": {\n'
-        '      "id": "add-user-model",\n'
-        '      "title": "Add user model",\n'
-        '      "target_files": ["src/models/user.py"],\n'
-        '      "execution_requirements": "Create the User model class...",\n'
-        '      "dependencies": [],\n'
-        '      "acceptance_criteria": ["User.save() persists to DB"],\n'
-        '      "complexity": "medium"\n'
-        "    },\n"
+        '    "slice-id": {"id", "title", "target_files", "execution_requirements", '
+        '"dependencies", "acceptance_criteria", "complexity"},\n'
         "    ...\n"
         "  },\n"
-        '  "codebase_map": "<full content of codebase_map field>",\n'
+        '  "codebase_map": "<string>",\n'
         '  "slice_count": N,\n'
         '  "plan_dir": "<path>"\n'
         "}\n"
         "```\n"
-        "Slices are keyed by their `id` field. Each value is the full "
-        "feature-slice dict. Store the result in eval: "
-        "`globalThis.planData = result;`\n\n"
-        "### Step 2 — Dispatch subagents per wave (1 eval turn)\n"
-        "Do this inside ONE eval call with Promise.allSettled:\n"
-        "1. Get the execution_waves array from globalThis.planData or globalThis.execution_waves\n"
-        "2. For each wave, create a Promise.allSettled call with all slices in that wave\n"
-        "3. Wait for each wave's Promise.allSettled to complete before starting the next\n"
-        "4. Store results in globalThis.sliceResults\n\n"
-        "Template code:\n"
+        "Store in eval: `globalThis.planData = result;`\n\n"
+    )
+
+
+def _prompt_step_3_template() -> str:
+    """Shared Step 3: write_implementation_report template."""
+    return (
+        "### Step 3 — Call write_implementation_report\n"
+        "Parse `globalThis.sliceResults` and call `write_implementation_report` with:\n"
+        "- `slice_results`: list of dicts, one per slice, each with:\n"
+        "  - `slice_name`: slice identifier (e.g., 'add-user-model')\n"
+        "  - `status`: 'implemented', 'partial', or 'blocked'\n"
+        "  - `files_modified`: list of files changed\n"
+        "  - `files_created`: list of new files\n"
+        "  - `test_results`: summary of test/lint outcomes\n"
+        "  - `issues`: list of remaining issues\n"
+        "- `summary`: overall summary (min 10 characters) of what was implemented\n\n"
+    )
+
+
+def _build_wave_orchestrator_prompt() -> str:
+    """Orchestrator prompt for wave-based dispatch (plan.json mode)."""
+    return (
+        _common_prompt_header()
+        + "## Dispatch Mode: Execution Waves\n"
+        "Slices from plan.json are organized into execution waves. Slices within a "
+        "wave are independent (parallel dispatch). Waves run sequentially — wait "
+        "for wave N before starting wave N+1.\n\n"
+        "### Step 2 — Dispatch Subagents Per Wave (1 eval turn)\n"
+        "Complete ALL waves in a SINGLE eval call:\n"
         "```js\n"
+        "globalThis.sliceResults = [];\n"
         "const waves = globalThis.execution_waves || Object.values(globalThis.planData.slices);\n"
-        "for (let i = 0; i < waves.length; i++) {\n"
-        "  const wave = waves[i];\n"
-        "  const promises = wave.map(slice => tools.task({\n"
+        "for (const wave of waves) {\n"
+        "  const promises = wave.map(s => tools.task({\n"
         "    subagent_type: 'slice-implementer',\n"
-        "    description: `Slice: ${slice.id}\n\n` +\n"
-        "      `Title: ${slice.title}\n` +\n"
-        "      `Files: ${slice.target_files.join(', ')}\n` +\n"
-        "      `Requirements: ${slice.execution_requirements}\n` +\n"
-        "      `Acceptance Criteria: ${slice.acceptance_criteria.join('; ')}`\n"
+        "    description: `Slice: ${s.id}\n\n` +\n"
+        "      `Title: ${s.title}\n` +\n"
+        "      `Files: ${s.target_files.join(', ')}\n` +\n"
+        "      `Requirements: ${s.execution_requirements}\n` +\n"
+        "      `Acceptance Criteria: ${s.acceptance_criteria.join('; ')}`\n"
         "  }));\n"
         "  const results = await Promise.allSettled(promises);\n"
-        "  globalThis.sliceResults = globalThis.sliceResults || [];\n"
         "  globalThis.sliceResults.push(...results);\n"
         "}\n"
         "```\n\n"
-        "### Step 3 — Call write_implementation_report (1 turn)\n"
-        "Parse globalThis.sliceResults and call `write_implementation_report` "
-        "with:\n"
-        "- `slice_results`: list of dicts, one per slice, each with "
-        "`slice_name`, `status` (implemented|partial|blocked), "
-        "`files_modified`, `files_created`, `test_results`, `issues`\n"
-        "- `summary`: overall summary of what was implemented\n\n"
-        "## Strict Rules\n"
-        "- Call `read_slice_files` FIRST. It provides all data needed for dispatch.\n"
-        "- Dispatch one `slice-implementer` subagent per slice via `eval`.\n"
-        "- Use only `slice-implementer` as the subagent_type.\n"
-        "- Dispatch slices within a wave in parallel using `Promise.allSettled`.\n"
-        "- Wait for Promise.allSettled(results) from wave N before starting wave N+1.\n"
-        "- Call `write_implementation_report` to complete the phase.\n"
-        "- Target ~3 turns total. If you reach 5+ turns without dispatching subagents, "
-        "write the report with whatever results you have.\n\n"
-        "## Eval context seed\n"
-        "Access session-specific context properties via `globalThis.context` "
-        "preloaded in your workspace environment on first turn (e.g., "
-        "use `globalThis.context.work_id`, `globalThis.context.plan_json`, "
-        "or `globalThis.execution_waves` inside eval).\n\n"
+        + _prompt_step_1_template()
+        + _prompt_step_3_template()
+        + "## Completion Rules\n"
+        "- Target ~3 total turns. If >5 turns without dispatching, write partial report.\n"
+        "- Access context in eval via `globalThis.context` (work_id, plan_json, execution_waves).\n"
     )
 
 
 def _build_legacy_orchestrator_prompt() -> str:
-    """Orchestrator prompt for flat-parallel dispatch (plan.json mode)."""
+    """Orchestrator prompt for flat-parallel dispatch (legacy mode)."""
     return (
-        "You are the IMPLEMENT phase orchestrator. Your job is to dispatch one "
-        "`slice-implementer` subagent per feature slice and synthesize their "
-        "results.\n\n"
-        "## Your tool surface (complete list)\n"
-        "- `read_slice_files` — loads all slice definitions + codebase map "
-        "in ONE call. No arguments needed. Call this FIRST.\n"
-        "- `write_implementation_report` — writes implementation.md. Call "
-        "this LAST after all subagents complete.\n"
-        "- `eval` — JavaScript REPL for subagent dispatch. "
-        "Call `tools.task()` INSIDE eval for parallel dispatch.\n\n"
-        "Your tools are restricted to `read_slice_files`, `write_implementation_report`, "
-        "`task`, and `eval`. This is enforced by tool design — you cannot call "
-        "`ls`, `read_file`, `glob`, `grep`, `write_file`, `edit_file`, or `execute`. "
-        "Use `read_slice_files` to load all slice definitions at once.\n\n"
-        "## Workflow (3 steps, ~3 turns total)\n\n"
-        "### Step 1 — Call read_slice_files (1 turn)\n"
-        "Call `read_slice_files` with no arguments. It returns a JSON object:\n"
-        "```\n"
-        "{\n"
-        '  "slices": {\n'
-        '    "add-user-model": {\n'
-        '      "id": "add-user-model",\n'
-        '      "title": "Add user model",\n'
-        '      "target_files": ["src/models/user.py"],\n'
-        '      "execution_requirements": "Create the User model class...",\n'
-        '      "dependencies": [],\n'
-        '      "acceptance_criteria": ["User.save() persists to DB"],\n'
-        '      "complexity": "medium"\n'
-        "    },\n"
-        "    ...\n"
-        "  },\n"
-        '  "codebase_map": "<full content of codebase_map field>",\n'
-        '  "slice_count": N,\n'
-        '  "plan_dir": "<path>"\n'
-        "}\n"
-        "```\n"
-        "Slices are keyed by their `id` field. Each value is the full "
-        "feature-slice dict. Store the result in eval: "
-        "`globalThis.planData = result;`\n\n"
-        "### Step 2 — Dispatch subagents in parallel (1 eval turn)\n"
-        "Do this inside ONE eval call with Promise.allSettled:\n"
-        "1. Get the slices array from globalThis.planData.slices (values)\n"
-        "2. Create a Promise.allSettled call with all slices\n"
-        "3. Store results in globalThis.sliceResults\n\n"
-        "Template code:\n"
+        _common_prompt_header()
+        + "### Step 2 — Dispatch Subagents In Parallel (1 eval turn)\n"
+        "Complete ALL slices in a SINGLE eval call:\n"
         "```js\n"
         "const slices = Object.values(globalThis.planData.slices);\n"
-        "const promises = slices.map(slice => tools.task({\n"
+        "const promises = slices.map(s => tools.task({\n"
         "  subagent_type: 'slice-implementer',\n"
-        "  description: `Slice: ${slice.id}\n\n` +\n"
-        "    `Title: ${slice.title}\n` +\n"
-        "    `Files: ${slice.target_files.join(', ')}\n` +\n"
-        "    `Requirements: ${slice.execution_requirements}\n` +\n"
-        "    `Acceptance Criteria: ${slice.acceptance_criteria.join('; ')}`\n"
+        "  description: `Slice: ${s.id}\n\n` +\n"
+        "    `Title: ${s.title}\n` +\n"
+        "    `Files: ${s.target_files.join(', ')}\n` +\n"
+        "    `Requirements: ${s.execution_requirements}\n` +\n"
+        "    `Acceptance Criteria: ${s.acceptance_criteria.join('; ')}`\n"
         "}));\n"
-        "const results = await Promise.allSettled(promises);\n"
-        "globalThis.sliceResults = results;\n"
+        "globalThis.sliceResults = await Promise.allSettled(promises);\n"
         "```\n\n"
-        "### Step 3 — Call write_implementation_report (1 turn)\n"
-        "Parse globalThis.sliceResults and call `write_implementation_report` "
-        "with:\n"
-        "- `slice_results`: list of dicts, one per slice, each with "
-        "`slice_name`, `status` (implemented|partial|blocked), "
-        "`files_modified`, `files_created`, `test_results`, `issues`\n"
-        "- `summary`: overall summary of what was implemented\n\n"
-        "## Strict Rules\n"
-        "- Call `read_slice_files` FIRST. It provides all data needed for dispatch.\n"
-        "- Dispatch one `slice-implementer` subagent per slice via `eval`.\n"
-        "- Use only `slice-implementer` as the subagent_type.\n"
-        "- Dispatch slices in parallel using `Promise.allSettled`.\n"
-        "- Call `write_implementation_report` to complete the phase.\n"
-        "- Target ~3 turns total. If you reach 5+ turns without dispatching subagents, "
-        "write the report with whatever results you have.\n\n"
-        "## Eval context seed\n"
-        "Access session-specific context properties via `globalThis.context` "
-        "preloaded in your workspace environment on first turn (e.g., "
-        "use `globalThis.context.work_id` or `globalThis.context.plan_dir` inside eval).\n\n"
+        + _prompt_step_1_template()
+        + _prompt_step_3_template()
+        + "## Completion Rules\n"
+        "- Target ~3 total turns. If >5 turns without dispatching, write partial report.\n"
+        "- Access context in eval via `globalThis.context` (work_id, plan_dir).\n"
     )
