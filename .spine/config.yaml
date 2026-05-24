@@ -1,11 +1,6 @@
 spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
-
-# ── MCP Servers ──────────────────────────────────────────────────
-# Model Context Protocol servers for external tool integration.
-# mcp-codebase-index provides 18 structural codebase query tools
-# (symbol lookup, dependency analysis, change impact assessment).
 mcp_servers:
   codebase-index:
     transport: stdio
@@ -13,16 +8,15 @@ mcp_servers:
     args: []
     env:
       PROJECT_ROOT: /home/pat/Projects/spine
-
 providers:
   llm:
   - name: glm
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
     enabled: true
-  - name: qwen3.7-max
+  - name: owl-alpha
     type: deepagents-model
-    model: openrouter:qwen/qwen3.7-max
+    model: openrouter:openrouter/owl-alpha
     enabled: true
   - name: deepseek-v4-flash
     type: deepagents-model
@@ -47,39 +41,32 @@ providers:
   - name: local
     type: deepagents-model
     model: openai:model
-    base_url: 'http://localhost:8000/v1'
-    api_key: 'vllm'
+    base_url: http://localhost:8000/v1
+    api_key: vllm
     guided_decoding: true
     enabled: true
   - name: pat
     type: deepagents-model
     model: openai:model
-    base_url: 'http://10.50.1.51:8000/v1'
-    api_key: 'vllm'
+    base_url: http://10.50.1.51:8000/v1
+    api_key: vllm
     guided_decoding: true
     enabled: true
-  
   phases:
-    # Heavy reasoning → frontier model (via reference)
     specify:
-      provider: local
+      provider: laguna-m1
     plan:
-      provider: local
+      provider: laguna-m1
     critic:
       provider: local
     exploration:
       provider: local
-    # Implementation → local vLLM, but colder temperature for code
     implement:
       provider: local
-      temperature: 0.6           # freezes just the temp override
-      guided_decoding: true
-
-    # Slice implementer subagent gets the same vLLM but even faster
     implement/subagents/slice-implementer:
       provider: local
       guided_decoding: true
-
-    # Verification → local vLLM model with custom endpoint
     verify:
-      provider: local             # short timeout for verify
+      provider: local
+    gap_plan:
+      provider: local

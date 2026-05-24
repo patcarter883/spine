@@ -223,6 +223,291 @@ class TestInvokeWithRetry:
         assert agent.invoke.call_count == 1
 
 
+# ── Rate-limit header parsing ──
+
+
+class TestParseRateLimitSleep:
+    """Test the _parse_rate_limit_sleep header extractor."""
+
+    @staticmethod
+    def _make_exc_with_headers(headers: dict[str, str]) -> Exception:
+        """Build a fake OpenAI-style exception carrying response headers."""
+        from openai import RateLimitError
+
+        response = MagicMock()
+        response.headers = headers
+        return RateLimitError(
+            message="Rate limit exceeded",
+            response=response,
+            body=None,
+        )
+
+    def test_retry_after_seconds(self):
+        """Retry-After header with integer seconds is returned directly."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        exc = self._make_exc_with_headers({"Retry-After": "30"})
+        assert _parse_rate_limit_sleep(exc) == 30.0
+
+    def test_retry_after_lowercase(self):
+        """retry-after (lowercase) is also matched — httpx normalises case."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        exc = self._make_exc_with_headers({"retry-after": "15"})
+        assert _parse_rate_limit_sleep(exc) == 15.0
+
+    def test_x_ratelimit_reset_epoch_millis(self):
+        """X-RateLimit-Reset with a future epoch-ms timestamp."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+        import time
+
+        future_ms = str(int((time.time() + 45.0) * 1000))
+        exc = self._make_exc_with_headers({"X-RateLimit-Reset": future_ms})
+        result = _parse_rate_limit_sleep(exc)
+        assert result is not None
+        # Allow 1-second tolerance for test execution time
+        assert 43.0 <= result <= 47.0
+
+    def test_x_ratelimit_reset_lowercase(self):
+        """x-ratelimit-reset (lowercase) is also matched."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+        import time
+
+        future_ms = str(int((time.time() + 10.0) * 1000))
+        exc = self._make_exc_with_headers({"x-ratelimit-reset": future_ms})
+        result = _parse_rate_limit_sleep(exc)
+        assert result is not None
+        assert 8.0 <= result <= 12.0
+
+    def test_expired_reset_returns_none(self):
+        """If X-RateLimit-Reset is in the past, return None (fall back)."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+        import time
+
+        past_ms = str(int((time.time() - 100.0) * 1000))
+        exc = self._make_exc_with_headers({"X-RateLimit-Reset": past_ms})
+        assert _parse_rate_limit_sleep(exc) is None
+
+    def test_zero_retry_after_returns_none(self):
+        """Retry-After of 0 is treated as absent (not positive)."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        exc = self._make_exc_with_headers({"Retry-After": "0"})
+        assert _parse_rate_limit_sleep(exc) is None
+
+    def test_retry_after_takes_priority_over_reset(self):
+        """When both headers are present, Retry-After wins."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+        import time
+
+        future_ms = str(int((time.time() + 99.0) * 1000))
+        exc = self._make_exc_with_headers({
+            "Retry-After": "5",
+            "X-RateLimit-Reset": future_ms,
+        })
+        assert _parse_rate_limit_sleep(exc) == 5.0
+
+    def test_no_response_attribute(self):
+        """Plain Exception without .response returns None."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        exc = RuntimeError("generic error")
+        assert _parse_rate_limit_sleep(exc) is None
+
+    def test_no_headers_on_response(self):
+        """Exception with a response that has no headers returns None."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        response = MagicMock(spec=[])  # no headers attr
+        exc = RuntimeError("error")
+        exc.response = response  # type: ignore[attr-defined]
+        assert _parse_rate_limit_sleep(exc) is None
+
+    def test_empty_exception_args_fallback(self):
+        """Exception with empty args doesn't crash the fallback path."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        exc = RuntimeError("error")
+        exc.args = ()  # type: ignore[assignment]
+        assert _parse_rate_limit_sleep(exc) is None
+
+    def test_nested_exception_with_headers(self):
+        """Wrapper exception whose .args[0] carries the real response."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+        from openai import RateLimitError
+
+        response = MagicMock()
+        response.headers = {"Retry-After": "20"}
+        inner = RateLimitError(
+            message="Rate limit exceeded",
+            response=response,
+            body=None,
+        )
+        wrapper = RuntimeError("wrapped")
+        wrapper.args = (inner,)
+        assert _parse_rate_limit_sleep(wrapper) == 20.0
+
+    def test_full_openrouter_header_set(self):
+        """Simulate the exact OpenRouter 429 headers from production."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+        import time
+
+        # Use a future timestamp so the delta is positive
+        future_ms = str(int((time.time() + 60.0) * 1000))
+        exc = self._make_exc_with_headers({
+            "X-RateLimit-Limit": "20",
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": future_ms,
+        })
+        result = _parse_rate_limit_sleep(exc)
+        assert result is not None
+        assert 58.0 <= result <= 62.0
+
+    def test_malformed_header_values(self):
+        """Non-numeric header values are silently ignored."""
+        from spine.agents.retry import _parse_rate_limit_sleep
+
+        exc = self._make_exc_with_headers({
+            "Retry-After": "not-a-number",
+            "X-RateLimit-Reset": "also-bad",
+        })
+        assert _parse_rate_limit_sleep(exc) is None
+
+
+# ── Sleep computation ──
+
+
+class TestComputeSleep:
+    """Test the _compute_sleep backoff calculator."""
+
+    def test_uses_retry_after_header(self):
+        """When Retry-After is present, it overrides exponential backoff."""
+        from spine.agents.retry import _compute_sleep
+
+        exc = TestParseRateLimitSleep._make_exc_with_headers(
+            {"Retry-After": "7"}
+        )
+        result = _compute_sleep(exc, attempt=5, base_delay=2.0, max_delay=60.0)
+        assert result == 7.0
+
+    def test_caps_at_max_delay(self):
+        """Header sleep is capped at max_delay."""
+        from spine.agents.retry import _compute_sleep
+
+        exc = TestParseRateLimitSleep._make_exc_with_headers(
+            {"Retry-After": "999"}
+        )
+        result = _compute_sleep(exc, attempt=0, base_delay=2.0, max_delay=60.0)
+        assert result == 60.0
+
+    def test_falls_back_to_exponential_backoff(self):
+        """Without headers, falls back to exponential backoff."""
+        from spine.agents.retry import _compute_sleep
+
+        exc = RuntimeError("no headers")
+        # attempt=2, base=2.0 → delay = min(2*4, 60) = 8.0
+        # jitter ±10% → 7.2..8.8
+        result = _compute_sleep(exc, attempt=2, base_delay=2.0, max_delay=60.0)
+        assert 7.0 <= result <= 9.5
+
+    def test_fallback_respects_max_delay_cap(self):
+        """Exponential backoff is capped at max_delay."""
+        from spine.agents.retry import _compute_sleep
+
+        exc = RuntimeError("no headers")
+        # attempt=10, base=2.0 → 2*1024 = 2048, capped to 60
+        result = _compute_sleep(exc, attempt=10, base_delay=2.0, max_delay=60.0)
+        assert result <= 60.0
+
+    def test_fallback_minimum_half_second(self):
+        """Sleep is never below 0.5s even with tiny backoff values."""
+        from spine.agents.retry import _compute_sleep
+
+        exc = RuntimeError("no headers")
+        result = _compute_sleep(exc, attempt=0, base_delay=0.01, max_delay=60.0)
+        assert result >= 0.5
+
+    def test_header_sleep_capped_but_not_floored(self):
+        """A small positive header value is used as-is (not raised to 0.5)."""
+        from spine.agents.retry import _compute_sleep
+
+        exc = TestParseRateLimitSleep._make_exc_with_headers(
+            {"Retry-After": "1"}
+        )
+        result = _compute_sleep(exc, attempt=0, base_delay=2.0, max_delay=60.0)
+        assert result == 1.0
+
+
+# ── Retry invocation with rate-limit headers ──
+
+
+class TestInvokeWithRetryRateAware:
+    """Test that invoke_with_retry uses header-based sleep for 429s."""
+
+    def test_429_with_retry_after_sleeps_correctly(self):
+        """A 429 with Retry-After: 2 should sleep ~2s, not exponential."""
+        import time
+        from openai import RateLimitError
+        from spine.agents.retry import invoke_with_retry
+
+        agent = MagicMock()
+        response = MagicMock()
+        response.headers = {"Retry-After": "2"}
+        rate_exc = RateLimitError(
+            message="Rate limit exceeded",
+            response=response,
+            body=None,
+        )
+        expected = {"messages": [MagicMock(content="ok")]}
+        agent.invoke.side_effect = [rate_exc, expected]
+
+        start = time.time()
+        result = invoke_with_retry(
+            agent,
+            {"messages": []},
+            max_retries=3,
+            base_delay=2.0,
+        )
+        elapsed = time.time() - start
+
+        assert result is expected
+        assert agent.invoke.call_count == 2
+        # Should sleep ~2s (the Retry-After value), not ~4s (exponential)
+        assert 1.5 <= elapsed <= 4.0
+
+    def test_429_without_headers_uses_exponential_backoff(self):
+        """A 429 without headers falls back to exponential backoff."""
+        import time
+        from openai import RateLimitError
+        from spine.agents.retry import invoke_with_retry
+
+        agent = MagicMock()
+        response = MagicMock()
+        response.headers = {}  # no rate-limit headers
+        rate_exc = RateLimitError(
+            message="Rate limit exceeded",
+            response=response,
+            body=None,
+        )
+        expected = {"messages": [MagicMock(content="ok")]}
+        agent.invoke.side_effect = [rate_exc, expected]
+
+        start = time.time()
+        result = invoke_with_retry(
+            agent,
+            {"messages": []},
+            max_retries=3,
+            base_delay=0.05,  # fast for tests
+        )
+        elapsed = time.time() - start
+
+        assert result is expected
+        assert agent.invoke.call_count == 2
+        # With base_delay=0.05, attempt=0: delay = min(0.05, 60) = 0.05
+        # jitter ±10% → 0.045..0.055, floored to 0.5
+        assert 0.4 <= elapsed <= 1.0
+
+
 # ── Helpers module ──
 
 

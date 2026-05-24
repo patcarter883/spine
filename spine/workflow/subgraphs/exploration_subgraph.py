@@ -502,6 +502,45 @@ async def _save_exploration_artifacts(
             "phase_status": existing_phase_status,
         }
 
+    # Fail-closed: SPECIFY requires specification.json (fail-closed like plan)
+    if phase == PhaseName.SPECIFY.value:
+        spec_json_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
+        if spec_json_path.exists():
+            try:
+                raw = spec_json_path.read_text(encoding="utf-8")
+                spec_data = json.loads(raw)
+                if not isinstance(spec_data, dict):
+                    raise CriticalContractFailure(
+                        phase="specify",
+                        reason="specification.json is not a JSON object",
+                    )
+                for key in ("title", "summary", "requirements"):
+                    if key not in spec_data:
+                        raise CriticalContractFailure(
+                            phase="specify",
+                            reason=f"specification.json missing required key '{key}' — "
+                                   f"keys found: {list(spec_data.keys())}",
+                        )
+            except (json.JSONDecodeError, OSError) as exc:
+                raise CriticalContractFailure(
+                    phase="specify",
+                    reason=f"specification.json is malformed or unreadable: {exc}",
+                )
+            except CriticalContractFailure:
+                raise
+            except Exception as exc:
+                raise CriticalContractFailure(
+                    phase="specify",
+                    reason=f"specification.json validation error: {exc}",
+                )
+        else:
+            raise CriticalContractFailure(
+                phase="specify",
+                reason="specification.json does not exist — "
+                       "the specify agent did not produce structured output via write_specification. "
+                       "This indicates a model invocation failure.",
+            )
+
     disk_artifacts = scan_artifact_dir(
         workspace_root,
         work_id,

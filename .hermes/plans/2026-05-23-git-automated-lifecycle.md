@@ -2,7 +2,7 @@
 
 ## Overview
 
-Wrap SPINE's workflow execution in a **transactional git sandbox**. After the IMPLEMENT phase produces code changes, the orchestrator validates them through a configurable pipeline, then either atomically merges them into the main branch or performs a hard rollback.
+Wrap SPINE's workflow execution in a **transactional git sandbox**. After the workflow produces code changes, the orchestrator validates them through a configurable pipeline, then either atomically merges them into the main branch or performs a hard rollback.
 
 ### Operational Flow
 
@@ -43,6 +43,10 @@ The orchestrator wraps `submit_work()` — **no changes to the LangGraph workflo
 
 ## New Modules
 
+### `spine/git/__init__.py` — Package init
+
+Empty file to make `spine.git` a Python package.
+
 ### `spine/git/orchestrator.py` — Core Orchestrator
 
 ```python
@@ -63,26 +67,26 @@ class SpineGitOrchestrator:
         """
         Strategy 'worktree': git worktree add -b <branch> <sandbox_dir> main
         Strategy 'branch':   git checkout -b <branch>
-        Returns True on success.
+        Returns sandbox_dir path on success, raises SandboxPreparationError on failure.
         """
 
     def execute_transactional_run(self, description, work_type="task"):
         """
         Full lifecycle with try/finally safety:
         1. prepare_sandbox()
-        2. patch workspace_root → sandbox_dir
+        2. Create sandbox-aware SpineConfig with workspace_root pointing to sandbox
         3. submit_work(description, work_type, config=sandbox_config)
         4. run_validation_pipeline()
         5a. commit_and_merge()     if all gates passed
         5b. rollback_workspace()   if any gate failed
-        finally: restore workspace_root, os.chdir(master_dir)
+        finally: restore original directory
         """
 
     def run_validation_pipeline(self):
         """
         Iterate through spine-gate.yaml gates sequentially.
-        Returns (True, None) on success.
-        Returns (False, diagnostic_dict) on first failure.
+        Returns dict: {"success": True} on success.
+        Returns dict: {"success": False, "gate": name, "output": str} on first failure.
         """
 
     def commit_and_merge(self):
@@ -112,28 +116,22 @@ class SpineGitOrchestrator:
 ```python
 class WorkspaceShim:
     """
-    Context manager that redirects workspace_root to the sandbox directory.
-
-    The Deep Agent's LocalShellBackend uses workspace_root for all file
-    operations. We need to override it without permanently mutating config.
+    Context manager that creates a sandbox-aware SpineConfig.
 
     Usage:
-        shim = WorkspaceShim(master_dir, sandbox_dir)
-        with shim:
-            # config.workspace_root == sandbox_dir
-            result = await submit_work(...)
-        # config.workspace_root restored to master_dir
+        with WorkspaceShim(master_dir, sandbox_dir, base_config) as sandbox_config:
+            result = await submit_work(description, config=sandbox_config)
     """
 
-    def __init__(self, master_dir: str, sandbox_dir: str):
+    def __init__(self, master_dir: str, sandbox_dir: str, base_config: SpineConfig):
         ...
 
-    def __enter__(self):
-        """Patch SpineConfig.workspace_root to sandbox_dir."""
+    def __enter__(self) -> SpineConfig:
+        """Return a new SpineConfig with workspace_root pointing to sandbox_dir."""
         ...
 
     def __exit__(self, *exc):
-        """Restore SpineConfig.workspace_root to master_dir."""
+        """Log exit (no cleanup needed, orchestrator handles it)."""
         ...
 ```
 
@@ -181,6 +179,7 @@ git:
   main_branch: main
   branch_prefix: spine/patch-
   strategy: worktree          # "worktree" or "branch"
+  sandbox_dir: /tmp/spine-sandbox  # Optional: auto-generated if not set
 
 validation_pipeline:
   lint:
@@ -195,6 +194,15 @@ validation_pipeline:
     command: ".venv/bin/pytest tests/ -x -q"
     timeout_seconds: 300
     failure_message: "Tests failed. Fix failing tests."
+
+artifact_path: .spine/artifacts  # Relative to workspace_root
+
+auto_merge_on_success: true  # If false, requires manual approval after validation
+
+# Optional: Check phase completion invariants before merging
+require_successful_phases:
+  - implement_completed
+  - verify_completed
 ```
 
 ## Critical Guardrails
@@ -213,26 +221,45 @@ def _resolve_validation_command(command: str, master_dir: str) -> str:
 
 ### 2. Agent Workspace Root
 
-The `WorkflowState.workspace_root` must point to the sandbox directory. This is done by creating a modified `SpineConfig`:
+The workflow state's `workspace_root` must point to the sandbox directory. This is done by creating a modified `SpineConfig`:
 
 ```python
-sandbox_config = SpineConfig.load()
-sandbox_config.workspace_root = sandbox_dir
+# Create sandbox config with workspace_root pointing to sandbox
+sandbox_config = SpineConfig(
+    checkpoint_path=base_config.checkpoint_path,  # Keep checkpoints in master
+    artifact_path=str(Path(sandbox_dir) / ".spine" / "artifacts"),
+    workspace_root=sandbox_dir,
+    # Copy other fields from base_config...
+)
 # Pass to submit_work(config=sandbox_config)
 ```
 
-### 3. os.chdir Safety
+### 3. Phase Completion Invariant Check (Updated)
+
+Before merging, verify the workflow completed successfully using the phase completion invariants now defined in `WorkflowState`:
+
+```python
+def _check_phase_prerequisites(self, work_result: dict, required_phases: list[str]) -> bool:
+    """Verify required phase completion flags before allowing merge."""
+    for phase in required_phases:
+        if not work_result.get(f"{phase}_completed", False):
+            self._logger.warning(f"Required phase '{phase}' did not complete - blocking merge")
+            return False
+    return True
+```
+
+### 4. os.chdir Safety
 
 ```python
 original_dir = os.getcwd()
 try:
-    os.chdir(sandbox_dir)
-    # ... run agent and validation ...
+    # Run agent and validation in sandbox context
+    ...
 finally:
     os.chdir(original_dir)  # ALWAYS restore, even on crash
 ```
 
-### 4. Untracked File Cleanup (Nuclear Purge)
+### 5. Untracked File Cleanup (Nuclear Purge)
 
 ```python
 def rollback_workspace(self):
@@ -246,7 +273,7 @@ def rollback_workspace(self):
     self._execute_shell("git clean -fd")
 ```
 
-### 5. Validation Gate Timeouts
+### 6. Validation Gate Timeouts
 
 Each gate has a configurable timeout (default 60s). The subprocess is killed on timeout and the gate is marked as failed.
 
@@ -258,7 +285,7 @@ Each gate has a configurable timeout (default 60s). The subprocess is killed on 
 |------|---------|------------|
 | `spine/git/__init__.py` | Package init | 0 |
 | `spine/git/orchestrator.py` | Core orchestrator class | ~300 |
-| `spine/git/workspace_shim.py` | Workspace root redirection | ~80 |
+| `spine/git/workspace_shim.py` | Workspace redirection | ~80 |
 | `spine/cli/git_commands.py` | CLI `gate` subcommands | ~150 |
 | `spine-gate.yaml` | Validation pipeline config | ~25 |
 | `spine/ui/_pages/gate_run.py` | Streamlit gated execution page | ~150 |

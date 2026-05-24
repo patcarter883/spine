@@ -22,6 +22,7 @@ from langgraph.graph import END, START, StateGraph
 
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import PlanSubgraphState
+from spine.exceptions import CriticalContractFailure
 from spine.agents.plan_agent import build_plan_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
@@ -117,13 +118,22 @@ async def _run_plan_agent(
                 execution_waves, wave_error = _compute_waves(plan_data, work_id)
 
                 if wave_error is not None:
-                    logger.warning(
-                        "[%s] PLAN subgraph: wave computation error: %s",
-                        work_id,
-                        wave_error,
+                    raise CriticalContractFailure(
+                        phase="plan",
+                        reason=wave_error,
                     )
             except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("[%s] Failed to read plan.json: %s", work_id, exc)
+                raise CriticalContractFailure(
+                    phase="plan",
+                    reason=f"plan.json exists but is malformed or unreadable: {exc}",
+                )
+        else:
+            raise CriticalContractFailure(
+                phase="plan",
+                reason="plan.json does not exist — "
+                       "the plan agent did not produce structured output via write_structured_plan. "
+                       "This indicates a model invocation failure in the plan node.",
+            )
 
         return {
             "messages": result.get("messages", []),
@@ -164,8 +174,12 @@ def _compute_waves(
 
     raw_slices = plan_data.get("feature_slices")
     if not isinstance(raw_slices, list) or not raw_slices:
-        logger.debug("[%s] plan.json has no feature_slices", work_id)
-        return [], None
+        raise CriticalContractFailure(
+            phase="plan",
+            reason="plan.json is missing or has empty 'feature_slices' — "
+                   "the plan agent did not produce structured output. "
+                   "This indicates a model invocation failure in the plan node.",
+        )
 
     try:
         scheduler_slices = [FeatureSlice.from_dict(sd) for sd in raw_slices]
