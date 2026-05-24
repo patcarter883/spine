@@ -218,7 +218,11 @@ def _build_openrouter_model(
     return ChatOpenRouter(**model_kwargs)
 
 
-def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseChatModel:
+def _build_local_model(
+    model_spec: str,
+    provider_cfg: dict[str, Any],
+    response_format: Any = None,
+) -> BaseChatModel:
     """Build a ChatOpenAI instance for a local/OpenAI-compatible server.
 
     When the provider config includes ``base_url`` and ``api_key`` (e.g. a
@@ -228,10 +232,17 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
     environment — which doesn't exist for local servers, causing a
     "missing credentials" error.
 
+    When guided_decoding is enabled in the provider config and a response_format
+    Pydantic model is provided, injects ``guided_json`` into the model kwargs
+    for schema-constrained sampling on vLLM-compatible servers.
+
     Args:
         model_spec: Full model spec like ``"openai:model"``.
         provider_cfg: The full provider dict from config (has ``base_url``,
             ``api_key``, ``temperature``, etc.).
+        response_format: Optional Pydantic model for structured output.
+            When guided_decoding is enabled, its schema is used for constrained
+            decoding via the ``guided_json`` parameter.
 
     Returns:
         A configured ``ChatOpenAI`` instance pointed at the local server.
@@ -286,7 +297,81 @@ def _build_local_model(model_spec: str, provider_cfg: dict[str, Any]) -> BaseCha
     # engines (vLLM, SGLang, hipfire) support this OpenAI API option.
     kwargs.setdefault("stream_usage", True)
 
+    # ── Inject guided_json for constrained decoding ──────────────────
+    # When guided_decoding is enabled and a response_format Pydantic model
+    # is provided, inject the JSON schema into extra_body for vLLM to use
+    # for schema-constrained sampling. This prevents the model from
+    # generating invalid JSON that would need post-hoc correction.
+    if provider_cfg.get("guided_decoding") and response_format is not None:
+        try:
+            json_schema = response_format.model_json_schema()
+            kwargs.setdefault("extra_body", {})["guided_json"] = json_schema
+        except Exception:
+            pass  # Silently skip if schema extraction fails
+
     return ChatOpenAI(**kwargs)
+
+
+def _supports_guided_decoding(model: Any) -> bool:
+    """Check if the model/engine supports guided JSON decoding.
+
+    vLLM, SGLang, and other OpenAI-compatible local servers support
+    guided_json for schema-constrained sampling. OpenRouter does not
+    support this feature (it uses response_format tool extraction instead).
+
+    Args:
+        model: A model string (``"openrouter:qwen/qwen3-235b"``) or
+            a pre-built ``BaseChatModel`` instance.
+
+    Returns:
+        ``True`` if the model/engine supports guided decoding via
+        the ``guided_json`` parameter.
+    """
+    name = _extract_model_name(model)
+    # OpenRouter doesn't support guided_json
+    if "openrouter:" in str(model).lower():
+        return False
+    # Local OpenAI-compatible servers with base_url support it
+    return True
+
+
+def _extract_model_name(model: Any) -> str:
+    """Extract a lowercase model name string from a model spec or instance.
+
+    Handles:
+    - String specs: ``"openrouter:qwen/qwen3-235b-a22b:free"`` → ``"qwen/qwen3-235b-a22b"``
+    - String specs without org: ``"openai:gpt-4o"`` → ``"gpt-4o"``
+    - Pre-built instances with ``.model`` attr (ChatOpenRouter, ChatOpenAI)
+    - Pre-built instances with ``.model_name`` attr (ChatAnthropic)
+
+    Returns:
+        Lowercase model name with provider prefix and quality suffix stripped.
+    """
+    raw: str = ""
+    if isinstance(model, str):
+        raw = model
+    elif hasattr(model, "model_name"):
+        raw = str(model.model_name)
+    elif hasattr(model, "model"):
+        raw = str(model.model)
+
+    # Strip provider prefix (e.g. "openrouter:" or "openai:")
+    if ":" in raw:
+        raw = raw.split(":", 1)[1]
+    # Strip trailing quality suffix (:free, :beta, etc.) — these appear
+    # after the model name and contain only short alpha-only strings.
+    # Model names like "qwen3-235b-a22b" contain hyphens/digits, so a
+    # trailing segment with only letters + digits/periods is a quality tag.
+    while ":" in raw:
+        last_part = raw.rsplit(":", 1)[1]
+        # If the last segment contains no "/" and looks like a quality tag
+        # (short, no hyphens suggesting model version), strip it.
+        if "/" not in last_part and not any(c == "-" for c in last_part):
+            raw = raw.rsplit(":", 1)[0]
+        else:
+            break
+
+    return raw.lower()
 
 
 def debug_enabled() -> bool:

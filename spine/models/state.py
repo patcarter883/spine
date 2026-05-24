@@ -103,3 +103,22 @@ class WorkflowState(TypedDict, total=False):
     # artifacts as intentionally empty work.
     gap_plan_produced: bool  # True when gap_plan.md was successfully created
     exploration_executed: bool  # True when SPECIFY/PLAN research rounds ran
+
+    # Phase completion flags
+    spec_completed: bool  # True when SPECIFY phase completed successfully
+    plan_completed: bool  # True when PLAN phase completed successfully
+    tasks_completed: bool  # True when TASKS phase completed successfully
+    implement_completed: bool  # True when IMPLEMENT phase completed successfully
+    verify_completed: bool  # True when VERIFY phase completed successfully
+    critic_specify_completed: bool  # True when CRITIC_SPECIFY phase passed
+    critic_plan_completed: bool  # True when CRITIC_PLAN phase passed
+    gap_plan_completed: bool  # True when GAP_PLAN phase completed successfully
+
+    # Additional tracking fields
+    verification_attempted: bool  # True when VERIFY phase ran
+    verification_passed: bool  # True when VERIFY phase passed
+    implementation_files_written: bool  # True when IMPLEMENT wrote files
+    slices_dispatched: bool  # True when IMPLEMENT dispatched slice subagents
+    gaps_identified: int  # Number of gaps found by GAP_PLAN
+    work_units_count: int  # Number of work units from TASKS phase
+    feature_slices_count: int  # Number of feature slices from PLAN phase

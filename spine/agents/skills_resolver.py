@@ -39,10 +39,24 @@ _PHASE_SKILLS: dict[str, list[str]] = {
     PhaseName.IMPLEMENT.value: [],
     PhaseName.VERIFY.value: ["code-review"],
     PhaseName.CRITIC.value: [],
+    PhaseName.GAP_PLAN.value: [],
 }
 
 # RLM pattern skill — included for all phases that have interpreter support
 _RLM_SKILL = "rlm-pattern"
+
+# Phases that don't need the full project AGENTS.md — it's ~22K chars
+# of mostly irrelevant content (testing, config, deps, workflows).
+# All phases skip AGENTS.md to save ~25K tokens total.
+_SKIP_AGENTS_MD: set[str] = {
+    PhaseName.SPECIFY.value,
+    PhaseName.PLAN.value,
+    PhaseName.TASKS.value,
+    PhaseName.IMPLEMENT.value,
+    PhaseName.VERIFY.value,
+    PhaseName.CRITIC.value,
+    PhaseName.GAP_PLAN.value,
+}
 
 
 def resolve_skills(
@@ -99,7 +113,7 @@ def resolve_memory(
     context.  We load:
 
     1. The target project's AGENTS.md (if it exists at the workspace root).
-       **Skipped for TASKS and CRITIC phases** — these phases don't need
+       **Skipped for phases in _SKIP_AGENTS_MD** — these phases don't need
        testing patterns, config formats, or dependency tables, and the
        full file costs ~22K chars (~5K tokens) per turn.
     2. The target project's .spine/AGENTS.md (if it exists — project-specific
@@ -119,13 +133,6 @@ def resolve_memory(
 
     memory_paths: list[str] = []
     root = Path(workspace_root)
-
-    # Phases that don't need the full project AGENTS.md — it's ~22K chars
-    # of mostly irrelevant content (testing, config, deps, workflows).
-    # The decomposer (TASKS) gets codebase context from researcher subagents
-    # and the architecture overview from the feature-slice-decomposition skill.
-    # The critic (CRITIC) only reviews the artifact under review.
-    _SKIP_AGENTS_MD: set[str] = {PhaseName.TASKS.value, PhaseName.CRITIC.value}
 
     # Project root AGENTS.md
     if phase not in _SKIP_AGENTS_MD:
