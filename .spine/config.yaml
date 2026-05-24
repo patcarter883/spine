@@ -62,13 +62,13 @@ providers:
   phases:
     # Heavy reasoning → frontier model (via reference)
     specify:
-      provider: deepseek-v4-pro
+      provider: local
     plan:
-      provider: deepseek-v4-pro
+      provider: local
     critic:
-      provider: deepseek-v4-pro
+      provider: local
     exploration:
-      provider: deepseek-v4-pro
+      provider: local
     # Implementation → local vLLM, but colder temperature for code
     implement:
       provider: local
@@ -82,4 +82,4 @@ providers:
 
     # Verification → local vLLM model with custom endpoint
     verify:
-      provider: deepseek-v4-pro             # short timeout for verify
+      provider: local             # short timeout for verify
