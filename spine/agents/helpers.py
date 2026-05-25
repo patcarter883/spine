@@ -187,10 +187,18 @@ def _build_openrouter_model(
     max_completion_tokens = provider_cfg.get("max_completion_tokens")
     max_tokens = provider_cfg.get("max_tokens")
 
+    # Merge OpenRouter provider preferences. require_parameters=True makes
+    # OpenRouter reject the request up-front if the chosen model doesn't
+    # support every parameter we send (notably response_format/json_schema),
+    # instead of silently dropping them and returning unstructured text.
+    provider_prefs: dict[str, Any] = dict(profile_kwargs.pop("openrouter_provider", {}) or {})
+    provider_prefs.setdefault("require_parameters", True)
+
     model_kwargs: dict[str, Any] = {
         "model": model_name,
         "session_id": truncated_session_id,
         "request_timeout": timeout_ms,
+        "openrouter_provider": provider_prefs,
         **profile_kwargs,
     }
     # ── Explicitly pass api_key from environment or provider config ──
@@ -221,7 +229,6 @@ def _build_openrouter_model(
 def _build_local_model(
     model_spec: str,
     provider_cfg: dict[str, Any],
-    response_format: Any = None,
 ) -> BaseChatModel:
     """Build a ChatOpenAI instance for a local/OpenAI-compatible server.
 
@@ -232,17 +239,15 @@ def _build_local_model(
     environment — which doesn't exist for local servers, causing a
     "missing credentials" error.
 
-    When guided_decoding is enabled in the provider config and a response_format
-    Pydantic model is provided, injects ``guided_json`` into the model kwargs
-    for schema-constrained sampling on vLLM-compatible servers.
+    Schema-constrained decoding (``response_format`` / ``guided_json``) is
+    bound at the call site by ``subagents._bind_response_format`` so the
+    schema is attached after the model is built — no schema argument is
+    needed here.
 
     Args:
         model_spec: Full model spec like ``"openai:model"``.
         provider_cfg: The full provider dict from config (has ``base_url``,
             ``api_key``, ``temperature``, etc.).
-        response_format: Optional Pydantic model for structured output.
-            When guided_decoding is enabled, its schema is used for constrained
-            decoding via the ``guided_json`` parameter.
 
     Returns:
         A configured ``ChatOpenAI`` instance pointed at the local server.
@@ -296,18 +301,6 @@ def _build_local_model(
     # token tracing.  All local inference
     # engines (vLLM, SGLang, hipfire) support this OpenAI API option.
     kwargs.setdefault("stream_usage", True)
-
-    # ── Inject guided_json for constrained decoding ──────────────────
-    # When guided_decoding is enabled and a response_format Pydantic model
-    # is provided, inject the JSON schema into extra_body for vLLM to use
-    # for schema-constrained sampling. This prevents the model from
-    # generating invalid JSON that would need post-hoc correction.
-    if provider_cfg.get("guided_decoding") and response_format is not None:
-        try:
-            json_schema = response_format.model_json_schema()
-            kwargs.setdefault("extra_body", {})["guided_json"] = json_schema
-        except Exception:
-            pass  # Silently skip if schema extraction fails
 
     return ChatOpenAI(**kwargs)
 

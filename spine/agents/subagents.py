@@ -478,6 +478,71 @@ def _extract_model_name(model: Any) -> str:
     return raw.lower()
 
 
+def _strict_json_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
+    """Build a strict-mode JSON schema dict from a Pydantic model.
+
+    OpenAI / OpenRouter strict json_schema mode requires
+    ``additionalProperties: false`` and every property listed in
+    ``required`` — for the root object *and* every nested ``$defs`` entry.
+    Pydantic's default schema sets neither, so normalize before sending.
+    """
+
+    def enforce(obj: dict[str, Any]) -> None:
+        if obj.get("type") == "object" and "properties" in obj:
+            obj["additionalProperties"] = False
+            obj["required"] = list(obj["properties"].keys())
+
+    schema = model_cls.model_json_schema()
+    enforce(schema)
+    for sub in schema.get("$defs", {}).values():
+        if isinstance(sub, dict):
+            enforce(sub)
+    return schema
+
+
+def _bind_response_format(
+    model: Any,
+    schema_model: type[BaseModel],
+    name: str,
+    *,
+    with_guided_json: bool = False,
+) -> bool:
+    """Bind an OpenAI/OpenRouter json_schema response_format on the model.
+
+    Mutates ``model.model_kwargs`` so every API call from this model
+    sends the strict json_schema response_format. When
+    ``with_guided_json`` is true, also sets ``extra_body.guided_json``
+    — older vLLM versions only respect the ``guided_json`` field, not
+    the OpenAI-style ``response_format``.
+
+    Returns ``True`` when binding succeeded — callers should fall back
+    to Deep Agents' spec-level ``response_format`` when this returns
+    ``False`` (e.g. for ChatAnthropic which doesn't expose
+    ``model_kwargs``).
+    """
+    model_kwargs = getattr(model, "model_kwargs", None)
+    if not isinstance(model_kwargs, dict):
+        return False
+    schema = _strict_json_schema(schema_model)
+    model_kwargs["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    if with_guided_json:
+        extra_body = getattr(model, "extra_body", None) or {}
+        extra_body["guided_json"] = schema
+        try:
+            model.extra_body = extra_body
+        except Exception:
+            # Field not writable on this model class — skip silently.
+            pass
+    return True
+
+
 def _supports_forced_tool_choice(model: Any) -> bool:
     """Check whether the model supports ``tool_choice="any"`` / ``"required"``.
 
@@ -533,7 +598,11 @@ def build_subagent_spec(
     if name not in SUBAGENT_DESCRIPTIONS:
         raise ValueError(f"Unknown subagent {name!r}. Available: {sorted(SUBAGENT_DESCRIPTIONS)}")
 
-    from spine.agents.helpers import _supports_guided_decoding, resolve_model
+    from spine.agents.helpers import (
+        _active_provider_config,
+        _supports_guided_decoding,
+        resolve_model,
+    )
     from spine.agents.skills_resolver import resolve_memory
 
     workspace_root = state.get("workspace_root", ".")
@@ -607,23 +676,38 @@ def build_subagent_spec(
         "tools": tools,
         "middleware": subagent_middleware,
     }
-    # Only researcher gets response_format — structured summaries prevent
-    # raw file contents from bloating the parent agent's context.
-    # slice-implementer and slice-verifier need free-form tool use.
+    # Structured outputs: bind json_schema response_format directly on
+    # the model so the underlying API call (OpenRouter / OpenAI / vLLM)
+    # enforces the schema natively. This replaces Deep Agents'
+    # ToolStrategy (which forced ``tool_choice="any"`` and crashed
+    # thinking models like Qwen3/QwQ with HTTP 400).
     #
-    # Guard: DA's create_agent resolves AutoStrategy → ToolStrategy which
-    # forces tool_choice="any" (wire: "required").  Models with thinking/
-    # reasoning mode (Qwen3, QwQ, etc.) reject this parameter, crashing
-    # every researcher subagent with a 400 error.  Skip response_format
-    # for those models — the prompt already instructs JSON output.
+    # JSON arrives in the assistant's final message ``content``; the
+    # downstream extractors (_extract_findings, _extract_slice_result,
+    # _extract_verification_result) already parse content as JSON.
     #
-    # Local vLLM/sGLang servers support constrained decoding via guided_json
-    # even when forced_tool_choice is unsupported — the response_format
-    # schema is injected as guided_json in the model kwargs.
-    if name in SUBAGENT_RESPONSE_MODELS and (
-        _supports_forced_tool_choice(model) or _supports_guided_decoding(model)
-    ):
-        spec["response_format"] = SUBAGENT_RESPONSE_MODELS[name]
+    # For models that don't expose ``model_kwargs`` (e.g. ChatAnthropic),
+    # fall back to DA's spec-level ``response_format`` — guarded by the
+    # capability checks so we don't apply ToolStrategy to thinking models
+    # that reject forced tool_choice.
+    if name in SUBAGENT_RESPONSE_MODELS:
+        schema_model = SUBAGENT_RESPONSE_MODELS[name]
+        # Only send extra_body.guided_json when the provider config has
+        # opted in (older vLLM/SGLang that don't accept OpenAI-style
+        # response_format). Modern engines honor response_format directly
+        # and the extra field is unnecessary.
+        provider_cfg = _active_provider_config(phase=model_path) or {}
+        with_guided_json = bool(provider_cfg.get("guided_decoding")) and not hasattr(
+            model, "openrouter_provider"
+        )
+        if not _bind_response_format(
+            model,
+            schema_model,
+            name=f"{name}_response",
+            with_guided_json=with_guided_json,
+        ):
+            if _supports_forced_tool_choice(model) or _supports_guided_decoding(model):
+                spec["response_format"] = schema_model
     if memory:
         spec["memory"] = memory
     if skills:

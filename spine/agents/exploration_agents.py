@@ -161,11 +161,17 @@ async def run_research_manager(
         #
         # Falls back to raw JSON extraction for providers that don't
         # support response_format with json_schema.
+        # Strict json_schema requires additionalProperties=false and every
+        # property listed in `required`. Pydantic's default schema omits
+        # both, so normalize before sending.
         schema = ResearchManagerDecision.model_json_schema()
+        schema["additionalProperties"] = False
+        schema["required"] = list(schema.get("properties", {}).keys())
         response_format_kwarg = {
             "type": "json_schema",
             "json_schema": {
                 "name": "research_manager_decision",
+                "strict": True,
                 "schema": schema,
             },
         }
