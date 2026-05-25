@@ -221,15 +221,21 @@ class VectorIndexer:
         return response.content if hasattr(response, "content") else str(response)
 
     async def _embed_text(self, text: str) -> np.ndarray:
-        """Embed text using the configured embedding model."""
+        """Embed text using the configured embedding provider."""
         from langchain_openai import OpenAIEmbeddings
-        import os
 
-        model_name = self.config.embedding_model.removeprefix("openai:")
+        provider_cfg = self.config.resolve_embedding_provider()
+        if not provider_cfg:
+            raise ValueError(f"Embedding provider '{self.config.embedding_provider}' not found")
+
+        model_name = provider_cfg.get("model", "text-embedding-3-large")
+        api_key = provider_cfg.get("api_key") or ""
+        base_url = provider_cfg.get("base_url")
 
         embeddings = OpenAIEmbeddings(
             model=model_name,
-            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            api_key=api_key,
+            **(base_url and {"base_url": base_url}) or {},
         )
 
         result = await embeddings.aembed_query(text)

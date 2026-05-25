@@ -2,30 +2,18 @@ spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
   guided_decoding: true
-  # Vector store configuration for Two-Pass Hybrid RAG
-  embedding_model: openai:text-embedding-3-large
+  # RAG configuration
+  embedding_provider: local-embeddings
   vector_indexing:
     max_concurrent_chunks: 5
     batch_size: 10
     summarize_temperature: 0.3
     embed_temperature: 0.1
-mcp_servers:
-  codebase-index:
-    transport: stdio
-    command: mcp-codebase-index
-    args: []
-    env:
-      PROJECT_ROOT: /home/pat/Projects/spine
 providers:
   llm:
   - name: glm
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
-    enabled: true
-    guided_decoding: true
-  - name: owl-alpha
-    type: deepagents-model
-    model: openrouter:openrouter/owl-alpha
     enabled: true
     guided_decoding: true
   - name: deepseek-v4-flash
@@ -71,25 +59,35 @@ providers:
     api_key: vllm
     guided_decoding: true
     enabled: true
-  phases:
-    specify:
-      provider: deepseek-v4-flash
-    plan:
-      provider: local
-    critic:
-      provider: deepseek-v4-pro
-    exploration:
-      provider: local
-    implement:
-      provider: local
-    implement/subagents/slice-implementer:
-      provider: local
-    verify:
-      provider: deepseek-v4-pro
-    gap_plan:
-      provider: local
-    # RAG phase providers
-    classification:
-      provider: deepseek-v4-flash
-    embedding:
-      provider: local
+  - name: tiny
+    type: deepagents-model
+    model: openai:Bonsai-8B-gguf
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+  # Embedding providers
+  embedding:
+  - name: local-embeddings
+    type: openai-embedding
+    model: embeddinggemma-300m-GGUF-BF16
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+phases:
+  specify:
+    provider: deepseek-v4-flash
+  plan:
+    provider: local
+  critic:
+    provider: deepseek-v4-pro
+  exploration:
+    provider: local
+  implement:
+    provider: local
+  implement/subagents/slice-implementer:
+    provider: local
+  verify:
+    provider: deepseek-v4-pro
+  gap_plan:
+    provider: local
+  # RAG phase providers
+  classification:
+    provider: tiny

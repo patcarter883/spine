@@ -91,8 +91,8 @@ class SpineConfig:
     mcp_servers: dict = field(default_factory=dict)
     guided_decoding: bool = False
 
-    # Vector store configuration
-    embedding_model: str = "openai:text-embedding-3-large"
+    # RAG (Retrieval-Augmented Generation) configuration
+    embedding_provider: str = "openai-embeddings"
     vector_indexing: dict = field(
         default_factory=lambda: {
             "max_concurrent_chunks": 5,
@@ -269,7 +269,7 @@ class SpineConfig:
                 str(spine.get("guided_decoding", False)).lower(),
             )
             in ("1", "true", "yes"),
-            embedding_model=spine.get("embedding_model", "openai:text-embedding-3-large"),
+            embedding_provider=spine.get("embedding_provider", "openai-embeddings"),
             vector_indexing=spine.get(
                 "vector_indexing",
                 {
@@ -471,6 +471,20 @@ class SpineConfig:
                         base[k] = phase_cfg[k]
 
         return base
+
+    def resolve_embedding_provider(self) -> dict | None:
+        """Resolve the embedding provider config.
+
+        Uses the ``embedding_provider`` name to look up the provider in
+        ``providers.embedding[]``.
+
+        Returns:
+            The embedding provider config dict, or None if not found.
+        """
+        for provider in self.providers.get("embedding", []):
+            if provider.get("name") == self.embedding_provider:
+                return provider
+        return None
 
     def ensure_dirs(self) -> None:
         """Create all necessary directories if they don't exist."""

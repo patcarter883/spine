@@ -157,32 +157,25 @@ class RecallTool(BaseTool):
 
     async def _embed_query(self, query: str) -> np.ndarray:
         """Generate embedding for the query text."""
-        from spine.agents.helpers import resolve_model
+        from spine.config import SpineConfig
 
-        model_spec = resolve_model(None, phase="embedding")
+        provider_cfg = SpineConfig.load().resolve_embedding_provider()
+        if not provider_cfg:
+            raise ValueError("No embedding provider configured")
 
-        # Handle OpenAI embedding model
-        if isinstance(model_spec, str) and model_spec.startswith("openai:"):
-            return await self._embed_with_openai(query, model_spec)
+        model_name = provider_cfg.get("model", "text-embedding-3-large")
+        api_key = provider_cfg.get("api_key") or ""
+        base_url = provider_cfg.get("base_url")
 
-        # Fallback: return zeros (shouldn't happen in production)
-        logger.warning("Unknown embedding model: %s", model_spec)
-        return np.zeros(VectorStore.EMBEDDING_DIM, dtype=np.float32)
-
-    async def _embed_with_openai(self, text: str, model_spec: str) -> np.ndarray:
-        """Embed text using OpenAI embeddings."""
         from langchain_openai import OpenAIEmbeddings
-
-        import os
-
-        model_name = model_spec.removeprefix("openai:")
 
         embeddings = OpenAIEmbeddings(
             model=model_name,
-            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            api_key=api_key,
+            **(base_url and {"base_url": base_url}) or {},
         )
 
-        result = await embeddings.aembed_query(text)
+        result = await embeddings.aembed_query(query)
         return np.array(result, dtype=np.float32)
 
     def _apply_token_budget(
