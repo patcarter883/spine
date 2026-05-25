@@ -172,10 +172,24 @@ class VectorIndexer:
 
     @staticmethod
     def _parse_tool_result(result: Any) -> list[Any]:
-        """Normalize tool results to a list of entries."""
+        """Normalize MCP tool results to a list of entries.
+
+        Handles LangChain tool response format:
+        [{"type": "text", "text": "[...json...]"}] -> parsed list
+        """
         import json
 
         if isinstance(result, list):
+            # LangChain MCP tool response: [{"type": "text", "text": "..."}]
+            if len(result) == 1 and isinstance(result[0], dict) and "text" in result[0]:
+                text = result[0]["text"]
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        return parsed
+                    return [parsed]
+                except (json.JSONDecodeError, TypeError):
+                    return [text] if text else []
             return result
         if isinstance(result, str):
             try:
@@ -184,7 +198,7 @@ class VectorIndexer:
                     return parsed
                 return [parsed]
             except (json.JSONDecodeError, TypeError):
-                return []
+                return [result] if result else []
         if isinstance(result, dict):
             # Some tools return {"items": [...]} or {"results": [...]}
             for key in ("items", "results", "symbols", "functions", "classes"):
