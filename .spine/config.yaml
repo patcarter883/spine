@@ -75,7 +75,7 @@ providers:
   embedding:
   - name: local-embeddings
     type: openai-embedding
-    model: embeddinggemma-300m-GGUF-BF16
+    model: Qwen3-Embedding-8B-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
 phases:
