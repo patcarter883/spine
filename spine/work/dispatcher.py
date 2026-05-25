@@ -710,18 +710,38 @@ async def resume_work(
 
     # ── Rebuild and re-run the workflow graph ──
     try:
-        from spine.workflow.compose import build_workflow_graph
+        from spine.workflow.compose import WORKFLOW_SEQUENCES, build_workflow_graph
 
         checkpointer = await checkpoint_store.get_checkpointer()
         graph = build_workflow_graph(work_type, checkpointer=checkpointer)
+
+        # Delete the old checkpoint so the graph starts fresh with our resume_state
+        # instead of restoring the previous checkpoint state
+        await checkpoint_store.delete_state(work_id)
+
+        # Determine the starting phase based on action and prior state
+        # For "rework" action, restart from the phase that needs review
+        # For "approve" action, start from the phase after the review
+        phase_seq = WORKFLOW_SEQUENCES.get(work_type, [])
+        phase_index = 0
+        current_phase = ""
+
+        if action == "rework" and saved_state:
+            needs_review_phase = saved_state.get("needs_review_phase", "")
+            if needs_review_phase:
+                for idx, (name, _) in enumerate(phase_seq):
+                    if name == needs_review_phase:
+                        phase_index = idx
+                        current_phase = needs_review_phase
+                        break
 
         # Seed the new run with all prior state plus the human feedback
         resume_state: dict[str, Any] = {
             "work_id": work_id,
             "work_type": work_type,
             "description": description,
-            "current_phase": "",
-            "phase_index": 0,
+            "current_phase": current_phase,
+            "phase_index": phase_index,
             "retry_count": prior_retry_count,
             "max_retries": config.max_critic_retries,
             "artifacts": prior_artifacts,

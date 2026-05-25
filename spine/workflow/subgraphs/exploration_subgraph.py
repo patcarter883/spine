@@ -115,8 +115,18 @@ def _research_router(
                    "the research_manager_node produced malformed structured output.",
         )
 
-    sends = [Send("explore", {"topic": t, "phase": state.get("phase", "")}) for t in topics]
-    logger.info("Dispatching %d explore node(s): %s", len(sends), topics)
+    findings: list[dict] = state.get("findings", [])
+    explored_topics: set[str] = {
+        f.get("topic", "") for f in findings if isinstance(f, dict) and f.get("topic")
+    }
+
+    new_topics = [t for t in topics if t not in explored_topics]
+    if not new_topics:
+        logger.info("All topics already explored — routing to synthesize")
+        return "synthesize"  # type: ignore[return-value]
+
+    sends = [Send("explore", {"topic": t, "phase": state.get("phase", "")}) for t in new_topics]
+    logger.info("Dispatching %d explore node(s): %s", len(sends), new_topics)
     return sends
 
 

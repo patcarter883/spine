@@ -310,10 +310,16 @@ def _plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> d
 
 
 def _critic_result_mapper(reviewed_phase: str):
-    """Create a result mapper for a critic subgraph reviewing a specific phase."""
+    """Create a result mapper for a critic subgraph reviewing a specific phase.
+    
+    Two-tier review logic:
+    1. Structural check: If it fails, the agent check still runs (for feedback).
+    2. Agent check: Determines the final status (PASSED, NEEDS_REVISION, NEEDS_REVIEW).
+    
+    The effective feedback comes from the agent if available, otherwise from structural.
+    """
 
     def mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
-        # Critic doesn't produce artifacts_output — it produces review results
         base: dict[str, Any] = {
             "current_phase": PhaseName.CRITIC.value,
             "status": "running",
@@ -323,9 +329,11 @@ def _critic_result_mapper(reviewed_phase: str):
         structural_result = subgraph_result.get("structural_result", {})
         agent_result = subgraph_result.get("agent_result", {})
 
-        # Determine effective feedback from both tiers
-        effective_result = agent_result if agent_result else structural_result
-        if not effective_result:
+        if agent_result:
+            effective_result = agent_result
+        elif structural_result:
+            effective_result = structural_result
+        else:
             effective_result = {
                 "status": "passed",
                 "tier": "structural",
@@ -339,20 +347,19 @@ def _critic_result_mapper(reviewed_phase: str):
         if phase_status == ReviewStatus.NEEDS_REVIEW.value:
             base["status"] = "needs_review"
             base["needs_review_phase"] = reviewed_phase
-            # Increment retry count before routing to needs_review
             retry_count = parent_state.get("retry_count", {})
             current = retry_count.get(reviewed_phase, 0)
             base["retry_count"] = {reviewed_phase: current + 1}
         elif phase_status == ReviewStatus.NEEDS_REVISION.value:
-            # Increment retry count for rework loops
             retry_count = parent_state.get("retry_count", {})
             current = retry_count.get(reviewed_phase, 0)
             base["retry_count"] = {reviewed_phase: current + 1}
             base["status"] = "running"
+        elif phase_status == "success":
+            base["status"] = "running"
         elif phase_status == "error":
             base["status"] = "failed"
 
-        # Set critic completion invariants
         if reviewed_phase == PhaseName.SPECIFY.value:
             base["critic_specify_completed"] = True
         elif reviewed_phase == PhaseName.PLAN.value:

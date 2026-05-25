@@ -63,7 +63,13 @@ class TestSubagentAutonomy:
     """Verify subagents are configured for autonomous tool use."""
 
     def test_subagent_response_format_policy(self):
-        """Researcher gets response_format (structured summaries); others don't."""
+        """No tool-using subagent gets response_format — schema binding
+        causes models to satisfy the schema on turn 1 without using tools.
+
+        All three subagents that use tools (researcher, slice-implementer,
+        slice-verifier) run free-form. Results are extracted from the last
+        assistant message after the agent loop completes.
+        """
         from unittest.mock import patch, MagicMock
         from spine.agents.subagents import build_subagent_spec
 
@@ -91,15 +97,11 @@ class TestSubagentAutonomy:
                     phase=PhaseName.IMPLEMENT,
                     state=state,
                 )
-            if name == "researcher":
-                assert "response_format" in spec, (
-                    "Researcher subagent should have response_format for structured summaries"
-                )
-            else:
-                assert "response_format" not in spec, (
-                    f"Subagent {name!r} should not have response_format — "
-                    f"only researcher uses structured output"
-                )
+            assert "response_format" not in spec, (
+                f"Subagent {name!r} should not have response_format — "
+                f"schema binding causes models to skip tool calls on turn 1. "
+                f"Results are extracted from the final assistant message instead."
+            )
 
     def test_subagent_prompt_enforces_tools(self):
         """Subagent prompts must contain 'MUST USE TOOLS' instruction."""

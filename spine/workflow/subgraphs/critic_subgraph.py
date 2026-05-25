@@ -208,7 +208,12 @@ async def _agent_check_node(
 
 
 def _critic_subgraph_router(state: CriticSubgraphState) -> str:
-    """Route based on structural check result."""
+    """Route based on structural check result.
+    
+    Structural check passes → proceed to agent check.
+    Structural check fails → still proceed to agent check (which will also fail).
+    This ensures both tiers produce feedback for the rework phase to address.
+    """
     structural = state.get("structural_result", {})
     status = structural.get("status", ReviewStatus.NEEDS_REVISION.value)
     if status == ReviewStatus.PASSED.value:
@@ -231,15 +236,19 @@ def _plan_validation_router(state: CriticSubgraphState) -> str:
 def build_critic_subgraph(reviewed_phase: str) -> Any:
     """Build a CRITIC phase subgraph for a specific reviewed phase.
 
-    Args:
-        reviewed_phase: The phase being reviewed (e.g. "plan", "tasks").
+    The critic performs two-tier review:
+    1. Structural check (fast, no-LLM) - checks artifacts exist and have content
+    2. Agent check (LLM-based) - quality review
+    
+    If structural fails, we still run the agent check so both tiers produce
+    feedback. The agent will see the structural failure in the state and can
+    provide additional context.
     """
     builder = StateGraph(CriticSubgraphState)
 
     builder.add_node("structural_check", _structural_check_node)
     builder.add_node("agent_check", _agent_check_node)
 
-    # Add plan validation node only when reviewing PLAN phase
     if PhaseName(reviewed_phase) == PhaseName.PLAN:
         builder.add_node("plan_validation", _plan_validation_node)
 
@@ -249,20 +258,19 @@ def build_critic_subgraph(reviewed_phase: str) -> Any:
         _critic_subgraph_router,
         {
             "passed": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
-            "needs_revision": END,
-            "needs_review": END,
+            "needs_revision": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "needs_review": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
         },
     )
 
-    # Plan validation node routing (only wired when reviewing PLAN)
     if PhaseName(reviewed_phase) == PhaseName.PLAN:
         builder.add_conditional_edges(
             "plan_validation",
             _plan_validation_router,
             {
                 "passed": "agent_check",
-                "needs_revision": END,
-                "needs_review": END,
+                "needs_revision": "agent_check",
+                "needs_review": "agent_check",
             },
         )
 

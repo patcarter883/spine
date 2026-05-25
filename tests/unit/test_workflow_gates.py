@@ -6,7 +6,7 @@ import json
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -297,6 +297,7 @@ class TestResumeWork:
     @pytest.mark.asyncio
     async def test_resume_rejects_unknown_work_id(self):
         import sqlite_utils
+
         from spine.work.dispatcher import resume_work
 
         with patch("spine.work.dispatcher._get_work_db") as mock_db_fn:
@@ -308,6 +309,72 @@ class TestResumeWork:
 
             with pytest.raises(ValueError, match="not found"):
                 await resume_work("nonexistent", "fix it")
+
+    @pytest.mark.asyncio
+    async def test_resume_rework_starts_from_needs_review_phase(self):
+        """When action='rework', resume should start from the needs_review_phase."""
+        from spine.work.dispatcher import resume_work
+
+        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn:
+            mock_db = MagicMock()
+            mock_table = MagicMock()
+            mock_table.get.return_value = {
+                "id": "abc",
+                "status": "needs_review",
+                "work_type": "task",
+                "description": "test task",
+                "result": "",
+            }
+            mock_db.__getitem__ = lambda s, k: mock_table
+            mock_db_fn.return_value = mock_db
+
+            saved_state = {
+                "needs_review_phase": "plan",
+                "artifacts": {"plan": {"plan.md": "content"}},
+                "feedback": [],
+                "retry_count": {},
+            }
+
+            async def mock_astream(*args, **kwargs):
+                yield {
+                    "type": "updates",
+                    "ns": (),
+                    "data": {
+                        "some_node": {
+                            "current_phase": "plan",
+                            "status": "running",
+                            "artifacts": {},
+                        }
+                    },
+                }
+
+            mock_graph = MagicMock()
+            mock_graph.astream = mock_astream
+
+            import sys as _sys
+
+            mock_compose = MagicMock()
+            mock_compose.WORKFLOW_SEQUENCES = {
+                "task": [("specify", None), ("plan", None), ("implement", None)]
+            }
+            mock_compose.build_workflow_graph.return_value = mock_graph
+            _sys.modules["spine.workflow.compose"] = mock_compose
+
+            mock_cp_mod = MagicMock()
+            mock_cp = MagicMock()
+            mock_cp_mod.CheckpointStore = MagicMock(return_value=mock_cp)
+            mock_cp.get_checkpointer = AsyncMock()
+            mock_cp.get_state = AsyncMock(return_value=saved_state)
+            mock_cp.delete_state = AsyncMock(return_value=True)
+            _sys.modules["spine.persistence.checkpoint"] = mock_cp_mod
+
+            try:
+                with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
+                    result = await resume_work("abc", "fix it", action="rework")
+                    mock_cp.delete_state.assert_called_once_with("abc")
+            finally:
+                _sys.modules.pop("spine.workflow.compose", None)
+                _sys.modules.pop("spine.persistence.checkpoint", None)
 
 
 # ── Critic router tests ──

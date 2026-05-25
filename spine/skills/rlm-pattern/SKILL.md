@@ -16,7 +16,7 @@ Variables survive between turns. Use it to keep intermediate data OUT of the mod
 | Situation | Use eval? | Why |
 |-----------|-----------|-----|
 | Reading ≥3 files | YES | Batch reads in one program, return synthesis |
-| Dispatching ≥2 subagents | YES | Promise.all for parallel, keep results in JS |
+| Dispatching ≥2 subagents | YES | Batch with eval for results caching; `task` dispatches run in parallel automatically |
 | Sorting/filtering data | YES | Deterministic — no token cost for logic |
 | Single file read | NO | Just use read_file directly |
 | Writing a file | NO | Use write_file tool directly |
@@ -73,13 +73,19 @@ console.log('Slices:', uniqueSlices.join(', '));
 
 Then read only the slice files you need — in one eval call.
 
-## Pattern 2: Parallel subagent dispatch (IMPLEMENT/VERIFY)
+## Pattern 2: Parallel subagent dispatch (IMPLEMENT/VERIFY via eval)
+
+> **Note:** IMPLEMENT and VERIFY phases now use the LangGraph Send API at the
+> subgraph level for slice dispatch — the agent no longer drives this.  Use
+> this eval pattern only inside the agent itself for ad-hoc batch operations
+> when you have results to cache in `globalThis`.
 
 ```js
 const subagent = globalThis.context?.phase === 'verify' ? 'slice-verifier' : 'slice-implementer';
 const slices = ['slice-queue-pending-reorder', 'slice-work-detail-reorder', 'slice-tests'];
 
-// Wave sort: all slices have no dependencies → one wave
+// Dispatch each task — the runtime executes them in parallel automatically.
+// Wrap in Promise.allSettled only when you need error isolation per task.
 const results = await Promise.allSettled(
   slices.map(name => tools.task({
     description: `Implement the slice defined in .spine/artifacts/${globalThis.context?.work_id}/tasks/${name}.md. Read the slice file and codebase-map.md first, then implement the changes described.`,
@@ -93,13 +99,18 @@ console.log(`Done: ${succeeded.length}/${slices.length}, Failed: ${failed.length
 JSON.stringify({succeeded, failed}, null, 2);
 ```
 
-## Pattern 3: Codebase exploration (TASKS/SPECIFY)
+## Pattern 3: Codebase exploration (TASKS — legacy quick workflows)
+
+> **Note:** SPECIFY and PLAN phases now use the LangGraph exploration subgraph
+> (Send API) for researcher dispatch — the agent receives pre-computed results
+> in its context and should synthesise them directly.  This eval pattern applies
+> only to the deprecated TASKS quick-workflow path.
 
 ```js
 const subagent = 'researcher';
 const modules = ['spine/work/ralph_worker.py', 'spine/ui_api/api.py', 'spine/ui/_pages/queue.py'];
 
-const reports = await Promise.all(
+const reports = await Promise.allSettled(
   modules.map(path => tools.task({
     description: `Research the module at ${path}. Report: 1) Key classes and functions, 2) Imports and dependencies, 3) Patterns and conventions used.`,
     subagent_type: subagent,
@@ -107,7 +118,7 @@ const reports = await Promise.all(
 );
 
 // Process reports in eval — don't dump into conversation
-const summaries = reports.map(r => r.substring(0, 200));
+const summaries = reports.map(r => r.value?.substring(0, 200) ?? String(r.reason));
 console.log(summaries.join('\\n\\n'));
 ```
 

@@ -1,14 +1,14 @@
 """SPINE plan agent — Deep Agent for the PLAN phase.
 
-Reads the specification artifact and codebase structure, then writes
-the technical plan via the ``write_structured_plan`` tool, emitting a
-flat array of feature_slices with explicit dependencies.
+Reads the specification artifact and codebase structure (pre-explored by the
+exploration subgraph) then writes the technical plan via the
+``write_structured_plan`` tool, emitting a flat array of feature_slices with
+explicit dependencies.
 
 Tool surface (complete list):
 - ``read_prior_artifacts`` — loads specification + context in one call
 - ``search_codebase`` — multi-query codebase file search
 - ``write_structured_plan`` — structured write with feature_slices (only)
-- ``eval`` (via CodeInterpreterMiddleware) — orchestration / store results
 
 No generic filesystem tools (ls, read_file, glob, grep, write_file,
 edit_file, execute). The plan agent has targeted read access via
@@ -16,11 +16,11 @@ edit_file, execute). The plan agent has targeted read access via
 through ``write_structured_plan``. It cannot browse the filesystem
 arbitrarily.
 
-PLAN dispatching: research subagents explore codebase areas in parallel
-via ``eval`` + ``Promise.allSettled``, matching the SPECIFY pattern.
-This is the PRIMARY exploration strategy — MCP tools and ``search_codebase``
-are supplemental, used only for narrow targeted lookups after broad
-researcher dispatch.
+PLAN research strategy: codebase exploration is handled UPSTREAM by the
+exploration subgraph (LangGraph Send API) before this agent runs.  The
+agent synthesises those findings to produce the plan.  ``search_codebase``
+and MCP tools are supplemental, used only for narrow targeted lookups that
+were not covered by the upstream exploration.
 """
 
 from __future__ import annotations
@@ -112,20 +112,19 @@ def _build_plan_prompt() -> str:
         "feature_slices with dependencies.\\n\\n"
         "## Available tools (use only these)\\n"
         "- `read_prior_artifacts` — loads spec and all prior artifacts. Call FIRST.\\n"
-        "- `task` — dispatches a `researcher` subagent via eval.\\n"
-        "- `eval` — JavaScript REPL for parallel dispatch and storing results.\\n"
+        "- `search_codebase` — targeted file search for narrow lookups not in exploration.\\n"
         "- `write_structured_plan` — emits feature_slices. Call LAST.\\n\\n"
-        "## WORKFLOW (3 steps, ~4 turns)\\n\\n"
+        "## WORKFLOW (2 steps, ~3 turns)\\n\\n"
         "### Step 1 — Call read_prior_artifacts (Turn 1)\\n"
-        "Call with no arguments, store: `globalThis.ctx = JSON.parse(result)`\\n\\n"
-        "### Step 2 — Dispatch spec-aware researchers (Turn 2)\\n"
-        "Identify 2-4 areas needing codebase mapping. For each:\\n"
-        "1. Extract relevant spec section from ctx.artifacts.specify['specification.md']\\n"
-        "2. Dispatch researcher with spec section + investigation task in description\\n"
-        "3. Use `Promise.allSettled` for parallel dispatch in single eval call\\n"
-        "4. Ensure each description is >= 300 characters with embedded spec content\\n\\n"
-        "### Step 3 — Call write_structured_plan (Turn 3)\\n"
-        "Synthesize spec + research into feature_slices and call write_structured_plan.\\n\\n"
+        "Call with no arguments to load the specification and prior exploration results.\\n\\n"
+        "### Step 2 — Review exploration results (already available)\\n"
+        "Codebase research was run BEFORE this agent started via the LangGraph "
+        "exploration subgraph (Send API parallel dispatch). The research findings are "
+        "injected into your context alongside the specification. Synthesise them — do "
+        "NOT dispatch additional researcher subagents. Use `search_codebase` only for "
+        "narrow targeted lookups (specific file paths, symbol names) not already covered.\\n\\n"
+        "### Step 3 — Call write_structured_plan (Turn 2-3)\\n"
+        "Synthesize spec + exploration into feature_slices and call write_structured_plan.\\n\\n"
         "Each slice requires these fields:\\n"
         "- id: unique short identifier (e.g., 'add-user-model')\\n"
         "- title: human-readable one-line summary\\n"
@@ -142,5 +141,5 @@ def _build_plan_prompt() -> str:
         "- Every target_file path must come from MCP, search_codebase, or "
         "confirmed existing directory.\\n"
         "- Call `write_structured_plan` exactly once with all required fields.\\n"
-        "- If not called by turn 5, write with current information.\\n"
+        "- If not called by turn 4, write with current information.\\n"
     )

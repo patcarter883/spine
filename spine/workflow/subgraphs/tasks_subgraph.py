@@ -79,11 +79,11 @@ async def _run_tasks_agent(
             )
         else:
             # Quick/critical_quick: no prior artifacts — work from the
-            # original description. First action must be parallel researcher
-            # dispatch via eval — the user message makes this explicit.
+            # original description. First action must be researcher dispatch
+            # via the task tool — the user message makes this explicit.
             desc_preview = description[:120].replace("'", "\\'")
-            researcher_line1 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 1>'}}),"
-            researcher_line2 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 2>'}}),"
+            researcher_line1 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 1>'}},"
+            researcher_line2 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 2>'}},"
             prompt_lines.extend(
                 [
                     "Break the work description into smaller, executable "
@@ -92,23 +92,15 @@ async def _run_tasks_agent(
                     "## Work Description",
                     description,
                     "",
-                    "## Your first action MUST be an eval call",
-                    "Dispatch 2-3 `researcher` subagents in parallel via "
-                    "`Promise.allSettled` inside a single `eval` call. "
-                    "Do NOT call codebase queries search/explore sequential turn-by-turn yourself first. "
-                    "Each researcher investigates ONE area of the codebase "
-                    "relevant to the work description above.",
+                    "## Your first action MUST be to dispatch researcher subagents",
+                    "Call `task` 2-3 times (once per area) to dispatch researcher subagents "
+                    "in parallel. Do NOT call codebase queries search/explore sequentially "
+                    "turn-by-turn yourself first. Each researcher investigates ONE area of "
+                    "the codebase relevant to the work description above.",
                     "",
-                    "```js",
-                    "// FIRST TURN — dispatch researchers in parallel:",
-                    "const results = await Promise.allSettled([",
-                    "  tools.task({subagent_type: 'researcher',",
-                    researcher_line1,
-                    "  tools.task({subagent_type: 'researcher',",
-                    researcher_line2,
-                    "]);",
-                    "globalThis.research = results.map(r => r.value || r.reason);",
-                    "```",
+                    "Example (adapt to the actual work description):",
+                    f"  tools.task({{subagent_type: 'researcher', {researcher_line1}}})",
+                    f"  tools.task({{subagent_type: 'researcher', {researcher_line2}}})",
                     "",
                     "After researchers complete, call `write_tasks_artifacts` "
                     "with all slices, tasks summary, dependency waves, and codebase map. "
@@ -127,8 +119,8 @@ async def _run_tasks_agent(
         )
         prompt_lines.extend(
             [
-                "## Instructions\n"
-                "1. Explore the codebase (use researcher subagents in parallel via first-turn `eval` call).\n"
+                "## Instructions\\n"
+                "1. Explore the codebase (dispatch researcher subagents via the `task` tool).\\n"
                 "2. After exploring, synthesize everything and write all slices, overview, and codebase-map "
                 "using `write_tasks_artifacts` once.\n"
                 "3. **You MUST call `write_tasks_artifacts` exactly ONCE** — do not call `write_file`.\n"

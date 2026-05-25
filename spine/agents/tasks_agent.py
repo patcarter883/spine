@@ -14,7 +14,7 @@ Tool surface (complete list):
 - ``search_codebase`` — multi-query targeted file search (replaces ls/glob/grep/read_file)
 - ``write_tasks_artifacts`` — atomic write of slices + tasks.md + codebase-map.md
 - ``task`` (via SubAgentMiddleware) — dispatches researcher subagents
-- ``eval`` (via CodeInterpreterMiddleware) — parallel subagent dispatch
+  (legacy; new workflows use LangGraph Send API at the subgraph level)
 
 No generic filesystem tools (ls, read_file, glob, grep, write_file,
 edit_file, execute). The agent cannot read files directly — it uses
@@ -155,8 +155,8 @@ def _build_tasks_prompt() -> str:
         "### Output\n"
         "- `write_tasks_artifacts` — writes all artifacts atomically. "
         "Call this ONCE. It is the ONLY write tool.\n"
-        "- `task` (via eval) — dispatches a `researcher` subagent.\n"
-        "- `eval` — JavaScript REPL for parallel dispatch and caching.\n\n"
+        "- `task` (via eval) — dispatches a `researcher` subagent (legacy path).\\n"
+        "- `eval` — JavaScript REPL for batching reads and caching.\\n\\n"
         "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
         "`edit_file`, or `execute`. Do not attempt to call them.\n\n"
         "## Workflow (~3 turns total)\n\n"

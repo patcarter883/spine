@@ -30,6 +30,8 @@ from the resulting plan.
 
 ## Research
 
-If the eval tool is available, use it with `tools.task()` to dispatch parallel
-research subagents that inspect different parts of the codebase, then synthesize
-findings in code before writing the spec.
+Codebase research is handled BEFORE the SPECIFY agent runs, via the LangGraph
+exploration subgraph (Send API parallel dispatch).  The agent receives the
+exploration results in its context and should synthesise them directly when
+writing the spec.  Do not dispatch additional researcher subagents via eval —
+the exploration phase has already covered codebase investigation.

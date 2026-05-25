@@ -58,7 +58,10 @@ class ResearchFindings(BaseModel):
 class SliceResult(BaseModel):
     """Structured output from the slice-implementer subagent."""
 
-    status: str = Field(description="One of: implemented, partial, blocked")
+    status: str = Field(
+        pattern="^(implemented|partial|blocked)$",
+        description="One of: implemented, partial, blocked",
+    )
     files_modified: list[str] = Field(description="Files that were modified")
     files_created: list[str] = Field(description="Files that were created")
     test_results: str = Field(description="Summary of test/lint outcomes for this slice")
@@ -650,22 +653,29 @@ def build_subagent_spec(
         "tools": tools,
         "middleware": subagent_middleware,
     }
-    # Structured outputs are NOT bound here for the researcher subagent.
-    # Both ``model_kwargs["response_format"]`` (native API json_schema) and
-    # LangChain's ToolStrategy/ProviderStrategy cause the model to satisfy
-    # the schema on its very first reply, skipping tool calls and emitting
-    # plausible-but-hallucinated content (observed on deepseek-v4-pro and
-    # -flash, glm, etc.). The researcher is run free-form so the agent
-    # loop actually explores the codebase with tools; ``run_explore_node``
-    # finalizes the conversation into ``ResearchFindings`` via a separate
-    # ``model.with_structured_output()`` call AFTER the loop completes.
+    # Structured outputs are NOT bound for subagents that need to use tools
+    # before reporting results.  Both ``model_kwargs["response_format"]``
+    # (native API json_schema) and LangChain's ToolStrategy/ProviderStrategy
+    # cause the model to satisfy the schema on its very first reply, skipping
+    # tool calls and emitting plausible-but-hallucinated content (observed on
+    # deepseek-v4-pro and -flash, glm, local vLLM, etc.).
     #
-    # Other subagents (slice-implementer, slice-verifier) keep schema
-    # binding here — they are short-turn agents whose tools differ and
-    # whose schemas are easier to emit alongside ongoing work. We use
-    # ``ProviderStrategy`` to avoid AutoStrategy's ToolStrategy fallback,
-    # which forces ``tool_choice="any"`` and crashes thinking models.
-    if name in SUBAGENT_RESPONSE_MODELS and name != "researcher":
+    # - ``researcher``: no schema — free-form exploration, finalized via
+    #   ``run_explore_node`` → ``_finalize_research_findings()``.
+    # - ``slice-implementer``: no schema — model uses write_file/edit_file/
+    #   execute tools, then reports SliceResult in its final message.
+    #   ``_extract_slice_result()`` parses it from the last assistant content.
+    # - ``slice-verifier``: no schema — model uses read_file/execute tools,
+    #   then reports VerificationResult.  The verify subgraph extracts it
+    #   from the last assistant content.
+    #
+    # Subagents NOT in this exclusion list receive ProviderStrategy schema
+    # binding by default (suitable for report-only agents with no tools).
+    if name in SUBAGENT_RESPONSE_MODELS and name not in (
+        "researcher",
+        "slice-implementer",
+        "slice-verifier",
+    ):
         schema_model = SUBAGENT_RESPONSE_MODELS[name]
         if _supports_forced_tool_choice(model):
             from langchain.agents.structured_output import ProviderStrategy

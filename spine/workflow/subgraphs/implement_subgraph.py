@@ -195,6 +195,20 @@ async def _run_slice_implementer_node(
     return {"slice_results": [slice_result]}
 
 
+def _normalize_status(status: str) -> str:
+    """Normalize status to a valid value: implemented, partial, or blocked."""
+    if not isinstance(status, str):
+        return "implemented"
+    status_lower = status.lower().strip()
+    if status_lower in ("implemented", "partial", "blocked"):
+        return status_lower
+    if status_lower in ("in_progress", "in", "running", "done"):
+        return "implemented"
+    if status_lower in ("failed", "error", "not_implemented"):
+        return "blocked"
+    return "implemented"
+
+
 def _extract_slice_result(result: dict, slice_id: str) -> dict:
     """Extract a SliceResult dict from an agent result.
 
@@ -210,10 +224,14 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
     if structured:
         if isinstance(structured, dict):
             structured["slice_name"] = slice_id
+            if "status" in structured:
+                structured["status"] = _normalize_status(structured["status"])
             return structured
         if hasattr(structured, "model_dump"):
             d = structured.model_dump()
             d["slice_name"] = slice_id
+            if "status" in d:
+                d["status"] = _normalize_status(d["status"])
             return d
 
     messages = result.get("messages", [])
@@ -224,6 +242,8 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
                 parsed = json.loads(content)
                 if isinstance(parsed, dict):
                     parsed["slice_name"] = slice_id
+                    if "status" in parsed:
+                        parsed["status"] = _normalize_status(parsed["status"])
                     return parsed
             except (json.JSONDecodeError, TypeError):
                 pass

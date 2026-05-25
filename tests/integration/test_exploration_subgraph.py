@@ -146,6 +146,72 @@ def test_research_router_fan_out():
     assert result[0].arg["phase"] == "specify"
 
 
+def test_research_router_filters_explored_topics():
+    """research_router should filter out topics already explored in previous rounds."""
+    from spine.workflow.subgraphs.exploration_subgraph import _research_router
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+    from langgraph.types import Send
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 1,
+        "max_rounds": 3,
+        "manager_decision": "explore",
+        "topics": ["auth-module", "database-layer", "new-topic"],
+        "findings": [
+            {"topic": "auth-module", "summary": "already explored"},
+            {"topic": "database-layer", "summary": "done"},
+        ],
+        "agent_response": "",
+    }
+
+    result = _research_router(state)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0].node == "explore"
+    assert result[0].arg["topic"] == "new-topic"
+
+
+def test_research_router_all_topics_explored():
+    """research_router should return 'synthesize' when all topics already explored."""
+    from spine.workflow.subgraphs.exploration_subgraph import _research_router
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 1,
+        "max_rounds": 3,
+        "manager_decision": "explore",
+        "topics": ["auth-module", "database-layer"],
+        "findings": [
+            {"topic": "auth-module", "summary": "done"},
+            {"topic": "database-layer", "summary": "done"},
+        ],
+        "agent_response": "",
+    }
+
+    result = _research_router(state)
+    assert result == "synthesize"
+
+
 def test_research_router_done():
     """research_router should return 'synthesize' when decision=done."""
     from spine.workflow.subgraphs.exploration_subgraph import _research_router

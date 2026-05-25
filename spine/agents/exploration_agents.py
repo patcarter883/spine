@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -153,75 +152,33 @@ async def run_research_manager(
     )
 
     try:
-        # Use response_format kwarg to enforce JSON schema at the model
-        # level without leaking a Pydantic instance into LangGraph state
-        # (avoids the serializer warning that .with_structured_output() causes
-        # when the AIMessage.parsed field is checkpointed).
-        #
-        # Falls back to raw JSON extraction for providers that don't
-        # support response_format with json_schema.
-        # Strict json_schema requires additionalProperties=false and every
-        # property listed in `required`. Pydantic's default schema omits
-        # both, so normalize before sending.
-        schema = ResearchManagerDecision.model_json_schema()
-        schema["additionalProperties"] = False
-        schema["required"] = list(schema.get("properties", {}).keys())
-        response_format_kwarg = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "research_manager_decision",
-                "strict": True,
-                "schema": schema,
-            },
-        }
-
-        try:
-            response = await model.ainvoke(
-                [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)],
-                response_format=response_format_kwarg,
-            )
-        except (TypeError, ValueError) as exc:
-            logger.debug(
-                "[%s] Model does not support response_format kwarg: %s — "
-                "falling back to raw JSON extraction",
-                work_id, exc,
-            )
-            response = await model.ainvoke(
-                [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)]
-            )
-
-        raw = response.content if hasattr(response, "content") else str(response)
-        # Handle content blocks (list of dicts from some model wrappers)
-        if isinstance(raw, list):
-            raw = "\n".join(
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in raw
-            )
-        # Extract JSON from anywhere in the response — handles leading
-        # whitespace, code fences, and thinking/reasoning preamble.
-        json_match = re.search(
-            r'\{\s*"decision"\s*:\s*"(?:explore|done)"[^}]*\}', raw, re.DOTALL
+        # Use model.with_structured_output() for proper Pydantic validation.
+        # The local vLLM can produce syntactically-valid but semantically-
+        # garbage JSON (e.g. topics=[" ["]) that json.loads() accepts —
+        # only Pydantic validation catches this.  We extract plain values
+        # into a dict so the Pydantic instance never leaks into LangGraph
+        # state (avoids the checkpoint serializer warning on AIMessage.parsed).
+        structured_model = model.with_structured_output(ResearchManagerDecision)
+        response = await structured_model.ainvoke(
+            [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)],
         )
-        if json_match:
-            result_dict = json.loads(json_match.group(0))
+
+        # .with_structured_output() may return the Pydantic instance directly
+        # (newer LangChain) or in AIMessage.parsed (legacy providers).
+        if isinstance(response, ResearchManagerDecision):
+            parsed = response
+        elif hasattr(response, "parsed") and isinstance(response.parsed, ResearchManagerDecision):
+            parsed = response.parsed
         else:
-            # Try stripping code fences with leading whitespace
-            stripped = raw.strip()
-            if stripped.startswith("```"):
-                inner = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
-                if inner.endswith("```"):
-                    inner = inner[:-3]
-                result_dict = json.loads(inner.strip())
-            else:
-                raise json.JSONDecodeError("No JSON found in response", raw, 0)
+            raise ValueError(
+                f"Unexpected structured output response type: {type(response).__name__}"
+            )
 
-        decision = result_dict.get("decision", "done")
-        topics = result_dict.get("topics", [])
-
-        if not isinstance(topics, list):
-            topics = []
-        logger.info("[%s] Research manager: decision=%s topics=%s", work_id, decision, topics)
-        return {"manager_decision": decision, "topics": topics}
+        logger.info(
+            "[%s] Research manager: decision=%s topics=%s",
+            work_id, parsed.decision, parsed.topics,
+        )
+        return {"manager_decision": parsed.decision, "topics": parsed.topics}
 
     except Exception as e:
         logger.warning(

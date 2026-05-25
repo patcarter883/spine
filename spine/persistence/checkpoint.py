@@ -83,3 +83,21 @@ class CheckpointStore:
         except Exception:
             pass
         return None
+
+    async def delete_state(self, work_id: str) -> bool:
+        """Delete the checkpoint state for a work item.
+
+        Args:
+            work_id: The work item ID to delete.
+
+        Returns:
+            True if deletion succeeded, False otherwise.
+        """
+        checkpointer = await self.get_checkpointer()
+        try:
+            config = {"configurable": {"thread_id": work_id}}
+            await checkpointer.adelete(config)
+            return True
+        except Exception:
+            pass
+        return False
