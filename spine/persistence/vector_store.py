@@ -28,7 +28,7 @@ class VectorStore:
         db_path: Path to the SQLite database file.
     """
 
-    EMBEDDING_DIM = 3072  # OpenAI text-embedding-3-large dimensions
+    EMBEDDING_DIM = 768  # Default, overridden by provider config or insert() call
 
     def __init__(self, db_path: str = ".spine/spine.db") -> None:
         """Initialize the vector store.

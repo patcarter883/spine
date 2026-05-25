@@ -31,6 +31,8 @@ class VectorIndexer:
     def __init__(self, config: SpineConfig | None = None) -> None:
         self.config = config or SpineConfig.load()
         self.store = VectorStore(self.config.checkpoint_path)
+        self._embedding_client = None
+        self._embed_lock = asyncio.Lock()
 
     async def index_codebase(self, workspace_root: str | None = None) -> dict[str, Any]:
         """Index the entire codebase into the vector store.
@@ -263,44 +265,13 @@ class VectorIndexer:
         symbol_name: str,
         workspace_root: str,
     ) -> str:
-        """Fetch source code for a symbol via MCP tools."""
-        from spine.mcp.client import get_mcp_tools
-
+        """Read the source file from disk."""
+        full_path = os.path.join(workspace_root, file_path)
         try:
-            mcp_tools = get_mcp_tools(
-                self.config.mcp_servers,
-                cache_key="indexing",
-                workspace_root=workspace_root,
-            )
-
-            tool_by_name = {t.name: t for t in mcp_tools}
-
-            for tool_name in (
-                "mcp_codebase-index_get_function_source",
-                "mcp_codebase-index_get_class_source",
-            ):
-                tool = tool_by_name.get(tool_name)
-                if not tool:
-                    continue
-                try:
-                    result = await tool.ainvoke({
-                        "name": symbol_name,
-                        "file_path": file_path,
-                    })
-                    if isinstance(result, str) and result.strip():
-                        return result
-                except Exception:
-                    continue
-
-            # Fallback: fetch whole file from disk
-            import os
-
-            full_path = os.path.join(workspace_root, file_path)
             with open(full_path, encoding="utf-8") as f:
                 return f.read()
-
         except OSError as e:
-            logger.warning("Could not read %s:%s — %s", file_path, symbol_name, e)
+            logger.warning("Could not read %s: %s", file_path, e)
             return ""
 
     async def _summarize_code(self, raw_code: str, symbol_name: str) -> str:
@@ -323,25 +294,38 @@ class VectorIndexer:
         return response.content if hasattr(response, "content") else str(response)
 
     async def _embed_text(self, text: str) -> np.ndarray:
-        """Embed text using the configured embedding provider."""
+        """Embed text using a shared embedding client with retry."""
         from langchain_openai import OpenAIEmbeddings
 
-        provider_cfg = self.config.resolve_embedding_provider()
-        if not provider_cfg:
-            raise ValueError(f"Embedding provider '{self.config.embedding_provider}' not found")
+        # Lazily create shared client (thread-safe via lock)
+        if self._embedding_client is None:
+            async with self._embed_lock:
+                if self._embedding_client is None:
+                    provider_cfg = self.config.resolve_embedding_provider()
+                    if not provider_cfg:
+                        raise ValueError(
+                            f"Embedding provider '{self.config.embedding_provider}' not found"
+                        )
+                    self._embedding_client = OpenAIEmbeddings(
+                        model=provider_cfg.get("model", "text-embedding-3-large"),
+                        api_key=provider_cfg.get("api_key") or "",
+                        **(provider_cfg.get("base_url") and {"base_url": provider_cfg["base_url"]}) or {},
+                    )
 
-        model_name = provider_cfg.get("model", "text-embedding-3-large")
-        api_key = provider_cfg.get("api_key") or ""
-        base_url = provider_cfg.get("base_url")
-
-        embeddings = OpenAIEmbeddings(
-            model=model_name,
-            api_key=api_key,
-            **(base_url and {"base_url": base_url}) or {},
-        )
-
-        result = await embeddings.aembed_query(text)
-        return np.array(result, dtype=np.float32)
+        # Retry transient embedding failures (vLLM overload)
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = await self._embedding_client.aembed_query(text)
+                return np.array(result, dtype=np.float32)
+            except (ValueError, RuntimeError) as e:
+                if "No embedding" in str(e) and attempt < max_retries - 1:
+                    delay = 1.0 * (2 ** attempt)
+                    logger.debug("Embedding retry %d/%d after %.1fs", attempt + 1, max_retries, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
 
 async def run_indexing_job(workspace_root: str | None = None) -> dict[str, Any]:
