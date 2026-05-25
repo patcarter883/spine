@@ -9,6 +9,13 @@ spine:
     batch_size: 10
     summarize_temperature: 0.3
     embed_temperature: 0.1
+mcp_servers:
+  codebase-index:
+    transport: stdio
+    command: mcp-codebase-index
+    args: []
+    env:
+      PROJECT_ROOT: /home/pat/Projects/spine
 providers:
   llm:
   - name: glm
