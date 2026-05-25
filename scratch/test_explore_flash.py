@@ -72,59 +72,8 @@ async def main() -> None:
         "topics": [TOPIC],
         "scratchpad": "",
     }
-    # Replicate run_explore_node so we can inspect the full message trace.
-    spec = build_subagent_spec(name="researcher", phase=PhaseName.SPECIFY, state=state, config=None)
-    extra_tools = list(spec.get("tools", []))
-    agent = build_phase_agent(
-        state=state,
-        config=None,
-        phase=PhaseName.SPECIFY,
-        system_prompt=spec["system_prompt"],
-        is_subagent=True,
-        extra_tools=extra_tools,
-        response_format=spec.get("response_format"),
-        skip_filesystem_middleware=True,
-    )
-    prompt = (
-        f"## Research Topic\n{TOPIC}\n\n"
-        "Investigate this specific area of the codebase. "
-        "Use MCP tools first for structural navigation, then fall back to read_file/glob/grep if needed. "
-        "Return your findings in the ResearchFindings format."
-    )
-    agent_result = await ainvoke_with_retry(
-        agent, {"messages": [{"role": "user", "content": prompt}]},
-        phase_name="explore", work_id="harness-flash-test",
-    )
-
-    msgs = agent_result.get("messages", [])
-    print(f"\n=== MESSAGE COUNT: {len(msgs)} ===")
-    tool_calls_total = 0
-    for i, m in enumerate(msgs):
-        mtype = type(m).__name__
-        tcs = getattr(m, "tool_calls", None) or []
-        tool_calls_total += len(tcs)
-        content = getattr(m, "content", "")
-        if isinstance(content, list):
-            content = str(content)
-        head = (content or "")[:200].replace("\n", " ")
-        tc_summary = ""
-        if tcs:
-            tc_summary = " tool_calls=" + ",".join(
-                f"{t.get('name')}({list((t.get('args') or {}).keys())})" for t in tcs
-            )
-        print(f"[{i}] {mtype}{tc_summary} :: {head}")
-    print(f"\nTOTAL TOOL CALLS: {tool_calls_total}")
-
-    print("\n=== STRUCTURED_RESPONSE PRESENT? ===")
-    print(repr(agent_result.get("structured_response"))[:500])
-    print("\n=== FINAL MSG CONTENT (raw) ===")
-    last = msgs[-1] if msgs else None
-    if last is not None:
-        c = getattr(last, "content", "")
-        print(f"type={type(c).__name__} len={len(str(c))}")
-        print(str(c)[:1200])
-
-    result = {"findings": _extract_findings(agent_result)}
+    from spine.agents.exploration_agents import run_explore_node
+    result = await run_explore_node(state, config=None, topic=TOPIC)
     print("\n=== EXPLORE NODE RESULT ===")
     findings = result.get("findings", [])
     print(f"findings count: {len(findings)}")

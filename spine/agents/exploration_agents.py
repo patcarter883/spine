@@ -382,6 +382,15 @@ async def run_explore_node(
             work_id=work_id,
         )
 
+        # Finalize: convert the free-form research conversation into a
+        # ResearchFindings JSON. The researcher agent is intentionally run
+        # WITHOUT response_format so the model actually explores with
+        # tools (binding a schema causes the model to satisfy it on turn 1
+        # and skip tool calls). After the loop completes, take the final
+        # assistant message and convert it via the model's native
+        # structured-output binding.
+        await _finalize_research_findings(result, subagent_spec.get("model"))
+
         # Extract findings from the result
         findings = _extract_findings(result)
         # Inject the topic into each finding so the synthesizer knows
@@ -414,6 +423,58 @@ async def run_explore_node(
         ]
 
     return {"findings": findings}
+
+
+async def _finalize_research_findings(result: dict, model: Any) -> None:
+    """Convert the researcher's final markdown report into ResearchFindings.
+
+    The researcher subagent runs without a bound response_format so that
+    it actually explores with tools instead of satisfying the schema on
+    turn 1. After the agent loop finishes we make ONE additional LLM call
+    here using the model's native structured-output binding to coerce the
+    accumulated conversation into the ResearchFindings schema.
+
+    Mutates ``result`` in place: sets ``structured_response`` to a
+    ``ResearchFindings`` instance on success. On failure, leaves
+    ``result`` untouched so the markdown fallback in ``_extract_findings``
+    still produces something.
+    """
+    from spine.agents.subagents import ResearchFindings
+
+    if model is None:
+        return
+    messages = result.get("messages", [])
+    final_content = ""
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            final_content = content
+            break
+    if not final_content:
+        return
+
+    try:
+        structured_model = model.with_structured_output(ResearchFindings)
+    except Exception:
+        logger.debug("Model does not support with_structured_output; skipping finalize", exc_info=True)
+        return
+
+    finalize_prompt = (
+        "Convert the research report below into the ResearchFindings JSON schema. "
+        "Populate ALL fields: summary (2-3 paragraph synthesis), patterns "
+        "(distinct list items), file_map (path -> description), dependencies "
+        "(distinct list items). Do NOT invent — use only information present "
+        "in the report.\n\n## Report\n" + final_content
+    )
+    try:
+        parsed = await structured_model.ainvoke(
+            [HumanMessage(content=finalize_prompt)]
+        )
+    except Exception as e:
+        logger.warning("Structured finalization failed: %s", e)
+        return
+
+    result["structured_response"] = parsed
 
 
 def _extract_findings(result: dict) -> list[dict]:

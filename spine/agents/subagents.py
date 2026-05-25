@@ -575,7 +575,6 @@ def build_subagent_spec(
 
     from spine.agents.helpers import (
         _active_provider_config,
-        _supports_guided_decoding,
         resolve_model,
     )
     from spine.agents.skills_resolver import resolve_memory
@@ -651,38 +650,37 @@ def build_subagent_spec(
         "tools": tools,
         "middleware": subagent_middleware,
     }
-    # Structured outputs: bind json_schema response_format directly on
-    # the model so the underlying API call (OpenRouter / OpenAI / vLLM)
-    # enforces the schema natively. This replaces Deep Agents'
-    # ToolStrategy (which forced ``tool_choice="any"`` and crashed
-    # thinking models like Qwen3/QwQ with HTTP 400).
+    # Structured outputs are NOT bound here for the researcher subagent.
+    # Both ``model_kwargs["response_format"]`` (native API json_schema) and
+    # LangChain's ToolStrategy/ProviderStrategy cause the model to satisfy
+    # the schema on its very first reply, skipping tool calls and emitting
+    # plausible-but-hallucinated content (observed on deepseek-v4-pro and
+    # -flash, glm, etc.). The researcher is run free-form so the agent
+    # loop actually explores the codebase with tools; ``run_explore_node``
+    # finalizes the conversation into ``ResearchFindings`` via a separate
+    # ``model.with_structured_output()`` call AFTER the loop completes.
     #
-    # JSON arrives in the assistant's final message ``content``; the
-    # downstream extractors (_extract_findings, _extract_slice_result,
-    # _extract_verification_result) already parse content as JSON.
-    #
-    # For models that don't expose ``model_kwargs`` (e.g. ChatAnthropic),
-    # fall back to DA's spec-level ``response_format`` — guarded by the
-    # capability checks so we don't apply ToolStrategy to thinking models
-    # that reject forced tool_choice.
-    if name in SUBAGENT_RESPONSE_MODELS:
+    # Other subagents (slice-implementer, slice-verifier) keep schema
+    # binding here — they are short-turn agents whose tools differ and
+    # whose schemas are easier to emit alongside ongoing work. We use
+    # ``ProviderStrategy`` to avoid AutoStrategy's ToolStrategy fallback,
+    # which forces ``tool_choice="any"`` and crashes thinking models.
+    if name in SUBAGENT_RESPONSE_MODELS and name != "researcher":
         schema_model = SUBAGENT_RESPONSE_MODELS[name]
-        # Only send extra_body.guided_json when the provider config has
-        # opted in (older vLLM/SGLang that don't accept OpenAI-style
-        # response_format). Modern engines honor response_format directly
-        # and the extra field is unnecessary.
-        provider_cfg = _active_provider_config(phase=model_path) or {}
-        with_guided_json = bool(provider_cfg.get("guided_decoding")) and not hasattr(
-            model, "openrouter_provider"
-        )
-        if not _bind_response_format(
-            model,
-            schema_model,
-            name=f"{name}_response",
-            with_guided_json=with_guided_json,
-        ):
-            if _supports_forced_tool_choice(model) or _supports_guided_decoding(model):
-                spec["response_format"] = schema_model
+        if _supports_forced_tool_choice(model):
+            from langchain.agents.structured_output import ProviderStrategy
+            spec["response_format"] = ProviderStrategy(schema=schema_model)
+        else:
+            provider_cfg = _active_provider_config(phase=model_path) or {}
+            with_guided_json = bool(provider_cfg.get("guided_decoding")) and not hasattr(
+                model, "openrouter_provider"
+            )
+            _bind_response_format(
+                model,
+                schema_model,
+                name=f"{name}_response",
+                with_guided_json=with_guided_json,
+            )
     if memory:
         spec["memory"] = memory
     if skills:
