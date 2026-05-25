@@ -215,7 +215,7 @@ class VectorIndexer:
                 )
                 embedding_task = asyncio.create_task(self._embed_text(raw_code))
 
-                summary, embedding = await asyncio.gather(
+                summary, raw_embed = await asyncio.gather(
                     summary_task, embedding_task, return_exceptions=True
                 )
 
@@ -230,13 +230,20 @@ class VectorIndexer:
                     summary = raw_code[:500] or "Summary failed"
                     needs_enrichment = True
 
-                if isinstance(embedding, Exception):
+                if isinstance(raw_embed, Exception):
                     logger.warning(
-                        "Embedding failed for %s: %s",
+                        "Embedding raw code failed for %s: %s",
                         symbol["symbol_name"],
-                        embedding,
+                        raw_embed,
                     )
-                    embedding = np.zeros(VectorStore.EMBEDDING_DIM, dtype=np.float32)
+                    raw_embed = np.zeros(VectorStore.EMBEDDING_DIM, dtype=np.float32)
+
+                # Re-embed the summary for better semantic retrieval
+                summary_embed = await self._embed_text(str(summary))
+                if isinstance(summary_embed, np.ndarray) and summary_embed.any():
+                    embedding = summary_embed
+                else:
+                    embedding = raw_embed
 
                 # Store in vector database
                 self.store.insert(
