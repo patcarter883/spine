@@ -47,12 +47,20 @@ class VectorStore:
             self._conn.enable_load_extension(True)
             # Load sqlite-vec extension
             try:
+                # First try bundled 'vec0' (newer sqlite-vec with Python 3.11+)
                 self._conn.execute("SELECT load_extension('vec0')")
             except sqlite3.OperationalError:
-                # Try alternative loading method
-                import vec
+                # Fallback: use sqlite_vec.load() helper
+                try:
+                    import sqlite_vec
 
-                self._conn.execute(f"SELECT load_extension('{vec.__file__}')")
+                    self._conn.execute(f"SELECT load_extension('{sqlite_vec.loadable_path()}')")
+                except (ImportError, AttributeError) as e:
+                    logger.error("Failed to load sqlite-vec extension: %s", e)
+                    raise RuntimeError(
+                        "sqlite-vec extension not available. Ensure sqlite-vec "
+                        "is installed via pip install sqlite-vec"
+                    ) from e
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
