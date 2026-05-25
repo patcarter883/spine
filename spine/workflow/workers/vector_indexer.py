@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -70,10 +71,10 @@ class VectorIndexer:
         }
 
     async def _discover_symbols(self, workspace_root: str) -> list[dict[str, Any]]:
-        """Discover symbols via mcp-codebase-index MCP tools.
+        """Discover Python symbols using MCP for file listing, AST for parsing.
 
-        Uses list_files to find Python files, then get_functions/get_classes
-        per file to enumerate symbols for indexing.
+        Uses mcp-codebase-index for file discovery (fast, cached), then
+        local AST parsing for symbol extraction (avoids per-file MCP overhead).
         """
         from spine.mcp.client import get_mcp_tools
 
@@ -83,13 +84,8 @@ class VectorIndexer:
                 cache_key="indexing",
                 workspace_root=workspace_root,
             )
+            tool_by_name = {t.name: t for t in mcp_tools}
 
-            # Build a lookup by name for fast access
-            tool_by_name: dict[str, Any] = {}
-            for t in mcp_tools:
-                tool_by_name[t.name] = t
-
-            # Step 1: List all Python files
             list_files_tool = tool_by_name.get("mcp_codebase-index_list_files")
             if not list_files_tool:
                 logger.warning("mcp_codebase-index_list_files tool not available")
@@ -101,74 +97,62 @@ class VectorIndexer:
             })
             py_files = self._parse_tool_result(files_result)
 
-            if not py_files:
-                logger.warning("No Python files found for indexing")
-                return []
-
-            logger.info("Found %d Python files to index", len(py_files))
-
-            # Step 2: Get functions and classes from each file
-            get_functions = tool_by_name.get("mcp_codebase-index_get_functions")
-            get_classes = tool_by_name.get("mcp_codebase-index_get_classes")
-
-            symbols: list[dict[str, Any]] = []
-            files_processed = 0
-
-            # Limit to internal packages (spine/, tests/)
-            target_files = [
+            target = [
                 f for f in py_files
                 if isinstance(f, str) and (
                     f.startswith("spine/") or f.startswith("tests/")
                 )
             ]
-            if not target_files:
-                target_files = [f for f in py_files if isinstance(f, str)]
+            if not target:
+                target = [f for f in py_files if isinstance(f, str)]
 
-            for file_path in target_files[:200]:  # Cap to prevent overloading
+            logger.info("Found %d Python files, parsing for symbols...", len(target))
+
+            symbols: list[dict[str, Any]] = []
+            for file_path in target[:200]:
                 if not isinstance(file_path, str):
                     continue
-                files_processed += 1
+                full_path = os.path.join(workspace_root, file_path)
+                symbols.extend(self._extract_symbols_from_file(full_path, file_path))
 
-                if get_functions:
-                    try:
-                        funcs = await get_functions.ainvoke(
-                            {"file_path": file_path}
-                        )
-                        for entry in self._parse_tool_result(funcs):
-                            if isinstance(entry, dict) and "name" in entry:
-                                symbols.append({
-                                    "file_path": file_path,
-                                    "symbol_name": entry["name"],
-                                    "symbol_type": "function",
-                                })
-                    except Exception as e:
-                        logger.debug("Failed to get functions for %s: %s", file_path, e)
-
-                if get_classes:
-                    try:
-                        classes = await get_classes.ainvoke(
-                            {"file_path": file_path}
-                        )
-                        for entry in self._parse_tool_result(classes):
-                            if isinstance(entry, dict) and "name" in entry:
-                                symbols.append({
-                                    "file_path": file_path,
-                                    "symbol_name": entry["name"],
-                                    "symbol_type": "class",
-                                })
-                    except Exception as e:
-                        logger.debug("Failed to get classes for %s: %s", file_path, e)
-
-            logger.info(
-                "Discovered %d symbols in %d files",
-                len(symbols),
-                files_processed,
-            )
+            logger.info("Discovered %d symbols across %d files", len(symbols), min(len(target), 200))
             return symbols
 
         except Exception as e:
             logger.error("MCP discovery failed: %s", e, exc_info=True)
             return []
+
+    @staticmethod
+    def _extract_symbols_from_file(
+        full_path: str, rel_path: str
+    ) -> list[dict[str, Any]]:
+        """Extract function and class names from a Python file using AST."""
+        import ast
+
+        symbols: list[dict[str, Any]] = []
+        try:
+            with open(full_path, encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source)
+        except (OSError, SyntaxError) as e:
+            logger.debug("Skipping %s: %s", rel_path, e)
+            return []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                symbols.append({
+                    "file_path": rel_path,
+                    "symbol_name": node.name,
+                    "symbol_type": "function",
+                })
+            elif isinstance(node, ast.ClassDef):
+                symbols.append({
+                    "file_path": rel_path,
+                    "symbol_name": node.name,
+                    "symbol_type": "class",
+                })
+
+        return symbols
 
     @staticmethod
     def _parse_tool_result(result: Any) -> list[Any]:
