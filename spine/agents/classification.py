@@ -94,17 +94,28 @@ async def classify_task(description: str, config: dict | None = None) -> TaskCla
 
         content = response.content if hasattr(response, "content") else str(response)
 
-        # Extract JSON from response
-        json_match = None
         if isinstance(content, str):
-            import re
+            # Try direct JSON parse first (handles multi-line JSON with reasoning)
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # Fall back to regex extraction for models that wrap JSON in markdown
+                import re
 
-            json_match = re.search(r'\{\s*"category"\s*:.*"confidence"\s*:\s*[\d.]+', content)
-
-        if json_match:
-            result = json.loads(json_match.group(0))
+                match = re.search(
+                    r'\{\s*"category"\s*:.*?"confidence"\s*:\s*[\d.]+.*?\}',
+                    content,
+                    re.DOTALL,
+                )
+                if match:
+                    try:
+                        result = json.loads(match.group(0))
+                    except json.JSONDecodeError:
+                        raise ValueError(f"No valid JSON in response: {content[:200]}")
+                else:
+                    raise ValueError(f"No valid JSON in response: {content[:200]}")
         else:
-            raise ValueError("No valid JSON in response")
+            raise ValueError(f"Unexpected response type: {type(content)}")
 
         return TaskClassificationResult(
             category=result.get("category", "Generic"),  # type: ignore[arg-type]

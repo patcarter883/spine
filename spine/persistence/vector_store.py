@@ -194,7 +194,7 @@ class VectorStore:
                 m.symbol_type,
                 m.enriched_summary,
                 m.raw_code,
-                vec_cosine_similarity(v.embedding, ?) as similarity
+                1.0 - vec_distance_cosine(v.embedding, ?) as similarity
             FROM symbol_vectors v
             JOIN symbol_metadata m ON v.rowid = m.id
             {type_filter}

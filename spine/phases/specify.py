@@ -44,7 +44,7 @@ async def _early_commitment(
     description: str,
     workspace_root: str,
     config: RunnableConfig | None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], str]:
     """Perform early commitment: classify task and retrieve relevant code.
 
     Args:
@@ -53,11 +53,12 @@ async def _early_commitment(
         config: LangGraph runtime config.
 
     Returns:
-        Tuple of (task_category, retrieved_context).
+        Tuple of (task_category, retrieved_context, classification_reasoning).
     """
     # Step 1: Classify the task
     classification = await classify_task(description, config)
     task_category = classification.category
+    reasoning = classification.reasoning
 
     logger.info("Task classification: %s (confidence: %.2f)", task_category, classification.confidence)
 
@@ -70,7 +71,7 @@ async def _early_commitment(
 
     recall_result = await recall_tool._arun(
         query=description,
-        k=10,
+        k=config_obj.recall_k,
         task_category=task_category,
         max_tokens=50000,
     )
@@ -81,7 +82,7 @@ async def _early_commitment(
 
     logger.info("Retrieved %d chunks for SPECIFY context", len(retrieved_context))
 
-    return task_category, retrieved_context
+    return task_category, retrieved_context, reasoning
 
 
 async def call_specify(
@@ -125,8 +126,9 @@ async def call_specify(
         # Only run on first pass (retry == 0) to avoid re-retrieving
         task_category = None
         retrieved_context = []
+        classification_reasoning = ""
         if retry_count == 0:
-            task_category, retrieved_context = await _early_commitment(
+            task_category, retrieved_context, classification_reasoning = await _early_commitment(
                 description, workspace_root, config
             )
 
@@ -158,6 +160,7 @@ async def call_specify(
         prompt = (
             context_seed
             + rework_prefix
+            + f"## Task Classification\nCategory: {task_category}\n{classification_reasoning}\n\n"
             + f"Create a detailed specification for the following work:\n\n{description}"
             + recall_section
         )

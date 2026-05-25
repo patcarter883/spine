@@ -189,6 +189,8 @@ async def _agent_check_node(
 ) -> dict[str, Any]:
     """Run the agent critic check within the subgraph."""
     reviewed_phase = state.get("reviewed_phase", "unknown")
+    work_id = state.get("work_id", "unknown")
+    logger.info("[%s] Critic agent check starting for phase '%s'", work_id, reviewed_phase)
     # agent_critic_check expects a dict-like state
     pseudo_state = {
         "artifacts": state.get("artifacts", {}),
@@ -201,6 +203,10 @@ async def _agent_check_node(
         "max_retries": 3,
     }
     result = await agent_critic_check(pseudo_state, reviewed_phase, config)
+    logger.info(
+        "[%s] Critic agent check complete: status=%s",
+        work_id, result.get("status"),
+    )
     return {
         "agent_result": result,
         "phase_status": result["status"],

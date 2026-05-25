@@ -50,22 +50,42 @@ class ResearchManagerDecision(BaseModel):
 # ── Research manager prompt ──────────────────────────────────────────────
 
 _RESEARCH_MANAGER_SYSTEM = """\
-You are a research planning assistant. Your job is to decide what areas
-of a codebase still need investigation before writing a specification or plan.
+You are a research planning assistant. Your job is to map the codebase
+territory and assign precise, scoped research topics to subagents.
+
+## How to work
+
+1. Read the **Retrieved Symbol Summaries** section below. These are
+   LLM-generated summaries of functions/classes most relevant to the work
+   description, discovered by semantic vector search. They give you an
+   instant architectural map — file paths, symbol names, and what each
+   symbol does — without raw code.
+
+2. From these summaries, identify which specific symbols (functions,
+   classes, files) are implicated in the work. Use these to craft
+   precise topics.
+
+3. Each topic you assign must reference at least 1-2 specific symbol
+   names discovered in the summaries, so the subagent knows exactly
+   what to look up with MCP tools. Example:
+   "Investigate CLI verbosity setup — symbols: cli/__init__.py::index,
+   spine/config.py::SpineConfig"
 
 Given:
 1. The work description
-2. A list of research topics already explored
-3. The findings accumulated so far
+2. The retrieved symbol summaries (semantic search results)
+3. A list of research topics already explored
+4. The findings accumulated so far
 
 Decide:
-- Are we done? (decision: "done") — all key areas have been investigated
-- Or do we need more? (decision: "explore") — return the next 2-4 topics
+- Are we done? (decision: "done")
+- Or do we need more? (decision: "explore") — return 2-4 topics, each
+  referencing specific symbol names from the summaries
 
 Rules:
 - Never return more than 4 topics in a single round.
 - If you've already explored a topic, don't return it again.
-- Prefer targeted, specific topics over broad ones.
+- Each topic MUST name specific symbols for the subagent to look up.
 - If the work description is self-contained (no codebase needed), decide "done".
 - If findings already cover all key areas, decide "done".
 """
@@ -75,14 +95,12 @@ async def run_research_manager(
     state: dict[str, Any],
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the research manager — a single LLM call to decide next topics.
+    """Run the research manager — single LLM call to decide next topics.
 
-    The manager has NO tools — it receives the description and accumulated
-    findings as plain text and makes one decision: explore more areas or done.
-
-    When the phase is ``"plan"``, the specification content is read from
-    disk and included in the context so the manager bases its decisions on
-    spec requirements rather than just the work description.
+    On the first round, pre-runs a semantic recall (summaries only) to
+    give the manager an instant architectural map. This avoids raw code
+    bloat while still letting the manager identify precise symbol names
+    to include in research topics.
 
     Args:
         state: The ExplorationSubgraphState.
@@ -117,15 +135,58 @@ async def run_research_manager(
     model = resolve_model(config, session_id=work_id, phase="exploration/manager")
 
     # resolve_model may return a string spec or a pre-built BaseChatModel.
-    # Ensure we have a BaseChatModel instance for .ainvoke().
     if isinstance(model, str):
         from langchain.chat_models import init_chat_model
 
         model = init_chat_model(model)
 
+    # ── Recall: summaries-only, guided by task classification ────────
+    recall_section = ""
+    task_category = None
+    if round_num == 0 and description:
+        try:
+            from spine.agents.classification import classify_task
+            from spine.agents.tools.recall_tool import RecallTool
+            from spine.config import SpineConfig
+            import json as _json
+
+            # Classify the task to get a targeted category for vector filtering
+            classification = await classify_task(description, config)
+            task_category = classification.category
+            logger.info(
+                "[%s] Research manager: classified as %s (confidence=%.2f) "
+                "— reasoning: %s",
+                work_id, task_category, classification.confidence,
+                classification.reasoning[:200],
+            )
+
+            cfg = SpineConfig.load()
+            recall = RecallTool(db_path=cfg.checkpoint_path)
+            result_text = await recall._arun(
+                query=description,
+                k=cfg.recall_k,
+                task_category=task_category,
+                summaries_only=True,
+                max_tokens=25000,
+            )
+            recall_data = _json.loads(result_text)
+            results = recall_data.get("results", [])
+            if results:
+                recall_section = "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
+                recall_section += "These are the most relevant functions/classes "
+                "discovered by vector search. Use these to name specific symbols "
+                "in your research topics.\n\n"
+                for i, chunk in enumerate(results, 1):
+                    recall_section += (
+                        f"### {chunk.get('symbol_name', '?')} "
+                        f"({chunk.get('symbol_type', '?')} in {chunk.get('file_path', '?')})\n"
+                        f"{chunk.get('enriched_summary', '')[:400]}\n\n"
+                    )
+                logger.info("[%s] Research manager: recall returned %d summaries", work_id, len(results))
+        except Exception as exc:
+            logger.warning("[%s] Research manager: recall skipped — %s", work_id, exc)
+
     # ── Build the context for the manager ────────────────────────────
-    # For PLAN phase: include the specification so the manager can decide
-    # research areas based on spec requirements, not just the description.
     spec_section = ""
     if phase == "plan":
         spec_path = state.get("spec_path", "")
@@ -145,10 +206,12 @@ async def run_research_manager(
     context = (
         f"## Work Description\n{description}\n\n"
         f"{spec_section}"
+        f"{recall_section}"
         f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
         f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
         f"## Findings So Far\n{findings_summary}\n\n"
-        "Decide: are we done, or do we need more research?"
+        "Decide: are we done, or do we need more research? "
+        "If exploring, each topic MUST name specific symbols from the summaries above."
     )
 
     try:
@@ -178,7 +241,10 @@ async def run_research_manager(
             "[%s] Research manager: decision=%s topics=%s",
             work_id, parsed.decision, parsed.topics,
         )
-        return {"manager_decision": parsed.decision, "topics": parsed.topics}
+        result: dict[str, Any] = {"manager_decision": parsed.decision, "topics": parsed.topics}
+        if task_category:
+            result["task_category"] = task_category
+        return result
 
     except Exception as e:
         logger.warning(

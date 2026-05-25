@@ -93,6 +93,7 @@ class SpineConfig:
 
     # RAG (Retrieval-Augmented Generation) configuration
     embedding_provider: str = "openai-embeddings"
+    recall_k: int = 3
     vector_indexing: dict = field(
         default_factory=lambda: {
             "max_concurrent_chunks": 5,
@@ -270,6 +271,7 @@ class SpineConfig:
             )
             in ("1", "true", "yes"),
             embedding_provider=spine.get("embedding_provider", "openai-embeddings"),
+            recall_k=int(spine.get("recall_k", 3)),
             vector_indexing=spine.get(
                 "vector_indexing",
                 {

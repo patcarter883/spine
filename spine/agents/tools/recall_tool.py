@@ -24,13 +24,13 @@ class RecallInput(BaseModel):
     """Input schema for the RecallTool."""
 
     query: str = Field(
-        description="The search query (work description or specific question about the codebase)"
+        description="Natural language search query describing what you need to find"
     )
     k: int = Field(
-        default=10,
+        default=0,
         ge=1,
         le=50,
-        description="Maximum number of chunks to return (default 10, max 50)",
+        description="Maximum number of chunks to return (0 = use config default, max 50)",
     )
     task_category: Optional[str] = Field(
         default=None,
@@ -39,6 +39,11 @@ class RecallInput(BaseModel):
     max_tokens: Optional[int] = Field(
         default=50000,
         description="Maximum total tokens for retrieved code (default 50k to stay under 100k context window)",
+    )
+    summaries_only: bool = Field(
+        default=False,
+        description="If True, return only natural language summaries (no raw code). "
+        "Use this for high-level architectural discovery — much more token-efficient.",
     )
 
 
@@ -57,10 +62,12 @@ class RecallTool(BaseTool):
 
     name: str = "recall"
     description: str = (
-        "Retrieve relevant code chunks from the vector knowledge base. "
-        "Use this tool FIRST to understand existing codebase patterns before writing specifications. "
-        "Provide the work description as the query, optionally with a task_category for filtering. "
-        "Returns raw code from similar functions/classes in the codebase."
+        "Semantic search against the vector knowledge base. "
+        "Use natural language queries to find relevant functions, classes, "
+        "and their LLM-generated summaries. "
+        "Set summaries_only=True for high-level architectural discovery "
+        "(returns file paths + symbol names + summaries only — no raw code). "
+        "Set summaries_only=False when you need the actual source code inline."
     )
     args_schema: type[RecallInput] = RecallInput
 
@@ -70,22 +77,24 @@ class RecallTool(BaseTool):
     def _run(
         self,
         query: str,
-        k: int = 10,
+        k: int = 0,
         task_category: Optional[str] = None,
         max_tokens: Optional[int] = 50000,
+        summaries_only: bool = False,
     ) -> str:
         """Execute the recall tool synchronously."""
-        return self._recall_sync(query, k, task_category, max_tokens)
+        return self._recall_sync(query, k, task_category, max_tokens, summaries_only)
 
     async def _arun(
         self,
         query: str,
-        k: int = 10,
+        k: int = 0,
         task_category: Optional[str] = None,
         max_tokens: Optional[int] = 50000,
+        summaries_only: bool = False,
     ) -> str:
         """Execute the recall tool asynchronously."""
-        return await self._recall_async(query, k, task_category, max_tokens)
+        return await self._recall_async(query, k, task_category, max_tokens, summaries_only)
 
     def _recall_sync(
         self,
@@ -93,6 +102,7 @@ class RecallTool(BaseTool):
         k: int,
         task_category: Optional[str],
         max_tokens: Optional[int],
+        summaries_only: bool = False,
     ) -> str:
         """Synchronous recall - wraps async implementation."""
         import asyncio
@@ -107,11 +117,11 @@ class RecallTool(BaseTool):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
-                    asyncio.run, self._recall_async(query, k, task_category, max_tokens)
+                    asyncio.run, self._recall_async(query, k, task_category, max_tokens, summaries_only)
                 )
                 return future.result(timeout=60)
         else:
-            return asyncio.run(self._recall_async(query, k, task_category, max_tokens))
+            return asyncio.run(self._recall_async(query, k, task_category, max_tokens, summaries_only))
 
     async def _recall_async(
         self,
@@ -119,9 +129,15 @@ class RecallTool(BaseTool):
         k: int,
         task_category: Optional[str],
         max_tokens: Optional[int],
+        summaries_only: bool = False,
     ) -> str:
         """Async recall implementation."""
         from spine.agents.helpers import resolve_model
+        from spine.config import SpineConfig
+
+        # Resolve k — 0 means "use config default"
+        if k == 0:
+            k = SpineConfig.load().recall_k
 
         # Get embedding for query
         embedding = await self._embed_query(query)
@@ -131,7 +147,6 @@ class RecallTool(BaseTool):
         if task_category:
             from spine.agents.classification import TaskCategory
 
-            # Cast string to TaskCategory type for the filter function
             cat: TaskCategory = task_category  # type: ignore[assignment]
             symbol_types = get_symbol_type_filter(cat)
 
@@ -144,12 +159,18 @@ class RecallTool(BaseTool):
         # Apply token budget
         results = self._apply_token_budget(results, max_tokens)
 
+        # Strip raw_code when summaries_only
+        if summaries_only:
+            for r in results:
+                r.pop("raw_code", None)
+
         return json.dumps(
             {
                 "query": query,
                 "category_filter": task_category,
                 "chunks_found": len(results),
-                "total_tokens": sum(self._estimate_tokens(r["raw_code"]) for r in results),
+                "total_tokens": sum(self._estimate_tokens(r.get("raw_code", "")) for r in results),
+                "summaries_only": summaries_only,
                 "results": results,
             },
             indent=2,

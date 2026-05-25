@@ -143,6 +143,10 @@ async def agent_critic_check(
         from spine.agents.artifacts import materialize_artifacts, build_inline_artifact_prompt
 
         critic_agent = critic_def.build_agent_fn(state, config)
+        logger.info(
+            "[%s] Critic agent built — invoking LLM review for phase '%s'",
+            state.get("work_id", "?"), reviewed_phase,
+        )
 
         # Materialize artifacts to disk so the critic can read them
         workspace_root = state.get("workspace_root", ".")
@@ -184,7 +188,12 @@ async def agent_critic_check(
         )
 
         # Parse the agent's response for the review status
-        return _parse_agent_review(result, reviewed_phase)
+        parsed = _parse_agent_review(result, reviewed_phase)
+        logger.info(
+            "[%s] Critic agent review complete: status=%s reason=%s",
+            state.get("work_id", "?"), parsed.get("status"), parsed.get("reason", "")[:120],
+        )
+        return parsed
 
     except Exception as e:
         logger.error(f"Critic agent failed: {e}", exc_info=True)

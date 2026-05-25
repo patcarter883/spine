@@ -36,7 +36,6 @@ dependencies = [
     "langchain-mcp-adapters>=0.2.2",
     "langgraph-cli>=0.4.26",
     "sqlite-vec>=0.1.0",
-    "sentence-transformers>=3.0.0",
 ]
 
 [project.scripts]

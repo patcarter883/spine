@@ -32,6 +32,9 @@ class SpecifySubgraphState(BaseSubgraphState, total=False):
     """SPECIFY phase — produces specification.md + specification.json."""
 
     specification_json: str  # Raw specification.json content (for downstream phases)
+    agent_response: str  # Agent's text response (captured for artifact fallback)
+    task_category: str | None  # Classified task category from early commitment
+    retrieved_context: list[dict]  # Retrieved code chunks from vector store
 
 
 class PlanSubgraphState(BaseSubgraphState, total=False):
@@ -121,6 +124,9 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     topics: Annotated[list[str], _op_add]  # Areas being explored this round
     findings: Annotated[list[dict], _op_add]  # ResearchFindings dicts from explore nodes
     scratchpad: Annotated[str, _op_add]  # Working memory accumulator for GC
+
+    # Classification from early commitment (for SPECIFY scope constraint)
+    task_category: str | None
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer

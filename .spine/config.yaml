@@ -4,6 +4,7 @@ spine:
   guided_decoding: true
   # RAG configuration
   embedding_provider: local-embeddings
+  recall_k: 3
   vector_indexing:
     max_concurrent_chunks: 5
     batch_size: 10
@@ -78,23 +79,23 @@ providers:
     model: Qwen3-Embedding-8B-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
-phases:
-  specify:
-    provider: deepseek-v4-flash
-  plan:
-    provider: local
-  critic:
-    provider: deepseek-v4-pro
-  exploration:
-    provider: local
-  implement:
-    provider: local
-  implement/subagents/slice-implementer:
-    provider: local
-  verify:
-    provider: deepseek-v4-pro
-  gap_plan:
-    provider: local
-  # RAG phase providers
-  classification:
-    provider: tiny
+  phases:
+    specify:
+      provider: deepseek-v4-flash
+    plan:
+      provider: local
+    critic:
+      provider: deepseek-v4-pro
+    exploration:
+      provider: local
+    implement:
+      provider: local
+    implement/subagents/slice-implementer:
+      provider: local
+    verify:
+      provider: deepseek-v4-pro
+    gap_plan:
+      provider: local
+    # RAG phase providers
+    classification:
+      provider: tiny

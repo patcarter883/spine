@@ -1,7 +1,8 @@
 """SPECIFY phase as a LangGraph subgraph.
 
 The subgraph has two internal nodes:
-1. ``run_agent`` — builds and invokes the specify Deep Agent.
+1. ``run_agent`` — builds and invokes the specify Deep Agent with early
+   commitment (task classification + vector recall).
 2. ``save_artifacts`` — scans disk for artifacts.
 """
 
@@ -19,16 +20,62 @@ from spine.agents.specify_agent import build_specify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
-from spine.exceptions import CriticalContractFailure
+from spine.agents.classification import classify_task
+from spine.agents.tools.recall_tool import RecallTool
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
     artifact_path,
 )
+from spine.config import SpineConfig
+from spine.exceptions import CriticalContractFailure
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+
+async def _early_commitment(
+    description: str,
+    workspace_root: str,
+    config: RunnableConfig | None,
+) -> tuple[str, list[dict], str]:
+    """Classify task and retrieve relevant code chunks from vector store."""
+    classification = await classify_task(description, config)
+    task_category = classification.category
+    reasoning = classification.reasoning
+    logger.info(
+        "Task classification: %s (confidence: %.2f)", task_category, classification.confidence
+    )
+
+    config_obj = SpineConfig.load()
+    recall = RecallTool(
+        db_path=config_obj.checkpoint_path,
+        embedding_provider=config_obj.embedding_model,
+    )
+
+    import json as _json
+
+    recall_result = await recall._arun(
+        query=description,
+        k=config_obj.recall_k,
+        task_category=task_category,
+        max_tokens=50000,
+    )
+    result_data = _json.loads(recall_result)
+    retrieved = result_data.get("results", [])
+    logger.info("Retrieved %d chunks for SPECIFY context", len(retrieved))
+    return task_category, retrieved, reasoning
+
+
+def _classify_section(task_category: str | None, reasoning: str) -> str:
+    """Build the classification guidance section for the specify prompt."""
+    if not task_category:
+        return ""
+    parts = [f"## Task Classification\nCategory: {task_category}"]
+    if reasoning:
+        parts.append(reasoning)
+    return "\n".join(parts) + "\n\n"
 
 
 async def _run_specify_agent(
@@ -44,16 +91,71 @@ async def _run_specify_agent(
     logger.info(f"[{work_id}] SPECIFY subgraph: run_agent starting")
 
     try:
-        agent = build_specify_agent(dict(state), config)
+        # ── Early commitment: classify + recall ──
+        # Reuse task_category from exploration subgraph if available,
+        # otherwise classify fresh.
+        task_category: str | None = state.get("task_category")
+        classification_reasoning = ""
+        retrieved_context: list[dict] = []
+        try:
+            if task_category:
+                logger.info("[%s] Using pre-classified task category: %s", work_id, task_category)
+            else:
+                _cat, _ctx, _reasoning = await _early_commitment(description, workspace_root, config)
+                task_category = _cat
+                retrieved_context = _ctx
+                classification_reasoning = _reasoning
+            if not retrieved_context:
+                # Run recall even when category was pre-existing
+                config_obj = SpineConfig.load()
+                recall = RecallTool(db_path=config_obj.checkpoint_path)
+                result_text = await recall._arun(
+                    query=description,
+                    k=config_obj.recall_k,
+                    task_category=task_category,
+                    max_tokens=50000,
+                )
+                import json as _json
+                result_data = _json.loads(result_text)
+                retrieved_context = result_data.get("results", [])
+                logger.info(
+                    "[%s] SPECIFY recall: %d chunks (category=%s)",
+                    work_id, len(retrieved_context), task_category,
+                )
+        except Exception as exc:
+            logger.warning("[%s] Early commitment skipped: %s", work_id, exc)
+
+        # Build recall section for prompt
+        recall_section = ""
+        if retrieved_context:
+            recall_section = "\n## Retrieved Codebase Context\n\n"
+            for i, chunk in enumerate(retrieved_context[:5], 1):
+                recall_section += (
+                    f"### Chunk {i}: {chunk.get('symbol_name', 'unknown')} "
+                    f"({chunk.get('file_path', 'unknown')})\n\n"
+                    f"```\n{chunk.get('raw_code', '')[:1000]}\n```\n\n"
+                )
+
+        agent = build_specify_agent(
+            dict(state),
+            config,
+            extra_tools=[
+                RecallTool(db_path=SpineConfig.load().checkpoint_path),
+            ],
+        )
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
+        spec_dir = artifact_path(work_id, PhaseName.SPECIFY.value)
+        context_seed = (
+            f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', "
+            f"spec_dir: '{spec_dir}'}};\n\n"
+        )
+
         prompt = (
-            "Write a formal specification for the work described below.\n\n"
-            f"## Work Description\n{description}\n\n"
-            f"Write the specification to `{artifact_path(work_id, PhaseName.SPECIFY.value)}/specification.md` "
-            "using `write_file`. "
-            "The spec must include: scope, requirements, constraints, "
-            "and acceptance criteria."
+            context_seed
+            + _classify_section(task_category, classification_reasoning)
+            + f"Create a detailed specification for the following work:\n\n{description}"
+            + recall_section
         )
 
         ctx = build_context(dict(state), PhaseName.SPECIFY)
@@ -70,6 +172,8 @@ async def _run_specify_agent(
         return {
             "messages": result.get("messages", []),
             "agent_response": extract_response(result),
+            "task_category": task_category,
+            "retrieved_context": retrieved_context,
         }
 
     except Exception as e:

@@ -136,6 +136,7 @@ def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
         "phase": PhaseName.SPECIFY.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0),
         "scratchpad": parent_state.get("scratchpad", ""),
+        "task_category": parent_state.get("task_category"),
     }
 
 
@@ -285,6 +286,11 @@ def _specify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -
         base["needs_review_phase"] = PhaseName.SPECIFY.value
     elif phase_status == "error":
         base["status"] = "failed"
+    # Forward early commitment results to parent state
+    if subgraph_result.get("task_category"):
+        base["task_category"] = subgraph_result["task_category"]
+    if subgraph_result.get("retrieved_context"):
+        base["retrieved_context"] = subgraph_result["retrieved_context"]
     # Set completion invariants
     base["spec_completed"] = phase_status == "success"
     return base
