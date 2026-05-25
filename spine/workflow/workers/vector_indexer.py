@@ -95,7 +95,10 @@ class VectorIndexer:
                 logger.warning("mcp_codebase-index_list_files tool not available")
                 return []
 
-            files_result = await list_files_tool.ainvoke({"pattern": "*.py"})
+            files_result = await list_files_tool.ainvoke({
+                "pattern": "*.py",
+                "root": workspace_root,
+            })
             py_files = self._parse_tool_result(files_result)
 
             if not py_files:
