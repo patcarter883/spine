@@ -79,6 +79,32 @@ def run(description: str, work_type: str, config_path: str, debug_llm: bool) -> 
     )
 
 
+@main.command()
+@click.option("--workspace", "workspace_root", default=None, help="Workspace root to index (default: from config).")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def index(workspace_root: str | None, config_path: str) -> None:
+    """Index the workspace into the vector store for RAG.
+
+    This discovers symbols via MCP, summarizes them with LLM, and stores
+    embeddings for semantic search in the SPECIFY phase.
+    """
+    config = SpineConfig.load(path=config_path)
+    console.print("[bold blue]Indexing workspace for RAG...[/bold blue]")
+
+    from spine.workflow.workers.vector_indexer import run_indexing_job
+
+    result = asyncio.run(run_indexing_job(workspace_root))
+
+    console.print(
+        Panel(
+            f"Processed: {result.get('total_processed', 0)}\n"
+            f"Succeeded: {result.get('success', 0)}\n"
+            f"Errors: {result.get('errors', 0)}",
+            title="Indexing Result",
+        )
+    )
+
+
 @main.command(name="status")
 @click.argument("work_id")
 @click.option(
