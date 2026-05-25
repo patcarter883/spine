@@ -125,3 +125,7 @@ class WorkflowState(TypedDict, total=False):
     gaps_identified: int  # Number of gaps found by GAP_PLAN
     work_units_count: int  # Number of work units from TASKS phase
     feature_slices_count: int  # Number of feature slices from PLAN phase
+
+    # RAG retrieved context (for SPECIFY phase early commitment)
+    task_category: str | None  # Classified task category for vector filtering
+    retrieved_context: list[dict]  # Retrieved code chunks from vector store

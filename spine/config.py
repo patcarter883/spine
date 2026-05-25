@@ -91,6 +91,15 @@ class SpineConfig:
     mcp_servers: dict = field(default_factory=dict)
     guided_decoding: bool = False
 
+    # Vector store configuration
+    embedding_model: str = "openai:text-embedding-3-large"
+    vector_indexing: dict = field(
+        default_factory=lambda: {
+            "max_concurrent_chunks": 5,
+            "batch_size": 100,
+        }
+    )
+
     @staticmethod
     def _find_workspace_root() -> str:
         """Auto-detect workspace root by searching upward for ``.spine/``.
@@ -260,6 +269,14 @@ class SpineConfig:
                 str(spine.get("guided_decoding", False)).lower(),
             )
             in ("1", "true", "yes"),
+            embedding_model=spine.get("embedding_model", "openai:text-embedding-3-large"),
+            vector_indexing=spine.get(
+                "vector_indexing",
+                {
+                    "max_concurrent_chunks": 5,
+                    "batch_size": 100,
+                },
+            ),
         )
 
     def resolve_model(self, phase: str | None = None) -> str:

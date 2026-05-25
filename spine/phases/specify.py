@@ -27,14 +27,61 @@ from spine.agents.specify_agent import build_specify_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
+from spine.agents.classification import classify_task
+from spine.agents.tools.recall_tool import RecallTool
 from spine.agents.artifacts import (
     artifact_path,
     materialize_artifacts,
     materialize_phase_artifacts,
 )
 from spine.workflow.registry import get_registry
+from spine.config import SpineConfig
 
 logger = logging.getLogger(__name__)
+
+
+async def _early_commitment(
+    description: str,
+    workspace_root: str,
+    config: RunnableConfig | None,
+) -> tuple[str, list[dict]]:
+    """Perform early commitment: classify task and retrieve relevant code.
+
+    Args:
+        description: The work description.
+        workspace_root: The workspace root path.
+        config: LangGraph runtime config.
+
+    Returns:
+        Tuple of (task_category, retrieved_context).
+    """
+    # Step 1: Classify the task
+    classification = await classify_task(description, config)
+    task_category = classification.category
+
+    logger.info("Task classification: %s (confidence: %.2f)", task_category, classification.confidence)
+
+    # Step 2: Retrieve relevant code using RecallTool
+    config_obj = SpineConfig.load()
+    recall_tool = RecallTool(
+        db_path=config_obj.checkpoint_path,
+        embedding_provider=config_obj.embedding_model,
+    )
+
+    recall_result = await recall_tool._arun(
+        query=description,
+        k=10,
+        task_category=task_category,
+        max_tokens=50000,
+    )
+
+    import json
+    result_data = json.loads(recall_result)
+    retrieved_context = result_data.get("results", [])
+
+    logger.info("Retrieved %d chunks for SPECIFY context", len(retrieved_context))
+
+    return task_category, retrieved_context
 
 
 async def call_specify(
@@ -45,6 +92,10 @@ async def call_specify(
     Delegates to the specify Deep Agent, which generates a specification
     document from the work description. If the phase is being reworked
     (retry > 0), includes prior critic feedback in the prompt.
+
+    Performs early commitment before agent invocation:
+    1. Classify the task type for targeted vector search
+    2. Retrieve relevant code chunks via RecallTool
 
     Args:
         state: The current workflow state.
@@ -70,7 +121,20 @@ async def call_specify(
     logger.info(f"[{work_id}] SPECIFY phase starting (retry={retry_count})")
 
     try:
-        agent = build_specify_agent(state, config)
+        # ── EARLY COMMITMENT: Classify and Recall ──
+        # Only run on first pass (retry == 0) to avoid re-retrieving
+        task_category = None
+        retrieved_context = []
+        if retry_count == 0:
+            task_category, retrieved_context = await _early_commitment(
+                description, workspace_root, config
+            )
+
+        agent = build_specify_agent(state, config, extra_tools=[
+            RecallTool(
+                db_path=SpineConfig.load().checkpoint_path,
+            )
+        ])
 
         # Materialize prior artifacts to disk so the agent can read them
         materialize_artifacts(state, workspace_root, work_id=work_id)
@@ -78,6 +142,14 @@ async def call_specify(
         # Build the prompt — prior artifacts are on disk, not inlined
         spec_dir = artifact_path(work_id, "specify")
         context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', spec_dir: '{spec_dir}'}};\n\n"
+
+        # Include retrieved context for first pass
+        recall_section = ""
+        if retrieved_context:
+            recall_section = "\n## Retrieved Codebase Context\n\n"
+            for i, chunk in enumerate(retrieved_context[:5], 1):
+                recall_section += f"### Chunk {i}: {chunk.get('symbol_name', 'unknown')} ({chunk.get('file_path', 'unknown')})\n\n"
+                recall_section += f"```\n{chunk.get('raw_code', '')[:1000]}\n```\n\n"
 
         rework_prefix = ""
         if retry_count > 0:
@@ -87,6 +159,7 @@ async def call_specify(
             context_seed
             + rework_prefix
             + f"Create a detailed specification for the following work:\n\n{description}"
+            + recall_section
         )
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
@@ -122,6 +195,8 @@ async def call_specify(
             "current_phase": PhaseName.SPECIFY.value,
             "status": "running",
             "prompt_request": None,
+            "task_category": task_category,
+            "retrieved_context": retrieved_context,
         }
 
     except Exception as e:
@@ -134,6 +209,8 @@ async def call_specify(
                 "message": f"SPECIFY phase failed: {e}",
                 "phase": PhaseName.SPECIFY.value,
             },
+            "task_category": None,
+            "retrieved_context": [],
         }
 
 
