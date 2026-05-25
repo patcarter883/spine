@@ -70,7 +70,11 @@ class VectorIndexer:
         }
 
     async def _discover_symbols(self, workspace_root: str) -> list[dict[str, Any]]:
-        """Discover symbols using mcp-codebase-index tools."""
+        """Discover symbols via mcp-codebase-index MCP tools.
+
+        Uses list_files to find Python files, then get_functions/get_classes
+        per file to enumerate symbols for indexing.
+        """
         from spine.mcp.client import get_mcp_tools
 
         try:
@@ -80,43 +84,111 @@ class VectorIndexer:
                 workspace_root=workspace_root,
             )
 
-            symbols = []
+            # Build a lookup by name for fast access
+            tool_by_name: dict[str, Any] = {}
+            for t in mcp_tools:
+                tool_by_name[t.name] = t
 
-            # Get functions
-            for tool in mcp_tools:
-                if "function" in tool.name.lower():
-                    result = await tool.ainvoke({})
-                    if isinstance(result, list):
-                        for item in result:
-                            if isinstance(item, dict) and "path" in item:
-                                symbols.append(
-                                    {
-                                        "file_path": item["path"],
-                                        "symbol_name": item.get("name", ""),
-                                        "symbol_type": "function",
-                                    }
-                                )
+            # Step 1: List all Python files
+            list_files_tool = tool_by_name.get("mcp_codebase-index_list_files")
+            if not list_files_tool:
+                logger.warning("mcp_codebase-index_list_files tool not available")
+                return []
 
-            # Get classes
-            for tool in mcp_tools:
-                if "class" in tool.name.lower():
-                    result = await tool.ainvoke({})
-                    if isinstance(result, list):
-                        for item in result:
-                            if isinstance(item, dict) and "path" in item:
-                                symbols.append(
-                                    {
-                                        "file_path": item["path"],
-                                        "symbol_name": item.get("name", ""),
-                                        "symbol_type": "class",
-                                    }
-                                )
+            files_result = await list_files_tool.ainvoke({"pattern": "*.py"})
+            py_files = self._parse_tool_result(files_result)
 
+            if not py_files:
+                logger.warning("No Python files found for indexing")
+                return []
+
+            logger.info("Found %d Python files to index", len(py_files))
+
+            # Step 2: Get functions and classes from each file
+            get_functions = tool_by_name.get("mcp_codebase-index_get_functions")
+            get_classes = tool_by_name.get("mcp_codebase-index_get_classes")
+
+            symbols: list[dict[str, Any]] = []
+            files_processed = 0
+
+            # Limit to internal packages (spine/, tests/)
+            target_files = [
+                f for f in py_files
+                if isinstance(f, str) and (
+                    f.startswith("spine/") or f.startswith("tests/")
+                )
+            ]
+            if not target_files:
+                target_files = [f for f in py_files if isinstance(f, str)]
+
+            for file_path in target_files[:200]:  # Cap to prevent overloading
+                if not isinstance(file_path, str):
+                    continue
+                files_processed += 1
+
+                if get_functions:
+                    try:
+                        funcs = await get_functions.ainvoke(
+                            {"file_path": file_path}
+                        )
+                        for entry in self._parse_tool_result(funcs):
+                            if isinstance(entry, dict) and "name" in entry:
+                                symbols.append({
+                                    "file_path": file_path,
+                                    "symbol_name": entry["name"],
+                                    "symbol_type": "function",
+                                })
+                    except Exception as e:
+                        logger.debug("Failed to get functions for %s: %s", file_path, e)
+
+                if get_classes:
+                    try:
+                        classes = await get_classes.ainvoke(
+                            {"file_path": file_path}
+                        )
+                        for entry in self._parse_tool_result(classes):
+                            if isinstance(entry, dict) and "name" in entry:
+                                symbols.append({
+                                    "file_path": file_path,
+                                    "symbol_name": entry["name"],
+                                    "symbol_type": "class",
+                                })
+                    except Exception as e:
+                        logger.debug("Failed to get classes for %s: %s", file_path, e)
+
+            logger.info(
+                "Discovered %d symbols in %d files",
+                len(symbols),
+                files_processed,
+            )
             return symbols
 
         except Exception as e:
-            logger.error("MCP discovery failed: %s", e)
+            logger.error("MCP discovery failed: %s", e, exc_info=True)
             return []
+
+    @staticmethod
+    def _parse_tool_result(result: Any) -> list[Any]:
+        """Normalize tool results to a list of entries."""
+        import json
+
+        if isinstance(result, list):
+            return result
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, list):
+                    return parsed
+                return [parsed]
+            except (json.JSONDecodeError, TypeError):
+                return []
+        if isinstance(result, dict):
+            # Some tools return {"items": [...]} or {"results": [...]}
+            for key in ("items", "results", "symbols", "functions", "classes"):
+                if key in result:
+                    return result[key]
+            return [result]
+        return []
 
     async def _process_symbol(
         self,
@@ -190,15 +262,44 @@ class VectorIndexer:
         symbol_name: str,
         workspace_root: str,
     ) -> str:
-        """Fetch raw code for a symbol."""
-        import os
+        """Fetch source code for a symbol via MCP tools."""
+        from spine.mcp.client import get_mcp_tools
 
-        full_path = os.path.join(workspace_root, file_path)
         try:
+            mcp_tools = get_mcp_tools(
+                self.config.mcp_servers,
+                cache_key="indexing",
+                workspace_root=workspace_root,
+            )
+
+            tool_by_name = {t.name: t for t in mcp_tools}
+
+            for tool_name in (
+                "mcp_codebase-index_get_function_source",
+                "mcp_codebase-index_get_class_source",
+            ):
+                tool = tool_by_name.get(tool_name)
+                if not tool:
+                    continue
+                try:
+                    result = await tool.ainvoke({
+                        "name": symbol_name,
+                        "file_path": file_path,
+                    })
+                    if isinstance(result, str) and result.strip():
+                        return result
+                except Exception:
+                    continue
+
+            # Fallback: fetch whole file from disk
+            import os
+
+            full_path = os.path.join(workspace_root, file_path)
             with open(full_path, encoding="utf-8") as f:
                 return f.read()
+
         except OSError as e:
-            logger.warning("Could not read file %s: %s", full_path, e)
+            logger.warning("Could not read %s:%s — %s", file_path, symbol_name, e)
             return ""
 
     async def _summarize_code(self, raw_code: str, symbol_name: str) -> str:
