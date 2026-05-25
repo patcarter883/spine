@@ -22,7 +22,6 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
-from spine.agents.garbage_collector import commit_findings_and_clear_search
 
 logger = logging.getLogger(__name__)
 
@@ -315,10 +314,15 @@ async def run_explore_node(
 
         # Build a minimal agent for this subagent — no filesystem middleware,
         # the tools are injected directly as extra_tools from the subagent spec.
-        # Add the GC tool to the researcher's toolbar so it can save findings
-        # and clear context when the window gets full.
+        # NOTE: commit_findings_and_clear_search is intentionally NOT injected
+        # here. The researcher's message loop is local to this one ainvoke and
+        # is discarded when the explore node returns; the eviction node at the
+        # subgraph level operates on the parent state, not the researcher's
+        # internal messages. Giving the tool to the researcher only causes its
+        # EVICTION_ANCHOR message to fool the model into believing its tool
+        # results are gone — after which the structured response collapses to
+        # an empty patterns/file_map/dependencies on most models.
         extra_tools = list(subagent_spec.get("tools", []))
-        extra_tools.append(commit_findings_and_clear_search)
         agent = build_phase_agent(
             state=state,  # type: ignore[arg-type]
             config=config,

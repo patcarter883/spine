@@ -1,46 +1,58 @@
 spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
+  guided_decoding: true
 mcp_servers:
   codebase-index:
     transport: stdio
     command: mcp-codebase-index
     args: []
     env:
-      PROJECT_ROOT: /home/pat/Projects/spine
+      PROJECT_ROOT: /home/pat/projects/spine
 providers:
   llm:
   - name: glm
     type: deepagents-model
     model: openrouter:z-ai/glm-5.1
     enabled: true
+    guided_decoding: true
   - name: owl-alpha
     type: deepagents-model
     model: openrouter:openrouter/owl-alpha
     enabled: true
+    guided_decoding: true
   - name: deepseek-v4-flash
     type: deepagents-model
     model: openrouter:deepseek/deepseek-v4-flash
     enabled: true
+    guided_decoding: true
   - name: deepseek-v4-pro
     type: deepagents-model
     model: openrouter:deepseek/deepseek-v4-pro
     enabled: true
+    guided_decoding: true
+
   - name: laguna-m1
     type: deepagents-model
     model: openrouter:poolside/laguna-m.1:free
     enabled: true
+    guided_decoding: true
+
   - name: laguna-xs2
     type: deepagents-model
     model: openrouter:poolside/laguna-xs.2:free
     enabled: true
+    guided_decoding: true
+
   - name: gemini-3.5-flash
     type: deepagents-model
     model: openrouter:google/gemini-3.5-flash
     enabled: true
+    guided_decoding: true
+
   - name: local
     type: deepagents-model
-    model: openai:model
+    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
     guided_decoding: true
@@ -54,19 +66,18 @@ providers:
     enabled: true
   phases:
     specify:
-      provider: laguna-m1
+      provider: deepseek-v4-flash
     plan:
-      provider: laguna-m1
+      provider: deepseek-v4-flash
     critic:
-      provider: local
+      provider: deepseek-v4-pro
     exploration:
-      provider: local
+      provider: deepseek-v4-pro
     implement:
-      provider: local
+      provider: deepseek-v4-flash
     implement/subagents/slice-implementer:
-      provider: local
-      guided_decoding: true
+      provider: deepseek-v4-flash
     verify:
-      provider: local
+      provider: deepseek-v4-pro
     gap_plan:
-      provider: local
+      provider: deepseek-v4-flash
