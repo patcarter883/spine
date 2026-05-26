@@ -165,7 +165,178 @@ async def _research_manager_node(
     }
 
 
-# ── Router: research_manager → explore (Send) or synthesize ─────────────
+# ── Node: topic_lookup ──────────────────────────────────────────────────
+
+
+def _new_topics(state: ExplorationSubgraphState) -> list[str]:
+    """Return the topics not yet represented in ``findings`` (round-stable)."""
+    topics: list[str] = state.get("topics", [])
+    findings: list[dict] = state.get("findings", [])
+    explored: set[str] = {
+        f.get("topic", "") for f in findings if isinstance(f, dict) and f.get("topic")
+    }
+    return [t for t in topics if t not in explored]
+
+
+def _enrich_topic(topic: str, hits: list[dict]) -> str:
+    """Append the recalled symbol references to a topic string.
+
+    The explore subagent gets this enriched string as its research target,
+    which gives it concrete symbols (and file paths) to anchor MCP lookups
+    against — much better than a bare natural-language topic.
+    """
+    if not hits:
+        return topic
+    refs = ", ".join(
+        f"{h.get('symbol_name', '?')} ({h.get('file_path', '?')})"
+        for h in hits
+    )
+    return f"{topic} — recall symbols: {refs}"
+
+
+async def _topic_lookup_node(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """For each NEW topic, recall the top-K symbols above the configured
+    similarity threshold and stash them under ``topic_recall_hits``.
+
+    Runs between ``research_manager`` and ``_research_router``. Short-
+    circuits to an empty hits dict when:
+      - the manager decided ``"done"``,
+      - or every topic from the manager has already been explored.
+
+    Both ``topic_lookup_top_k`` and ``topic_lookup_min_similarity`` come
+    from :class:`spine.config.SpineConfig`. Recall failures for a single
+    topic do not abort the round — the topic is simply sent on without
+    annotations.
+    """
+    from spine.agents.tools.recall_tool import RecallTool
+    from spine.config import SpineConfig
+
+    work_id = state.get("work_id", "unknown")
+    decision = state.get("manager_decision")
+    topics_in_state: list[str] = state.get("topics", [])
+    findings_count = len(state.get("findings", []) or [])
+
+    # NOTE: deliberately using logger.warning for the topic_lookup lifecycle
+    # lines. The CLI never calls logging.basicConfig() (see work-item
+    # 131f2f1e.md — pending), so the root logger sits at WARNING and any
+    # INFO call is dropped silently. WARNING is the only level guaranteed
+    # to reach stderr today. Drop back to INFO once configure_logging()
+    # lands.
+    logger.warning(
+        "[%s] topic_lookup: ENTER decision=%s state_topics=%d findings=%d",
+        work_id, decision, len(topics_in_state), findings_count,
+    )
+
+    if decision != "explore":
+        logger.warning(
+            "[%s] topic_lookup: SKIP — manager_decision=%r (not 'explore')",
+            work_id, decision,
+        )
+        return {"topic_recall_hits": {}}
+
+    new_topics = _new_topics(state)
+    if not new_topics:
+        logger.warning(
+            "[%s] topic_lookup: SKIP — every topic %s already in findings",
+            work_id, topics_in_state,
+        )
+        return {"topic_recall_hits": {}}
+
+    cfg = SpineConfig.load()
+    top_k = max(1, int(cfg.topic_lookup_top_k))
+    min_sim = float(cfg.topic_lookup_min_similarity)
+    # Request more than top_k so we still have ≥top_k after threshold filtering.
+    request_k = max(top_k * 3, cfg.recall_k)
+
+    recall = RecallTool(
+        db_path=cfg.checkpoint_path,
+        embedding_provider=cfg.embedding_provider,
+    )
+    # NOTE: deliberately NOT passing task_category. CATEGORY_TO_SYMBOL_TYPES
+    # in spine/agents/classification.py maps every non-Generic category to
+    # symbol_types like "endpoint", "component", "middleware" — but the
+    # indexer only writes "function" and "class". Filtering by category
+    # eliminates 100% of rows and gives 0 results for every topic.
+    # Semantic similarity is already the right discriminator here.
+    hits_map: dict[str, list[dict]] = {}
+
+    logger.warning(
+        "[%s] topic_lookup: searching %d topic(s) — request_k=%d min_sim=%.2f top_k=%d "
+        "db=%s",
+        work_id, len(new_topics), request_k, min_sim, top_k, cfg.checkpoint_path,
+    )
+
+    for topic in new_topics:
+        try:
+            raw = await recall._arun(
+                query=topic,
+                k=request_k,
+                task_category=None,
+                max_tokens=cfg.specify_context_token_budget,
+                summaries_only=True,
+            )
+            results = json.loads(raw).get("results", []) or []
+        except Exception as exc:
+            logger.warning(
+                "[%s] topic_lookup: recall FAILED for topic=%r — %s",
+                work_id, topic, exc,
+            )
+            hits_map[topic] = []
+            continue
+
+        sims = [float(r.get("similarity", 0.0)) for r in results if isinstance(r, dict)]
+        if not results:
+            logger.warning(
+                "[%s] topic_lookup: topic=%r — recall returned 0 results "
+                "(vector store empty or no matches at all)",
+                work_id, topic,
+            )
+            hits_map[topic] = []
+            continue
+
+        filtered = [
+            r for r in results
+            if isinstance(r, dict) and float(r.get("similarity", 0.0)) >= min_sim
+        ]
+        filtered.sort(
+            key=lambda r: float(r.get("similarity", 0.0)),
+            reverse=True,
+        )
+        kept = filtered[:top_k]
+        hits_map[topic] = kept
+
+        if not filtered:
+            logger.warning(
+                "[%s] topic_lookup: topic=%r — %d raw hits, similarities=%s, "
+                "ALL below threshold %.2f (max=%.3f)",
+                work_id, topic, len(results),
+                [f"{s:.3f}" for s in sims], min_sim, max(sims) if sims else 0.0,
+            )
+        else:
+            logger.warning(
+                "[%s] topic_lookup: topic=%r — %d raw hits, %d ≥%.2f, "
+                "keeping top-%d: %s",
+                work_id, topic, len(results), len(filtered), min_sim, len(kept),
+                [
+                    f"{h.get('symbol_name', '?')}({h.get('file_path', '?')})"
+                    f"@{float(h.get('similarity', 0.0)):.3f}"
+                    for h in kept
+                ],
+            )
+
+    total_kept = sum(len(v) for v in hits_map.values())
+    logger.warning(
+        "[%s] topic_lookup: EXIT — %d topic(s) processed, %d total hit(s) attached",
+        work_id, len(hits_map), total_kept,
+    )
+
+    return {"topic_recall_hits": hits_map}
+
+
+# ── Router: topic_lookup → explore (Send) or synthesize ─────────────────
 
 
 def _research_router(
@@ -177,6 +348,10 @@ def _research_router(
     research is needed, or the string ``"synthesize"`` when done.
     LangGraph executes all Send targets in parallel within the same
     super-step and waits for all to complete before proceeding.
+
+    Each Send's ``topic`` arg is enriched with the recall hits gathered
+    by the upstream ``topic_lookup`` node so the explore subagent
+    receives concrete symbol references alongside the topic.
 
     Raises ``CriticalContractFailure`` if structured data transfer from
     the research_manager is incomplete — silent defaults to ``"done"``
@@ -212,17 +387,23 @@ def _research_router(
                    "the research_manager_node produced malformed structured output.",
         )
 
-    findings: list[dict] = state.get("findings", [])
-    explored_topics: set[str] = {
-        f.get("topic", "") for f in findings if isinstance(f, dict) and f.get("topic")
-    }
-
-    new_topics = [t for t in topics if t not in explored_topics]
+    new_topics = _new_topics(state)
     if not new_topics:
         logger.info("All topics already explored — routing to synthesize")
         return "synthesize"  # type: ignore[return-value]
 
-    sends = [Send("explore", {"topic": t, "phase": state.get("phase", "")}) for t in new_topics]
+    hits_map: dict[str, list[dict]] = state.get("topic_recall_hits") or {}
+    phase = state.get("phase", "")
+    sends = [
+        Send(
+            "explore",
+            {
+                "topic": _enrich_topic(t, hits_map.get(t, [])),
+                "phase": phase,
+            },
+        )
+        for t in new_topics
+    ]
     logger.info("Dispatching %d explore node(s): %s", len(sends), new_topics)
     return sends
 
@@ -302,7 +483,7 @@ async def _synthesize_plan(
     with the ``write_structured_plan`` tool and research findings as context.
     Reads ``plan.json`` from disk after invocation and computes execution waves.
     """
-    from spine.agents.plan_agent import build_plan_agent
+    from spine.agents.plan_agent import build_plan_synthesizer
 
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
@@ -320,7 +501,7 @@ async def _synthesize_plan(
     )
 
     try:
-        agent = build_plan_agent(dict(state), config)
+        agent = build_plan_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
         findings_text = _format_findings(findings)
@@ -332,19 +513,15 @@ async def _synthesize_plan(
                 "critic feedback.\n\n"
             )
 
-        spec_path = artifact_path(work_id, PhaseName.SPECIFY.value) + "/specification.md"
-
         prompt = (
             f"{rework_prefix}Create a detailed technical plan with structured "
             f"feature slices, incorporating the codebase research findings below.\n\n"
             f"## Work Description\n{description}\n\n"
             f"## Codebase Research Findings\n{findings_text}\n\n"
-            f"The full specification is available on disk at "
-            f"`{spec_path}` — read it carefully with `read_file`.\n\n"
-            f"After completing your research, call `write_structured_plan` to "
-            f"produce both `plan.md` (narrative) and `plan.json` (structured "
-            f"JSON with feature_slices).\n\n"
-            f"Write the plan artifacts to `{artifact_path(work_id, PhaseName.PLAN.value)}/`."
+            f"Call `read_prior_artifacts` to load the specification and prior context "
+            f"in one call. Then synthesize the spec + findings into structured "
+            f"feature_slices and call `write_structured_plan` exactly once — the tool "
+            f"writes both plan.md and plan.json for you. Do not call write_file."
         )
 
         if retry_count > 0 and feedback:
@@ -423,7 +600,7 @@ async def _synthesize_specify(
     Uses the existing specify agent infrastructure — builds a Deep Agent
     with the ``write_specification`` tool and research findings as context.
     """
-    from spine.agents.specify_agent import build_specify_agent
+    from spine.agents.specify_agent import build_specify_synthesizer
 
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
@@ -441,7 +618,7 @@ async def _synthesize_specify(
     )
 
     try:
-        agent = build_specify_agent(dict(state), config)
+        agent = build_specify_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
         findings_text = _format_findings(findings)
@@ -469,9 +646,12 @@ async def _synthesize_specify(
             f"## Work Description\n{description}\n\n"
             f"## Codebase Research Findings\n{findings_text}\n\n"
             f"{recall_section}"
-            f"Write the specification to "
-            f"`{artifact_path(work_id, PhaseName.SPECIFY.value)}/specification.md` "
-            f"using `write_file`."
+            f"Call `read_work_context` once to load description, feedback, and any "
+            f"prior spec. Then synthesize the work description + research findings "
+            f"into the structured fields and call `write_specification` exactly once "
+            f"(fields: title, summary, objectives, requirements, constraints, "
+            f"scope_inclusions, scope_exclusions, known_risks). The tool renders "
+            f"markdown and emits JSON for you — do not call write_file."
         )
 
         if retry_count > 0 and feedback:
@@ -752,6 +932,34 @@ async def _save_exploration_artifacts(
         if spec_json_path.exists() and spec_json_str:
             disk_artifacts["specification.json"] = spec_json_str[:_MAX_ARTIFACT_STATE_CHARS]
 
+    # ── Persist research log as artifact ───────────────────────────────
+    topics: list[str] = state.get("topics", [])
+    findings: list[dict] = state.get("findings", [])
+    if topics or findings:
+        try:
+            from spine.persistence.artifacts import ArtifactStore
+            from spine.config import SpineConfig
+
+            cfg = SpineConfig.load()
+            store = ArtifactStore(base_path=cfg.artifact_path)
+            research_log = json.dumps({
+                "topics": topics,
+                "findings": [
+                    {
+                        "topic": f.get("topic", ""),
+                        "summary": f.get("summary", ""),
+                        "patterns": f.get("patterns", []),
+                        "file_map": f.get("file_map", {}),
+                        "dependencies": f.get("dependencies", []),
+                    }
+                    for f in findings
+                    if isinstance(f, dict)
+                ],
+            }, indent=2, default=str)
+            store.save_artifact(work_id, phase, "research_log.json", research_log)
+        except Exception as exc:
+            logger.warning("[%s] Could not persist research_log.json: %s", work_id, exc)
+
     result: dict[str, Any] = {
         "artifacts_output": disk_artifacts,
         "phase_status": "success" if disk_artifacts else "needs_review",
@@ -836,6 +1044,7 @@ def build_exploration_subgraph(
 
     builder.add_node("pre_research_gate", _pre_research_gate)
     builder.add_node("research_manager", _research_manager_node)
+    builder.add_node("topic_lookup", _topic_lookup_node)
     builder.add_node("explore", _explore_node)
     builder.add_node("aggregate", _aggregate_node)
     builder.add_node("eviction_check", _eviction_check_node)
@@ -852,9 +1061,12 @@ def build_exploration_subgraph(
         {"skip_to_synth": "synthesize", "explore": "research_manager"},
     )
 
-    # research_manager → Send("explore", ...) or → synthesize
+    # research_manager → topic_lookup (annotate topics with recall hits)
+    builder.add_edge("research_manager", "topic_lookup")
+
+    # topic_lookup → Send("explore", ...) (with enriched topics) or → synthesize
     builder.add_conditional_edges(
-        "research_manager",
+        "topic_lookup",
         _research_router,
         {"explore": "explore", "synthesize": "synthesize"},
     )

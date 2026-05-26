@@ -154,7 +154,7 @@ class RecallTool(BaseTool):
         store = VectorStore(self.db_path)
         store.ensure_schema()
 
-        results = store.search_similar(embedding, k=k, filter_by_type=symbol_types)
+        results = store.search_similar(embedding, k=k, filter_by_types=symbol_types)
 
         # Apply token budget
         results = self._apply_token_budget(results, max_tokens)

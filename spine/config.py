@@ -108,6 +108,14 @@ class SpineConfig:
     recall_gate_min_hits: int = 5
     specify_context_token_budget: int = 30000
 
+    # Per-topic recall lookup (runs between research_manager and the
+    # research_router). For each topic emitted by the manager, recall the
+    # top-K symbols whose cosine similarity is at least this threshold —
+    # those are then attached to the topic that gets sent to the explore
+    # subagent.
+    topic_lookup_top_k: int = 2
+    topic_lookup_min_similarity: float = 0.5
+
     @staticmethod
     def _find_workspace_root() -> str:
         """Auto-detect workspace root by searching upward for ``.spine/``.
@@ -290,6 +298,10 @@ class SpineConfig:
             recall_gate_min_hits=int(spine.get("recall_gate_min_hits", 5)),
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)
+            ),
+            topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 2)),
+            topic_lookup_min_similarity=float(
+                spine.get("topic_lookup_min_similarity", 0.5)
             ),
         )
 

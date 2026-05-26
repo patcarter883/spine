@@ -2,6 +2,7 @@ spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
   guided_decoding: true
+  topic_lookup_min_similarity: 0.45
   # RAG configuration
   embedding_provider: local-embeddings
   recall_k: 3
@@ -60,6 +61,7 @@ providers:
     api_key: vllm
     guided_decoding: true
     enabled: true
+    stream_usage: true
   - name: pat
     type: deepagents-model
     model: openai:model
@@ -67,11 +69,13 @@ providers:
     api_key: vllm
     guided_decoding: true
     enabled: true
+    stream_usage: true
   - name: tiny
     type: deepagents-model
     model: openai:Bonsai-8B-gguf
     base_url: http://localhost:8000/v1
     api_key: vllm
+    stream_usage: true
   # Embedding providers
   embedding:
   - name: local-embeddings
@@ -79,6 +83,7 @@ providers:
     model: Qwen3-Embedding-8B-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
+    stream_usage: true
   phases:
     specify:
       provider: pat

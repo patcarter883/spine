@@ -270,8 +270,8 @@ def build_artifact_prompt(
     lines: list[str] = ["## Prior Artifacts (on disk)"]
     lines.append(
         "The following artifacts from prior phases are available on disk. "
-        "Use `read_file` and `grep` to read only what you need — do NOT "
-        "load everything into context at once."
+        "Use this phase's purpose-built context loader — it loads the right "
+        "artifacts in one call. Do NOT load everything into context at once."
     )
     # RLM guidance: load artifact inventory into interpreter once,
     # not into every turn's system prompt. Later eval calls can reference
@@ -300,6 +300,14 @@ def build_artifact_prompt(
     return "\n".join(lines) + "\n\n"
 
 
+_PHASE_WRITE_TOOLS: dict[str, str] = {
+    PhaseName.SPECIFY.value: "write_specification",
+    PhaseName.PLAN.value: "write_structured_plan",
+    PhaseName.IMPLEMENT.value: "write_implementation_report",
+    PhaseName.VERIFY.value: "write_verification_report",
+}
+
+
 def build_current_phase_write_prompt(
     work_id: str,
     current_phase: str,
@@ -307,40 +315,48 @@ def build_current_phase_write_prompt(
 ) -> str:
     """Build a prompt section telling the agent WHERE to write its outputs.
 
-    Without this, agents call ``write_file("specification.md", ...)`` which
-    lands at the workspace root.  The subgraph's ``save_artifacts`` node
-    then scans ``.spine/artifacts/{work_id}/{phase}/`` and finds nothing,
-    so the phase is flagged ``needs_review`` despite the agent having
-    written a valid document — just in the wrong place.
+    Each phase has a purpose-built write tool that handles directory
+    discipline (writing into ``.spine/artifacts/{work_id}/{phase}/``)
+    and structured output for you. This prompt names that tool — it does
+    NOT instruct the agent to fall back to ``write_file``.
 
     Args:
         work_id: Unique work item identifier.
         current_phase: The phase name (e.g. ``"specify"``).
         expected_files: Optional list of files the agent is expected to
-            produce (e.g. ``["specification.md"]``).  Listed in the prompt
-            so the agent uses the correct relative paths.
+            produce (e.g. ``["specification.md"]``).  Listed for context.
 
     Returns:
         A markdown-formatted instruction block.
     """
     base_path = artifact_path(work_id, current_phase)
+    write_tool = _PHASE_WRITE_TOOLS.get(current_phase)
+
     lines: list[str] = [
         "## Where to Write This Phase's Artifacts",
         "",
-        f"All files you produce for the **{current_phase.upper()}** phase MUST be written",
-        f"to the directory `{base_path}/`.",
+        f"All files you produce for the **{current_phase.upper()}** phase MUST land in",
+        f"`{base_path}/`. The phase write tool handles this for you.",
         "",
-        "Use `write_file` with paths like:",
     ]
-    files = expected_files or ["<filename>.md"]
-    for f in files:
-        lines.append(f"  - `{base_path}/{f}`")
-    lines.append("")
-    lines.append(
-        "Do NOT write to the workspace root (e.g. `./specification.md`) — files there "
-        "are invisible to the workflow and will cause the phase to be flagged for "
-        "human review even if the content is correct."
-    )
+
+    if write_tool:
+        lines.append(
+            f"Call `{write_tool}` exactly once with structured fields — the tool "
+            f"writes the artifact(s) to the correct path and emits JSON when "
+            f"applicable. Do NOT call `write_file`."
+        )
+    else:
+        lines.append(
+            "Use the purpose-built write tool for this phase. Do NOT call `write_file`."
+        )
+
+    if expected_files:
+        lines.append("")
+        lines.append("Expected artifacts:")
+        for f in expected_files:
+            lines.append(f"  - `{base_path}/{f}`")
+
     return "\n".join(lines) + "\n\n"
 
 

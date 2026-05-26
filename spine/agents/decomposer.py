@@ -155,6 +155,7 @@ async def run_decomposer(
         parsed = response
     elif hasattr(response, "parsed") and isinstance(response.parsed, DecompositionResult):
         parsed = response.parsed
+        response.parsed = None  # prevent Pydantic serialization warning
     else:
         raise ValueError(
             f"Decomposer returned unexpected structured-output type: {type(response).__name__}"

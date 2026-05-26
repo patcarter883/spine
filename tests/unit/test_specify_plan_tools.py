@@ -17,7 +17,6 @@ from spine.agents.specify_tools import (
 from spine.agents.plan_tools import (
     ReadPriorArtifactsTool,
     SearchCodebaseTool,
-    WritePlanTool,
     build_plan_agent_tools,
 )
 
@@ -86,55 +85,89 @@ class TestWriteSpecificationTool:
 
     def _full_args(self) -> dict:
         return {
-            "overview": "Build a widget factory system.",
-            "requirements": "- FR1: Create widgets\n- NFR1: <100ms latency",
-            "architecture": "Three-layer: API, service, storage.",
-            "interfaces": "POST /widgets, GET /widgets/{id}",
-            "success_criteria": "- All tests pass\n- P99 <100ms",
+            "title": "Widget Factory System",
+            "summary": "Build a widget factory system that creates widgets quickly.",
+            "objectives": ["Ship widget creation API", "Hit P99 <100ms"],
+            "requirements": [
+                "FR1: Create widgets via POST /widgets",
+                "NFR1: P99 latency <100ms",
+            ],
+            "constraints": ["Must run on existing infra"],
+            "scope_inclusions": ["API service", "Storage layer"],
+            "scope_exclusions": ["UI work", "Billing"],
+            "known_risks": ["Cold-start latency on cold storage"],
         }
 
     def test_writes_specification_md(self, tmp_path):
         tool = self._tool(tmp_path)
         result = tool._run(**self._full_args())
-        assert "specification.md written" in result
+        assert "specification.md" in result
+        assert "specification.json" in result
         spec = tmp_path / ".spine/artifacts/wk-s1/specify/specification.md"
         assert spec.exists()
         content = spec.read_text()
-        assert "# Specification" in content
-        assert "Build a widget factory" in content
+        assert "# Widget Factory System" in content
+        assert "factory system" in content
+
+    def test_writes_specification_json(self, tmp_path):
+        tool = self._tool(tmp_path)
+        tool._run(**self._full_args())
+        json_path = tmp_path / ".spine/artifacts/wk-s1/specify/specification.json"
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert data["title"] == "Widget Factory System"
+        assert data["summary"].startswith("Build a widget")
+        assert "FR1: Create widgets via POST /widgets" in data["requirements"]
+        assert "API service" in data["scope_inclusions"]
 
     def test_all_sections_present(self, tmp_path):
         tool = self._tool(tmp_path)
         tool._run(**self._full_args())
         content = (tmp_path / ".spine/artifacts/wk-s1/specify/specification.md").read_text()
         for section in [
-            "Overview",
+            "Summary",
+            "Objectives",
             "Requirements",
-            "Architecture",
-            "Interfaces",
-            "Success Criteria",
+            "Constraints",
+            "Scope — Inclusions",
+            "Scope — Exclusions",
+            "Known Risks",
         ]:
             assert section in content
 
-    def test_open_questions_optional(self, tmp_path):
+    def test_optional_sections_omitted_when_empty(self, tmp_path):
         tool = self._tool(tmp_path)
-        args = self._full_args()
-        args["open_questions"] = "What about rate limiting?"
-        tool._run(**args)
+        # Only title, summary, requirements — the rest left empty
+        tool._run(
+            title="Minimal Spec",
+            summary="A minimal spec.",
+            requirements=["FR1: Do the thing"],
+        )
         content = (tmp_path / ".spine/artifacts/wk-s1/specify/specification.md").read_text()
-        assert "Open Questions" in content
-        assert "rate limiting" in content
+        assert "# Minimal Spec" in content
+        assert "## Summary" in content
+        assert "## Requirements" in content
+        # Optional sections must not appear when their lists are empty
+        assert "## Objectives" not in content
+        assert "## Constraints" not in content
+        assert "Scope — Inclusions" not in content
+        assert "Known Risks" not in content
 
-    def test_no_open_questions_section_when_empty(self, tmp_path):
-        tool = self._tool(tmp_path)
-        tool._run(**self._full_args())
-        content = (tmp_path / ".spine/artifacts/wk-s1/specify/specification.md").read_text()
-        assert "Open Questions" not in content
+    def test_requirements_field_is_required(self, tmp_path):
+        """Pydantic schema must reject missing requirements via the tool's input model."""
+        from spine.agents.specify_tools import _WriteSpecificationInput
+        import pytest
+
+        with pytest.raises(Exception):
+            _WriteSpecificationInput(title="t", summary="s")  # type: ignore[call-arg]
+        with pytest.raises(Exception):
+            _WriteSpecificationInput(title="t", summary="s", requirements=[])
 
     def test_creates_directory(self, tmp_path):
         tool = self._tool(tmp_path, work_id="brand-new")
         tool._run(**self._full_args())
         assert (tmp_path / ".spine/artifacts/brand-new/specify/specification.md").exists()
+        assert (tmp_path / ".spine/artifacts/brand-new/specify/specification.json").exists()
 
 
 # ── build_specify_orchestrator_tools ─────────────────────────────────────
@@ -278,9 +311,11 @@ class TestSearchCodebaseTool:
 # ── WritePlanTool ─────────────────────────────────────────────────────────
 
 
-class TestWritePlanTool:
-    def _tool(self, tmp_path: Path, work_id: str = "wk-pl") -> WritePlanTool:
-        return WritePlanTool(
+class TestStructuredWritePlanTool:
+    def _tool(self, tmp_path: Path, work_id: str = "wk-pl"):
+        from spine.agents.plan_tools import StructuredWritePlanTool
+
+        return StructuredWritePlanTool(
             workspace_root=str(tmp_path),
             plan_dir=f".spine/artifacts/{work_id}/plan",
         )
@@ -288,62 +323,108 @@ class TestWritePlanTool:
     def _full_args(self) -> dict:
         return {
             "architecture_overview": "Three services: API, worker, DB.",
-            "technology_choices": "Python 3.12, FastAPI, SQLite.",
-            "module_structure": "- spine/api.py\n- spine/worker.py",
-            "api_designs": "POST /work, GET /work/{id}",
-            "implementation_order": "1. DB layer\n2. API layer\n3. Worker",
+            "technology_choices": ["Python 3.12", "FastAPI", "SQLite"],
+            "feature_slices": [
+                {
+                    "id": "db-layer",
+                    "title": "Database layer",
+                    "target_files": ["spine/db.py"],
+                    "execution_requirements": "Create SQLAlchemy models and migrations.",
+                    "dependencies": [],
+                    "acceptance_criteria": ["Tables created", "Migrations apply cleanly"],
+                    "complexity": "small",
+                },
+                {
+                    "id": "api-layer",
+                    "title": "API layer",
+                    "target_files": ["spine/api.py"],
+                    "execution_requirements": "FastAPI routes for CRUD.",
+                    "dependencies": ["db-layer"],
+                    "acceptance_criteria": ["POST /work returns 201"],
+                    "complexity": "medium",
+                },
+            ],
             "testing_strategy": "pytest tests/unit/, pytest tests/integration/",
+            "risks": ["Tight deadline", "Cold-start latency"],
         }
 
-    def test_writes_plan_md(self, tmp_path):
+    def test_writes_plan_md_and_json(self, tmp_path):
         tool = self._tool(tmp_path)
         result = tool._run(**self._full_args())
-        assert "plan.md written" in result
-        plan = tmp_path / ".spine/artifacts/wk-pl/plan/plan.md"
-        assert plan.exists()
-        content = plan.read_text()
+        assert "plan.md" in result
+        assert "plan.json" in result
+        plan_md = tmp_path / ".spine/artifacts/wk-pl/plan/plan.md"
+        plan_json = tmp_path / ".spine/artifacts/wk-pl/plan/plan.json"
+        assert plan_md.exists()
+        assert plan_json.exists()
+        content = plan_md.read_text()
         assert "# Technical Plan" in content
 
-    def test_all_sections_present(self, tmp_path):
+    def test_lists_render_as_bullets(self, tmp_path):
         tool = self._tool(tmp_path)
         tool._run(**self._full_args())
         content = (tmp_path / ".spine/artifacts/wk-pl/plan/plan.md").read_text()
-        for section in [
-            "Architecture Overview",
-            "Technology Choices",
-            "Module Structure",
-            "API Designs",
-            "Implementation Order",
-            "Testing Strategy",
-        ]:
-            assert section in content
+        # technology_choices and risks render as bullets, one per item
+        assert "- Python 3.12" in content
+        assert "- FastAPI" in content
+        assert "- SQLite" in content
+        assert "- Tight deadline" in content
+        assert "- Cold-start latency" in content
 
-    def test_risks_section_optional(self, tmp_path):
+    def test_json_lists_are_arrays_not_strings(self, tmp_path):
+        tool = self._tool(tmp_path)
+        tool._run(**self._full_args())
+        data = json.loads(
+            (tmp_path / ".spine/artifacts/wk-pl/plan/plan.json").read_text()
+        )
+        # The downstream consumer expects technology_choices and risks as arrays
+        assert isinstance(data["technology_choices"], list)
+        assert data["technology_choices"] == ["Python 3.12", "FastAPI", "SQLite"]
+        assert isinstance(data["risks"], list)
+        assert data["risks"] == ["Tight deadline", "Cold-start latency"]
+
+    def test_feature_slices_validated_in_schema(self, tmp_path):
+        """Per-slice validation should happen at the Pydantic boundary, not in _run."""
+        from spine.agents.plan_tools import _StructuredWritePlanInput
+        import pytest
+
+        # Missing acceptance_criteria (min_length=1) on a slice → schema error
+        with pytest.raises(Exception):
+            _StructuredWritePlanInput(
+                architecture_overview="x",
+                feature_slices=[
+                    {
+                        "id": "s",
+                        "title": "t",
+                        "execution_requirements": "do it",
+                        "acceptance_criteria": [],
+                    }
+                ],
+                testing_strategy="y",
+            )
+
+    def test_optional_sections_omitted_when_empty(self, tmp_path):
         tool = self._tool(tmp_path)
         args = self._full_args()
-        args["risks"] = "Risk: tight deadline."
+        args["technology_choices"] = []
+        args["risks"] = []
         tool._run(**args)
         content = (tmp_path / ".spine/artifacts/wk-pl/plan/plan.md").read_text()
-        assert "Risks" in content
-        assert "tight deadline" in content
-
-    def test_no_risks_section_when_empty(self, tmp_path):
-        tool = self._tool(tmp_path)
-        tool._run(**self._full_args())
-        content = (tmp_path / ".spine/artifacts/wk-pl/plan/plan.md").read_text()
-        assert "Risks" not in content
+        assert "## Technology Choices" not in content
+        assert "Risks & Open Questions" not in content
 
     def test_creates_directory(self, tmp_path):
         tool = self._tool(tmp_path, work_id="fresh")
         tool._run(**self._full_args())
         assert (tmp_path / ".spine/artifacts/fresh/plan/plan.md").exists()
+        assert (tmp_path / ".spine/artifacts/fresh/plan/plan.json").exists()
 
 
 # ── build_plan_agent_tools ────────────────────────────────────────────────
 
 
 class TestBuildPlanAgentTools:
-    def test_returns_four_tools(self, tmp_path):
+    def test_returns_three_tools(self, tmp_path):
         tools = build_plan_agent_tools(
             workspace_root=str(tmp_path),
             work_id="abc",
@@ -351,11 +432,12 @@ class TestBuildPlanAgentTools:
             work_type="task",
             prior_phase_dirs={},
         )
-        assert len(tools) == 4
+        assert len(tools) == 3
         names = {t.name for t in tools}
         assert "read_prior_artifacts" in names
         assert "search_codebase" in names
-        assert "write_plan" in names
+        assert "write_structured_plan" in names
+        assert "write_plan" not in names
 
     def test_prior_phase_dirs_passed_through(self, tmp_path):
         prior = {"specify": ".spine/artifacts/x/specify"}

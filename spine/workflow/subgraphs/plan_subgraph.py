@@ -68,9 +68,9 @@ async def _run_plan_agent(
 
         if has_spec and spec_path:
             spec_instruction = (
-                "The full specification is available on disk at "
-                f"`{spec_path}/specification.md` — read it carefully with "
-                "`read_file` — your plan must implement exactly what the spec describes.\n\n"
+                "Call `read_prior_artifacts` to load the specification — it returns "
+                "the spec content and prior context in one call. Your plan must "
+                "implement exactly what the spec describes.\n\n"
             )
         else:
             spec_instruction = (
@@ -81,11 +81,12 @@ async def _run_plan_agent(
         prompt = (
             "Create a detailed technical plan with structured feature slices.\n\n"
             + spec_instruction
-            + "After completing your research, call `write_structured_plan` to produce "
-            "both `plan.md` (narrative) and `plan.json` (structured JSON with feature_slices). "
-            "The structured plan is REQUIRED — the downstream implementation phase needs the "
-            "feature_slices array in `plan.json` to dispatch slice-implementer subagents.\n\n"
-            f"Write the plan artifacts to `{plan_path}/`."
+            + "Call `write_structured_plan` exactly once with structured fields "
+            "(architecture_overview, technology_choices, feature_slices, "
+            "testing_strategy, risks, codebase_map). The tool writes both plan.md "
+            "and plan.json for you — do not call write_file. The structured plan "
+            "is REQUIRED: the downstream implementation phase needs the feature_slices "
+            "array in plan.json to dispatch slice-implementer subagents."
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)

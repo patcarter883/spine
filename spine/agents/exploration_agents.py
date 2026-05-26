@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Literal
 
@@ -47,47 +48,140 @@ class ResearchManagerDecision(BaseModel):
     )
 
 
-# ── Research manager prompt ──────────────────────────────────────────────
+# ── Research manager prompts ─────────────────────────────────────────────
 
-_RESEARCH_MANAGER_SYSTEM = """\
-You are a research planning assistant. Your job is to map the codebase
-territory and assign precise, scoped research topics to subagents.
+_RESEARCH_MANAGER_SPECIFY = """\
+You are an Architectural Research Manager. Your job is to map the codebase
+structure so the SPECIFY orchestrator can write an accurate specification.
+
+## Your mission
+
+The SPECIFY orchestrator needs to understand what EXISTS:
+1. Public interfaces and module boundaries — what are the contracts?
+2. Dependency relationships — what imports what and why?
+3. Conventions and patterns — naming, structure, idioms in use
+4. Configuration and global state — what settings or singletons exist?
+
+Your task is to assign research topics to subagents (Architectural Scouts)
+that will discover this structural knowledge. Each topic should describe
+a *question* about a specific area of the codebase — in plain natural
+language, no symbol or file references.
 
 ## How to work
 
-1. Read the **Retrieved Symbol Summaries** section below. These are
-   LLM-generated summaries of functions/classes most relevant to the work
-   description, discovered by semantic vector search. They give you an
-   instant architectural map — file paths, symbol names, and what each
-   symbol does — without raw code.
+1. Read the **Retrieved Symbol Summaries** section below (if present).
+   These are LLM-generated summaries of functions/classes most relevant
+   to the work description, discovered by semantic vector search. Use
+   them as background context — they tell you which areas of the codebase
+   are likely relevant. Do NOT copy symbol names or file paths into your
+   topics.
 
-2. From these summaries, identify which specific symbols (functions,
-   classes, files) are implicated in the work. Use these to craft
-   precise topics.
+2. Phrase each topic as a natural-language research question about an
+   area of the codebase. Examples:
+   "How is CLI verbosity configured and threaded through to subcommands?"
+   "How does the configuration loader resolve workspace roots?"
+   "What logging conventions are used across the agent layer?"
 
-3. Each topic you assign must reference at least 1-2 specific symbol
-   names discovered in the summaries, so the subagent knows exactly
-   what to look up with MCP tools. Example:
-   "Investigate CLI verbosity setup — symbols: cli/__init__.py::index,
-   spine/config.py::SpineConfig"
+3. Do NOT name specific functions, classes, methods, or file paths in
+   topics. A downstream lookup step will resolve each topic to the
+   relevant symbols via semantic search — naming them yourself risks
+   hallucinating names that don't exist.
+
+4. Topics should focus on STRUCTURE, not implementation:
+   - What are the public interfaces? (function signatures, class contracts)
+   - What are the dependency relationships? (imports, call chains)
+   - What conventions and patterns exist? (naming, error handling, config)
+   - What configuration or global state is involved? (singletons, env vars)
+   Do NOT ask subagents to propose solutions or implementation details.
 
 Given:
 1. The work description
-2. The retrieved symbol summaries (semantic search results)
+2. The retrieved symbol summaries (semantic search results, for context only)
 3. A list of research topics already explored
 4. The findings accumulated so far
 
 Decide:
-- Are we done? (decision: "done")
-- Or do we need more? (decision: "explore") — return 2-4 topics, each
-  referencing specific symbol names from the summaries
+- Are we done? (decision: "done") — structural coverage is sufficient
+- Or do we need more? (decision: "explore") — return 2-4 plain-language
+  topics framed as research questions
 
 Rules:
 - Never return more than 4 topics in a single round.
 - If you've already explored a topic, don't return it again.
-- Each topic MUST name specific symbols for the subagent to look up.
+- Topics MUST NOT contain symbol names, function names, class names, or
+  file paths. Use plain English descriptions of the area to investigate.
 - If the work description is self-contained (no codebase needed), decide "done".
-- If findings already cover all key areas, decide "done".
+- If findings already cover all key architectural areas, decide "done".
+- Cover breadth before depth — ensure all implicated modules are touched
+  before diving deeper into any one module.
+"""
+
+_RESEARCH_MANAGER_PLAN = """\
+You are a Change Surface Research Manager. Your job is to identify the
+codebase areas that will need modification so the PLAN orchestrator can
+decompose the work into executable slices.
+
+## Your mission
+
+The PLAN orchestrator needs to understand what CHANGES:
+1. Touch points — which areas of the codebase will need edits?
+2. Dependency chains — what else will be affected by those changes?
+3. Risks — are there complex data flows, global state, or tight coupling to flag?
+
+Your task is to assign research topics to subagents (Blueprint Scouts)
+that will map the specification requirements to the codebase surface area.
+Each topic should describe — in plain natural language — an area of the
+codebase where changes will happen, framed as a research question.
+
+## How to work
+
+1. Read the **Specification** section below (always present in PLAN phase).
+   This describes what needs to be built or changed. Your research topics
+   MUST directly target the codebase areas that the specification requires.
+
+2. Read the **Retrieved Symbol Summaries** section below (if present).
+   These are LLM-generated summaries of functions/classes most relevant
+   to the work. Use them as background context to understand which areas
+   are implicated. Do NOT copy symbol names or file paths into your topics.
+
+3. Phrase each topic as a natural-language research question about an
+   area of the codebase. Examples:
+   "How does workspace-root resolution work for spec-path handling?"
+   "How do the CLI subcommands wire arguments through to the agent factory?"
+
+4. Do NOT name specific functions, classes, methods, or file paths in
+   topics. A downstream lookup step will resolve each topic to the
+   relevant symbols via semantic search — naming them yourself risks
+   hallucinating names that don't exist.
+
+5. Topics should focus on CHANGE SURFACE, not architecture:
+   - Which areas will need modification? (touch points)
+   - What imports or callers will be affected? (dependency chains)
+   - Are there complex data flows, global state, or tight coupling? (risks)
+   Do NOT ask subagents to propose solutions — only to identify what exists
+   and what will be impacted.
+
+Given:
+1. The specification (what needs to change)
+2. The retrieved symbol summaries (semantic search results, for context only)
+3. A list of research topics already explored
+4. The findings accumulated so far
+
+Decide:
+- Are we done? (decision: "done") — change surface is adequately mapped
+- Or do we need more? (decision: "explore") — return 2-4 plain-language
+  topics framed as research questions
+
+Rules:
+- Never return more than 4 topics in a single round.
+- If you've already explored a topic, don't return it again.
+- Topics MUST NOT contain symbol names, function names, class names, or
+  file paths. Use plain English descriptions of the area to investigate.
+- If findings already cover all key change areas, decide "done".
+- Prioritize high-risk areas (glue code, shared state, widely-imported
+  modules) before peripheral concerns.
+- Cross-reference every topic against the specification — if the spec
+  doesn't mention an area, don't explore it.
 """
 
 
@@ -98,9 +192,10 @@ async def run_research_manager(
     """Run the research manager — single LLM call to decide next topics.
 
     On the first round, pre-runs a semantic recall (summaries only) to
-    give the manager an instant architectural map. This avoids raw code
-    bloat while still letting the manager identify precise symbol names
-    to include in research topics.
+    give the manager an instant architectural map. The summaries are
+    background context only — the manager emits plain natural-language
+    topics; the downstream ``topic_lookup`` node resolves each topic to
+    concrete symbols via semantic search.
 
     Args:
         state: The ExplorationSubgraphState.
@@ -153,8 +248,9 @@ async def run_research_manager(
         recall_section = (
             "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
             "These are the most relevant functions/classes discovered by "
-            "vector search. Use these to name specific symbols in your "
-            "research topics.\n\n"
+            "vector search. Use them ONLY as background context to identify "
+            "which areas of the codebase are relevant — do NOT copy symbol "
+            "names or file paths into your topics.\n\n"
         )
         for i, chunk in enumerate(retrieved, 1):
             recall_section += (
@@ -192,8 +288,22 @@ async def run_research_manager(
         f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
         f"## Findings So Far\n{findings_summary}\n\n"
         "Decide: are we done, or do we need more research? "
-        "If exploring, each topic MUST name specific symbols from the summaries above."
+        "If exploring, return 2-4 plain-language topics framed as research "
+        "questions. Topics MUST NOT contain symbol names, function names, "
+        "class names, or file paths — a downstream lookup step resolves "
+        "each topic to the relevant symbols automatically."
     )
+
+    # ── Select the phase-appropriate manager prompt ─────────────────
+    # The SPECIFY manager maps architecture (what exists — interfaces,
+    # boundaries, conventions). The PLAN manager maps change surface
+    # (what will change — touch points, dependency chains, risks).
+    # This mirrors the researcher subagent split: Architectural Scout
+    # vs Blueprint Scout.
+    if phase == "plan":
+        manager_prompt = _RESEARCH_MANAGER_PLAN
+    else:
+        manager_prompt = _RESEARCH_MANAGER_SPECIFY
 
     try:
         # Use model.with_structured_output() for proper Pydantic validation.
@@ -203,9 +313,22 @@ async def run_research_manager(
         # into a dict so the Pydantic instance never leaks into LangGraph
         # state (avoids the checkpoint serializer warning on AIMessage.parsed).
         structured_model = model.with_structured_output(ResearchManagerDecision)
-        response = await structured_model.ainvoke(
-            [SystemMessage(content=_RESEARCH_MANAGER_SYSTEM), HumanMessage(content=context)],
-        )
+        # LangChain's tracer Pydantic-serializes the raw AIMessage with
+        # `.parsed` populated to our custom model, which trips Pydantic's
+        # "unexpected value" warning every call. The warning is cosmetic
+        # — suppress only this specific warning around the invocation.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*PydanticSerializationUnexpectedValue.*parsed.*",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*Expected `none`.*parsed.*",
+            )
+            response = await structured_model.ainvoke(
+                [SystemMessage(content=manager_prompt), HumanMessage(content=context)],
+            )
 
         # .with_structured_output() may return the Pydantic instance directly
         # (newer LangChain) or in AIMessage.parsed (legacy providers).
@@ -213,6 +336,7 @@ async def run_research_manager(
             parsed = response
         elif hasattr(response, "parsed") and isinstance(response.parsed, ResearchManagerDecision):
             parsed = response.parsed
+            response.parsed = None  # prevent Pydantic serialization warning
         else:
             raise ValueError(
                 f"Unexpected structured output response type: {type(response).__name__}"

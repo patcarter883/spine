@@ -59,7 +59,7 @@ the actual tool names present in ``request.tools`` when the interpreter's
 interpreter — see factory.py ordering constraint).
 
 - SPECIFY: ``task``, ``read_work_context``, ``write_specification``
-- PLAN:    ``task``, ``search_codebase``, ``read_prior_artifacts``, ``write_plan``
+- PLAN:    ``task``, ``search_codebase``, ``read_prior_artifacts``, ``write_structured_plan``
 - TASKS:   ``task``, ``search_codebase``, ``read_prior_artifacts``, ``write_tasks_artifacts``
 - IMPLEMENT: ``task``, ``read_slice_files``, ``write_implementation_report``
 - VERIFY:  ``task``, ``grep``, ``glob``, ``ls``, ``write_file`` (still uses FilesystemMiddleware)
