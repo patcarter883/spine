@@ -17,7 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import SpecifySubgraphState
 from spine.agents.specify_agent import build_specify_agent
-from spine.agents.helpers import extract_response
+from spine.agents.helpers import extract_response, format_classification_block
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.classification import classify_task
@@ -66,16 +66,6 @@ async def _early_commitment(
     retrieved = result_data.get("results", [])
     logger.info("Retrieved %d chunks for SPECIFY context", len(retrieved))
     return task_category, retrieved, reasoning
-
-
-def _classify_section(task_category: str | None, reasoning: str) -> str:
-    """Build the classification guidance section for the specify prompt."""
-    if not task_category:
-        return ""
-    parts = [f"## Task Classification\nCategory: {task_category}"]
-    if reasoning:
-        parts.append(reasoning)
-    return "\n".join(parts) + "\n\n"
 
 
 async def _run_specify_agent(
@@ -153,7 +143,7 @@ async def _run_specify_agent(
 
         prompt = (
             context_seed
-            + _classify_section(task_category, classification_reasoning)
+            + format_classification_block(task_category, classification_reasoning)
             + f"Create a detailed specification for the following work:\n\n{description}"
             + recall_section
         )

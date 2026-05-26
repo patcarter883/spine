@@ -79,10 +79,12 @@ async def _pre_research_gate(
         logger.info("[%s] pre_research_gate: no description — fall through", work_id)
         return {"classification_confidence": 0.0}
 
+    reasoning = ""
     try:
         classification = await classify_task(description, config)
         task_category = classification.category
         confidence = float(classification.confidence)
+        reasoning = classification.reasoning or ""
         logger.info(
             "[%s] pre_research_gate: %s confidence=%.2f",
             work_id, task_category, confidence,
@@ -117,6 +119,7 @@ async def _pre_research_gate(
     return {
         "task_category": task_category,
         "classification_confidence": confidence,
+        "classification_reasoning": reasoning,
         "retrieved_context": retrieved,
     }
 

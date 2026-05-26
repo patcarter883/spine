@@ -20,7 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_model
+from spine.agents.helpers import format_classification_block, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -56,36 +56,41 @@ territory and assign precise, scoped research topics to subagents.
 ## How to work
 
 1. Read the **Retrieved Symbol Summaries** section below. These are
-   LLM-generated summaries of functions/classes most relevant to the work
-   description, discovered by semantic vector search. They give you an
-   instant architectural map — file paths, symbol names, and what each
-   symbol does — without raw code.
+   LLM-generated summaries of the functions/classes most relevant to
+   the work description, discovered by semantic vector search. They
+   give you an instant architectural map — file paths, symbol names,
+   and what each symbol does — without raw code.
 
 2. From these summaries, identify which specific symbols (functions,
    classes, files) are implicated in the work. Use these to craft
    precise topics.
 
-3. Each topic you assign must reference at least 1-2 specific symbol
-   names discovered in the summaries, so the subagent knows exactly
-   what to look up with MCP tools. Example:
+3. Each topic should reference symbol names *only* when those names
+   appear in the Retrieved Symbol Summaries below or in Findings So
+   Far. Example:
    "Investigate CLI verbosity setup — symbols: cli/__init__.py::index,
    spine/config.py::SpineConfig"
 
 Given:
-1. The work description
+1. The work description (and any classification context)
 2. The retrieved symbol summaries (semantic search results)
 3. A list of research topics already explored
 4. The findings accumulated so far
 
 Decide:
 - Are we done? (decision: "done")
-- Or do we need more? (decision: "explore") — return 2-4 topics, each
-  referencing specific symbol names from the summaries
+- Or do we need more? (decision: "explore") — return 2-4 topics.
 
-Rules:
+Hard rules — do not violate these:
+- The **Retrieved Symbol Summaries** section is the authoritative list
+  of symbol names you may cite. **Do not invent symbol or file names.**
+  Names from earlier Findings So Far entries are also acceptable.
+- If a topic requires referencing code that isn't in the summaries or
+  prior findings, write it as `TBD: needs discovery` and describe the
+  *kind* of symbol expected (e.g. "the function that registers CLI
+  verbosity flags"), not a guessed name.
 - Never return more than 4 topics in a single round.
 - If you've already explored a topic, don't return it again.
-- Each topic MUST name specific symbols for the subagent to look up.
 - If the work description is self-contained (no codebase needed), decide "done".
 - If findings already cover all key areas, decide "done".
 """
@@ -147,14 +152,18 @@ async def run_research_manager(
     # call.  task_category may be None on the first round if the gate
     # failed (we fall through to the loop anyway).
     task_category = state.get("task_category")
+    classification_reasoning = state.get("classification_reasoning", "")
     retrieved = state.get("retrieved_context") or []
     recall_section = ""
-    if round_num == 0 and retrieved:
+    # Inject on every round — without this section the model has no
+    # authoritative symbol list, and the system prompt forbids inventing
+    # names. Skipping it on rounds ≥1 was producing hallucinated symbols.
+    if retrieved:
         recall_section = (
             "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
             "These are the most relevant functions/classes discovered by "
-            "vector search. Use these to name specific symbols in your "
-            "research topics.\n\n"
+            "vector search. These are the only symbol names you may cite "
+            "in your research topics — do not invent others.\n\n"
         )
         for i, chunk in enumerate(retrieved, 1):
             recall_section += (
@@ -163,8 +172,8 @@ async def run_research_manager(
                 f"{chunk.get('enriched_summary', '')[:400]}\n\n"
             )
         logger.info(
-            "[%s] Research manager: using %d pre-recalled summaries from gate",
-            work_id, len(retrieved),
+            "[%s] Research manager (round %d): using %d pre-recalled summaries from gate",
+            work_id, round_num, len(retrieved),
         )
 
     # ── Build the context for the manager ────────────────────────────
@@ -184,7 +193,11 @@ async def run_research_manager(
                     pass
 
     findings_summary = _summarize_findings(findings)
+    classification_block = format_classification_block(
+        task_category, classification_reasoning
+    )
     context = (
+        f"{classification_block}"
         f"## Work Description\n{description}\n\n"
         f"{spec_section}"
         f"{recall_section}"
@@ -192,7 +205,8 @@ async def run_research_manager(
         f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
         f"## Findings So Far\n{findings_summary}\n\n"
         "Decide: are we done, or do we need more research? "
-        "If exploring, each topic MUST name specific symbols from the summaries above."
+        "Cite only symbol names that appear in the Retrieved Symbol "
+        "Summaries above or in Findings So Far."
     )
 
     try:

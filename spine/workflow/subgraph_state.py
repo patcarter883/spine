@@ -36,6 +36,7 @@ class SpecifySubgraphState(BaseSubgraphState, total=False):
     task_category: str | None  # Classified task category from early commitment
     retrieved_context: list[dict]  # Retrieved code chunks from vector store
     classification_confidence: float  # 0.0-1.0 from classify_task
+    classification_reasoning: str  # Classifier's free-form rationale
 
 
 class PlanSubgraphState(BaseSubgraphState, total=False):
@@ -174,6 +175,9 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # loop and synthesize directly from recalled chunks.
     retrieved_context: list[dict]  # Chunks pulled by the pre_research_gate;
     # injected into the SPECIFY synthesizer prompt when present.
+    classification_reasoning: str  # Classifier's free-form rationale —
+    # threaded into the research-manager and synthesizer prompts so the
+    # exploration path receives the same enriched brief as specify_subgraph.
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer

@@ -15,6 +15,23 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 
 
+def format_classification_block(
+    task_category: str | None,
+    reasoning: str | None = None,
+) -> str:
+    """Render the ``## Task Classification`` prompt block.
+
+    Returns an empty string when ``task_category`` is missing so callers
+    can unconditionally concatenate it into a prompt template.
+    """
+    if not task_category:
+        return ""
+    parts = [f"## Task Classification\nCategory: {task_category}"]
+    if reasoning:
+        parts.append(reasoning)
+    return "\n".join(parts) + "\n\n"
+
+
 def resolve_model(
     config: RunnableConfig | None,
     session_id: str | None = None,

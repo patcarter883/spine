@@ -132,3 +132,6 @@ class WorkflowState(TypedDict, total=False):
     classification_confidence: float  # 0.0-1.0 confidence from classify_task —
     # used by the pre_research_gate to decide whether to skip the exploration
     # loop and synthesize directly from recalled chunks.
+    classification_reasoning: str  # Classifier's free-form rationale —
+    # threaded into downstream prompts (research manager, specify agent)
+    # so the brief is richer than the raw user description.

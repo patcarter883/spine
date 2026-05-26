@@ -24,7 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.specify_agent import build_specify_agent
-from spine.agents.helpers import extract_response
+from spine.agents.helpers import extract_response, format_classification_block
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.classification import classify_task
@@ -160,7 +160,7 @@ async def call_specify(
         prompt = (
             context_seed
             + rework_prefix
-            + f"## Task Classification\nCategory: {task_category}\n{classification_reasoning}\n\n"
+            + format_classification_block(task_category, classification_reasoning)
             + f"Create a detailed specification for the following work:\n\n{description}"
             + recall_section
         )
