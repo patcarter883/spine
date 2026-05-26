@@ -291,6 +291,8 @@ def _specify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -
         base["task_category"] = subgraph_result["task_category"]
     if subgraph_result.get("retrieved_context"):
         base["retrieved_context"] = subgraph_result["retrieved_context"]
+    if "classification_confidence" in subgraph_result:
+        base["classification_confidence"] = subgraph_result["classification_confidence"]
     # Set completion invariants
     base["spec_completed"] = phase_status == "success"
     return base

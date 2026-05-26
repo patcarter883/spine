@@ -1,8 +1,8 @@
 """Vector Indexer - background job for ingesting codebase into vector store.
 
 Runs as a background job in RalphLoopWorker to chunk the codebase via AST
-boundaries (using mcp-codebase-index), summarize with LLM, and embed for
-vector search.
+boundaries (using tree-sitter via ``spine.agents.tools.ast_extract``),
+summarize with LLM, and embed for vector search.
 """
 
 from __future__ import annotations
@@ -15,10 +15,16 @@ from typing import Any
 
 import numpy as np
 
+from spine.agents.tools.ast_extract import extract_symbols as ast_extract_symbols
 from spine.config import SpineConfig
 from spine.persistence.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
+
+# Extensions the AST extractor knows how to parse.  Keep this narrower
+# than ``plan_tools._CODE_EXTENSIONS`` — we only want extensions that
+# yield symbols, not every text file (markdown, yaml, json) in the tree.
+_INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({".py", ".php", ".ts", ".tsx"})
 
 
 class VectorIndexer:
@@ -73,10 +79,12 @@ class VectorIndexer:
         }
 
     async def _discover_symbols(self, workspace_root: str) -> list[dict[str, Any]]:
-        """Discover Python symbols using MCP for file listing, AST for parsing.
+        """Discover symbols using MCP for file listing, tree-sitter for parsing.
 
         Uses mcp-codebase-index for file discovery (fast, cached), then
-        local AST parsing for symbol extraction (avoids per-file MCP overhead).
+        local tree-sitter parsing for symbol extraction.  Each symbol is
+        sliced to its own byte range — ``raw_code`` is the function/class
+        body, NOT the containing file.
         """
         from spine.mcp.client import get_mcp_tools
 
@@ -93,22 +101,27 @@ class VectorIndexer:
                 logger.warning("mcp_codebase-index_list_files tool not available")
                 return []
 
-            files_result = await list_files_tool.ainvoke({
-                "pattern": "*.py",
-                "root": workspace_root,
-            })
-            py_files = self._parse_tool_result(files_result)
+            files_result = await list_files_tool.ainvoke({"root": workspace_root})
+            all_files = self._parse_tool_result(files_result)
+
+            # Filter to extensions the AST extractor knows how to parse.
+            candidate = [
+                f for f in all_files
+                if isinstance(f, str)
+                and os.path.splitext(f)[1].lower() in _INDEXABLE_EXTENSIONS
+            ]
 
             target = [
-                f for f in py_files
-                if isinstance(f, str) and (
-                    f.startswith("spine/") or f.startswith("tests/")
-                )
+                f for f in candidate
+                if f.startswith("spine/") or f.startswith("tests/") or f.startswith("src/")
             ]
             if not target:
-                target = [f for f in py_files if isinstance(f, str)]
+                target = candidate
 
-            logger.info("Found %d Python files, parsing for symbols...", len(target))
+            logger.info(
+                "Found %d indexable files (%d after scope filter), parsing for symbols...",
+                len(candidate), len(target),
+            )
 
             symbols: list[dict[str, Any]] = []
             for file_path in target[:200]:
@@ -128,33 +141,20 @@ class VectorIndexer:
     def _extract_symbols_from_file(
         full_path: str, rel_path: str
     ) -> list[dict[str, Any]]:
-        """Extract function and class names from a Python file using AST."""
-        import ast
-
-        symbols: list[dict[str, Any]] = []
-        try:
-            with open(full_path, encoding="utf-8") as f:
-                source = f.read()
-            tree = ast.parse(source)
-        except (OSError, SyntaxError) as e:
-            logger.debug("Skipping %s: %s", rel_path, e)
-            return []
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                symbols.append({
-                    "file_path": rel_path,
-                    "symbol_name": node.name,
-                    "symbol_type": "function",
-                })
-            elif isinstance(node, ast.ClassDef):
-                symbols.append({
-                    "file_path": rel_path,
-                    "symbol_name": node.name,
-                    "symbol_type": "class",
-                })
-
-        return symbols
+        """Extract symbols via tree-sitter, returning per-symbol byte slices."""
+        extracted = ast_extract_symbols(full_path, rel_path)
+        return [
+            {
+                "file_path": s.file_path,
+                "symbol_name": s.symbol_name,
+                "symbol_type": s.symbol_type,
+                "raw_code": s.raw_code,
+                "start_byte": s.start_byte,
+                "end_byte": s.end_byte,
+                "lang": s.lang,
+            }
+            for s in extracted
+        ]
 
     @staticmethod
     def _parse_tool_result(result: Any) -> list[Any]:
@@ -199,13 +199,16 @@ class VectorIndexer:
         semaphore: asyncio.Semaphore,
         workspace_root: str,
     ) -> bool:
-        """Process a single symbol: fetch code, summarize, embed, store."""
+        """Process a single symbol: summarize, embed, store.
+
+        ``raw_code`` is the per-symbol byte slice produced by the
+        tree-sitter extractor — NOT the containing file.  This means
+        each row holds at most a single function/class body, keeping
+        recall hits small and on-topic.
+        """
         async with semaphore:
             try:
-                # Fetch raw code
-                raw_code = await self._fetch_raw_code(
-                    symbol["file_path"], symbol["symbol_name"], workspace_root
-                )
+                raw_code = symbol.get("raw_code", "")
                 if not raw_code:
                     return False
 
@@ -254,6 +257,7 @@ class VectorIndexer:
                     raw_code=raw_code,
                     embedding=embedding,
                     needs_enrichment=needs_enrichment,
+                    lang=symbol.get("lang", "python"),
                 )
 
                 return True
@@ -265,21 +269,6 @@ class VectorIndexer:
                     e,
                 )
                 return False
-
-    async def _fetch_raw_code(
-        self,
-        file_path: str,
-        symbol_name: str,
-        workspace_root: str,
-    ) -> str:
-        """Read the source file from disk."""
-        full_path = os.path.join(workspace_root, file_path)
-        try:
-            with open(full_path, encoding="utf-8") as f:
-                return f.read()
-        except OSError as e:
-            logger.warning("Could not read %s: %s", file_path, e)
-            return ""
 
     async def _summarize_code(self, raw_code: str, symbol_name: str) -> str:
         """Summarize code using the configured summarization model."""

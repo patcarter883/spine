@@ -101,6 +101,13 @@ class SpineConfig:
         }
     )
 
+    # SPECIFY exploration short-circuit. When classification confidence is
+    # high enough AND we retrieved at least N hits, skip the multi-round
+    # research_manager loop and synthesize directly from the recalled chunks.
+    recall_gate_confidence: float = 0.75
+    recall_gate_min_hits: int = 5
+    specify_context_token_budget: int = 30000
+
     @staticmethod
     def _find_workspace_root() -> str:
         """Auto-detect workspace root by searching upward for ``.spine/``.
@@ -278,6 +285,11 @@ class SpineConfig:
                     "max_concurrent_chunks": 5,
                     "batch_size": 100,
                 },
+            ),
+            recall_gate_confidence=float(spine.get("recall_gate_confidence", 0.75)),
+            recall_gate_min_hits=int(spine.get("recall_gate_min_hits", 5)),
+            specify_context_token_budget=int(
+                spine.get("specify_context_token_budget", 30000)
             ),
         )
 

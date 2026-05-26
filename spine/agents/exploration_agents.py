@@ -140,51 +140,32 @@ async def run_research_manager(
 
         model = init_chat_model(model)
 
-    # ── Recall: summaries-only, guided by task classification ────────
+    # ── Recall context from state ────────────────────────────────────
+    # The pre_research_gate (exploration_subgraph._pre_research_gate)
+    # already classified the task and pulled recall hits before the loop
+    # started.  Use the chunks it put on state — no second classify+recall
+    # call.  task_category may be None on the first round if the gate
+    # failed (we fall through to the loop anyway).
+    task_category = state.get("task_category")
+    retrieved = state.get("retrieved_context") or []
     recall_section = ""
-    task_category = None
-    if round_num == 0 and description:
-        try:
-            from spine.agents.classification import classify_task
-            from spine.agents.tools.recall_tool import RecallTool
-            from spine.config import SpineConfig
-            import json as _json
-
-            # Classify the task to get a targeted category for vector filtering
-            classification = await classify_task(description, config)
-            task_category = classification.category
-            logger.info(
-                "[%s] Research manager: classified as %s (confidence=%.2f) "
-                "— reasoning: %s",
-                work_id, task_category, classification.confidence,
-                classification.reasoning[:200],
+    if round_num == 0 and retrieved:
+        recall_section = (
+            "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
+            "These are the most relevant functions/classes discovered by "
+            "vector search. Use these to name specific symbols in your "
+            "research topics.\n\n"
+        )
+        for i, chunk in enumerate(retrieved, 1):
+            recall_section += (
+                f"### {chunk.get('symbol_name', '?')} "
+                f"({chunk.get('symbol_type', '?')} in {chunk.get('file_path', '?')})\n"
+                f"{chunk.get('enriched_summary', '')[:400]}\n\n"
             )
-
-            cfg = SpineConfig.load()
-            recall = RecallTool(db_path=cfg.checkpoint_path)
-            result_text = await recall._arun(
-                query=description,
-                k=cfg.recall_k,
-                task_category=task_category,
-                summaries_only=True,
-                max_tokens=25000,
-            )
-            recall_data = _json.loads(result_text)
-            results = recall_data.get("results", [])
-            if results:
-                recall_section = "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
-                recall_section += "These are the most relevant functions/classes "
-                "discovered by vector search. Use these to name specific symbols "
-                "in your research topics.\n\n"
-                for i, chunk in enumerate(results, 1):
-                    recall_section += (
-                        f"### {chunk.get('symbol_name', '?')} "
-                        f"({chunk.get('symbol_type', '?')} in {chunk.get('file_path', '?')})\n"
-                        f"{chunk.get('enriched_summary', '')[:400]}\n\n"
-                    )
-                logger.info("[%s] Research manager: recall returned %d summaries", work_id, len(results))
-        except Exception as exc:
-            logger.warning("[%s] Research manager: recall skipped — %s", work_id, exc)
+        logger.info(
+            "[%s] Research manager: using %d pre-recalled summaries from gate",
+            work_id, len(retrieved),
+        )
 
     # ── Build the context for the manager ────────────────────────────
     spec_section = ""

@@ -82,13 +82,34 @@ def run(description: str, work_type: str, config_path: str, debug_llm: bool) -> 
 @main.command()
 @click.option("--workspace", "workspace_root", default=None, help="Workspace root to index (default: from config).")
 @click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
-def index(workspace_root: str | None, config_path: str) -> None:
+@click.option(
+    "--wipe",
+    is_flag=True,
+    default=False,
+    help="Drop all existing vector rows before indexing (required after the "
+         "tree-sitter migration — older rows hold whole-file raw_code).",
+)
+def index(workspace_root: str | None, config_path: str, wipe: bool) -> None:
     """Index the workspace into the vector store for RAG.
 
-    This discovers symbols via MCP, summarizes them with LLM, and stores
+    Discovers source files (.py, .php, .ts, .tsx), extracts per-symbol
+    byte slices via tree-sitter, summarizes with LLM, and stores
     embeddings for semantic search in the SPECIFY phase.
+
+    Use ``--wipe`` after upgrading from the pre-tree-sitter ingestion to
+    drop legacy rows that store whole-file ``raw_code``.
     """
     config = SpineConfig.load(path=config_path)
+
+    if wipe:
+        from spine.persistence.vector_store import VectorStore
+
+        console.print("[bold yellow]Wiping existing vector rows...[/bold yellow]")
+        store = VectorStore(config.checkpoint_path)
+        store.ensure_schema()
+        store.delete_all()
+        store.close()
+
     console.print("[bold blue]Indexing workspace for RAG...[/bold blue]")
 
     from spine.workflow.workers.vector_indexer import run_indexing_job

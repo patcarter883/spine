@@ -32,6 +32,7 @@ from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
 from spine.agents.artifacts import artifact_path
+from spine.agents.tools._fs import _atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -298,13 +299,13 @@ class WriteImplementationReportTool(BaseTool):
         json_path = impl_path / "implementation.json"
         json_str = json.dumps(json_data, indent=2, ensure_ascii=False)
         try:
-            json_path.write_text(json_str, encoding="utf-8")
+            _atomic_write(json_path, json_str)
         except OSError as exc:
             return f"ERROR: Could not write implementation.json: {exc}"
 
         content = "".join(lines)
         try:
-            report_path.write_text(content, encoding="utf-8")
+            _atomic_write(report_path, content)
         except OSError as exc:
             return f"ERROR: Could not write implementation.md: {exc}"
 
