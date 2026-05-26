@@ -1,27 +1,20 @@
-"""IMPLEMENT phase as a LangGraph subgraph with Send API dispatch.
+"""IMPLEMENT phase subgraph — SmallCode refactor.
 
-The subgraph uses the same manager/router/call/aggregate pattern as the
-exploration subgraph, replacing the old ``eval`` + ``tools.task()`` +
-``Promise.allSettled`` approach with native LangGraph ``Send`` API
-parallel dispatch.
+The slice-implementer's filesystem tool surface is narrowed to a single
+Compound Tool ``ReadEditLintTool`` (read -> edit -> lint, atomic with
+revert on lint failure) plus the MCP codebase-index tools. Removing
+``read_file`` / ``write_file`` / ``edit_file`` / ``ls`` / ``glob`` /
+``grep`` / ``execute`` / ``search_codebase`` stops the Qwen3-class
+local model from looping on raw reads and surfaces lint errors before
+synthesis declares a slice "implemented".
 
-Nodes:
-- ``implement_router``: conditional edge — reads ``execution_waves`` from
-  state, returns ``[Send("run_slice_implementer", ...)]`` or ``"synthesize_implementation"``
-- ``run_slice_implementer``: builds a ``slice-implementer`` subagent per
-  slice and invokes it. Runs in parallel via Send API.
-- ``aggregate_implementation``: deterministic fan-in point after all
-  parallel slice-implementer nodes complete.
-- ``synthesize_implementation``: writes ``implementation.md`` and
-  ``implementation.json`` from accumulated slice results.
-- ``save_artifacts``: scans disk, materializes to state.
-
-Edges::
-
-    START → implement_router
-    implement_router → Send("run_slice_implementer", {slice}) × N  OR  → synthesize_implementation
-    run_slice_implementer → aggregate_implementation
-    aggregate_implementation → synthesize_implementation → save_artifacts → END
+Dispatch is a loop driven by a single conditional edge ``_route_slices``:
+``pending_slices`` -> ``slice_implementer`` (per-slice Sends),
+``failed_slices`` -> ``fallback_decomposer`` (per-slice Sends), and once
+both lists are empty -> ``synthesize_implementation``. The custom
+``_slice_list_reducer`` (see ``spine.workflow.subgraph_state``) lets a
+node atomically remove the slice it was handed and add new ones in a
+single state update, so the loop actually terminates.
 """
 
 from __future__ import annotations
@@ -40,100 +33,99 @@ from spine.agents.artifacts import (
     scan_artifact_dir,
 )
 from spine.agents.retry import ainvoke_with_retry
-from spine.exceptions import CriticalContractFailure
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ImplementSubgraphState
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+_MAX_DECOMPOSE_DEPTH = 2
 
 
-# ── Router: START → run_slice_implementer (Send) or synthesize ──────────
+# ── Router ──────────────────────────────────────────────────────────────
 
 
-def _implement_router(
-    state: ImplementSubgraphState,
-) -> list[Send] | Literal["synthesize_implementation"]:
-    """Fan-out to slice-implementer nodes via Send API.
+def _base_send_payload(state: ImplementSubgraphState) -> dict[str, Any]:
+    """Propagated context shared by every Send.
 
-    Reads ``execution_waves`` from state, flattens all waves into a single
-    dispatch list (the scheduler guarantees dependency ordering within
-    waves, and wave ordering is satisfied by topological sort).
-
-    Raises ``CriticalContractFailure`` if ``execution_waves`` is missing
-    or empty — this is a structural invariant violation that means PLAN
-    did not produce the required structured data transfer.
+    The reducer-managed slice lists are intentionally omitted — each
+    fan-out node only needs the active slice plus the surrounding
+    work/phase context.
     """
-    execution_waves = state.get("execution_waves")
-
-    if not execution_waves:
-        raise CriticalContractFailure(
-            phase="implement",
-            reason="execution_waves is missing or empty in state — "
-                   "the PLAN phase did not produce structured data transfer. "
-                   "The prerequisite gate should have caught this before "
-                   "IMPLEMENT ran; check artifact_gate.py.",
-        )
-
-    all_slices: list[dict] = []
-    for wave in execution_waves:
-        if isinstance(wave, list):
-            for sl in wave:
-                if isinstance(sl, dict) and sl.get("id"):
-                    all_slices.append(sl)
-
-    if not all_slices:
-        raise CriticalContractFailure(
-            phase="implement",
-            reason="execution_waves is present but contains zero valid "
-                   "slice dicts with 'id' fields. The PLAN phase produced "
-                   "malformed structured data.",
-        )
-
-    logger.info(
-        "IMPLEMENT router: dispatching %d slice-implementer(s): %s",
-        len(all_slices),
-        [s.get("id", "?") for s in all_slices],
-    )
-
-    base_state = {
+    return {
         "phase": state.get("phase", "implement"),
         "work_id": state.get("work_id", "unknown"),
         "work_type": state.get("work_type", ""),
         "workspace_root": state.get("workspace_root", "."),
+        "plan_path": state.get("plan_path", ""),
+        "gap_plan_path": state.get("gap_plan_path"),
     }
-    return [
-        Send("run_slice_implementer", {**base_state, "slice": s})
-        for s in all_slices
-    ]
 
 
-# ── Node: run_slice_implementer ─────────────────────────────────────────
+def _route_slices(
+    state: ImplementSubgraphState,
+) -> list[Send] | Literal["synthesize_implementation"]:
+    """Conditional edge from START / slice_implementer / fallback_decomposer.
+
+    Fans out one Send per pending slice (to ``slice_implementer``) and
+    one Send per failed slice (to ``fallback_decomposer``). When both
+    lists are empty, routes to synthesis.
+    """
+    pending = state.get("pending_slices", []) or []
+    failed = state.get("failed_slices", []) or []
+
+    if not pending and not failed:
+        logger.info(
+            "[%s] IMPLEMENT route: pending=0 failed=0 — routing to synthesis",
+            state.get("work_id", "?"),
+        )
+        return "synthesize_implementation"
+
+    base = _base_send_payload(state)
+    sends: list[Send] = []
+    for sl in pending:
+        sends.append(Send("slice_implementer", {**base, "active_slice": sl}))
+    for sl in failed:
+        sends.append(Send("fallback_decomposer", {**base, "active_slice": sl}))
+
+    logger.info(
+        "[%s] IMPLEMENT route: pending=%d failed=%d — dispatching %d Send(s)",
+        state.get("work_id", "?"),
+        len(pending),
+        len(failed),
+        len(sends),
+    )
+    return sends
 
 
-async def _run_slice_implementer_node(
+# ── slice_implementer node ──────────────────────────────────────────────
+
+
+async def _slice_implementer_node(
     state: ImplementSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run a slice-implementer subagent for one feature slice.
+    """Run a slice-implementer subagent on the active slice.
 
-    The slice is injected into state by the Send API via
-    ``Send("run_slice_implementer", {"slice": {...}})`` — it arrives as
-    a state key, not a keyword argument.  The state merger injects
-    ``slice`` alongside the normal subgraph state fields.
+    Tools available to the subagent are restricted to
+    ``ReadEditLintTool`` plus MCP codebase-index tools — raw filesystem
+    tools are stripped. Returns a state update that removes the active
+    slice from ``pending_slices`` and adds it (with outcome merged in)
+    to either ``completed_slices`` or ``failed_slices``.
     """
     from spine.agents.factory import build_phase_agent
     from spine.agents.subagents import build_subagent_spec
+    from spine.tools.cvf import ReadEditLintTool
 
     work_id = state.get("work_id", "unknown")
-    slice_data: dict = state.get("slice", {})
-    slice_id = slice_data.get("id", "unknown")
+    workspace_root = state.get("workspace_root", ".")
+    active_slice: dict = state.get("active_slice") or {}
+    slice_id = active_slice.get("id", "unknown")
 
     logger.info(
-        "[%s] Slice-implementer node: slice=%r (title=%r)",
+        "[%s] slice_implementer: slice=%r title=%r",
         work_id,
         slice_id,
-        slice_data.get("title", ""),
+        active_slice.get("title", ""),
     )
 
     try:
@@ -144,24 +136,35 @@ async def _run_slice_implementer_node(
             config=config,
         )
 
-        extra_tools = list(subagent_spec.get("tools", []))
+        spec_tools = list(subagent_spec.get("tools", []))
+        mcp_tools = [t for t in spec_tools if getattr(t, "name", "").startswith("mcp_")]
+        restricted_tools: list[Any] = [
+            ReadEditLintTool(workspace_root=workspace_root),
+            *mcp_tools,
+        ]
+        logger.info(
+            "[%s] slice_implementer: tool surface = read_edit_lint + %d MCP tool(s)",
+            work_id,
+            len(mcp_tools),
+        )
+
         agent = build_phase_agent(
             state=state,
             config=config,
             phase=PhaseName.IMPLEMENT,
             system_prompt=subagent_spec["system_prompt"],
             is_subagent=True,
-            extra_tools=extra_tools,
+            extra_tools=restricted_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
         )
 
-        slice_json = json.dumps(slice_data, indent=2, ensure_ascii=False)
+        slice_json = json.dumps(active_slice, indent=2, ensure_ascii=False, default=str)
         prompt = (
             f"## Implement Slice: {slice_id}\n\n"
             f"The full slice definition is in the JSON below. "
             f"Read it carefully — it specifies target_files, "
-            f"execution_requirements, dependencies, and acceptance_criteria. "
+            f"acceptance_criteria, and (optionally) a description. "
             f"Make only the changes described in the slice.\n\n"
             f"```json\n{slice_json}\n```"
         )
@@ -172,12 +175,11 @@ async def _run_slice_implementer_node(
             phase_name="implement-slice",
             work_id=work_id,
         )
-
         slice_result = _extract_slice_result(result, slice_id)
 
     except Exception as e:
         logger.error(
-            "[%s] Slice-implementer failed for %r: %s",
+            "[%s] slice_implementer failed for %r: %s",
             work_id,
             slice_id,
             e,
@@ -192,7 +194,35 @@ async def _run_slice_implementer_node(
             "issues": [str(e)],
         }
 
-    return {"slice_results": [slice_result]}
+    status = slice_result.get("status", "blocked")
+    if status in ("implemented", "partial"):
+        merged = {**active_slice, **slice_result}
+        return {
+            "pending_slices": {"remove": [slice_id]},
+            "completed_slices": {"add": [merged]},
+            "slices_dispatched": True,
+            "implementation_files_written": True,
+        }
+
+    failure_traceback = "\n".join(
+        part
+        for part in (
+            slice_result.get("test_results", ""),
+            "\n".join(slice_result.get("issues", []) or []),
+        )
+        if part
+    )
+    tagged = {
+        **active_slice,
+        **slice_result,
+        "_failure_traceback": failure_traceback,
+        "_decompose_depth": active_slice.get("_decompose_depth", 0),
+    }
+    return {
+        "pending_slices": {"remove": [slice_id]},
+        "failed_slices": {"add": [tagged]},
+        "slices_dispatched": True,
+    }
 
 
 def _normalize_status(status: str) -> str:
@@ -215,10 +245,6 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
     If the agent returned structured output via ``response_format``,
     it'll be in the ``structured_response`` key.  Falls back to the
     last assistant message content.
-
-    The ``slice_name`` field is overridden with the actual slice_id
-    from the router to guarantee consistency — the subagent may not
-    include the slice name in its response.
     """
     structured = result.get("structured_response")
     if structured:
@@ -266,47 +292,112 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
     }
 
 
-# ── Node: aggregate_implementation ──────────────────────────────────────
+# ── fallback_decomposer node ────────────────────────────────────────────
 
 
-async def _aggregate_implementation_node(
+async def _fallback_decomposer_node(
     state: ImplementSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Fan-in point after all parallel slice-implementer nodes complete.
+    """Decompose a failed slice into 2–3 micro-slices via a structured LLM call.
 
-    Results are already accumulated via ``operator.add`` on the
-    ``slice_results`` field — no manual merging needed. This node
-    exists as a routing checkpoint.
+    Bounded by ``_decompose_depth`` so a chronically-unrecoverable slice
+    surfaces as permanently blocked rather than looping forever.
     """
-    results = state.get("slice_results", [])
-    statuses = [r.get("status", "?") for r in results]
+    from spine.agents.decomposer import run_decomposer
+
+    work_id = state.get("work_id", "unknown")
+    active_slice: dict = state.get("active_slice") or {}
+    slice_id = active_slice.get("id", "unknown")
+    depth = active_slice.get("_decompose_depth", 0)
+
+    if depth >= _MAX_DECOMPOSE_DEPTH:
+        logger.warning(
+            "[%s] fallback_decomposer: slice=%r hit depth cap (%d) — leaving as blocked",
+            work_id,
+            slice_id,
+            depth,
+        )
+        return {}
+
+    try:
+        micro_slices = await run_decomposer(
+            mode="FALLBACK",
+            failed_slice=active_slice,
+            error_traceback=active_slice.get("_failure_traceback", ""),
+            config=config,
+            session_id=work_id,
+        )
+    except Exception as e:
+        logger.error(
+            "[%s] fallback_decomposer failed for %r: %s — dropping slice",
+            work_id,
+            slice_id,
+            e,
+            exc_info=True,
+        )
+        return {"failed_slices": {"remove": [slice_id]}}
+
+    if not micro_slices:
+        logger.warning(
+            "[%s] fallback_decomposer: slice=%r produced 0 micro-slices — dropping",
+            work_id,
+            slice_id,
+        )
+        return {"failed_slices": {"remove": [slice_id]}}
+
+    next_depth = depth + 1
+    for sl in micro_slices:
+        sl["_decompose_depth"] = next_depth
+
     logger.info(
-        "IMPLEMENT aggregate: %d slice result(s) — statuses: %s",
-        len(results),
-        statuses,
+        "[%s] fallback_decomposer: slice=%r -> %d micro-slice(s) at depth=%d",
+        work_id,
+        slice_id,
+        len(micro_slices),
+        next_depth,
     )
-    return {}
+    return {
+        "failed_slices": {"remove": [slice_id]},
+        "pending_slices": {"add": micro_slices},
+    }
 
 
-# ── Node: synthesize_implementation ──────────────────────────────────────
+# ── synthesize_implementation node ──────────────────────────────────────
+
+
+def _failed_to_blocked(s: dict) -> dict:
+    """Coerce a failed-slice dict into the SliceResult shape expected by synthesis."""
+    issues = (
+        ["exceeded fallback depth"]
+        if s.get("_decompose_depth", 0) >= _MAX_DECOMPOSE_DEPTH
+        else ["implementer failed"]
+    )
+    return {
+        "slice_name": s.get("id", "?"),
+        "status": "blocked",
+        "files_modified": s.get("files_modified", []) or [],
+        "files_created": s.get("files_created", []) or [],
+        "test_results": (s.get("_failure_traceback", "") or "")[:1000],
+        "issues": issues,
+    }
 
 
 async def _synthesize_implementation_node(
     state: ImplementSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Write implementation.md and implementation.json from accumulated results.
-
-    Uses the existing ``WriteImplementationReportTool`` logic (via a
-    utility function) to produce both the human-readable markdown and
-    the structured JSON artifact.
-    """
+    """Write implementation.md / implementation.json from accumulated results."""
     from spine.agents.implement_tools import write_implementation_files
 
     work_id = state.get("work_id", "unknown")
     workspace_root = state.get("workspace_root", ".")
-    slice_results = state.get("slice_results", [])
+    completed = state.get("completed_slices", []) or []
+    failed = state.get("failed_slices", []) or []
+
+    slice_results: list[dict] = []
+    slice_results.extend(completed)
+    slice_results.extend(_failed_to_blocked(s) for s in failed)
 
     if not slice_results:
         logger.warning("[%s] IMPLEMENT synthesize: zero slice results", work_id)
@@ -325,9 +416,7 @@ async def _synthesize_implementation_node(
         write_implementation_files(slice_results, summary, workspace_root, impl_dir)
     except Exception as e:
         logger.error(
-            "[%s] IMPLEMENT synthesize: failed to write artifacts: %s",
-            work_id,
-            e,
+            "[%s] IMPLEMENT synthesize: failed to write artifacts: %s", work_id, e
         )
         return {
             "agent_response": summary,
@@ -338,7 +427,7 @@ async def _synthesize_implementation_node(
         }
 
     logger.info(
-        "[%s] IMPLEMENT synthesize: wrote %d slice results to %s/",
+        "[%s] IMPLEMENT synthesize: wrote %d slice result(s) to %s/",
         work_id,
         len(slice_results),
         impl_dir,
@@ -361,9 +450,7 @@ def _build_implementation_summary(slice_results: list[dict]) -> str:
         s = r.get("status", "unknown")
         statuses[s] = statuses.get(s, 0) + 1
 
-    parts = [
-        f"Implemented {total} feature slice(s).",
-    ]
+    parts = [f"Implemented {total} feature slice(s)."]
     for status, count in sorted(statuses.items()):
         parts.append(f"- {status}: {count}")
 
@@ -377,7 +464,7 @@ def _build_implementation_summary(slice_results: list[dict]) -> str:
     return "\n".join(parts)
 
 
-# ── Node: save_artifacts ────────────────────────────────────────────────
+# ── save_artifacts node ─────────────────────────────────────────────────
 
 
 async def _save_implement_artifacts(
@@ -420,35 +507,37 @@ async def _save_implement_artifacts(
 
 # ── Builder ──────────────────────────────────────────────────────────────
 
+_ROUTE_MAP = {
+    "slice_implementer": "slice_implementer",
+    "fallback_decomposer": "fallback_decomposer",
+    "synthesize_implementation": "synthesize_implementation",
+}
+
 
 def build_implement_subgraph() -> Any:
-    """Build the IMPLEMENT phase subgraph with Send API dispatch.
+    """Build the IMPLEMENT phase subgraph (SmallCode dispatch loop).
 
-    Returns a compiled StateGraph with five nodes:
-    1. implement_router — conditional edge dispatching Send objects
-    2. run_slice_implementer — per-slice subagent invocation (parallel)
-    3. aggregate_implementation — fan-in checkpoint
-    4. synthesize_implementation — writes implementation artifacts
-    5. save_artifacts — scans disk, materializes to state
+    Nodes:
+    1. ``slice_implementer`` — per-slice subagent with restricted tools.
+    2. ``fallback_decomposer`` — micro-slices a failed slice.
+    3. ``synthesize_implementation`` — writes implementation artifacts.
+    4. ``save_artifacts`` — scans disk and materializes to state.
+
+    The conditional edge ``_route_slices`` is wired three times — from
+    ``START`` and from each fan-out node — so the loop re-evaluates after
+    every super-step until both ``pending_slices`` and ``failed_slices``
+    are empty.
     """
     builder = StateGraph(ImplementSubgraphState)
 
-    builder.add_node("run_slice_implementer", _run_slice_implementer_node)
-    builder.add_node("aggregate_implementation", _aggregate_implementation_node)
+    builder.add_node("slice_implementer", _slice_implementer_node)
+    builder.add_node("fallback_decomposer", _fallback_decomposer_node)
     builder.add_node("synthesize_implementation", _synthesize_implementation_node)
     builder.add_node("save_artifacts", _save_implement_artifacts)
 
-    builder.add_conditional_edges(
-        START,
-        _implement_router,
-        {
-            "run_slice_implementer": "run_slice_implementer",
-            "synthesize_implementation": "synthesize_implementation",
-        },
-    )
-
-    builder.add_edge("run_slice_implementer", "aggregate_implementation")
-    builder.add_edge("aggregate_implementation", "synthesize_implementation")
+    builder.add_conditional_edges(START, _route_slices, _ROUTE_MAP)
+    builder.add_conditional_edges("slice_implementer", _route_slices, _ROUTE_MAP)
+    builder.add_conditional_edges("fallback_decomposer", _route_slices, _ROUTE_MAP)
     builder.add_edge("synthesize_implementation", "save_artifacts")
     builder.add_edge("save_artifacts", END)
 

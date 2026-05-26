@@ -33,8 +33,8 @@ class TestAllSubgraphsCompile:
         graph = build_implement_subgraph().compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
-        assert "run_slice_implementer" in nodes
-        assert "aggregate_implementation" in nodes
+        assert "slice_implementer" in nodes
+        assert "fallback_decomposer" in nodes
         assert "synthesize_implementation" in nodes
         assert "save_artifacts" in nodes
 
