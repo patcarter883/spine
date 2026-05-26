@@ -336,18 +336,24 @@ class TestSubagentFactory:
         researcher_tools = SUBAGENT_TOOLS["researcher"]
         assert "write_file" not in researcher_tools
         assert "edit_file" not in researcher_tools
+        assert "read_edit_lint" not in researcher_tools
         assert "execute" not in researcher_tools
         assert "read_file" in researcher_tools
+        assert "ast_extract_symbol" in researcher_tools
 
-        # Implementer has full tools
+        # Implementer writes via the linted compound tool, NOT raw write/edit.
         impl_tools = SUBAGENT_TOOLS["slice-implementer"]
-        assert "write_file" in impl_tools
+        assert "write_file" not in impl_tools
+        assert "edit_file" not in impl_tools
+        assert "read_edit_lint" in impl_tools
         assert "execute" in impl_tools
+        assert "ast_extract_symbol" in impl_tools
 
         # Verifier can execute (tests/lint) but not write
         verifier_tools = SUBAGENT_TOOLS["slice-verifier"]
         assert "execute" in verifier_tools
         assert "write_file" not in verifier_tools
+        assert "read_edit_lint" not in verifier_tools
 
     def test_build_subagent_spec_rejects_unknown(self) -> None:
         from spine.agents.subagents import build_subagent_spec

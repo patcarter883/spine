@@ -169,6 +169,9 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- `mcp_codebase-index_get_imports` — list imports for a file. "
         'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n\n'
         "### Fallback (only when MCP tools don't have what you need)\n"
+        "- `ast_extract_symbol` — fetch a single named symbol's body from the "
+        "vector index (filesystem fallback when the symbol isn't indexed yet). "
+        "Use when you know the symbol name and want the body straight from disk.\n"
         "- `search_codebase` — multi-query keyword file search with content previews\n"
         "- `read_file` — read specific files (use offset/limit for large files)\n"
         "- `ls`, `glob`, `grep` — traditional filesystem tools for targeted lookups\n\n"
@@ -210,7 +213,7 @@ SUBAGENT_PROMPTS: dict[str, str] = {
     ),
     "slice-implementer": (
         "YOU MUST USE TOOLS. Do not describe changes — make them with "
-        "write_file and edit_file, then verify with execute.\n"
+        "read_edit_lint, then verify with execute.\n"
         "You are a code implementer for a single feature slice. "
         "Your task description contains the full slice definition, "
         "codebase context, modification targets with exact line ranges, "
@@ -228,8 +231,14 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- `search_codebase` — multi-query file search with content previews. "
         "Use this FIRST to understand existing code structure before making changes.\n"
         "- `read_file` — read files (use offset/limit for pagination).\n"
-        "- `write_file` — create or overwrite a file.\n"
-        "- `edit_file` — find-and-replace within a file (use replace_all for all occurrences).\n"
+        "- `ast_extract_symbol` — fetch a single named symbol's source straight "
+        "from the index. Use when you know the symbol name and want its body without "
+        "reading the whole file.\n"
+        "- `read_edit_lint` — the ONLY write tool. Pass either `old_str`+`new_str` "
+        "(exact, single-occurrence find-and-replace) OR `full_replace` (whole-file "
+        "content). The tool runs a syntax check before writing — on a syntax error "
+        "it returns `{\"status\":\"syntax_error\",...}` and the file is left "
+        "untouched. Fix the snippet and call again.\n"
         "- `ls`, `glob`, `grep` — directory listing and text search.\n"
         "- `execute` — run shell commands (tests, linters, builds).\n\n"
         "## Implementation workflow (4-6 turns)\n"
@@ -240,9 +249,12 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "2. **Search if needed (0-1 turns):** If you need to understand code "
         "not covered by the task description, call `search_codebase` with "
         "specific queries. Do NOT explore broadly.\n"
-        "3. **Make changes (1-2 turns, batch):** Apply all edits. Read-before-write. "
-        "Write/edit ≥2 files in a single turn where possible. Focus only on "
-        "files listed in the slice — do NOT modify or create files outside its scope.\n"
+        "3. **Make changes (1-2 turns, batch):** Apply all edits with "
+        "`read_edit_lint`. Read-before-write. Issue ≥2 edits in a single turn "
+        "where possible. Focus only on files listed in the slice — do NOT modify "
+        "or create files outside its scope. If `read_edit_lint` returns "
+        "`status=\"syntax_error\"`, the file was NOT written — correct the "
+        "snippet and call again.\n"
         "4. **Test (1 turn):** Run the tests listed in your task description's "
         "acceptance criteria. Run linters (ruff) on the files you changed.\n"
         "5. **Fix if needed (0-1 turns):** If tests fail, fix and re-test.\n"
@@ -316,16 +328,17 @@ _READ_ONLY_TOOLS: list[str] = [
     "glob",
     "grep",
     "search_codebase",
+    "ast_extract_symbol",
 ]
 
 _FULL_TOOLS: list[str] = [
     "ls",
     "read_file",
-    "write_file",
-    "edit_file",
+    "read_edit_lint",
     "glob",
     "grep",
     "search_codebase",
+    "ast_extract_symbol",
     "execute",
 ]
 
@@ -632,6 +645,24 @@ def build_subagent_spec(
     # use multi-query codebase search instead of sequential ls/glob/grep/read_file.
     if "search_codebase" in allowed_tool_names:
         tools.append(SearchCodebaseTool(workspace_root=workspace_root))
+
+    # ── Inject compound tools (read_edit_lint, ast_extract_symbol) ──
+    # These are standalone BaseTools that replace generic write_file/edit_file
+    # (slice-implementer) and supplement MCP get_function_source (researcher).
+    if "read_edit_lint" in allowed_tool_names:
+        from spine.agents.tools.read_edit_lint import ReadEditLintTool
+
+        tools.append(ReadEditLintTool(workspace_root=workspace_root))
+    if "ast_extract_symbol" in allowed_tool_names:
+        from spine.agents.tools.ast_extract_symbol import AstExtractSymbolTool
+        from spine.config import SpineConfig
+
+        tools.append(
+            AstExtractSymbolTool(
+                workspace_root=workspace_root,
+                db_path=SpineConfig.load().checkpoint_path,
+            )
+        )
 
     # ── Inject MCP codebase-index tools for researcher + slice-implementer ─
     # Both subagents benefit enormously from structural queries instead of
