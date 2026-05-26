@@ -112,9 +112,14 @@ SUBAGENT_DESCRIPTIONS: dict[str, str] = {
 SUBAGENT_PROMPTS: dict[str, str] = {
     "researcher": (
         "YOU MUST USE TOOLS. Do not produce a report from memory or speculation.\n"
-        "You are a codebase researcher. Your job is to investigate specific "
-        "symbols and areas assigned by the research manager and report back "
-        "with structured findings.\n\n"
+        "You are an Architectural Scout. Your objective is to map the boundaries "
+        "of the requested feature, not to implement it. You may only extract "
+        "structural information. For every file you investigate, your final "
+        "report back to the SPECIFY orchestrator must be strictly formatted as:\n"
+        "1. Dependencies: What does this file import?\n"
+        "2. Interfaces: What are the public function signatures?\n"
+        "3. State: Does this file manage global state or configuration?\n"
+        "Do not return implementation logic.\n\n"
         "## Your task topic\n"
         "Your research topic names specific symbols discovered by semantic "
         "(vector) search. For example: \"Investigate CLI verbosity — symbols: "
@@ -172,9 +177,7 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- `ast_extract_symbol` — fetch a single named symbol's body from the "
         "vector index (filesystem fallback when the symbol isn't indexed yet). "
         "Use when you know the symbol name and want the body straight from disk.\n"
-        "- `search_codebase` — multi-query keyword file search with content previews\n"
-        "- `read_file` — read specific files (use offset/limit for large files)\n"
-        "- `ls`, `glob`, `grep` — traditional filesystem tools for targeted lookups\n\n"
+        "- `search_codebase` — multi-query keyword file search with content previews\n\n"
         "## Path conventions (CRITICAL)\n"
         "All paths MUST be relative from the project workspace root:\n"
         "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
@@ -190,17 +193,122 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "relevant symbols, look those up too. Call `mcp_codebase-index_get_dependents` "
         "to understand what calls a key function.\n"
         "3. **Fallback search only if needed (0-1 turns):** If you need content-level "
-        "pattern matching the MCP tools don't provide, use `search_codebase` or `grep`. "
+        "pattern matching the MCP tools don't provide, use `search_codebase`. "
         "This should be RARE — MCP tools cover 90% of research needs.\n"
         "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
         "summarize key facts, signatures, conventions, and patterns.\n\n"
         "## Hard limits\n"
-        "- You MUST look up every symbol named in your topic before falling back to read_file.\n"
+        "- You MUST look up every symbol named in your topic before falling back to search_codebase.\n"
         "- Your file_map MUST contain at least 1 entry.\n"
         "- Your summary MUST be at least 2 sentences.\n"
         "- Total turns: 3-5. More than 5 calls without producing "
         "output means you're over-exploring — report what you have.\n"
-        "- If you cannot read files (tool errors, permission issues), report that "
+        "- If your tools fail (tool errors, permission issues), report that "
+        "with the error details — do NOT return empty results.\n"
+        "- If you produce empty results, you WILL be re-dispatched, wasting time "
+        "and tokens. Do the work correctly the first time.\n\n"
+        "## Output format\n"
+        "Your output MUST follow the ResearchFindings schema:\n"
+        "- summary: concise paragraph summarizing findings\n"
+        "- patterns: notable patterns, conventions, or idioms discovered\n"
+        "- file_map: mapping of important file paths to brief descriptions\n"
+        "- dependencies: key dependencies, imports, or external services\n"
+    ),
+    "researcher-plan": (
+        "YOU MUST USE TOOLS. Do not produce a report from memory or speculation.\n"
+        "You are a Blueprint Scout. Your objective is to map the specification "
+        "requirements to the codebase surface area that will need to change. "
+        "You are preparing the terrain for the PLAN orchestrator to decompose "
+        "the work into executable slices. For every file you investigate, your "
+        "final report back to the PLAN orchestrator must be strictly formatted as:\n"
+        "1. Touch Points: Which functions/classes in this file will need modification?\n"
+        "2. Dependencies: What imports or callers will be affected by changes here?\n"
+        "3. Risk: Are there complex data flows, global state, or tight coupling to flag?\n"
+        "Do not propose solutions or implementation details.\n\n"
+        "## Your task topic\n"
+        "Your research topic names specific symbols discovered by semantic "
+        "(vector) search. For example: \"Investigate CLI verbosity — symbols: "
+        "cli/__init__.py::index, spine/config.py::SpineConfig\"\n\n"
+        "Use MCP tools to look up these specific symbols — get their source, "
+        "dependencies, and dependents. Never guess their interfaces.\n\n"
+        "## Codebase navigation — USE MCP TOOLS FIRST\n"
+        "You have MCP codebase index tools for efficient structural navigation. "
+        "These answer symbol-level questions in sub-millisecond time with "
+        "minimal token usage — ALWAYS use them before reading files.\n\n"
+        "### Batching and Parallel Tool Calling (CRITICAL)\n"
+        "- **NEVER query symbols, function sources, or files sequentially turn-by-turn.** "
+        "If you need to look up 3 function sources or search multiple directories, generate "
+        "all those tool calls in parallel in a SINGLE response. This is highly efficient and avoids wasting turns.\n"
+        "- **Plan your queries:** In your first turn, identify all symbols named in your "
+        "topic, and issue ALL lookup calls in parallel, instead of requesting them one-by-one sequentially.\n\n"
+        "| Question | Tool to use |\n"
+        "|----------|-------------|\n"
+        "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
+        "| What does function X call? | `mcp_codebase-index_get_dependencies` |\n"
+        "| Who calls function X? | `mcp_codebase-index_get_dependents` |\n"
+        "| What breaks if I change X? | `mcp_codebase-index_get_change_impact` |\n"
+        "| How does X connect to Y? | `mcp_codebase-index_get_call_chain` |\n"
+        "| Show me function X's code | `mcp_codebase-index_get_function_source` |\n"
+        "| What files match pattern X? | `mcp_codebase-index_list_files` |\n"
+        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n"
+        "| High-level project overview | `mcp_codebase-index_get_project_summary` |\n\n"
+        "## Tool surface\n"
+        "### Primary (use these FIRST)\n"
+        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type). "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_function_source` — get full function source. "
+        'Call with `{"name": "func_name"}`.\n'
+        "- `mcp_codebase-index_get_dependencies` — what a symbol calls/uses. "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol. "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_change_impact` — direct + transitive dependents. "
+        'Call with `{"name": "symbol_name"}`.\n'
+        "- `mcp_codebase-index_get_call_chain` — BFS path between two symbols. "
+        'Call with `{"from_name": "A", "to_name": "B"}`.\n'
+        "- `mcp_codebase-index_search_codebase` — regex search across all files. "
+        'Call with `{"pattern": "regex", "max_results": 20}`.\n'
+        "- `mcp_codebase-index_list_files` — list files matching a glob pattern. "
+        'Call with `{"pattern": "*.py"}`.\n'
+        "- `mcp_codebase-index_get_project_summary` — file count, packages, top symbols. "
+        "No arguments needed.\n"
+        "- `mcp_codebase-index_get_classes` — list classes with methods and bases. "
+        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
+        "- `mcp_codebase-index_get_functions` — list functions with params. "
+        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
+        "- `mcp_codebase-index_get_imports` — list imports for a file. "
+        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n\n'
+        "### Fallback (only when MCP tools don't have what you need)\n"
+        "- `ast_extract_symbol` — fetch a single named symbol's body from the "
+        "vector index (filesystem fallback when the symbol isn't indexed yet). "
+        "Use when you know the symbol name and want the body straight from disk.\n"
+        "- `search_codebase` — multi-query keyword file search with content previews\n\n"
+        "## Path conventions (CRITICAL)\n"
+        "All paths MUST be relative from the project workspace root:\n"
+        "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
+        "- A leading `/` is workspace-relative.\n"
+        "- **NEVER** use absolute paths like `/home/user/project/...` — they "
+        "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
+        "## Research workflow (3-5 turns)\n"
+        "1. **Look up all symbols from your topic (1 turn):** Call "
+        "`mcp_codebase-index_get_function_source` for EVERY symbol named "
+        "in your research topic. Call `mcp_codebase-index_get_dependencies` "
+        "to trace relationships. Do ALL lookups in parallel in a single turn.\n"
+        "2. **Targeted follow-up (1 turn):** If the dependencies reveal more "
+        "relevant symbols, look those up too. Call `mcp_codebase-index_get_dependents` "
+        "to understand what calls a key function.\n"
+        "3. **Fallback search only if needed (0-1 turns):** If you need content-level "
+        "pattern matching the MCP tools don't provide, use `search_codebase`. "
+        "This should be RARE — MCP tools cover 90% of research needs.\n"
+        "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
+        "summarize key facts, signatures, conventions, and patterns.\n\n"
+        "## Hard limits\n"
+        "- You MUST look up every symbol named in your topic before falling back to search_codebase.\n"
+        "- Your file_map MUST contain at least 1 entry.\n"
+        "- Your summary MUST be at least 2 sentences.\n"
+        "- Total turns: 3-5. More than 5 calls without producing "
+        "output means you're over-exploring — report what you have.\n"
+        "- If your tools fail (tool errors, permission issues), report that "
         "with the error details — do NOT return empty results.\n"
         "- If you produce empty results, you WILL be re-dispatched, wasting time "
         "and tokens. Do the work correctly the first time.\n\n"
@@ -323,10 +431,6 @@ SUBAGENT_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
 # list every tool the subagent should have access to.
 
 _READ_ONLY_TOOLS: list[str] = [
-    "ls",
-    "read_file",
-    "glob",
-    "grep",
     "search_codebase",
     "ast_extract_symbol",
 ]
@@ -364,9 +468,9 @@ SUBAGENT_TOOLS: dict[str, list[str]] = {
 _RE_RESEARCH_PROMPT_SUFFIX = (
     "\n\n⚠ RE-DISPATCH: A previous researcher returned empty results for this "
     "task. This is your second chance. You MUST:\n"
-    "1. Read at least 3 files relevant to the task description.\n"
+    "1. Look up at least 3 symbols relevant to the task description.\n"
     "2. Produce a file_map with at least 2 entries.\n"
-    "3. If files cannot be found, explain what you searched and what went wrong.\n"
+    "3. If symbols cannot be found, explain what you searched and what went wrong.\n"
     "Do NOT return empty results again."
 )
 
@@ -500,16 +604,14 @@ def _bind_response_format(
     model: Any,
     schema_model: type[BaseModel],
     name: str,
-    *,
-    with_guided_json: bool = False,
 ) -> bool:
     """Bind an OpenAI/OpenRouter json_schema response_format on the model.
 
     Mutates ``model.model_kwargs`` so every API call from this model
-    sends the strict json_schema response_format. When
-    ``with_guided_json`` is true, also sets ``extra_body.guided_json``
-    — older vLLM versions only respect the ``guided_json`` field, not
-    the OpenAI-style ``response_format``.
+    sends the strict json_schema response_format.  Both OpenRouter
+    (ChatOpenRouter) and local OpenAI-compatible servers (ChatOpenAI)
+    use the same OpenAI-style ``response_format`` — no separate
+    ``guided_json`` fallback is needed for modern vLLM versions.
 
     Returns ``True`` when binding succeeded — callers should fall back
     to Deep Agents' spec-level ``response_format`` when this returns
@@ -528,14 +630,6 @@ def _bind_response_format(
             "schema": schema,
         },
     }
-    if with_guided_json:
-        extra_body = getattr(model, "extra_body", None) or {}
-        extra_body["guided_json"] = schema
-        try:
-            model.extra_body = extra_body
-        except Exception:
-            # Field not writable on this model class — skip silently.
-            pass
     return True
 
 
@@ -560,6 +654,23 @@ def _supports_forced_tool_choice(model: Any) -> bool:
     """
     name = _extract_model_name(model)
     return not any(pattern in name for pattern in _THINKING_MODEL_PATTERNS)
+
+
+# ── Prompt resolution ──────────────────────────────────────────────────
+
+
+def _resolve_subagent_prompt(name: str, phase: PhaseName) -> str:
+    """Resolve the system prompt for a subagent, with phase-specific variants.
+
+    The researcher subagent uses different prompts depending on whether it is
+    scouting for SPECIFY (Architectural Scout — boundaries/contracts) or PLAN
+    (Blueprint Scout — change surface/risk assessment).
+    """
+    if name == "researcher":
+        plan_key = f"{name}-{phase.value}"
+        if plan_key in SUBAGENT_PROMPTS:
+            return SUBAGENT_PROMPTS[plan_key]
+    return SUBAGENT_PROMPTS[name]
 
 
 def build_subagent_spec(
@@ -595,7 +706,6 @@ def build_subagent_spec(
         raise ValueError(f"Unknown subagent {name!r}. Available: {sorted(SUBAGENT_DESCRIPTIONS)}")
 
     from spine.agents.helpers import (
-        _active_provider_config,
         resolve_model,
     )
     from spine.agents.skills_resolver import resolve_memory
@@ -684,7 +794,7 @@ def build_subagent_spec(
     spec: dict[str, Any] = {
         "name": name,
         "description": SUBAGENT_DESCRIPTIONS[name],
-        "system_prompt": SUBAGENT_PROMPTS[name],
+        "system_prompt": _resolve_subagent_prompt(name, phase),
         "model": model,
         "tools": tools,
         "middleware": subagent_middleware,
@@ -717,15 +827,10 @@ def build_subagent_spec(
             from langchain.agents.structured_output import ProviderStrategy
             spec["response_format"] = ProviderStrategy(schema=schema_model)
         else:
-            provider_cfg = _active_provider_config(phase=model_path) or {}
-            with_guided_json = bool(provider_cfg.get("guided_decoding")) and not hasattr(
-                model, "openrouter_provider"
-            )
             _bind_response_format(
                 model,
                 schema_model,
                 name=f"{name}_response",
-                with_guided_json=with_guided_json,
             )
     if memory:
         spec["memory"] = memory

@@ -174,14 +174,14 @@ class VectorStore:
         self,
         query_embedding: np.ndarray,
         k: int = 10,
-        filter_by_type: str | None = None,
+        filter_by_types: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Search for similar chunks using cosine similarity.
 
         Args:
             query_embedding: The query embedding as numpy array.
             k: Number of results to return.
-            filter_by_type: Optional symbol type filter.
+            filter_by_types: Optional list of symbol types to filter by.
 
         Returns:
             List of dicts with file_path, symbol_name, symbol_type,
@@ -196,9 +196,10 @@ class VectorStore:
         type_filter = ""
         params: list[Any] = [query_bytes, k]
 
-        if filter_by_type:
-            type_filter = "WHERE symbol_type = ?"
-            params.insert(1, filter_by_type)
+        if filter_by_types:
+            placeholders = ", ".join("?" for _ in filter_by_types)
+            type_filter = f"WHERE symbol_type IN ({placeholders})"
+            params[1:1] = filter_by_types
 
         query = f"""
             SELECT

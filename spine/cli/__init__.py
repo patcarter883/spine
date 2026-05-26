@@ -403,3 +403,62 @@ def ui(port: int, config_path: str, debug_llm: bool) -> None:
         env=env,
     )
     sys.exit(result.returncode)
+
+
+@main.command()
+@click.argument("work_id")
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Write export to a file instead of stdout.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["markdown", "json"]),
+    default="markdown",
+    help="Output format.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    default=".spine/config.yaml",
+    help="Path to config file.",
+)
+def export(work_id: str, output: str | None, output_format: str, config_path: str) -> None:
+    """Export work item data for external analysis.
+
+    WORK_ID is the unique identifier for the work item.
+    Outputs specification, plan, research data, and prompts.
+    """
+    config = SpineConfig.load(path=config_path)
+
+    from spine.work.dispatcher import get_work_status
+
+    entry = get_work_status(work_id, config)
+    if entry is None:
+        console.print(f"[bold red]Work item '{work_id}' not found.[/bold red]")
+        sys.exit(1)
+
+    from spine.workflow.export import export_work_item, format_export_markdown
+
+    data = export_work_item(work_id, config)
+    if "error" in data:
+        console.print(f"[bold red]{data['error']}[/bold red]")
+        sys.exit(1)
+
+    if output_format == "json":
+        import json
+
+        out = json.dumps(data, indent=2, default=str)
+    else:
+        out = format_export_markdown(data)
+
+    if output:
+        from pathlib import Path
+
+        Path(output).write_text(out, encoding="utf-8")
+        console.print(f"[green]Exported to {output}[/green]")
+    else:
+        console.print(out)

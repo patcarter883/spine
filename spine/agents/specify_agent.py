@@ -92,6 +92,48 @@ def build_specify_agent(
     return agent
 
 
+def build_specify_synthesizer(
+    state: WorkflowState,
+    config: RunnableConfig | None = None,
+) -> Any:
+    """Build the synthesize-only Deep Agent for the SPECIFY phase.
+
+    Tool surface is intentionally minimal: ``read_work_context`` and
+    ``write_specification`` only. No ``recall``, no ``search_codebase``,
+    no researcher subagents — codebase lookups were done by the upstream
+    exploration subgraph and the findings are already in the prompt.
+    This stops the synthesizer from re-exploring.
+    """
+    work_id = state.get("work_id", "")
+    workspace_root = state.get("workspace_root", ".")
+    work_type = state.get("work_type", "")
+    description = state.get("description", "")
+    feedback_raw = state.get("feedback", [])
+    feedback = [str(f) for f in feedback_raw] if feedback_raw else []
+
+    orchestrator_tools = build_specify_orchestrator_tools(
+        workspace_root=workspace_root,
+        work_id=work_id,
+        description=description,
+        work_type=work_type,
+        feedback=feedback,
+    )
+
+    system_prompt = _build_specify_synthesizer_prompt() + build_artifact_prompt(
+        state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
+    )
+
+    return build_phase_agent(
+        state=state,
+        config=config,
+        phase=PhaseName.SPECIFY,
+        system_prompt=system_prompt,
+        subagents=None,
+        extra_tools=list(orchestrator_tools),
+        skip_filesystem_middleware=True,
+    )
+
+
 def _build_specify_prompt() -> str:
     return (
         "You are the SPECIFY phase orchestrator. Synthesise the exploration results "
@@ -112,17 +154,48 @@ def _build_specify_prompt() -> str:
         "Analyze them to understand existing patterns, conventions, and architectural decisions. "
         "Do NOT dispatch additional researcher subagents unless the pre-retrieved context is insufficient.\\n\\n"
         "### Step 3 — Call write_specification (Turn 2)\\n"
-        "3. Synthesize the retrieved context and/or research findings into these 5 required sections:\\n"
-        "   - overview: 2-3 sentences of what needs to be built\\n"
-        "   - requirements: numbered list of functional + non-functional requirements\\n"
-        "   - architecture: bullet list of design decisions with rationale\\n"
-        "   - interfaces: bullet list of APIs, data models, contracts with types\\n"
-        "   - success_criteria: numbered list of 3-5 measurable outcomes\\n"
-        "4. Call `write_specification` with all 5 fields.\\n"
-        "   ALSO include `specification_json` — a JSON string with keys: title, summary, "
-        "objectives (list), requirements (list), constraints (list), scope_inclusions (list), "
-        "scope_exclusions (list), known_risks (list).\\n\\n"
+        "Synthesize the retrieved context and/or research findings into the structured "
+        "fields below and call `write_specification` ONCE. The tool renders markdown and "
+        "emits JSON for you — DO NOT author markdown, DO NOT hand-serialize JSON.\\n\\n"
+        "Fields (all lists are arrays of short strings — one item per array entry):\\n"
+        "- title: short specification title\\n"
+        "- summary: 2-3 sentence executive summary\\n"
+        "- objectives: list of high-level goals\\n"
+        "- requirements: list of functional + non-functional requirements (each measurable). REQUIRED — must have at least one item.\\n"
+        "- constraints: list of non-functional constraints\\n"
+        "- scope_inclusions: list of areas explicitly in scope\\n"
+        "- scope_exclusions: list of areas explicitly out of scope\\n"
+        "- known_risks: list of open questions or risks\\n\\n"
         "### Turn Budget\\n"
         "Expected: 2 turns. If exceeding 4 turns without calling `write_specification`, "
         "check that context is available and proceed to write.\\n"
+    )
+
+
+def _build_specify_synthesizer_prompt() -> str:
+    return (
+        "You are the SPECIFY phase synthesizer. Codebase research was completed "
+        "BEFORE you started — the findings are injected into your prompt below. "
+        "Your job is to synthesize those findings into a structured specification "
+        "and call `write_specification` ONCE. Do NOT re-explore the codebase.\\n\\n"
+        "## Available tools (the ONLY tools you have)\\n"
+        "- `read_work_context` — loads work description, feedback, prior spec (rework). Call FIRST.\\n"
+        "- `write_specification` — writes both specification.md and specification.json. Call LAST.\\n\\n"
+        "## Workflow (exactly 2 calls)\\n\\n"
+        "### Step 1 — Call read_work_context\\n"
+        "Call with no arguments. Extract description, feedback, and any prior_spec.\\n\\n"
+        "### Step 2 — Call write_specification\\n"
+        "Synthesize the findings (already in your prompt) plus the work context into "
+        "the structured fields below and call `write_specification` ONCE. The tool "
+        "renders markdown and emits JSON for you — DO NOT author markdown, DO NOT "
+        "hand-serialize JSON, DO NOT call write_file.\\n\\n"
+        "Fields (all lists are arrays of short strings — one item per array entry):\\n"
+        "- title: short specification title\\n"
+        "- summary: 2-3 sentence executive summary\\n"
+        "- objectives: list of high-level goals\\n"
+        "- requirements: list of functional + non-functional requirements (each measurable). REQUIRED — must have at least one item.\\n"
+        "- constraints: list of non-functional constraints\\n"
+        "- scope_inclusions: list of areas explicitly in scope\\n"
+        "- scope_exclusions: list of areas explicitly out of scope\\n"
+        "- known_risks: list of open questions or risks\\n"
     )

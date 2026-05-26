@@ -25,6 +25,7 @@ from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
 from spine.agents.artifacts import artifact_path
+from spine.models.types import Specification
 
 logger = logging.getLogger(__name__)
 
@@ -97,62 +98,86 @@ class ReadWorkContextTool(BaseTool):
 
 
 class _WriteSpecificationInput(BaseModel):
-    overview: str = Field(description="Summary of what needs to be built (2-4 paragraphs).")
-    requirements: str = Field(
-        description=(
-            "Functional and non-functional requirements as a markdown list. "
-            "Each requirement should be measurable."
-        )
+    """Structured specification fields. Mirrors :class:`Specification`.
+
+    The agent provides structured data; the tool renders markdown and
+    emits JSON. The agent does not author markdown.
+    """
+
+    title: str = Field(description="Specification title.")
+    summary: str = Field(description="Executive summary (2-3 sentences).")
+    objectives: list[str] = Field(
+        default_factory=list,
+        description="High-level goals as a list of short strings.",
     )
-    architecture: str = Field(
+    requirements: list[str] = Field(
         description=(
-            "High-level design decisions: components, data flow, key patterns. "
-            "Include rationale for major choices."
-        )
-    )
-    interfaces: str = Field(
-        description=(
-            "API endpoints, data models, and contracts. Include types, "
-            "signatures, and schemas where applicable."
-        )
-    )
-    success_criteria: str = Field(
-        description=(
-            "Measurable outcomes that define completion. Each criterion "
-            "must be verifiable by the VERIFY phase."
-        )
-    )
-    open_questions: str = Field(
-        default="",
-        description=(
-            "Any open questions or risks discovered during research. Optional — omit if none."
+            "Functional requirements as a list of short, measurable strings. "
+            "Required — at least one item."
         ),
+        min_length=1,
     )
-    specification_json: str | None = Field(
-        default=None,
-        description=(
-            "Structured JSON specification (must be valid JSON). "
-            "Use the Specification schema with keys: title, summary, "
-            "objectives, requirements, constraints, scope_inclusions, "
-            "scope_exclusions, known_risks."
-        ),
+    constraints: list[str] = Field(
+        default_factory=list,
+        description="Non-functional constraints as a list of short strings.",
     )
+    scope_inclusions: list[str] = Field(
+        default_factory=list,
+        description="Areas explicitly in scope as a list of short strings.",
+    )
+    scope_exclusions: list[str] = Field(
+        default_factory=list,
+        description="Areas explicitly out of scope as a list of short strings.",
+    )
+    known_risks: list[str] = Field(
+        default_factory=list,
+        description="Known risks / open questions as a list of short strings.",
+    )
+
+
+def _render_spec_markdown(spec: Specification) -> str:
+    """Render a Specification as markdown. Tool owns markdown shape."""
+    parts: list[str] = [f"# {spec.title.strip()}\n", "\n## Summary\n", f"{spec.summary.strip()}\n"]
+
+    def _bullets(heading: str, items: list[str]) -> None:
+        cleaned = [s.strip() for s in items if s and s.strip()]
+        if not cleaned:
+            return
+        parts.append(f"\n## {heading}\n")
+        parts.extend(f"- {item}\n" for item in cleaned)
+
+    def _numbered(heading: str, items: list[str]) -> None:
+        cleaned = [s.strip() for s in items if s and s.strip()]
+        if not cleaned:
+            return
+        parts.append(f"\n## {heading}\n")
+        parts.extend(f"{i}. {item}\n" for i, item in enumerate(cleaned, start=1))
+
+    _bullets("Objectives", spec.objectives)
+    _numbered("Requirements", spec.requirements)
+    _bullets("Constraints", spec.constraints)
+    _bullets("Scope — Inclusions", spec.scope_inclusions)
+    _bullets("Scope — Exclusions", spec.scope_exclusions)
+    _bullets("Known Risks", spec.known_risks)
+
+    return "".join(parts)
 
 
 class WriteSpecificationTool(BaseTool):
-    """Write the specification.md artifact.
+    """Write the specification artifacts (specification.md + specification.json).
 
-    This is the ONLY write tool available to the specify agent.
-    Accepts structured sections and writes a complete specification
-    to the fixed path. Cannot write to any other location.
+    This is the ONLY write tool available to the specify agent. Accepts
+    structured fields matching :class:`Specification`; the tool itself
+    renders markdown and emits JSON. The agent does not author markdown
+    and does not hand-serialize JSON.
     """
 
     name: str = "write_specification"
     description: str = (
-        "Write the specification.md artifact. "
-        "This is the ONLY write tool available — you cannot write other files. "
-        "Provide all five required sections. Call this after researcher subagents "
-        "have returned their findings."
+        "Write the specification artifacts (specification.md + specification.json). "
+        "Provide structured fields (title, summary, objectives, requirements, "
+        "constraints, scope_inclusions, scope_exclusions, known_risks). "
+        "The tool renders markdown and emits JSON for you — do not call write_file."
     )
     args_schema: Optional[ArgsSchema] = _WriteSpecificationInput
 
@@ -161,51 +186,47 @@ class WriteSpecificationTool(BaseTool):
 
     def _run(
         self,
-        overview: str,
-        requirements: str,
-        architecture: str,
-        interfaces: str,
-        success_criteria: str,
-        open_questions: str = "",
-        specification_json: str | None = None,
+        title: str,
+        summary: str,
+        requirements: list[str],
+        objectives: list[str] | None = None,
+        constraints: list[str] | None = None,
+        scope_inclusions: list[str] | None = None,
+        scope_exclusions: list[str] | None = None,
+        known_risks: list[str] | None = None,
     ) -> str:
+        spec = Specification(
+            title=title,
+            summary=summary,
+            objectives=objectives or [],
+            requirements=requirements,
+            constraints=constraints or [],
+            scope_inclusions=scope_inclusions or [],
+            scope_exclusions=scope_exclusions or [],
+            known_risks=known_risks or [],
+        )
+
         spec_path = Path(self.workspace_root) / self.spec_dir
         spec_path.mkdir(parents=True, exist_ok=True)
-        output = spec_path / "specification.md"
+        md_output = spec_path / "specification.md"
+        json_output = spec_path / "specification.json"
 
-        lines = [
-            "# Specification\n",
-            "## Overview\n",
-            f"{overview.strip()}\n",
-            "\n## Requirements\n",
-            f"{requirements.strip()}\n",
-            "\n## Architecture\n",
-            f"{architecture.strip()}\n",
-            "\n## Interfaces\n",
-            f"{interfaces.strip()}\n",
-            "\n## Success Criteria\n",
-            f"{success_criteria.strip()}\n",
-        ]
-        if open_questions.strip():
-            lines += ["\n## Open Questions\n", f"{open_questions.strip()}\n"]
+        md_content = _render_spec_markdown(spec)
+        json_content = spec.model_dump_json(indent=2)
 
-        content = "".join(lines)
         try:
-            output.write_text(content, encoding="utf-8")
+            md_output.write_text(md_content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: Could not write specification.md: {exc}"
 
-        json_msg = ""
-        if specification_json:
-            json_path = spec_path / "specification.json"
-            try:
-                json_path.write_text(specification_json, encoding="utf-8")
-                json_msg = f" + specification.json ({len(specification_json)} chars)"
-            except OSError as exc:
-                json_msg = f" (specification.json write FAILED: {exc})"
+        try:
+            json_output.write_text(json_content, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: Could not write specification.json: {exc}"
 
         return (
-            f"specification.md written to {self.spec_dir}/specification.md ({len(content)} chars){json_msg}."
+            f"specification.md ({len(md_content)} chars) and "
+            f"specification.json ({len(json_content)} chars) written to {self.spec_dir}/."
         )
 
     async def _arun(self, **kwargs: Any) -> str:

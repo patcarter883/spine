@@ -294,6 +294,175 @@ def test_sufficiency_router_max_rounds():
     assert _sufficiency_router(state) == "done"
 
 
+# ── Test: topic_lookup node ──────────────────────────────────────────────
+
+
+def test_enrich_topic_no_hits_returns_bare():
+    from spine.workflow.subgraphs.exploration_subgraph import _enrich_topic
+
+    assert _enrich_topic("auth-module", []) == "auth-module"
+
+
+def test_enrich_topic_appends_symbol_refs():
+    from spine.workflow.subgraphs.exploration_subgraph import _enrich_topic
+
+    hits = [
+        {"symbol_name": "AuthManager", "file_path": "spine/auth.py"},
+        {"symbol_name": "verify_token", "file_path": "spine/auth/jwt.py"},
+    ]
+    enriched = _enrich_topic("auth-module", hits)
+    assert enriched.startswith("auth-module")
+    assert "AuthManager (spine/auth.py)" in enriched
+    assert "verify_token (spine/auth/jwt.py)" in enriched
+    assert "recall symbols" in enriched
+
+
+def test_research_router_enriches_topics_with_hits():
+    """Send args should carry recall-enriched topic strings when hits exist."""
+    from spine.workflow.subgraphs.exploration_subgraph import _research_router
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 0,
+        "max_rounds": 3,
+        "manager_decision": "explore",
+        "topics": ["auth-module"],
+        "findings": [],
+        "agent_response": "",
+        "topic_recall_hits": {
+            "auth-module": [
+                {
+                    "symbol_name": "AuthManager",
+                    "file_path": "spine/auth.py",
+                    "similarity": 0.91,
+                },
+            ],
+        },
+    }
+
+    sends = _research_router(state)
+    assert isinstance(sends, list) and len(sends) == 1
+    topic_arg = sends[0].arg["topic"]
+    assert topic_arg.startswith("auth-module")
+    assert "AuthManager (spine/auth.py)" in topic_arg
+
+
+def test_topic_lookup_short_circuits_when_done():
+    """topic_lookup returns an empty hits map when the manager said 'done'."""
+    import asyncio
+
+    from spine.workflow.subgraphs.exploration_subgraph import _topic_lookup_node
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 1,
+        "max_rounds": 3,
+        "manager_decision": "done",
+        "topics": [],
+        "findings": [],
+        "agent_response": "",
+    }
+
+    result = asyncio.run(_topic_lookup_node(state, None))
+    assert result == {"topic_recall_hits": {}}
+
+
+def test_topic_lookup_filters_threshold_and_top_k(monkeypatch):
+    """topic_lookup keeps only the top-K hits above the configured threshold."""
+    import asyncio
+    import json as _json
+
+    from spine.workflow.subgraphs import exploration_subgraph as mod
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    # Stub SpineConfig.load() so this runs without a real .spine directory.
+    class _FakeCfg:
+        checkpoint_path = "/tmp/fake.db"
+        embedding_provider = "openai-embeddings"
+        recall_k = 5
+        specify_context_token_budget = 30000
+        topic_lookup_top_k = 2
+        topic_lookup_min_similarity = 0.5
+
+    monkeypatch.setattr(
+        "spine.config.SpineConfig.load",
+        classmethod(lambda cls: _FakeCfg()),
+    )
+
+    # Stub RecallTool to return canned, deliberately-mixed scored results.
+    captured_calls = []
+
+    class _StubRecall:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def _arun(self, **kw):
+            captured_calls.append(kw)
+            return _json.dumps({
+                "results": [
+                    {"symbol_name": "A", "file_path": "a.py", "similarity": 0.95},
+                    {"symbol_name": "B", "file_path": "b.py", "similarity": 0.72},
+                    {"symbol_name": "C", "file_path": "c.py", "similarity": 0.55},
+                    {"symbol_name": "D", "file_path": "d.py", "similarity": 0.40},
+                ]
+            })
+
+    monkeypatch.setattr(
+        "spine.agents.tools.recall_tool.RecallTool", _StubRecall
+    )
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 0,
+        "max_rounds": 3,
+        "manager_decision": "explore",
+        "topics": ["auth-module"],
+        "findings": [],
+        "agent_response": "",
+        "task_category": "Backend/API",
+    }
+
+    result = asyncio.run(mod._topic_lookup_node(state, None))
+    hits = result["topic_recall_hits"]["auth-module"]
+    # Only A, B, C are ≥0.5; top-K=2 keeps the two highest.
+    assert [h["symbol_name"] for h in hits] == ["A", "B"]
+    # The stub was called once (only one new topic).
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["query"] == "auth-module"
+    # task_category is intentionally NOT forwarded — see comment in
+    # _topic_lookup_node about the broken CATEGORY_TO_SYMBOL_TYPES filter.
+    assert captured_calls[0]["task_category"] is None
+
+
 # ── Test: compose integration ────────────────────────────────────────────
 
 

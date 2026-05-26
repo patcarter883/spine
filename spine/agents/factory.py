@@ -379,6 +379,19 @@ def build_phase_agent(
     all_tools = list(extra_tools) if extra_tools else []
     all_tools.extend(mcp_tools)
 
+    # Deduplicate by tool name — callers that build SubAgent specs
+    # (e.g. run_explore_node) already inject MCP tools via _inject_mcp_tools(),
+    # and build_phase_agent loads them independently. Duplicate tool names
+    # cause 400 "Extra data" parse errors on strict backends (local vLLM).
+    seen_names: set[str] = set()
+    deduped: list = []
+    for tool in all_tools:
+        name = getattr(tool, "name", None) or str(tool)
+        if name not in seen_names:
+            seen_names.add(name)
+            deduped.append(tool)
+    all_tools = deduped
+
     agent = create_agent(
         model,
         system_prompt=final_system_prompt,

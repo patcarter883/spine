@@ -239,10 +239,9 @@ def _build_local_model(
     environment — which doesn't exist for local servers, causing a
     "missing credentials" error.
 
-    Schema-constrained decoding (``response_format`` / ``guided_json``) is
-    bound at the call site by ``subagents._bind_response_format`` so the
-    schema is attached after the model is built — no schema argument is
-    needed here.
+    Schema-constrained decoding (``response_format``) is bound at the call
+    site by ``subagents._bind_response_format`` so the schema is attached
+    after the model is built — no schema argument is needed here.
 
     Args:
         model_spec: Full model spec like ``"openai:model"``.
@@ -293,39 +292,17 @@ def _build_local_model(
     # as stalled even though inference is still running.
     kwargs.setdefault("streaming", True)
 
-    # ── Enable stream_usage for token counting ───────────────────────
-    # Without stream_usage=True, ChatOpenAI does not send
-    # `stream_options: {"include_usage": true}` to the OpenAI-compatible
-    # server.  The server then omits the final usage chunk, and
-    # AIMessage.usage_metadata is None.  This breaks LangSmith
-    # token tracing.  All local inference
-    # engines (vLLM, SGLang, hipfire) support this OpenAI API option.
-    kwargs.setdefault("stream_usage", True)
+    # ── Enable stream_usage for token counting (opt-in) ──────────────
+    # When stream_usage=True, ChatOpenAI sends
+    # `stream_options: {"include_usage": true}` to the server so the
+    # final usage chunk includes token counts (needed by LangSmith).
+    # Some strict local vLLM backends reject unexpected request fields
+    # with a 400 "Extra data" parse error.  Set `stream_usage: true` in
+    # the provider config (providers.llm[].stream_usage) to enable.
+    if provider_cfg.get("stream_usage"):
+        kwargs.setdefault("stream_usage", True)
 
     return ChatOpenAI(**kwargs)
-
-
-def _supports_guided_decoding(model: Any) -> bool:
-    """Check if the model/engine supports guided JSON decoding.
-
-    vLLM, SGLang, and other OpenAI-compatible local servers support
-    guided_json for schema-constrained sampling. OpenRouter does not
-    support this feature (it uses response_format tool extraction instead).
-
-    Args:
-        model: A model string (``"openrouter:qwen/qwen3-235b"``) or
-            a pre-built ``BaseChatModel`` instance.
-
-    Returns:
-        ``True`` if the model/engine supports guided decoding via
-        the ``guided_json`` parameter.
-    """
-    name = _extract_model_name(model)
-    # OpenRouter doesn't support guided_json
-    if "openrouter:" in str(model).lower():
-        return False
-    # Local OpenAI-compatible servers with base_url support it
-    return True
 
 
 def _extract_model_name(model: Any) -> str:

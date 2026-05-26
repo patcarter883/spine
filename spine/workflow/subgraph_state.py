@@ -167,6 +167,13 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     findings: Annotated[list[dict], _op_add]  # ResearchFindings dicts from explore nodes
     scratchpad: Annotated[str, _op_add]  # Working memory accumulator for GC
 
+    # Recall hits per topic from the topic_lookup node. Populated for the
+    # latest round's NEW topics only — older rounds' entries are not
+    # carried forward (already-explored topics won't be re-sent by the
+    # router). Each hit is {symbol_name, file_path, symbol_type, lang,
+    # enriched_summary, similarity}. Last-write-wins (no reducer).
+    topic_recall_hits: dict[str, list[dict]]
+
     # Classification from early commitment (for SPECIFY scope constraint)
     task_category: str | None
     classification_confidence: float  # 0.0-1.0 from classify_task —

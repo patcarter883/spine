@@ -338,7 +338,6 @@ class TestSubagentFactory:
         assert "edit_file" not in researcher_tools
         assert "read_edit_lint" not in researcher_tools
         assert "execute" not in researcher_tools
-        assert "read_file" in researcher_tools
         assert "ast_extract_symbol" in researcher_tools
 
         # Implementer writes via the linted compound tool, NOT raw write/edit.
