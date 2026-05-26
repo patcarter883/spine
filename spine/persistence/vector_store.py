@@ -74,10 +74,11 @@ class VectorStore:
         """Ensure the vector store tables exist.
 
         Creates the tables if they don't exist. Should be called once
-        during initialization.
+        during initialization. Idempotently migrates existing databases
+        by adding the ``lang`` column when absent.
         """
         conn = self._get_connection()
-        
+
         # Create metadata table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS symbol_metadata (
@@ -87,16 +88,26 @@ class VectorStore:
                 symbol_type TEXT NOT NULL,
                 enriched_summary TEXT NOT NULL,
                 raw_code TEXT NOT NULL,
+                lang TEXT NOT NULL DEFAULT 'python',
                 needs_enrichment BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
+        # Migrate older databases that pre-date the lang column.
+        try:
+            conn.execute(
+                "ALTER TABLE symbol_metadata ADD COLUMN lang TEXT NOT NULL DEFAULT 'python'"
+            )
+        except sqlite3.OperationalError:
+            # Column already exists — no-op.
+            pass
+
         # Create vector table using sqlite-vec's vec0 virtual table
         # The embedding column stores the vector as a BLOB
         conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS symbol_vectors 
+            CREATE VIRTUAL TABLE IF NOT EXISTS symbol_vectors
             USING vec0(embedding FLOAT[{self.EMBEDDING_DIM}])
         """)
 
@@ -120,6 +131,7 @@ class VectorStore:
         raw_code: str,
         embedding: np.ndarray,
         needs_enrichment: bool = False,
+        lang: str = "python",
     ) -> int:
         """Insert a symbol chunk with its embedding.
 
@@ -131,6 +143,7 @@ class VectorStore:
             raw_code: The raw source code.
             embedding: The embedding vector as numpy array.
             needs_enrichment: Flag for failed summarization.
+            lang: Source language (``python``, ``php``, ``typescript``).
 
         Returns:
             The ID of the inserted row.
@@ -139,10 +152,10 @@ class VectorStore:
 
         cursor = conn.execute(
             """
-            INSERT INTO symbol_metadata (file_path, symbol_name, symbol_type, enriched_summary, raw_code, needs_enrichment)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO symbol_metadata (file_path, symbol_name, symbol_type, enriched_summary, raw_code, needs_enrichment, lang)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (file_path, symbol_name, symbol_type, enriched_summary, raw_code, needs_enrichment),
+            (file_path, symbol_name, symbol_type, enriched_summary, raw_code, needs_enrichment, lang),
         )
         row_id = cursor.lastrowid
 
@@ -188,12 +201,13 @@ class VectorStore:
             params.insert(1, filter_by_type)
 
         query = f"""
-            SELECT 
+            SELECT
                 m.file_path,
                 m.symbol_name,
                 m.symbol_type,
                 m.enriched_summary,
                 m.raw_code,
+                m.lang,
                 1.0 - vec_distance_cosine(v.embedding, ?) as similarity
             FROM symbol_vectors v
             JOIN symbol_metadata m ON v.rowid = m.id
@@ -212,6 +226,7 @@ class VectorStore:
                     "symbol_type": row["symbol_type"],
                     "enriched_summary": row["enriched_summary"],
                     "raw_code": row["raw_code"],
+                    "lang": row["lang"],
                     "similarity": float(row["similarity"]),
                 }
             )
