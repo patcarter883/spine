@@ -129,3 +129,6 @@ class WorkflowState(TypedDict, total=False):
     # RAG retrieved context (for SPECIFY phase early commitment)
     task_category: str | None  # Classified task category for vector filtering
     retrieved_context: list[dict]  # Retrieved code chunks from vector store
+    classification_confidence: float  # 0.0-1.0 confidence from classify_task —
+    # used by the pre_research_gate to decide whether to skip the exploration
+    # loop and synthesize directly from recalled chunks.

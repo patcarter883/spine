@@ -50,6 +50,103 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 _DEFAULT_MAX_ROUNDS = 3
 
 
+# ── Node: pre_research_gate ─────────────────────────────────────────────
+
+
+async def _pre_research_gate(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Classify + recall once at entry. Sets fields used by ``_gate_router``.
+
+    Replaces the round-0 classify+recall block previously embedded in
+    ``_research_manager_node`` so the routing decision (skip exploration
+    vs. enter the loop) happens BEFORE we spend a round on the research
+    manager LLM call.
+
+    Fail-open: if classification or recall throws, return empty fields so
+    the router falls through to the existing exploration loop.
+    """
+    from spine.agents.classification import classify_task
+    from spine.agents.tools.recall_tool import RecallTool
+    from spine.config import SpineConfig
+
+    description = state.get("description", "")
+    work_id = state.get("work_id", "unknown")
+    phase = state.get("phase", "")
+
+    if not description:
+        logger.info("[%s] pre_research_gate: no description — fall through", work_id)
+        return {"classification_confidence": 0.0}
+
+    try:
+        classification = await classify_task(description, config)
+        task_category = classification.category
+        confidence = float(classification.confidence)
+        logger.info(
+            "[%s] pre_research_gate: %s confidence=%.2f",
+            work_id, task_category, confidence,
+        )
+    except Exception as exc:
+        logger.warning("[%s] pre_research_gate: classify failed — %s", work_id, exc)
+        return {"classification_confidence": 0.0}
+
+    retrieved: list[dict] = []
+    try:
+        cfg = SpineConfig.load()
+        recall = RecallTool(db_path=cfg.checkpoint_path)
+        # Only fetch full raw_code for SPECIFY (synth needs it inline). For
+        # PLAN we always re-run the exploration loop, so summaries are
+        # plenty — the loop builds its own context.
+        summaries_only = phase != PhaseName.SPECIFY.value
+        result_text = await recall._arun(
+            query=description,
+            k=cfg.recall_k,
+            task_category=task_category,
+            max_tokens=cfg.specify_context_token_budget,
+            summaries_only=summaries_only,
+        )
+        retrieved = json.loads(result_text).get("results", [])
+        logger.info(
+            "[%s] pre_research_gate: recall returned %d chunks (summaries_only=%s)",
+            work_id, len(retrieved), summaries_only,
+        )
+    except Exception as exc:
+        logger.warning("[%s] pre_research_gate: recall failed — %s", work_id, exc)
+
+    return {
+        "task_category": task_category,
+        "classification_confidence": confidence,
+        "retrieved_context": retrieved,
+    }
+
+
+def _gate_router(
+    state: ExplorationSubgraphState,
+) -> Literal["skip_to_synth", "explore"]:
+    """High-confidence + sufficient hits → synthesize directly.
+
+    Only SPECIFY gets the short-circuit; PLAN always runs the loop
+    (it needs the spec plus broader codebase research).
+    """
+    from spine.config import SpineConfig
+
+    phase = state.get("phase", "")
+    if phase != PhaseName.SPECIFY.value:
+        return "explore"
+
+    cfg = SpineConfig.load()
+    confidence = float(state.get("classification_confidence", 0.0) or 0.0)
+    hits = len(state.get("retrieved_context") or [])
+    if confidence >= cfg.recall_gate_confidence and hits >= cfg.recall_gate_min_hits:
+        logger.info(
+            "Recall gate firing: confidence=%.2f hits=%d → skip exploration",
+            confidence, hits,
+        )
+        return "skip_to_synth"
+    return "explore"
+
+
 # ── Node: research_manager ───────────────────────────────────────────────
 
 
@@ -356,12 +453,22 @@ async def _synthesize_specify(
                 "critic feedback.\n\n"
             )
 
+        # When the pre_research_gate fired (high confidence + sufficient
+        # hits), it skips the exploration loop and we synthesize directly
+        # from the recalled chunks.  Inject the raw per-symbol bodies
+        # (tree-sitter-sliced — single function bodies, not whole files)
+        # up to the configured token budget.
+        recall_section = _format_retrieved_context(
+            state.get("retrieved_context") or []
+        )
+
         prompt = (
             f"{rework_prefix}Create a detailed specification for the "
             f"following work, incorporating the codebase research "
             f"findings below.\n\n"
             f"## Work Description\n{description}\n\n"
             f"## Codebase Research Findings\n{findings_text}\n\n"
+            f"{recall_section}"
             f"Write the specification to "
             f"`{artifact_path(work_id, PhaseName.SPECIFY.value)}/specification.md` "
             f"using `write_file`."
@@ -456,6 +563,63 @@ def _compute_waves(
         return wave_dicts, None
     except (ValueError, KeyError, TypeError) as exc:
         return [], str(exc)
+
+
+def _count_tokens(text: str) -> int:
+    """Best-effort token count via tiktoken with a 4-char-per-token fallback."""
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return len(text) // 4
+
+
+def _format_retrieved_context(chunks: list[dict]) -> str:
+    """Render recalled chunks as code blocks, capped by ``specify_context_token_budget``.
+
+    Each chunk is a tree-sitter-sliced symbol body (Phase 1), so there is
+    no per-chunk truncation — we simply stop appending when adding the
+    next chunk would exceed the budget.
+    """
+    if not chunks:
+        return ""
+
+    from spine.config import SpineConfig
+
+    budget = SpineConfig.load().specify_context_token_budget
+    parts: list[str] = ["## Retrieved Codebase Context\n"]
+    used = _count_tokens(parts[0])
+
+    for i, chunk in enumerate(chunks, 1):
+        symbol = chunk.get("symbol_name", "unknown")
+        file_path = chunk.get("file_path", "unknown")
+        lang = chunk.get("lang", "")
+        raw = chunk.get("raw_code", "") or ""
+        if not raw:
+            # Summaries-only result — fall back to the enriched_summary.
+            summary = chunk.get("enriched_summary", "")
+            if not summary:
+                continue
+            block = f"### Chunk {i}: {symbol} ({file_path})\n{summary}\n\n"
+        else:
+            block = (
+                f"### Chunk {i}: {symbol} ({file_path})\n"
+                f"```{lang}\n{raw}\n```\n\n"
+            )
+
+        block_tokens = _count_tokens(block)
+        if used + block_tokens > budget:
+            logger.info(
+                "Context budget reached at chunk %d/%d (%d tokens)",
+                i - 1, len(chunks), used,
+            )
+            break
+        parts.append(block)
+        used += block_tokens
+
+    return "".join(parts)
 
 
 def _format_findings(findings: list[dict]) -> str:
@@ -670,6 +834,7 @@ def build_exploration_subgraph(
 
     builder = StateGraph(ExplorationSubgraphState)
 
+    builder.add_node("pre_research_gate", _pre_research_gate)
     builder.add_node("research_manager", _research_manager_node)
     builder.add_node("explore", _explore_node)
     builder.add_node("aggregate", _aggregate_node)
@@ -677,7 +842,15 @@ def build_exploration_subgraph(
     builder.add_node("synthesize", synthesizer)
     builder.add_node("save_artifacts", _save_exploration_artifacts)
 
-    builder.add_edge(START, "research_manager")
+    builder.add_edge(START, "pre_research_gate")
+
+    # pre_research_gate → skip exploration (high confidence + hits) OR
+    # fall through to the existing research_manager loop.
+    builder.add_conditional_edges(
+        "pre_research_gate",
+        _gate_router,
+        {"skip_to_synth": "synthesize", "explore": "research_manager"},
+    )
 
     # research_manager → Send("explore", ...) or → synthesize
     builder.add_conditional_edges(

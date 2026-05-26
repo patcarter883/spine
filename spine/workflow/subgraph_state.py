@@ -35,6 +35,7 @@ class SpecifySubgraphState(BaseSubgraphState, total=False):
     agent_response: str  # Agent's text response (captured for artifact fallback)
     task_category: str | None  # Classified task category from early commitment
     retrieved_context: list[dict]  # Retrieved code chunks from vector store
+    classification_confidence: float  # 0.0-1.0 from classify_task
 
 
 class PlanSubgraphState(BaseSubgraphState, total=False):
@@ -127,6 +128,11 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
 
     # Classification from early commitment (for SPECIFY scope constraint)
     task_category: str | None
+    classification_confidence: float  # 0.0-1.0 from classify_task —
+    # used by the pre_research_gate to decide whether to skip the exploration
+    # loop and synthesize directly from recalled chunks.
+    retrieved_context: list[dict]  # Chunks pulled by the pre_research_gate;
+    # injected into the SPECIFY synthesizer prompt when present.
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer
