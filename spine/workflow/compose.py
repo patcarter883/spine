@@ -168,13 +168,22 @@ def _tasks_state_mapper(parent_state: WorkflowState, config) -> dict:
 def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
     verify_attempts = parent_state.get("verify_attempts", 0)
+    execution_waves = parent_state.get("execution_waves", []) or []
+    pending: list[dict] = []
+    for wave in execution_waves:
+        if isinstance(wave, list):
+            for sl in wave:
+                if isinstance(sl, dict) and sl.get("id"):
+                    pending.append(sl)
     return {
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.IMPLEMENT.value,
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0),
         "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
         "gap_plan_path": artifact_path(work_id, PhaseName.GAP_PLAN.value) if verify_attempts > 0 else None,
-        "execution_waves": parent_state.get("execution_waves", []),
+        "pending_slices": pending,
+        "completed_slices": [],
+        "failed_slices": [],
     }
 
 

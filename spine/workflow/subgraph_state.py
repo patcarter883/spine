@@ -54,15 +54,56 @@ class TasksSubgraphState(BaseSubgraphState, total=False):
     spec_path: str  # Only for spec/critical_spec workflows
 
 
+def _slice_list_reducer(
+    existing: list[dict] | None,
+    update: list[dict] | dict | None,
+) -> list[dict]:
+    """Reducer for pending_slices / completed_slices / failed_slices.
+
+    Update shapes:
+      - ``list[dict]``  -> append (initial seed from state mapper).
+      - ``dict``        -> ``{"add": [...], "remove": ["<slice_id>", ...]}``
+                            directive; ids are matched against ``slice["id"]``.
+      - ``None``        -> no-op.
+
+    ``remove`` is idempotent: an id absent from ``existing`` is a no-op.
+    Within a super-step LangGraph applies parallel-Send updates through
+    the reducer sequentially, so two sibling Sends each emitting
+    ``{"remove": [...]}`` compose correctly.
+    """
+    base = list(existing or [])
+    if update is None:
+        return base
+    if isinstance(update, dict):
+        remove_ids = set(update.get("remove") or [])
+        if remove_ids:
+            base = [s for s in base if s.get("id") not in remove_ids]
+        adds = update.get("add") or []
+        if adds:
+            base.extend(adds)
+        return base
+    return base + list(update)
+
+
 class ImplementSubgraphState(BaseSubgraphState, total=False):
-    """IMPLEMENT phase — reads plan artifacts, dispatches slice-implementers."""
+    """IMPLEMENT phase — reads plan artifacts, dispatches slice-implementers.
+
+    Slice lists use ``_slice_list_reducer`` so a node can atomically
+    remove a slice (by id) and add new ones in a single update — this
+    is what lets the dispatch loop terminate even though pending and
+    failed slices are repeatedly re-routed via conditional edges.
+    """
 
     plan_path: str
     gap_plan_path: str | None  # Set when re-running for a gap fix
-    execution_waves: list  # Execution waves from PLAN phase (for wave dispatch)
 
-    # Accumulated per-slice results from parallel Send dispatch (operator.add)
-    slice_results: Annotated[list[dict], _op_add]
+    # Transient — populated per-Send by ``_route_slices``.
+    active_slice: dict
+
+    # Slice lists, all using the same custom reducer.
+    pending_slices: Annotated[list[dict], _slice_list_reducer]
+    completed_slices: Annotated[list[dict], _slice_list_reducer]
+    failed_slices: Annotated[list[dict], _slice_list_reducer]
 
     # ── Phase Completion Invariants ──
     slices_dispatched: bool  # True when slice-implementers were dispatched
