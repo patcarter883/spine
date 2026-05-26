@@ -6,8 +6,8 @@ spine:
   embedding_provider: local-embeddings
   recall_k: 3
   vector_indexing:
-    max_concurrent_chunks: 5
-    batch_size: 10
+    max_concurrent_chunks: 10
+    batch_size: 100
     summarize_temperature: 0.3
     embed_temperature: 0.1
 mcp_servers:
@@ -16,7 +16,7 @@ mcp_servers:
     command: mcp-codebase-index
     args: []
     env:
-      PROJECT_ROOT: /home/pat/Projects/spine
+      PROJECT_ROOT: /home/pat/projects/spine
 providers:
   llm:
   - name: glm
@@ -33,7 +33,7 @@ providers:
     type: deepagents-model
     model: openrouter:deepseek/deepseek-v4-pro
     enabled: true
-    guided_decoding: true
+    guided_decoding: false
 
   - name: laguna-m1
     type: deepagents-model
@@ -55,7 +55,7 @@ providers:
 
   - name: local
     type: deepagents-model
-    model: openai:model
+    model: openai:Qwen3.6-27B-MTP-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
     guided_decoding: true
@@ -70,32 +70,34 @@ providers:
   - name: tiny
     type: deepagents-model
     model: openai:Bonsai-8B-gguf
-    base_url: http://localhost:8010/v1
+    base_url: http://localhost:8000/v1
     api_key: vllm
   # Embedding providers
   embedding:
   - name: local-embeddings
     type: openai-embedding
     model: Qwen3-Embedding-8B-GGUF
-    base_url: http://localhost:8010/v1
+    base_url: http://localhost:8000/v1
     api_key: vllm
   phases:
     specify:
-      provider: deepseek-v4-flash
+      provider: pat
     plan:
-      provider: local
+      provider: pat
     critic:
-      provider: deepseek-v4-pro
+      provider: pat
     exploration:
-      provider: local
+      provider: pat
     implement:
-      provider: local
+      provider: pat
     implement/subagents/slice-implementer:
-      provider: local
+      provider: pat
     verify:
-      provider: deepseek-v4-pro
+      provider: pat
     gap_plan:
-      provider: local
+      provider: pat
     # RAG phase providers
     classification:
-      provider: tiny
+      provider: local
+    summarization:
+      provider: local
