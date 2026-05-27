@@ -114,7 +114,7 @@ async def _slice_implementer_node(
     """
     from spine.agents.factory import build_phase_agent
     from spine.agents.subagents import build_subagent_spec
-    from spine.tools.cvf import ReadEditLintTool
+    from spine.agents.tools.read_edit_lint import ReadEditLintTool
 
     work_id = state.get("work_id", "unknown")
     workspace_root = state.get("workspace_root", ".")

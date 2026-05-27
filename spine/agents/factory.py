@@ -114,6 +114,94 @@ def _is_anthropic_model(model: Any) -> bool:
     return False
 
 
+def _supports_cache_control(model: Any) -> bool:
+    """Return True if the model is Anthropic-backed (direct or via OpenRouter).
+
+    OpenRouter passes Anthropic ``cache_control`` markers through to the
+    upstream Anthropic API for the ``anthropic/*`` model family. Marking
+    a static-prefix breakpoint costs nothing for non-Anthropic providers
+    (they ignore the field) but unlocks prefix caching when the trace
+    actually does land on Anthropic.
+    """
+    if _is_anthropic_model(model):
+        return True
+    raw = ""
+    if isinstance(model, str):
+        raw = model
+    elif hasattr(model, "model_name"):
+        raw = str(getattr(model, "model_name", ""))
+    elif hasattr(model, "model"):
+        raw = str(getattr(model, "model", ""))
+    raw = raw.lower()
+    # openrouter:anthropic/claude-*, openrouter:anthropic/...
+    if raw.startswith("openrouter:") and "anthropic/" in raw:
+        return True
+    return False
+
+
+# ── Static-prefix cache marker ──────────────────────────────────────────
+
+
+class StaticPrefixCacheMiddleware:
+    """Mark the static system prefix with an Anthropic ephemeral cache breakpoint.
+
+    The factory assembles the system prompt as ``user_prompt + BASE_AGENT_PROMPT
+    + mcp_guidance``. The *base prompt + MCP guidance* portion is identical
+    across every turn of a given phase agent, so it is the right thing to
+    cache. We split the system message into two content blocks so the
+    cacheable static prefix lives in its own block, then stamp the
+    ``cache_control`` breakpoint on that block.
+
+    Implemented as a plain class rather than subclassing AgentMiddleware
+    because LangChain's middleware base lives at multiple import paths
+    depending on version — we duck-type with ``modify_request`` only.
+    """
+
+    def __init__(self, static_prefix: str) -> None:
+        self._static_prefix = static_prefix.strip()
+
+    def modify_request(self, request: Any) -> Any:
+        from langchain_core.messages import SystemMessage
+
+        if not self._static_prefix:
+            return request
+        sys_msg = getattr(request, "system_message", None)
+        if sys_msg is None:
+            return request
+
+        content = getattr(sys_msg, "content", None)
+        if not isinstance(content, str) or self._static_prefix not in content:
+            return request
+
+        idx = content.index(self._static_prefix)
+        head = content[:idx].rstrip()
+        tail = content[idx + len(self._static_prefix):].lstrip()
+
+        blocks: list[dict[str, Any]] = []
+        if head:
+            blocks.append({"type": "text", "text": head})
+        blocks.append({
+            "type": "text",
+            "text": self._static_prefix,
+            "cache_control": {"type": "ephemeral"},
+        })
+        if tail:
+            blocks.append({"type": "text", "text": tail})
+
+        new_sys = SystemMessage(content=blocks)
+        return request.override(system_message=new_sys)
+
+    # LangChain calls ``awrap_model_call`` or ``modify_request`` depending on
+    # version. Provide a passthrough wrap_model_call that delegates to
+    # modify_request semantics, since AgentMiddleware's default flow is to
+    # call modify_request before the model call.
+    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        return await handler(self.modify_request(request))
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        return handler(self.modify_request(request))
+
+
 # ── SPINE filesystem system prompt ───────────────────────────────────────
 # Replaces DA's default "All file paths must start with a /" prompt.
 # Under virtual_mode=True, paths are resolved relative to the workspace root.
@@ -323,6 +411,7 @@ def build_phase_agent(
         final_system_prompt = system_prompt + "\n\n" + base_prompt
 
     # ── MCP tool guidance ────────────────────────────────────────────
+    mcp_guidance = ""
     if mcp_tools:
         mcp_names = [getattr(t, "name", "?") for t in mcp_tools]
         mcp_guidance = (
@@ -336,6 +425,13 @@ def build_phase_agent(
         if len(mcp_names) > 10:
             mcp_guidance += f" and {len(mcp_names) - 10} more"
         final_system_prompt += mcp_guidance
+
+    # The static prefix — base prompt + MCP guidance — is what we want to
+    # mark with an ephemeral cache breakpoint.  It is identical across
+    # every turn of this phase agent, and lives entirely inside the
+    # system message.  Pass it through to the middleware stack so the
+    # StaticPrefixCacheMiddleware can find and stamp it.
+    static_cacheable_prefix = (base_prompt + mcp_guidance).strip()
 
     # ── Memory ───────────────────────────────────────────────────────
     memory = resolve_memory(workspace_root, phase=phase.value)
@@ -370,6 +466,7 @@ def build_phase_agent(
         skills=skills,
         allowed_tools=allowed_tools,
         skip_filesystem_middleware=skip_filesystem_middleware,
+        static_cacheable_prefix=static_cacheable_prefix,
     )
 
     # ── Context schema ───────────────────────────────────────────────
@@ -432,6 +529,7 @@ def _build_middleware_stack(
     skills: list[str] | None,
     allowed_tools: list[str] | None = None,
     skip_filesystem_middleware: bool = False,
+    static_cacheable_prefix: str | None = None,
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
@@ -545,11 +643,12 @@ def _build_middleware_stack(
         except Exception:
             pass
 
-    # 11. Prompt caching — only for Anthropic models.
-    #     Non-Anthropic models (OpenRouter, OpenAI, local) don't support
-    #     Anthropic cache_control breakpoints.  Skip entirely to avoid
-    #     per-turn isinstance check overhead and misleading "ran 30 times"
-    #     metrics in traces.
+    # 11. Prompt caching — mark the static system prefix with an Anthropic
+    #     ephemeral cache breakpoint. Honored by direct Anthropic API and
+    #     OpenRouter Anthropic routes; silently ignored by other providers
+    #     (the field is added once per turn, negligible overhead).
+    if static_cacheable_prefix and _supports_cache_control(model):
+        middleware.append(StaticPrefixCacheMiddleware(static_cacheable_prefix))
     if _is_anthropic_model(model):
         middleware.append(AnthropicPromptCachingMiddleware())
 

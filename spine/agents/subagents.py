@@ -141,12 +141,8 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
         "| What does function X call? | `mcp_codebase-index_get_dependencies` |\n"
         "| Who calls function X? | `mcp_codebase-index_get_dependents` |\n"
-        "| What breaks if I change X? | `mcp_codebase-index_get_change_impact` |\n"
-        "| How does X connect to Y? | `mcp_codebase-index_get_call_chain` |\n"
         "| Show me function X's code | `mcp_codebase-index_get_function_source` |\n"
-        "| What files match pattern X? | `mcp_codebase-index_list_files` |\n"
-        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n"
-        "| High-level project overview | `mcp_codebase-index_get_project_summary` |\n\n"
+        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n\n"
         "## Tool surface\n"
         "### Primary (use these FIRST)\n"
         "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type). "
@@ -157,22 +153,9 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         'Call with `{"name": "symbol_name"}`.\n'
         "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol. "
         'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_change_impact` — direct + transitive dependents. "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_call_chain` — BFS path between two symbols. "
-        'Call with `{"from_name": "A", "to_name": "B"}`.\n'
         "- `mcp_codebase-index_search_codebase` — regex search across all files. "
-        'Call with `{"pattern": "regex", "max_results": 20}`.\n'
-        "- `mcp_codebase-index_list_files` — list files matching a glob pattern. "
-        'Call with `{"pattern": "*.py"}`.\n'
-        "- `mcp_codebase-index_get_project_summary` — file count, packages, top symbols. "
-        "No arguments needed.\n"
-        "- `mcp_codebase-index_get_classes` — list classes with methods and bases. "
-        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
-        "- `mcp_codebase-index_get_functions` — list functions with params. "
-        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
-        "- `mcp_codebase-index_get_imports` — list imports for a file. "
-        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n\n'
+        'Call with `{"pattern": "regex", "max_results": 20}`. Output is capped to ~8 KB / 50 hits; '
+        "refine the regex (anchors, file globs) rather than retrying naively.\n\n"
         "### Fallback (only when MCP tools don't have what you need)\n"
         "- `ast_extract_symbol` — fetch a single named symbol's body from the "
         "vector index (filesystem fallback when the symbol isn't indexed yet). "
@@ -246,12 +229,8 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
         "| What does function X call? | `mcp_codebase-index_get_dependencies` |\n"
         "| Who calls function X? | `mcp_codebase-index_get_dependents` |\n"
-        "| What breaks if I change X? | `mcp_codebase-index_get_change_impact` |\n"
-        "| How does X connect to Y? | `mcp_codebase-index_get_call_chain` |\n"
         "| Show me function X's code | `mcp_codebase-index_get_function_source` |\n"
-        "| What files match pattern X? | `mcp_codebase-index_list_files` |\n"
-        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n"
-        "| High-level project overview | `mcp_codebase-index_get_project_summary` |\n\n"
+        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n\n"
         "## Tool surface\n"
         "### Primary (use these FIRST)\n"
         "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type). "
@@ -262,22 +241,9 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         'Call with `{"name": "symbol_name"}`.\n'
         "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol. "
         'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_change_impact` — direct + transitive dependents. "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_call_chain` — BFS path between two symbols. "
-        'Call with `{"from_name": "A", "to_name": "B"}`.\n'
         "- `mcp_codebase-index_search_codebase` — regex search across all files. "
-        'Call with `{"pattern": "regex", "max_results": 20}`.\n'
-        "- `mcp_codebase-index_list_files` — list files matching a glob pattern. "
-        'Call with `{"pattern": "*.py"}`.\n'
-        "- `mcp_codebase-index_get_project_summary` — file count, packages, top symbols. "
-        "No arguments needed.\n"
-        "- `mcp_codebase-index_get_classes` — list classes with methods and bases. "
-        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
-        "- `mcp_codebase-index_get_functions` — list functions with params. "
-        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n'
-        "- `mcp_codebase-index_get_imports` — list imports for a file. "
-        'Call with `{"file_path": "path/to/file.py"}` or no args for all.\n\n'
+        'Call with `{"pattern": "regex", "max_results": 20}`. Output is capped to ~8 KB / 50 hits; '
+        "refine the regex (anchors, file globs) rather than retrying naively.\n\n"
         "### Fallback (only when MCP tools don't have what you need)\n"
         "- `ast_extract_symbol` — fetch a single named symbol's body from the "
         "vector index (filesystem fallback when the symbol isn't indexed yet). "
@@ -491,6 +457,20 @@ PHASE_SUBAGENTS: dict[str, list[str]] = {
 # ── Factory functions ──────────────────────────────────────────────────
 
 
+# MCP tools the researcher (Explore) loop is actually allowed to call.
+# The upstream codebase-index server exposes 21+ tools, but the researcher
+# prompts (Blueprint Scout / Architectural Scout) only describe these five.
+# Loading the others is dead schema in the prefix — each tool description
+# costs ~150-400 prefix tokens per researcher turn. Trim aggressively.
+_RESEARCHER_MCP_ALLOWLIST: frozenset[str] = frozenset({
+    "mcp_codebase-index_find_symbol",
+    "mcp_codebase-index_get_function_source",
+    "mcp_codebase-index_get_dependencies",
+    "mcp_codebase-index_get_dependents",
+    "mcp_codebase-index_search_codebase",
+})
+
+
 def _inject_mcp_tools(
     tools: list, workspace_root: str, *, subagent_name: str = "researcher"
 ) -> None:
@@ -521,6 +501,8 @@ def _inject_mcp_tools(
             cache_key=cache_key,
             workspace_root=workspace_root,
         )
+        if subagent_name == "researcher":
+            mcp_tools = [t for t in mcp_tools if t.name in _RESEARCHER_MCP_ALLOWLIST]
         tools.extend(mcp_tools)
         logger.debug("Injected %d MCP tools into %s subagent", len(mcp_tools), subagent_name)
     except Exception:
@@ -783,13 +765,17 @@ def build_subagent_spec(
         _inject_mcp_tools(tools, workspace_root, subagent_name=name)
 
     # ── Build spec ───────────────────────────────────────────────
-    # ToolOutputTrimmer REMOVED from the entire SPINE stack (2026-05 directive).
-    # It was aggressively discarding full file-read & execute outputs that
-    # leaf sub-agents (slice-implementer / slice-verifier) critically needed,
-    # directly causing the 40+:1 prompt:completion ratios seen in traces
-    # 019e486e… and 019e488f….
-    # Context control now comes ONLY from tight system prompts + read cache.
+    # ToolOutputTrimmer is intentionally absent from leaf code-producing
+    # subagents (slice-implementer / slice-verifier) — they need full
+    # file-read & execute outputs to do their job. The researcher subagent
+    # is different: it is a survey loop that synthesises findings, so old
+    # tool results past the recent window are safe to evict to a metadata
+    # placeholder. This caps Explore transcripts at ~30 K tokens given the
+    # 8 KB cap on `mcp_codebase-index_search_codebase` output.
     subagent_middleware: list[Any] = []
+    if name == "researcher":
+        from spine.agents.context_editing import ToolOutputTrimmer
+        subagent_middleware.append(ToolOutputTrimmer(max_full_tool_results=8))
 
     spec: dict[str, Any] = {
         "name": name,

@@ -86,48 +86,15 @@ Don't pound the same broken approach.
 - Be concise in reasoning. Reserve verbosity for the final artifact.
 - **Batch independent operations.** When you need to read ≥2 files or run ≥2 \
 searches, make all calls in one response instead of sequentially.
-- **Use the interpreter (eval) for orchestration.** When processing ≥3 files \
-or dispatching ≥2 subagents, write a JS program in eval that reads files, \
-dispatches work, and returns only the synthesis. \
-PTC tool names are camelCase (`tools.readFile`), arguments are snake_case \
-(`{file_path: '...'}`), and return values are native JS types — \
-`readFile` returns a string, not an object.
-
-## Interpreter Environment (QuickJS)
-
-The `eval` tool runs in **QuickJS**, a server-side JS sandbox — NOT Node.js.
-The following Node.js / browser APIs DO NOT exist and will throw errors:
-
-- ``require()`` — no module system
-- ``import`` / ``export`` — no ES modules
-- ``fs`` — no filesystem access (use PTC ``tools.readFile`` instead)
-- ``process`` — no Node.js process object
-- ``window`` — use ``globalThis`` instead (QuickJS has no browser globals)
-- ``fetch`` / ``XMLHttpRequest`` — no network access
-
-**Available:** ``globalThis`` (persistent state across turns), ``console.log``
-(for output), ``Promise``, ``async/await``, ``JSON``, and
-``globalThis.tools`` (PTC tool bindings, when enabled).
 
 ## Tools
 
 Tool descriptions are provided by the runtime. Follow these principles:
 - Read before write — inspect existing code before modifying it.
 - Test after write — run tests immediately after making changes.
-- Use `task` subagents for parallel work on independent slices.
-- Use `eval` to orchestrate multi-step workflows in code, not conversation.
-- **Context is L1 cache; conversation history is swap.** Before reading a file,
-  check if it's already been read this phase — the read cache in runtime
-  context stores a metadata summary of every file read.
-- **Never re-read a file in the same phase.** If a file is already cached,
-  use the cached summary (saved in the runtime context read_cache) instead of
-  calling read_file again. The cache includes line counts and symbol names
-  so you know what's in each file without re-reading.
-- **Token budget: 60K prompt token target.** After 60K tokens, the
-  read cache prevents duplicate file reads, keeping context growth linear.
-  Batch reads, use eval for multi-step orchestration, and produce compact
-  artifacts. Evicted tool results appear as structured metadata like
-  `[read: path (N lines) — symbols]` — use these hints instead of re-reading.
+- Do not re-read a file already read this phase. The runtime keeps a
+  read cache; rely on its summary (line count + symbols) instead of
+  calling read_file again.
 
 ## Workflow Context
 
