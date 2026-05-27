@@ -210,6 +210,8 @@ async def run_research_manager(
     round_num = state.get("research_round", 0)
     max_rounds = state.get("max_rounds", 3)
     work_id = state.get("work_id", "unknown")
+    retry_count = state.get("retry_count", 0)
+    last_critic_review = state.get("last_critic_review") or {}
     phase = state.get("phase")
     if phase is None:
         raise ValueError(
@@ -280,10 +282,38 @@ async def run_research_manager(
                     pass
 
     findings_summary = _summarize_findings(findings)
+
+    # Rework context: when the critic rejected the prior pass, the manager
+    # must see the verdict and the prior research so it can target gaps
+    # rather than repeat the same exploration. Seeded `findings`/`topics`
+    # already carry the prior research_log into state; this section makes
+    # the rework framing explicit and asks for gap-targeted topics.
+    rework_section = ""
+    if retry_count > 0 and last_critic_review:
+        suggestions = last_critic_review.get("suggestions") or []
+        sug_text = (
+            "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  (none)"
+        )
+        rework_section = (
+            "## ⚠ Rework Pass — Critic Rejected Prior Output\n"
+            f"Attempt: {last_critic_review.get('attempt', retry_count + 1)}\n"
+            f"Verdict: {last_critic_review.get('status', 'needs_revision')} "
+            f"(tier: {last_critic_review.get('tier', 'unknown')})\n"
+            f"Reason: {last_critic_review.get('reason', '')}\n"
+            f"Suggestions:\n{sug_text}\n\n"
+            "The 'Topics Already Explored' and 'Findings So Far' sections "
+            "below carry the prior research_log. Do NOT re-explore the same "
+            "ground — propose 2-4 NEW topics that close the specific gaps "
+            "the critic flagged. If the prior research is already sufficient "
+            "to address the verdict, decide 'done' so synthesis can rework "
+            "with the existing findings.\n\n"
+        )
+
     context = (
         f"## Work Description\n{description}\n\n"
         f"{spec_section}"
         f"{recall_section}"
+        f"{rework_section}"
         f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
         f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
         f"## Findings So Far\n{findings_summary}\n\n"
@@ -541,9 +571,18 @@ async def run_explore_node(
             e,
             exc_info=True,
         )
+        # Keep the user-visible summary terse — full traceback stays in logs
+        # via exc_info=True. Embedding str(e) directly used to leak multi-line
+        # Pydantic / MCP errors straight into ResearchFindings.summary.
+        err_str = str(e).splitlines()[0].strip() if str(e).strip() else type(e).__name__
+        if len(err_str) > 300:
+            err_str = err_str[:299] + "…"
         findings = [
             {
-                "summary": f"Research failed for topic '{topic_str}': {e}",
+                "summary": (
+                    f"Research failed for topic '{topic_str}': "
+                    f"{type(e).__name__}: {err_str}"
+                ),
                 "patterns": [],
                 "file_map": {},
                 "dependencies": [],

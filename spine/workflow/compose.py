@@ -131,11 +131,59 @@ def _base_state_mapper(parent_state: WorkflowState, config) -> dict:
     }
 
 
+def _load_prior_research(
+    workspace_root: str,
+    work_id: str,
+    phase: str,
+) -> tuple[list[str], list[dict]]:
+    """Read research_log.json from the phase's artifact dir.
+
+    Returns ``(topics, findings)`` so the rework pass can seed the
+    exploration subgraph with prior research instead of starting fresh
+    and repeating the same exploration the critic just rejected.
+    Returns empty lists if the log is missing or unreadable.
+    """
+    import json as _json
+
+    from pathlib import Path as _Path
+
+    log_path = (
+        _Path(workspace_root)
+        / ".spine"
+        / "artifacts"
+        / work_id
+        / phase
+        / "research_log.json"
+    )
+    if not log_path.exists():
+        return [], []
+    try:
+        data = _json.loads(log_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [], []
+    topics = data.get("topics") or []
+    findings = data.get("findings") or []
+    return (
+        [t for t in topics if isinstance(t, str)],
+        [f for f in findings if isinstance(f, dict)],
+    )
+
+
 def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
+    workspace_root = parent_state.get("workspace_root", ".")
+    work_id = parent_state.get("work_id", "")
+    retry_count = parent_state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0)
+    base = _base_state_mapper(parent_state, config)
+    if retry_count > 0:
+        prior_topics, prior_findings = _load_prior_research(
+            workspace_root, work_id, PhaseName.SPECIFY.value
+        )
+        base["topics"] = prior_topics
+        base["findings"] = prior_findings
     return {
-        **_base_state_mapper(parent_state, config),
+        **base,
         "phase": PhaseName.SPECIFY.value,
-        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0),
+        "retry_count": retry_count,
         "scratchpad": parent_state.get("scratchpad", ""),
         "task_category": parent_state.get("task_category"),
     }
@@ -143,11 +191,20 @@ def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
 
 def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
+    workspace_root = parent_state.get("workspace_root", ".")
+    retry_count = parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
+    base = _base_state_mapper(parent_state, config)
+    if retry_count > 0:
+        prior_topics, prior_findings = _load_prior_research(
+            workspace_root, work_id, PhaseName.PLAN.value
+        )
+        base["topics"] = prior_topics
+        base["findings"] = prior_findings
     # All work types now run specify, so has_spec is always True
     return {
-        **_base_state_mapper(parent_state, config),
+        **base,
         "phase": PhaseName.PLAN.value,
-        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0),
+        "retry_count": retry_count,
         "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
         "has_spec": True,
         "scratchpad": parent_state.get("scratchpad", ""),

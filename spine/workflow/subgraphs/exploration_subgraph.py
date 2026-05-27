@@ -127,12 +127,23 @@ def _gate_router(
     """High-confidence + sufficient hits → synthesize directly.
 
     Only SPECIFY gets the short-circuit; PLAN always runs the loop
-    (it needs the spec plus broader codebase research).
+    (it needs the spec plus broader codebase research). On a rework
+    pass (retry_count > 0) the short-circuit is disabled — the critic
+    rejected the prior output, so re-synthesizing from the same recall
+    chunks without re-running the research manager (with prior findings
+    + critic feedback) would just repeat the work.
     """
     from spine.config import SpineConfig
 
     phase = state.get("phase", "")
     if phase != PhaseName.SPECIFY.value:
+        return "explore"
+
+    if int(state.get("retry_count", 0) or 0) > 0:
+        logger.info(
+            "Recall gate skipped: retry_count>0 — routing through research_manager "
+            "with prior findings + critic feedback",
+        )
         return "explore"
 
     cfg = SpineConfig.load()
