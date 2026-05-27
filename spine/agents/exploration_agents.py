@@ -17,7 +17,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
@@ -701,35 +701,24 @@ async def run_explore_node(
 
     except Exception as e:
         # Recursion-cap salvage: _ainvoke_explore_collecting attaches the
-        # last-seen state dict to the exception. If any assistant messages
-        # accumulated before the cap fired, run the same finalize +
-        # extract pipeline used on the happy path so the synthesizer
-        # downstream still gets useful findings from this branch.
+        # last-seen state dict to the exception. We build an evidence
+        # dossier from ToolMessage results (the actual research data),
+        # not from the last AIMessage text — when the cap fires the last
+        # text message is typically the topic restatement, which the
+        # finalize call would just paraphrase back as a fake summary.
+        # Salvage is accepted only when the structured response contains
+        # at least one concrete field (file_map / patterns / dependencies);
+        # otherwise we fall through to the error sentinel so the user-
+        # visible outcome is a real error rather than a hallucinated
+        # restatement of the topic.
         partial_state = getattr(e, "partial_state", None) if isinstance(e, GraphRecursionError) else None
         salvaged: list[dict] | None = None
         if partial_state and partial_state.get("messages"):
-            msg_count = len(partial_state.get("messages", []))
-            logger.warning(
-                "[%s] Recursion cap hit for topic=%r after %d messages; salvaging partial findings",
-                work_id,
-                topic_str,
-                msg_count,
+            salvaged = await _attempt_research_salvage(
+                partial_state, subagent_spec.get("model"), topic_str, work_id
             )
-            try:
-                await _finalize_research_findings(partial_state, subagent_spec.get("model"))
-                candidate = _extract_findings(partial_state)
-                if candidate and candidate[0].get("summary") not in ("", "(no findings)"):
-                    for f in candidate:
-                        if isinstance(f, dict):
-                            if "topic" not in f:
-                                f["topic"] = topic_str
-                            f["partial"] = True
-                    salvaged = candidate
-                    result = partial_state
-            except Exception:
-                logger.warning(
-                    "[%s] Salvage finalize failed for topic=%r", work_id, topic_str, exc_info=True
-                )
+            if salvaged is not None:
+                result = partial_state
 
         if salvaged is not None:
             findings = salvaged
@@ -906,6 +895,180 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
         return
 
     result["structured_response"] = parsed
+
+
+# Per-section cap for tool result bodies in the salvage evidence dossier.
+# MCP results can be tens of KB (function source, search hits) — clamp each
+# section so the salvage finalize prompt stays bounded regardless of how
+# many turns ran before the cap fired.
+_SALVAGE_SECTION_CHAR_CAP = 2000
+
+# If the assembled evidence is shorter than this, treat it as "nothing
+# usable accumulated" and skip salvage entirely. Calibrated above the
+# length of a typical empty-tool-result error message so a single failed
+# lookup doesn't get treated as a real finding.
+_SALVAGE_MIN_EVIDENCE_CHARS = 200
+
+
+def _collect_salvage_evidence(messages: list) -> str:
+    """Build an evidence dossier from a researcher's partial message history.
+
+    Walks ``messages`` in order and extracts ``ToolMessage`` contents (the
+    real research data — symbol bodies, dependency lists, search hits) plus
+    any non-empty ``AIMessage`` content (intermediate synthesis attempts).
+    Skips ``HumanMessage`` / ``SystemMessage`` so the dossier doesn't echo
+    the topic prompt back into the finalize call.
+
+    Returns the concatenated dossier, or ``""`` if nothing substantive
+    accumulated.
+    """
+    sections: list[str] = []
+    for msg in messages:
+        content = getattr(msg, "content", "")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if isinstance(msg, ToolMessage):
+            tool_name = getattr(msg, "name", None) or "tool"
+            body = content.strip()
+            if len(body) > _SALVAGE_SECTION_CHAR_CAP:
+                body = body[: _SALVAGE_SECTION_CHAR_CAP - 1] + "…"
+            sections.append(f"### Tool result: {tool_name}\n{body}")
+        elif isinstance(msg, AIMessage):
+            sections.append(f"### Intermediate synthesis\n{content.strip()}")
+    return "\n\n".join(sections)
+
+
+async def _finalize_research_findings_from_evidence(
+    result: dict, model: Any, evidence: str
+) -> None:
+    """Salvage-mode finalize: coerce a tool-result dossier into ResearchFindings.
+
+    Unlike :func:`_finalize_research_findings`, which assumes the
+    researcher produced a clean final synthesis message, this variant runs
+    when the LangGraph recursion cap fired mid-investigation. The
+    ``evidence`` argument is the raw tool-result dossier from
+    :func:`_collect_salvage_evidence`; the prompt explicitly frames it as
+    partial evidence (not a finished report) and forbids using the
+    research topic to fabricate fields when the dossier has no support
+    for them.
+
+    Mutates ``result`` in place on success.
+    """
+    from spine.agents.subagents import ResearchFindings
+
+    if model is None or not evidence:
+        return
+
+    try:
+        structured_model = model.with_structured_output(ResearchFindings)
+    except Exception:
+        logger.debug(
+            "Model does not support with_structured_output; skipping salvage finalize",
+            exc_info=True,
+        )
+        return
+
+    salvage_prompt = (
+        "The researcher agent ran out of steps before producing a final "
+        "synthesis. Below is the raw evidence it gathered — tool results "
+        "from symbol lookups, dependency queries, and codebase searches, "
+        "plus any intermediate synthesis attempts.\n\n"
+        "Convert this evidence into the ResearchFindings JSON schema. "
+        "STRICT RULES:\n"
+        "- Use ONLY information present in the evidence below.\n"
+        "- Do NOT use the research topic name to fill in fields. If the "
+        "evidence does not mention a file, pattern, or dependency, do not "
+        "invent one.\n"
+        "- file_map paths MUST appear in the tool results (as file paths, "
+        "symbol locations, or import targets).\n"
+        "- If a field has no support in the evidence, leave it empty "
+        "(``[]`` for lists, ``{}`` for file_map).\n"
+        "- summary should describe what was actually discovered in the "
+        "tool results, not what the agent was asked to investigate.\n\n"
+        "## Evidence\n" + evidence
+    )
+    try:
+        parsed = await structured_model.ainvoke(
+            [HumanMessage(content=salvage_prompt)]
+        )
+    except Exception as e:
+        logger.warning("Salvage finalization failed: %s", e)
+        return
+
+    result["structured_response"] = parsed
+
+
+async def _attempt_research_salvage(
+    partial_state: dict,
+    model: Any,
+    topic_str: str,
+    work_id: str,
+) -> list[dict] | None:
+    """Decide whether a researcher's partial state yields usable findings.
+
+    Returns a list of finding dicts (each stamped ``partial=True`` and
+    ``topic``) on success, or ``None`` when the caller should fall through
+    to the error sentinel — either because nothing substantive
+    accumulated, because the salvage finalize call failed, or because the
+    structured response contained no concrete fields and would just be a
+    hallucinated paraphrase of the topic.
+    """
+    messages = partial_state.get("messages", [])
+    msg_count = len(messages)
+    evidence = _collect_salvage_evidence(messages)
+    if len(evidence) < _SALVAGE_MIN_EVIDENCE_CHARS:
+        logger.warning(
+            "[%s] Recursion cap hit for topic=%r after %d messages; "
+            "evidence too thin (%d chars) — skipping salvage",
+            work_id,
+            topic_str,
+            msg_count,
+            len(evidence),
+        )
+        return None
+
+    logger.warning(
+        "[%s] Recursion cap hit for topic=%r after %d messages; "
+        "salvaging from %d chars of evidence",
+        work_id,
+        topic_str,
+        msg_count,
+        len(evidence),
+    )
+    try:
+        await _finalize_research_findings_from_evidence(partial_state, model, evidence)
+    except Exception:
+        logger.warning(
+            "[%s] Salvage finalize failed for topic=%r",
+            work_id,
+            topic_str,
+            exc_info=True,
+        )
+        return None
+
+    candidate = _extract_findings(partial_state)
+    first = candidate[0] if candidate else {}
+    has_real_content = (
+        bool(first.get("file_map"))
+        or bool(first.get("patterns"))
+        or bool(first.get("dependencies"))
+    )
+    if not has_real_content:
+        logger.warning(
+            "[%s] Salvage rejected for topic=%r: "
+            "no concrete file_map / patterns / dependencies "
+            "in structured output — falling through to error sentinel",
+            work_id,
+            topic_str,
+        )
+        return None
+
+    for f in candidate:
+        if isinstance(f, dict):
+            if "topic" not in f:
+                f["topic"] = topic_str
+            f["partial"] = True
+    return candidate
 
 
 def _extract_findings(result: dict) -> list[dict]:
