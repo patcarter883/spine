@@ -28,14 +28,12 @@ _PHASE_SEQUENCE: dict[str, list[str]] = {
         "implement",
         "verify",
     ],
-    "reviewed_task": ["specify", "plan", "critic_plan", "implement", "verify"],
+    "reviewed_task": ["specify", "plan", "critic_plan"],
     "critical_reviewed_task": [
         "specify",
         "critic_specify",
         "plan",
         "critic_plan",
-        "implement",
-        "verify",
     ],
 }
 

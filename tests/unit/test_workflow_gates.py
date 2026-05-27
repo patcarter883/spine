@@ -514,3 +514,58 @@ class TestWorkflowCompositionGates:
                 f"work_type={work_type}: TASKS should not appear in workflow "
                 f"sequence. Found phases: {phase_names}"
             )
+
+
+class TestReviewedTaskHumanApprovalGate:
+    """Reviewed work types MUST terminate before implement.
+
+    The human-review gate for reviewed_task / critical_reviewed_task is the
+    graph reaching END after critic_plan: the dispatcher then relabels
+    "completed" → "awaiting_approval" and the user approves via
+    approve_and_spawn (which spawns fresh ``task`` items for execution).
+
+    If the sequence ever includes IMPLEMENT or VERIFY again, the human gate
+    is bypassed — implementation runs before any human looks at the plan.
+    This was a real regression once; these tests exist so it can't recur.
+    """
+
+    def test_reviewed_task_sequence_stops_at_critic_plan(self):
+        from spine.models.enums import PhaseName
+        from spine.workflow.compose import WORKFLOW_SEQUENCES
+
+        sequence = WORKFLOW_SEQUENCES["reviewed_task"]
+        phase_names = [name for name, _ in sequence]
+        assert phase_names[-1] == f"{PhaseName.CRITIC.value}_plan", (
+            f"reviewed_task must end at critic_plan, got: {phase_names}"
+        )
+        assert PhaseName.IMPLEMENT.value not in phase_names
+        assert PhaseName.VERIFY.value not in phase_names
+
+    def test_critical_reviewed_task_sequence_stops_at_critic_plan(self):
+        from spine.models.enums import PhaseName
+        from spine.workflow.compose import WORKFLOW_SEQUENCES
+
+        sequence = WORKFLOW_SEQUENCES["critical_reviewed_task"]
+        phase_names = [name for name, _ in sequence]
+        assert phase_names[-1] == f"{PhaseName.CRITIC.value}_plan", (
+            f"critical_reviewed_task must end at critic_plan, got: {phase_names}"
+        )
+        assert PhaseName.IMPLEMENT.value not in phase_names
+        assert PhaseName.VERIFY.value not in phase_names
+
+    def test_reviewed_task_graph_has_no_implement_node(self):
+        """Compiled graph for reviewed types must not contain implement/verify nodes."""
+        from spine.models.enums import PhaseName
+        from spine.workflow.compose import build_workflow_graph
+
+        for work_type in ("reviewed_task", "critical_reviewed_task"):
+            graph = build_workflow_graph(work_type)
+            nodes = set(graph.get_graph().nodes.keys())
+            assert PhaseName.IMPLEMENT.value not in nodes, (
+                f"{work_type}: implement node leaked into compiled graph — "
+                f"the human-review gate would be bypassed. Nodes: {sorted(nodes)}"
+            )
+            assert PhaseName.VERIFY.value not in nodes, (
+                f"{work_type}: verify node leaked into compiled graph. "
+                f"Nodes: {sorted(nodes)}"
+            )

@@ -27,10 +27,10 @@ def critical_task_graph():
 
 
 def reviewed_task_graph():
-    """REVIEWED_TASK: specify → plan → critic_plan → implement → verify (pauses for approval after critic_plan)."""
+    """REVIEWED_TASK: specify → plan → critic_plan, then ENDs for human approval."""
     return build_workflow_graph("reviewed_task")
 
 
 def critical_reviewed_task_graph():
-    """CRITICAL_REVIEWED_TASK: specify → critic_specify → plan → critic_plan → implement → verify (pauses for approval after critic_plan)."""
+    """CRITICAL_REVIEWED_TASK: specify → critic_specify → plan → critic_plan, then ENDs for human approval."""
     return build_workflow_graph("critical_reviewed_task")

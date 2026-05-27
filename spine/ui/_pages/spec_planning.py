@@ -58,10 +58,10 @@ def _render_submit_tab(api: UIApi) -> None:
         "Planning Workflow",
         options=["reviewed_task", "critical_reviewed_task"],
         format_func=lambda x: {
-            "reviewed_task": "📋 Reviewed Task (SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY)",
-            "critical_reviewed_task": "📐 Critical Reviewed Task (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY)",
+            "reviewed_task": "📋 Reviewed Task (SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs)",
+            "critical_reviewed_task": "📐 Critical Reviewed Task (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs)",
         }.get(x, x),
-        help="Planning workflows pause for approval after the critic_plan phase. Once approved, they continue through implement and verify.",
+        help="Planning workflows stop after the critic_plan phase. On approval, fresh task work items are spawned for execution.",
     )
 
     if st.button("🚀 Submit Planning Work", type="primary", disabled=not description.strip()):
@@ -88,10 +88,12 @@ def _render_submit_tab(api: UIApi) -> None:
     st.markdown("""
     | Type | Phases | Use Case |
     |------|--------|----------|
-    | **Reviewed Task** | SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY | Standard planning with plan review |
-    | **Critical Reviewed Task** | SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → IMPLEMENT → VERIFY | Full planning with spec critic review |
+    | **Reviewed Task** | SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs | Standard planning with plan review |
+    | **Critical Reviewed Task** | SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs | Full planning with spec critic review |
 
-    After a plan is approved, the workflow continues through implement and verify.
+    On approval, fresh ``task`` work items are spawned for each unit and run
+    through their own implement/verify cycle. The reviewed-task graph itself
+    never runs implement/verify directly — that's what the human gate guards.
     """)
 
 

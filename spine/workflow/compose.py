@@ -19,12 +19,14 @@ that; there is no reason for a human review gate between those two phases.
 Phase sequences by WorkType:
     task:              SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
     critical_task:     SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
-    reviewed_task:     SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
-    critical_reviewed: SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+    reviewed_task:     SPECIFY → PLAN → CRITIC_PLAN  (graph ENDs; awaits human approval)
+    critical_reviewed: SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN  (graph ENDs; awaits human approval)
 
-Note: reviewed_task and critical_reviewed_task share identical phase sequences
-with their non-reviewed counterparts. The difference is handled at the stream
-level via ``interrupt_after=["critic_plan"]`` in submit_work().
+Reviewed work types intentionally terminate after ``critic_plan``. The
+graph never runs IMPLEMENT/VERIFY directly — when the human approves
+the plan via ``approve_and_spawn``, fresh ``task`` work items are
+spawned for execution. Letting the graph fall through to IMPLEMENT
+would defeat the entire purpose of the human-review gate.
 """
 
 from typing import Any, Callable, Optional
@@ -509,9 +511,15 @@ def _gap_plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) 
 # Each tuple is (node_name, reviewed_phase_or_None).
 # For critic nodes, reviewed_phase tells the critic which phase to review.
 #
-# All 4 work types share identical phase sequences. The difference between
-# "reviewed" and non-reviewed types is handled at the stream level via
-# interrupt_after=["critic_plan"] in submit_work().
+# Reviewed work types (REVIEWED_TASK, CRITICAL_REVIEWED_TASK) terminate
+# after critic_plan. The graph reaching END is the human-review gate:
+# the dispatcher relabels the resulting "completed" status as
+# "awaiting_approval", and the user reviews and either approves
+# (spawning fresh execution tasks via approve_and_spawn) or requests
+# revision (which re-runs the planning graph with feedback).
+#
+# Letting reviewed types fall through to IMPLEMENT/VERIFY would skip
+# the human gate entirely — the entire point of the workflow.
 
 WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
     WorkType.TASK.value: [
@@ -533,16 +541,12 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
         (PhaseName.SPECIFY.value, None),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-        (PhaseName.IMPLEMENT.value, None),
-        (PhaseName.VERIFY.value, None),
     ],
     WorkType.CRITICAL_REVIEWED_TASK.value: [
         (PhaseName.SPECIFY.value, None),
         (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
-        (PhaseName.IMPLEMENT.value, None),
-        (PhaseName.VERIFY.value, None),
     ],
 }
 
@@ -861,7 +865,9 @@ def build_workflow_graph(
     _hr_ends: dict[str, str] = {"abort": END, END: END}
     for name, _ in phase_seq:
         _hr_ends[name] = name
-    _hr_ends[PhaseName.GAP_PLAN.value] = PhaseName.GAP_PLAN.value
+    # gap_plan only exists when verify is in the sequence (recovery loop).
+    if PhaseName.VERIFY.value in {n for n, _ in phase_seq}:
+        _hr_ends[PhaseName.GAP_PLAN.value] = PhaseName.GAP_PLAN.value
 
     graph.add_node("human_review", _human_review_interrupt)
     graph.add_conditional_edges(
@@ -870,46 +876,64 @@ def build_workflow_graph(
         _hr_ends,
     )
 
+    # Reviewed work types terminate after critic_plan and never reach
+    # IMPLEMENT/VERIFY/GAP_PLAN. Compiling the prereq gates and the
+    # gap_plan recovery node anyway would leave conditional edges pointing
+    # at non-existent targets (LangGraph rejects this at compile time).
+    seq_phase_names = {name for name, _ in phase_seq}
+    has_implement = PhaseName.IMPLEMENT.value in seq_phase_names
+    has_verify = PhaseName.VERIFY.value in seq_phase_names
+
     # Add gap_plan node — not in WORKFLOW_SEQUENCES because it's a
     # conditional node reached via the verify_router, not a linear step.
-    if _SUBGRAPH_ENABLED.get(PhaseName.GAP_PLAN.value, False):
-        gap_subgraph = build_gap_plan_subgraph().compile()
-        graph.add_node(
-            PhaseName.GAP_PLAN.value,
-            make_subgraph_node(
-                gap_subgraph,
+    # Only relevant when verify is present (gap_plan is the recovery loop
+    # after a failed verification).
+    if has_verify:
+        if _SUBGRAPH_ENABLED.get(PhaseName.GAP_PLAN.value, False):
+            gap_subgraph = build_gap_plan_subgraph().compile()
+            graph.add_node(
                 PhaseName.GAP_PLAN.value,
-                _gap_plan_state_mapper,
-                _gap_plan_result_mapper,
-                use_per_phase_checkpointer=True,
-            ),
-        )
-    else:
-        # Legacy gap_plan node — wrap with phase-start tracking
-        gap_plan_def = registry.require(PhaseName.GAP_PLAN.value)
-        if gap_plan_def.call_fn is None:
-            raise ValueError(f"Phase '{PhaseName.GAP_PLAN.value}' has no call_fn (legacy mode)")
-        graph.add_node(PhaseName.GAP_PLAN.value, _make_legacy_node(PhaseName.GAP_PLAN.value, gap_plan_def.call_fn))
+                make_subgraph_node(
+                    gap_subgraph,
+                    PhaseName.GAP_PLAN.value,
+                    _gap_plan_state_mapper,
+                    _gap_plan_result_mapper,
+                    use_per_phase_checkpointer=True,
+                ),
+            )
+        else:
+            # Legacy gap_plan node — wrap with phase-start tracking
+            gap_plan_def = registry.require(PhaseName.GAP_PLAN.value)
+            if gap_plan_def.call_fn is None:
+                raise ValueError(f"Phase '{PhaseName.GAP_PLAN.value}' has no call_fn (legacy mode)")
+            graph.add_node(PhaseName.GAP_PLAN.value, _make_legacy_node(PhaseName.GAP_PLAN.value, gap_plan_def.call_fn))
 
     # ── Prerequisite Gate Nodes ─────────────────────────────────────────
     # These gates check phase completion invariants before allowing phases to run.
     # They are wired inline with the graph edges to block empty progression.
+    # Only add a gate when its target phase is part of this work type's
+    # sequence — wiring a gate that targets a missing node breaks compile.
 
-    # Gate: PLAN requires SPECIFY completed
+    # Gate: PLAN requires SPECIFY completed (PLAN is in every work type)
     prereq_gate_plan = make_prerequisite_gate_node(_check_spec_prerequisite, PhaseName.PLAN.value)
     graph.add_node("prereq_gate_plan", prereq_gate_plan)
 
-    # Gate: IMPLEMENT requires PLAN completed
-    prereq_gate_implement = make_prerequisite_gate_node(_check_plan_prerequisite, PhaseName.IMPLEMENT.value)
-    graph.add_node("prereq_gate_implement", prereq_gate_implement)
+    if has_implement:
+        prereq_gate_implement = make_prerequisite_gate_node(
+            _check_plan_prerequisite, PhaseName.IMPLEMENT.value
+        )
+        graph.add_node("prereq_gate_implement", prereq_gate_implement)
 
-    # Gate: VERIFY requires IMPLEMENT completed
-    prereq_gate_verify = make_prerequisite_gate_node(_check_implement_prerequisite, PhaseName.VERIFY.value)
-    graph.add_node("prereq_gate_verify", prereq_gate_verify)
+    if has_verify:
+        prereq_gate_verify = make_prerequisite_gate_node(
+            _check_implement_prerequisite, PhaseName.VERIFY.value
+        )
+        graph.add_node("prereq_gate_verify", prereq_gate_verify)
 
-    # Gate: GAP_PLAN requires VERIFY attempted
-    prereq_gate_gap_plan = make_prerequisite_gate_node(_check_verify_prerequisite, PhaseName.GAP_PLAN.value)
-    graph.add_node("prereq_gate_gap_plan", prereq_gate_gap_plan)
+        prereq_gate_gap_plan = make_prerequisite_gate_node(
+            _check_verify_prerequisite, PhaseName.GAP_PLAN.value
+        )
+        graph.add_node("prereq_gate_gap_plan", prereq_gate_gap_plan)
 
     # Add artifact gate nodes and their outgoing conditional edges.
     # Gate nodes route to ``next_node`` on proceed or ``human_review`` on
@@ -1048,7 +1072,8 @@ def build_workflow_graph(
             )
 
     # Wire prerequisite gates to their target phases via conditional edges
-    # (failure routes to human_review, success routes to target phase)
+    # (failure routes to human_review, success routes to target phase).
+    # Gates that were skipped above must also be skipped here.
     graph.add_conditional_edges(
         "prereq_gate_plan",
         _phase_status_router,
@@ -1058,36 +1083,37 @@ def build_workflow_graph(
             "failed": END,
         },
     )
-    graph.add_conditional_edges(
-        "prereq_gate_implement",
-        _phase_status_router,
-        {
-            "proceed": PhaseName.IMPLEMENT.value,
-            "needs_review": "human_review",
-            "failed": END,
-        },
-    )
-    graph.add_conditional_edges(
-        "prereq_gate_verify",
-        _phase_status_router,
-        {
-            "proceed": PhaseName.VERIFY.value,
-            "needs_review": "human_review",
-            "failed": END,
-        },
-    )
-    graph.add_conditional_edges(
-        "prereq_gate_gap_plan",
-        _phase_status_router,
-        {
-            "proceed": PhaseName.GAP_PLAN.value,
-            "needs_review": "human_review",
-            "failed": END,
-        },
-    )
-
-    # Wire gap_plan → implement (gap-fix loop: verify → gap_plan → implement → verify)
-    graph.add_edge(PhaseName.GAP_PLAN.value, PhaseName.IMPLEMENT.value)
+    if has_implement:
+        graph.add_conditional_edges(
+            "prereq_gate_implement",
+            _phase_status_router,
+            {
+                "proceed": PhaseName.IMPLEMENT.value,
+                "needs_review": "human_review",
+                "failed": END,
+            },
+        )
+    if has_verify:
+        graph.add_conditional_edges(
+            "prereq_gate_verify",
+            _phase_status_router,
+            {
+                "proceed": PhaseName.VERIFY.value,
+                "needs_review": "human_review",
+                "failed": END,
+            },
+        )
+        graph.add_conditional_edges(
+            "prereq_gate_gap_plan",
+            _phase_status_router,
+            {
+                "proceed": PhaseName.GAP_PLAN.value,
+                "needs_review": "human_review",
+                "failed": END,
+            },
+        )
+        # Wire gap_plan → implement (gap-fix loop: verify → gap_plan → implement → verify)
+        graph.add_edge(PhaseName.GAP_PLAN.value, PhaseName.IMPLEMENT.value)
 
     # Compile with optional checkpointer
     compile_kwargs: dict[str, Any] = {}

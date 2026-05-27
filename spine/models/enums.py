@@ -22,8 +22,11 @@ class WorkType(str, Enum):
 
     - TASK: specify -> plan -> critic_plan -> implement -> verify
     - CRITICAL_TASK: specify -> critic_specify -> plan -> critic_plan -> implement -> verify
-    - REVIEWED_TASK: same as TASK but pauses for approval after critic_plan
-    - CRITICAL_REVIEWED_TASK: same as CRITICAL_TASK but pauses for approval after critic_plan
+    - REVIEWED_TASK: specify -> plan -> critic_plan, then stops for human
+      approval. On approval, execution tasks are spawned as TASK items.
+    - CRITICAL_REVIEWED_TASK: specify -> critic_specify -> plan -> critic_plan,
+      then stops for human approval. On approval, execution tasks are
+      spawned as TASK items.
     """
 
     TASK = "task"
