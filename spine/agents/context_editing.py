@@ -67,6 +67,17 @@ def _args_fingerprint(args: dict) -> str:
         canonical = repr(sorted(args.items()))
     return hashlib.sha1(canonical.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
 
+
+def _content_sha(content: str) -> str:
+    """Short SHA of a tool result string — used in dedupe sentinels so the
+    model can recognise "this is the exact same response I already have"
+    rather than treating a placeholder as a new opaque result."""
+    if not content:
+        return "empty"
+    return hashlib.sha1(
+        content.encode("utf-8", errors="replace"), usedforsecurity=False
+    ).hexdigest()[:7]
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -190,38 +201,67 @@ class ReadCacheMiddleware(AgentMiddleware):
             # the same MCP call. The per-branch SpineContext cache below
             # still serves intra-branch repeat-call detection.
             if symbol_cache.is_cacheable(tool_name) and getattr(ctx, "work_id", ""):
+                # Capture the handler result in the closure so the middleware
+                # can return it directly when _fetch decides not to memoise
+                # (error responses, non-string payloads). Avoids invoking the
+                # handler a second time on the fall-through path.
+                captured: dict[str, Any] = {}
+
                 async def _fetch() -> str | None:
                     res = await handler(request)
+                    captured["result"] = res
+                    # Don't memoise error responses: schema-validation or
+                    # runtime errors are call-shape-specific, not codebase
+                    # facts. Caching them would make a future sibling see
+                    # an "ALREADY FETCHED" sentinel wrapping a stale error.
+                    if isinstance(res, ToolMessage) and getattr(res, "status", None) == "error":
+                        return None
                     if isinstance(res, ToolMessage) and isinstance(res.content, str):
                         return res.content
                     if hasattr(res, "content") and isinstance(res.content, str):
                         return res.content
                     return None
 
-                cached_content = await symbol_cache.get_or_fetch(
+                cached_content, hit_count = await symbol_cache.get_or_fetch(
                     ctx.work_id, tool_name, args, _fetch,
                 )
                 if cached_content is not None:
+                    content_sha = _content_sha(cached_content)
                     if key not in cache:
                         cache[key] = {
                             "summary": f"{_count_lines(cached_content)} lines",
                             "turn": turn,
+                            "content_sha": content_sha,
                         }
+                    if hit_count > 0:
+                        payload = (
+                            f"[ALREADY FETCHED via sibling branch — "
+                            f"turn {turn}, hit #{hit_count}, content_sha={content_sha}]\n"
+                            f"{cached_content}"
+                        )
+                    else:
+                        payload = cached_content
                     return ToolMessage(
-                        content=cached_content,
+                        content=payload,
                         tool_call_id=request.tool_call["id"],
                         name=tool_name,
                     )
-                # Fall through: non-string payload from the handler —
-                # let the regular path run so the model still sees it.
+                # Uncacheable result (error or non-string payload) — return
+                # the captured handler result verbatim. Skip the per-branch
+                # cache write below too: caching an error keyed by args would
+                # mask a corrected retry from the same branch.
+                if "result" in captured:
+                    return captured["result"]
 
             if key in cache:
                 entry = cache[key]
+                sha = entry.get("content_sha", "?")
                 return ToolMessage(
                     content=(
                         f"[cached: {tool_name} — issued at turn {entry['turn']} — "
-                        f"{entry['summary']}. Re-issue avoided; consult the "
-                        f"earlier result above or change the arguments.]"
+                        f"{entry['summary']} — content_sha={sha}. Re-issue avoided; "
+                        f"the response is above in this conversation. Change "
+                        f"arguments or stop retrying.]"
                     ),
                     tool_call_id=request.tool_call["id"],
                     name=tool_name,
@@ -237,7 +277,11 @@ class ReadCacheMiddleware(AgentMiddleware):
 
             if content:
                 summary = f"{_count_lines(content)} lines"
-                cache[key] = {"summary": summary, "turn": turn}
+                cache[key] = {
+                    "summary": summary,
+                    "turn": turn,
+                    "content_sha": _content_sha(content),
+                }
 
             return result
 

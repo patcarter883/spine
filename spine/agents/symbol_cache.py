@@ -32,21 +32,59 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# Allowlist of deterministic, read-only MCP tools whose results can be
-# safely memoised across sibling branches for the same work_id. These
-# query the codebase index (file/symbol structure), which only changes
-# when the user edits files on disk — not during a single work item.
-_CACHEABLE_TOOL_PREFIXES: tuple[str, ...] = (
-    "mcp_codebase-index_get_",
-    "mcp_codebase-index_find_symbol",
+# Allowlist of deterministic, read-only MCP tool prefixes whose results
+# can be safely memoised across sibling branches for the same work_id.
+# Keyed by server name; values are the tool-name-suffix prefixes (after
+# the ``mcp_<server>_`` namespace) that qualify as deterministic lookups.
+#
+# Servers register themselves via ``register_cacheable_server``; the
+# codebase-index entry is preloaded because spine has always treated it
+# as deterministic and existing callers rely on the prior behaviour.
+_DEFAULT_DETERMINISTIC_SUFFIXES: tuple[str, ...] = (
+    "get_",
+    "find_",
+    "list_",
+    "search_",
 )
+
+_cacheable_servers: dict[str, tuple[str, ...]] = {
+    # Preserves the historical prefix behaviour for codebase-index:
+    # any ``mcp_codebase-index_get_*`` and ``mcp_codebase-index_find_symbol``.
+    # The default suffixes also cover find_symbol (find_ prefix).
+    "codebase-index": _DEFAULT_DETERMINISTIC_SUFFIXES,
+}
+
+
+def register_cacheable_server(
+    server_name: str,
+    suffix_prefixes: tuple[str, ...] = _DEFAULT_DETERMINISTIC_SUFFIXES,
+) -> None:
+    """Opt a deterministic MCP server into cross-branch result sharing.
+
+    Call once at MCP-client init for each server whose read-only tools
+    are safe to memoise within a single ``work_id``. Re-registering a
+    server overwrites the previous suffix list.
+    """
+    if not server_name:
+        return
+    _cacheable_servers[server_name] = tuple(suffix_prefixes)
 
 
 def is_cacheable(tool_name: str) -> bool:
-    """Return True when *tool_name* is a deterministic codebase-index lookup."""
-    if not tool_name:
+    """Return True when *tool_name* is a deterministic MCP lookup.
+
+    Matches the ``mcp_<server>_<suffix>...`` naming convention against
+    the server allowlist registered via ``register_cacheable_server``.
+    """
+    if not tool_name or not tool_name.startswith("mcp_"):
         return False
-    return any(tool_name.startswith(prefix) for prefix in _CACHEABLE_TOOL_PREFIXES)
+    for server, suffixes in _cacheable_servers.items():
+        prefix = f"mcp_{server}_"
+        if not tool_name.startswith(prefix):
+            continue
+        rest = tool_name[len(prefix):]
+        return any(rest.startswith(suf) for suf in suffixes)
+    return False
 
 
 def args_fingerprint(args: dict[str, Any]) -> str:
@@ -65,13 +103,18 @@ class _Entry:
     block on it. Once the first fetcher stores ``result`` and releases
     the lock, the others see the populated value and return it without
     invoking the MCP handler.
+
+    ``hit_count`` tracks how many times this entry has been served
+    *after* the initial fetch — used by the dedupe middleware to stamp
+    a "tried-already" sentinel so the model recognises the loop.
     """
 
-    __slots__ = ("lock", "result")
+    __slots__ = ("lock", "result", "hit_count")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.result: str | None = None
+        self.hit_count: int = 0
 
 
 # Process-level cache. Keys are (work_id, tool_name, args_fingerprint).
@@ -90,7 +133,7 @@ async def get_or_fetch(
     tool_name: str,
     args: dict[str, Any],
     fetch: Any,
-) -> str | None:
+) -> tuple[str | None, int]:
     """Return the cached result for (work_id, tool_name, args) or fetch it.
 
     ``fetch`` is an awaitable returning the raw tool result string (or
@@ -98,18 +141,22 @@ async def get_or_fetch(
     Only the *first* concurrent caller invokes ``fetch``; siblings
     block on the per-key lock and receive the same result.
 
-    Returns ``None`` if the fetcher itself produced a non-string result —
-    in that case the middleware should fall back to the handler return
-    value verbatim (we don't memoise non-string payloads).
+    Returns ``(content, hit_count)``:
+        - ``content`` is the cached string, or ``None`` if the fetcher
+          produced a non-string payload (caller falls back to the handler
+          return verbatim — we don't memoise non-string results).
+        - ``hit_count`` is 0 when *this* caller did the fetch and >=1 when
+          the result was served from a previously populated entry. The
+          dedupe middleware uses this to stamp a sentinel header.
     """
     cache_key = _key(work_id, tool_name, args)
 
-    # Fast path: entry already populated, no lock needed for read of
-    # an immutable string. We still go through the index_lock to grab
-    # the entry object so we don't race with concurrent creation.
+    # Fast path: entry already populated. Still go through _index_lock
+    # below for the increment so hit_count is race-free.
     entry = _cache.get(cache_key)
     if entry is not None and entry.result is not None:
-        return entry.result
+        entry.hit_count += 1
+        return entry.result, entry.hit_count
 
     async with _index_lock:
         entry = _cache.get(cache_key)
@@ -119,14 +166,15 @@ async def get_or_fetch(
 
     async with entry.lock:
         if entry.result is not None:
-            return entry.result
+            entry.hit_count += 1
+            return entry.result, entry.hit_count
         result = await fetch()
         if isinstance(result, str):
             entry.result = result
-            return result
+            return result, 0
         # Non-string payload — don't memoise, but signal the caller
         # to use the handler result directly.
-        return None
+        return None, 0
 
 
 def clear(work_id: str) -> int:

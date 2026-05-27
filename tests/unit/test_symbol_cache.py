@@ -30,11 +30,44 @@ class TestIsCacheable:
     def test_find_symbol_is_cacheable(self):
         assert symbol_cache.is_cacheable("mcp_codebase-index_find_symbol")
 
-    def test_other_tools_are_not_cacheable(self):
-        assert not symbol_cache.is_cacheable("mcp_codebase-index_search_codebase")
+    def test_search_codebase_is_cacheable(self):
+        # search_* is in the default deterministic suffix set — read-only
+        # regex against the index is safe to share across sibling branches.
+        assert symbol_cache.is_cacheable("mcp_codebase-index_search_codebase")
+
+    def test_non_mcp_and_mutating_tools_are_not_cacheable(self):
         assert not symbol_cache.is_cacheable("read_file")
         assert not symbol_cache.is_cacheable("write_file")
         assert not symbol_cache.is_cacheable("")
+        # No suffix match — create_/update_/delete_/run_ are excluded.
+        assert not symbol_cache.is_cacheable("mcp_codebase-index_create_thing")
+        assert not symbol_cache.is_cacheable("mcp_codebase-index_run_query")
+        # Unregistered server — even read-shaped names don't qualify.
+        assert not symbol_cache.is_cacheable("mcp_unregistered_get_thing")
+
+
+class TestRegisterCacheableServer:
+    def test_registering_a_server_opts_in_its_read_tools(self):
+        # Sanity: unregistered server's read-shaped tools don't qualify.
+        assert not symbol_cache.is_cacheable("mcp_my-server_get_thing")
+        try:
+            symbol_cache.register_cacheable_server("my-server")
+            assert symbol_cache.is_cacheable("mcp_my-server_get_thing")
+            assert symbol_cache.is_cacheable("mcp_my-server_find_widget")
+            assert symbol_cache.is_cacheable("mcp_my-server_list_all")
+            # Mutating tools still excluded (no matching suffix).
+            assert not symbol_cache.is_cacheable("mcp_my-server_update_thing")
+        finally:
+            symbol_cache._cacheable_servers.pop("my-server", None)
+
+    def test_custom_suffixes_override_defaults(self):
+        try:
+            symbol_cache.register_cacheable_server("strict", suffix_prefixes=("get_",))
+            assert symbol_cache.is_cacheable("mcp_strict_get_thing")
+            # search_ not in the custom suffix list — excluded.
+            assert not symbol_cache.is_cacheable("mcp_strict_search_thing")
+        finally:
+            symbol_cache._cacheable_servers.pop("strict", None)
 
 
 class TestArgsFingerprint:
@@ -57,10 +90,11 @@ class TestGetOrFetch:
             calls += 1
             return "payload"
 
-        result = await symbol_cache.get_or_fetch(
+        result, hit_count = await symbol_cache.get_or_fetch(
             "work-1", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
         assert result == "payload"
+        assert hit_count == 0, "first call is a fetch, not a hit"
         assert calls == 1
 
     @pytest.mark.asyncio
@@ -75,10 +109,11 @@ class TestGetOrFetch:
         await symbol_cache.get_or_fetch(
             "work-1", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
-        result = await symbol_cache.get_or_fetch(
+        result, hit_count = await symbol_cache.get_or_fetch(
             "work-1", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
         assert result == "payload"
+        assert hit_count == 1, "second call is the first hit on a populated entry"
         assert calls == 1, "second call should hit the cache"
 
     @pytest.mark.asyncio
@@ -110,7 +145,12 @@ class TestGetOrFetch:
         results = await asyncio.gather(*tasks)
 
         assert calls == 1, f"expected single-flight, got {calls} underlying calls"
-        assert results == ["payload"] * 9
+        payloads = [r[0] for r in results]
+        assert payloads == ["payload"] * 9
+        # One fetcher (hit_count=0); the other 8 see a populated entry.
+        hit_counts = sorted(r[1] for r in results)
+        assert hit_counts[0] == 0
+        assert all(h >= 1 for h in hit_counts[1:])
 
     @pytest.mark.asyncio
     async def test_different_work_ids_do_not_collide(self):
@@ -121,13 +161,14 @@ class TestGetOrFetch:
             calls += 1
             return f"payload-{calls}"
 
-        r1 = await symbol_cache.get_or_fetch(
+        r1, h1 = await symbol_cache.get_or_fetch(
             "work-A", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
-        r2 = await symbol_cache.get_or_fetch(
+        r2, h2 = await symbol_cache.get_or_fetch(
             "work-B", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
         assert r1 != r2
+        assert h1 == 0 and h2 == 0, "different work_ids are independent fetches"
         assert calls == 2
 
     @pytest.mark.asyncio
@@ -139,10 +180,10 @@ class TestGetOrFetch:
             calls += 1
             return None
 
-        r1 = await symbol_cache.get_or_fetch(
+        r1, _ = await symbol_cache.get_or_fetch(
             "work-1", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
-        r2 = await symbol_cache.get_or_fetch(
+        r2, _ = await symbol_cache.get_or_fetch(
             "work-1", "mcp_codebase-index_find_symbol", {"name": "X"}, fetch,
         )
         assert r1 is None and r2 is None

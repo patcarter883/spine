@@ -21,6 +21,8 @@ from typing import Any
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from spine.agents import symbol_cache
+
 logger = logging.getLogger(__name__)
 
 
@@ -249,6 +251,12 @@ def _get_client(server_configs: dict[str, dict[str, Any]]) -> MultiServerMCPClie
         }
         _client = MultiServerMCPClient(adapter_configs)
         _client_config_hash = config_hash
+        # Opt every configured MCP server into cross-branch result sharing
+        # for its deterministic read-only tools. The default suffix set
+        # (get_/find_/list_/search_) covers the common naming convention;
+        # mutating tools (create_/update_/delete_/run_/...) are excluded.
+        for server_name in server_configs:
+            symbol_cache.register_cacheable_server(server_name)
         logger.info("MCP client created for %d server(s)", len(adapter_configs))
 
     return _client

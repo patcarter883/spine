@@ -182,6 +182,137 @@ class TestReturnsErrorOnWrongType:
         assert "count" in result.content  # Field with wrong type
 
 
+class TestExampleCallSynthesis:
+    """Validation errors should include a concrete example of a valid call."""
+
+    def test_error_includes_example_valid_call(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = make_mock_tool("read_file", SimpleSchema)
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "read_file",
+            "args": {"file_names": "/home/user/test.txt"},
+            "id": "tc_1",
+        }
+
+        result = validator.wrap_tool_call(request, handler)
+
+        assert isinstance(result, ToolMessage)
+        assert "Example valid call:" in result.content
+        # The synthesised example must be JSON-shaped and reference the
+        # actual required field name from the schema.
+        assert '"filepath"' in result.content
+
+    def test_example_uses_int_placeholder_for_int_fields(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = make_mock_tool("count_lines", SchemaWithInt)
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "count_lines",
+            "args": {"filepath": "x", "count": "not_an_int"},
+            "id": "tc_1",
+        }
+
+        result = validator.wrap_tool_call(request, handler)
+
+        assert "Example valid call:" in result.content
+        # Int placeholder is 0, not a string template.
+        assert '"count": 0' in result.content
+
+
+class TestMCPRootModelSchemas:
+    """MCP tools expose their schema as a JSON-Schema dict via ``args_schema``.
+
+    Their ``get_input_schema()`` returns a Pydantic ``RootModel`` whose only
+    field is ``root`` — surfacing that to the model on a validation error is
+    pure noise. The validator must read ``args_schema`` directly in this case.
+    """
+
+    def _make_mcp_tool(self, name: str, json_schema: dict) -> MagicMock:
+        tool = MagicMock()
+        tool.name = name
+        tool.args_schema = json_schema
+        # Simulate the RootModel that StructuredTool wraps a dict schema in:
+        # its model_fields surface only {"root": ...}, not the real fields.
+        from pydantic import RootModel
+        from typing import Any
+        RootWrapper = RootModel[dict[str, Any]]
+        tool.get_input_schema = lambda: RootWrapper
+        return tool
+
+    def test_empty_args_error_reports_real_required_fields(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = self._make_mcp_tool(
+            "mcp_codebase-index_get_dependencies",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["name"],
+            },
+        )
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "mcp_codebase-index_get_dependencies",
+            "args": {},
+            "id": "tc_1",
+        }
+
+        result = validator.wrap_tool_call(request, handler)
+
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        # Must NOT leak the RootModel wrapper field name.
+        assert "'root'" not in result.content
+        assert "['root']" not in result.content
+        # Must surface the real required field.
+        assert "name" in result.content
+
+    def test_example_call_for_mcp_tool_uses_real_field_names(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = self._make_mcp_tool(
+            "mcp_codebase-index_get_function_source",
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        )
+        # Trigger a non-empty schema error so _format_validation_error runs.
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "mcp_codebase-index_get_function_source",
+            "args": {"wrong_field": "x"},
+            "id": "tc_1",
+        }
+
+        # RootModel will accept the dict, so force the format path by
+        # calling _format_validation_error directly with a synthetic exc.
+        from pydantic import ValidationError
+        try:
+            from pydantic import BaseModel
+
+            class _Probe(BaseModel):
+                name: str
+
+            _Probe.model_validate({})
+        except ValidationError as exc:
+            msg = validator._format_validation_error(tool, {"wrong_field": "x"}, exc)
+            assert "Example valid call:" in msg
+            assert '"name"' in msg
+            assert '"root"' not in msg
+
+
 class TestReboundLimitExhaustion:
     """After max_rebound failures, should pass through to handler."""
 
