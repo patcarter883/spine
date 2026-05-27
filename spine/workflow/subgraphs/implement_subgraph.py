@@ -409,8 +409,43 @@ async def _synthesize_implementation_node(
             "implementation_files_written": False,
         }
 
+    # ── Honesty guard ────────────────────────────────────────────────
+    # Trace 019e6974 showed the slice-implementer returning
+    # status="implemented" with empty files_modified/files_created
+    # arrays despite the actual edits being applied on disk — a
+    # reporting bug masquerading as success. Downstream gates and
+    # verify treat "success + no files" as a working implementation,
+    # so verify burns its whole budget chasing an empty diff.
+    #
+    # If every slice claims success but reports no file activity,
+    # demote to needs_review so a human can reconcile the gap between
+    # the report and reality.
+    non_failed = [
+        r for r in slice_results
+        if r.get("status") in ("implemented", "partial")
+    ]
+    touched = [
+        r for r in non_failed
+        if (r.get("files_modified") or r.get("files_created"))
+    ]
+    all_claimed_no_files = bool(non_failed) and not touched
+
     impl_dir = artifact_path(work_id, PhaseName.IMPLEMENT.value)
     summary = _build_implementation_summary(slice_results)
+
+    if all_claimed_no_files:
+        warning_line = (
+            f"WARNING: {len(non_failed)} slice(s) reported success but "
+            "files_modified/files_created are empty — the implementer's "
+            "self-report disagrees with what was written. Manual review "
+            "required to reconcile the implementation report against disk."
+        )
+        summary = f"{summary}\n\n{warning_line}"
+        logger.warning(
+            "[%s] IMPLEMENT synthesize: %d slice(s) success-with-no-files — "
+            "demoting phase_status to needs_review",
+            work_id, len(non_failed),
+        )
 
     try:
         write_implementation_files(slice_results, summary, workspace_root, impl_dir)
@@ -436,7 +471,7 @@ async def _synthesize_implementation_node(
     return {
         "agent_response": summary,
         "artifacts_output": {"implementation.md": summary[:_MAX_ARTIFACT_STATE_CHARS]},
-        "phase_status": "success",
+        "phase_status": "needs_review" if all_claimed_no_files else "success",
         "slices_dispatched": True,
         "implementation_files_written": True,
     }

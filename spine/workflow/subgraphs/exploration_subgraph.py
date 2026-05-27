@@ -224,6 +224,32 @@ def _enrich_topic(topic: str, hits: list[dict]) -> str:
     return f"{topic} — recall symbols: {refs}"
 
 
+def _is_test_artifact(hit: dict) -> bool:
+    """Return True if the recall hit points at a test file/function.
+
+    Test-file matches dominated the false-positive symbol recalls in
+    trace 019e6974: every other topic ended up anchored on a
+    ``test_*`` function (e.g. ``test_config_nonexistent_file`` attached
+    to a "How is CLI argument parsing done?" topic). Test symbols have
+    rich docstrings that overlap with question wording, so the
+    embedding similarity passes but the researcher learns nothing
+    about the production code. Filter them out unless the topic
+    explicitly mentions tests — which the caller can re-enable by
+    passing ``allow_tests=True``.
+    """
+    path = (hit.get("file_path") or "").lower()
+    if path.startswith("tests/") or "/tests/" in path or path.endswith("/conftest.py"):
+        return True
+    name = hit.get("symbol_name") or ""
+    return name.startswith("test_") or name.startswith("Test")
+
+
+def _topic_mentions_tests(topic: str) -> bool:
+    """Cheap heuristic: only keep test hits when the topic is about tests."""
+    t = topic.lower()
+    return any(kw in t for kw in (" test", "tests ", "tests,", "tests."))
+
+
 async def _topic_lookup_node(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
@@ -331,6 +357,14 @@ async def _topic_lookup_node(
             r for r in results
             if isinstance(r, dict) and float(r.get("similarity", 0.0)) >= min_sim
         ]
+        # Drop test-file matches unless the topic itself is about tests.
+        # See _is_test_artifact for the trace 019e6974 evidence.
+        if not _topic_mentions_tests(topic):
+            before_test_filter = len(filtered)
+            filtered = [h for h in filtered if not _is_test_artifact(h)]
+            test_dropped = before_test_filter - len(filtered)
+        else:
+            test_dropped = 0
         filtered.sort(
             key=lambda r: float(r.get("similarity", 0.0)),
             reverse=True,
@@ -341,15 +375,17 @@ async def _topic_lookup_node(
         if not filtered:
             logger.warning(
                 "[%s] topic_lookup: topic=%r — %d raw hits, similarities=%s, "
-                "ALL below threshold %.2f (max=%.3f)",
+                "ALL below threshold %.2f (max=%.3f); test_dropped=%d",
                 work_id, topic, len(results),
-                [f"{s:.3f}" for s in sims], min_sim, max(sims) if sims else 0.0,
+                [f"{s:.3f}" for s in sims], min_sim,
+                max(sims) if sims else 0.0, test_dropped,
             )
         else:
             logger.warning(
                 "[%s] topic_lookup: topic=%r — %d raw hits, %d ≥%.2f, "
-                "keeping top-%d: %s",
-                work_id, topic, len(results), len(filtered), min_sim, len(kept),
+                "test_dropped=%d, keeping top-%d: %s",
+                work_id, topic, len(results), len(filtered) + test_dropped,
+                min_sim, test_dropped, len(kept),
                 [
                     f"{h.get('symbol_name', '?')}({h.get('file_path', '?')})"
                     f"@{float(h.get('similarity', 0.0)):.3f}"

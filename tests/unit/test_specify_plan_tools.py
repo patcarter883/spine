@@ -307,6 +307,31 @@ class TestSearchCodebaseTool:
             assert "preview" in result["results"][0]
             assert len(result["results"][0]["preview"]) > 0
 
+    def test_relative_workspace_root_still_finds_matches(self, tmp_path, monkeypatch):
+        """Regression for trace 019e6974: when workspace_root='.' (the default
+        in state.get('workspace_root', '.')), rglob and rg returned paths
+        with different leading prefixes ('spine/...' vs './spine/...') and
+        the membership check dropped every hit silently."""
+        self._setup_files(tmp_path)
+        # Simulate the workflow's default: workspace_root="." with cwd set
+        # to the project root.
+        monkeypatch.chdir(tmp_path)
+        tool = SearchCodebaseTool(workspace_root=".")
+        result = json.loads(tool._run(queries=["build_phase_agent"]))
+        assert result["total_files_found"] >= 1, (
+            f"Relative workspace_root should still find matches, got "
+            f"total_files_found={result['total_files_found']}"
+        )
+
+    def test_empty_workspace_root_falls_back_to_cwd(self, tmp_path, monkeypatch):
+        """workspace_root='' (also seen on bare SearchCodebaseTool()) should
+        not silently search nothing."""
+        self._setup_files(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        tool = SearchCodebaseTool(workspace_root="")
+        result = json.loads(tool._run(queries=["build_phase_agent"]))
+        assert result["total_files_found"] >= 1
+
 
 # ── WritePlanTool ─────────────────────────────────────────────────────────
 

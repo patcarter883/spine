@@ -16,6 +16,7 @@ import asyncio
 import functools
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import BaseTool
@@ -282,8 +283,11 @@ def get_mcp_tools(
         server_configs: Dict of server_name → {command, args, env, ...}.
             If ``None`` or empty, returns an empty list.
         cache_key: Ignored (kept for backward compat with custom client).
-        workspace_root: Optional project root to set as ``PROJECT_ROOT``
-            in server environments that don't have it configured.
+        workspace_root: Project root to inject as ``PROJECT_ROOT`` in every
+            MCP server's environment. Resolved to an absolute path and
+            *overrides* any PROJECT_ROOT the user may have set in their
+            ``mcp_servers`` config — keeping the MCP index and spine
+            pointed at the same project is the whole point of the wiring.
 
     Returns:
         List of LangChain ``BaseTool`` instances ready for agent injection.
@@ -291,11 +295,23 @@ def get_mcp_tools(
     if not server_configs:
         return []
 
-    # Auto-inject PROJECT_ROOT for servers that don't have it configured
+    # Force every MCP server's PROJECT_ROOT to match spine's workspace_root.
+    # We override unconditionally — a typo'd PROJECT_ROOT in user config
+    # (e.g. lowercase vs capital P) silently breaks every codebase-index
+    # query, so the workspace spine is running against wins.
     if workspace_root:
+        resolved_root = str(Path(workspace_root).resolve())
         for _name, cfg in server_configs.items():
             env = cfg.setdefault("env", {})
-            env.setdefault("PROJECT_ROOT", str(workspace_root))
+            existing = env.get("PROJECT_ROOT")
+            if existing and existing != resolved_root:
+                logger.info(
+                    "MCP %s: overriding configured PROJECT_ROOT %r with spine workspace %r",
+                    _name,
+                    existing,
+                    resolved_root,
+                )
+            env["PROJECT_ROOT"] = resolved_root
 
     try:
         client = _get_client(server_configs)

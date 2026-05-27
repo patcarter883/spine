@@ -1,6 +1,5 @@
 spine:
   checkpoint_path: .spine/spine.db
-  interpreter_enabled: true
   guided_decoding: true
   topic_lookup_min_similarity: 0.5
   # RAG configuration
@@ -14,8 +13,8 @@ mcp_servers:
     transport: stdio
     command: mcp-codebase-index
     args: []
-    env:
-      PROJECT_ROOT: /home/pat/projects/spine
+    # PROJECT_ROOT is auto-injected by spine.mcp.client.get_mcp_tools from
+    # the active workspace_root — do not set it here.
 providers:
   llm:
   - name: glm
@@ -69,7 +68,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2
+    max_concurrent_calls: 3
   - name: tiny
     type: deepagents-model
     model: openai:Bonsai-8B-gguf
@@ -81,7 +80,7 @@ providers:
   - name: local-embeddings
     type: openai-embedding
     model: Qwen3-Embedding-8B-GGUF
-    base_url: http://localhost:8000/v1
+    base_url: http://localhost:8010/v1
     api_key: vllm
     stream_usage: true
   phases:

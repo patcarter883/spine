@@ -191,7 +191,14 @@ class SearchCodebaseTool(BaseTool):
         file_patterns: list[str] | None = None,
         max_files: int = 6,
     ) -> str:
-        root = Path(self.workspace_root)
+        # Resolve to an absolute path so candidate paths from rglob and
+        # rg's output use the same representation. Trace 019e6974
+        # showed total_files_found=0 for queries that obviously matched
+        # because rglob returned relative paths ("spine/cli/...") while
+        # rg returned ones prefixed with "./" — different Path objects,
+        # so the `fpath in candidates` membership test below silently
+        # dropped every hit.
+        root = Path(self.workspace_root or ".").resolve()
         file_patterns = file_patterns or []
 
         # Build candidate file set: pattern-filtered or all source files
@@ -236,6 +243,16 @@ class SearchCodebaseTool(BaseTool):
         ranked = sorted(file_scores.items(), key=lambda x: (-x[1], str(x[0])))
         total_found = len(ranked)
         top = ranked[: min(max_files, _MAX_SEARCH_FILES)]
+
+        # Surface the path-mismatch class of bugs (rg/candidates disagree
+        # on canonical form, workspace_root pointing somewhere empty, etc.)
+        # — otherwise the agent sees an empty result and assumes "nothing
+        # to find", burning research turns.
+        if total_found == 0 and candidates:
+            logger.warning(
+                "search_codebase: 0/%d candidates matched queries=%r in root=%s",
+                len(candidates), queries, root,
+            )
 
         results = []
         for fpath, score in top:
@@ -290,7 +307,13 @@ class SearchCodebaseTool(BaseTool):
             for line in out.stdout.splitlines():
                 parts = line.split(":", 2)
                 if len(parts) >= 3:
-                    fpath = Path(parts[0])
+                    # Resolve to the same absolute form candidates use so a
+                    # leading "./" or symlink discrepancy doesn't kill the
+                    # membership check.
+                    try:
+                        fpath = Path(parts[0]).resolve()
+                    except OSError:
+                        continue
                     if fpath in candidates:
                         matched.setdefault(fpath, []).append(
                             {
@@ -324,7 +347,17 @@ class SearchCodebaseTool(BaseTool):
         file_patterns: list[str] | None = None,
         max_files: int = 6,
     ) -> str:
-        return self._run(queries=queries, file_patterns=file_patterns, max_files=max_files)
+        # Run the blocking _run on a worker thread so it doesn't stall
+        # the LangGraph event loop (researchers fan out concurrently and
+        # a 10s ripgrep timeout × N candidates would otherwise serialise).
+        import asyncio
+
+        return await asyncio.to_thread(
+            self._run,
+            queries=queries,
+            file_patterns=file_patterns,
+            max_files=max_files,
+        )
 
 
 # ── write_structured_plan ─────────────────────────────────────────────────
@@ -535,8 +568,9 @@ def build_plan_agent_tools(
     - ``write_structured_plan``: structured write to plan.md + plan.json
       with feature slices and dependencies
 
-    Together with ``eval`` (CodeInterpreterMiddleware), these replace all
-    generic filesystem tools. No ls/glob/grep/read_file/write_file exposed.
+    These replace all generic filesystem tools. No ls/glob/grep/read_file/write_file
+    exposed. Researcher subagents (when needed) are dispatched by the
+    exploration subgraph router, not by the agent itself.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

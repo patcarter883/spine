@@ -127,6 +127,48 @@ class TestGetMCPTools:
             assert isinstance(result, list)
             assert configs["idx"]["env"]["PROJECT_ROOT"] == "/test/project"
 
+    def test_workspace_root_overrides_existing_project_root(self) -> None:
+        """A wrong PROJECT_ROOT in user config must not silently win.
+
+        Regression: trace 019e6974 had ``PROJECT_ROOT: /home/pat/projects/spine``
+        (lowercase) configured but spine was running at ``/home/pat/Projects/spine``.
+        ``setdefault`` left the wrong value in place and every codebase-index
+        call returned ``not found``. Spine's workspace_root is the source of truth.
+        """
+        with patch("spine.mcp.client.MultiServerMCPClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.get_tools = AsyncMock(return_value=[])
+            mock_client_cls.return_value = mock_client
+
+            configs = {
+                "idx": {
+                    "command": "idx",
+                    "args": [],
+                    "transport": "stdio",
+                    "env": {"PROJECT_ROOT": "/wrong/path", "OTHER_VAR": "keep"},
+                },
+            }
+            get_mcp_tools(configs, cache_key="test", workspace_root="/test/project")
+            assert configs["idx"]["env"]["PROJECT_ROOT"] == "/test/project"
+            assert configs["idx"]["env"]["OTHER_VAR"] == "keep"
+
+    def test_workspace_root_resolved_to_absolute(self, tmp_path) -> None:
+        """Relative workspace_root should be resolved to an absolute path
+        before being passed to the MCP server (which spawns in a separate
+        process and won't share spine's cwd)."""
+        with patch("spine.mcp.client.MultiServerMCPClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.get_tools = AsyncMock(return_value=[])
+            mock_client_cls.return_value = mock_client
+
+            configs = {"idx": {"command": "idx", "args": [], "transport": "stdio"}}
+            get_mcp_tools(configs, cache_key="test", workspace_root=str(tmp_path))
+            injected = configs["idx"]["env"]["PROJECT_ROOT"]
+            assert injected == str(tmp_path.resolve())
+            # And for relative paths
+            get_mcp_tools(configs, cache_key="test", workspace_root=".")
+            assert configs["idx"]["env"]["PROJECT_ROOT"].startswith("/")
+
     @patch("spine.mcp.client.MultiServerMCPClient")
     def test_loads_tools_with_namespacing(self, mock_client_cls: MagicMock) -> None:
         """Tools should be loaded and namespaced with server prefix."""

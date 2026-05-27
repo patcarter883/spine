@@ -463,6 +463,140 @@ def test_topic_lookup_filters_threshold_and_top_k(monkeypatch):
     assert captured_calls[0]["task_category"] is None
 
 
+def test_topic_lookup_drops_test_artifacts(monkeypatch):
+    """Test-file hits crowd out production code in recall results.
+
+    Regression: trace 019e6974 showed researchers anchored on
+    ``test_config_nonexistent_file`` when asked about CLI argument parsing.
+    Tests have rich docstrings that score high on natural-language topic
+    similarity but tell the researcher nothing about the production code.
+    """
+    import asyncio
+    import json as _json
+
+    from spine.workflow.subgraphs import exploration_subgraph as mod
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    class _FakeCfg:
+        checkpoint_path = "/tmp/fake.db"
+        embedding_provider = "openai-embeddings"
+        recall_k = 5
+        specify_context_token_budget = 30000
+        topic_lookup_top_k = 2
+        topic_lookup_min_similarity = 0.5
+
+    monkeypatch.setattr(
+        "spine.config.SpineConfig.load",
+        classmethod(lambda cls: _FakeCfg()),
+    )
+
+    class _StubRecall:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def _arun(self, **kw):
+            return _json.dumps({
+                "results": [
+                    # Highest similarity is a test — must be dropped.
+                    {"symbol_name": "test_cli_parses_verbose",
+                     "file_path": "tests/unit/test_cli.py",
+                     "similarity": 0.95},
+                    # Production symbol, lower similarity.
+                    {"symbol_name": "main",
+                     "file_path": "spine/cli/__init__.py",
+                     "similarity": 0.80},
+                    # Test class via name prefix.
+                    {"symbol_name": "TestCliParser",
+                     "file_path": "spine/cli/parser.py",
+                     "similarity": 0.75},
+                    # Conftest fixture path.
+                    {"symbol_name": "tmp_workspace",
+                     "file_path": "tests/conftest.py",
+                     "similarity": 0.70},
+                ]
+            })
+
+    monkeypatch.setattr("spine.agents.tools.recall_tool.RecallTool", _StubRecall)
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 0,
+        "max_rounds": 3,
+        "manager_decision": "explore",
+        "topics": ["how does CLI argument parsing work"],
+        "findings": [],
+        "agent_response": "",
+        "task_category": "Backend/API",
+    }
+
+    result = asyncio.run(mod._topic_lookup_node(state, None))
+    hits = result["topic_recall_hits"]["how does CLI argument parsing work"]
+    # The only non-test hit at ≥0.5 is `main`.
+    assert [h["symbol_name"] for h in hits] == ["main"]
+
+
+def test_topic_lookup_keeps_test_artifacts_when_topic_is_about_tests(monkeypatch):
+    """If the topic explicitly mentions tests, keep test-file hits."""
+    import asyncio
+    import json as _json
+
+    from spine.workflow.subgraphs import exploration_subgraph as mod
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    class _FakeCfg:
+        checkpoint_path = "/tmp/fake.db"
+        embedding_provider = "openai-embeddings"
+        recall_k = 5
+        specify_context_token_budget = 30000
+        topic_lookup_top_k = 2
+        topic_lookup_min_similarity = 0.5
+
+    monkeypatch.setattr(
+        "spine.config.SpineConfig.load",
+        classmethod(lambda cls: _FakeCfg()),
+    )
+
+    class _StubRecall:
+        def __init__(self, **kwargs):
+            pass
+
+        async def _arun(self, **kw):
+            return _json.dumps({
+                "results": [
+                    {"symbol_name": "test_cli", "file_path": "tests/test_cli.py",
+                     "similarity": 0.95},
+                    {"symbol_name": "main", "file_path": "spine/cli/__init__.py",
+                     "similarity": 0.80},
+                ]
+            })
+
+    monkeypatch.setattr("spine.agents.tools.recall_tool.RecallTool", _StubRecall)
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify", "work_id": "wk", "work_type": "task",
+        "description": "", "workspace_root": "/tmp", "retry_count": 0,
+        "feedback": [], "messages": [], "artifacts_output": {},
+        "phase_status": "", "research_round": 0, "max_rounds": 3,
+        "manager_decision": "explore",
+        "topics": ["what tests cover the CLI"],
+        "findings": [], "agent_response": "", "task_category": "Backend/API",
+    }
+
+    result = asyncio.run(mod._topic_lookup_node(state, None))
+    hits = result["topic_recall_hits"]["what tests cover the CLI"]
+    # Topic is about tests — both kept.
+    assert [h["symbol_name"] for h in hits] == ["test_cli", "main"]
+
+
 # ── Test: compose integration ────────────────────────────────────────────
 
 

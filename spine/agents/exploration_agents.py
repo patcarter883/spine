@@ -58,6 +58,40 @@ def _normalise_topic(topic: str) -> str:
     return " ".join(topic.lower().split())
 
 
+_CRITIC_RESEARCH_KEYWORDS: tuple[str, ...] = (
+    "research",
+    "explore",
+    "investigate",
+    "missing knowledge",
+    "missing context",
+    "unclear scope",
+    "more information",
+    "more info",
+    "need to understand",
+    "needs investigation",
+    "find out",
+    "discover",
+)
+
+
+def _critic_wants_more_research(last_critic_review: dict[str, Any]) -> bool:
+    """Decide whether a critic verdict implies more exploration is needed.
+
+    The synth-only rework path requires confidence that the critic is
+    asking us to fix the artifact, not fill a research gap. We look at
+    both the verdict's reason and its suggestions for explicit research
+    cues — when neither mentions them, synthesis can take another swing
+    with the existing findings.
+    """
+    if not last_critic_review:
+        return False
+    blob_parts = [last_critic_review.get("reason", "") or ""]
+    sugs = last_critic_review.get("suggestions") or []
+    blob_parts.extend(str(s) for s in sugs)
+    blob = " ".join(blob_parts).lower()
+    return any(kw in blob for kw in _CRITIC_RESEARCH_KEYWORDS)
+
+
 def _approx_findings_tokens(findings: list[Any]) -> int:
     """Rough token estimate for accumulated Explore findings.
 
@@ -310,6 +344,34 @@ async def run_research_manager(
             "[%s] Research manager: token budget (%d) reached — forcing done",
             work_id,
             EXPLORE_TOKEN_BUDGET,
+        )
+        return {"manager_decision": "done", "topics": []}
+
+    # Critic-rework re-entry guard — when the state mapper seeded findings
+    # from a prior attempt's research_log.json AND the critic's feedback
+    # doesn't call out a research gap, skip exploration and let the
+    # synthesiser take another swing with the existing findings.
+    #
+    # Trace 019e6974: PLAN was reworked 3× because critic_plan rejected
+    # the slice metadata ("missing target_files", "malformed JSON"). On
+    # each rework the manager fired again and re-emitted near-duplicate
+    # topics — even though the research log already covered the relevant
+    # files. ~3.3M PLAN prompt tokens were spent re-learning the same
+    # facts. The synthesis fix-up was the actual unit of work.
+    is_rework_entry = (
+        round_num == 0
+        and retry_count > 0
+        and bool(findings)
+        and bool(last_critic_review)
+    )
+    if is_rework_entry and not _critic_wants_more_research(last_critic_review):
+        logger.warning(
+            "[%s] Research manager: critic-rework entry — %d prior findings "
+            "exist and critic feedback %r does not call for more research; "
+            "skipping exploration so synthesis can rework with what we have.",
+            work_id,
+            len(findings),
+            (last_critic_review.get("reason", "") or "")[:120],
         )
         return {"manager_decision": "done", "topics": []}
 
