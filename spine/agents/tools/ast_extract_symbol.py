@@ -34,7 +34,13 @@ _FALLBACK_MAX_FILES = 200
 class AstExtractSymbolInput(BaseModel):
     """Input schema for :class:`AstExtractSymbolTool`."""
 
-    symbol_name: str = Field(description="Exact symbol name (function, class, method, interface).")
+    symbol_name: str = Field(
+        description=(
+            "REQUIRED. Exact symbol name — a function, class, method, or "
+            "interface identifier (no parentheses, no module prefix). "
+            "E.g. 'build_phase_agent', 'SpineContext', '_extract_findings'."
+        ),
+    )
     file_hint: Optional[str] = Field(
         default=None,
         description=(

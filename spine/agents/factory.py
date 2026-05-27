@@ -516,18 +516,21 @@ def _build_middleware_stack(
     if has_interpreter:
         middleware.append(build_interpreter_middleware(phase.value))
 
-    # 6. Read cache — prevents re-reading already-seen files.  Checks
-    #    SpineContext.read_cache before allowing read_file to execute.
-    #    Only for top-level orchestrators, not subagent leaves.
-    if not is_subagent:
-        middleware.append(_build_read_cache_middleware())
+    # 6. Read cache — prevents re-reading already-seen files and re-issuing
+    #    identical search_codebase / MCP lookups.  Checks SpineContext.read_cache
+    #    before allowing the cached tools to execute.  Applied to subagents too:
+    #    Explore researcher loops were re-running the same MCP lookups within a
+    #    single invocation and leaking duplicate output into findings.
+    middleware.append(_build_read_cache_middleware())
 
     # 7. Patch tool calls — normalisation
     middleware.append(PatchToolCallsMiddleware())
 
-    # 7. SPINE-specific middleware (tool validation, context editing)
-    if not is_subagent:
-        _add_spine_middleware(middleware, phase)
+    # 7. SPINE-specific middleware (tool validation, context editing).  Applied
+    #    to subagents too so that tool runtime errors become a compact
+    #    ToolMessage(status="error") instead of a raw traceback that ends up
+    #    serialized into ResearchFindings.summary.
+    _add_spine_middleware(middleware, phase)
 
     # 8. User-provided extra middleware
     if extra_middleware:

@@ -201,6 +201,8 @@ async def _agent_check_node(
         "feedback": state.get("feedback", []),
         "retry_count": {reviewed_phase: state.get("retry_count", 0)},
         "max_retries": 3,
+        "specification_json": state.get("specification_json"),
+        "plan_json": state.get("plan_json"),
     }
     result = await agent_critic_check(pseudo_state, reviewed_phase, config)
     logger.info(

@@ -56,7 +56,7 @@ providers:
 
   - name: local
     type: deepagents-model
-    model: openai:Qwen3.6-27B-MTP-GGUF
+    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
     guided_decoding: true
@@ -90,17 +90,17 @@ providers:
     plan:
       provider: pat
     critic:
-      provider: pat
+      provider: local
     exploration:
-      provider: pat
+      provider: local
     implement:
-      provider: pat
+      provider: local
     implement/subagents/slice-implementer:
       provider: pat
     verify:
       provider: pat
     gap_plan:
-      provider: pat
+      provider: local
     # RAG phase providers
     classification:
       provider: local

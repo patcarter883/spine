@@ -135,18 +135,20 @@ class ReadPriorArtifactsTool(BaseTool):
 class _SearchCodebaseInput(BaseModel):
     queries: list[str] = Field(
         description=(
-            "List of search terms or topic keywords to find in the codebase. "
+            "REQUIRED. Non-empty list of search terms or topic keywords. "
             "Each query is run as a case-insensitive substring search across "
-            "all source files. E.g. ['WorkflowState', 'submit_work', 'UIApi']."
+            "all source files. E.g. ['WorkflowState', 'submit_work', 'UIApi']. "
+            "You MUST pass this as a list of strings — a bare string will be "
+            "rejected."
         ),
         min_length=1,
     )
     file_patterns: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional glob patterns to restrict the search scope. "
+            "Optional glob patterns to restrict the search scope (default: []). "
             "E.g. ['spine/agents/*.py', 'spine/workflow/*.py']. "
-            "Leave empty to search the entire workspace."
+            "Leave empty / omit to search the entire workspace."
         ),
     )
     max_files: int = Field(

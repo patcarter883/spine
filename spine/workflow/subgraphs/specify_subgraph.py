@@ -200,42 +200,40 @@ async def _save_specify_artifacts(
 
     # Fail-closed: validate specification.json exists and is well-formed
     spec_json_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
-    if spec_json_path.exists():
-        try:
-            raw = spec_json_path.read_text(encoding="utf-8")
-            spec_data = json.loads(raw)
-            # Validate required keys exist
-            if not isinstance(spec_data, dict):
-                raise CriticalContractFailure(
-                    phase="specify",
-                    reason="specification.json exists but is not a JSON object",
-                )
-            for key in ("title", "summary", "requirements"):
-                if key not in spec_data:
-                    raise CriticalContractFailure(
-                        phase="specify",
-                        reason=f"specification.json is missing required key '{key}' — "
-                               f"the specify agent produced malformed structured output. "
-                               f"Keys found: {list(spec_data.keys())}",
-                    )
-        except (json.JSONDecodeError, OSError) as exc:
-            raise CriticalContractFailure(
-                phase="specify",
-                reason=f"specification.json exists but is malformed or unreadable: {exc}",
-            )
-        except CriticalContractFailure:
-            raise
-        except Exception as exc:
-            raise CriticalContractFailure(
-                phase="specify",
-                reason=f"specification.json validation error: {exc}",
-            )
-    else:
+    if not spec_json_path.exists():
         raise CriticalContractFailure(
             phase="specify",
             reason="specification.json does not exist — "
                    "the specify agent did not produce structured output via write_specification. "
                    "This indicates a model invocation failure in the specify node.",
+        )
+    try:
+        specification_json = spec_json_path.read_text(encoding="utf-8")
+        spec_data = json.loads(specification_json)
+        if not isinstance(spec_data, dict):
+            raise CriticalContractFailure(
+                phase="specify",
+                reason="specification.json exists but is not a JSON object",
+            )
+        for key in ("title", "summary", "requirements"):
+            if key not in spec_data:
+                raise CriticalContractFailure(
+                    phase="specify",
+                    reason=f"specification.json is missing required key '{key}' — "
+                           f"the specify agent produced malformed structured output. "
+                           f"Keys found: {list(spec_data.keys())}",
+                )
+    except (json.JSONDecodeError, OSError) as exc:
+        raise CriticalContractFailure(
+            phase="specify",
+            reason=f"specification.json exists but is malformed or unreadable: {exc}",
+        )
+    except CriticalContractFailure:
+        raise
+    except Exception as exc:
+        raise CriticalContractFailure(
+            phase="specify",
+            reason=f"specification.json validation error: {exc}",
         )
 
     disk_artifacts = scan_artifact_dir(
@@ -256,6 +254,7 @@ async def _save_specify_artifacts(
 
     return {
         "artifacts_output": disk_artifacts,
+        "specification_json": specification_json,
         "phase_status": "success" if disk_artifacts else "needs_review",
     }
 

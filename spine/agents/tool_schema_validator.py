@@ -37,6 +37,36 @@ from langchain_core.messages import ToolMessage
 
 logger = logging.getLogger(__name__)
 
+_MAX_EXC_CHARS = 300
+_MAX_VALIDATION_ERRORS = 5
+_MAX_SCHEMA_FIELDS = 10
+
+
+def _summarize_exception(exc: Exception) -> str:
+    """Render an exception as a single short line — no traceback.
+
+    Some tool runtime errors arrive with embedded tracebacks or multi-line
+    Pydantic dumps in ``str(exc)``. The model gains nothing from those —
+    they bloat the conversation and previously ended up serialized into
+    ResearchFindings.summary verbatim. Strip to the first non-empty line
+    and cap at ``_MAX_EXC_CHARS``.
+    """
+    raw = str(exc) or exc.__class__.__name__
+    first_line = ""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Traceback") or stripped.startswith('File "'):
+            continue
+        first_line = stripped
+        break
+    if not first_line:
+        first_line = raw.strip().replace("\n", " ")
+    if len(first_line) > _MAX_EXC_CHARS:
+        first_line = first_line[: _MAX_EXC_CHARS - 1] + "…"
+    return f"{type(exc).__name__}: {first_line}"
+
 
 class ToolSchemaValidator(AgentMiddleware):
     """Validate tool call arguments against the registered tool schema.
@@ -143,24 +173,29 @@ class ToolSchemaValidator(AgentMiddleware):
 
         parts = [f"Tool call to '{tool_name}' failed validation:"]
 
-        for err in error_list:
+        for err in error_list[:_MAX_VALIDATION_ERRORS]:
             loc = " -> ".join(str(part) for part in err.get("loc", []))
             msg = err.get("msg", "unknown error")
             err_type = err.get("type", "")
             parts.append(f"  - Field '{loc}': {msg} (type={err_type})")
+        if len(error_list) > _MAX_VALIDATION_ERRORS:
+            parts.append(f"  … {len(error_list) - _MAX_VALIDATION_ERRORS} more")
 
         # Provide the valid schema fields so the model knows what to use
         try:
             input_schema = tool.get_input_schema()
             if input_schema and hasattr(input_schema, "model_fields"):
+                fields = list(input_schema.model_fields.items())
                 valid_fields = []
-                for fname, finfo in input_schema.model_fields.items():
+                for fname, finfo in fields[:_MAX_SCHEMA_FIELDS]:
                     required = "required" if finfo.is_required() else "optional"
                     ftype = getattr(finfo, "annotation", "any")
                     valid_fields.append(f"  {fname}: {ftype} ({required})")
                 if valid_fields:
                     parts.append("Valid parameters:")
                     parts.extend(valid_fields)
+                if len(fields) > _MAX_SCHEMA_FIELDS:
+                    parts.append(f"  … {len(fields) - _MAX_SCHEMA_FIELDS} more")
         except Exception:
             pass
 
@@ -168,10 +203,17 @@ class ToolSchemaValidator(AgentMiddleware):
         return "\n".join(parts)
 
     def _format_runtime_error(self, tool_name: str, exc: Exception) -> str:
-        """Format a runtime tool execution error."""
+        """Format a runtime tool execution error.
+
+        Keeps the output terse and free of tracebacks. The model only needs
+        the failure reason and a hint to retry — embedding a full
+        ``str(exc)`` (which often contains a multi-line traceback or schema
+        dump) just pollutes the conversation and ends up serialized into
+        findings.
+        """
         return (
             f"Tool '{tool_name}' execution failed: "
-            f"{type(exc).__name__}: {exc}\n"
+            f"{_summarize_exception(exc)}. "
             f"Check the arguments and retry."
         )
 

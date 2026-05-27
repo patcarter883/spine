@@ -20,12 +20,50 @@ trim large arguments in AI messages that correspond to evicted tool results
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
+
+# Tools (beyond read_file) whose results we deduplicate when called with
+# identical arguments inside a single phase / subagent invocation. Read-only
+# lookup tools are safe to short-circuit; anything that mutates state must
+# never appear here. The MCP codebase-index tools are dispatched under the
+# ``mcp_codebase-index_*`` prefix; rather than enumerating each one, the
+# middleware also dedupes any tool whose name starts with ``mcp_``.
+_DEDUPED_TOOLS: frozenset[str] = frozenset({
+    "search_codebase",
+    "ast_extract_symbol",
+    "glob",
+    "grep",
+})
+
+
+def _is_dedupable(tool_name: str) -> bool:
+    """Return True if repeated calls to *tool_name* with the same args should
+    return a cached placeholder instead of re-executing.
+
+    Covers explicit read-only research tools plus every MCP tool. MCP tools
+    are by convention named ``mcp_<server>_<tool>`` (e.g. the codebase-index
+    server exposes ``mcp_codebase-index_find_symbol``); they are all
+    read-only lookups in the SPINE configuration.
+    """
+    if tool_name in _DEDUPED_TOOLS:
+        return True
+    return tool_name.startswith("mcp_")
+
+
+def _args_fingerprint(args: dict) -> str:
+    """Stable short hash of a tool call's arguments for cache keying."""
+    try:
+        canonical = json.dumps(args, sort_keys=True, default=str)
+    except Exception:
+        canonical = repr(sorted(args.items()))
+    return hashlib.sha1(canonical.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
 
 logger = logging.getLogger(__name__)
 
@@ -67,70 +105,109 @@ def _count_lines(content: str) -> int:
 
 
 class ReadCacheMiddleware(AgentMiddleware):
-    """Short-circuit re-reads by returning a cached metadata summary.
+    """Short-circuit re-issued read-only tool calls.
 
-    Before every ``read_file`` call, checks the ``read_cache`` dict on the
-    ``SpineContext`` (accessible via ``request.runtime.context``).  If the
-    file was already read this phase, returns a compact placeholder::
+    Two cache paths share ``SpineContext.read_cache``:
 
-        [cached: path.py (N lines) — read at turn T — def foo, class Bar]
+    1. ``read_file`` — keyed by file path; the cached placeholder carries
+       a symbol summary so the model can still see what the file contains
+       without paying the re-read cost.
+    2. Other read-only lookup tools (``search_codebase``, ``ast_extract_symbol``,
+       ``glob``, ``grep``, and every ``mcp_*`` tool) — keyed by a hash of the
+       call's arguments.  On a hit the placeholder tells the model the
+       query was already issued so it should not re-run it verbatim.
 
-    The cache is shared across subagents via ``SpineContext`` propagation,
-    directly preventing re-read amnesia without an eviction strategy —
-    the existing ``ToolOutputTrimmer`` handles LRU eviction markers
-    independently.
-
-    On first read the file goes through normally; the metadata is extracted
-    and cached for future hits.
+    The cache is shared across subagents via ``SpineContext`` propagation.
+    It is intentionally never invalidated within a phase — duplicate calls
+    inside one explore loop are the bug we are guarding against; tools that
+    mutate state (write_file, edit_file, execute, …) are not on the dedupe
+    list and run untouched.
     """
 
     async def awrap_tool_call(self, request, handler):
-        if request.tool_call.get("name") != "read_file":
-            return await handler(request)
-
-        file_path = request.tool_call.get("args", {}).get("file_path", "")
-        if not file_path:
-            return await handler(request)
+        tool_name = request.tool_call.get("name", "")
+        args = request.tool_call.get("args", {}) or {}
 
         ctx = request.runtime.context
         if ctx is None:
             return await handler(request)
 
-        ctx.read_cache_turn += 1
-        turn = ctx.read_cache_turn
+        # ── read_file path: keyed by file_path, stores symbol summary ──
+        if tool_name == "read_file":
+            file_path = args.get("file_path", "")
+            if not file_path:
+                return await handler(request)
 
-        cache: dict = ctx.read_cache
-        if file_path in cache:
-            entry = cache[file_path]
-            return ToolMessage(
-                content=(
-                    f"[cached: {file_path} "
-                    f"({entry['n_lines']} lines) — "
-                    f"read at turn {entry['turn']} — "
-                    f"{entry['symbols']}]"
-                ),
-                tool_call_id=request.tool_call["id"],
-                name="read_file",
-            )
+            ctx.read_cache_turn += 1
+            turn = ctx.read_cache_turn
 
-        result = await handler(request)
+            cache: dict = ctx.read_cache
+            if file_path in cache:
+                entry = cache[file_path]
+                return ToolMessage(
+                    content=(
+                        f"[cached: {file_path} "
+                        f"({entry['n_lines']} lines) — "
+                        f"read at turn {entry['turn']} — "
+                        f"{entry['symbols']}]"
+                    ),
+                    tool_call_id=request.tool_call["id"],
+                    name="read_file",
+                )
 
-        content: str = ""
-        if isinstance(result, ToolMessage) and isinstance(result.content, str):
-            content = result.content
-        elif hasattr(result, "content") and isinstance(result.content, str):
-            content = result.content
+            result = await handler(request)
 
-        if content:
-            n_lines = _count_lines(content)
-            symbols = _extract_symbols(content)
-            cache[file_path] = {
-                "n_lines": n_lines,
-                "symbols": ", ".join(symbols) if symbols else "no symbols",
-                "turn": turn,
-            }
+            content: str = ""
+            if isinstance(result, ToolMessage) and isinstance(result.content, str):
+                content = result.content
+            elif hasattr(result, "content") and isinstance(result.content, str):
+                content = result.content
 
-        return result
+            if content:
+                n_lines = _count_lines(content)
+                symbols = _extract_symbols(content)
+                cache[file_path] = {
+                    "n_lines": n_lines,
+                    "symbols": ", ".join(symbols) if symbols else "no symbols",
+                    "turn": turn,
+                }
+
+            return result
+
+        # ── generic lookup-tool dedupe (search_codebase, MCP, …) ──
+        if _is_dedupable(tool_name):
+            ctx.read_cache_turn += 1
+            turn = ctx.read_cache_turn
+            cache = ctx.read_cache
+            key = f"call::{tool_name}::{_args_fingerprint(args)}"
+
+            if key in cache:
+                entry = cache[key]
+                return ToolMessage(
+                    content=(
+                        f"[cached: {tool_name} — issued at turn {entry['turn']} — "
+                        f"{entry['summary']}. Re-issue avoided; consult the "
+                        f"earlier result above or change the arguments.]"
+                    ),
+                    tool_call_id=request.tool_call["id"],
+                    name=tool_name,
+                )
+
+            result = await handler(request)
+
+            content = ""
+            if isinstance(result, ToolMessage) and isinstance(result.content, str):
+                content = result.content
+            elif hasattr(result, "content") and isinstance(result.content, str):
+                content = result.content
+
+            if content:
+                summary = f"{_count_lines(content)} lines"
+                cache[key] = {"summary": summary, "turn": turn}
+
+            return result
+
+        return await handler(request)
 
     def wrap_tool_call(self, request, handler):
         # SPINE uses async invoke; sync pass-through only.
