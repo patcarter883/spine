@@ -17,7 +17,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
@@ -856,6 +856,86 @@ async def _ainvoke_explore_collecting(
     raise RuntimeError("_ainvoke_explore_collecting: unexpected state")
 
 
+_TOOL_ERROR_MARKERS = (
+    "tool validation error",
+    "not a recognized function",
+    "not a recognized tool",
+    "not recognized as",
+    "unknown tool",
+    "no such tool",
+    "tool call",
+    "validation error",
+    "failed validation",
+    "execution failed",
+    "not available",
+    "available tools",
+    "available toolset",
+    "valid alternatives",
+    "list of valid",
+)
+
+
+def _last_ai_narrative(messages: list[Any]) -> str:
+    """Return content of the last AIMessage with non-empty string content.
+
+    Walks messages in reverse and ignores ToolMessage / HumanMessage /
+    SystemMessage entries. ToolMessages are tool outputs (including
+    ``status="error"`` rebound messages from ToolSchemaValidator) — they
+    are not the agent's own narration and must not be treated as the
+    research report. Returns an empty string if no such message exists.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, (ToolMessage, HumanMessage, SystemMessage)):
+            continue
+        if not isinstance(msg, AIMessage):
+            # Defensive: fall through for unknown message types but still
+            # skip anything whose role/type self-identifies as tool/user.
+            role = getattr(msg, "type", "") or getattr(msg, "role", "")
+            if role in {"tool", "user", "system"}:
+                continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, list):
+            # Anthropic-style content blocks — join text parts.
+            text_parts = [
+                blk.get("text", "")
+                for blk in content
+                if isinstance(blk, dict) and blk.get("type") == "text"
+            ]
+            content = "".join(text_parts)
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _looks_like_pure_tool_error(text: str, messages: list[Any]) -> bool:
+    """Heuristic: is ``text`` just a narration of tool errors, no findings?
+
+    A real research report references files, modules, functions, or
+    behaviour. An error narration just describes what tool failed and
+    what was offered instead. We flag a report as a pure tool-error
+    narration when:
+
+    * It's short (<= 800 chars), AND
+    * It contains tool-error marker phrases, AND
+    * No successful (non-error) ToolMessage exists in the conversation.
+
+    Any one of those alone is too aggressive — a long report that briefly
+    mentions an error is fine, and a short report after successful tool
+    calls is probably genuine if terse.
+    """
+    if len(text) > 800:
+        return False
+    lowered = text.lower()
+    if not any(marker in lowered for marker in _TOOL_ERROR_MARKERS):
+        return False
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            status = getattr(msg, "status", None)
+            if status != "error":
+                return False
+    return True
+
+
 async def _finalize_research_findings(result: dict, model: Any) -> None:
     """Convert the researcher's final markdown report into ResearchFindings.
 
@@ -875,13 +955,21 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
     if model is None:
         return
     messages = result.get("messages", [])
-    final_content = ""
-    for msg in reversed(messages):
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.strip():
-            final_content = content
-            break
+    final_content = _last_ai_narrative(messages)
     if not final_content:
+        return
+    if _looks_like_pure_tool_error(final_content, messages):
+        # The researcher gave up after a tool error without producing
+        # any actual codebase findings. Feeding this prose into the
+        # structured-output model just produces a "summary" that
+        # narrates the error (e.g. "The report indicates a tool
+        # validation error where 'foo' is not a recognized function…"),
+        # which then surfaces to the synthesizer as if it were a real
+        # finding. Bail out so _extract_findings falls back to the
+        # explicit "(no findings)" sentinel instead.
+        logger.info(
+            "Skipping structured finalize: researcher output is pure tool-error narration"
+        )
         return
 
     try:
@@ -923,25 +1011,37 @@ def _extract_findings(result: dict) -> list[dict]:
         if hasattr(structured, "model_dump"):
             return [structured.model_dump()]
 
-    # Fall back to messages — use the last assistant message content
+    # Fall back to messages — use the last assistant message content.
+    # ToolMessages (especially status="error" rebound messages from
+    # ToolSchemaValidator) must be skipped: they're tool outputs, not
+    # the researcher's own narration, and treating them as findings
+    # produced summaries like "Tool 'foo' is not a recognized function".
     messages = result.get("messages", [])
-    for msg in reversed(messages):
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.strip():
-            # Try to parse as JSON first (models may output JSON directly)
-            try:
-                parsed = json.loads(content)
-                if isinstance(parsed, dict):
-                    return [parsed]
-            except (json.JSONDecodeError, TypeError):
-                pass
+    content = _last_ai_narrative(messages)
+    if content:
+        # Try to parse as JSON first (models may output JSON directly)
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return [parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if _looks_like_pure_tool_error(content, messages):
             return [
                 {
-                    "summary": content,
+                    "summary": "(no findings)",
                     "patterns": [],
                     "file_map": {},
                     "dependencies": [],
                 }
             ]
+        return [
+            {
+                "summary": content,
+                "patterns": [],
+                "file_map": {},
+                "dependencies": [],
+            }
+        ]
 
     return [{"summary": "(no findings)", "patterns": [], "file_map": {}, "dependencies": []}]
