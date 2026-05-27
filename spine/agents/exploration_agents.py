@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
@@ -564,7 +565,6 @@ async def run_explore_node(
         ResearchFindings dict (merged by operator.add).
     """
     from spine.agents.factory import build_phase_agent
-    from spine.agents.retry import ainvoke_with_retry
     from spine.agents.subagents import build_subagent_spec
     from spine.models.enums import PhaseName
 
@@ -661,18 +661,19 @@ async def run_explore_node(
         from spine.agents.context import build_context as _build_context
 
         ctx = _build_context(state, phase_enum)
-        # Cap the researcher's LangGraph recursion at ~24 steps (≈12
-        # model+tool round-trips). Past that the marginal value of
-        # further tool calls collapses and the branch's thread tokens
-        # reliably cross the DA compaction line (~56K). The early stop
-        # forces the model to commit findings rather than churning.
-        result = await ainvoke_with_retry(
+        # Cap the researcher's LangGraph recursion at ~50 steps (≈25
+        # model+tool round-trips). LangGraph's default is 25; the prior
+        # cap of 24 sat below that and routinely terminated survey-style
+        # branches mid-investigation (telemetry showed branches still
+        # productive at >50K prompt tokens when the wall hit). 50 gives
+        # enough headroom for breadth-first topics while still bounding
+        # runaway loops.
+        result = await _ainvoke_explore_collecting(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
-            phase_name="explore",
             work_id=work_id,
             context=ctx,
-            config={"recursion_limit": 24},
+            config={"recursion_limit": 50},
         )
 
         # Finalize: convert the free-form research conversation into a
@@ -699,36 +700,76 @@ async def run_explore_node(
         )
 
     except Exception as e:
-        logger.error(
-            "[%s] Explore node failed for topic=%r: %s",
-            work_id,
-            topic_str,
-            e,
-            exc_info=True,
-        )
-        # Keep the user-visible summary terse — full traceback stays in logs
-        # via exc_info=True. Embedding str(e) directly used to leak multi-line
-        # Pydantic / MCP errors straight into ResearchFindings.summary.
-        err_str = str(e).splitlines()[0].strip() if str(e).strip() else type(e).__name__
-        if len(err_str) > 300:
-            err_str = err_str[:299] + "…"
-        findings = [
-            {
-                "summary": (
-                    f"Research failed for topic '{topic_str}': "
-                    f"{type(e).__name__}: {err_str}"
-                ),
-                "patterns": [],
-                "file_map": {},
-                "dependencies": [],
-                # Marker consumed by _summarize_findings and
-                # _format_findings to drop this sentinel from
-                # LLM-facing summaries. The entry is still kept in
-                # state["findings"] so the manager's topic-coverage
-                # bookkeeping sees the attempt.
-                "error": True,
-            }
-        ]
+        # Recursion-cap salvage: _ainvoke_explore_collecting attaches the
+        # last-seen state dict to the exception. If any assistant messages
+        # accumulated before the cap fired, run the same finalize +
+        # extract pipeline used on the happy path so the synthesizer
+        # downstream still gets useful findings from this branch.
+        partial_state = getattr(e, "partial_state", None) if isinstance(e, GraphRecursionError) else None
+        salvaged: list[dict] | None = None
+        if partial_state and partial_state.get("messages"):
+            msg_count = len(partial_state.get("messages", []))
+            logger.warning(
+                "[%s] Recursion cap hit for topic=%r after %d messages; salvaging partial findings",
+                work_id,
+                topic_str,
+                msg_count,
+            )
+            try:
+                await _finalize_research_findings(partial_state, subagent_spec.get("model"))
+                candidate = _extract_findings(partial_state)
+                if candidate and candidate[0].get("summary") not in ("", "(no findings)"):
+                    for f in candidate:
+                        if isinstance(f, dict):
+                            if "topic" not in f:
+                                f["topic"] = topic_str
+                            f["partial"] = True
+                    salvaged = candidate
+                    result = partial_state
+            except Exception:
+                logger.warning(
+                    "[%s] Salvage finalize failed for topic=%r", work_id, topic_str, exc_info=True
+                )
+
+        if salvaged is not None:
+            findings = salvaged
+            logger.info(
+                "[%s] Explore node (salvaged): topic=%r — %d findings entries",
+                work_id,
+                topic_str,
+                len(findings),
+            )
+        else:
+            logger.error(
+                "[%s] Explore node failed for topic=%r: %s",
+                work_id,
+                topic_str,
+                e,
+                exc_info=True,
+            )
+            # Keep the user-visible summary terse — full traceback stays in logs
+            # via exc_info=True. Embedding str(e) directly used to leak multi-line
+            # Pydantic / MCP errors straight into ResearchFindings.summary.
+            err_str = str(e).splitlines()[0].strip() if str(e).strip() else type(e).__name__
+            if len(err_str) > 300:
+                err_str = err_str[:299] + "…"
+            findings = [
+                {
+                    "summary": (
+                        f"Research failed for topic '{topic_str}': "
+                        f"{type(e).__name__}: {err_str}"
+                    ),
+                    "patterns": [],
+                    "file_map": {},
+                    "dependencies": [],
+                    # Marker consumed by _summarize_findings and
+                    # _format_findings to drop this sentinel from
+                    # LLM-facing summaries. The entry is still kept in
+                    # state["findings"] so the manager's topic-coverage
+                    # bookkeeping sees the attempt.
+                    "error": True,
+                }
+            ]
 
     # Bubble the post-invocation deduper cache back into subgraph state so
     # sibling Send() researchers (and the next rework cycle) skip queries we
@@ -738,6 +779,81 @@ async def run_explore_node(
     if cache_snapshot:
         update["read_cache"] = cache_snapshot
     return update
+
+
+async def _ainvoke_explore_collecting(
+    agent: Any,
+    input_: dict[str, Any],
+    *,
+    work_id: str,
+    context: Any,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Drive the researcher agent via ``astream`` so partial state survives errors.
+
+    Behaves like :func:`spine.agents.retry.ainvoke_with_retry` for transient
+    errors (same backoff schedule via the imported helpers), but uses
+    ``stream_mode="values"`` to accumulate the latest state dict locally.
+    On ``GraphRecursionError`` it attaches the accumulated state to the
+    exception as a ``partial_state`` attribute so the caller can salvage
+    whatever messages the researcher produced before the cap fired.
+    """
+    from spine.agents.retry import (
+        DEFAULT_BASE_DELAY,
+        DEFAULT_MAX_DELAY,
+        DEFAULT_MAX_RETRIES,
+        _is_transient_error,
+    )
+
+    invoke_kwargs: dict[str, Any] = {"config": config}
+    if context is not None:
+        invoke_kwargs["context"] = context
+
+    prefix = f"[{work_id}]" if work_id else ""
+
+    last_exc: Exception | None = None
+    for attempt in range(DEFAULT_MAX_RETRIES + 1):
+        partial_state: dict[str, Any] = {}
+        try:
+            async for chunk in agent.astream(
+                input_, stream_mode="values", **invoke_kwargs
+            ):
+                if isinstance(chunk, dict):
+                    partial_state = chunk
+            if context is not None and hasattr(context, "read_cache"):
+                cache_snapshot = getattr(context, "read_cache", None) or {}
+                if cache_snapshot:
+                    partial_state["read_cache"] = dict(cache_snapshot)
+            return partial_state
+        except GraphRecursionError as exc:
+            if context is not None and hasattr(context, "read_cache"):
+                cache_snapshot = getattr(context, "read_cache", None) or {}
+                if cache_snapshot:
+                    partial_state["read_cache"] = dict(cache_snapshot)
+            exc.partial_state = partial_state  # type: ignore[attr-defined]
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_error(exc) or attempt >= DEFAULT_MAX_RETRIES:
+                raise
+
+            delay = min(DEFAULT_BASE_DELAY * (2**attempt), DEFAULT_MAX_DELAY)
+            import random as _random
+
+            jitter = delay * 0.1
+            sleep_time = max(delay + _random.uniform(-jitter, jitter), 0.5)
+            logger.warning(
+                f"{prefix} explore transient error "
+                f"(attempt {attempt + 1}/{DEFAULT_MAX_RETRIES + 1}), "
+                f"retrying in {sleep_time:.1f}s: {type(exc).__name__}: {exc}"
+            )
+            import asyncio as _asyncio
+
+            await _asyncio.sleep(sleep_time)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("_ainvoke_explore_collecting: unexpected state")
 
 
 async def _finalize_research_findings(result: dict, model: Any) -> None:
