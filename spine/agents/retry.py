@@ -225,6 +225,7 @@ async def ainvoke_with_retry(
     work_id: str = "",
     work_type: str = "",
     context: Any = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Async invoke a Deep Agent with exponential backoff retry for transient errors.
 
@@ -267,6 +268,8 @@ async def ainvoke_with_retry(
     invoke_kwargs: dict[str, Any] = {}
     if context is not None:
         invoke_kwargs["context"] = context
+    if config is not None:
+        invoke_kwargs["config"] = config
 
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):

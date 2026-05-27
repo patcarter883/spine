@@ -47,6 +47,13 @@ from langchain_core.messages import AIMessage
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 _DEFAULT_MAX_ROUNDS = 3
+# Cap on concurrent Send("explore", …) dispatches per research round.
+# Without this, _research_router fans out one branch per topic — observed
+# runs spawned ~9 simultaneous researchers, each re-fetching the same
+# hot symbols and crossing the per-branch token budget. Topics beyond
+# the cap are deferred: the manager will re-propose them next round
+# (and _new_topics will skip ones already covered).
+_MAX_PARALLEL_EXPLORES = 4
 
 
 # ── Node: pre_research_gate ─────────────────────────────────────────────
@@ -417,6 +424,8 @@ def _research_router(
 
     hits_map: dict[str, list[dict]] = state.get("topic_recall_hits") or {}
     phase = state.get("phase", "")
+    capped_topics = new_topics[:_MAX_PARALLEL_EXPLORES]
+    deferred = new_topics[_MAX_PARALLEL_EXPLORES:]
     sends = [
         Send(
             "explore",
@@ -425,9 +434,15 @@ def _research_router(
                 "phase": phase,
             },
         )
-        for t in new_topics
+        for t in capped_topics
     ]
-    logger.info("Dispatching %d explore node(s): %s", len(sends), new_topics)
+    if deferred:
+        logger.info(
+            "Dispatching %d explore node(s) (deferring %d to next round): %s | deferred=%s",
+            len(sends), len(deferred), capped_topics, deferred,
+        )
+    else:
+        logger.info("Dispatching %d explore node(s): %s", len(sends), capped_topics)
     return sends
 
 

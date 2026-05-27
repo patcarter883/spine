@@ -29,6 +29,8 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 
+from spine.agents import symbol_cache
+
 # Tools (beyond read_file) whose results we deduplicate when called with
 # identical arguments inside a single phase / subagent invocation. Read-only
 # lookup tools are safe to short-circuit; anything that mutates state must
@@ -180,6 +182,38 @@ class ReadCacheMiddleware(AgentMiddleware):
             turn = ctx.read_cache_turn
             cache = ctx.read_cache
             key = f"call::{tool_name}::{_args_fingerprint(args)}"
+
+            # ── Cross-branch dedupe via symbol_cache ──────────────────
+            # Deterministic codebase-index lookups are memoised at the
+            # work_id level so sibling explore branches running in the
+            # same super-step share results instead of each re-issuing
+            # the same MCP call. The per-branch SpineContext cache below
+            # still serves intra-branch repeat-call detection.
+            if symbol_cache.is_cacheable(tool_name) and getattr(ctx, "work_id", ""):
+                async def _fetch() -> str | None:
+                    res = await handler(request)
+                    if isinstance(res, ToolMessage) and isinstance(res.content, str):
+                        return res.content
+                    if hasattr(res, "content") and isinstance(res.content, str):
+                        return res.content
+                    return None
+
+                cached_content = await symbol_cache.get_or_fetch(
+                    ctx.work_id, tool_name, args, _fetch,
+                )
+                if cached_content is not None:
+                    if key not in cache:
+                        cache[key] = {
+                            "summary": f"{_count_lines(cached_content)} lines",
+                            "turn": turn,
+                        }
+                    return ToolMessage(
+                        content=cached_content,
+                        tool_call_id=request.tool_call["id"],
+                        name=tool_name,
+                    )
+                # Fall through: non-string payload from the handler —
+                # let the regular path run so the model still sees it.
 
             if key in cache:
                 entry = cache[key]

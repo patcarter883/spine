@@ -33,7 +33,7 @@ _MAX_SPEC_CHARS = 8000
 # launching another researcher round — Explore is a survey loop, not an
 # implementation loop, and beyond this threshold the manager starts
 # re-exploring territory already covered by earlier rounds.
-EXPLORE_TOKEN_BUDGET = 30_000
+EXPLORE_TOKEN_BUDGET = 20_000
 
 
 _RECALL_SUFFIX_MARKER = " — recall symbols:"
@@ -659,12 +659,18 @@ async def run_explore_node(
         from spine.agents.context import build_context as _build_context
 
         ctx = _build_context(state, phase_enum)
+        # Cap the researcher's LangGraph recursion at ~24 steps (≈12
+        # model+tool round-trips). Past that the marginal value of
+        # further tool calls collapses and the branch's thread tokens
+        # reliably cross the DA compaction line (~56K). The early stop
+        # forces the model to commit findings rather than churning.
         result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name="explore",
             work_id=work_id,
             context=ctx,
+            config={"recursion_limit": 24},
         )
 
         # Finalize: convert the free-form research conversation into a
