@@ -11,6 +11,8 @@ from typing import Annotated, Any
 
 from typing_extensions import TypedDict
 
+from spine.models.state import _merge_read_cache
+
 
 class BaseSubgraphState(TypedDict, total=False):
     """Fields shared by all phase subgraphs."""
@@ -29,6 +31,11 @@ class BaseSubgraphState(TypedDict, total=False):
     last_critic_review: dict | None  # Forwarded from parent WorkflowState so
     # synthesizers can render the critic's most recent verdict in rework prompts
     # without scanning the accumulating `feedback` list.
+    # Shared dedupe cache for ReadCacheMiddleware — seeded by the state mapper
+    # from WorkflowState.read_cache and written back by nodes after every
+    # agent.ainvoke(). Merged with _merge_read_cache so parallel Send()
+    # researchers do not clobber each other's contributions.
+    read_cache: Annotated[dict, _merge_read_cache]
 
 
 class SpecifySubgraphState(BaseSubgraphState, total=False):

@@ -128,6 +128,10 @@ def _base_state_mapper(parent_state: WorkflowState, config) -> dict:
         "messages": [],
         "artifacts_output": {},
         "phase_status": "",
+        # Seed the subgraph with the run-wide dedupe cache. The subgraph
+        # accumulates further entries during the phase and bubbles the
+        # merged dict back via its phase result mapper.
+        "read_cache": dict(parent_state.get("read_cache") or {}),
     }
 
 

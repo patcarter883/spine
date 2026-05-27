@@ -271,7 +271,16 @@ async def ainvoke_with_retry(
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return await agent.ainvoke(input_, **invoke_kwargs)
+            result = await agent.ainvoke(input_, **invoke_kwargs)
+            # Snapshot the deduper cache onto the result so the calling node
+            # can forward it into LangGraph state via the read_cache reducer.
+            # ReadCacheMiddleware mutates context.read_cache in place during
+            # the invocation; we take a shallow copy to decouple ownership.
+            if context is not None and hasattr(context, "read_cache"):
+                cache_snapshot = getattr(context, "read_cache", None) or {}
+                if cache_snapshot and isinstance(result, dict):
+                    result["read_cache"] = dict(cache_snapshot)
+            return result
         except Exception as exc:
             last_exc = exc
 

@@ -128,6 +128,13 @@ def build_context(
     subagent_names = PHASE_SUBAGENTS.get(phase_name, [])
     active_subagent = subagent_names[0] if len(subagent_names) == 1 else ""
 
+    # Seed the dedupe cache from prior phases / rework cycles. The mapping
+    # is checkpointed in WorkflowState.read_cache; we hand the middleware a
+    # mutable copy so its in-place writes during this invocation can be
+    # snapshotted back into state without leaking writes onto the parent
+    # dict before the LangGraph reducer runs.
+    seeded_cache = dict(state.get("read_cache") or {})
+
     return SpineContext(
         work_id=state.get("work_id", "unknown"),
         phase=phase_name,
@@ -137,4 +144,5 @@ def build_context(
         is_rework=retry_count > 0,
         critic_feedback=critic_feedback,
         artifact_paths=artifact_paths,
+        read_cache=seeded_cache,
     )

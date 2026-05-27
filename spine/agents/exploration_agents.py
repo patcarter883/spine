@@ -458,6 +458,7 @@ async def run_explore_node(
 
     logger.info("[%s] Explore node (phase=%s): researching topic=%r", work_id, phase, topic_str)
 
+    result: dict[str, Any] = {}
     try:
         # Determine which PhaseName to use for model/skill resolution
         phase_enum = PhaseName(phase)
@@ -533,11 +534,19 @@ async def run_explore_node(
         if scratchpad:
             prompt = prompt + "\n\n## Working Memory Scratchpad\n" + scratchpad + "\n"
 
+        # Build a SpineContext so ReadCacheMiddleware can dedupe MCP/read_file
+        # calls inside this researcher loop. Without context= the middleware
+        # bails on ctx=None and every lookup re-hits the live tool — which is
+        # exactly the failure mode the f51d448 deduper was supposed to fix.
+        from spine.agents.context import build_context as _build_context
+
+        ctx = _build_context(state, phase_enum)
         result = await ainvoke_with_retry(
             agent,
             {"messages": [{"role": "user", "content": prompt}]},
             phase_name="explore",
             work_id=work_id,
+            context=ctx,
         )
 
         # Finalize: convert the free-form research conversation into a
@@ -589,7 +598,14 @@ async def run_explore_node(
             }
         ]
 
-    return {"findings": findings}
+    # Bubble the post-invocation deduper cache back into subgraph state so
+    # sibling Send() researchers (and the next rework cycle) skip queries we
+    # already ran. The reducer (_merge_read_cache) handles merge semantics.
+    cache_snapshot = result.get("read_cache") if isinstance(result, dict) else None
+    update: dict[str, Any] = {"findings": findings}
+    if cache_snapshot:
+        update["read_cache"] = cache_snapshot
+    return update
 
 
 async def _finalize_research_findings(result: dict, model: Any) -> None:

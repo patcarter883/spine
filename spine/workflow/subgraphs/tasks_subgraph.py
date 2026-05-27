@@ -150,6 +150,7 @@ async def _run_tasks_agent(
         return {
             "messages": result.get("messages", []),
             "agent_response": extract_response(result),
+            "read_cache": result.get("read_cache") or {},
         }
 
     except Exception as e:
@@ -257,10 +258,16 @@ async def _save_tasks_artifacts(
                 "phase_status": "needs_review",
             }
 
-    return {
+    update: dict[str, Any] = {
         "artifacts_output": disk_artifacts,
         "phase_status": "success",
     }
+    # If the retry branch ran, it produced its own deduper cache snapshot.
+    if "retry_result" in locals():
+        cache = retry_result.get("read_cache") if isinstance(retry_result, dict) else None
+        if cache:
+            update["read_cache"] = cache
+    return update
 
 
 def build_tasks_subgraph() -> Any:

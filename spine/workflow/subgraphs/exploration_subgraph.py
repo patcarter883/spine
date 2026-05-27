@@ -586,6 +586,7 @@ async def _synthesize_plan(
             "agent_response": extract_response(result),
             "plan_json": plan_json_str,
             "execution_waves": execution_waves,
+            "read_cache": result.get("read_cache") or {},
         }
 
     except Exception as e:
@@ -700,6 +701,7 @@ async def _synthesize_specify(
             "messages": result.get("messages", []),
             "agent_response": extract_response(result),
             "specification_json": spec_json_str,
+            "read_cache": result.get("read_cache") or {},
         }
 
     except Exception as e:

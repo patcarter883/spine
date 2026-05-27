@@ -18,6 +18,22 @@ def _merge_dicts(left: dict, right: dict) -> dict:
     return merged
 
 
+def _merge_read_cache(left: dict, right: dict) -> dict:
+    """Reducer for the cross-invocation read_cache.
+
+    Entries are keyed by file path or by ``call::<tool>::<args-fingerprint>``;
+    values are small metadata dicts (n_lines, symbols, turn, summary). Right
+    wins on key collisions so the newest probe — which has the freshest turn
+    counter — survives. Concurrent Send() researchers each contribute their
+    own keys; non-overlapping keys merge cleanly.
+    """
+    if not left:
+        return dict(right or {})
+    if not right:
+        return dict(left)
+    return {**left, **right}
+
+
 def _merge_artifacts(left: dict, right: dict) -> dict:
     """Deep-merge artifacts dicts so per-file entries aren't lost.
 
@@ -145,3 +161,10 @@ class WorkflowState(TypedDict, total=False):
     classification_confidence: float  # 0.0-1.0 confidence from classify_task —
     # used by the pre_research_gate to decide whether to skip the exploration
     # loop and synthesize directly from recalled chunks.
+
+    # Shared deduper cache for the run — survives across phases and rework
+    # cycles via the LangGraph checkpointer. Populated by ReadCacheMiddleware
+    # inside every agent.ainvoke() and merged back into state by each node.
+    # Subgraph state mappers seed their own copy from this field and bubble
+    # the post-invocation cache back via the same key.
+    read_cache: Annotated[dict, _merge_read_cache]

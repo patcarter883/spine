@@ -141,6 +141,7 @@ async def _run_plan_agent(
             "agent_response": extract_response(result),
             "plan_json": plan_json_str,
             "execution_waves": execution_waves,
+            "read_cache": result.get("read_cache") or {},
         }
 
     except Exception as e:

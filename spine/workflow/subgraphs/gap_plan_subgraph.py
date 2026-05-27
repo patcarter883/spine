@@ -89,6 +89,7 @@ async def _run_gap_plan_agent(
             "messages": result.get("messages", []),
             "agent_response": extract_response(result),
             "gap_plan_json": gap_plan_json_content,
+            "read_cache": result.get("read_cache") or {},
         }
 
     except Exception as e:

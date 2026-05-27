@@ -174,6 +174,7 @@ async def _run_specify_agent(
             "agent_response": extract_response(result),
             "task_category": task_category,
             "retrieved_context": retrieved_context,
+            "read_cache": result.get("read_cache") or {},
         }
 
     except Exception as e:

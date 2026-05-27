@@ -330,7 +330,7 @@ def make_success_result_mapper(phase: str) -> Callable:
                 if isinstance(content, str):
                     artifact_previews[name] = content[:_MAX_ARTIFACT_STATE_CHARS]
 
-        return {
+        result: dict[str, Any] = {
             "current_phase": phase,
             "status": "running",
             "prompt_request": None,
@@ -345,5 +345,11 @@ def make_success_result_mapper(phase: str) -> Callable:
             },
             "artifacts": {phase: artifact_previews},
         }
+        # Bubble the subgraph's accumulated dedupe cache back to WorkflowState
+        # so downstream phases (and rework cycles) start with a warm cache.
+        cache = subgraph_result.get("read_cache")
+        if cache:
+            result["read_cache"] = cache
+        return result
 
     return map_success
