@@ -19,6 +19,8 @@ from spine.agents.exploration_agents import (
     _SALVAGE_SECTION_CHAR_CAP,
     _attempt_research_salvage,
     _collect_salvage_evidence,
+    _extract_findings,
+    _finalize_research_findings,
     _finalize_research_findings_from_evidence,
 )
 
@@ -278,10 +280,163 @@ async def test_salvage_returns_none_when_finalize_call_raises():
     }
     # _finalize_research_findings_from_evidence swallows the error and
     # leaves structured_response unset. _extract_findings then falls back
-    # to the last text message; with only a ToolMessage, the fallback
-    # returns {"summary": <tool body>, "file_map": {}, "patterns": [],
-    # "dependencies": []} — which the all-empty check rejects.
+    # to the last AIMessage; with only a ToolMessage in history, it
+    # returns the "(no findings)" sentinel — which the all-empty check
+    # in _attempt_research_salvage rejects.
     out = await _attempt_research_salvage(
         partial_state, _ExplodingModel(), "topic", "work1"
     )
     assert out is None
+
+
+# ── Error-status ToolMessage filtering (regression guards) ────────────────
+#
+# When a tool call raises, ToolSchemaValidator wraps the exception as
+# ToolMessage(status="error", content="Tool 'X' execution failed: ...").
+# Three code paths used to splice that error string into findings passed
+# back to the model. These tests pin the fix.
+
+
+def test_collect_evidence_skips_error_status_tool_messages():
+    msgs = [
+        ToolMessage(
+            content="Tool 'mcp_find_symbol' execution failed: timeout. Check the arguments and retry.",
+            tool_call_id="t1",
+            name="mcp_find_symbol",
+            status="error",
+        ),
+        ToolMessage(
+            content="def login(): ...",
+            tool_call_id="t2",
+            name="mcp_get_function_source",
+        ),
+    ]
+    out = _collect_salvage_evidence(msgs)
+    assert "def login()" in out
+    assert "execution failed" not in out
+    assert "mcp_find_symbol" not in out
+
+
+def test_collect_evidence_returns_empty_when_only_errors():
+    msgs = [
+        ToolMessage(
+            content="Tool 'search_codebase' execution failed: connection refused.",
+            tool_call_id="t1",
+            name="search_codebase",
+            status="error",
+        ),
+        ToolMessage(
+            content="Tool 'fetch_url' execution failed: HTTP 503.",
+            tool_call_id="t2",
+            name="fetch_url",
+            status="error",
+        ),
+    ]
+    assert _collect_salvage_evidence(msgs) == ""
+
+
+@pytest.mark.asyncio
+async def test_finalize_research_findings_ignores_trailing_error_tool_message():
+    # Researcher loop ended on a failed tool call. Without the fix, the
+    # reverse scan would pick up the error ToolMessage and feed
+    # "Tool 'X' execution failed: ..." into the structured-output prompt.
+    captured: dict[str, Any] = {}
+    result: dict[str, Any] = {
+        "messages": [
+            AIMessage(content="Auth lives in spine/auth.py with JWT validation."),
+            AIMessage(content=""),  # final assistant turn — tool_calls only
+            ToolMessage(
+                content="Tool 'mcp_find_symbol' execution failed: file not found. Check the arguments and retry.",
+                tool_call_id="t1",
+                name="mcp_find_symbol",
+                status="error",
+            ),
+        ]
+    }
+
+    from spine.agents.subagents import ResearchFindings
+
+    fake_findings = ResearchFindings(
+        summary="Auth lives in spine/auth.py with JWT validation.",
+        patterns=[],
+        file_map={"spine/auth.py": "auth"},
+        dependencies=[],
+    )
+    await _finalize_research_findings(result, _FakeModel(fake_findings, captured))
+
+    assert result["structured_response"] is fake_findings
+    assert "execution failed" not in captured["prompt"]
+    assert "spine/auth.py" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_research_findings_noop_when_only_error_tool_messages():
+    # No AIMessage with content at all — nothing legitimate to coerce.
+    # Must NOT pull from the error ToolMessage.
+    result: dict[str, Any] = {
+        "messages": [
+            ToolMessage(
+                content="Tool 'X' execution failed: boom.",
+                tool_call_id="t1",
+                name="X",
+                status="error",
+            ),
+        ]
+    }
+    captured: dict[str, Any] = {}
+    await _finalize_research_findings(
+        result, _FakeModel(response=object(), captured=captured)
+    )
+    assert "structured_response" not in result
+    assert "prompt" not in captured  # ainvoke must not have been called
+
+
+def test_extract_findings_returns_sentinel_when_only_error_tool_messages():
+    result = {
+        "messages": [
+            ToolMessage(
+                content="Tool 'search_codebase' execution failed: timeout.",
+                tool_call_id="t1",
+                name="search_codebase",
+                status="error",
+            ),
+        ]
+    }
+    out = _extract_findings(result)
+    assert out == [
+        {"summary": "(no findings)", "patterns": [], "file_map": {}, "dependencies": []}
+    ]
+
+
+def test_extract_findings_picks_last_ai_message_over_trailing_tool_message():
+    # AIMessage with the real synthesis exists, but a ToolMessage trails it.
+    # The fallback must pick the AIMessage, not wrap the ToolMessage body.
+    result = {
+        "messages": [
+            AIMessage(content="Found auth in spine/auth.py."),
+            ToolMessage(
+                content="def login(): ...",  # successful tool result
+                tool_call_id="t1",
+                name="get_source",
+            ),
+        ]
+    }
+    out = _extract_findings(result)
+    assert out[0]["summary"] == "Found auth in spine/auth.py."
+
+
+def test_extract_findings_skips_error_tool_message_and_uses_earlier_ai_message():
+    result = {
+        "messages": [
+            AIMessage(content="Earlier synthesis: pattern X observed."),
+            ToolMessage(
+                content="Tool 'Y' execution failed: timeout.",
+                tool_call_id="t1",
+                name="Y",
+                status="error",
+            ),
+        ]
+    }
+    out = _extract_findings(result)
+    assert out[0]["summary"] == "Earlier synthesis: pattern X observed."
+    assert "execution failed" not in out[0]["summary"]

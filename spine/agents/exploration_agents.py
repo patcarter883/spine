@@ -950,7 +950,12 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
         return
     messages = result.get("messages", [])
     final_content = ""
+    # Only AIMessages count as "the report". Tool results are evidence, not
+    # synthesis — and an error-status ToolMessage trailing the loop would
+    # otherwise be coerced into a fake ResearchFindings.
     for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
         content = getattr(msg, "content", "")
         if isinstance(content, str) and content.strip():
             final_content = content
@@ -1013,6 +1018,12 @@ def _collect_salvage_evidence(messages: list) -> str:
         if not isinstance(content, str) or not content.strip():
             continue
         if isinstance(msg, ToolMessage):
+            # Skip failed tool calls — their content is an error string from
+            # ToolSchemaValidator, not real evidence. Including them would
+            # let the salvage prompt frame "Tool 'X' execution failed: ..."
+            # as research data and produce a hallucinated paraphrase.
+            if getattr(msg, "status", None) == "error":
+                continue
             tool_name = getattr(msg, "name", None) or "tool"
             body = content.strip()
             if len(body) > _SALVAGE_SECTION_CHAR_CAP:
@@ -1171,9 +1182,13 @@ def _extract_findings(result: dict) -> list[dict]:
         if hasattr(structured, "model_dump"):
             return [structured.model_dump()]
 
-    # Fall back to messages — use the last assistant message content
+    # Fall back to messages — use the last assistant message content.
+    # Restrict to AIMessage so error-status ToolMessages don't get wrapped
+    # as the finding summary.
     messages = result.get("messages", [])
     for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
         content = getattr(msg, "content", "")
         if isinstance(content, str) and content.strip():
             # Try to parse as JSON first (models may output JSON directly)
