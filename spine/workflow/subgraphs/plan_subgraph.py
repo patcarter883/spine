@@ -31,7 +31,6 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    artifact_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,8 +62,6 @@ async def _run_plan_agent(
 
         has_spec = state.get("has_spec", False)
         spec_path = state.get("spec_path", "")
-
-        plan_path = artifact_path(work_id, PhaseName.PLAN.value)
 
         if has_spec and spec_path:
             spec_instruction = (

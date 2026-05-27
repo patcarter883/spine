@@ -553,53 +553,6 @@ async def submit_work(
         }
 
 
-# ── List planning work ──
-
-
-async def list_plans(
-    status: str | None = None,
-    limit: int = 50,
-    config: SpineConfig | None = None,
-) -> list[dict[str, Any]]:
-    """List planning work items with optional status filter.
-
-    This function retrieves work items that are planning workflows
-    (work_type in: reviewed_task, critical_reviewed_task).
-
-    Args:
-        status: Optional status filter (e.g., 'awaiting_approval', 'completed', 'needs_review').
-        limit: Maximum number of results to return.
-        config: Optional SpineConfig.
-
-    Returns:
-        List of work entry dicts for planning work items.
-    """
-    if config is None:
-        config = SpineConfig.load()
-
-    db = _get_work_db(config)
-
-    # Planning work types (new names)
-    plan_types = ("reviewed_task", "critical_reviewed_task")
-
-    # Query with optional status filter
-    placeholders = ",".join(["?" for _ in plan_types])
-    args = list(plan_types)
-
-    if status:
-        where_clause = f"work_type IN ({placeholders}) AND status = ?"
-        args.append(status)
-    else:
-        where_clause = f"work_type IN ({placeholders})"
-
-    args.append(limit)
-    where_clause += " ORDER BY created_at DESC LIMIT ?"
-
-    entries = list(db["work_entries"].search(where_clause, *args))
-
-    return [dict(entry) for entry in entries]
-
-
 # ── Resume work ──
 
 

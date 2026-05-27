@@ -13,13 +13,182 @@ call MCP tools concurrently from different event loops.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import re
 from typing import Any
 
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 logger = logging.getLogger(__name__)
+
+
+# ── Result-size caps for chatty index tools ───────────────────────────────
+# A bare `mcp_codebase-index_search_codebase` call has been observed dumping
+# ~190 KB into the agent transcript in one shot. We post-process the tool
+# result string to enforce a hard ceiling and force the agent to refine its
+# regex / file globs instead. Tunable per deployment via these constants.
+
+SEARCH_CODEBASE_MAX_BYTES = 8192
+SEARCH_CODEBASE_MAX_HITS = 50
+
+# Tools whose results are line-shaped (one match per line) and benefit from
+# both byte + hit caps.
+_HIT_CAPPED_TOOLS: frozenset[str] = frozenset({
+    "mcp_codebase-index_search_codebase",
+})
+
+# Tools that can return very large blobs (full source bodies). Apply only
+# the byte cap.
+_BYTE_CAPPED_TOOLS: frozenset[str] = frozenset({
+    "mcp_codebase-index_get_function_source",
+    "mcp_codebase-index_get_class_source",
+})
+
+
+# ── Path-prefix exclusions for indexed-but-uninteresting directories ─────
+# The external indexer is configured against PROJECT_ROOT and has no
+# awareness of spine's own scratch directories. Without this filter the
+# researcher reads back its own prior artifacts as if they were source.
+EXCLUDED_INDEX_PATHS: tuple[str, ...] = (
+    ".spine/artifacts/",
+    ".spine/checkpoints/",
+    ".spine/spine.db",
+)
+
+# Matches a path-like prefix at the start of a line (after optional bullet/
+# whitespace decoration). Anchored to line start so prose lines that merely
+# mention a path are not stripped.
+_PATH_LINE_RE = re.compile(
+    r"^(?P<lead>\s*[-*•]?\s*)(?P<path>(?:\./)?[\w./-]+)"
+)
+
+
+def _line_starts_with_excluded_path(line: str) -> bool:
+    """Return True when *line* leads with a path inside EXCLUDED_INDEX_PATHS."""
+    m = _PATH_LINE_RE.match(line)
+    if not m:
+        return False
+    path = m.group("path")
+    if path.startswith("./"):
+        path = path[2:]
+    return any(path.startswith(prefix) for prefix in EXCLUDED_INDEX_PATHS)
+
+
+def _strip_excluded_paths(text: str) -> tuple[str, int]:
+    """Drop lines whose leading path falls under an excluded directory.
+
+    Returns (filtered_text, n_dropped). Forgiving — non-path lines pass
+    through untouched so prose/grouping headers are preserved.
+    """
+    if not text or not any(prefix in text for prefix in EXCLUDED_INDEX_PATHS):
+        return text, 0
+    kept: list[str] = []
+    dropped = 0
+    for line in text.splitlines():
+        if _line_starts_with_excluded_path(line):
+            dropped += 1
+            continue
+        kept.append(line)
+    return ("\n".join(kept), dropped)
+
+
+def _cap_result(tool_name: str, result: str) -> str:
+    """Apply byte / hit caps to a tool result string."""
+    if not isinstance(result, str):
+        return result
+
+    apply_hits = tool_name in _HIT_CAPPED_TOOLS
+    apply_bytes = tool_name in _HIT_CAPPED_TOOLS or tool_name in _BYTE_CAPPED_TOOLS
+
+    if not (apply_hits or apply_bytes):
+        return result
+
+    capped = result
+    truncation_notes: list[str] = []
+
+    if apply_hits:
+        lines = capped.splitlines()
+        total = len(lines)
+        if total > SEARCH_CODEBASE_MAX_HITS:
+            capped = "\n".join(lines[:SEARCH_CODEBASE_MAX_HITS])
+            truncation_notes.append(
+                f"{SEARCH_CODEBASE_MAX_HITS}/{total} hits"
+            )
+
+    if apply_bytes:
+        raw = capped.encode("utf-8", errors="replace")
+        if len(raw) > SEARCH_CODEBASE_MAX_BYTES:
+            capped = raw[:SEARCH_CODEBASE_MAX_BYTES].decode("utf-8", errors="ignore")
+            truncation_notes.append(
+                f"{SEARCH_CODEBASE_MAX_BYTES}/{len(raw)} bytes"
+            )
+
+    if truncation_notes:
+        capped = (
+            f"{capped}\n[truncated: showed {', '.join(truncation_notes)} — "
+            "refine regex with anchors / file globs / case sensitivity, "
+            "or call a structural tool like find_symbol / get_dependencies]"
+        )
+    return capped
+
+
+def _post_process_result(tool_name: str, result: Any) -> Any:
+    """Apply path exclusion + size caps to a tool's textual result.
+
+    Operates on strings (which MCP adapters return for most server tools).
+    Non-string payloads pass through unchanged so future structured results
+    are not mangled.
+    """
+    if not isinstance(result, str):
+        return result
+    filtered, dropped = _strip_excluded_paths(result)
+    if dropped:
+        logger.debug(
+            "MCP %s: dropped %d result lines pointing at excluded paths",
+            tool_name,
+            dropped,
+        )
+    return _cap_result(tool_name, filtered)
+
+
+def _wrap_for_postprocessing(tool: BaseTool) -> BaseTool:
+    """Patch *tool* so its `_run` / `_arun` outputs are post-processed.
+
+    Patches in place rather than subclassing to avoid Pydantic model
+    constraints on BaseTool. The original bound methods are captured in a
+    closure so the wrapper is idempotent (re-wrapping a wrapped tool is a
+    no-op since we check the marker attribute).
+    """
+    name = getattr(tool, "name", None)
+    if not isinstance(name, str) or not name.startswith("mcp_codebase-index_"):
+        return tool
+    if getattr(tool, "_spine_postprocess_wrapped", False):
+        return tool
+
+    try:
+        original_run = getattr(tool, "_run", None)
+        original_arun = getattr(tool, "_arun", None)
+
+        if callable(original_arun):
+            @functools.wraps(original_arun)
+            async def _wrapped_arun(*args: Any, **kwargs: Any) -> Any:
+                result = await original_arun(*args, **kwargs)
+                return _post_process_result(name, result)
+            object.__setattr__(tool, "_arun", _wrapped_arun)
+
+        if callable(original_run):
+            @functools.wraps(original_run)
+            def _wrapped_run(*args: Any, **kwargs: Any) -> Any:
+                result = original_run(*args, **kwargs)
+                return _post_process_result(name, result)
+            object.__setattr__(tool, "_run", _wrapped_run)
+
+        object.__setattr__(tool, "_spine_postprocess_wrapped", True)
+    except Exception:
+        logger.debug("Failed to wrap MCP tool %s for post-processing", name, exc_info=True)
+    return tool
 
 
 def _convert_server_config(spine_server: dict[str, Any]) -> dict[str, Any]:
@@ -137,7 +306,8 @@ def get_mcp_tools(
     namespaced: list[BaseTool] = []
     if primary_server:
         for tool in tools:
-            namespaced.append(_namespace_tool(tool, primary_server))
+            ns_tool = _namespace_tool(tool, primary_server)
+            namespaced.append(_wrap_for_postprocessing(ns_tool))
 
     logger.info("Loaded %d MCP tools from %d server(s)", len(namespaced), len(server_configs))
     return namespaced

@@ -494,13 +494,6 @@ def make_prerequisite_gate_node(
     Returns:
         A node function suitable for ``graph.add_node()``.
     """
-    phase_completion_flags = {
-        "plan": "spec_completed",
-        "implement": "plan_completed",
-        "verify": "implement_completed",
-        "gap_plan": "verification_attempted",
-    }
-
     def gate_node(state: WorkflowState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
         work_id = state.get("work_id", "unknown")
 

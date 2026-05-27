@@ -132,7 +132,6 @@ class RecallTool(BaseTool):
         summaries_only: bool = False,
     ) -> str:
         """Async recall implementation."""
-        from spine.agents.helpers import resolve_model
         from spine.config import SpineConfig
 
         # Resolve k — 0 means "use config default"

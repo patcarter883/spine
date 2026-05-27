@@ -8,7 +8,6 @@ summarize with LLM, and embed for vector search.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from typing import Any
@@ -309,7 +308,6 @@ class VectorIndexer:
                     )
 
         # Retry transient embedding failures (vLLM overload)
-        import time
         max_retries = 3
         for attempt in range(max_retries):
             try:

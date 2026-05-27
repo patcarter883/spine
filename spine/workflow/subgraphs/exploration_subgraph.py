@@ -35,7 +35,6 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    artifact_path,
 )
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry

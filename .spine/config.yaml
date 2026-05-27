@@ -9,8 +9,6 @@ spine:
   vector_indexing:
     max_concurrent_chunks: 10
     batch_size: 100
-    summarize_temperature: 0.3
-    embed_temperature: 0.1
 mcp_servers:
   codebase-index:
     transport: stdio
@@ -90,17 +88,17 @@ providers:
     plan:
       provider: pat
     critic:
-      provider: local
+      provider: pat
     exploration:
-      provider: local
+      provider: pat
     implement:
-      provider: local
+      provider: pat
     implement/subagents/slice-implementer:
       provider: pat
     verify:
       provider: pat
     gap_plan:
-      provider: local
+      provider: pat
     # RAG phase providers
     classification:
       provider: local
