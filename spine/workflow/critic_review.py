@@ -38,6 +38,36 @@ _STRUCTURED_STATE_FIELD: dict[str, str] = {
 logger = logging.getLogger(__name__)
 
 
+def _build_review_prompt(
+    *,
+    reviewed_phase: str,
+    structured_payload: str,
+    description: str,
+) -> str:
+    """Build the user-message prompt for the critic agent.
+
+    Inlines the original user description (when present) so phase-specific
+    critic augmentations such as :data:`_SPECIFY_REVIEW_INSTRUCTIONS` can
+    check spec-to-description traceability without re-reading state.
+    """
+    description = (description or "").strip()
+    description_section = (
+        f"## Original User Description\n{description}\n\n"
+        if description
+        else ""
+    )
+    return (
+        f"Review ONLY the structured output below for the {reviewed_phase} "
+        "phase. Do not attempt to read files or run commands; everything "
+        "you need is inlined.\n\n"
+        f"{description_section}"
+        "## Structured Output Under Review\n"
+        f"```json\n{structured_payload}\n```\n\n"
+        "Respond with PASSED, NEEDS_REVISION, or NEEDS_REVIEW and include "
+        "concrete reasons and suggestions."
+    )
+
+
 def _get_reviewed_phase(state: WorkflowState) -> str:
     """Determine which phase the critic is reviewing.
 
@@ -187,14 +217,10 @@ async def agent_critic_check(
                 ),
             )
 
-        prompt = (
-            f"Review ONLY the structured output below for the "
-            f"{reviewed_phase} phase. Do not attempt to read files or run "
-            f"commands; everything you need is inlined.\n\n"
-            f"## Structured Output Under Review\n"
-            f"```json\n{structured_payload}\n```\n\n"
-            f"Respond with PASSED, NEEDS_REVISION, or NEEDS_REVIEW and "
-            f"include concrete reasons and suggestions."
+        prompt = _build_review_prompt(
+            reviewed_phase=reviewed_phase,
+            structured_payload=structured_payload,
+            description=state.get("description") or "",
         )
 
         ctx = build_context(state, PhaseName.CRITIC)

@@ -252,9 +252,14 @@ async def submit_work(
     try:
         from spine.persistence.checkpoint import CheckpointStore
         from spine.workflow.compose import build_workflow_graph
+        from spine.agents.retry import reset_token_budget
 
         checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
         checkpointer = await checkpoint_store.get_checkpointer()
+
+        # Clear any stale cumulative token count from a prior run of the
+        # same work_id (e.g. a restart) so the budget enforcer starts fresh.
+        reset_token_budget(work_id)
 
         graph = build_workflow_graph(work_type, checkpointer=checkpointer)
 

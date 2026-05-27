@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -28,6 +29,128 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = 2.0  # seconds
 DEFAULT_MAX_DELAY = 60.0  # seconds
+
+
+# ── Token budget enforcement ────────────────────────────────────────────────
+#
+# Cumulative input+output tokens per work_id. Phases call ainvoke_with_retry
+# repeatedly; once cumulative usage crosses the per-work-type budget, the next
+# invocation raises MaxTokenBudgetExceeded so the phase subgraph wrapper can
+# route to needs_review instead of running unbounded.
+#
+# Budget is only effective when the LLM returns usage_metadata. OpenRouter
+# requires stream_usage=True (see _build_openrouter_model); local vLLM needs
+# providers.llm[].stream_usage: true.
+
+# Defaults derived from operational telemetry — quick workflows almost never
+# exceed 200K when behaving correctly; spec workflows top out around 500K;
+# critical_reviewed_task is allowed up to 1M before forcing human review.
+_DEFAULT_BUDGETS_BY_WORK_TYPE: dict[str, int] = {
+    "quick": 200_000,
+    "spec": 500_000,
+    "critical_reviewed_task": 1_000_000,
+}
+
+_cumulative_tokens: dict[str, int] = {}
+
+
+class MaxTokenBudgetExceeded(Exception):
+    """Raised when a work_id's cumulative LLM token usage exceeds its budget.
+
+    Phase subgraph wrappers catch this and convert it into a needs_review
+    outcome so the workflow stops instead of burning unbounded tokens.
+    """
+
+    def __init__(self, work_id: str, cumulative: int, budget: int):
+        self.work_id = work_id
+        self.cumulative = cumulative
+        self.budget = budget
+        super().__init__(
+            f"Token budget exceeded for work_id={work_id}: "
+            f"{cumulative:,} / {budget:,} tokens"
+        )
+
+
+def _get_token_budget(work_type: str) -> int:
+    """Return the token budget for ``work_type``.
+
+    Honours the ``SPINE_TOKEN_BUDGET`` env var as a global override; falls
+    back to ``_DEFAULT_BUDGETS_BY_WORK_TYPE``; defaults to 1M for unknown
+    work types so an unfamiliar workflow doesn't trip on a missing entry.
+    """
+    override = os.environ.get("SPINE_TOKEN_BUDGET", "").strip()
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            logger.warning(
+                "SPINE_TOKEN_BUDGET=%r is not an integer — ignoring", override
+            )
+    return _DEFAULT_BUDGETS_BY_WORK_TYPE.get(work_type, 1_000_000)
+
+
+def _tokens_from_result(result: Any) -> int:
+    """Sum input+output tokens from any AIMessage.usage_metadata in ``result``.
+
+    LangGraph agent results carry an ``"messages"`` list whose ``AIMessage``
+    entries have a ``usage_metadata`` dict (``input_tokens`` /
+    ``output_tokens`` / ``total_tokens``). Some providers attach usage only
+    to the final chunk; others attach per-message. We sum across every
+    AIMessage so per-message providers are accounted for, then deduplicate
+    by message id when present.
+    """
+    if not isinstance(result, dict):
+        return 0
+    messages = result.get("messages") or []
+    if not isinstance(messages, list):
+        return 0
+    total = 0
+    seen_ids: set[str] = set()
+    for msg in messages:
+        usage = getattr(msg, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            continue
+        msg_id = getattr(msg, "id", None)
+        if isinstance(msg_id, str) and msg_id:
+            if msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+        total += int(usage.get("input_tokens") or 0)
+        total += int(usage.get("output_tokens") or 0)
+    return total
+
+
+def reset_token_budget(work_id: str) -> None:
+    """Clear cumulative token tracking for a work_id.
+
+    Called by the dispatcher at workflow launch so a re-run of the same
+    work_id starts with a fresh budget rather than inheriting whatever was
+    left over from the prior process's in-memory counter.
+    """
+    _cumulative_tokens.pop(work_id, None)
+
+
+def _check_and_update_token_budget(
+    *, work_id: str, work_type: str, result: Any
+) -> int:
+    """Add this call's tokens to the work_id counter and enforce the budget.
+
+    Returns the new cumulative total. Raises ``MaxTokenBudgetExceeded``
+    when the cumulative crosses the work-type budget. Silently no-ops
+    (returns the prior cumulative) when ``work_id`` is missing or the LLM
+    response lacks usage_metadata.
+    """
+    if not work_id:
+        return 0
+    tokens = _tokens_from_result(result)
+    if tokens <= 0:
+        return _cumulative_tokens.get(work_id, 0)
+    new_total = _cumulative_tokens.get(work_id, 0) + tokens
+    _cumulative_tokens[work_id] = new_total
+    budget = _get_token_budget(work_type)
+    if new_total > budget:
+        raise MaxTokenBudgetExceeded(work_id, new_total, budget)
+    return new_total
 
 
 def _is_transient_error(exc: Exception) -> bool:
@@ -178,7 +301,19 @@ def invoke_with_retry(
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return agent.invoke(input_, **invoke_kwargs)
+            result = agent.invoke(input_, **invoke_kwargs)
+            try:
+                _check_and_update_token_budget(
+                    work_id=work_id, work_type=work_type, result=result
+                )
+            except MaxTokenBudgetExceeded as budget_exc:
+                logger.warning(
+                    f"{prefix}{phase_label} {budget_exc} — aborting phase"
+                )
+                raise
+            return result
+        except MaxTokenBudgetExceeded:
+            raise
         except Exception as exc:
             last_exc = exc
 
@@ -283,7 +418,23 @@ async def ainvoke_with_retry(
                 cache_snapshot = getattr(context, "read_cache", None) or {}
                 if cache_snapshot and isinstance(result, dict):
                     result["read_cache"] = dict(cache_snapshot)
+            # Token-budget enforcement: account for this call and raise
+            # MaxTokenBudgetExceeded if the cumulative crosses the budget.
+            # The subgraph wrapper catches this and routes to needs_review.
+            try:
+                _check_and_update_token_budget(
+                    work_id=work_id, work_type=work_type, result=result
+                )
+            except MaxTokenBudgetExceeded as budget_exc:
+                logger.warning(
+                    f"{prefix}{phase_label} {budget_exc} — aborting phase"
+                )
+                raise
             return result
+        except MaxTokenBudgetExceeded:
+            # Already logged inside the inner try-block above. Propagate
+            # without the "permanent error" log line and without retrying.
+            raise
         except Exception as exc:
             last_exc = exc
 

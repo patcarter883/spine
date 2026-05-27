@@ -381,6 +381,7 @@ class SpineConfig:
         "max_retries",
         "guided_decoding",
         "max_concurrent_calls",
+        "stream_usage",
     )
 
     def resolve_active_provider(self) -> dict | None:

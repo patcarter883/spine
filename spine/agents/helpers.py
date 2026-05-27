@@ -223,6 +223,17 @@ def _build_openrouter_model(
     # falsely fires on slow models (reasoning models, long outputs).
     model_kwargs.setdefault("streaming", True)
 
+    # ── Enable usage_metadata on streamed responses ─────────────────
+    # ChatOpenRouter inherits ChatOpenAI; stream_usage=True causes it
+    # to send stream_options: {"include_usage": true} on the request,
+    # which makes the final stream chunk carry the token counts.
+    # Without it, LangSmith records 0 tokens on every call and the
+    # token-budget tracker is blind.  Default-on; set
+    # providers.llm[].stream_usage: false to opt out for a misbehaving
+    # provider.
+    if provider_cfg.get("stream_usage") is not False:
+        model_kwargs.setdefault("stream_usage", True)
+
     _apply_concurrency_cap(model_kwargs, provider_cfg)
 
     return ChatOpenRouter(**model_kwargs)
@@ -294,14 +305,14 @@ def _build_local_model(
     # as stalled even though inference is still running.
     kwargs.setdefault("streaming", True)
 
-    # ── Enable stream_usage for token counting (opt-in) ──────────────
-    # When stream_usage=True, ChatOpenAI sends
-    # `stream_options: {"include_usage": true}` to the server so the
-    # final usage chunk includes token counts (needed by LangSmith).
-    # Some strict local vLLM backends reject unexpected request fields
-    # with a 400 "Extra data" parse error.  Set `stream_usage: true` in
-    # the provider config (providers.llm[].stream_usage) to enable.
-    if provider_cfg.get("stream_usage"):
+    # ── Enable stream_usage for token counting (default-on) ──────────
+    # ChatOpenAI sends `stream_options: {"include_usage": true}` when
+    # stream_usage=True so the final stream chunk carries token counts —
+    # required for LangSmith reporting and the per-work_id budget tracker.
+    # Default-on parity with _build_openrouter_model. Some strict local
+    # vLLM backends 400 on unexpected request fields; opt out by setting
+    # providers.llm[].stream_usage: false for that provider.
+    if provider_cfg.get("stream_usage") is not False:
         kwargs.setdefault("stream_usage", True)
 
     _apply_concurrency_cap(kwargs, provider_cfg)

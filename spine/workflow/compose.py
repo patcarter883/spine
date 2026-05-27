@@ -178,10 +178,17 @@ def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
     retry_count = parent_state.get("retry_count", {}).get(PhaseName.SPECIFY.value, 0)
     base = _base_state_mapper(parent_state, config)
-    if retry_count > 0:
-        prior_topics, prior_findings = _load_prior_research(
-            workspace_root, work_id, PhaseName.SPECIFY.value
-        )
+    # Always attempt to load prior research, regardless of retry_count.
+    # CriticalContractFailure on a critic gate does not increment
+    # retry_count but does re-enter the phase, so gating prior-research
+    # seeding on retry_count > 0 caused the research_manager to re-issue
+    # the same architectural topics on every re-entry. _load_prior_research
+    # returns ([], []) when no research_log.json exists, so the fresh-run
+    # path is unaffected.
+    prior_topics, prior_findings = _load_prior_research(
+        workspace_root, work_id, PhaseName.SPECIFY.value
+    )
+    if prior_topics or prior_findings:
         base["topics"] = prior_topics
         base["findings"] = prior_findings
     return {
@@ -198,10 +205,11 @@ def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     workspace_root = parent_state.get("workspace_root", ".")
     retry_count = parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
     base = _base_state_mapper(parent_state, config)
-    if retry_count > 0:
-        prior_topics, prior_findings = _load_prior_research(
-            workspace_root, work_id, PhaseName.PLAN.value
-        )
+    # Always attempt to load prior research (see _specify_state_mapper).
+    prior_topics, prior_findings = _load_prior_research(
+        workspace_root, work_id, PhaseName.PLAN.value
+    )
+    if prior_topics or prior_findings:
         base["topics"] = prior_topics
         base["findings"] = prior_findings
     # All work types now run specify, so has_spec is always True

@@ -171,6 +171,11 @@ Rules:
 - If findings already cover all key architectural areas, decide "done".
 - Cover breadth before depth — ensure all implicated modules are touched
   before diving deeper into any one module.
+- If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
+  rework — the prior pass already wrote a research log. Default to
+  decision="done" so synthesis can re-run with the existing findings.
+  Propose new topics ONLY when a critic suggestion explicitly identifies
+  a coverage gap, and then cap at 1 topic addressing that gap.
 """
 
 _RESEARCH_MANAGER_PLAN = """\
@@ -244,6 +249,11 @@ Rules:
   modules) before peripheral concerns.
 - Cross-reference every topic against the specification — if the spec
   doesn't mention an area, don't explore it.
+- If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
+  rework — the prior pass already wrote a research log. Default to
+  decision="done" so synthesis can re-run with the existing findings.
+  Propose new topics ONLY when a critic suggestion explicitly identifies
+  a coverage gap, and then cap at 1 topic addressing that gap.
 """
 
 
@@ -742,21 +752,34 @@ async def run_explore_node(
             err_str = str(e).splitlines()[0].strip() if str(e).strip() else type(e).__name__
             if len(err_str) > 300:
                 err_str = err_str[:299] + "…"
+            # Harvest any cached file lookups from the partial run so the
+            # error sentinel still records *what was attempted*. Without
+            # `topic` + `file_map`, _new_topics treats this topic as
+            # un-explored and the research_manager re-issues it on the
+            # next round (or the next rework attempt).
+            attempted_files: dict[str, str] = {}
+            if partial_state and isinstance(partial_state.get("read_cache"), dict):
+                for key in list(partial_state["read_cache"].keys())[:20]:
+                    if isinstance(key, str) and key:
+                        attempted_files[key] = "attempted during failed exploration"
             findings = [
                 {
+                    "topic": topic_str,
                     "summary": (
                         f"Research failed for topic '{topic_str}': "
                         f"{type(e).__name__}: {err_str}"
                     ),
                     "patterns": [],
-                    "file_map": {},
+                    "file_map": attempted_files,
                     "dependencies": [],
                     # Marker consumed by _summarize_findings and
                     # _format_findings to drop this sentinel from
-                    # LLM-facing summaries. The entry is still kept in
+                    # LLM-facing *summaries*. The entry is still kept in
                     # state["findings"] so the manager's topic-coverage
-                    # bookkeeping sees the attempt.
+                    # bookkeeping (_new_topics) sees the attempt and
+                    # does not re-issue this topic next round.
                     "error": True,
+                    "partial": True,
                 }
             ]
 

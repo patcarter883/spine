@@ -15,6 +15,7 @@ from typing import Any, Callable
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from spine.agents.retry import MaxTokenBudgetExceeded
 from spine.models.state import WorkflowState
 from spine.workflow.phase_progress import mark_phase_started
 
@@ -298,6 +299,25 @@ def make_subgraph_node(
                 parent_state,
                 phase_name,
                 "Cancelled — subgraph did not complete. Prior phases preserved.",
+            )
+
+        except MaxTokenBudgetExceeded as budget_exc:
+            logger.error(
+                f"[{work_id}] [{phase_name}] token budget exceeded: "
+                f"{budget_exc.cumulative:,} / {budget_exc.budget:,} tokens"
+            )
+            return _needs_review_update(
+                parent_state,
+                phase_name,
+                (
+                    f"Token budget exceeded "
+                    f"({budget_exc.cumulative:,}/{budget_exc.budget:,} tokens). "
+                    "Phase aborted to prevent unbounded spend."
+                ),
+                suggestions=[
+                    "Reduce scope or split into smaller work items",
+                    "Raise the per-work-type budget if the scope genuinely warrants it",
+                ],
             )
 
         except Exception as e:

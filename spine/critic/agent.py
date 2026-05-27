@@ -65,6 +65,32 @@ _PLAN_REVIEW_INSTRUCTIONS = (
 )
 
 
+# ── SPECIFY-specific review instructions appended to the system prompt ──────
+_SPECIFY_REVIEW_INSTRUCTIONS = (
+    "## Spec-to-Description Alignment (SPECIFY phase)\n\n"
+    "The user message includes the original user description above the\n"
+    "structured payload. Treat the description as the source of truth and\n"
+    "verify that every requirement in the specification traces back to it.\n\n"
+    "1. **Traceability** — every entry in the spec's requirements /\n"
+    "   acceptance criteria / scope_inclusions must be derivable from the\n"
+    "   original description. Requirements that introduce concepts the user\n"
+    "   never mentioned are scope creep.\n"
+    "2. **Proportionality** — for trivial descriptions (≤ 200 chars and no\n"
+    "   verbs like 'design', 'refactor', 'rebuild', 'architect'), the spec\n"
+    "   should be concise: a single feature area, no cross-cutting\n"
+    "   architectural changes, no surveys of unrelated subsystems. Flag\n"
+    "   specs that propose multi-module refactors for a trivial request.\n"
+    "3. **Scope exclusions present** — when the user's intent is narrow,\n"
+    "   the spec should explicitly list `scope_exclusions` for adjacent\n"
+    "   areas the model considered but rejected. Missing exclusions on a\n"
+    "   narrow description signal the critic should look harder for creep.\n\n"
+    "If you find scope creep, respond with NEEDS_REVISION and set the\n"
+    "`reason` field to a phrase starting with `scope_creep:` followed by\n"
+    "the specific untraceable requirement(s). List each violating\n"
+    "requirement separately in `suggestions`.\n\n"
+)
+
+
 def build_critic_agent(
     state: WorkflowState,
     config: RunnableConfig | None = None,
@@ -108,11 +134,13 @@ def build_critic_agent(
         "for improvement when recommending revision."
     )
 
-    # Append structured-plan validation instructions when reviewing the PLAN
-    # phase. Other phases (specify, tasks, implement) keep the base prompt
-    # unchanged so existing behaviour is preserved.
+    # Append phase-specific validation instructions. PLAN gets structured-plan
+    # rules + scope-creep detection; SPECIFY gets spec-to-description
+    # traceability rules. Other phases keep the base prompt unchanged.
     if PhaseName(reviewed_phase) == PhaseName.PLAN:
         system_prompt = system_prompt + "\n\n" + _PLAN_REVIEW_INSTRUCTIONS
+    elif PhaseName(reviewed_phase) == PhaseName.SPECIFY:
+        system_prompt = system_prompt + "\n\n" + _SPECIFY_REVIEW_INSTRUCTIONS
 
     agent = build_phase_agent(
         state=state,
