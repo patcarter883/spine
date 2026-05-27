@@ -28,6 +28,57 @@ logger = logging.getLogger(__name__)
 # Truncate spec content for PLAN explore agents to reasonable size
 _MAX_SPEC_CHARS = 8000
 
+# Token budget for the cumulative Explore loop findings.  Once the
+# manager's accumulated findings exceed this we force "done" rather than
+# launching another researcher round — Explore is a survey loop, not an
+# implementation loop, and beyond this threshold the manager starts
+# re-exploring territory already covered by earlier rounds.
+EXPLORE_TOKEN_BUDGET = 30_000
+
+
+_RECALL_SUFFIX_MARKER = " — recall symbols:"
+
+
+def _normalise_topic(topic: str) -> str:
+    """Normalise a topic string for set-membership comparisons.
+
+    ``_research_router`` decorates topics with a "— recall symbols: …"
+    suffix before dispatch, and ``run_explore_node`` stamps that decorated
+    string onto each finding as ``finding["topic"]``. The manager's
+    ``state.topics`` list, by contrast, holds the bare topic. Exact-match
+    comparisons therefore mis-classify every enriched topic as "new",
+    which makes the topics-already-explored signal useless. Normalising on
+    both sides keeps the comparison stable across that decoration.
+    """
+    if not topic:
+        return ""
+    if _RECALL_SUFFIX_MARKER in topic:
+        topic = topic.split(_RECALL_SUFFIX_MARKER, 1)[0]
+    return " ".join(topic.lower().split())
+
+
+def _approx_findings_tokens(findings: list[Any]) -> int:
+    """Rough token estimate for accumulated Explore findings.
+
+    Uses the 4-chars-per-token heuristic — Explore content is plain English
+    + code snippets so this is within ~20 % of the real tokenisation for
+    every provider SPINE supports. Good enough for an early-exit gate.
+    """
+    if not findings:
+        return 0
+    total_chars = 0
+    for item in findings:
+        if isinstance(item, str):
+            total_chars += len(item)
+        elif isinstance(item, dict):
+            try:
+                total_chars += len(json.dumps(item, default=str))
+            except Exception:
+                total_chars += len(repr(item))
+        else:
+            total_chars += len(str(item))
+    return total_chars // 4
+
 # ── Research manager structured output model ─────────────────────────────
 
 
@@ -108,6 +159,11 @@ Decide:
 Rules:
 - Never return more than 4 topics in a single round.
 - If you've already explored a topic, don't return it again.
+- On any round after the first, every new topic MUST target a different
+  module, layer, or concern than every topic in "Topics Already Explored".
+  Rephrasing a prior topic with different words is NOT a new topic — if
+  the "Files examined" coverage in Findings So Far already touches the
+  area, do not propose another topic about that area.
 - Topics MUST NOT contain symbol names, function names, class names, or
   file paths. Use plain English descriptions of the area to investigate.
 - If the work description is self-contained (no codebase needed), decide "done".
@@ -175,6 +231,11 @@ Decide:
 Rules:
 - Never return more than 4 topics in a single round.
 - If you've already explored a topic, don't return it again.
+- On any round after the first, every new topic MUST target a different
+  module, layer, or concern than every topic in "Topics Already Explored".
+  Rephrasing a prior topic with different words is NOT a new topic — if
+  the "Files examined" coverage in Findings So Far already touches the
+  area, do not propose another topic about that area.
 - Topics MUST NOT contain symbol names, function names, class names, or
   file paths. Use plain English descriptions of the area to investigate.
 - If findings already cover all key change areas, decide "done".
@@ -226,6 +287,18 @@ async def run_research_manager(
             "[%s] Research manager: max rounds (%d) reached — forcing done",
             work_id,
             max_rounds,
+        )
+        return {"manager_decision": "done", "topics": []}
+
+    # Token-budget safety valve — survey loops should synthesise once their
+    # accumulated findings approach the prompt-cache window. Forcing "done"
+    # past EXPLORE_TOKEN_BUDGET keeps the manager from spinning on already-
+    # explored ground when the findings are already context-heavy.
+    if round_num > 0 and _approx_findings_tokens(findings) >= EXPLORE_TOKEN_BUDGET:
+        logger.info(
+            "[%s] Research manager: token budget (%d) reached — forcing done",
+            work_id,
+            EXPLORE_TOKEN_BUDGET,
         )
         return {"manager_decision": "done", "topics": []}
 
@@ -283,11 +356,35 @@ async def run_research_manager(
 
     findings_summary = _summarize_findings(findings)
 
-    # Rework context: when the critic rejected the prior pass, the manager
-    # must see the verdict and the prior research so it can target gaps
-    # rather than repeat the same exploration. Seeded `findings`/`topics`
-    # already carry the prior research_log into state; this section makes
-    # the rework framing explicit and asks for gap-targeted topics.
+    # Prior-round framing: whenever any topic has already been dispatched
+    # (round_num > 0 OR seeded from a prior research_log on rework), the
+    # manager must treat the explored set as territory to *extend past*,
+    # not territory to revisit. Without this, the LLM tends to rephrase
+    # prior topics — same modules, different words — because the
+    # natural-language "already explored" list alone is too soft a signal.
+    #
+    # When the critic also rejected the prior pass, the rework specifics
+    # (verdict, suggestions) layer on top of the always-on framing.
+    has_prior_round = round_num > 0 or bool(existing_topics) or bool(findings)
+    prior_round_section = ""
+    if has_prior_round:
+        prior_round_section = (
+            "## Prior-Round Coverage — Extend, Do Not Repeat\n"
+            "The 'Topics Already Explored' and 'Findings So Far' sections "
+            "below describe ground that has already been mapped. Every new "
+            "topic you propose MUST target a different module / layer / "
+            "concern than what is already covered there. Use the 'Files "
+            "examined' line on each finding as the authoritative coverage "
+            "signal — if a file or area appears there, that area is "
+            "covered, regardless of how the prior topic was worded. "
+            "Rephrasing a prior topic ('How does X configure Y?' → 'How "
+            "are Y preferences managed in X?') is forbidden — those count "
+            "as the same topic. If findings already cover all relevant "
+            "areas, decide 'done'.\n\n"
+            "Before returning each topic, silently check: which module or "
+            "layer does this target, and is that module already in any "
+            "prior finding's 'Files examined'? If yes, drop the topic.\n\n"
+        )
     rework_section = ""
     if retry_count > 0 and last_critic_review:
         suggestions = last_critic_review.get("suggestions") or []
@@ -301,18 +398,18 @@ async def run_research_manager(
             f"(tier: {last_critic_review.get('tier', 'unknown')})\n"
             f"Reason: {last_critic_review.get('reason', '')}\n"
             f"Suggestions:\n{sug_text}\n\n"
-            "The 'Topics Already Explored' and 'Findings So Far' sections "
-            "below carry the prior research_log. Do NOT re-explore the same "
-            "ground — propose 2-4 NEW topics that close the specific gaps "
-            "the critic flagged. If the prior research is already sufficient "
-            "to address the verdict, decide 'done' so synthesis can rework "
-            "with the existing findings.\n\n"
+            "Propose 2-4 NEW topics that close the specific gaps the critic "
+            "flagged (in addition to the prior-round rules above). If the "
+            "prior research is already sufficient to address the verdict, "
+            "decide 'done' so synthesis can rework with the existing "
+            "findings.\n\n"
         )
 
     context = (
         f"## Work Description\n{description}\n\n"
         f"{spec_section}"
         f"{recall_section}"
+        f"{prior_round_section}"
         f"{rework_section}"
         f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
         f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
@@ -394,23 +491,46 @@ async def run_research_manager(
         }
 
 
+_FINDINGS_SUMMARY_BUDGET = 8000
+
+
 def _summarize_findings(findings: list[dict]) -> str:
-    """Create a compact summary of accumulated research findings."""
+    """Create a coverage-oriented summary of accumulated research findings.
+
+    The manager uses this to decide gaps for the next round. It must convey
+    *what was covered* (topic + files touched) — not just *flavor* — or it
+    will rephrase prior topics instead of extending coverage. Accumulates
+    entries until the running string crosses ``_FINDINGS_SUMMARY_BUDGET``
+    chars (well inside ``EXPLORE_TOKEN_BUDGET``).
+    """
     if not findings:
         return "(no findings yet)"
-    parts = []
+    parts: list[str] = []
+    total = 0
     for i, f in enumerate(findings):
-        if isinstance(f, dict):
-            summary = f.get("summary", "")
-            patterns = f.get("patterns", [])
-            deps = f.get("dependencies", [])
-            entry = f"Finding {i + 1}: {summary[:200]}"
-            if patterns:
-                entry += f"\n  Patterns: {', '.join(patterns[:5])}"
-            if deps:
-                entry += f"\n  Dependencies: {', '.join(deps[:5])}"
-            parts.append(entry)
-    return "\n\n".join(parts[:10])  # Keep compact
+        if not isinstance(f, dict):
+            continue
+        topic = _normalise_topic(f.get("topic", ""))
+        summary = f.get("summary", "")
+        patterns = f.get("patterns", [])
+        deps = f.get("dependencies", [])
+        file_map = f.get("file_map", {}) or {}
+        files = list(file_map.keys()) if isinstance(file_map, dict) else []
+        entry = f"Finding {i + 1} [topic: {topic[:160]}]: {summary[:600]}"
+        if files:
+            entry += f"\n  Files examined: {', '.join(files[:10])}"
+        if patterns:
+            entry += f"\n  Patterns: {', '.join(patterns[:8])}"
+        if deps:
+            entry += f"\n  Dependencies: {', '.join(deps[:8])}"
+        total += len(entry)
+        parts.append(entry)
+        if total >= _FINDINGS_SUMMARY_BUDGET:
+            remaining = len(findings) - (i + 1)
+            if remaining > 0:
+                parts.append(f"(... {remaining} additional finding(s) elided — coverage budget reached)")
+            break
+    return "\n\n".join(parts)
 
 
 # ── Explore node ─────────────────────────────────────────────────────────
@@ -515,8 +635,7 @@ async def run_explore_node(
                 f"## Research Task\n"
                 f"For the topic '{topic_str}', find the existing codebase files, "
                 f"patterns, conventions, and dependencies that map to the specification "
-                f"sections above. Use MCP tools first for structural navigation, "
-                f"then fall back to read_file/glob/grep if needed. "
+                f"sections above. Use MCP tools for structural navigation. "
                 f"Return your findings in the ResearchFindings format with specific "
                 f"file paths and how they relate to the spec."
             )
@@ -524,8 +643,7 @@ async def run_explore_node(
             prompt = (
                 f"## Research Topic\n{topic_str}\n\n"
                 f"Investigate this specific area of the codebase. "
-                f"Use MCP tools first for structural navigation, "
-                f"then fall back to read_file/glob/grep if needed. "
+                f"Use MCP tools for structural navigation. "
                 f"Return your findings in the ResearchFindings format."
             )
 

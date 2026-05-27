@@ -179,13 +179,26 @@ async def _research_manager_node(
 
 
 def _new_topics(state: ExplorationSubgraphState) -> list[str]:
-    """Return the topics not yet represented in ``findings`` (round-stable)."""
+    """Return the topics not yet represented in ``findings`` (round-stable).
+
+    ``state.topics`` holds bare topic strings, but ``finding['topic']`` is
+    stamped with the enriched form ("<topic> — recall symbols: …") by
+    ``run_explore_node``. Comparing them raw therefore always reports the
+    topic as un-explored. ``_normalise_topic`` strips the recall suffix and
+    case/whitespace so the membership check actually reflects what was
+    dispatched on prior rounds.
+    """
+    from spine.agents.exploration_agents import _normalise_topic
+
     topics: list[str] = state.get("topics", [])
     findings: list[dict] = state.get("findings", [])
     explored: set[str] = {
-        f.get("topic", "") for f in findings if isinstance(f, dict) and f.get("topic")
+        _normalise_topic(f.get("topic", ""))
+        for f in findings
+        if isinstance(f, dict) and f.get("topic")
     }
-    return [t for t in topics if t not in explored]
+    explored.discard("")
+    return [t for t in topics if _normalise_topic(t) not in explored]
 
 
 def _enrich_topic(topic: str, hits: list[dict]) -> str:
