@@ -223,6 +223,8 @@ def _build_openrouter_model(
     # falsely fires on slow models (reasoning models, long outputs).
     model_kwargs.setdefault("streaming", True)
 
+    _apply_concurrency_cap(model_kwargs, provider_cfg)
+
     return ChatOpenRouter(**model_kwargs)
 
 
@@ -302,7 +304,37 @@ def _build_local_model(
     if provider_cfg.get("stream_usage"):
         kwargs.setdefault("stream_usage", True)
 
+    _apply_concurrency_cap(kwargs, provider_cfg)
+
     return ChatOpenAI(**kwargs)
+
+
+def _apply_concurrency_cap(
+    kwargs: dict[str, Any],
+    provider_cfg: dict[str, Any],
+) -> None:
+    """Inject shared httpx clients when ``max_concurrent_calls`` is set.
+
+    Both ChatOpenAI and ChatOpenRouter accept ``http_client`` /
+    ``http_async_client``; using cached, connection-capped clients keyed
+    by provider name caps concurrent in-flight requests globally across
+    every agent that resolves to the same provider.
+    """
+    raw = provider_cfg.get("max_concurrent_calls")
+    if raw is None:
+        return
+    try:
+        max_concurrent = int(raw)
+    except (TypeError, ValueError):
+        return
+    if max_concurrent <= 0:
+        return
+
+    from spine.agents.http_clients import get_async_http_client, get_sync_http_client
+
+    provider_name = provider_cfg.get("name") or "default"
+    kwargs.setdefault("http_async_client", get_async_http_client(provider_name, max_concurrent))
+    kwargs.setdefault("http_client", get_sync_http_client(provider_name, max_concurrent))
 
 
 def _extract_model_name(model: Any) -> str:

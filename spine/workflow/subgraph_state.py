@@ -149,6 +149,13 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     # The agent_critic_check fails closed if the relevant field is empty.
     specification_json: str | None
     plan_json: str | None
+    # Review results written by the subgraph nodes. These MUST be declared
+    # here — LangGraph drops state updates for keys not in the schema, which
+    # silently strips the agent/structural verdicts before the result mapper
+    # can read them (manifests as "No review performed" feedback).
+    structural_result: dict | None
+    agent_result: dict | None
+    validation_result: dict | None
 
 
 class GapPlanSubgraphState(BaseSubgraphState, total=False):

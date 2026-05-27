@@ -380,6 +380,7 @@ class SpineConfig:
         "request_timeout",
         "max_retries",
         "guided_decoding",
+        "max_concurrent_calls",
     )
 
     def resolve_active_provider(self) -> dict | None:

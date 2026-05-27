@@ -880,6 +880,8 @@ def _format_findings(findings: list[dict]) -> str:
     parts: list[str] = []
     for i, f in enumerate(findings):
         if isinstance(f, dict):
+            if f.get("error"):
+                continue
             topic = f.get("topic", "")
             summary = f.get("summary", "")
             patterns = f.get("patterns", [])
@@ -895,6 +897,8 @@ def _format_findings(findings: list[dict]) -> str:
                 parts.append(f"Key files: {_json_mod.dumps(file_map)}")
             if deps:
                 parts.append(f"Dependencies: {', '.join(deps)}")
+    if not parts:
+        return "(no codebase research was performed)"
     return "\n\n".join(parts)
 
 

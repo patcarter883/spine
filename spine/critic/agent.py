@@ -23,9 +23,7 @@ from spine.models.types import CriticReview
 # ── PLAN-specific review instructions appended to the system prompt ──────────
 _PLAN_REVIEW_INSTRUCTIONS = (
     "## Structured Plan Validation (PLAN phase)\n\n"
-    "When reviewing the PLAN phase output you must also validate the structured\n"
-    "`plan.json` artifact in addition to any prose documents (plan.md).\n\n"
-    "Run `read_file` on the `plan.json` artifact and verify:\n\n"
+    "Validate the following structure in the provided `plan.json` payload:\n\n"
     "1. **feature_slices present and non-empty** — the top-level\n"
     "   `feature_slices` array must exist and contain at least one slice.\n"
     "2. **Required slice fields** — every slice object must have:\n"
@@ -88,17 +86,15 @@ def build_critic_agent(
     Returns:
         A compiled Deep Agent ready for invocation.
     """
-    workspace_root = state.get("workspace_root", ".")
     reviewed_phase = _get_reviewed_phase(state)
 
     system_prompt = (
-        "You are a quality reviewer. Review the output of a workflow "
-        "phase and determine if it meets quality standards.\n\n"
-        f"Your workspace root is: {workspace_root}\n\n"
-        "You have filesystem and shell tools available. Use them to:\n"
-        "- Inspect actual files when reviewing implementation\n"
-        "- Run linters or tests to check code quality\n"
-        "- Verify that referenced files actually exist\n\n"
+        "You are a quality reviewer. Review the structured payload provided "
+        "in the user message and determine if it meets quality standards.\n\n"
+        "Your review must be based ONLY on the JSON payload inlined in the "
+        "user message. Do not attempt to read files, run shell commands, or "
+        "inspect anything on disk — the payload is the complete scope of "
+        "your review.\n\n"
         "Evaluate:\n"
         "1. Completeness — all required elements are present\n"
         "2. Correctness — the content is technically accurate\n"
@@ -109,9 +105,7 @@ def build_critic_agent(
         "- NEEDS_REVISION — the output needs improvement (specify what)\n"
         "- NEEDS_REVIEW — the output requires human judgment\n\n"
         "Always explain your reasoning and provide specific suggestions "
-        "for improvement when recommending revision.\n\n"
-        "Full artifact content is available on disk — use `read_file` to "
-        "inspect details when needed."
+        "for improvement when recommending revision."
     )
 
     # Append structured-plan validation instructions when reviewing the PLAN
@@ -126,6 +120,8 @@ def build_critic_agent(
         phase=PhaseName.CRITIC,
         system_prompt=system_prompt,
         response_format=CriticReview,
+        allowed_tools=[],
+        skip_filesystem_middleware=True,
     )
 
     return agent

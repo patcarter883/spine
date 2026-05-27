@@ -2,7 +2,7 @@ spine:
   checkpoint_path: .spine/spine.db
   interpreter_enabled: true
   guided_decoding: true
-  topic_lookup_min_similarity: 0.45
+  topic_lookup_min_similarity: 0.5
   # RAG configuration
   embedding_provider: local-embeddings
   recall_k: 3
@@ -60,6 +60,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
+    max_concurrent_calls: 1
   - name: pat
     type: deepagents-model
     model: openai:model
@@ -68,6 +69,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
+    max_concurrent_calls: 2
   - name: tiny
     type: deepagents-model
     model: openai:Bonsai-8B-gguf

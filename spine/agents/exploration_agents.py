@@ -510,6 +510,8 @@ def _summarize_findings(findings: list[dict]) -> str:
     for i, f in enumerate(findings):
         if not isinstance(f, dict):
             continue
+        if f.get("error"):
+            continue
         topic = _normalise_topic(f.get("topic", ""))
         summary = f.get("summary", "")
         patterns = f.get("patterns", [])
@@ -719,6 +721,12 @@ async def run_explore_node(
                 "patterns": [],
                 "file_map": {},
                 "dependencies": [],
+                # Marker consumed by _summarize_findings and
+                # _format_findings to drop this sentinel from
+                # LLM-facing summaries. The entry is still kept in
+                # state["findings"] so the manager's topic-coverage
+                # bookkeeping sees the attempt.
+                "error": True,
             }
         ]
 

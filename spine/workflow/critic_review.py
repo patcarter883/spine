@@ -188,11 +188,13 @@ async def agent_critic_check(
             )
 
         prompt = (
-            f"Review the output of the {reviewed_phase} phase.\n\n"
+            f"Review ONLY the structured output below for the "
+            f"{reviewed_phase} phase. Do not attempt to read files or run "
+            f"commands; everything you need is inlined.\n\n"
             f"## Structured Output Under Review\n"
             f"```json\n{structured_payload}\n```\n\n"
-            f"Provide a review: PASSED, NEEDS_REVISION, or NEEDS_REVIEW.\n"
-            f"Include specific reasons and suggestions for improvement."
+            f"Respond with PASSED, NEEDS_REVISION, or NEEDS_REVIEW and "
+            f"include concrete reasons and suggestions."
         )
 
         ctx = build_context(state, PhaseName.CRITIC)
