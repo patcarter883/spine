@@ -103,6 +103,6 @@ providers:
       provider: pat
     # RAG phase providers
     classification:
-      provider: local
+      provider: pat
     summarization:
-      provider: local
+      provider: pat
