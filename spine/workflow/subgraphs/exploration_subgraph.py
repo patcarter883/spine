@@ -492,6 +492,7 @@ async def _synthesize_plan(
     findings = state.get("findings", [])
     retry_count = state.get("retry_count", 0)
     feedback = state.get("feedback", [])
+    last_critic_review = state.get("last_critic_review") or {}
 
     logger.info(
         "[%s] Synthesize (plan): %d findings available, retry=%d",
@@ -524,13 +525,10 @@ async def _synthesize_plan(
             f"writes both plan.md and plan.json for you. Do not call write_file."
         )
 
-        if retry_count > 0 and feedback:
-            feedback_text = "\n".join(
-                f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
-                for f in feedback
-                if isinstance(f, dict)
-            )
-            prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
+        if retry_count > 0:
+            feedback_text = _render_rework_feedback(last_critic_review, feedback)
+            if feedback_text:
+                prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
 
         scratchpad = state.get("scratchpad", "")
         if scratchpad:
@@ -609,6 +607,7 @@ async def _synthesize_specify(
     findings = state.get("findings", [])
     retry_count = state.get("retry_count", 0)
     feedback = state.get("feedback", [])
+    last_critic_review = state.get("last_critic_review") or {}
 
     logger.info(
         "[%s] Synthesize (specify): %d findings available, retry=%d",
@@ -654,13 +653,10 @@ async def _synthesize_specify(
             f"markdown and emits JSON for you — do not call write_file."
         )
 
-        if retry_count > 0 and feedback:
-            feedback_text = "\n".join(
-                f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
-                for f in feedback
-                if isinstance(f, dict)
-            )
-            prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
+        if retry_count > 0:
+            feedback_text = _render_rework_feedback(last_critic_review, feedback)
+            if feedback_text:
+                prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
 
         scratchpad = state.get("scratchpad", "")
         if scratchpad:
@@ -800,6 +796,37 @@ def _format_retrieved_context(chunks: list[dict]) -> str:
         used += block_tokens
 
     return "".join(parts)
+
+
+def _render_rework_feedback(
+    last_critic_review: dict,
+    feedback: list[dict],
+) -> str:
+    """Render the rework feedback block for the synthesizer prompt.
+
+    Prefers ``last_critic_review`` (the single record written by the most
+    recent critic) so the rework prompt always surfaces the exact verdict
+    that caused the loopback. Falls back to the full ``feedback`` list when
+    the field is absent (older state checkpoints).
+    """
+    if last_critic_review:
+        status = last_critic_review.get("status", "needs_revision")
+        tier = last_critic_review.get("tier", "unknown")
+        reason = last_critic_review.get("reason", "")
+        suggestions = last_critic_review.get("suggestions") or []
+        attempt = last_critic_review.get("attempt", 1)
+        lines = [f"- [{tier}] (attempt {attempt}, status={status}) {reason}"]
+        for s in suggestions:
+            lines.append(f"  - {s}")
+        return "\n".join(lines)
+
+    if not feedback:
+        return ""
+    return "\n".join(
+        f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
+        for f in feedback
+        if isinstance(f, dict)
+    )
 
 
 def _format_findings(findings: list[dict]) -> str:

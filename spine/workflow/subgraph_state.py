@@ -26,6 +26,9 @@ class BaseSubgraphState(TypedDict, total=False):
     messages: list[Any]
     artifacts_output: dict  # {filename: content} — what this phase produced
     phase_status: str  # "success" | "needs_review" | "error"
+    last_critic_review: dict | None  # Forwarded from parent WorkflowState so
+    # synthesizers can render the critic's most recent verdict in rework prompts
+    # without scanning the accumulating `feedback` list.
 
 
 class SpecifySubgraphState(BaseSubgraphState, total=False):
@@ -135,6 +138,10 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     reviewed_phase_path: str
     artifacts: dict  # Phase artifacts from parent WorkflowState — needed
     # by structural_critic_check to verify artifacts exist.
+    # Structured outputs the critic reviews (forwarded from parent state).
+    # The agent_critic_check fails closed if the relevant field is empty.
+    specification_json: str | None
+    plan_json: str | None
 
 
 class GapPlanSubgraphState(BaseSubgraphState, total=False):

@@ -387,10 +387,12 @@ class TestCriticRouter:
         from spine.workflow.critic_review import critic_router
 
         state = {
-            "critic_reviewing": "plan",
-            "feedback": [
-                {"status": "passed", "tier": "agent", "reason": "OK"},
-            ],
+            "last_critic_review": {
+                "phase": "plan",
+                "status": "passed",
+                "tier": "agent",
+                "reason": "OK",
+            },
         }
         assert critic_router(state) == "passed"
 
@@ -398,10 +400,12 @@ class TestCriticRouter:
         from spine.workflow.critic_review import critic_router
 
         state = {
-            "critic_reviewing": "plan",
-            "feedback": [
-                {"status": "needs_review", "tier": "agent", "reason": "Bad"},
-            ],
+            "last_critic_review": {
+                "phase": "plan",
+                "status": "needs_review",
+                "tier": "agent",
+                "reason": "Bad",
+            },
         }
         assert critic_router(state) == "needs_review"
 
@@ -409,10 +413,12 @@ class TestCriticRouter:
         from spine.workflow.critic_review import critic_router
 
         state = {
-            "critic_reviewing": "plan",
-            "feedback": [
-                {"status": "needs_revision", "tier": "structural", "reason": "Short"},
-            ],
+            "last_critic_review": {
+                "phase": "plan",
+                "status": "needs_revision",
+                "tier": "structural",
+                "reason": "Short",
+            },
             "retry_count": {"plan": 1},
             "max_retries": 3,
         }
@@ -422,23 +428,42 @@ class TestCriticRouter:
         from spine.workflow.critic_review import critic_router
 
         state = {
-            "critic_reviewing": "plan",
-            "feedback": [
-                {"status": "needs_revision", "tier": "structural", "reason": "Short"},
-            ],
+            "last_critic_review": {
+                "phase": "plan",
+                "status": "needs_revision",
+                "tier": "structural",
+                "reason": "Short",
+            },
             "retry_count": {"plan": 3},
             "max_retries": 3,
         }
         assert critic_router(state) == "needs_review"
 
-    def test_routes_needs_revision_when_no_feedback(self):
+    def test_routes_needs_revision_when_record_missing(self):
         from spine.workflow.critic_review import critic_router
 
+        state = {"critic_reviewing": "plan"}
+        # Missing last_critic_review → routes needs_revision as fallback
+        assert critic_router(state) == "needs_revision"
+
+    def test_ignores_stale_feedback_entry(self):
+        from spine.workflow.critic_review import critic_router
+
+        # feedback[-1] says PASSED (stale carryover from a prior tier), but
+        # last_critic_review is authoritative and says NEEDS_REVISION.
         state = {
-            "critic_reviewing": "plan",
-            "feedback": [],
+            "last_critic_review": {
+                "phase": "plan",
+                "status": "needs_revision",
+                "tier": "agent",
+                "reason": "Plan slices missing acceptance criteria",
+            },
+            "feedback": [
+                {"status": "passed", "tier": "structural", "reason": "OK"},
+            ],
+            "retry_count": {"plan": 1},
+            "max_retries": 3,
         }
-        # No feedback → routes needs_revision as fallback
         assert critic_router(state) == "needs_revision"
 
 

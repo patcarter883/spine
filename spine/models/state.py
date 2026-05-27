@@ -81,6 +81,12 @@ class WorkflowState(TypedDict, total=False):
     status: str
     prompt_request: dict | None
     critic_reviewing: str  # Phase the current critic node is reviewing
+    last_critic_review: dict | None  # {"phase": str, "status": str, "tier": str,
+    # "reason": str, "suggestions": list[str], "attempt": int}
+    # Written by _critic_result_mapper; consumed by critic_router and by the
+    # specify/plan synthesizers when retry_count > 0. Last-write-wins — this
+    # is the single source of truth for routing, decoupled from the
+    # operator.add `feedback` list.
     workspace_root: str  # Project root directory for deep agent backends
     phase_results: Annotated[dict, _merge_dicts]  # phase → PhaseResult
     needs_review_phase: str | None  # Which phase triggered human review
@@ -125,6 +131,13 @@ class WorkflowState(TypedDict, total=False):
     gaps_identified: int  # Number of gaps found by GAP_PLAN
     work_units_count: int  # Number of work units from TASKS phase
     feature_slices_count: int  # Number of feature slices from PLAN phase
+
+    # Structured phase outputs (raw JSON strings) — sourced from the phase
+    # agent's structured tool call (write_specification / write_structured_plan)
+    # and consumed by the matching critic. Critics MUST work from these
+    # structured fields; missing values are a CriticalContractFailure.
+    specification_json: str | None
+    plan_json: str | None
 
     # RAG retrieved context (for SPECIFY phase early commitment)
     task_category: str | None  # Classified task category for vector filtering

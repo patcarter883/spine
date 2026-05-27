@@ -23,8 +23,17 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from spine.exceptions import CriticalContractFailure
 from spine.models.enums import PhaseName, ReviewStatus
 from spine.models.state import WorkflowState
+
+# Phase → state field carrying the raw structured JSON produced by the
+# phase agent. Critics MUST consume these instead of artifact previews;
+# absence is a CriticalContractFailure.
+_STRUCTURED_STATE_FIELD: dict[str, str] = {
+    PhaseName.SPECIFY.value: "specification_json",
+    PhaseName.PLAN.value: "plan_json",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +149,7 @@ async def agent_critic_check(
         # Build the critic agent and invoke it with retry
         from spine.agents.retry import ainvoke_with_retry
         from spine.agents.context import build_context
-        from spine.agents.artifacts import materialize_artifacts, build_inline_artifact_prompt
+        from spine.agents.artifacts import materialize_artifacts
 
         critic_agent = critic_def.build_agent_fn(state, config)
         logger.info(
@@ -148,30 +157,40 @@ async def agent_critic_check(
             state.get("work_id", "?"), reviewed_phase,
         )
 
-        # Materialize artifacts to disk so the critic can read them
+        # Materialize artifacts to disk so the critic can read them on demand.
         workspace_root = state.get("workspace_root", ".")
         work_id = state.get("work_id", "unknown")
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build a compact preview with paths to full files
-        artifact_preview = build_inline_artifact_prompt(state, reviewed_phase, work_id=work_id)
+        # Critics review the structured JSON the phase agent produced — never
+        # a truncated .md preview. Missing structured state is a contract
+        # failure that must surface, not get papered over with a fallback.
+        structured_field = _STRUCTURED_STATE_FIELD.get(reviewed_phase)
+        if structured_field is None:
+            raise CriticalContractFailure(
+                phase=f"critic/{reviewed_phase}",
+                reason=(
+                    f"No structured-state field is registered for phase "
+                    f"'{reviewed_phase}'. Critics require structured output; "
+                    f"add an entry to _STRUCTURED_STATE_FIELD before enabling "
+                    f"a critic for this phase."
+                ),
+            )
+        structured_payload = state.get(structured_field)
+        if not structured_payload or not isinstance(structured_payload, str):
+            raise CriticalContractFailure(
+                phase=f"critic/{reviewed_phase}",
+                reason=(
+                    f"State field '{structured_field}' is missing or empty — "
+                    f"the {reviewed_phase} agent did not propagate structured "
+                    f"output. Critics cannot review without it."
+                ),
+            )
 
-        # Format the review request
-        # The original description is NOT included here — the critic reviews
-        # the artifact itself, which already captures and expands on the
-        # description.  Including the raw description biases the critic toward
-        # the original wording rather than evaluating the artifact's quality
-        # independently.  The only additional context beyond artifacts should be
-        # review feedback (from critic gates, verify agent, or human review).
-        from spine.agents.artifacts import artifact_path
-
-        reviewed_path = artifact_path(work_id, reviewed_phase)
         prompt = (
             f"Review the output of the {reviewed_phase} phase.\n\n"
-            f"{artifact_preview}"
-            f"Full artifact content is available on disk at "
-            f"`{reviewed_path}/` — use `read_file` to "
-            f"inspect details.\n\n"
+            f"## Structured Output Under Review\n"
+            f"```json\n{structured_payload}\n```\n\n"
             f"Provide a review: PASSED, NEEDS_REVISION, or NEEDS_REVIEW.\n"
             f"Include specific reasons and suggestions for improvement."
         )
@@ -195,6 +214,11 @@ async def agent_critic_check(
         )
         return parsed
 
+    except CriticalContractFailure:
+        # Contract failures must propagate — critics cannot review without
+        # structured input, and silently downgrading to NEEDS_REVISION would
+        # mask the real defect (e.g. a phase agent that didn't emit JSON).
+        raise
     except Exception as e:
         logger.error(f"Critic agent failed: {e}", exc_info=True)
         return {
@@ -296,25 +320,38 @@ def critic_router(state: WorkflowState) -> str:
     if state.get("status") == "failed":
         return "failed"
 
-    reviewed_phase = _get_reviewed_phase(state)
-
-    # The last feedback entry was written by call_critic — use it directly.
-    feedback = state.get("feedback", [])
-    if not feedback:
-        # No feedback at all is unexpected — treat as needs_revision.
-        logger.warning("critic_router: no feedback in state, routing needs_revision")
+    # Single source of truth: the critic mapper writes last_critic_review with
+    # the canonical phase_status from the subgraph. Reading feedback[-1] was
+    # fragile because feedback is operator.add and any prior "passed" entry
+    # from another tier or phase could shadow the current critic's verdict.
+    lcr = state.get("last_critic_review") or {}
+    if not lcr:
+        logger.warning(
+            "critic_router: last_critic_review missing — routing needs_revision"
+        )
         return "needs_revision"
 
-    last_review = feedback[-1] if isinstance(feedback[-1], dict) else {}
-    review_status = last_review.get("status", ReviewStatus.NEEDS_REVISION.value)
+    reviewed_phase = lcr.get("phase") or _get_reviewed_phase(state)
+    review_status = lcr.get("status", ReviewStatus.NEEDS_REVISION.value)
 
     review = {
         "status": review_status,
-        "tier": last_review.get("tier", "unknown"),
-        "reason": last_review.get("reason", ""),
-        "suggestions": last_review.get("suggestions", []),
+        "tier": lcr.get("tier", "unknown"),
+        "reason": lcr.get("reason", ""),
+        "suggestions": lcr.get("suggestions", []),
     }
-    return _handle_review_outcome(state, reviewed_phase, review)
+    decision = _handle_review_outcome(state, reviewed_phase, review)
+    retry_count = state.get("retry_count", {})
+    logger.info(
+        "[%s] critic_router: phase=%s status=%s retries=%d/%d → %s",
+        state.get("work_id", "?"),
+        reviewed_phase,
+        review_status,
+        retry_count.get(reviewed_phase, 0),
+        state.get("max_retries", 3),
+        decision,
+    )
+    return decision
 
 
 def _handle_review_outcome(

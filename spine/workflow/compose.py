@@ -124,6 +124,7 @@ def _base_state_mapper(parent_state: WorkflowState, config) -> dict:
         "description": parent_state.get("description", ""),
         "workspace_root": parent_state.get("workspace_root", "."),
         "feedback": parent_state.get("feedback", []),
+        "last_critic_review": parent_state.get("last_critic_review"),
         "messages": [],
         "artifacts_output": {},
         "phase_status": "",
@@ -213,6 +214,10 @@ def _critic_state_mapper(reviewed_phase: str):
             "reviewed_phase": reviewed_phase,
             "reviewed_phase_path": artifact_path(work_id, reviewed_phase),
             "artifacts": parent_state.get("artifacts", {}),
+            # Structured outputs the critic reviews — must round-trip into
+            # the critic subgraph state, not get re-read from disk.
+            "specification_json": parent_state.get("specification_json"),
+            "plan_json": parent_state.get("plan_json"),
         }
 
     return mapper
@@ -302,6 +307,9 @@ def _specify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -
         base["retrieved_context"] = subgraph_result["retrieved_context"]
     if "classification_confidence" in subgraph_result:
         base["classification_confidence"] = subgraph_result["classification_confidence"]
+    # Forward structured spec JSON so CRITIC_SPECIFY can read it from state.
+    if subgraph_result.get("specification_json"):
+        base["specification_json"] = subgraph_result["specification_json"]
     # Set completion invariants
     base["spec_completed"] = phase_status == "success"
     return base
@@ -320,6 +328,9 @@ def _plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> d
     execution_waves = subgraph_result.get("execution_waves", [])
     if execution_waves:
         base["execution_waves"] = execution_waves
+    # Forward structured plan JSON so CRITIC_PLAN can read it from state.
+    if subgraph_result.get("plan_json"):
+        base["plan_json"] = subgraph_result["plan_json"]
     # Set completion invariants
     base["plan_completed"] = phase_status == "success"
     base["feature_slices_count"] = len(subgraph_result.get("feature_slices", []))
@@ -361,18 +372,29 @@ def _critic_result_mapper(reviewed_phase: str):
         base["feedback"] = [effective_result]
 
         phase_status = subgraph_result.get("phase_status", "")
+        prior_attempts = parent_state.get("retry_count", {}).get(reviewed_phase, 0)
+
+        # Single source of truth for the next routing decision. Derived from
+        # the subgraph's phase_status (canonical) plus the effective review
+        # dict — never from the operator.add `feedback` list, which can carry
+        # stale entries from earlier phases or tiers.
+        base["last_critic_review"] = {
+            "phase": reviewed_phase,
+            "status": phase_status,
+            "tier": effective_result.get("tier", "unknown"),
+            "reason": effective_result.get("reason", ""),
+            "suggestions": effective_result.get("suggestions", []),
+            "attempt": prior_attempts + 1,
+        }
+
         if phase_status == ReviewStatus.NEEDS_REVIEW.value:
             base["status"] = "needs_review"
             base["needs_review_phase"] = reviewed_phase
-            retry_count = parent_state.get("retry_count", {})
-            current = retry_count.get(reviewed_phase, 0)
-            base["retry_count"] = {reviewed_phase: current + 1}
+            base["retry_count"] = {reviewed_phase: prior_attempts + 1}
         elif phase_status == ReviewStatus.NEEDS_REVISION.value:
-            retry_count = parent_state.get("retry_count", {})
-            current = retry_count.get(reviewed_phase, 0)
-            base["retry_count"] = {reviewed_phase: current + 1}
+            base["retry_count"] = {reviewed_phase: prior_attempts + 1}
             base["status"] = "running"
-        elif phase_status == "success":
+        elif phase_status == ReviewStatus.PASSED.value:
             base["status"] = "running"
         elif phase_status == "error":
             base["status"] = "failed"
