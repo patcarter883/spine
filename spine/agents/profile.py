@@ -26,9 +26,9 @@ via ``_resolve_profile()`` rather than automatically by DA.  The profile
 still serves its purpose: it holds ``base_system_prompt`` and
 ``tool_description_overrides`` that the factory reads.
 
-RLM/interpreter guidance has been moved to the ``rlm-pattern`` skill for
-progressive disclosure — it's loaded only when the interpreter is available,
-saving ~500 tokens per agent on phases that don't need it.
+Phase agents do not have the ``eval`` interpreter or the ``task`` subagent
+dispatcher. Parallel work is dispatched by the per-phase subgraph routers
+via the LangGraph ``Send`` API.
 
 Token budget for 128K context models (target: <60K prompt tokens at peak):
 

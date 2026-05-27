@@ -1,42 +1,26 @@
 """SPINE agent factory — custom agent construction with full middleware control.
 
 Every phase agent builder (specify, plan, implement, etc.) was duplicating
-the same pattern: resolve model, build backend, optionally add interpreter
-middleware, assemble system_prompt.  This module consolidates the shared
-logic and adds the context engineering features:
+the same pattern: resolve model, build backend, assemble system_prompt.
+This module consolidates the shared logic and adds the context engineering
+features:
 
 - **Artifacts on disk** — prior artifacts are materialized to the filesystem
   and referenced by path, not inlined into the prompt.
 - **Memory** — workspace AGENTS.md files are loaded via ``MemoryMiddleware``
   for always-injected project conventions.
-- **Skills** — phase-specific and RLM skills are loaded via ``SkillsMiddleware``
+- **Skills** — phase-specific skills are loaded via ``SkillsMiddleware``
   for progressive disclosure.
-- **Context schema** — ``SpineContext`` provides typed per-run context that
-  propagates to subagents automatically.
+- **Context schema** — ``SpineContext`` provides typed per-run context.
 - **Read cache** — ``ReadCacheMiddleware`` prevents re-read amnesia by
-  returning cached metadata summaries for already-read files. The cache
-  is shared across subagents via ``SpineContext``.
+  returning cached metadata summaries for already-read files.
 
-## Why ``create_agent`` instead of ``create_deep_agent``?
-
-SPINE uses ``langchain.agents.create_agent`` (LangChain 1.0) directly instead
-of ``deepagents.create_deep_agent``.  The Deep Agents harness auto-adds
-``FilesystemMiddleware``, ``TodoListMiddleware``, ``SubAgentMiddleware``, etc.
-with no way to customise the ``FilesystemMiddleware`` system prompt.  The
-default prompt says **"All file paths must start with a /"**, which conflicts
-with ``virtual_mode=True`` on our ``LocalShellBackend`` — absolute paths get
-double-nested under the workspace root.
-
-By assembling the middleware stack ourselves, we gain:
-
-1. **Custom filesystem prompt** — relative-path guidance that works with
-   ``virtual_mode=True``.
-2. **Explicit stack** — every middleware is visible, no hidden auto-wiring.
-3. **Trimmed prompts** — we only inject what SPINE needs, avoiding DA's
-   conversational framing that fights SPINE's phase-executor model.
-4. **Interpreter in the stack** — the ``CodeInterpreterMiddleware`` (eval tool)
-   is always present for phases that enable it, with instructions in the
-   filesystem prompt about how to use it for orchestration.
+Parallel work (researcher subagents, slice-implementers, slice-verifiers)
+is dispatched at the **graph layer** via the LangGraph ``Send`` API from
+the per-phase subgraph routers (``exploration_subgraph``, ``implement_subgraph``,
+``verify_subgraph``).  Phase agents themselves have no ``eval`` interpreter
+and no ``task`` subagent-dispatch tool — those were removed because models
+used them as escape hatches around the curated phase tool surfaces.
 
 Usage::
 
@@ -65,13 +49,11 @@ from deepagents.middleware.filesystem import FilesystemMiddleware, supports_exec
 from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
-from deepagents.middleware.subagents import SubAgentMiddleware
 
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.context import SpineContext
 from spine.agents.helpers import resolve_model, debug_enabled
-from spine.agents.interpreter import build_interpreter_middleware, interpreter_enabled
 
 # ── Recursion limit ─────────────────────────────────────────────────
 # Removed per-phase limits (2026-05). Each SPINE phase runs an entire
@@ -319,7 +301,6 @@ def build_phase_agent(
     system_prompt: str,
     *,
     extra_middleware: list[Any] | None = None,
-    subagents: list[Any] | None = None,
     response_format: Any | None = None,
     is_subagent: bool = False,
     allowed_tools: list[str] | None = None,
@@ -333,10 +314,9 @@ def build_phase_agent(
     memory, skills, and context schema — so individual
     phase builders don't have to.
 
-    Uses ``create_agent`` directly with a custom middleware stack, giving
-    full control over the ``FilesystemMiddleware`` system prompt and stack
-    ordering.  This replaces the previous ``create_deep_agent`` approach
-    which could not customise the filesystem prompt.
+    Phase agents do not get the ``eval`` interpreter or the ``task``
+    subagent-dispatch tool. Parallel work is orchestrated by the per-phase
+    subgraph routers via the LangGraph ``Send`` API.
 
     Args:
         state: The current workflow state.
@@ -344,12 +324,10 @@ def build_phase_agent(
         phase: The phase being executed.
         system_prompt: Phase-specific system prompt (role + task framing).
         extra_middleware: Additional middleware to include.
-        subagents: Optional subagent specs for this phase.
         response_format: Optional Pydantic model or ResponseFormat for
             structured output (DA ≥0.5.3).
         is_subagent: When True, skips artifact materialization and
-            interpreter/read-cache middleware (subagents are leaf
-            agents, not orchestrators).
+            read-cache middleware (subagents are leaf agents).
         extra_tools: Additional BaseTool instances injected directly into
             create_agent(tools=[...]). These sit alongside tools from
             middleware. Use for custom orchestrator tools (e.g. ReadSliceFilesTool)
@@ -439,14 +417,9 @@ def build_phase_agent(
         logger.debug("Phase %s: loading memory files: %s", phase.value, memory)
 
     # ── Skills ───────────────────────────────────────────────────────
-    # Check if interpreter will be in the stack (needed before building
-    # skills, because include_rlm affects skill resolution)
-    has_interpreter = not is_subagent and interpreter_enabled()
-    include_rlm = has_interpreter if not is_subagent else False
     skills = resolve_skills(
         phase=phase.value,
         workspace_root=workspace_root,
-        include_rlm=include_rlm,
     )
     if skills:
         logger.debug("Phase %s: loading skills: %s", phase.value, skills)
@@ -457,11 +430,9 @@ def build_phase_agent(
         model=model,
         phase=phase,
         is_subagent=is_subagent,
-        has_interpreter=has_interpreter,
         extra_middleware=extra_middleware,
         tool_desc_overrides=tool_desc_overrides,
         profile=profile,
-        subagents=subagents,
         memory=memory,
         skills=skills,
         allowed_tools=allowed_tools,
@@ -520,11 +491,9 @@ def _build_middleware_stack(
     model: Any,
     phase: PhaseName,
     is_subagent: bool,
-    has_interpreter: bool,
     extra_middleware: list[Any] | None,
     tool_desc_overrides: dict[str, str],
     profile: Any,
-    subagents: list[Any] | None,
     memory: list[str] | None,
     skills: list[str] | None,
     allowed_tools: list[str] | None = None,
@@ -533,30 +502,18 @@ def _build_middleware_stack(
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
-    Replaces create_deep_agent's auto-wiring with explicit, auditable
-    middleware construction. Each entry is intentional and documented.
-
     Stack order (from outermost to innermost in the middleware chain):
 
     1.  TodoListMiddleware         — task planning state
     2.  SkillsMiddleware           — progressive skill disclosure
     3.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
-    4.  SubAgentMiddleware         — task delegation (BEFORE interpreter so tools.task is PTC-visible)
-    5.  CodeInterpreterMiddleware  — eval tool (when enabled); sees task tool from step 4
-    6.  ReadCacheMiddleware        — prevents re-read amnesia via SpineContext cache
-    7.  PatchToolCallsMiddleware   — tool call normalization
-    8.  SPINE-specific middleware  — ToolSchemaValidator (ToolOutputTrimmer removed 2026-05)
-    9.  User extra_middleware
-    10. Profile extra_middleware
-    11. AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
-    12. MemoryMiddleware           — AGENTS.md injection (when memory present)
-
-    CRITICAL ordering constraint: SubAgentMiddleware (4) MUST precede
-    CodeInterpreterMiddleware (5). The interpreter's PTC system calls
-    filter_tools_for_ptc(request.tools, ptc_allowlist) to bind tools onto
-    globalThis.tools in the QuickJS sandbox. If SubAgentMiddleware hasn't
-    run yet, `task` is not in request.tools and tools.task is undefined,
-    causing "TypeError: not a function" on every tools.task() call in eval.
+    4.  ReadCacheMiddleware        — prevents re-read amnesia via SpineContext cache
+    5.  PatchToolCallsMiddleware   — tool call normalization
+    6.  SPINE-specific middleware  — ToolSchemaValidator
+    7.  User extra_middleware
+    8.  Profile extra_middleware
+    9.  AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
+    10. MemoryMiddleware           — AGENTS.md injection (when memory present)
     """
     middleware: list[Any] = []
 
@@ -592,49 +549,27 @@ def _build_middleware_stack(
             phase.value,
         )
 
-    # 4. Subagent delegation — MUST come before interpreter so that the
-    #    `task` tool is in request.tools when CodeInterpreterMiddleware's
-    #    _prepare_for_call runs filter_tools_for_ptc. If SubAgentMiddleware
-    #    is after the interpreter, `task` is not yet in the tool registry
-    #    and tools.task resolves to undefined in the QuickJS sandbox,
-    #    causing "TypeError: not a function" on every Promise.allSettled call.
-    if subagents:
-        middleware.append(
-            SubAgentMiddleware(
-                backend=backend,
-                subagents=subagents,
-                task_description=tool_desc_overrides.get("task"),
-            )
-        )
-
-    # 5. Interpreter (eval tool) — only for top-level phase agents.
-    #    SubAgentMiddleware must be above this in the stack (position 4)
-    #    so that the `task` tool is visible to PTC when the interpreter
-    #    installs its globalThis.tools bindings.
-    if has_interpreter:
-        middleware.append(build_interpreter_middleware(phase.value))
-
-    # 6. Read cache — prevents re-reading already-seen files and re-issuing
+    # 4. Read cache — prevents re-reading already-seen files and re-issuing
     #    identical search_codebase / MCP lookups.  Checks SpineContext.read_cache
     #    before allowing the cached tools to execute.  Applied to subagents too:
     #    Explore researcher loops were re-running the same MCP lookups within a
     #    single invocation and leaking duplicate output into findings.
     middleware.append(_build_read_cache_middleware())
 
-    # 7. Patch tool calls — normalisation
+    # 5. Patch tool calls — normalisation
     middleware.append(PatchToolCallsMiddleware())
 
-    # 7. SPINE-specific middleware (tool validation, context editing).  Applied
+    # 6. SPINE-specific middleware (tool validation, context editing).  Applied
     #    to subagents too so that tool runtime errors become a compact
     #    ToolMessage(status="error") instead of a raw traceback that ends up
     #    serialized into ResearchFindings.summary.
     _add_spine_middleware(middleware, phase)
 
-    # 8. User-provided extra middleware
+    # 7. User-provided extra middleware
     if extra_middleware:
         middleware.extend(extra_middleware)
 
-    # 9. Profile extra middleware
+    # 8. Profile extra middleware
     if profile is not None:
         try:
             extra = profile.materialize_extra_middleware()
@@ -643,16 +578,16 @@ def _build_middleware_stack(
         except Exception:
             pass
 
-    # 11. Prompt caching — mark the static system prefix with an Anthropic
-    #     ephemeral cache breakpoint. Honored by direct Anthropic API and
-    #     OpenRouter Anthropic routes; silently ignored by other providers
-    #     (the field is added once per turn, negligible overhead).
+    # 9. Prompt caching — mark the static system prefix with an Anthropic
+    #    ephemeral cache breakpoint. Honored by direct Anthropic API and
+    #    OpenRouter Anthropic routes; silently ignored by other providers
+    #    (the field is added once per turn, negligible overhead).
     if static_cacheable_prefix and _supports_cache_control(model):
         middleware.append(StaticPrefixCacheMiddleware(static_cacheable_prefix))
     if _is_anthropic_model(model):
         middleware.append(AnthropicPromptCachingMiddleware())
 
-    # 11. Memory — AGENTS.md injection (when memory sources provided)
+    # 10. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
         middleware.append(
             SpineProjectMemoryMiddleware(

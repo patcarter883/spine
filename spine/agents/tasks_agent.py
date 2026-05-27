@@ -13,14 +13,11 @@ Tool surface (complete list):
 - ``read_prior_artifacts`` — loads spec/plan artifacts (spec workflows only)
 - ``search_codebase`` — multi-query targeted file search (replaces ls/glob/grep/read_file)
 - ``write_tasks_artifacts`` — atomic write of slices + tasks.md + codebase-map.md
-- ``task`` (via SubAgentMiddleware) — dispatches researcher subagents
-  (legacy; new workflows use LangGraph Send API at the subgraph level)
 
 No generic filesystem tools (ls, read_file, glob, grep, write_file,
 edit_file, execute). The agent cannot read files directly — it uses
-``search_codebase`` for targeted lookup. Researcher subagents do deep
-exploration. ``write_tasks_artifacts`` is the only write surface and
-calling it ends the phase.
+``search_codebase`` for targeted lookup. ``write_tasks_artifacts`` is
+the only write surface and calling it ends the phase.
 
 Design rationale (trace 019e4483 analysis):
 - With generic fs tools: 87 read_file calls, same files re-read 38×,
@@ -39,24 +36,11 @@ from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import artifact_path
 from spine.agents.factory import build_phase_agent
-from spine.agents.subagents import build_phase_subagents
 from spine.agents.tasks_tools import build_tasks_agent_tools
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 
 logger = logging.getLogger(__name__)
-
-
-def _build_subagents(
-    phase: PhaseName,
-    state: WorkflowState,
-    config: RunnableConfig | None,
-) -> list[Any] | None:
-    """Resolve subagent specs for the TASKS phase.
-
-    All work types now include specify+plan, so researcher subagents are always built.
-    """
-    return build_phase_subagents(phase, state, config)
 
 
 def build_tasks_agent(
@@ -102,7 +86,6 @@ def build_tasks_agent(
         config=config,
         phase=PhaseName.TASKS,
         system_prompt=system_prompt,
-        subagents=_build_subagents(PhaseName.TASKS, state, config),
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
     )
@@ -154,9 +137,7 @@ def _build_tasks_prompt() -> str:
         "content previews. Use for content-level queries MCP doesn't cover.\n"
         "### Output\n"
         "- `write_tasks_artifacts` — writes all artifacts atomically. "
-        "Call this ONCE. It is the ONLY write tool.\n"
-        "- `task` (via eval) — dispatches a `researcher` subagent (legacy path).\\n"
-        "- `eval` — JavaScript REPL for batching reads and caching.\\n\\n"
+        "Call this ONCE. It is the ONLY write tool.\n\n"
         "You do NOT have `ls`, `read_file`, `glob`, `grep`, `write_file`, "
         "`edit_file`, or `execute`. Do not attempt to call them.\n\n"
         "## Workflow (~3 turns total)\n\n"
@@ -184,8 +165,4 @@ def _build_tasks_prompt() -> str:
         "MCP `get_function_source` results or researcher output — not placeholder text.\n"
         "- Call `write_tasks_artifacts` exactly ONCE with ALL slices together.\n"
         "- After `write_tasks_artifacts` returns, stop immediately.\n\n"
-        "## Eval context seed\n"
-        "Access session-specific context properties via `globalThis.context` "
-        "preloaded in your workspace environment on first turn (e.g., "
-        "use `globalThis.context.work_id` or `globalThis.context.tasks_dir` inside eval).\n\n"
     )

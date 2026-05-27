@@ -293,8 +293,10 @@ def build_verify_orchestrator_tools(
     - ``read_verify_context``: loads all verification inputs in one call
     - ``write_verification_report``: writes the verification.md and verification.json artifacts
 
-    Together with ``eval`` (via CodeInterpreterMiddleware), these are all the
-    tools the orchestrator needs. No generic filesystem tools are exposed.
+    These are the complete tool surface for the VERIFY orchestrator.
+    No generic filesystem tools are exposed. Slice-verifier subagents are
+    dispatched per slice by the verify subgraph router via the LangGraph
+    Send API.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

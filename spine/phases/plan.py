@@ -168,9 +168,6 @@ async def call_plan(
         # Build prompt — specification is on disk at work_id-scoped path.
         # The original description is intentionally NOT re-included — the
         # specification file already captures and expands on it.
-        plan_dir = artifact_path(work_id, "plan")
-        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'plan', plan_dir: '{plan_dir}'}};\n\n"
-
         rework_prefix = ""
         if retry_count > 0:
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior plan. Address all points from the critic feedback.\n\n"
@@ -184,18 +181,16 @@ async def call_plan(
 
         spec_instruction = (
             f"The full specification is available on disk at `{spec_path}/specification.md` "
-            "and will also be loaded by `read_prior_artifacts` under "
-            "`artifacts.specify['specification.md']`. Use it as the source of truth "
-            "for ALL researcher dispatches — every subagent must receive the relevant "
-            "spec section so it can find the matching codebase files, patterns, and "
-            "conventions. Do NOT dispatch researchers with just the work description.\n\n"
+            "and is also loaded by `read_prior_artifacts` under "
+            "`artifacts.specify['specification.md']`. Use it as the source of truth — "
+            "the upstream exploration subgraph has already dispatched researchers "
+            "against the spec; their findings are in your context.\n\n"
             if has_spec
             else "No prior artifacts found. Work directly from the description returned by `read_prior_artifacts`.\n\n"
         )
 
         prompt = (
-            context_seed
-            + rework_prefix
+            rework_prefix
             + "Create a detailed technical plan based on the specification.\n\n"
             + spec_instruction
         )

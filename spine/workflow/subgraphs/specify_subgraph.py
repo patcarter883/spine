@@ -145,15 +145,8 @@ async def _run_specify_agent(
         )
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        spec_dir = artifact_path(work_id, PhaseName.SPECIFY.value)
-        context_seed = (
-            f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', "
-            f"spec_dir: '{spec_dir}'}};\n\n"
-        )
-
         prompt = (
-            context_seed
-            + _classify_section(task_category, classification_reasoning)
+            _classify_section(task_category, classification_reasoning)
             + f"Create a detailed specification for the following work:\n\n{description}"
             + recall_section
         )

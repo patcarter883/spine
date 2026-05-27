@@ -249,9 +249,9 @@ def build_specify_orchestrator_tools(
     - ``read_work_context``: loads description, feedback, and prior spec
     - ``write_specification``: structured write to specification.md
 
-    Together with ``task`` (SubAgentMiddleware) and ``eval``
-    (CodeInterpreterMiddleware), these are the complete tool surface.
-    No generic filesystem tools are exposed.
+    These are the complete tool surface for the SPECIFY agent. No generic
+    filesystem tools are exposed. Researcher subagents (when needed) are
+    dispatched by the exploration subgraph router, not by the agent itself.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

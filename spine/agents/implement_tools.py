@@ -347,10 +347,11 @@ def build_implement_orchestrator_tools(
     - ``read_slice_files``: loads all slice definitions + codebase map in one call
     - ``write_implementation_report``: writes the implementation.md artifact
 
-    Together with ``task`` (from SubAgentMiddleware) and ``eval`` (from
-    CodeInterpreterMiddleware), these are all the tools the orchestrator needs.
+    These are the complete tool surface for the IMPLEMENT orchestrator.
     No generic filesystem tools are exposed — the orchestrator physically
-    cannot read arbitrary files or write source code.
+    cannot read arbitrary files or write source code. Slice-implementer
+    subagents are dispatched per slice by the implement subgraph router
+    via the LangGraph Send API.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

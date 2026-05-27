@@ -36,18 +36,8 @@ from spine.agents.plan_tools import (
     StructuredWritePlanTool,
     build_plan_agent_tools,
 )
-from spine.agents.subagents import build_phase_subagents
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-
-
-def _build_subagents(
-    phase: PhaseName,
-    state: WorkflowState,
-    config: RunnableConfig | None,
-) -> list[Any] | None:
-    """Resolve subagent specs for the PLAN phase."""
-    return build_phase_subagents(phase, state, config)
 
 
 def build_plan_agent(
@@ -138,7 +128,6 @@ def build_plan_synthesizer(
         config=config,
         phase=PhaseName.PLAN,
         system_prompt=_build_plan_synthesizer_prompt(),
-        subagents=None,
         extra_tools=synthesizer_tools,
         skip_filesystem_middleware=True,
     )

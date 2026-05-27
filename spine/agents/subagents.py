@@ -440,20 +440,6 @@ _RE_RESEARCH_PROMPT_SUFFIX = (
     "Do NOT return empty results again."
 )
 
-# ── Which phases use which subagents ────────────────────────────────────
-
-PHASE_SUBAGENTS: dict[str, list[str]] = {
-    PhaseName.SPECIFY.value: ["researcher"],
-    PhaseName.PLAN.value: ["researcher"],
-    PhaseName.TASKS.value: ["researcher"],
-    PhaseName.IMPLEMENT.value: [
-        "slice-implementer"
-    ],  # No verifier — dedicated verify phase is authoritative
-    PhaseName.VERIFY.value: ["slice-verifier"],
-    # CRITIC — single-agent, no subagents
-}
-
-
 # ── Factory functions ──────────────────────────────────────────────────
 
 
@@ -834,48 +820,6 @@ def build_subagent_spec(
     return spec
 
 
-def build_phase_subagents(
-    phase: PhaseName,
-    state: WorkflowState,
-    config: RunnableConfig | None = None,
-    *,
-    extra_skills: dict[str, list[str]] | None = None,
-) -> list[dict[str, Any]] | None:
-    """Build all subagent specs for a given phase.
-
-    Returns ``None`` if the phase has no subagents (PLAN, TASKS, CRITIC).
-
-    Args:
-        phase: The parent phase.
-        state: The current workflow state.
-        config: LangGraph runtime config.
-        extra_skills: Mapping of subagent name → extra skill directories.
-            Allows callers to inject additional skills for specific subagents
-            (e.g. from task complexity analysis).
-
-    Returns:
-        A list of SubAgent dicts, or ``None`` if the phase uses no subagents.
-    """
-    names = PHASE_SUBAGENTS.get(phase.value)
-    if not names:
-        return None
-
-    extra_skills = extra_skills or {}
-    specs: list[dict[str, Any]] = []
-
-    for name in names:
-        spec = build_subagent_spec(
-            name=name,
-            phase=phase,
-            state=state,
-            config=config,
-            extra_skills=extra_skills.get(name),
-        )
-        specs.append(spec)
-
-    return specs
-
-
 def _resolve_subagent_skills(
     name: str,
     phase: PhaseName,
@@ -898,8 +842,7 @@ def _resolve_subagent_skills(
     """
     from spine.agents.skills_resolver import resolve_skills
 
-    # Phase-specific skills are resolved for the subagent's parent phase,
-    # but with include_rlm=False (subagents don't use the interpreter).
+    # Phase-specific skills are resolved for the subagent's parent phase.
     # Most subagents get no phase skills — they are focused workers.
     default_skills: list[str] = []
 
@@ -908,7 +851,6 @@ def _resolve_subagent_skills(
         phase_skills = resolve_skills(
             phase=phase.value,
             workspace_root=workspace_root,
-            include_rlm=False,
         )
         default_skills = phase_skills
 

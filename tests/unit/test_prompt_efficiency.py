@@ -19,25 +19,24 @@ class TestPromptEfficiency:
     """Verify prompt changes that reduce token usage."""
 
     def test_base_prompt_no_tool_duplicates(self):
-        """SPINE_BASE_PROMPT should not duplicate DA middleware injections."""
+        """SPINE_BASE_PROMPT should not duplicate DA middleware injections
+        or reference removed tools (eval / task / QuickJS)."""
         duplicated_phrases = [
             "read_file, write_file, edit_file, ls, glob, grep",
             "run shell commands",
             "QuickJS interpreter",
             "task tool to launch short-lived subagents",
+            "eval",
+            "tools.task",
         ]
         for phrase in duplicated_phrases:
             assert phrase not in SPINE_BASE_PROMPT, (
-                f"SPINE_BASE_PROMPT duplicates DA middleware content: {phrase!r}"
+                f"SPINE_BASE_PROMPT references removed/duplicated content: {phrase!r}"
             )
 
     def test_base_prompt_has_batch_instruction(self):
         """Base prompt must instruct agents to batch independent operations."""
         assert "batch" in SPINE_BASE_PROMPT.lower() or "Batch" in SPINE_BASE_PROMPT
-
-    def test_base_prompt_has_eval_instruction(self):
-        """Base prompt must reference eval/interpreter for orchestration."""
-        assert "eval" in SPINE_BASE_PROMPT.lower()
 
     def test_base_prompt_has_no_re_read_instruction(self):
         """Base prompt must tell agents not to re-read files."""
@@ -48,14 +47,6 @@ class TestPromptEfficiency:
         assert len(SPINE_BASE_PROMPT) < 3400, (
             f"SPINE_BASE_PROMPT is {len(SPINE_BASE_PROMPT)} chars — "
             "should be under 3400 chars (~850 tokens)"
-        )
-
-    def test_rlm_preamble_removed(self):
-        """_RLM_PREAMBLE should no longer exist in factory.py."""
-        from spine.agents import factory
-
-        assert not hasattr(factory, "_RLM_PREAMBLE"), (
-            "_RLM_PREAMBLE still exists in factory.py — should be removed"
         )
 
 

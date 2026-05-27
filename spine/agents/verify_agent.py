@@ -17,19 +17,9 @@ from spine.agents.artifacts import (
     build_current_phase_write_prompt,
 )
 from spine.agents.factory import build_phase_agent
-from spine.agents.subagents import build_phase_subagents
 from spine.agents.verify_tools import build_verify_orchestrator_tools
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-
-
-def _build_subagents(
-    phase: PhaseName,
-    state: WorkflowState,
-    config: RunnableConfig | None,
-) -> list[Any] | None:
-    """Resolve subagent specs for the VERIFY phase."""
-    return build_phase_subagents(phase, state, config)
 
 
 def build_verify_agent(
@@ -50,11 +40,11 @@ def build_verify_agent(
     custom_tools = build_verify_orchestrator_tools(workspace_root, work_id)
 
     system_prompt = (
-        "You are the VERIFY phase orchestrator. Dispatch slice-verifier "
-        "subagents per feature slice and synthesize their verdicts into a "
-        "single report. Use `read_verify_context` to load structured slice "
-        "definitions and implementation results, then dispatch subagents via "
-        "`task` inside `eval`.\n\n"
+        "You are the VERIFY phase synthesiser. Slice-verifier subagents "
+        "have already been dispatched in parallel by the verify subgraph "
+        "router; their verdicts are in your context. Use `read_verify_context` "
+        "to load structured slice definitions and implementation results, then "
+        "call `write_verification_report` to record the combined verdict.\n\n"
     )
     system_prompt += build_current_phase_write_prompt(
         work_id, PhaseName.VERIFY.value, expected_files=["verification.md"]
@@ -65,7 +55,6 @@ def build_verify_agent(
         config=config,
         phase=PhaseName.VERIFY,
         system_prompt=system_prompt,
-        subagents=_build_subagents(PhaseName.VERIFY, state, config),
         extra_tools=custom_tools,
         skip_filesystem_middleware=True,
     )

@@ -219,22 +219,6 @@ class TestSkillsResolver:
         skill_names = [s.split("/")[-1] for s in skills]
         assert "code-review" in skill_names
 
-    def test_rlm_skill_included_when_requested(self) -> None:
-        """RLM pattern skill should be included when include_rlm=True."""
-        from spine.agents.skills_resolver import resolve_skills
-
-        skills = resolve_skills("specify", include_rlm=True)
-        skill_names = [s.split("/")[-1] for s in skills]
-        assert "rlm-pattern" in skill_names
-
-    def test_rlm_skill_excluded_by_default(self) -> None:
-        """RLM pattern skill should NOT be included by default."""
-        from spine.agents.skills_resolver import resolve_skills
-
-        skills = resolve_skills("specify", include_rlm=False)
-        skill_names = [s.split("/")[-1] for s in skills]
-        assert "rlm-pattern" not in skill_names
-
     def test_skill_paths_are_absolute(self) -> None:
         """All skill paths should be absolute."""
         from spine.agents.skills_resolver import resolve_skills

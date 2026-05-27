@@ -45,11 +45,10 @@ summaries or descriptions.
 - Issues: 1
 ```
 
-## Using the interpreter
+## Parallel verification
 
-If the eval tool is available:
-- Dispatch verification subagents in parallel per slice via `tools.task()`.
-- Aggregate results deterministically in code — count passes/fails, flag
-  issues.
-- Run the actual test suite and linters via the shell backend (`execute`),
-  not through the interpreter.
+Slice-verifier subagents are dispatched in parallel by `verify_subgraph`
+via the LangGraph `Send` API — one per feature slice. Their verdicts
+arrive in your context before this synthesiser runs; aggregate them by
+counting passes/fails and flagging issues. Run the actual test suite and
+linters via the shell backend's `execute` tool when available.

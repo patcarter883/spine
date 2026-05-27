@@ -273,17 +273,6 @@ def build_artifact_prompt(
         "Use this phase's purpose-built context loader — it loads the right "
         "artifacts in one call. Do NOT load everything into context at once."
     )
-    # RLM guidance: load artifact inventory into interpreter once,
-    # not into every turn's system prompt. Later eval calls can reference
-    # globalThis.artifacts for paths.
-    lines.append(
-        "**RLM tip:** At the start of this phase, run one `eval` call to "
-        "load the artifact paths into interpreter state (e.g. "
-        "`globalThis.artifactPaths = {...}`). Refer to those variables in "
-        "subsequent eval calls instead of repeating paths in conversation. "
-        "Remember: PTC tool names are camelCase (`tools.readFile`) and "
-        "return native values — `readFile` returns a string, not an object."
-    )
 
     for phase in phase_order:
         if phase == current_phase:

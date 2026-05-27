@@ -275,9 +275,7 @@ def build_tasks_agent_tools(
     - ``search_codebase`` — multi-query targeted file search
     - ``write_tasks_artifacts`` — atomic write of all tasks artifacts
 
-    Together with ``task`` (SubAgentMiddleware) and ``eval``
-    (CodeInterpreterMiddleware), these are the complete tool surface.
-    No generic filesystem tools are exposed.
+    These are the complete tool surface. No generic filesystem tools are exposed.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

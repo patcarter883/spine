@@ -79,11 +79,9 @@ async def _run_tasks_agent(
             )
         else:
             # Quick/critical_quick: no prior artifacts — work from the
-            # original description. First action must be researcher dispatch
-            # via the task tool — the user message makes this explicit.
-            desc_preview = description[:120].replace("'", "\\'")
-            researcher_line1 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 1>'}},"
-            researcher_line2 = f"    description: 'Research code relevant to: {desc_preview}\\nInvestigate: <area 2>'}},"
+            # original description. Researcher exploration was dispatched
+            # by the upstream exploration subgraph; the agent uses
+            # search_codebase / MCP tools for any targeted follow-up.
             prompt_lines.extend(
                 [
                     "Break the work description into smaller, executable "
@@ -92,19 +90,12 @@ async def _run_tasks_agent(
                     "## Work Description",
                     description,
                     "",
-                    "## Your first action MUST be to dispatch researcher subagents",
-                    "Call `task` 2-3 times (once per area) to dispatch researcher subagents "
-                    "in parallel. Do NOT call codebase queries search/explore sequentially "
-                    "turn-by-turn yourself first. Each researcher investigates ONE area of "
-                    "the codebase relevant to the work description above.",
+                    "Researcher findings from the upstream exploration subgraph "
+                    "are already in your context. Use MCP tools or `search_codebase` "
+                    "for any narrow targeted follow-up only — do not re-explore.",
                     "",
-                    "Example (adapt to the actual work description):",
-                    f"  tools.task({{subagent_type: 'researcher', {researcher_line1}}})",
-                    f"  tools.task({{subagent_type: 'researcher', {researcher_line2}}})",
-                    "",
-                    "After researchers complete, call `write_tasks_artifacts` "
-                    "with all slices, tasks summary, dependency waves, and codebase map. "
-                    "Total turns: ~2-3.",
+                    "Then call `write_tasks_artifacts` with all slices, tasks summary, "
+                    "dependency waves, and codebase map. Total turns: ~2-3.",
                     "",
                 ]
             )

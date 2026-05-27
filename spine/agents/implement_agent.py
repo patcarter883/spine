@@ -18,18 +18,8 @@ from spine.agents.artifacts import (
 )
 from spine.agents.factory import build_phase_agent
 from spine.agents.implement_tools import build_implement_orchestrator_tools
-from spine.agents.subagents import build_phase_subagents
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-
-
-def _build_subagents(
-    phase: PhaseName,
-    state: WorkflowState,
-    config: RunnableConfig | None,
-) -> list[Any] | None:
-    """Resolve subagent specs for the IMPLEMENT phase."""
-    return build_phase_subagents(phase, state, config)
 
 
 def build_implement_agent(
@@ -51,10 +41,11 @@ def build_implement_agent(
     total_slices = sum(len(wave) for wave in execution_waves)
 
     system_prompt = (
-        "You are the IMPLEMENT phase orchestrator. Your job is to dispatch "
-        "slice-implementer subagents per feature slice and synthesize their "
-        "results. Use `read_slice_files` to load slice definitions and the "
-        "codebase map, then dispatch subagents via `task` inside `eval`.\n\n"
+        "You are the IMPLEMENT phase synthesiser. Slice-implementer subagents "
+        "have already been dispatched in parallel by the implement subgraph "
+        "router; their results are in your context. Use `read_slice_files` "
+        "to load slice definitions and the codebase map for cross-reference, "
+        "then call `write_implementation_report` to record the outcome.\n\n"
         f"Total slices to implement: {total_slices}\n\n"
     )
 
@@ -72,7 +63,6 @@ def build_implement_agent(
         config=config,
         phase=PhaseName.IMPLEMENT,
         system_prompt=system_prompt,
-        subagents=_build_subagents(PhaseName.IMPLEMENT, state, config),
         extra_tools=orchestrator_tools,
         skip_filesystem_middleware=True,
     )

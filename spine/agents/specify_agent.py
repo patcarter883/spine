@@ -1,16 +1,14 @@
 """SPINE specify agent — Deep Agent for the SPECIFY phase.
 
-In the normal workflow, codebase exploration is handled upstream by the
-exploration subgraph (LangGraph Send API) before this agent runs.  This
-agent's job is to synthesise the exploration results and write the final
-specification.md via the ``write_specification`` tool.
+Codebase exploration is handled upstream by the exploration subgraph
+(LangGraph Send API dispatch of researcher subagents) before this agent
+runs.  This agent's job is to synthesise the exploration results and write
+the final specification.md via the ``write_specification`` tool.
 
 Tool surface (complete list):
 - ``read_work_context`` — loads description, feedback, prior spec (rework)
 - ``write_specification`` — structured write to specification.md (only)
 - ``recall`` — retrieves relevant code chunks from vector store
-- ``task`` (via SubAgentMiddleware) — dispatches researcher subagents
-  (only used when the exploration subgraph was skipped)
 
 No generic filesystem tools (ls, read_file, glob, grep, write_file,
 edit_file, execute). The agent cannot read arbitrary files or write
@@ -26,18 +24,8 @@ from langchain_core.runnables import RunnableConfig
 from spine.agents.artifacts import build_artifact_prompt
 from spine.agents.factory import build_phase_agent
 from spine.agents.specify_tools import build_specify_orchestrator_tools
-from spine.agents.subagents import build_phase_subagents
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
-
-
-def _build_subagents(
-    phase: PhaseName,
-    state: WorkflowState,
-    config: RunnableConfig | None,
-) -> list[Any] | None:
-    """Resolve subagent specs for the SPECIFY phase."""
-    return build_phase_subagents(phase, state, config)
 
 
 def build_specify_agent(
@@ -84,7 +72,6 @@ def build_specify_agent(
         config=config,
         phase=PhaseName.SPECIFY,
         system_prompt=system_prompt,
-        subagents=_build_subagents(PhaseName.SPECIFY, state, config),
         extra_tools=all_tools,
         skip_filesystem_middleware=True,
     )
@@ -128,7 +115,6 @@ def build_specify_synthesizer(
         config=config,
         phase=PhaseName.SPECIFY,
         system_prompt=system_prompt,
-        subagents=None,
         extra_tools=list(orchestrator_tools),
         skip_filesystem_middleware=True,
     )
@@ -142,8 +128,10 @@ def _build_specify_prompt() -> str:
         "- `read_work_context` — loads work description, feedback, prior spec. Call FIRST.\\n"
         "- `recall` — retrieves relevant code chunks from the vector knowledge base. "
         "Use this to understand existing patterns before writing the spec.\\n"
-        "- `write_specification` — writes specification.md. Call LAST.\\n"
-        "- `task` — dispatches a `researcher` subagent (only if exploration was skipped).\\n\\n"
+        "- `write_specification` — writes specification.md. Call LAST.\\n\\n"
+        "Researcher subagents that explored the codebase were dispatched by "
+        "the upstream exploration subgraph; their findings are already in your "
+        "context. Do not try to dispatch more.\\n\\n"
         "## SPECIFY PHASE — STEP-BY-STEP WORKFLOW\\n\\n"
         "Execute these steps in order. Complete each fully before proceeding.\\n\\n"
         "### Step 1 — Call read_work_context (Turn 1)\\n"

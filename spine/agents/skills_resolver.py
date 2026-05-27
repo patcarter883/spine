@@ -8,11 +8,9 @@ loads the full content only when it determines the skill is relevant
 This module provides :func:`resolve_skills` which builds the list of skill
 paths appropriate for a given SPINE phase, combining:
 
-1. **Always-loaded skills** — the RLM pattern skill (when interpreter is
-   available), which applies to any phase that has the eval tool.
-2. **Phase-specific skills** — e.g. spec-writing for SPECIFY,
+1. **Phase-specific skills** — e.g. spec-writing for SPECIFY,
    feature-slice-decomposition for TASKS, code-review for VERIFY.
-3. **Workspace skills** — if the target project has a ``.spine/skills/``
+2. **Workspace skills** — if the target project has a ``.spine/skills/``
    directory, those are included too.
 
 Skill paths are absolute so they work regardless of the agent's cwd.
@@ -42,9 +40,6 @@ _PHASE_SKILLS: dict[str, list[str]] = {
     PhaseName.GAP_PLAN.value: [],
 }
 
-# RLM pattern skill — included for all phases that have interpreter support
-_RLM_SKILL = "rlm-pattern"
-
 # Phases that don't need the full project AGENTS.md — it's ~22K chars
 # of mostly irrelevant content (testing, config, deps, workflows).
 # All phases skip AGENTS.md to save ~25K tokens total.
@@ -62,15 +57,12 @@ _SKIP_AGENTS_MD: set[str] = {
 def resolve_skills(
     phase: str,
     workspace_root: str | None = None,
-    include_rlm: bool = False,
 ) -> list[str]:
     """Build the list of skill paths for a SPINE phase agent.
 
     Args:
         phase: Phase name (e.g. "specify", "implement").
         workspace_root: Project workspace root (checked for .spine/skills/).
-        include_rlm: Whether to include the RLM pattern skill
-            (set True when interpreter is enabled).
 
     Returns:
         List of absolute paths to skill directories, ready to pass to
@@ -85,12 +77,6 @@ def resolve_skills(
             skills.append(str(skill_dir))
         else:
             logger.warning("Built-in skill directory not found: %s", skill_dir)
-
-    # RLM pattern skill (when interpreter is available)
-    if include_rlm:
-        rlm_dir = _SKILLS_ROOT / _RLM_SKILL
-        if rlm_dir.is_dir():
-            skills.append(str(rlm_dir))
 
     # Workspace-level skills (project-specific)
     if workspace_root:

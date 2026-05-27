@@ -1,9 +1,9 @@
 """VERIFY phase as a LangGraph subgraph with Send API dispatch.
 
 The subgraph uses the same manager/router/call/aggregate pattern as the
-exploration and implement subgraphs, replacing the old ``eval`` +
-``tools.task()`` + ``Promise.allSettled`` approach with native LangGraph
-``Send`` API parallel dispatch.
+exploration and implement subgraphs: it dispatches one ``slice-verifier``
+per slice in parallel via the LangGraph ``Send`` API, then aggregates
+the verdicts.
 
 Nodes:
 - ``verify_router``: conditional edge — reads ``execution_waves`` from

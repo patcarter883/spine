@@ -312,16 +312,6 @@ class TestPhaseAwareProviderConfig:
 class TestSubagentFactory:
     """Test spine.agents.subagents module."""
 
-    def test_phase_subagents_mapping(self) -> None:
-        from spine.agents.subagents import PHASE_SUBAGENTS
-
-        assert "researcher" in PHASE_SUBAGENTS.get("specify", [])
-        assert "slice-implementer" in PHASE_SUBAGENTS.get("implement", [])
-        assert "slice-verifier" in PHASE_SUBAGENTS.get("verify", [])
-        # Phases without subagents
-        assert "researcher" in PHASE_SUBAGENTS.get("plan", [])
-        assert PHASE_SUBAGENTS.get("critic") is None
-
     def test_response_models_defined(self) -> None:
         from spine.agents.subagents import SUBAGENT_RESPONSE_MODELS
 

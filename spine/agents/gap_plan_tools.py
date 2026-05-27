@@ -342,8 +342,8 @@ def build_gap_plan_tools(
     - ``read_verification_findings``: loads all verification inputs in one call
     - ``write_structured_gap_plan``: writes gap_plan.md + gap_plan.json
 
-    Together with ``eval`` (via CodeInterpreterMiddleware), these are all the
-    tools the gap_plan agent needs. No generic filesystem tools are exposed.
+    These are the complete tool surface for the gap_plan agent. No generic
+    filesystem tools are exposed.
 
     Args:
         workspace_root: Absolute path to the project workspace root.

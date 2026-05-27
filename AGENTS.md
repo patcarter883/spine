@@ -26,7 +26,6 @@ SPINE is a deterministic AI agent harness with a workflow engine and modular pro
 spine:
   checkpoint_path: .spine/spine.db
   workspace_root: /home/pat/Projects/spine
-  interpreter_enabled: true
 
 # MCP Servers
 # Model Context Protocol servers for external tool integration.
@@ -190,11 +189,10 @@ build_gap_plan_subgraph  -> spine/workflow/subgraphs/gap_plan_subgraph.py
 | `spine/agents/retry.py` | `invoke_with_retry()` - exponential backoff for transient LLM API errors |
 | `spine/agents/context.py` | `SpineContext` - typed per-run context that propagates to subagents |
 | `spine/agents/artifacts.py` | Artifact materialization to disk + inline preview builder |
-| `spine/agents/interpreter.py` | Code interpreter middleware (optional, per-phase) |
 | `spine/agents/skills_resolver.py` | `resolve_skills()`, `resolve_memory()` - loads phase-specific skills and memory |
 | `spine/agents/backend.py` | `build_backend()` - creates DA backend with CompositeBackend + cross-work memory |
 | `spine/agents/debug_callback.py` | LLM debug logging callback (enabled via `--debug-llm` or `SPINE_DEBUG_LLM`) |
-| `spine/agents/subagents.py` | SubAgent spec builders for DA `task` tool delegation |
+| `spine/agents/subagents.py` | `build_subagent_spec()` - constructs researcher / slice-implementer / slice-verifier specs consumed by the subgraph routers (Send API dispatch) |
 | `spine/agents/tool_schema_validator.py` | Rebound loop middleware - self-corrects when tool args don't match schema |
 | `spine/agents/exploration_agents.py` | Lightweight agent functions for the exploration subgraph (research_manager, explore) |
 | `spine/agents/specify_agent.py` | SPECIFY phase agent builder |

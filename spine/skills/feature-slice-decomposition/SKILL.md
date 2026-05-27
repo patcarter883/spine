@@ -48,11 +48,9 @@ Output the slices in structured markdown with clear dependency annotations:
 - **Complexity**: small
 ```
 
-## Using the interpreter
+## Parallel research
 
-If the eval tool is available:
-- Read the plan with filesystem tools, then store key sections in interpreter
-  variables for reference without re-reading.
-- Dispatch independent research subagents via `tools.task()` in parallel.
-- Build the dependency graph and sort into waves in code (topological sort) —
-  this is deterministic work that doesn't need the model.
+Researcher subagents that explore the codebase are dispatched in parallel by
+the upstream `exploration_subgraph` router via the LangGraph `Send` API
+before this phase runs. Their findings are already in your context — do
+not attempt to re-explore the codebase yourself.

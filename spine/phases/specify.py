@@ -142,8 +142,6 @@ async def call_specify(
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
         # Build the prompt — prior artifacts are on disk, not inlined
-        spec_dir = artifact_path(work_id, "specify")
-        context_seed = f"globalThis.context = {{work_id: '{work_id}', phase: 'specify', spec_dir: '{spec_dir}'}};\n\n"
 
         # Include retrieved context for first pass
         recall_section = ""
@@ -158,8 +156,7 @@ async def call_specify(
             rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior specification. Address all points from the critic feedback.\n\n"
 
         prompt = (
-            context_seed
-            + rework_prefix
+            rework_prefix
             + f"## Task Classification\nCategory: {task_category}\n{classification_reasoning}\n\n"
             + f"Create a detailed specification for the following work:\n\n{description}"
             + recall_section

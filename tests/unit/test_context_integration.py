@@ -1,4 +1,4 @@
-"""Integration tests for SPINE three-layer context efficiency defense.
+"""Integration tests for SPINE context efficiency defenses.
 
 These tests verify that the assembled middleware stack works together
 correctly — not the individual methods (covered by unit tests in
@@ -7,9 +7,8 @@ end-to-end integration of:
 
 1. ToolOutputTrimmer + AI arg trimming — eviction triggers arg compaction
 2. ToolSchemaValidator edit_file empty old_string — rebound error
-3. PTC allowlist excludes read_file — interpreter doesn't expose readFile
-4. codebase-map prompt enrichment — tasks prompt has Modification Targets
-5. Researcher minimum output requirements — prompt includes guardrails
+3. codebase-map prompt enrichment — tasks prompt has Modification Targets
+4. Researcher minimum output requirements — prompt includes guardrails
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from spine.agents.context_editing import ToolOutputTrimmer
-from spine.agents.interpreter import _PTC_ALLOWLISTS
 from spine.agents.subagents import SUBAGENT_PROMPTS
 from spine.agents.tool_schema_validator import ToolSchemaValidator
 from spine.models.enums import PhaseName
@@ -317,51 +315,7 @@ class TestEditFileEmptyOldString:
 # ── 3. PTC allowlist excludes read_file ─────────────────────────────────
 
 
-class TestPTCAllowlistExcludesReadFile:
-    """Verify that read_file is NOT in any phase's PTC allowlist."""
-
-    @pytest.mark.parametrize(
-        "phase_value",
-        [
-            PhaseName.SPECIFY.value,
-            PhaseName.TASKS.value,
-            PhaseName.IMPLEMENT.value,
-            PhaseName.VERIFY.value,
-        ],
-    )
-    def test_read_file_absent_from_allowlist(self, phase_value: str) -> None:
-        """read_file should not appear in any PTC allowlist."""
-        allowlist = _PTC_ALLOWLISTS.get(phase_value, [])
-        assert "read_file" not in allowlist, (
-            f"Phase {phase_value!r} PTC allowlist should not include read_file "
-            f"(causes null returns under virtual_mode=True). "
-            f"Got: {allowlist}"
-        )
-
-    def test_all_phases_have_allowlists(self) -> None:
-        """SPECIFY, TASKS, IMPLEMENT, VERIFY must all have PTC entries."""
-        for phase in [PhaseName.SPECIFY, PhaseName.TASKS, PhaseName.IMPLEMENT, PhaseName.VERIFY]:
-            assert phase.value in _PTC_ALLOWLISTS, (
-                f"Phase {phase.value!r} missing from _PTC_ALLOWLISTS"
-            )
-
-    def test_task_present_in_all_allowlists(self) -> None:
-        """Every phase with a PTC allowlist must include 'task' for
-        subagent orchestration."""
-        for phase_value, allowlist in _PTC_ALLOWLISTS.items():
-            assert "task" in allowlist, (
-                f"Phase {phase_value!r} PTC allowlist must include 'task'. Got: {allowlist}"
-            )
-
-    def test_no_phase_has_read_file(self) -> None:
-        """No phase allowlist should contain read_file (defensive scan)."""
-        for phase_value, allowlist in _PTC_ALLOWLISTS.items():
-            assert "read_file" not in allowlist, (
-                f"Phase {phase_value!r} includes read_file in PTC allowlist"
-            )
-
-
-# ── 4. codebase-map prompt enrichment ───────────────────────────────────
+# ── 3. codebase-map prompt enrichment ───────────────────────────────────
 
 
 class TestCodebaseMapPromptEnrichment:

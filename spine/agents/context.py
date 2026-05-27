@@ -41,10 +41,6 @@ class SpineContext(BaseModel):
     Attributes:
         work_id: Unique work item identifier.
         phase: Current phase name (e.g. "specify", "implement").
-        active_subagent: Name of the subagent the interpreter should target
-            with the ``task`` tool (e.g. ``"researcher"`` for SPECIFY,
-            ``"slice-implementer"`` for IMPLEMENT, ``"slice-verifier"``
-            for VERIFY).  Empty for phases without subagents.
         workspace_root: Absolute path to the project directory.
         retry_count: How many times this phase has been retried.
         is_rework: True if this is a rework (retry_count > 0).
@@ -64,7 +60,6 @@ class SpineContext(BaseModel):
 
     work_id: str = ""
     phase: str = ""
-    active_subagent: str = ""
     workspace_root: str = "."
     retry_count: int = 0
     is_rework: bool = False
@@ -122,12 +117,6 @@ def build_context(
         if artifacts.get(phase_key):
             artifact_paths[phase_key] = artifact_path(work_id, phase_key)
 
-    # Resolve the named subagent for this phase (for interpreter PTC)
-    from spine.agents.subagents import PHASE_SUBAGENTS
-
-    subagent_names = PHASE_SUBAGENTS.get(phase_name, [])
-    active_subagent = subagent_names[0] if len(subagent_names) == 1 else ""
-
     # Seed the dedupe cache from prior phases / rework cycles. The mapping
     # is checkpointed in WorkflowState.read_cache; we hand the middleware a
     # mutable copy so its in-place writes during this invocation can be
@@ -138,7 +127,6 @@ def build_context(
     return SpineContext(
         work_id=state.get("work_id", "unknown"),
         phase=phase_name,
-        active_subagent=active_subagent,
         workspace_root=workspace_root,
         retry_count=retry_count,
         is_rework=retry_count > 0,
