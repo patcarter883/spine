@@ -27,9 +27,10 @@ import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from spine.agents import symbol_cache
+from spine.agents._tokens import count_tokens
 
 # Tools (beyond read_file) whose results we deduplicate when called with
 # identical arguments inside a single phase / subagent invocation. Read-only
@@ -293,7 +294,181 @@ class ReadCacheMiddleware(AgentMiddleware):
 
 
 # ---------------------------------------------------------------------------
-# ToolOutputTrimmer
+# Tool-output eviction helpers (shared by ToolOutputTrimmer and TokenBudgetCompactor)
+# ---------------------------------------------------------------------------
+
+
+# Tools whose ToolMessage outputs must NEVER be replaced by a metadata
+# placeholder. These carry information the agent needs verbatim to keep
+# working on the current slice (write/edit acknowledgements, structured
+# artifact bodies, verification reports). Trimming them caused the
+# regression that retired the old ToolOutputTrimmer.
+DEFAULT_PRESERVED_TOOLS: frozenset[str] = frozenset({
+    "write_file",
+    "edit_file",
+    "read_edit_lint",
+    "write_specification",
+    "write_plan",
+    "write_tasks",
+    "write_verification_report",
+})
+
+
+def extract_metadata(content: str, tool_name: str, tool_args: dict[str, Any]) -> str:
+    """Produce a structured placeholder from a tool result.
+
+    The placeholder encodes enough information for the agent to know
+    *what* was read/written without needing to re-execute the tool.
+    """
+    if tool_name == "read_file":
+        path = tool_args.get("file_path", "?")
+        n_lines = _count_lines(content)
+        symbols = _extract_symbols(content)
+        sym_str = ", ".join(symbols) if symbols else "no symbols"
+        return f"[read: {path} ({n_lines} lines) — {sym_str}]"
+
+    if tool_name == "execute":
+        cmd = tool_args.get("command", "?")
+        last_line = content.rstrip().rsplit("\n", 1)[-1] if content.strip() else ""
+        exit_match = re.search(r"(?:exit code|Exit code|exit_status)[:\s]*(\d+)", content)
+        if exit_match:
+            return f"[exec: {cmd} — exit code {exit_match.group(1)}]"
+        if last_line and len(last_line) < 120:
+            return f"[exec: {cmd} — {last_line}]"
+        return f"[exec: {cmd}]"
+
+    if tool_name == "grep":
+        pattern = tool_args.get("pattern", "?")
+        path = tool_args.get("path", ".")
+        file_matches = re.findall(r"^([^:\n]+):", content, re.MULTILINE)
+        n_files = len(set(file_matches))
+        n_lines = _count_lines(content)
+        return f"[grep: '{pattern}' in {path} — {n_files} files, {n_lines} lines]"
+
+    if tool_name == "write_file":
+        path = tool_args.get("file_path", "?")
+        return f"[written: {path}]"
+
+    if tool_name == "edit_file":
+        path = tool_args.get("file_path", "?")
+        new_str = tool_args.get("new_string", "")
+        preview = new_str[:60]
+        if len(new_str) > 60:
+            preview += "..."
+        return f"[edited: {path} → {preview}]"
+
+    if tool_name == "glob":
+        pattern = tool_args.get("pattern", "?")
+        n_files = _count_lines(content)
+        return f"[glob: '{pattern}' — {n_files} files]"
+
+    if tool_name == "ls":
+        path = tool_args.get("path", ".")
+        entries = [line for line in content.splitlines() if line.strip()]
+        return f"[ls: {path} — {len(entries)} entries]"
+
+    hint = content[:80].split("\n")[0]
+    if len(hint) == 80 and len(content) > 80:
+        hint += "..."
+    return f"[evicted({tool_name}): {hint}]"
+
+
+def trim_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Return trimmed args for a single tool call, or *args* unchanged."""
+    if name == "write_file":
+        content_val = args.get("content", "")
+        path = args.get("file_path", "?")
+        if isinstance(content_val, str) and len(content_val) > 100:
+            return {**args, "content": f"[{len(content_val)} chars written to {path}]"}
+        return args
+
+    if name == "edit_file":
+        new_args = dict(args)
+        path = args.get("file_path", "?")
+        old_str = args.get("old_string", "")
+        new_str = args.get("new_string", "")
+        if isinstance(old_str, str) and len(old_str) > 100:
+            new_args["old_string"] = f"[{len(old_str)} chars from {path}]"
+        if isinstance(new_str, str) and len(new_str) > 100:
+            new_args["new_string"] = f"[{len(new_str)} chars → {path}]"
+        return new_args
+
+    return args
+
+
+def trim_ai_args(messages: list, evicted_ids: set[str]) -> list:
+    """Trim tool_call arguments in AI messages for evicted tool results.
+
+    For write_file / edit_file calls whose ToolMessage was evicted,
+    replace the large argument values with compact summaries.
+    """
+    trimmed = list(messages)
+    for i, msg in enumerate(trimmed):
+        if not isinstance(msg, AIMessage):
+            continue
+        if not msg.tool_calls:
+            continue
+        new_calls: list[dict] | None = None
+        for j, tc in enumerate(msg.tool_calls):
+            tc_id = tc.get("id", "")
+            if tc_id not in evicted_ids:
+                continue
+            name = tc.get("name", "")
+            args = tc.get("args", {})
+            new_args = trim_tool_args(name, args)
+            if new_args is not args:
+                if new_calls is None:
+                    new_calls = [dict(c) for c in msg.tool_calls]
+                new_calls[j] = {**new_calls[j], "args": new_args}
+        if new_calls is not None:
+            trimmed[i] = AIMessage(
+                content=msg.content,
+                tool_calls=new_calls,
+            )
+    return trimmed
+
+
+def build_tool_call_map(messages: list) -> dict[str, tuple[str, dict]]:
+    """Map tool_call_id → (tool_name, tool_args) from AI messages."""
+    call_map: dict[str, tuple[str, dict]] = {}
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in msg.tool_calls:
+            tc_id = tc.get("id")
+            if tc_id:
+                call_map[tc_id] = (tc.get("name", ""), tc.get("args", {}))
+    return call_map
+
+
+def _estimate_message_tokens(messages: list) -> int:
+    """Estimate prompt-token cost of *messages* via the shared tokenizer."""
+    total = 0
+    for msg in messages:
+        content = getattr(msg, "content", "")
+        if isinstance(content, str):
+            total += count_tokens(content)
+        elif isinstance(content, list):
+            # Multimodal content blocks: count any text parts we can find.
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text") or block.get("content") or ""
+                    if isinstance(text, str):
+                        total += count_tokens(text)
+                elif isinstance(block, str):
+                    total += count_tokens(block)
+        # tool_calls args also live in the wire prompt; account for them.
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            try:
+                total += count_tokens(json.dumps(tool_calls, default=str))
+            except Exception:
+                pass
+    return total
+
+
+# ---------------------------------------------------------------------------
+# ToolOutputTrimmer (count-based eviction — used by researcher subagent)
 # ---------------------------------------------------------------------------
 
 
@@ -318,162 +493,36 @@ class ToolOutputTrimmer(AgentMiddleware):
     ) -> None:
         self.max_full_tool_results = max_full_tool_results
 
-    # ── Metadata extraction ──────────────────────────────────────────────
-
-    def _extract_metadata(self, content: str, tool_name: str, tool_args: dict[str, Any]) -> str:
-        """Produce a structured placeholder from a tool result.
-
-        The placeholder encodes enough information for the agent to know
-        *what* was read/written without needing to re-execute the tool.
-        """
-        if tool_name == "read_file":
-            path = tool_args.get("file_path", "?")
-            n_lines = _count_lines(content)
-            symbols = _extract_symbols(content)
-            sym_str = ", ".join(symbols) if symbols else "no symbols"
-            return f"[read: {path} ({n_lines} lines) — {sym_str}]"
-
-        if tool_name == "execute":
-            cmd = tool_args.get("command", "?")
-            # Try to find exit code in the content
-            last_line = content.rstrip().rsplit("\n", 1)[-1] if content.strip() else ""
-            # Look for common exit-code patterns
-            exit_match = re.search(r"(?:exit code|Exit code|exit_status)[:\s]*(\d+)", content)
-            if exit_match:
-                return f"[exec: {cmd} — exit code {exit_match.group(1)}]"
-            if last_line and len(last_line) < 120:
-                return f"[exec: {cmd} — {last_line}]"
-            return f"[exec: {cmd}]"
-
-        if tool_name == "grep":
-            pattern = tool_args.get("pattern", "?")
-            path = tool_args.get("path", ".")
-            # Count matching files and lines
-            file_matches = re.findall(r"^([^:\n]+):", content, re.MULTILINE)
-            n_files = len(set(file_matches))
-            n_lines = _count_lines(content)
-            return f"[grep: '{pattern}' in {path} — {n_files} files, {n_lines} lines]"
-
-        if tool_name == "write_file":
-            path = tool_args.get("file_path", "?")
-            return f"[written: {path}]"
-
-        if tool_name == "edit_file":
-            path = tool_args.get("file_path", "?")
-            new_str = tool_args.get("new_string", "")
-            preview = new_str[:60]
-            if len(new_str) > 60:
-                preview += "..."
-            return f"[edited: {path} → {preview}]"
-
-        if tool_name == "glob":
-            pattern = tool_args.get("pattern", "?")
-            n_files = _count_lines(content)
-            return f"[glob: '{pattern}' — {n_files} files]"
-
-        if tool_name == "ls":
-            path = tool_args.get("path", ".")
-            entries = [line for line in content.splitlines() if line.strip()]
-            return f"[ls: {path} — {len(entries)} entries]"
-
-        # Default fallback
-        hint = content[:80].split("\n")[0]
-        if len(hint) == 80 and len(content) > 80:
-            hint += "..."
-        return f"[evicted({tool_name}): {hint}]"
-
-    # ── AI message argument trimming ─────────────────────────────────────
+    # Back-compat shims so existing tests that reach into the instance
+    # methods keep working after the helpers were lifted to module scope.
+    def _extract_metadata(
+        self, content: str, tool_name: str, tool_args: dict[str, Any]
+    ) -> str:
+        return extract_metadata(content, tool_name, tool_args)
 
     def _trim_ai_args(self, messages: list, evicted_ids: set[str]) -> list:
-        """Trim tool_call arguments in AI messages for evicted tool results.
-
-        For write_file / edit_file calls whose ToolMessage was evicted,
-        replace the large argument values with compact summaries.
-        """
-        trimmed = list(messages)
-        for i, msg in enumerate(trimmed):
-            if not isinstance(msg, AIMessage):
-                continue
-            if not msg.tool_calls:
-                continue
-            new_calls: list[dict] | None = None
-            for j, tc in enumerate(msg.tool_calls):
-                tc_id = tc.get("id", "")
-                if tc_id not in evicted_ids:
-                    continue
-                name = tc.get("name", "")
-                args = tc.get("args", {})
-                new_args = self._trim_args(name, args)
-                if new_args is not args:
-                    if new_calls is None:
-                        new_calls = [dict(c) for c in msg.tool_calls]
-                    new_calls[j] = {**new_calls[j], "args": new_args}
-            if new_calls is not None:
-                trimmed[i] = AIMessage(
-                    content=msg.content,
-                    tool_calls=new_calls,
-                )
-        return trimmed
+        return trim_ai_args(messages, evicted_ids)
 
     @staticmethod
     def _trim_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Return trimmed args for a single tool call, or *args* unchanged."""
-        if name == "write_file":
-            content_val = args.get("content", "")
-            path = args.get("file_path", "?")
-            if isinstance(content_val, str) and len(content_val) > 100:
-                return {**args, "content": f"[{len(content_val)} chars written to {path}]"}
-            return args
-
-        if name == "edit_file":
-            new_args = dict(args)
-            path = args.get("file_path", "?")
-            old_str = args.get("old_string", "")
-            new_str = args.get("new_string", "")
-            if isinstance(old_str, str) and len(old_str) > 100:
-                new_args["old_string"] = f"[{len(old_str)} chars from {path}]"
-            if isinstance(new_str, str) and len(new_str) > 100:
-                new_args["new_string"] = f"[{len(new_str)} chars → {path}]"
-            return new_args
-
-        # Don't trim read_file args — they're small
-        return args
-
-    # ── Build tool_call_id → (name, args) map ───────────────────────────
+        return trim_tool_args(name, args)
 
     @staticmethod
     def _build_tool_call_map(messages: list) -> dict[str, tuple[str, dict]]:
-        """Map tool_call_id → (tool_name, tool_args) from AI messages."""
-        call_map: dict[str, tuple[str, dict]] = {}
-        for msg in messages:
-            if not isinstance(msg, AIMessage):
-                continue
-            for tc in msg.tool_calls:
-                tc_id = tc.get("id")
-                if tc_id:
-                    call_map[tc_id] = (tc.get("name", ""), tc.get("args", {}))
-        return call_map
-
-    # ── Main model-call hook ─────────────────────────────────────────────
+        return build_tool_call_map(messages)
 
     async def awrap_model_call(self, request, handler):
         """Trim old tool results and AI args before each model call."""
         messages = request.messages
+        call_map = build_tool_call_map(messages)
 
-        # Build tool_call_id → (name, args) map from AI messages
-        call_map = self._build_tool_call_map(messages)
+        tool_result_indices = [
+            i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
+        ]
 
-        # Count tool results in the message list
-        tool_result_indices: list[int] = []
-        for i, msg in enumerate(messages):
-            if isinstance(msg, ToolMessage):
-                tool_result_indices.append(i)
-
-        # If within budget, pass through unchanged
         if len(tool_result_indices) <= self.max_full_tool_results:
             return await handler(request)
 
-        # Trim old results — keep the last N in full
         trim_count = len(tool_result_indices) - self.max_full_tool_results
         evicted_ids: set[str] = set()
         trimmed_messages = list(messages)
@@ -488,7 +537,7 @@ class ToolOutputTrimmer(AgentMiddleware):
                 name, args = call_map[tc_id]
 
             content = msg.content if isinstance(msg.content, str) else ""
-            metadata = self._extract_metadata(content, name, args)
+            metadata = extract_metadata(content, name, args)
 
             evicted_ids.add(tc_id or "")
             try:
@@ -500,21 +549,204 @@ class ToolOutputTrimmer(AgentMiddleware):
             except Exception:
                 pass
 
-        # Trim AI message args for evicted tool_call_ids
         if evicted_ids:
-            trimmed_messages = self._trim_ai_args(trimmed_messages, evicted_ids)
+            trimmed_messages = trim_ai_args(trimmed_messages, evicted_ids)
 
         return await handler(request.override(messages=trimmed_messages))
 
-    # ── Pass-through tool call wrapping ────────────────────────────────
-    # This middleware only intercepts model calls. Tool calls must still
-    # be defined so DA's factory check (``m.__class__.wrap_tool_call is
-    # not AgentMiddleware.wrap_tool_call``) passes without AttributeError.
-
+    # Pass-throughs so DA's factory check keeps the middleware bound.
     def wrap_tool_call(self, request, handler):
-        """Pass-through: no tool-call interception needed."""
         return handler(request)
 
     async def awrap_tool_call(self, request, handler):
-        """Pass-through: no tool-call interception needed."""
+        return await handler(request)
+
+
+# ---------------------------------------------------------------------------
+# TokenBudgetCompactor (token-threshold eviction — used by phase agents)
+# ---------------------------------------------------------------------------
+
+
+class TokenBudgetCompactor(AgentMiddleware):
+    """Token-threshold compaction with hardened preservation rules.
+
+    The retired ``ToolOutputTrimmer`` was removed in 2026-05 because it
+    aggressively evicted tool results during implement/verify phases and
+    cost the agent its working state. This middleware keeps the same
+    metadata-placeholder approach but only fires when prompt tokens exceed
+    ``threshold_tokens`` AND applies three preservation rules so the
+    regression cannot recur:
+
+      1. Keep the most recent ``keep_recent`` ToolMessages verbatim.
+      2. Keep any ToolMessage whose source tool is in ``preserved_tools``
+         (defaults to write/edit and the SPINE artifact-writer family).
+      3. Anything else older than the preservation window is replaced by
+         the structured metadata placeholder produced by
+         :func:`extract_metadata`, and the corresponding ``AIMessage``
+         ``tool_calls`` args are compacted via :func:`trim_ai_args`.
+    """
+
+    def __init__(
+        self,
+        threshold_tokens: int,
+        keep_recent: int = 6,
+        preserved_tools: frozenset[str] = DEFAULT_PRESERVED_TOOLS,
+    ) -> None:
+        self.threshold_tokens = threshold_tokens
+        self.keep_recent = keep_recent
+        self.preserved_tools = preserved_tools
+
+    async def awrap_model_call(self, request, handler):
+        messages = request.messages
+
+        if self.threshold_tokens <= 0:
+            return await handler(request)
+
+        total_tokens = _estimate_message_tokens(messages)
+        if total_tokens < self.threshold_tokens:
+            return await handler(request)
+
+        call_map = build_tool_call_map(messages)
+        tool_result_indices = [
+            i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
+        ]
+
+        if len(tool_result_indices) <= self.keep_recent:
+            return await handler(request)
+
+        # Evict everything older than the last `keep_recent`, EXCEPT
+        # preserved-tool outputs which are always kept verbatim.
+        evict_candidate_indices = tool_result_indices[: -self.keep_recent]
+        evicted_ids: set[str] = set()
+        trimmed_messages = list(messages)
+
+        for idx in evict_candidate_indices:
+            msg = trimmed_messages[idx]
+            assert isinstance(msg, ToolMessage)
+            tc_id = msg.tool_call_id or ""
+            name = msg.name or ""
+            args: dict = {}
+            if tc_id and tc_id in call_map:
+                name, args = call_map[tc_id]
+
+            if name in self.preserved_tools:
+                continue
+
+            content = msg.content if isinstance(msg.content, str) else ""
+            metadata = extract_metadata(content, name, args)
+            evicted_ids.add(tc_id)
+            try:
+                trimmed_messages[idx] = ToolMessage(
+                    content=metadata,
+                    tool_call_id=msg.tool_call_id,
+                    name=msg.name,
+                )
+            except Exception:
+                pass
+
+        if not evicted_ids:
+            return await handler(request)
+
+        trimmed_messages = trim_ai_args(trimmed_messages, evicted_ids)
+        new_tokens = _estimate_message_tokens(trimmed_messages)
+        logger.info(
+            "TokenBudgetCompactor: %d→%d tokens, evicted %d msgs",
+            total_tokens, new_tokens, len(evicted_ids),
+        )
+        return await handler(request.override(messages=trimmed_messages))
+
+    def wrap_tool_call(self, request, handler):
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        return await handler(request)
+
+
+# ---------------------------------------------------------------------------
+# ResearcherConvergenceMiddleware (push researcher to finalise findings)
+# ---------------------------------------------------------------------------
+
+
+class ResearcherConvergenceMiddleware(AgentMiddleware):
+    """Steer the researcher subagent toward emitting a final ResearchFindings
+    message before the LangGraph ``recursion_limit`` is hit.
+
+    Researcher convergence == an ``AIMessage`` with no ``tool_calls``; that
+    is what :func:`spine.agents.exploration_agents._finalize_research_findings`
+    consumes. The salvage pathway added in commit ``80c9a66`` kicks in only
+    *after* a ``GraphRecursionError``, so up to ``recursion_limit`` (50)
+    turns can be wasted on breadth-first wandering first. This middleware
+    counts tool calls emitted so far and intervenes in two stages:
+
+      * ``>= soft_threshold``: append a nudging ``SystemMessage`` asking the
+        model to begin synthesising findings.
+      * ``>= hard_threshold``: append a stronger forcing reminder AND drop
+        the tool bindings (``request.override(tools=[])``) so the model has
+        no choice but to emit a final non-tool-calling message.
+    """
+
+    def __init__(
+        self,
+        soft_threshold: int = 25,
+        hard_threshold: int = 40,
+        recursion_limit: int = 50,
+    ) -> None:
+        if hard_threshold < soft_threshold:
+            raise ValueError("hard_threshold must be >= soft_threshold")
+        self.soft_threshold = soft_threshold
+        self.hard_threshold = hard_threshold
+        self.recursion_limit = recursion_limit
+
+    @staticmethod
+    def _count_tool_calls(messages: list) -> int:
+        n = 0
+        for msg in messages:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                n += len(msg.tool_calls)
+        return n
+
+    async def awrap_model_call(self, request, handler):
+        messages = request.messages
+        n = self._count_tool_calls(messages)
+
+        if n < self.soft_threshold:
+            return await handler(request)
+
+        if n >= self.hard_threshold:
+            reminder = (
+                f"[CONVERGENCE FORCING] You have made {n} of {self.recursion_limit} "
+                f"allotted tool calls. STOP calling tools NOW. Your next message MUST be "
+                f"your final ResearchFindings markdown report — patterns, file_map, "
+                f"dependencies, summary — with NO tool_calls. If you call another tool, "
+                f"your partial findings will be auto-salvaged and may be lower quality."
+            )
+            logger.info(
+                "ResearcherConvergence: forcing (n=%d ≥ hard=%d, tools dropped)",
+                n, self.hard_threshold,
+            )
+            return await handler(
+                request.override(
+                    messages=[*messages, SystemMessage(content=reminder)],
+                    tools=[],
+                )
+            )
+
+        nudge = (
+            f"[CONVERGENCE NUDGE] {n} of {self.recursion_limit} tool calls used. "
+            f"Begin synthesising your ResearchFindings now. Only call further tools "
+            f"if absolutely required to fill a critical gap; otherwise emit your final "
+            f"markdown report with no tool_calls."
+        )
+        logger.info(
+            "ResearcherConvergence: nudging (n=%d ≥ soft=%d)",
+            n, self.soft_threshold,
+        )
+        return await handler(
+            request.override(messages=[*messages, SystemMessage(content=nudge)])
+        )
+
+    def wrap_tool_call(self, request, handler):
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
         return await handler(request)

@@ -29,6 +29,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from spine.agents._tokens import count_tokens as _count_tokens
+
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ExplorationSubgraphState
 from spine.agents.artifacts import (
@@ -579,7 +581,11 @@ async def _synthesize_plan(
         agent = build_plan_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        findings_text = _format_findings(findings)
+        from spine.config import SpineConfig as _SpineConfig
+        findings_text = _format_findings(
+            findings,
+            budget=_SpineConfig.load().synthesize_findings_token_budget,
+        )
         rework_prefix = ""
         if retry_count > 0:
             rework_prefix = (
@@ -695,7 +701,11 @@ async def _synthesize_specify(
         agent = build_specify_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        findings_text = _format_findings(findings)
+        from spine.config import SpineConfig as _SpineConfig
+        findings_text = _format_findings(
+            findings,
+            budget=_SpineConfig.load().synthesize_findings_token_budget,
+        )
         rework_prefix = ""
         if retry_count > 0:
             rework_prefix = (
@@ -817,15 +827,7 @@ def _compute_waves(
         return [], str(exc)
 
 
-def _count_tokens(text: str) -> int:
-    """Best-effort token count via tiktoken with a 4-char-per-token fallback."""
-    try:
-        import tiktoken
-
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    except Exception:
-        return len(text) // 4
+# _count_tokens has moved to spine.agents._tokens (imported at module top).
 
 
 def _format_retrieved_context(chunks: list[dict]) -> str:
@@ -905,37 +907,74 @@ def _render_rework_feedback(
     )
 
 
-def _format_findings(findings: list[dict]) -> str:
+def _format_findings(
+    findings: list[dict], *, budget: int | None = None,
+) -> str:
     """Format accumulated findings for the synthesizer prompt.
 
     Keeps individual findings compact — the synthesizer can read files
     from disk if more detail is needed.
+
+    When ``budget`` is a positive int, accumulates token count per
+    appended finding (via :func:`spine.agents._tokens.count_tokens`) and
+    stops once the next finding would push the total over budget. A
+    trailing marker tells the synthesizer how many findings were omitted
+    so it can request specific symbols if needed.
     """
     if not findings:
         return "(no codebase research was performed)"
+
+    use_budget = isinstance(budget, int) and budget > 0
     parts: list[str] = []
+    included = 0
+    omitted = 0
+    used_tokens = 0
+
     for i, f in enumerate(findings):
-        if isinstance(f, dict):
-            if f.get("error"):
-                continue
-            topic = f.get("topic", "")
-            summary = f.get("summary", "")
-            patterns = f.get("patterns", [])
-            file_map = f.get("file_map", {})
-            deps = f.get("dependencies", [])
-            header = f"### Finding {i + 1}"
-            if topic:
-                header += f" — Topic: {topic}"
-            parts.append(f"{header}\n{summary}")
-            if patterns:
-                parts.append(f"Patterns: {', '.join(patterns)}")
-            if file_map:
-                parts.append(f"Key files: {_json_mod.dumps(file_map)}")
-            if deps:
-                parts.append(f"Dependencies: {', '.join(deps)}")
+        if not isinstance(f, dict):
+            continue
+        if f.get("error"):
+            continue
+        topic = f.get("topic", "")
+        summary = f.get("summary", "")
+        patterns = f.get("patterns", [])
+        file_map = f.get("file_map", {})
+        deps = f.get("dependencies", [])
+        header = f"### Finding {i + 1}"
+        if topic:
+            header += f" — Topic: {topic}"
+        block_parts: list[str] = [f"{header}\n{summary}"]
+        if patterns:
+            block_parts.append(f"Patterns: {', '.join(patterns)}")
+        if file_map:
+            block_parts.append(f"Key files: {_json_mod.dumps(file_map)}")
+        if deps:
+            block_parts.append(f"Dependencies: {', '.join(deps)}")
+        block = "\n\n".join(block_parts)
+
+        if use_budget:
+            block_tokens = _count_tokens(block)
+            if used_tokens + block_tokens > budget:
+                # Count this finding + every later non-error finding as omitted.
+                omitted = sum(
+                    1 for g in findings[i:]
+                    if isinstance(g, dict) and not g.get("error")
+                )
+                break
+            used_tokens += block_tokens
+        parts.append(block)
+        included += 1
+
     if not parts:
         return "(no codebase research was performed)"
-    return "\n\n".join(parts)
+
+    rendered = "\n\n".join(parts)
+    if omitted > 0:
+        rendered += (
+            f"\n\n[truncated: {omitted} more findings omitted "
+            f"(over {budget}-token budget — request specific symbols if needed)]"
+        )
+    return rendered
 
 
 # ── Node: save_artifacts ────────────────────────────────────────────────
@@ -1060,7 +1099,7 @@ async def _save_exploration_artifacts(
                         "dependencies": f.get("dependencies", []),
                     }
                     for f in findings
-                    if isinstance(f, dict)
+                    if isinstance(f, dict) and not f.get("error")
                 ],
             }, indent=2, default=str)
             store.save_artifact(work_id, phase, "research_log.json", research_log)

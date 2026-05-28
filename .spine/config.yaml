@@ -1,13 +1,45 @@
 spine:
   checkpoint_path: .spine/spine.db
   guided_decoding: true
-  topic_lookup_min_similarity: 0.5
+  topic_lookup_min_similarity: 0.75
+  # Cap the findings block injected into plan/specify synthesize prompts.
+  # Prevents accumulated research summaries from dominating prompt size
+  # (trace 019e6d27: plan-synthesize hit 42K, above the 40K compactor
+  # threshold). Set to 0 or negative to disable the cap.
+  synthesize_findings_token_budget: 20000
   # RAG configuration
   embedding_provider: local-embeddings
   recall_k: 3
   vector_indexing:
     max_concurrent_chunks: 10
     batch_size: 100
+  # Researcher convergence steering — nudge & force the explore subagent
+  # to emit final ResearchFindings before LangGraph's recursion_limit (50)
+  # is hit. Disable with SPINE_RESEARCHER_CONVERGENCE=false.
+  convergence:
+    researcher_soft: 10            # tool calls before a SystemMessage nudge
+    researcher_hard: 14            # tool calls before tools are dropped
+    researcher_recursion_limit: 50 # matches exploration_agents.py safety cap
+  # Token-based phase compaction (TokenBudgetCompactor). Off by default;
+  # enable with SPINE_TOKEN_COMPACTION=true. Per-phase threshold of 0
+  # disables compaction for that phase even when the env flag is set.
+  token_compaction:
+    enabled: false
+    default_threshold: 0
+    thresholds:
+      specify:   30000
+      plan:      40000
+      implement: 60000
+      verify:    40000
+    keep_recent: 6
+    preserved_tools:
+      - write_file
+      - edit_file
+      - read_edit_lint
+      - write_specification
+      - write_plan
+      - write_tasks
+      - write_verification_report
 mcp_servers:
   codebase-index:
     transport: stdio
@@ -86,6 +118,12 @@ providers:
   phases:
     specify:
       provider: pat
+    # Researcher subagent override. The local `pat` model struggles with
+    # MCP tool-arg schemas (trace 019e6cc4: 23/23 research branches failed
+    # with malformed args). Uncomment to escalate the researcher to a
+    # stronger model — must already be defined and enabled in providers.llm[].
+    # specify/subagents/researcher:
+    #   provider: deepseek-v4-pro
     plan:
       provider: pat
     critic:

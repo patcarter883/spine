@@ -241,6 +241,84 @@ class ToolSchemaValidator(AgentMiddleware):
         except Exception as exc:
             return self._format_validation_error(tool, args, exc), exc
 
+    # ── Hardened guards (markup / whitespace) ─────────────────────────
+
+    _MARKUP_TOKENS: tuple[str, ...] = (
+        "<tool_call>", "</tool_call>",
+        "<arg_value>", "</arg_value>",
+        "<tool_response>", "</tool_response>",
+    )
+
+    @classmethod
+    def _markup_in(cls, value: str) -> str | None:
+        for tok in cls._MARKUP_TOKENS:
+            if tok in value:
+                return tok
+        return None
+
+    @classmethod
+    def _classify_validation(
+        cls, args: dict[str, Any], exc: Exception | None
+    ) -> list[str]:
+        """Return short telemetry tags describing what went wrong.
+
+        Tags are non-exclusive: a single failed call can have any combination
+        of ``unknown_keys``, ``whitespace_value``, ``markup_leak``, and
+        ``pydantic_other`` (catch-all for cases the more-specific tags don't
+        cover). Used by the rebound logger to build a per-tool failure
+        histogram across runs.
+        """
+        tags: list[str] = []
+        if exc is not None:
+            errors_fn = getattr(exc, "errors", None)
+            error_list = errors_fn() if callable(errors_fn) else []
+            if any(e.get("type") == "extra_forbidden" for e in error_list):
+                tags.append("unknown_keys")
+        for v in (args or {}).values():
+            if not isinstance(v, str):
+                continue
+            if v != "" and not v.strip():
+                tags.append("whitespace_value")
+            if cls._markup_in(v):
+                tags.append("markup_leak")
+        if not tags:
+            tags.append("pydantic_other")
+        # De-duplicate while preserving order.
+        seen: set[str] = set()
+        return [t for t in tags if not (t in seen or seen.add(t))]
+
+    def _scan_value_guards(
+        self, args: dict[str, Any]
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Inspect top-level string args for whitespace-only or markup-leak values.
+
+        Returns three lists of (already-formatted) callout strings:
+        whitespace_callouts, markup_callouts, classifications.
+        Classifications are short tags used for telemetry.
+        """
+        ws_callouts: list[str] = []
+        markup_callouts: list[str] = []
+        tags: list[str] = []
+        for k, v in args.items():
+            if not isinstance(v, str):
+                continue
+            if v != "" and not v.strip():
+                ws_callouts.append(
+                    f"  - Field '{k}': value is whitespace-only ({v!r}). "
+                    f"Pass a clean identifier like 'MyClass.my_method' or "
+                    f"'my_function'."
+                )
+                tags.append("whitespace_value")
+            tok = self._markup_in(v)
+            if tok is not None:
+                markup_callouts.append(
+                    f"  - Field '{k}': value contains tool-call markup "
+                    f"({tok!r}). Pass only the raw identifier / regex; do "
+                    f"not echo back the tool-call envelope."
+                )
+                tags.append("markup_leak")
+        return ws_callouts, markup_callouts, tags
+
     def _format_validation_error(self, tool: Any, args: dict[str, Any], exc: Exception) -> str:
         """Format a Pydantic validation error into an actionable message.
 
@@ -261,6 +339,39 @@ class ToolSchemaValidator(AgentMiddleware):
             )
 
         parts = [f"Tool call to '{tool_name}' failed validation:"]
+
+        # ── Invented-key callout (Pydantic 'extra_forbidden') ──
+        # The default Pydantic message says 'Extra inputs are not permitted',
+        # which the model frequently misreads as advice to add more inputs.
+        # Lead with an explicit "you used a key that doesn't exist" line and
+        # the list of valid parameters so the correction is unambiguous.
+        invented_keys = [
+            str(err.get("loc", [""])[0])
+            for err in error_list
+            if err.get("type") == "extra_forbidden" and err.get("loc")
+        ]
+        telemetry_tags: list[str] = []
+        if invented_keys:
+            valid_field_names = [
+                fname for (fname, _t, _req) in (_resolve_schema_fields(tool) or [])
+            ]
+            parts.append(
+                f"You used unknown parameter(s) {invented_keys!r}. "
+                f"Valid parameters: {valid_field_names}. "
+                f"Replace the unknown keys with valid ones — do not add extra "
+                f"fields and do not invent new keys."
+            )
+            telemetry_tags.append("unknown_keys")
+
+        # ── Whitespace / markup-leak guards on supplied string values ──
+        ws_callouts, markup_callouts, value_tags = self._scan_value_guards(args)
+        if ws_callouts:
+            parts.append("Value guard — whitespace-only string fields:")
+            parts.extend(ws_callouts)
+        if markup_callouts:
+            parts.append("Value guard — tool-call markup leaked into a field:")
+            parts.extend(markup_callouts)
+        telemetry_tags.extend(value_tags)
 
         for err in error_list[:_MAX_VALIDATION_ERRORS]:
             loc = " -> ".join(str(part) for part in err.get("loc", []))
@@ -396,22 +507,24 @@ class ToolSchemaValidator(AgentMiddleware):
 
         # Invalid — increment rebound counter
         rebound = self._increment_rebound(tool_name)
+        tags = self._classify_validation(args, _exc)
         if rebound > self.max_schema_rebound:
             logger.warning(
-                "Tool '%s' schema rebound limit (%d) exceeded, "
+                "Tool '%s' schema rebound limit (%d) exceeded [tags=%s], "
                 "letting handler run (will likely raise): %s",
                 tool_name,
                 self.max_schema_rebound,
+                tags,
                 error,
             )
             return handler(request)
 
-        logger.info(
-            "Tool '%s' validation failed (rebound %d/%d): %s",
+        logger.warning(
+            "Tool '%s' validation failed (rebound %d/%d) [tags=%s]",
             tool_name,
             rebound,
             self.max_schema_rebound,
-            error,
+            tags,
         )
 
         return self._make_error_message(tool_name, tool_call_id, error)
@@ -482,22 +595,24 @@ class ToolSchemaValidator(AgentMiddleware):
 
         # Invalid — increment rebound counter
         rebound = self._increment_rebound(tool_name)
+        tags = self._classify_validation(args, _exc)
         if rebound > self.max_schema_rebound:
             logger.warning(
-                "Tool '%s' schema rebound limit (%d) exceeded, "
+                "Tool '%s' schema rebound limit (%d) exceeded [tags=%s], "
                 "letting handler run (will likely raise): %s",
                 tool_name,
                 self.max_schema_rebound,
+                tags,
                 error,
             )
             return await handler(request)
 
-        logger.info(
-            "Tool '%s' validation failed (rebound %d/%d): %s",
+        logger.warning(
+            "Tool '%s' validation failed (rebound %d/%d) [tags=%s]",
             tool_name,
             rebound,
             self.max_schema_rebound,
-            error,
+            tags,
         )
 
         return self._make_error_message(tool_name, tool_call_id, error)

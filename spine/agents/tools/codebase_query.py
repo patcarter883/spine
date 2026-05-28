@@ -1,0 +1,289 @@
+"""Consolidated codebase-query tool for the researcher subagent.
+
+Replaces the five separately-bound ``mcp_codebase-index_*`` tools the
+researcher previously had access to with a single ``BaseTool`` exposing
+an ``action`` enum. The model picks one of five actions, fills the one
+or two argument fields the action needs, and the tool dispatches to the
+matching MCP backend.
+
+Why this exists
+---------------
+Trace ``019e6cc4-f57d-7652-a718-15d04278ad5c`` showed the local researcher
+model emitting malformed MCP args at a high rate: invented argument keys
+(``maxfile_patterns``, ``queries`` instead of ``pattern``), whitespace-only
+``name`` values (``"test\\n"``), and tool-call markup leaking into regex
+patterns (``"spine.*__init__|arg_value>\\n</tool_call>\\n"``). Branches
+exhausted the 50-step recursion cap before producing findings; 23/23 real
+research branches failed.
+
+Collapsing five tool schemas into one (with one ``action`` decision plus a
+small, named arg set) removes the wrong-key class of failures entirely,
+and the markup/whitespace guards short-circuit the obvious garbage at
+validator level before it reaches the MCP server.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Literal
+
+from langchain_core.tools import BaseTool, ToolException
+from langchain_core.tools.base import ArgsSchema
+from pydantic import BaseModel, Field, PrivateAttr
+
+logger = logging.getLogger(__name__)
+
+
+# Markup substrings that must never appear inside model-supplied strings.
+# These indicate the model has spilled its own tool-call XML into a value.
+_FORBIDDEN_MARKUP_TOKENS: tuple[str, ...] = (
+    "<tool_call>",
+    "</tool_call>",
+    "<arg_value>",
+    "</arg_value>",
+    "<tool_response>",
+    "</tool_response>",
+)
+
+
+CodebaseQueryAction = Literal[
+    "find_symbol",
+    "get_source",
+    "get_dependencies",
+    "get_dependents",
+    "search",
+]
+
+
+# action → backing MCP tool name on the codebase-index server.
+_ACTION_TO_MCP: dict[str, str] = {
+    "find_symbol":      "mcp_codebase-index_find_symbol",
+    "get_source":       "mcp_codebase-index_get_function_source",
+    "get_dependencies": "mcp_codebase-index_get_dependencies",
+    "get_dependents":   "mcp_codebase-index_get_dependents",
+    "search":           "mcp_codebase-index_search_codebase",
+}
+
+
+class CodebaseQueryInput(BaseModel):
+    """Single schema covering every action of :class:`CodebaseQueryTool`.
+
+    Validation rules (enforced in :meth:`CodebaseQueryTool._arun`):
+
+    * ``find_symbol`` / ``get_source`` / ``get_dependencies`` /
+      ``get_dependents`` all require ``name`` (a non-whitespace identifier).
+    * ``search`` requires ``pattern`` (a non-whitespace regex).
+    * ``name`` and ``pattern`` are mutually exclusive — supply only the
+      one the chosen action needs.
+    * Neither field may contain tool-call markup substrings.
+    """
+
+    action: CodebaseQueryAction = Field(
+        description=(
+            "One of: 'find_symbol' (locate a symbol's definition), "
+            "'get_source' (full source body of a function/method/class), "
+            "'get_dependencies' (what a symbol calls/uses), "
+            "'get_dependents' (what calls/uses a symbol), "
+            "'search' (regex search across the codebase)."
+        ),
+    )
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Symbol identifier (function, class, or method name). REQUIRED "
+            "for find_symbol, get_source, get_dependencies, get_dependents. "
+            "Must be a clean identifier — no whitespace, no module prefix, "
+            "no parentheses."
+        ),
+    )
+    pattern: str | None = Field(
+        default=None,
+        description=(
+            "Regex pattern for the 'search' action. REQUIRED for search; "
+            "must not be used with other actions. Output is capped to "
+            "~8 KB / 50 hits — refine with anchors/file-globs rather than "
+            "retrying naively."
+        ),
+    )
+    max_results: int = Field(
+        default=20,
+        description="Result-count cap for the 'search' action (default 20).",
+    )
+
+
+def _reject_markup(value: str, field: str) -> None:
+    """Raise ``ToolException`` if *value* contains tool-call markup."""
+    for token in _FORBIDDEN_MARKUP_TOKENS:
+        if token in value:
+            raise ToolException(
+                f"codebase_query: '{field}' contains tool-call markup ({token!r}). "
+                f"Pass only the raw identifier / regex; do not echo back the "
+                f"<tool_call> envelope."
+            )
+
+
+def _normalise_name(value: str | None) -> str:
+    """Strip whitespace from a symbol name and validate it is non-empty."""
+    if value is None:
+        raise ToolException(
+            "codebase_query: 'name' is required for this action."
+        )
+    stripped = value.strip()
+    if not stripped:
+        raise ToolException(
+            "codebase_query: 'name' is whitespace-only. Pass a clean symbol "
+            "identifier like 'MyClass.my_method' or 'my_function'."
+        )
+    _reject_markup(stripped, "name")
+    return stripped
+
+
+def _normalise_pattern(value: str | None) -> str:
+    """Validate the regex pattern for the 'search' action."""
+    if value is None:
+        raise ToolException(
+            "codebase_query: 'pattern' is required for action='search'."
+        )
+    if not value.strip():
+        raise ToolException(
+            "codebase_query: 'pattern' is empty or whitespace-only."
+        )
+    _reject_markup(value, "pattern")
+    return value
+
+
+class CodebaseQueryTool(BaseTool):
+    """One tool, five actions — wraps the codebase-index MCP backend.
+
+    Construction loads the MCP tool set once (via
+    :func:`spine.mcp.client.get_mcp_tools`) and dispatches by action.
+    Failures during MCP loading are surfaced at first call time rather
+    than at construction so the rest of the researcher's tool list can
+    still be built when the index is unavailable.
+    """
+
+    name: str = "codebase_query"
+    description: str = (
+        "Structural codebase navigation. ONE tool covering every kind of "
+        "lookup the researcher needs:\n"
+        "  - action='find_symbol' + name='X'        → locate symbol X (file, line, type)\n"
+        "  - action='get_source' + name='X'         → full source of function/method/class X\n"
+        "  - action='get_dependencies' + name='X'   → what X calls/uses\n"
+        "  - action='get_dependents' + name='X'     → what calls/uses X\n"
+        "  - action='search' + pattern='regex'      → regex search across the codebase\n"
+        "Pick the action FIRST, then fill the one argument it needs. Use "
+        "'name' for the four symbol actions and 'pattern' for 'search' — "
+        "they are mutually exclusive. Sub-millisecond latency; use this "
+        "before reading whole files."
+    )
+    args_schema: ArgsSchema | None = CodebaseQueryInput
+
+    workspace_root: str = ""
+
+    # Lazily-loaded MCP tool map: { mcp_tool_name → BaseTool }.
+    _tool_map: dict[str, BaseTool] | None = PrivateAttr(default=None)
+    _server_configs: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
+
+    def __init__(self, *, workspace_root: str, mcp_servers: dict[str, dict[str, Any]]):
+        super().__init__(workspace_root=workspace_root)
+        # Store the server config; the actual tool load happens on first use.
+        self._server_configs = mcp_servers or {}
+
+    # ── Lazy backend loader ─────────────────────────────────────────────
+
+    def _ensure_loaded(self) -> dict[str, BaseTool]:
+        if self._tool_map is not None:
+            return self._tool_map
+        from spine.mcp.client import get_mcp_tools
+
+        try:
+            tools = get_mcp_tools(
+                self._server_configs,
+                cache_key=f"codebase-query-{self.workspace_root}",
+                workspace_root=self.workspace_root,
+            )
+        except Exception as exc:
+            logger.warning("codebase_query: MCP tool load failed: %s", exc)
+            self._tool_map = {}
+            return self._tool_map
+        mapping = {t.name: t for t in tools}
+        self._tool_map = mapping
+        missing = [m for m in _ACTION_TO_MCP.values() if m not in mapping]
+        if missing:
+            logger.warning(
+                "codebase_query: backing MCP tools missing: %s (available: %s)",
+                missing, sorted(mapping.keys())[:10],
+            )
+        return mapping
+
+    # ── Action validation + dispatch ────────────────────────────────────
+
+    def _resolve_args(
+        self, action: str, name: str | None, pattern: str | None, max_results: int,
+    ) -> tuple[str, dict[str, Any]]:
+        if action == "search":
+            if name is not None:
+                raise ToolException(
+                    "codebase_query: 'name' must not be supplied for action='search'; "
+                    "use 'pattern' instead."
+                )
+            return _ACTION_TO_MCP[action], {
+                "pattern": _normalise_pattern(pattern),
+                "max_results": max(1, int(max_results)),
+            }
+        # All other actions take a symbol name.
+        if pattern is not None:
+            raise ToolException(
+                f"codebase_query: 'pattern' must not be supplied for action={action!r}; "
+                f"use 'name' instead."
+            )
+        return _ACTION_TO_MCP[action], {"name": _normalise_name(name)}
+
+    # NOTE: backing tools are wrapped as ``langchain_core.tools.StructuredTool``
+    # by the MCP adapter. Their ``_run`` / ``_arun`` signatures require a
+    # ``config: RunnableConfig`` keyword-only argument (it carries tags,
+    # metadata, callbacks). Direct calls without ``config`` raise the
+    # ``TypeError: ... missing 1 required keyword-only argument: 'config'``
+    # observed in trace 019e6d27. We dispatch via the public ``.invoke`` /
+    # ``.ainvoke`` API instead — it handles config plumbing and is the
+    # documented surface for invoking a BaseTool by argument dict.
+
+    def _run(
+        self,
+        action: str,
+        name: str | None = None,
+        pattern: str | None = None,
+        max_results: int = 20,
+    ) -> str:
+        backing_name, backing_args = self._resolve_args(
+            action, name, pattern, max_results,
+        )
+        tool_map = self._ensure_loaded()
+        tool = tool_map.get(backing_name)
+        if tool is None:
+            raise ToolException(
+                f"codebase_query: backing tool {backing_name!r} is not loaded "
+                f"(MCP server unavailable?). Available actions: "
+                f"{sorted(_ACTION_TO_MCP)}."
+            )
+        return tool.invoke(backing_args)
+
+    async def _arun(
+        self,
+        action: str,
+        name: str | None = None,
+        pattern: str | None = None,
+        max_results: int = 20,
+    ) -> str:
+        backing_name, backing_args = self._resolve_args(
+            action, name, pattern, max_results,
+        )
+        tool_map = self._ensure_loaded()
+        tool = tool_map.get(backing_name)
+        if tool is None:
+            raise ToolException(
+                f"codebase_query: backing tool {backing_name!r} is not loaded "
+                f"(MCP server unavailable?). Available actions: "
+                f"{sorted(_ACTION_TO_MCP)}."
+            )
+        return await tool.ainvoke(backing_args)

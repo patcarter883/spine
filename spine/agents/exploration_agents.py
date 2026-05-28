@@ -808,40 +808,35 @@ async def run_explore_node(
                 e,
                 exc_info=True,
             )
-            # Keep the user-visible summary terse — full traceback stays in logs
-            # via exc_info=True. Embedding str(e) directly used to leak multi-line
-            # Pydantic / MCP errors straight into ResearchFindings.summary.
-            err_str = str(e).splitlines()[0].strip() if str(e).strip() else type(e).__name__
-            if len(err_str) > 300:
-                err_str = err_str[:299] + "…"
-            # Harvest any cached file lookups from the partial run so the
-            # error sentinel still records *what was attempted*. Without
-            # `topic` + `file_map`, _new_topics treats this topic as
-            # un-explored and the research_manager re-issues it on the
-            # next round (or the next rework attempt).
-            attempted_files: dict[str, str] = {}
-            if partial_state and isinstance(partial_state.get("read_cache"), dict):
-                for key in list(partial_state["read_cache"].keys())[:20]:
-                    if isinstance(key, str) and key:
-                        attempted_files[key] = "attempted during failed exploration"
+            # The summary field is intentionally a neutral marker — NEVER
+            # embed the exception text here. Earlier versions wrote the raw
+            # GraphRecursionError / Pydantic stack into `summary`, and even
+            # though every render path filters error sentinels, the entry
+            # is still in `state["findings"]` for coverage bookkeeping, so
+            # any agent or sub-agent that introspects state directly was
+            # being fed the noise (observed in production trace where the
+            # synthesizer's input findings list carried "Research failed
+            # for topic '…': GraphRecursionError: …"). Full traceback stays
+            # in logs via exc_info=True. The structured `error_class` /
+            # `error_topic` fields are available for diagnostic introspection
+            # by anything that explicitly opts in.
             findings = [
                 {
                     "topic": topic_str,
-                    "summary": (
-                        f"Research failed for topic '{topic_str}': "
-                        f"{type(e).__name__}: {err_str}"
-                    ),
+                    "summary": "(research did not converge on this topic)",
                     "patterns": [],
                     "file_map": attempted_files,
                     "dependencies": [],
-                    # Marker consumed by _summarize_findings and
-                    # _format_findings to drop this sentinel from
-                    # LLM-facing *summaries*. The entry is still kept in
-                    # state["findings"] so the manager's topic-coverage
-                    # bookkeeping (_new_topics) sees the attempt and
-                    # does not re-issue this topic next round.
+                    # Marker consumed by _summarize_findings,
+                    # _format_findings, _save_exploration_artifacts, and
+                    # export.format_export_markdown to drop this sentinel
+                    # from every LLM-facing or human-facing render path.
                     "error": True,
-                    "partial": True,
+                    # Structured diagnostic fields — explicit, no free-text
+                    # exception messages. The class name is the most you
+                    # should ever surface to a downstream consumer.
+                    "error_class": type(e).__name__,
+                    "error_topic": topic_str,
                 }
             ]
 
@@ -930,6 +925,86 @@ async def _ainvoke_explore_collecting(
     raise RuntimeError("_ainvoke_explore_collecting: unexpected state")
 
 
+_TOOL_ERROR_MARKERS = (
+    "tool validation error",
+    "not a recognized function",
+    "not a recognized tool",
+    "not recognized as",
+    "unknown tool",
+    "no such tool",
+    "tool call",
+    "validation error",
+    "failed validation",
+    "execution failed",
+    "not available",
+    "available tools",
+    "available toolset",
+    "valid alternatives",
+    "list of valid",
+)
+
+
+def _last_ai_narrative(messages: list[Any]) -> str:
+    """Return content of the last AIMessage with non-empty string content.
+
+    Walks messages in reverse and ignores ToolMessage / HumanMessage /
+    SystemMessage entries. ToolMessages are tool outputs (including
+    ``status="error"`` rebound messages from ToolSchemaValidator) — they
+    are not the agent's own narration and must not be treated as the
+    research report. Returns an empty string if no such message exists.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, (ToolMessage, HumanMessage, SystemMessage)):
+            continue
+        if not isinstance(msg, AIMessage):
+            # Defensive: fall through for unknown message types but still
+            # skip anything whose role/type self-identifies as tool/user.
+            role = getattr(msg, "type", "") or getattr(msg, "role", "")
+            if role in {"tool", "user", "system"}:
+                continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, list):
+            # Anthropic-style content blocks — join text parts.
+            text_parts = [
+                blk.get("text", "")
+                for blk in content
+                if isinstance(blk, dict) and blk.get("type") == "text"
+            ]
+            content = "".join(text_parts)
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _looks_like_pure_tool_error(text: str, messages: list[Any]) -> bool:
+    """Heuristic: is ``text`` just a narration of tool errors, no findings?
+
+    A real research report references files, modules, functions, or
+    behaviour. An error narration just describes what tool failed and
+    what was offered instead. We flag a report as a pure tool-error
+    narration when:
+
+    * It's short (<= 800 chars), AND
+    * It contains tool-error marker phrases, AND
+    * No successful (non-error) ToolMessage exists in the conversation.
+
+    Any one of those alone is too aggressive — a long report that briefly
+    mentions an error is fine, and a short report after successful tool
+    calls is probably genuine if terse.
+    """
+    if len(text) > 800:
+        return False
+    lowered = text.lower()
+    if not any(marker in lowered for marker in _TOOL_ERROR_MARKERS):
+        return False
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            status = getattr(msg, "status", None)
+            if status != "error":
+                return False
+    return True
+
+
 async def _finalize_research_findings(result: dict, model: Any) -> None:
     """Convert the researcher's final markdown report into ResearchFindings.
 
@@ -949,18 +1024,21 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
     if model is None:
         return
     messages = result.get("messages", [])
-    final_content = ""
-    # Only AIMessages count as "the report". Tool results are evidence, not
-    # synthesis — and an error-status ToolMessage trailing the loop would
-    # otherwise be coerced into a fake ResearchFindings.
-    for msg in reversed(messages):
-        if not isinstance(msg, AIMessage):
-            continue
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.strip():
-            final_content = content
-            break
+    final_content = _last_ai_narrative(messages)
     if not final_content:
+        return
+    if _looks_like_pure_tool_error(final_content, messages):
+        # The researcher gave up after a tool error without producing
+        # any actual codebase findings. Feeding this prose into the
+        # structured-output model just produces a "summary" that
+        # narrates the error (e.g. "The report indicates a tool
+        # validation error where 'foo' is not a recognized function…"),
+        # which then surfaces to the synthesizer as if it were a real
+        # finding. Bail out so _extract_findings falls back to the
+        # explicit "(no findings)" sentinel instead.
+        logger.info(
+            "Skipping structured finalize: researcher output is pure tool-error narration"
+        )
         return
 
     try:
@@ -1183,28 +1261,36 @@ def _extract_findings(result: dict) -> list[dict]:
             return [structured.model_dump()]
 
     # Fall back to messages — use the last assistant message content.
-    # Restrict to AIMessage so error-status ToolMessages don't get wrapped
-    # as the finding summary.
+    # ToolMessages (especially status="error" rebound messages from
+    # ToolSchemaValidator) must be skipped: they're tool outputs, not
+    # the researcher's own narration, and treating them as findings
+    # produced summaries like "Tool 'foo' is not a recognized function".
     messages = result.get("messages", [])
-    for msg in reversed(messages):
-        if not isinstance(msg, AIMessage):
-            continue
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.strip():
-            # Try to parse as JSON first (models may output JSON directly)
-            try:
-                parsed = json.loads(content)
-                if isinstance(parsed, dict):
-                    return [parsed]
-            except (json.JSONDecodeError, TypeError):
-                pass
+    content = _last_ai_narrative(messages)
+    if content:
+        # Try to parse as JSON first (models may output JSON directly)
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return [parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if _looks_like_pure_tool_error(content, messages):
             return [
                 {
-                    "summary": content,
+                    "summary": "(no findings)",
                     "patterns": [],
                     "file_map": {},
                     "dependencies": [],
                 }
             ]
+        return [
+            {
+                "summary": content,
+                "patterns": [],
+                "file_map": {},
+                "dependencies": [],
+            }
+        ]
 
     return [{"summary": "(no findings)", "patterns": [], "file_map": {}, "dependencies": []}]

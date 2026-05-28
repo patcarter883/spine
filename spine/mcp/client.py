@@ -69,14 +69,28 @@ _PATH_LINE_RE = re.compile(
 
 
 def _line_starts_with_excluded_path(line: str) -> bool:
-    """Return True when *line* leads with a path inside EXCLUDED_INDEX_PATHS."""
+    """Return True when *line* leads with a path inside EXCLUDED_INDEX_PATHS
+    or any dot-folder (``.git/``, ``.venv/``, ``.spine/``, ``.pytest_cache/``…).
+
+    The dot-folder filter applies at any depth — ``spine/.cache/foo`` is
+    dropped just like ``.git/HEAD``. ``./`` (current-dir notation) and
+    ``../`` (parent-dir notation) are NOT treated as dot-folders.
+    """
     m = _PATH_LINE_RE.match(line)
     if not m:
         return False
     path = m.group("path")
     if path.startswith("./"):
         path = path[2:]
-    return any(path.startswith(prefix) for prefix in EXCLUDED_INDEX_PATHS)
+    if any(path.startswith(prefix) for prefix in EXCLUDED_INDEX_PATHS):
+        return True
+    # Any segment beginning with '.' (other than '.' or '..') indicates a
+    # dot-folder. Splits handle both leading (.git/HEAD) and nested
+    # (src/.cache/foo) cases.
+    for segment in path.split("/"):
+        if segment.startswith(".") and segment not in (".", ".."):
+            return True
+    return False
 
 
 def _strip_excluded_paths(text: str) -> tuple[str, int]:

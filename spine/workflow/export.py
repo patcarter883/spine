@@ -203,22 +203,32 @@ def format_export_markdown(data: dict[str, Any]) -> str:
                     lines.append(f"- {topic}")
                 lines.append("")
             if findings:
-                lines.append("#### Findings\n")
-                for i, f in enumerate(findings, 1):
-                    lines.append(f"**Finding {i}**")
-                    lines.append(f"- Topic: {f.get('topic', '')}")
-                    lines.append(f"- Summary: {f.get('summary', '')}")
-                    patterns = f.get("patterns", [])
-                    if patterns:
-                        lines.append(f"- Patterns: {', '.join(patterns)}")
-                    file_map = f.get("file_map", {})
-                    if file_map:
-                        lines.append(f"- File Map: {json.dumps(file_map)}")
-                    dependencies = f.get("dependencies", [])
-                    if dependencies:
-                        lines.append(f"- Dependencies: {', '.join(dependencies)}")
+                # Drop error-sentinel findings: they carry raw exception
+                # text like "Research failed for topic ...: GraphRecursionError"
+                # in their `summary` field and must never reach a human-facing
+                # export. The salvage path in spine/agents/exploration_agents.py
+                # sets `error=True` on these sentinels for exactly this filter.
+                real_findings = [
+                    f for f in findings
+                    if isinstance(f, dict) and not f.get("error")
+                ]
+                if real_findings:
+                    lines.append("#### Findings\n")
+                    for i, f in enumerate(real_findings, 1):
+                        lines.append(f"**Finding {i}**")
+                        lines.append(f"- Topic: {f.get('topic', '')}")
+                        lines.append(f"- Summary: {f.get('summary', '')}")
+                        patterns = f.get("patterns", [])
+                        if patterns:
+                            lines.append(f"- Patterns: {', '.join(patterns)}")
+                        file_map = f.get("file_map", {})
+                        if file_map:
+                            lines.append(f"- File Map: {json.dumps(file_map)}")
+                        dependencies = f.get("dependencies", [])
+                        if dependencies:
+                            lines.append(f"- Dependencies: {', '.join(dependencies)}")
+                        lines.append("")
                     lines.append("")
-                lines.append("")
 
         artifacts = phase_data.get("artifacts", {})
         if artifacts:
