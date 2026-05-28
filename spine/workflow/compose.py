@@ -214,6 +214,16 @@ def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     if prior_topics or prior_findings:
         base["topics"] = prior_topics
         base["findings"] = prior_findings
+    # Inject SPECIFY's research findings into a separate channel so PLAN
+    # researchers and the PLAN manager start from the architectural map
+    # instead of re-mapping it. Topics are NOT seeded — they would pollute
+    # PLAN's topic-dedup (different angles on the same module are valid
+    # PLAN topics even when SPECIFY already touched the area).
+    _, specify_findings = _load_prior_research(
+        workspace_root, work_id, PhaseName.SPECIFY.value
+    )
+    if specify_findings:
+        base["prior_phase_findings"] = specify_findings
     # All work types now run specify, so has_spec is always True
     return {
         **base,

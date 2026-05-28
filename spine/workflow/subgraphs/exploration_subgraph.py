@@ -22,7 +22,6 @@ import logging
 from typing import Any, Literal
 
 import json
-import json as _json_mod
 from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
@@ -30,6 +29,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send
 
 from spine.agents._tokens import count_tokens as _count_tokens
+from spine.agents.exploration_agents import format_findings as _format_findings
 
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ExplorationSubgraphState
@@ -991,74 +991,10 @@ def _render_rework_feedback(
     )
 
 
-def _format_findings(
-    findings: list[dict], *, budget: int | None = None,
-) -> str:
-    """Format accumulated findings for the synthesizer prompt.
-
-    Keeps individual findings compact — the synthesizer can read files
-    from disk if more detail is needed.
-
-    When ``budget`` is a positive int, accumulates token count per
-    appended finding (via :func:`spine.agents._tokens.count_tokens`) and
-    stops once the next finding would push the total over budget. A
-    trailing marker tells the synthesizer how many findings were omitted
-    so it can request specific symbols if needed.
-    """
-    if not findings:
-        return "(no codebase research was performed)"
-
-    use_budget = isinstance(budget, int) and budget > 0
-    parts: list[str] = []
-    included = 0
-    omitted = 0
-    used_tokens = 0
-
-    for i, f in enumerate(findings):
-        if not isinstance(f, dict):
-            continue
-        if f.get("error"):
-            continue
-        topic = f.get("topic", "")
-        summary = f.get("summary", "")
-        patterns = f.get("patterns", [])
-        file_map = f.get("file_map", {})
-        deps = f.get("dependencies", [])
-        header = f"### Finding {i + 1}"
-        if topic:
-            header += f" — Topic: {topic}"
-        block_parts: list[str] = [f"{header}\n{summary}"]
-        if patterns:
-            block_parts.append(f"Patterns: {', '.join(patterns)}")
-        if file_map:
-            block_parts.append(f"Key files: {_json_mod.dumps(file_map)}")
-        if deps:
-            block_parts.append(f"Dependencies: {', '.join(deps)}")
-        block = "\n\n".join(block_parts)
-
-        if use_budget:
-            block_tokens = _count_tokens(block)
-            if used_tokens + block_tokens > budget:
-                # Count this finding + every later non-error finding as omitted.
-                omitted = sum(
-                    1 for g in findings[i:]
-                    if isinstance(g, dict) and not g.get("error")
-                )
-                break
-            used_tokens += block_tokens
-        parts.append(block)
-        included += 1
-
-    if not parts:
-        return "(no codebase research was performed)"
-
-    rendered = "\n\n".join(parts)
-    if omitted > 0:
-        rendered += (
-            f"\n\n[truncated: {omitted} more findings omitted "
-            f"(over {budget}-token budget — request specific symbols if needed)]"
-        )
-    return rendered
+# _format_findings has moved to spine.agents.exploration_agents.format_findings
+# so it can be reused by the per-topic researcher + research-manager prompts
+# (which inject prior-phase findings) without a circular import. Imported at
+# module top.
 
 
 # ── Node: save_artifacts ────────────────────────────────────────────────

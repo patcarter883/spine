@@ -22,6 +22,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
+from spine.agents._tokens import count_tokens as _count_tokens
 from spine.agents.helpers import resolve_model
 
 logger = logging.getLogger(__name__)
@@ -366,6 +367,11 @@ Rules:
   modules) before peripheral concerns.
 - Cross-reference every topic against the specification — if the spec
   doesn't mention an area, don't explore it.
+- If a "Prior SPECIFY Research" section is present, it describes the
+  architectural map already gathered during SPECIFY. Treat its
+  ``Key files`` entries as covered territory — propose PLAN topics
+  that build on this map (touch points, change risk, dependency chains)
+  rather than topics that would just re-discover the same files.
 - If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
   rework — the prior pass already wrote a research log. Default to
   decision="done" so synthesis can re-run with the existing findings.
@@ -510,6 +516,26 @@ async def run_research_manager(
                 except OSError:
                     pass
 
+    # SPECIFY's research log carried across by the PLAN state mapper. The
+    # manager uses this to avoid proposing topics that would just re-map
+    # files SPECIFY already examined — see _RESEARCH_MANAGER_PLAN rules.
+    prior_phase_section = ""
+    if phase == "plan":
+        prior_phase_findings = state.get("prior_phase_findings") or []
+        if prior_phase_findings:
+            from spine.config import SpineConfig as _SpineConfig
+
+            rendered_prior = format_findings(
+                prior_phase_findings,
+                budget=_SpineConfig.load().prior_phase_findings_token_budget,
+            )
+            prior_phase_section = (
+                "## Prior SPECIFY Research (architectural map already gathered "
+                "— propose PLAN topics that build on this, do not re-map these "
+                "files)\n"
+                f"{rendered_prior}\n\n"
+            )
+
     findings_summary = _summarize_findings(findings)
 
     # Prior-round framing: whenever any topic has already been dispatched
@@ -571,6 +597,7 @@ async def run_research_manager(
     context = (
         f"## Work Description\n{description}\n\n"
         f"{spec_section}"
+        f"{prior_phase_section}"
         f"{recall_section}"
         f"{prior_round_section}"
         f"{rework_section}"
@@ -909,11 +936,34 @@ async def run_explore_do_node(
                     except OSError:
                         pass
 
+        # Inject SPECIFY's findings (carried across by the PLAN state mapper
+        # in spine/workflow/compose.py) so the Blueprint Scout starts from
+        # the architectural map already gathered, not from scratch. Gated
+        # on phase==PLAN because only PLAN's state mapper seeds the field.
+        prior_findings_section = ""
+        if phase_enum == PhaseName.PLAN:
+            prior_findings = state.get("prior_phase_findings") or []
+            if prior_findings:
+                from spine.config import SpineConfig
+
+                rendered_prior = format_findings(
+                    prior_findings,
+                    budget=SpineConfig.load().prior_phase_findings_token_budget,
+                )
+                prior_findings_section = (
+                    "## Prior SPECIFY Research (already discovered — use as "
+                    "starting context, don't re-investigate these files unless "
+                    "your topic specifically requires deeper detail than the "
+                    "summary below provides)\n"
+                    f"{rendered_prior}\n\n"
+                )
+
         if spec_content:
             prompt = (
                 f"## Plan Research Topic: {topic_str}\n\n"
                 f"## Specification (read this FIRST — your research must map this to "
                 f"the codebase)\n\n{spec_content[:_MAX_SPEC_CHARS]}\n\n"
+                f"{prior_findings_section}"
                 f"## Research Task\n"
                 f"For the topic '{topic_str}', find the existing codebase files, "
                 f"patterns, conventions, and dependencies that map to the specification "
@@ -924,6 +974,7 @@ async def run_explore_do_node(
         else:
             prompt = (
                 f"## Research Topic\n{topic_str}\n\n"
+                f"{prior_findings_section}"
                 f"Investigate this specific area of the codebase. "
                 f"Use MCP tools for structural navigation. "
                 f"Return your findings in the ResearchFindings format."
@@ -1699,3 +1750,85 @@ def _extract_findings(result: dict) -> list[dict]:
         ]
 
     return [{"summary": "(no findings)", "patterns": [], "file_map": {}, "dependencies": []}]
+
+
+# ── Shared findings renderer ────────────────────────────────────────────
+
+
+def format_findings(
+    findings: list[dict], *, budget: int | None = None,
+) -> str:
+    """Render accumulated findings for inclusion in an LLM prompt.
+
+    Used by:
+    - synthesizer prompts (plan/specify) — see exploration_subgraph
+    - PLAN per-topic researcher prompts (prior-phase findings inject)
+    - PLAN research-manager prompt (prior-phase findings inject)
+
+    Keeps individual findings compact — the consumer can read files
+    from disk if more detail is needed. Skips error-sentinel entries
+    (``error=True``) so they never leak into LLM-facing renders.
+
+    When ``budget`` is a positive int, accumulates tokens per appended
+    finding and stops once the next finding would push the total over
+    budget. A trailing marker tells the consumer how many findings were
+    omitted so it can request specific symbols if needed.
+    """
+    if not findings:
+        return "(no codebase research was performed)"
+
+    use_budget = isinstance(budget, int) and budget > 0
+    parts: list[str] = []
+    included = 0
+    omitted = 0
+    used_tokens = 0
+
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            continue
+        if f.get("error"):
+            continue
+        topic = f.get("topic", "")
+        summary = f.get("summary", "")
+        patterns = f.get("patterns", [])
+        file_map = f.get("file_map", {})
+        deps = f.get("dependencies", [])
+        header = f"### Finding {i + 1}"
+        if topic:
+            header += f" — Topic: {topic}"
+        block_parts: list[str] = [f"{header}\n{summary}"]
+        if patterns:
+            block_parts.append(f"Patterns: {', '.join(patterns)}")
+        if file_map:
+            block_parts.append(f"Key files: {json.dumps(file_map)}")
+        if deps:
+            block_parts.append(f"Dependencies: {', '.join(deps)}")
+        block = "\n\n".join(block_parts)
+
+        if use_budget:
+            block_tokens = _count_tokens(block)
+            if used_tokens + block_tokens > budget:
+                omitted = sum(
+                    1 for g in findings[i:]
+                    if isinstance(g, dict) and not g.get("error")
+                )
+                break
+            used_tokens += block_tokens
+        parts.append(block)
+        included += 1
+
+    if not parts:
+        return "(no codebase research was performed)"
+
+    rendered = "\n\n".join(parts)
+    if omitted > 0:
+        rendered += (
+            f"\n\n[truncated: {omitted} more findings omitted "
+            f"(over {budget}-token budget — request specific symbols if needed)]"
+        )
+    return rendered
+
+
+# Backwards-compatible alias for the legacy underscore name used by the
+# synthesizers in exploration_subgraph.py.
+_format_findings = format_findings

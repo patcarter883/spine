@@ -188,6 +188,13 @@ class SpineConfig:
     # vs 40K TokenBudgetCompactor threshold). 0 or negative = unbounded.
     synthesize_findings_token_budget: int = 20000
 
+    # Token budget for the prior-phase findings injected into PLAN
+    # researcher / manager prompts (SPECIFY's research_log.json findings
+    # carried across into PLAN exploration). Tighter than the synthesis
+    # budget because the PLAN researcher prompt already carries the spec
+    # (~8K). 0 or negative = unbounded.
+    prior_phase_findings_token_budget: int = 6000
+
     # Global default for the model's ``max_completion_tokens`` request
     # field. Per-provider settings still win — this is the fallback used
     # when ``providers.llm[].max_completion_tokens`` is unset. Without a
@@ -400,6 +407,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_SYNTHESIZE_FINDINGS_TOKEN_BUDGET",
                     spine.get("synthesize_findings_token_budget", 20000),
+                )
+            ),
+            prior_phase_findings_token_budget=int(
+                os.getenv(
+                    "SPINE_PRIOR_PHASE_FINDINGS_TOKEN_BUDGET",
+                    spine.get("prior_phase_findings_token_budget", 6000),
                 )
             ),
             max_completion_tokens=int(
