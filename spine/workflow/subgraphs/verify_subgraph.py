@@ -36,12 +36,17 @@ from typing import Any, Literal
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import Command, Send
 
 from spine.agents.artifacts import (
     artifact_path,
     materialize_phase_artifacts,
     scan_artifact_dir,
+)
+from spine.agents.plan_do import (
+    directive_from_state,
+    format_directive_for_prompt,
+    run_plan_node,
 )
 from spine.agents.retry import ainvoke_with_retry
 from spine.exceptions import CriticalContractFailure
@@ -105,9 +110,67 @@ def _verify_router(
         "workspace_root": state.get("workspace_root", "."),
     }
     return [
-        Send("run_slice_verifier", {**base_state, "slice": s})
+        # Two-node verifier branch: plan_slice_verifier (no tools) →
+        # run_slice_verifier (tools). Each parallel branch carries its
+        # own active_slice_directive through the chain.
+        Send("plan_slice_verifier", {**base_state, "slice": s})
         for s in all_slices
     ]
+
+
+# ── Node: plan_slice_verifier (no tools) ────────────────────────────────
+
+
+async def _plan_slice_verifier_node(
+    state: VerifySubgraphState,
+    config: RunnableConfig | None = None,
+) -> Command:
+    """No-tool plan step for one slice's verification.
+
+    Produces a per-branch SubagentDirective and dispatches a Send to
+    run_slice_verifier carrying both the slice and the directive on the
+    per-branch payload. Returning ``Command(goto=Send(...))`` — rather
+    than writing the directive to a shared channel — is required
+    because parallel Send branches share the subgraph's channel space,
+    so N concurrent writes to ``active_slice_directive`` would crash
+    apply_writes with ``InvalidUpdateError``.
+    """
+    work_id = state.get("work_id", "unknown")
+    slice_data: dict = state.get("slice", {}) or {}
+    slice_id = slice_data.get("id", "unknown")
+    title = slice_data.get("title", "")
+    target_files = slice_data.get("target_files") or []
+    criteria = slice_data.get("acceptance_criteria") or []
+
+    crit_lines = "\n".join(f"- {c}" for c in criteria) if criteria else "(none provided)"
+    file_lines = "\n".join(f"- {p}" for p in target_files) if target_files else "(none provided)"
+    task = (
+        f"Plan a verification pass for slice {slice_id!r} (title: {title!r}). "
+        "The do node will read the files, run any lint/tests it needs, and emit a "
+        "VerificationResult (verdict, checklist, gaps, recommendations).\n\n"
+        f"## Acceptance criteria\n{crit_lines}\n\n"
+        f"## Target files\n{file_lines}"
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=f"{PhaseName.VERIFY.value}/subagents/slice-verifier",
+        task_description=task,
+        role_hint=f"slice-verifier for slice {slice_id!r}",
+    )
+    logger.info(
+        "[%s] plan_slice_verifier: slice=%r approach=%r",
+        work_id, slice_id, directive.approach[:80],
+    )
+    send_payload: dict[str, Any] = {
+        "phase": state.get("phase", "verify"),
+        "work_id": state.get("work_id", "unknown"),
+        "work_type": state.get("work_type", ""),
+        "workspace_root": state.get("workspace_root", "."),
+        "slice": slice_data,
+        "active_slice_directive": directive.model_dump(),
+    }
+    return Command(goto=Send("run_slice_verifier", send_payload))
 
 
 # ── Node: run_slice_verifier ────────────────────────────────────────────
@@ -159,8 +222,12 @@ async def _run_slice_verifier_node(
         )
 
         slice_json = json.dumps(slice_data, indent=2, ensure_ascii=False)
+        directive_block = format_directive_for_prompt(
+            directive_from_state(dict(state), "active_slice_directive")
+        )
         prompt = (
-            f"## Verify Slice: {slice_id}\n\n"
+            (directive_block + "\n" if directive_block else "")
+            + f"## Verify Slice: {slice_id}\n\n"
             f"The full slice definition is in the JSON below. "
             f"Verify the implementation against these acceptance criteria. "
             f"Inspect the actual code files on disk — do not trust that "
@@ -469,6 +536,7 @@ def build_verify_subgraph() -> Any:
     """
     builder = StateGraph(VerifySubgraphState)
 
+    builder.add_node("plan_slice_verifier", _plan_slice_verifier_node)
     builder.add_node("run_slice_verifier", _run_slice_verifier_node)
     builder.add_node("aggregate_verification", _aggregate_verification_node)
     builder.add_node("synthesize_verification", _synthesize_verification_node)
@@ -478,11 +546,18 @@ def build_verify_subgraph() -> Any:
         START,
         _verify_router,
         {
-            "run_slice_verifier": "run_slice_verifier",
+            # Send targets dispatch to plan_slice_verifier; each parallel
+            # branch then chains plan → do before fan-in.
+            "plan_slice_verifier": "plan_slice_verifier",
             "synthesize_verification": "synthesize_verification",
         },
     )
 
+    # plan_slice_verifier dispatches to run_slice_verifier dynamically
+    # via Command(goto=Send) (see the node) so each parallel branch
+    # carries its own directive without colliding on a shared LastValue
+    # channel. run_slice_verifier → aggregate_verification is a plain
+    # fan-in edge that runs once on the merged verification_results.
     builder.add_edge("run_slice_verifier", "aggregate_verification")
     builder.add_edge("aggregate_verification", "synthesize_verification")
     builder.add_edge("synthesize_verification", "save_artifacts")

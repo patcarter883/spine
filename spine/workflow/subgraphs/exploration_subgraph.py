@@ -27,7 +27,7 @@ from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import Command, Send
 
 from spine.agents._tokens import count_tokens as _count_tokens
 
@@ -196,18 +196,55 @@ def _new_topics(state: ExplorationSubgraphState) -> list[str]:
     topic as un-explored. ``_normalise_topic`` strips the recall suffix and
     case/whitespace so the membership check actually reflects what was
     dispatched on prior rounds.
+
+    Layered dedup:
+
+    1. Exact normalised-string match against ``finding["topic"]`` —
+       fast path for the manager re-emitting an identical topic.
+    2. Content-word overlap against every prior topic — catches the
+       local-model paraphrase pattern (trace 019e6e53: round 1 "How
+       does the CLI entrypoint currently parse and handle command-line
+       arguments?" ↔ round 2 "How does the command-line interface
+       parse and handle flags?") that the exact filter misses because
+       the strings differ word-for-word.
     """
-    from spine.agents.exploration_agents import _normalise_topic
+    from spine.agents.exploration_agents import (
+        _RECALL_SUFFIX_MARKER,
+        _normalise_topic,
+        _topics_near_duplicate,
+    )
+
+    def _strip_suffix(s: str) -> str:
+        if s and _RECALL_SUFFIX_MARKER in s:
+            return s.split(_RECALL_SUFFIX_MARKER, 1)[0]
+        return s
 
     topics: list[str] = state.get("topics", [])
     findings: list[dict] = state.get("findings", [])
-    explored: set[str] = {
-        _normalise_topic(f.get("topic", ""))
+    # Strip the enriched recall suffix off prior topics before any
+    # comparison — its tokens (file paths, symbol names) would otherwise
+    # pollute the content-word fingerprint used for paraphrase dedup and
+    # let near-duplicates slip through.
+    prior_topics: list[str] = [
+        _strip_suffix(f.get("topic", ""))
         for f in findings
         if isinstance(f, dict) and f.get("topic")
-    }
+    ]
+    explored: set[str] = {_normalise_topic(p) for p in prior_topics}
     explored.discard("")
-    return [t for t in topics if _normalise_topic(t) not in explored]
+
+    kept: list[str] = []
+    for t in topics:
+        if _normalise_topic(t) in explored:
+            continue
+        if any(_topics_near_duplicate(t, p) for p in prior_topics):
+            logger.info(
+                "topic dedup: dropping near-duplicate topic=%r (paraphrase of prior round)",
+                t,
+            )
+            continue
+        kept.append(t)
+    return kept
 
 
 def _enrich_topic(topic: str, hits: list[dict]) -> str:
@@ -466,7 +503,10 @@ def _research_router(
     deferred = new_topics[_MAX_PARALLEL_EXPLORES:]
     sends = [
         Send(
-            "explore",
+            # Two-node researcher: explore_do (tools) → summarise (no tools).
+            # The plain edge explore_do→summarise threads each parallel
+            # branch's evidence dossier to its own summariser before fan-in.
+            "explore_do",
             {
                 "topic": _enrich_topic(t, hits_map.get(t, [])),
                 "phase": phase,
@@ -484,24 +524,68 @@ def _research_router(
     return sends
 
 
-# ── Node: explore ───────────────────────────────────────────────────────
+# ── Nodes: explore_do (tools) → summarise (no tools) ───────────────────
 
 
-async def _explore_node(
+async def _explore_do_node(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None = None,
+) -> Command:
+    """Run the researcher's tool-using loop for one topic, then dispatch to summarise.
+
+    The topic is injected into state by the Send API via
+    ``Send("explore_do", {"topic": "area"})``. Returns a LangGraph
+    ``Command`` whose ``goto`` dispatches a per-branch ``Send`` to the
+    summarise node carrying that branch's ``exploration_evidence`` —
+    this is required because parallel Send branches share the
+    subgraph's channel space, so a plain ``return {"exploration_evidence": ...}``
+    would collide N writes into the LastValue channel and crash with
+    ``InvalidUpdateError``.
+
+    The ``update`` dict is restricted to channels with reducers
+    (``read_cache`` has ``_merge_read_cache``) so concurrent writes from
+    sibling branches merge cleanly.
+    """
+    from spine.agents.exploration_agents import run_explore_do_node
+
+    topic: str = state.get("topic", "")  # type: ignore[typeddict-unknown-key]
+    raw = await run_explore_do_node(dict(state), config, topic=topic)
+
+    evidence = raw.get("exploration_evidence") or {}
+    cache = raw.get("read_cache")
+
+    update: dict[str, Any] = {}
+    if cache:
+        update["read_cache"] = cache
+
+    # Carry the BaseSubgraphState fields the downstream node will need
+    # to resolve the researcher model and log against the right work_id.
+    send_payload: dict[str, Any] = {
+        "exploration_evidence": evidence,
+        "topic": evidence.get("topic") or topic,
+        "phase": state.get("phase"),
+        "work_id": state.get("work_id"),
+        "work_type": state.get("work_type", ""),
+        "workspace_root": state.get("workspace_root", "."),
+        "spec_path": state.get("spec_path", ""),
+    }
+    return Command(update=update, goto=Send("summarise", send_payload))
+
+
+async def _summarise_node(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run a researcher subagent for one topic.
+    """Convert the per-branch evidence dossier into a ResearchFindings.
 
-    The topic is injected into state by the Send API via
-    ``Send("explore", {"topic": "area"})`` — it arrives as a state key,
-    not a keyword argument.  The state merger injects ``topic`` alongside
-    the normal subgraph state fields.
+    Runs with no tools attached — the model's only job is structural
+    conversion of evidence to findings, aligned to the original topic.
+    This split exists so smaller models stop oscillating between tool
+    use and structured-output reasoning within a single node.
     """
-    from spine.agents.exploration_agents import run_explore_node
+    from spine.agents.exploration_agents import run_summarise_node
 
-    topic: str = state.get("topic", "")  # type: ignore[typeddict-unknown-key]
-    return await run_explore_node(dict(state), config, topic=topic)
+    return await run_summarise_node(dict(state), config)
 
 
 # ── Node: aggregate ────────────────────────────────────────────────────
@@ -1191,7 +1275,8 @@ def build_exploration_subgraph(
     builder.add_node("pre_research_gate", _pre_research_gate)
     builder.add_node("research_manager", _research_manager_node)
     builder.add_node("topic_lookup", _topic_lookup_node)
-    builder.add_node("explore", _explore_node)
+    builder.add_node("explore_do", _explore_do_node)
+    builder.add_node("summarise", _summarise_node)
     builder.add_node("aggregate", _aggregate_node)
     builder.add_node("eviction_check", _eviction_check_node)
     builder.add_node("synthesize", synthesizer)
@@ -1210,15 +1295,19 @@ def build_exploration_subgraph(
     # research_manager → topic_lookup (annotate topics with recall hits)
     builder.add_edge("research_manager", "topic_lookup")
 
-    # topic_lookup → Send("explore", ...) (with enriched topics) or → synthesize
+    # topic_lookup → Send("explore_do", ...) (with enriched topics) or → synthesize
     builder.add_conditional_edges(
         "topic_lookup",
         _research_router,
-        {"explore": "explore", "synthesize": "synthesize"},
+        {"explore": "explore_do", "synthesize": "synthesize"},
     )
 
-    # Explore → aggregate (fan-in — LangGraph waits for ALL Send targets)
-    builder.add_edge("explore", "aggregate")
+    # explore_do dispatches to summarise dynamically via Command(goto=Send)
+    # so each parallel branch carries its own evidence dossier without
+    # colliding on a shared LastValue channel. summarise → aggregate is a
+    # plain fan-in edge that runs once on the merged ``findings`` channel
+    # after all parallel summarises complete.
+    builder.add_edge("summarise", "aggregate")
 
     # Aggregate → eviction_check → sufficiency router (loop or synthesize)
     builder.add_edge("aggregate", "eviction_check")

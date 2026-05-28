@@ -19,6 +19,11 @@ from spine.agents.tasks_agent import build_tasks_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
+from spine.agents.plan_do import (
+    directive_from_state,
+    format_directive_for_prompt,
+    run_plan_node,
+)
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
@@ -28,6 +33,39 @@ from spine.agents.artifacts import (
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+
+async def _tasks_directive_node(
+    state: TasksSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """No-tool planning step before the tasks Deep Agent."""
+    work_id = state.get("work_id", "unknown")
+    description = state.get("description", "")
+    work_type = state.get("work_type", "")
+    has_spec = "spec" in work_type
+    spec_hint = (
+        "A spec + plan are on disk; the do node will call read_prior_artifacts."
+        if has_spec else "No prior spec — the do node will work from the description."
+    )
+    task = (
+        "Break the work into 2-5 executable feature slices and emit slice files. "
+        "The do node will call write_tasks_artifacts exactly once. "
+        f"{spec_hint}\n\n"
+        f"## Work description\n{description}"
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=PhaseName.TASKS.value,
+        task_description=task,
+        role_hint="tasks-agent (produces slice files + tasks.md + codebase-map.md)",
+    )
+    logger.info(
+        "[%s] TASKS plan-directive: approach=%r",
+        work_id, directive.approach[:80],
+    )
+    return {"tasks_directive": directive.model_dump()}
 
 
 async def _run_tasks_agent(
@@ -118,7 +156,12 @@ async def _run_tasks_agent(
                 "4. Total phase length is ~2-3 turns. Stop immediately after `write_tasks_artifacts` returns.\n",
             ]
         )
+        directive_block = format_directive_for_prompt(
+            directive_from_state(dict(state), "tasks_directive")
+        )
         prompt = "\n".join(prompt_lines)
+        if directive_block:
+            prompt = directive_block + "\n" + prompt
         if retry_count > 0 and feedback:
             feedback_text = "\n".join(
                 f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
@@ -264,9 +307,11 @@ async def _save_tasks_artifacts(
 def build_tasks_subgraph() -> Any:
     """Build the TASKS phase subgraph."""
     builder = StateGraph(TasksSubgraphState)
+    builder.add_node("plan_directive", _tasks_directive_node)
     builder.add_node("run_agent", _run_tasks_agent)
     builder.add_node("save_artifacts", _save_tasks_artifacts)
-    builder.add_edge(START, "run_agent")
+    builder.add_edge(START, "plan_directive")
+    builder.add_edge("plan_directive", "run_agent")
     builder.add_edge("run_agent", "save_artifacts")
     builder.add_edge("save_artifacts", END)
     return builder

@@ -83,8 +83,50 @@ class TestVerifyRouter:
         assert isinstance(result, list)
         assert len(result) == 1
         assert isinstance(result[0], Send)
-        assert result[0].node == "run_slice_verifier"
+        # Sends now target the per-branch plan node, which dispatches
+        # to run_slice_verifier dynamically via Command(goto=Send).
+        # See the plan→do split.
+        assert result[0].node == "plan_slice_verifier"
         assert result[0].arg["slice"]["id"] == "s1"
+
+
+class TestPlanSliceVerifierCommand:
+    """Regression for the InvalidUpdateError crash.
+
+    Parallel ``Send("plan_slice_verifier", ...)`` branches must hand
+    off to run_slice_verifier via per-branch ``Command(goto=Send(...))``,
+    not by writing the directive to a shared LastValue channel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_command_with_send_to_run_slice_verifier(self, monkeypatch):
+        from langgraph.types import Command, Send
+        from spine.agents.plan_do import SubagentDirective
+        from spine.workflow.subgraphs.verify_subgraph import _plan_slice_verifier_node
+
+        async def _fake_plan(*, state, config, phase_path, task_description, role_hint=""):
+            return SubagentDirective(approach="check tests", acceptance=["tests green"])
+
+        monkeypatch.setattr(
+            "spine.workflow.subgraphs.verify_subgraph.run_plan_node", _fake_plan
+        )
+
+        state = {
+            "phase": "verify",
+            "work_id": "w1",
+            "work_type": "task",
+            "workspace_root": "/tmp",
+            "slice": {"id": "s1", "title": "Slice 1"},
+        }
+        out = await _plan_slice_verifier_node(state, None)
+        assert isinstance(out, Command)
+        assert isinstance(out.goto, Send)
+        assert out.goto.node == "run_slice_verifier"
+        assert out.goto.arg["slice"]["id"] == "s1"
+        assert "active_slice_directive" in out.goto.arg
+        assert out.goto.arg["active_slice_directive"]["acceptance"] == ["tests green"]
+        # Nothing problematic on update.
+        assert "active_slice_directive" not in (out.update or {})
 
 
 class TestRunSliceVerifier:

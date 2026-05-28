@@ -58,6 +58,89 @@ def _normalise_topic(topic: str) -> str:
     return " ".join(topic.lower().split())
 
 
+# Stop words stripped before content-word overlap comparison. Short
+# function words don't carry topic identity — keeping them in the
+# similarity score inflates duplicate detection for unrelated topics.
+_TOPIC_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "do", "does",
+    "for", "from", "has", "have", "how", "if", "in", "into", "is", "it",
+    "its", "of", "on", "or", "that", "the", "their", "then", "there",
+    "these", "this", "those", "to", "use", "used", "uses", "using", "via",
+    "was", "we", "what", "when", "where", "which", "who", "why", "will",
+    "with", "would",
+    # SPINE-domain noise words — common in every research question without
+    # actually distinguishing topics.
+    "code", "codebase", "currently", "currently", "exist", "exists",
+    "way", "ways", "approach", "approaches", "system",
+})
+
+
+def _topic_content_tokens(topic: str) -> frozenset[str]:
+    """Extract the content-word fingerprint of a topic.
+
+    Lowercases, splits on any non-alphanumeric run (so "CLI", "command-line",
+    "command_line" all reduce to the same constituent words), strips
+    short / stop tokens, and crudely de-pluralises trailing 's' on tokens
+    ≥ 5 chars so "arguments"/"argument" and "patterns"/"pattern" collapse.
+    Returns a frozenset for set-arithmetic in :func:`_topics_near_duplicate`.
+    """
+    if not topic:
+        return frozenset()
+    cleaned: list[str] = []
+    buf: list[str] = []
+    for ch in topic.lower():
+        if ch.isalnum():
+            buf.append(ch)
+        else:
+            if buf:
+                cleaned.append("".join(buf))
+                buf = []
+    if buf:
+        cleaned.append("".join(buf))
+    out: set[str] = set()
+    for w in cleaned:
+        if len(w) < 4:
+            continue
+        if w in _TOPIC_STOPWORDS:
+            continue
+        # Cheap singular collapse — only strip a trailing 's' so we don't
+        # mangle words that legitimately end in 's' as the final letter
+        # (e.g. "status" stays "status"; "arguments" → "argument").
+        if len(w) >= 5 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        out.add(w)
+    return frozenset(out)
+
+
+# Topic-pair content-overlap threshold (Szymkiewicz-Simpson coefficient).
+# Two topics whose smaller content-word set is ≥60 % covered by the
+# other count as paraphrases. Calibrated against trace 019e6e53 where
+# "How does the CLI entrypoint currently parse and handle command-line
+# arguments?" and "How does the command-line interface parse and handle
+# flags?" produced an overlap of 4/6 = 0.67 after stop-word stripping.
+_TOPIC_DUPE_OVERLAP_THRESHOLD: float = 0.6
+
+
+def _topics_near_duplicate(a: str, b: str) -> bool:
+    """Return True when *a* and *b* are likely paraphrases of the same topic.
+
+    Compares the content-word fingerprints using the overlap coefficient
+    ``|A ∩ B| / min(|A|, |B|)``. This catches semantic paraphrases the
+    exact-string :func:`_normalise_topic` check misses (observed in
+    trace 019e6e53). The threshold is intentionally conservative — a
+    false-positive merely drops one duplicate research question, which
+    is recoverable, but a false-negative wastes a full explore round.
+    """
+    fa = _topic_content_tokens(a)
+    fb = _topic_content_tokens(b)
+    if not fa or not fb:
+        return False
+    overlap = len(fa & fb)
+    if overlap == 0:
+        return False
+    return (overlap / min(len(fa), len(fb))) >= _TOPIC_DUPE_OVERLAP_THRESHOLD
+
+
 _CRITIC_RESEARCH_KEYWORDS: tuple[str, ...] = (
     "research",
     "explore",
@@ -478,6 +561,13 @@ async def run_research_manager(
             "findings.\n\n"
         )
 
+    explored_roll_up = _render_explored_topic_roll_up(existing_topics, findings)
+    explored_block = (
+        f"## Topics Already Explored (with per-topic outcome)\n{explored_roll_up}\n\n"
+        if explored_roll_up
+        else ""
+    )
+
     context = (
         f"## Work Description\n{description}\n\n"
         f"{spec_section}"
@@ -485,13 +575,16 @@ async def run_research_manager(
         f"{prior_round_section}"
         f"{rework_section}"
         f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
-        f"## Topics Already Explored\n{json.dumps(existing_topics)}\n\n"
+        f"{explored_block}"
         f"## Findings So Far\n{findings_summary}\n\n"
         "Decide: are we done, or do we need more research? "
         "If exploring, return 2-4 plain-language topics framed as research "
         "questions. Topics MUST NOT contain symbol names, function names, "
         "class names, or file paths — a downstream lookup step resolves "
-        "each topic to the relevant symbols automatically."
+        "each topic to the relevant symbols automatically. Cross-reference "
+        "each candidate topic against the 'Topics Already Explored' list "
+        "above before returning — if the same module/concern was already "
+        "investigated or attempted, drop the candidate or decide 'done'."
     )
 
     # ── Select the phase-appropriate manager prompt ─────────────────
@@ -575,6 +668,13 @@ def _summarize_findings(findings: list[dict]) -> str:
     will rephrase prior topics instead of extending coverage. Accumulates
     entries until the running string crosses ``_FINDINGS_SUMMARY_BUDGET``
     chars (well inside ``EXPLORE_TOKEN_BUDGET``).
+
+    Error sentinels (``error=True``) get a one-line "attempted, no usable
+    findings" entry rather than being hidden — the manager needs to see
+    *that the topic was tried* so it doesn't re-propose the same question
+    under different wording. The neutral marker is intentional: no error
+    text is rendered (per the
+    [[feedback_no_error_text_in_research_results]] rule).
     """
     if not findings:
         return "(no findings yet)"
@@ -583,21 +683,25 @@ def _summarize_findings(findings: list[dict]) -> str:
     for i, f in enumerate(findings):
         if not isinstance(f, dict):
             continue
-        if f.get("error"):
-            continue
         topic = _normalise_topic(f.get("topic", ""))
-        summary = f.get("summary", "")
-        patterns = f.get("patterns", [])
-        deps = f.get("dependencies", [])
-        file_map = f.get("file_map", {}) or {}
-        files = list(file_map.keys()) if isinstance(file_map, dict) else []
-        entry = f"Finding {i + 1} [topic: {topic[:160]}]: {summary[:600]}"
-        if files:
-            entry += f"\n  Files examined: {', '.join(files[:10])}"
-        if patterns:
-            entry += f"\n  Patterns: {', '.join(patterns[:8])}"
-        if deps:
-            entry += f"\n  Dependencies: {', '.join(deps[:8])}"
+        if f.get("error"):
+            entry = (
+                f"Finding {i + 1} [topic: {topic[:160]}]: "
+                "(attempted; no usable findings — do NOT re-propose this topic)"
+            )
+        else:
+            summary = f.get("summary", "")
+            patterns = f.get("patterns", [])
+            deps = f.get("dependencies", [])
+            file_map = f.get("file_map", {}) or {}
+            files = list(file_map.keys()) if isinstance(file_map, dict) else []
+            entry = f"Finding {i + 1} [topic: {topic[:160]}]: {summary[:600]}"
+            if files:
+                entry += f"\n  Files examined: {', '.join(files[:10])}"
+            if patterns:
+                entry += f"\n  Patterns: {', '.join(patterns[:8])}"
+            if deps:
+                entry += f"\n  Dependencies: {', '.join(deps[:8])}"
         total += len(entry)
         parts.append(entry)
         if total >= _FINDINGS_SUMMARY_BUDGET:
@@ -606,6 +710,81 @@ def _summarize_findings(findings: list[dict]) -> str:
                 parts.append(f"(... {remaining} additional finding(s) elided — coverage budget reached)")
             break
     return "\n\n".join(parts)
+
+
+def _render_explored_topic_roll_up(
+    existing_topics: list[str],
+    findings: list[dict],
+) -> str:
+    """Render prior topics with their outcome inline.
+
+    The legacy ``"## Topics Already Explored\n{json.dumps([...])}"``
+    rendering presented topics as a passive list disconnected from the
+    findings block — the model had to cross-reference manually and
+    routinely rephrased prior questions instead of treating them as
+    covered ground.
+
+    This roll-up pairs each prior topic with one of three outcomes:
+
+    * ``investigated; <N> files examined`` — substantive finding
+    * ``attempted; no usable findings`` — error sentinel
+    * ``proposed; no result recorded`` — topic in ``state.topics`` that
+      never produced a finding (e.g. router dropped it as a near-dupe)
+
+    Returns ``""`` when there is nothing to surface so the manager prompt
+    can omit the section entirely on round 1.
+    """
+    if not existing_topics and not findings:
+        return ""
+
+    # Build a lookup keyed by normalised topic so enriched (suffix-stamped)
+    # finding topics still match the bare topic the manager originally
+    # emitted. Last finding for a given topic wins — typical case is one.
+    by_topic: dict[str, dict] = {}
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        t = _normalise_topic(f.get("topic", ""))
+        if t:
+            by_topic[t] = f
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for topic in existing_topics:
+        if not isinstance(topic, str) or not topic.strip():
+            continue
+        key = _normalise_topic(topic)
+        if key in seen:
+            continue
+        seen.add(key)
+        f = by_topic.get(key)
+        if f is None:
+            outcome = "proposed; no result recorded"
+        elif f.get("error"):
+            outcome = "attempted; no usable findings"
+        else:
+            file_map = f.get("file_map", {}) or {}
+            n_files = len(file_map) if isinstance(file_map, dict) else 0
+            outcome = f"investigated; {n_files} file(s) examined"
+        lines.append(f"- {topic.strip()} — {outcome}")
+
+    # Surface any finding whose topic never appeared in existing_topics
+    # (e.g. seeded from a prior research_log on rework). The manager
+    # otherwise has no way to know these were covered.
+    for key, f in by_topic.items():
+        if key in seen:
+            continue
+        seen.add(key)
+        original = f.get("topic", "") or "(unknown topic)"
+        if f.get("error"):
+            outcome = "attempted; no usable findings"
+        else:
+            file_map = f.get("file_map", {}) or {}
+            n_files = len(file_map) if isinstance(file_map, dict) else 0
+            outcome = f"investigated; {n_files} file(s) examined"
+        lines.append(f"- {original.strip()} — {outcome}")
+
+    return "\n".join(lines)
 
 
 # ── Explore node ─────────────────────────────────────────────────────────
@@ -617,24 +796,50 @@ async def run_explore_node(
     *,
     topic: str = "",
 ) -> dict[str, Any]:
-    """Run an explore node — invokes a researcher subagent for one topic.
+    """Back-compat shim: run explore_do then summarise inline.
 
-    Uses ``build_subagent_spec("researcher", ...)`` to get the full
-    subagent configuration (model, tools, MCP, response_format), then
-    wraps it in a minimal agent for invocation.
+    The exploration subgraph now wires these as two separate graph nodes
+    (see :func:`run_explore_do_node` and :func:`run_summarise_node`) so
+    smaller models can switch cognitive modes between "use tools" and
+    "convert evidence to findings". This wrapper preserves the old
+    single-call contract for any direct caller.
+    """
+    do_update = await run_explore_do_node(state, config, topic=topic)
+    merged = {**state, **do_update}
+    summarise_update = await run_summarise_node(merged, config)
+    # Merge: explore_do contributes read_cache, summarise contributes findings.
+    out: dict[str, Any] = {}
+    if "read_cache" in do_update:
+        out["read_cache"] = do_update["read_cache"]
+    if "findings" in summarise_update:
+        out["findings"] = summarise_update["findings"]
+    return out
 
-    When the phase is ``"plan"``, the specification content is read from
-    disk and injected into the subagent prompt so the researcher maps spec
-    requirements to codebase files rather than doing generic exploration.
 
-    Args:
-        state: The ExplorationSubgraphState.
-        config: LangGraph runtime config.
-        topic: The specific research topic (set by Send API).
+async def run_explore_do_node(
+    state: dict[str, Any],
+    config: RunnableConfig | None = None,
+    *,
+    topic: str = "",
+) -> dict[str, Any]:
+    """Drive the researcher subagent and return a structured evidence dossier.
 
-    Returns:
-        Dict with ``findings`` key containing a list with one
-        ResearchFindings dict (merged by operator.add).
+    This is the "do" half of the explore→summarise split. It runs the
+    researcher's tool-using loop exactly like the legacy
+    ``run_explore_node`` body, but stops short of converting the result
+    into a :class:`ResearchFindings`. The conversion happens in the
+    separate :func:`run_summarise_node` so the model never has to switch
+    between "use tools" and "produce structured output" within a single
+    node.
+
+    Returns a dict with two keys:
+
+    * ``exploration_evidence`` — a per-branch dict containing the
+      tool-result dossier, the researcher's narrative (if any), the
+      topic, and a ``recursion_capped`` flag. Last-write-wins per Send
+      branch.
+    * ``read_cache`` — propagated to the parent state for cross-branch
+      dedupe (same as the legacy node).
     """
     from spine.agents.factory import build_phase_agent
     from spine.agents.subagents import build_subagent_spec
@@ -650,7 +855,10 @@ async def run_explore_node(
     workspace_root = state.get("workspace_root", ".")
     topic_str = topic or "general codebase investigation"
 
-    logger.info("[%s] Explore node (phase=%s): researching topic=%r", work_id, phase, topic_str)
+    logger.info(
+        "[%s] explore_do (phase=%s): researching topic=%r",
+        work_id, phase, topic_str,
+    )
 
     result: dict[str, Any] = {}
     try:
@@ -748,106 +956,292 @@ async def run_explore_node(
             config={"recursion_limit": 50},
         )
 
-        # Finalize: convert the free-form research conversation into a
-        # ResearchFindings JSON. The researcher agent is intentionally run
-        # WITHOUT response_format so the model actually explores with
-        # tools (binding a schema causes the model to satisfy it on turn 1
-        # and skip tool calls). After the loop completes, take the final
-        # assistant message and convert it via the model's native
-        # structured-output binding.
-        await _finalize_research_findings(result, subagent_spec.get("model"))
-
-        # Extract findings from the result
-        findings = _extract_findings(result)
-        # Inject the topic into each finding so the synthesizer knows
-        # which area each finding addresses.
-        for f in findings:
-            if isinstance(f, dict) and "topic" not in f:
-                f["topic"] = topic_str
+        # NOTE: the legacy run_explore_node called _finalize_research_findings
+        # here. That step now belongs to run_summarise_node — it's a
+        # separate graph node so the model never has to switch between
+        # "use tools" and "produce structured output" within one
+        # invocation. We pass the raw evidence forward instead.
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        evidence_text = collect_exploration_evidence(messages)
+        narrative = _last_ai_narrative(messages)
+        evidence: dict[str, Any] = {
+            "topic": topic_str,
+            "phase": phase,
+            "tool_results_text": evidence_text,
+            "narrative": narrative,
+            "recursion_capped": False,
+            "error_class": None,
+            "message_count": len(messages),
+        }
         logger.info(
-            "[%s] Explore node: topic=%r — %d findings entries",
+            "[%s] explore_do: topic=%r — %d evidence chars, %d narrative chars",
             work_id,
             topic_str,
-            len(findings),
+            len(evidence_text),
+            len(narrative),
         )
 
     except Exception as e:
-        # Recursion-cap salvage: _ainvoke_explore_collecting attaches the
-        # last-seen state dict to the exception. We build an evidence
-        # dossier from ToolMessage results (the actual research data),
-        # not from the last AIMessage text — when the cap fires the last
-        # text message is typically the topic restatement, which the
-        # finalize call would just paraphrase back as a fake summary.
-        # Salvage is accepted only when the structured response contains
-        # at least one concrete field (file_map / patterns / dependencies);
-        # otherwise we fall through to the error sentinel so the user-
-        # visible outcome is a real error rather than a hallucinated
-        # restatement of the topic.
-        partial_state = getattr(e, "partial_state", None) if isinstance(e, GraphRecursionError) else None
-        salvaged: list[dict] | None = None
-        if partial_state and partial_state.get("messages"):
-            salvaged = await _attempt_research_salvage(
-                partial_state, subagent_spec.get("model"), topic_str, work_id
-            )
-            if salvaged is not None:
-                result = partial_state
+        # On recursion cap (or any other failure) gather whatever the
+        # researcher accumulated and pass it forward. The summarise node
+        # decides whether to salvage it or emit an error sentinel — keeping
+        # that decision out of the do node means the do node never has to
+        # reason about output formatting.
+        # _ainvoke_explore_collecting attaches partial_state to any
+        # non-transient exception that carries accumulated stream state
+        # (GraphRecursionError, BadRequestError on context overflow, etc.).
+        # getattr fails closed when an exception type doesn't carry it.
+        partial_state = getattr(e, "partial_state", None)
+        partial_messages: list = []
+        if isinstance(partial_state, dict) and partial_state.get("messages"):
+            partial_messages = partial_state["messages"]
+            result = partial_state
 
-        if salvaged is not None:
-            findings = salvaged
-            logger.info(
-                "[%s] Explore node (salvaged): topic=%r — %d findings entries",
-                work_id,
-                topic_str,
-                len(findings),
-            )
-        else:
-            logger.error(
-                "[%s] Explore node failed for topic=%r: %s",
-                work_id,
-                topic_str,
-                e,
-                exc_info=True,
-            )
-            # The summary field is intentionally a neutral marker — NEVER
-            # embed the exception text here. Earlier versions wrote the raw
-            # GraphRecursionError / Pydantic stack into `summary`, and even
-            # though every render path filters error sentinels, the entry
-            # is still in `state["findings"]` for coverage bookkeeping, so
-            # any agent or sub-agent that introspects state directly was
-            # being fed the noise (observed in production trace where the
-            # synthesizer's input findings list carried "Research failed
-            # for topic '…': GraphRecursionError: …"). Full traceback stays
-            # in logs via exc_info=True. The structured `error_class` /
-            # `error_topic` fields are available for diagnostic introspection
-            # by anything that explicitly opts in.
-            findings = [
-                {
-                    "topic": topic_str,
-                    "summary": "(research did not converge on this topic)",
-                    "patterns": [],
-                    "file_map": attempted_files,
-                    "dependencies": [],
-                    # Marker consumed by _summarize_findings,
-                    # _format_findings, _save_exploration_artifacts, and
-                    # export.format_export_markdown to drop this sentinel
-                    # from every LLM-facing or human-facing render path.
-                    "error": True,
-                    # Structured diagnostic fields — explicit, no free-text
-                    # exception messages. The class name is the most you
-                    # should ever surface to a downstream consumer.
-                    "error_class": type(e).__name__,
-                    "error_topic": topic_str,
-                }
-            ]
+        evidence_text = collect_exploration_evidence(partial_messages) if partial_messages else ""
+        narrative = _last_ai_narrative(partial_messages) if partial_messages else ""
+        evidence = {
+            "topic": topic_str,
+            "phase": phase,
+            "tool_results_text": evidence_text,
+            "narrative": narrative,
+            "recursion_capped": isinstance(e, GraphRecursionError),
+            "error_class": type(e).__name__,
+            "message_count": len(partial_messages),
+        }
+        logger.warning(
+            "[%s] explore_do: topic=%r failed (%s) — captured %d evidence chars",
+            work_id,
+            topic_str,
+            type(e).__name__,
+            len(evidence_text),
+            exc_info=not isinstance(e, GraphRecursionError),
+        )
 
     # Bubble the post-invocation deduper cache back into subgraph state so
     # sibling Send() researchers (and the next rework cycle) skip queries we
     # already ran. The reducer (_merge_read_cache) handles merge semantics.
     cache_snapshot = result.get("read_cache") if isinstance(result, dict) else None
-    update: dict[str, Any] = {"findings": findings}
+    update: dict[str, Any] = {"exploration_evidence": evidence}
     if cache_snapshot:
         update["read_cache"] = cache_snapshot
     return update
+
+
+# Minimum evidence dossier length before the summarise node will attempt
+# a structured summarisation. Below this we emit the error sentinel so a
+# recursion-capped or empty-tool-result run never produces a hallucinated
+# paraphrase of the topic. Kept in sync with _SALVAGE_MIN_EVIDENCE_CHARS
+# (defined further down) — same calibration rationale.
+_SUMMARISE_MIN_EVIDENCE_CHARS = 200
+
+
+def _empty_research_finding(topic_str: str, error_class: str | None = None) -> dict:
+    """Build the canonical error-sentinel finding.
+
+    The shape MUST match what ``_summarize_findings`` /
+    ``_format_findings`` / ``_save_exploration_artifacts`` already drop
+    via the ``error=True`` marker. The memory-pinned rule
+    ``feedback_no_error_text_in_research_results`` requires that the
+    ``summary`` field NEVER contain raw exception text — keep it as a
+    neutral marker.
+    """
+    out: dict[str, Any] = {
+        "topic": topic_str,
+        "summary": "(research did not converge on this topic)",
+        "patterns": [],
+        "file_map": {},
+        "dependencies": [],
+        "error": True,
+        "error_topic": topic_str,
+    }
+    if error_class:
+        out["error_class"] = error_class
+    return out
+
+
+async def run_summarise_node(
+    state: dict[str, Any],
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """No-tool summarisation: convert an evidence dossier into ResearchFindings.
+
+    Reads ``state["exploration_evidence"]`` (populated by
+    :func:`run_explore_do_node` in the same Send branch) and produces
+    exactly one entry to merge into the shared ``findings`` channel
+    via the existing ``operator.add`` reducer.
+
+    Tools are deliberately not bound on this call — the model's only job
+    here is structural conversion. This is the node that solves the
+    "smaller model gets fixated on the original request" problem.
+    """
+    from spine.agents.subagents import build_subagent_spec
+    from spine.models.enums import PhaseName
+
+    work_id = state.get("work_id", "unknown")
+    phase = state.get("phase")
+    evidence = state.get("exploration_evidence") or {}
+    topic_str = evidence.get("topic") or "general codebase investigation"
+    evidence_text = evidence.get("tool_results_text") or ""
+    narrative = evidence.get("narrative") or ""
+    recursion_capped = bool(evidence.get("recursion_capped"))
+    error_class = evidence.get("error_class")
+
+    # Empty evidence and no narrative — emit the error sentinel. The
+    # downstream filter chain (_summarize_findings, _format_findings,
+    # _save_exploration_artifacts) already drops error=True entries
+    # before they reach any LLM-facing or human-facing render path.
+    if not evidence_text and (not narrative or _looks_like_pure_tool_error(narrative, [])):
+        logger.warning(
+            "[%s] summarise: topic=%r had no usable evidence — emitting sentinel",
+            work_id, topic_str,
+        )
+        return {"findings": [_empty_research_finding(topic_str, error_class)]}
+
+    # When evidence is below the salvage threshold and the explore_do
+    # call was recursion-capped, prefer the sentinel over a hallucinated
+    # paraphrase of the topic.
+    if recursion_capped and len(evidence_text) < _SUMMARISE_MIN_EVIDENCE_CHARS and not narrative:
+        logger.warning(
+            "[%s] summarise: topic=%r recursion-capped with thin evidence — emitting sentinel",
+            work_id, topic_str,
+        )
+        return {"findings": [_empty_research_finding(topic_str, error_class)]}
+
+    if phase is None:
+        logger.warning(
+            "[%s] summarise: missing phase — emitting sentinel for topic=%r",
+            work_id, topic_str,
+        )
+        return {"findings": [_empty_research_finding(topic_str, "MissingPhase")]}
+
+    try:
+        phase_enum = PhaseName(phase)
+        subagent_spec = build_subagent_spec(
+            name="researcher",
+            phase=phase_enum,
+            state=state,  # type: ignore[arg-type]
+            config=config,
+        )
+        model = subagent_spec.get("model")
+    except Exception:
+        logger.warning(
+            "[%s] summarise: could not resolve researcher model — emitting sentinel",
+            work_id, exc_info=True,
+        )
+        return {"findings": [_empty_research_finding(topic_str, "ResolveModelFailed")]}
+
+    if model is None:
+        return {"findings": [_empty_research_finding(topic_str, "NoModel")]}
+
+    finding = await summarise_evidence(
+        model=model,
+        topic=topic_str,
+        evidence_text=evidence_text,
+        narrative=narrative,
+        recursion_capped=recursion_capped,
+    )
+    if finding is None:
+        return {"findings": [_empty_research_finding(topic_str, "SummariseFailed")]}
+
+    finding.setdefault("topic", topic_str)
+    if recursion_capped:
+        finding["partial"] = True
+    logger.info(
+        "[%s] summarise: topic=%r — %d file_map / %d patterns / %d dependencies",
+        work_id,
+        topic_str,
+        len(finding.get("file_map") or {}),
+        len(finding.get("patterns") or []),
+        len(finding.get("dependencies") or []),
+    )
+    return {"findings": [finding]}
+
+
+async def summarise_evidence(
+    *,
+    model: Any,
+    topic: str,
+    evidence_text: str,
+    narrative: str = "",
+    recursion_capped: bool = False,
+) -> dict | None:
+    """Coerce an evidence dossier into a ResearchFindings dict.
+
+    No tools are attached to this call. The model receives only the
+    evidence (tool results + the researcher's own narration, if any) and
+    the topic, and must produce a strict ResearchFindings JSON populated
+    from what the evidence actually shows.
+
+    Returns the parsed finding as a dict, or ``None`` if the model
+    rejected the call or the structured output binding is unsupported.
+    """
+    from spine.agents.subagents import ResearchFindings
+
+    if model is None:
+        return None
+
+    try:
+        structured_model = model.with_structured_output(ResearchFindings)
+    except Exception:
+        logger.debug(
+            "summarise_evidence: model lacks with_structured_output", exc_info=True
+        )
+        return None
+
+    sections: list[str] = []
+    if evidence_text:
+        sections.append("## Tool-result evidence\n" + evidence_text)
+    if narrative:
+        sections.append("## Researcher's own narrative\n" + narrative.strip())
+    body = "\n\n".join(sections) if sections else "(no evidence gathered)"
+
+    cap_warning = (
+        "\nNote: the researcher hit its step cap before producing a final report. "
+        "Treat the evidence as partial — leave fields empty when unsupported.\n"
+        if recursion_capped else ""
+    )
+
+    summarise_prompt = (
+        "You will be given evidence gathered while researching a specific topic in a "
+        "codebase. Convert the evidence into the ResearchFindings JSON schema.\n\n"
+        "STRICT RULES:\n"
+        "- Use ONLY information present in the evidence below.\n"
+        "- Do NOT use the topic name to fill in fields. If the evidence does not "
+        "mention a file, pattern, or dependency, leave the field empty.\n"
+        "- file_map paths MUST appear in the evidence (as file paths, symbol locations, "
+        "or import targets).\n"
+        "- If a field has no support in the evidence, leave it empty (``[]`` for lists, "
+        "``{}`` for file_map).\n"
+        "- summary should describe what was actually discovered in the evidence, not "
+        "what the agent was asked to investigate.\n"
+        f"{cap_warning}\n"
+        f"## Topic\n{topic}\n\n"
+        f"{body}"
+    )
+
+    try:
+        parsed = await structured_model.ainvoke(
+            [HumanMessage(content=summarise_prompt)]
+        )
+    except Exception as e:
+        logger.warning("summarise_evidence: invocation failed: %s", e)
+        return None
+
+    if hasattr(parsed, "model_dump"):
+        return parsed.model_dump()
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def collect_exploration_evidence(messages: list) -> str:
+    """Public alias for :func:`_collect_salvage_evidence`.
+
+    The salvage path historically owned this extractor; the explore/summarise
+    split uses it on the happy path too. Keep the underscore-prefixed name
+    available for the existing salvage tests.
+    """
+    return _collect_salvage_evidence(messages)
 
 
 async def _ainvoke_explore_collecting(
@@ -904,6 +1298,17 @@ async def _ainvoke_explore_collecting(
         except Exception as exc:
             last_exc = exc
             if not _is_transient_error(exc) or attempt >= DEFAULT_MAX_RETRIES:
+                # Attach any state accumulated by astream before the
+                # exception fired so the caller can salvage messages
+                # the same way it does for GraphRecursionError. Notably
+                # rescues context-overflow BadRequestError after a
+                # researcher has built up 80K of investigation.
+                if partial_state:
+                    if context is not None and hasattr(context, "read_cache"):
+                        cache_snapshot = getattr(context, "read_cache", None) or {}
+                        if cache_snapshot:
+                            partial_state["read_cache"] = dict(cache_snapshot)
+                    exc.partial_state = partial_state  # type: ignore[attr-defined]
                 raise
 
             delay = min(DEFAULT_BASE_DELAY * (2**attempt), DEFAULT_MAX_DELAY)

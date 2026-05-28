@@ -21,6 +21,11 @@ from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
 from spine.agents.classification import classify_task
+from spine.agents.plan_do import (
+    directive_from_state,
+    format_directive_for_prompt,
+    run_plan_node,
+)
 from spine.agents.tools.recall_tool import RecallTool
 from spine.agents.artifacts import (
     materialize_artifacts,
@@ -76,6 +81,32 @@ def _classify_section(task_category: str | None, reasoning: str) -> str:
     if reasoning:
         parts.append(reasoning)
     return "\n".join(parts) + "\n\n"
+
+
+async def _specify_directive_node(
+    state: SpecifySubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """No-tool planning step that precedes the specify Deep Agent."""
+    work_id = state.get("work_id", "unknown")
+    description = state.get("description", "")
+    task = (
+        "Produce a structured specification (specification.md + specification.json) "
+        "for the work below. The do node will use write_specification once.\n\n"
+        f"## Work description\n{description}"
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=PhaseName.SPECIFY.value,
+        task_description=task,
+        role_hint="specify-agent (produces specification.md and specification.json)",
+    )
+    logger.info(
+        "[%s] SPECIFY plan-directive: approach=%r",
+        work_id, directive.approach[:80],
+    )
+    return {"specify_directive": directive.model_dump()}
 
 
 async def _run_specify_agent(
@@ -145,8 +176,12 @@ async def _run_specify_agent(
         )
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
+        directive_block = format_directive_for_prompt(
+            directive_from_state(dict(state), "specify_directive")
+        )
         prompt = (
-            _classify_section(task_category, classification_reasoning)
+            (directive_block + "\n" if directive_block else "")
+            + _classify_section(task_category, classification_reasoning)
             + f"Create a detailed specification for the following work:\n\n{description}"
             + recall_section
         )
@@ -261,9 +296,11 @@ def build_specify_subgraph() -> Any:
         or .compile(checkpointer=...) for per-phase checkpoint isolation.
     """
     builder = StateGraph(SpecifySubgraphState)
+    builder.add_node("plan_directive", _specify_directive_node)
     builder.add_node("run_agent", _run_specify_agent)
     builder.add_node("save_artifacts", _save_specify_artifacts)
-    builder.add_edge(START, "run_agent")
+    builder.add_edge(START, "plan_directive")
+    builder.add_edge("plan_directive", "run_agent")
     builder.add_edge("run_agent", "save_artifacts")
     builder.add_edge("save_artifacts", END)
     return builder

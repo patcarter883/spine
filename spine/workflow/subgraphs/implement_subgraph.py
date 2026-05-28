@@ -25,12 +25,17 @@ from typing import Any, Literal
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import Command, Send
 
 from spine.agents.artifacts import (
     artifact_path,
     materialize_phase_artifacts,
     scan_artifact_dir,
+)
+from spine.agents.plan_do import (
+    directive_from_state,
+    format_directive_for_prompt,
+    run_plan_node,
 )
 from spine.agents.retry import ainvoke_with_retry
 from spine.models.enums import PhaseName
@@ -83,8 +88,13 @@ def _route_slices(
     base = _base_send_payload(state)
     sends: list[Send] = []
     for sl in pending:
-        sends.append(Send("slice_implementer", {**base, "active_slice": sl}))
+        # Each parallel slice goes through plan_slice_implementer → slice_implementer
+        # so the model splits "plan approach" from "execute with tools" — a
+        # mitigation for smaller models that fixate on the slice JSON.
+        sends.append(Send("plan_slice_implementer", {**base, "active_slice": sl}))
     for sl in failed:
+        # The decomposer is already a no-tool structured-output call, so it
+        # doesn't get a plan-before-do step.
         sends.append(Send("fallback_decomposer", {**base, "active_slice": sl}))
 
     logger.info(
@@ -95,6 +105,60 @@ def _route_slices(
         len(sends),
     )
     return sends
+
+
+# ── plan_slice_implementer node (no tools) ──────────────────────────────
+
+
+async def _plan_slice_implementer_node(
+    state: ImplementSubgraphState,
+    config: RunnableConfig | None = None,
+) -> Command:
+    """No-tool planning step for a single slice's implementation.
+
+    Produces a per-branch SubagentDirective and dispatches a Send to
+    the slice_implementer carrying both the slice and the directive on
+    the per-branch payload. Returning ``Command(goto=Send(...))`` —
+    rather than writing the directive to a shared channel — is required
+    because parallel Send branches share the subgraph's channel space,
+    so N concurrent writes to ``active_slice_directive`` would crash
+    apply_writes with ``InvalidUpdateError``.
+    """
+    work_id = state.get("work_id", "unknown")
+    active_slice: dict = state.get("active_slice") or {}
+    slice_id = active_slice.get("id", "unknown")
+    title = active_slice.get("title", "")
+    target_files = active_slice.get("target_files") or []
+    criteria = active_slice.get("acceptance_criteria") or []
+    description = active_slice.get("description", "")
+
+    crit_lines = "\n".join(f"- {c}" for c in criteria) if criteria else "(none)"
+    file_lines = "\n".join(f"- {p}" for p in target_files) if target_files else "(none listed)"
+
+    task = (
+        f"Plan how to implement slice {slice_id!r} (title: {title!r}). The do "
+        "node will use read_edit_lint and MCP tools to make atomic edits.\n\n"
+        f"## Description\n{description or '(none)'}\n\n"
+        f"## Target files\n{file_lines}\n\n"
+        f"## Acceptance criteria\n{crit_lines}"
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=f"{PhaseName.IMPLEMENT.value}/subagents/slice-implementer",
+        task_description=task,
+        role_hint=f"slice-implementer for slice {slice_id!r}",
+    )
+    logger.info(
+        "[%s] plan_slice_implementer: slice=%r approach=%r",
+        work_id, slice_id, directive.approach[:80],
+    )
+    send_payload: dict[str, Any] = {
+        **_base_send_payload(state),
+        "active_slice": active_slice,
+        "active_slice_directive": directive.model_dump(),
+    }
+    return Command(goto=Send("slice_implementer", send_payload))
 
 
 # ── slice_implementer node ──────────────────────────────────────────────
@@ -160,8 +224,12 @@ async def _slice_implementer_node(
         )
 
         slice_json = json.dumps(active_slice, indent=2, ensure_ascii=False, default=str)
+        directive_block = format_directive_for_prompt(
+            directive_from_state(dict(state), "active_slice_directive")
+        )
         prompt = (
-            f"## Implement Slice: {slice_id}\n\n"
+            (directive_block + "\n" if directive_block else "")
+            + f"## Implement Slice: {slice_id}\n\n"
             f"The full slice definition is in the JSON below. "
             f"Read it carefully — it specifies target_files, "
             f"acceptance_criteria, and (optionally) a description. "
@@ -543,6 +611,7 @@ async def _save_implement_artifacts(
 # ── Builder ──────────────────────────────────────────────────────────────
 
 _ROUTE_MAP = {
+    "plan_slice_implementer": "plan_slice_implementer",
     "slice_implementer": "slice_implementer",
     "fallback_decomposer": "fallback_decomposer",
     "synthesize_implementation": "synthesize_implementation",
@@ -565,12 +634,18 @@ def build_implement_subgraph() -> Any:
     """
     builder = StateGraph(ImplementSubgraphState)
 
+    builder.add_node("plan_slice_implementer", _plan_slice_implementer_node)
     builder.add_node("slice_implementer", _slice_implementer_node)
     builder.add_node("fallback_decomposer", _fallback_decomposer_node)
     builder.add_node("synthesize_implementation", _synthesize_implementation_node)
     builder.add_node("save_artifacts", _save_implement_artifacts)
 
     builder.add_conditional_edges(START, _route_slices, _ROUTE_MAP)
+    # plan_slice_implementer dispatches to slice_implementer dynamically
+    # via Command(goto=Send) (see the node itself) so each parallel
+    # branch carries its own directive without colliding on a shared
+    # LastValue channel. slice_implementer's outgoing conditional edge
+    # re-enters the router so the dispatch loop terminates correctly.
     builder.add_conditional_edges("slice_implementer", _route_slices, _ROUTE_MAP)
     builder.add_conditional_edges("fallback_decomposer", _route_slices, _ROUTE_MAP)
     builder.add_edge("synthesize_implementation", "save_artifacts")

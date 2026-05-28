@@ -188,6 +188,17 @@ class SpineConfig:
     # vs 40K TokenBudgetCompactor threshold). 0 or negative = unbounded.
     synthesize_findings_token_budget: int = 20000
 
+    # Global default for the model's ``max_completion_tokens`` request
+    # field. Per-provider settings still win — this is the fallback used
+    # when ``providers.llm[].max_completion_tokens`` is unset. Without a
+    # cap, finite-window local providers (vLLM/SGLang) consume the entire
+    # remaining context as output budget and 400 once prompt+budget
+    # exceeds the model window (trace 019e6e53: 80K-context model
+    # rejected 80001-token prompts with "0 output tokens requested"
+    # because no per-provider cap was set). 0 disables the global
+    # fallback (falls back to provider/library defaults).
+    max_completion_tokens: int = 0
+
     # Per-topic recall lookup (runs between research_manager and the
     # research_router). For each topic emitted by the manager, recall the
     # top-K symbols whose cosine similarity is at least this threshold —
@@ -389,6 +400,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_SYNTHESIZE_FINDINGS_TOKEN_BUDGET",
                     spine.get("synthesize_findings_token_budget", 20000),
+                )
+            ),
+            max_completion_tokens=int(
+                os.getenv(
+                    "SPINE_MAX_COMPLETION_TOKENS",
+                    spine.get("max_completion_tokens", 0),
                 )
             ),
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 2)),

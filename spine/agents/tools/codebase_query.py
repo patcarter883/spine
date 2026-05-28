@@ -122,11 +122,12 @@ def _reject_markup(value: str, field: str) -> None:
             )
 
 
-def _normalise_name(value: str | None) -> str:
+def _normalise_name(value: str | None, action: str = "") -> str:
     """Strip whitespace from a symbol name and validate it is non-empty."""
     if value is None:
         raise ToolException(
-            "codebase_query: 'name' is required for this action."
+            f"codebase_query: 'name' is required for action={action!r}. "
+            f"Retry with name='<symbol_identifier>' (e.g. name='MyClass.my_method')."
         )
     stripped = value.strip()
     if not stripped:
@@ -142,7 +143,8 @@ def _normalise_pattern(value: str | None) -> str:
     """Validate the regex pattern for the 'search' action."""
     if value is None:
         raise ToolException(
-            "codebase_query: 'pattern' is required for action='search'."
+            "codebase_query: 'pattern' is required for action='search'. "
+            "Retry with pattern='<regex>' (e.g. pattern='def my_function')."
         )
     if not value.strip():
         raise ToolException(
@@ -237,7 +239,7 @@ class CodebaseQueryTool(BaseTool):
                 f"codebase_query: 'pattern' must not be supplied for action={action!r}; "
                 f"use 'name' instead."
             )
-        return _ACTION_TO_MCP[action], {"name": _normalise_name(name)}
+        return _ACTION_TO_MCP[action], {"name": _normalise_name(name, action)}
 
     # NOTE: backing tools are wrapped as ``langchain_core.tools.StructuredTool``
     # by the MCP adapter. Their ``_run`` / ``_arun`` signatures require a

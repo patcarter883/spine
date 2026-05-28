@@ -141,7 +141,9 @@ def test_research_router_fan_out():
     assert isinstance(result, list)
     assert len(result) == 2
     assert all(isinstance(s, Send) for s in result)
-    assert result[0].node == "explore"
+    # Sends now target the do→summarise branch head; explore_do chains
+    # into summarise via a plain edge before fan-in.
+    assert result[0].node == "explore_do"
     assert result[0].arg["topic"] == "auth-module"
     assert result[0].arg["phase"] == "specify"
 
@@ -177,7 +179,9 @@ def test_research_router_filters_explored_topics():
     result = _research_router(state)
     assert isinstance(result, list)
     assert len(result) == 1
-    assert result[0].node == "explore"
+    # Sends now target the do→summarise branch head; explore_do chains
+    # into summarise via a plain edge before fan-in.
+    assert result[0].node == "explore_do"
     assert result[0].arg["topic"] == "new-topic"
 
 

@@ -186,6 +186,15 @@ def _build_openrouter_model(
     provider_cfg = _active_provider_config(phase=phase) or {}
     max_completion_tokens = provider_cfg.get("max_completion_tokens")
     max_tokens = provider_cfg.get("max_tokens")
+    # Fall back to the global SpineConfig.max_completion_tokens when the
+    # provider hasn't set its own cap. Prevents finite-window providers
+    # from being asked to allocate the entire remaining context as output
+    # budget. See SpineConfig.max_completion_tokens for the trace context.
+    if max_completion_tokens is None and max_tokens is None:
+        from spine.config import SpineConfig as _SpineConfig
+        global_cap = _SpineConfig.load().max_completion_tokens
+        if global_cap and global_cap > 0:
+            max_completion_tokens = global_cap
 
     # Merge OpenRouter provider preferences. require_parameters=True makes
     # OpenRouter reject the request up-front if the chosen model doesn't
@@ -287,6 +296,17 @@ def _build_local_model(
     ):
         if key in provider_cfg:
             kwargs[key] = provider_cfg[key]
+
+    # Fall back to global SpineConfig.max_completion_tokens when neither
+    # max_completion_tokens nor max_tokens is set on the provider. Without
+    # this, finite-window local backends (vLLM/SGLang) use the full
+    # remaining window as output budget and 400 when prompt+budget exceeds
+    # the model window. See SpineConfig.max_completion_tokens.
+    if "max_completion_tokens" not in kwargs and "max_tokens" not in kwargs:
+        from spine.config import SpineConfig as _SpineConfig
+        global_cap = _SpineConfig.load().max_completion_tokens
+        if global_cap and global_cap > 0:
+            kwargs["max_completion_tokens"] = int(global_cap)
 
     # ── Default request_timeout ───────────────────────────────────────
     # If not explicitly configured, default to 300s (5 min) to prevent

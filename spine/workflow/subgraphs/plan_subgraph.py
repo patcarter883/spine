@@ -27,6 +27,11 @@ from spine.agents.plan_agent import build_plan_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
+from spine.agents.plan_do import (
+    directive_from_state,
+    format_directive_for_prompt,
+    run_plan_node,
+)
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
@@ -35,6 +40,46 @@ from spine.agents.artifacts import (
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+
+async def _plan_directive_node(
+    state: PlanSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """No-tool planning step that precedes the plan Deep Agent.
+
+    Produces a SubagentDirective describing how the do node should
+    approach producing the structured plan. Splitting this out means
+    smaller models can think about approach without being distracted by
+    the tool surface; the do node then executes against the directive.
+    """
+    work_id = state.get("work_id", "unknown")
+    description = state.get("description", "")
+    has_spec = state.get("has_spec", False)
+    spec_path = state.get("spec_path", "")
+    spec_hint = (
+        f"A specification artifact is available at `{spec_path}/specification.md`. "
+        "The do node will call read_prior_artifacts to load it."
+        if has_spec and spec_path
+        else "No prior specification — the do node will work from the description."
+    )
+    task = (
+        "Produce a structured technical plan (plan.md + plan.json) with feature_slices. "
+        f"{spec_hint}\n\n"
+        f"## Work description\n{description}"
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=PhaseName.PLAN.value,
+        task_description=task,
+        role_hint="plan-agent (writes plan.md + plan.json with feature_slices)",
+    )
+    logger.info(
+        "[%s] PLAN plan-directive: approach=%r targets=%d",
+        work_id, directive.approach[:80], len(directive.target_files),
+    )
+    return {"plan_directive": directive.model_dump()}
 
 
 async def _run_plan_agent(
@@ -75,8 +120,12 @@ async def _run_plan_agent(
                 "Work directly from the description returned by `read_prior_artifacts`.\n\n"
             )
 
+        directive_block = format_directive_for_prompt(
+            directive_from_state(dict(state), "plan_directive")
+        )
         prompt = (
-            "Create a detailed technical plan with structured feature slices.\n\n"
+            (directive_block + "\n" if directive_block else "")
+            + "Create a detailed technical plan with structured feature slices.\n\n"
             + spec_instruction
             + "Call `write_structured_plan` exactly once with structured fields "
             "(architecture_overview, technology_choices, feature_slices, "
@@ -263,11 +312,13 @@ async def _save_plan_artifacts(
 
 
 def build_plan_subgraph() -> Any:
-    """Build the PLAN phase subgraph."""
+    """Build the PLAN phase subgraph (plan-then-do)."""
     builder = StateGraph(PlanSubgraphState)
+    builder.add_node("plan_directive", _plan_directive_node)
     builder.add_node("run_agent", _run_plan_agent)
     builder.add_node("save_artifacts", _save_plan_artifacts)
-    builder.add_edge(START, "run_agent")
+    builder.add_edge(START, "plan_directive")
+    builder.add_edge("plan_directive", "run_agent")
     builder.add_edge("run_agent", "save_artifacts")
     builder.add_edge("save_artifacts", END)
     return builder

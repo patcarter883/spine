@@ -22,8 +22,43 @@ from langgraph.graph import END, START, StateGraph
 from spine.models.enums import PhaseName, ReviewStatus
 from spine.workflow.subgraph_state import CriticSubgraphState
 from spine.workflow.critic_review import structural_critic_check, agent_critic_check
+from spine.agents.plan_do import run_plan_node
 
 logger = logging.getLogger(__name__)
+
+
+async def _critic_directive_node(
+    state: CriticSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """No-tool planning step before the critic's agent_check.
+
+    Gives the planner the reviewed phase and a short task framing; the
+    do node then runs the full critic agent with the directive
+    prepended to its prompt.
+    """
+    work_id = state.get("work_id", "unknown")
+    reviewed_phase = state.get("reviewed_phase", "unknown")
+    description = state.get("description", "")
+    task = (
+        f"Plan a code review of the {reviewed_phase!r} phase output. The do node "
+        "will inspect the structured artifact (specification.json / plan.json / etc.) "
+        "and return a verdict (PASSED / NEEDS_REVISION / NEEDS_REVIEW). Identify "
+        "what to focus on.\n\n"
+        f"## Original work description\n{description}"
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=PhaseName.CRITIC.value,
+        task_description=task,
+        role_hint=f"critic for the {reviewed_phase!r} phase",
+    )
+    logger.info(
+        "[%s] CRITIC plan-directive: approach=%r",
+        work_id, directive.approach[:80],
+    )
+    return {"critic_directive": directive.model_dump()}
 
 
 async def _structural_check_node(
@@ -203,6 +238,9 @@ async def _agent_check_node(
         "max_retries": 3,
         "specification_json": state.get("specification_json"),
         "plan_json": state.get("plan_json"),
+        # Forward the directive from the plan-before-do split so
+        # agent_critic_check can prepend it to the critic's prompt.
+        "critic_directive": state.get("critic_directive"),
     }
     result = await agent_critic_check(pseudo_state, reviewed_phase, config)
     logger.info(
@@ -255,19 +293,24 @@ def build_critic_subgraph(reviewed_phase: str) -> Any:
     builder = StateGraph(CriticSubgraphState)
 
     builder.add_node("structural_check", _structural_check_node)
+    # No-tool planning step inserted before agent_check (plan→do split).
+    builder.add_node("plan_directive", _critic_directive_node)
     builder.add_node("agent_check", _agent_check_node)
 
     if PhaseName(reviewed_phase) == PhaseName.PLAN:
         builder.add_node("plan_validation", _plan_validation_node)
 
     builder.add_edge(START, "structural_check")
+    # Route to plan_validation (PLAN reviews) or plan_directive (others).
+    # plan_validation is its own router target so it can also funnel into
+    # plan_directive before the agent runs.
     builder.add_conditional_edges(
         "structural_check",
         _critic_subgraph_router,
         {
-            "passed": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
-            "needs_revision": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
-            "needs_review": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "passed": "plan_directive" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "needs_revision": "plan_directive" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "needs_review": "plan_directive" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
         },
     )
 
@@ -276,12 +319,13 @@ def build_critic_subgraph(reviewed_phase: str) -> Any:
             "plan_validation",
             _plan_validation_router,
             {
-                "passed": "agent_check",
-                "needs_revision": "agent_check",
-                "needs_review": "agent_check",
+                "passed": "plan_directive",
+                "needs_revision": "plan_directive",
+                "needs_review": "plan_directive",
             },
         )
 
+    builder.add_edge("plan_directive", "agent_check")
     builder.add_edge("agent_check", END)
 
     return builder

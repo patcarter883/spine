@@ -20,6 +20,11 @@ from spine.agents.gap_plan_agent import build_gap_plan_agent
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
+from spine.agents.plan_do import (
+    directive_from_state,
+    format_directive_for_prompt,
+    run_plan_node,
+)
 from spine.agents.artifacts import (
     materialize_artifacts,
     scan_artifact_dir,
@@ -28,6 +33,31 @@ from spine.agents.artifacts import (
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+
+async def _gap_plan_directive_node(
+    state: GapPlanSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """No-tool planning step before the gap-plan Deep Agent."""
+    work_id = state.get("work_id", "unknown")
+    task = (
+        "Read the verification report, identify failed acceptance items, and produce "
+        "gap_plan.md + gap_plan.json with remediation items. The do node will call "
+        "read_verification_findings then write_structured_gap_plan."
+    )
+    directive = await run_plan_node(
+        state=dict(state),
+        config=config,
+        phase_path=PhaseName.GAP_PLAN.value,
+        task_description=task,
+        role_hint="gap-plan-agent (remediation plan for verify failures)",
+    )
+    logger.info(
+        "[%s] GAP_PLAN plan-directive: approach=%r",
+        work_id, directive.approach[:80],
+    )
+    return {"gap_plan_directive": directive.model_dump()}
 
 
 async def _run_gap_plan_agent(
@@ -54,8 +84,12 @@ async def _run_gap_plan_agent(
         plan_path = artifact_path(work_id, PhaseName.PLAN.value)
         gap_plan_path = artifact_path(work_id, PhaseName.GAP_PLAN.value)
 
+        directive_block = format_directive_for_prompt(
+            directive_from_state(dict(state), "gap_plan_directive")
+        )
         prompt = (
-            "Your tools are ready. Call ``read_verification_findings`` FIRST "
+            (directive_block + "\n" if directive_block else "")
+            + "Your tools are ready. Call ``read_verification_findings`` FIRST "
             "to load all verification inputs in one call. Then analyze the failures "
             "and call ``write_structured_gap_plan`` with your remediation items.\n\n"
             "## Artifact Paths for Reference\n"
@@ -134,9 +168,11 @@ async def _save_gap_plan_artifacts(
 def build_gap_plan_subgraph() -> Any:
     """Build the GAP_PLAN phase subgraph."""
     builder = StateGraph(GapPlanSubgraphState)
+    builder.add_node("plan_directive", _gap_plan_directive_node)
     builder.add_node("run_agent", _run_gap_plan_agent)
     builder.add_node("save_artifacts", _save_gap_plan_artifacts)
-    builder.add_edge(START, "run_agent")
+    builder.add_edge(START, "plan_directive")
+    builder.add_edge("plan_directive", "run_agent")
     builder.add_edge("run_agent", "save_artifacts")
     builder.add_edge("save_artifacts", END)
     return builder

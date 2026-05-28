@@ -223,6 +223,16 @@ async def agent_critic_check(
             description=state.get("description") or "",
         )
 
+        # If the critic subgraph ran a plan-before-do step, prepend the
+        # directive so the do node knows the planning context (e.g. which
+        # tiers to weight, which areas the planner flagged).
+        directive_raw = state.get("critic_directive")
+        if directive_raw:
+            from spine.agents.plan_do import format_directive_for_prompt
+            block = format_directive_for_prompt(directive_raw)
+            if block:
+                prompt = block + "\n" + prompt
+
         ctx = build_context(state, PhaseName.CRITIC)
 
         result = await ainvoke_with_retry(

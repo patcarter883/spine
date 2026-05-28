@@ -46,6 +46,10 @@ class SpecifySubgraphState(BaseSubgraphState, total=False):
     task_category: str | None  # Classified task category from early commitment
     retrieved_context: list[dict]  # Retrieved code chunks from vector store
     classification_confidence: float  # 0.0-1.0 from classify_task
+    # SubagentDirective from the plan-before-do split (no-tool LLM call that
+    # the do node consumes). Declared so LangGraph doesn't drop it between
+    # nodes. See spine.agents.plan_do.
+    specify_directive: dict
 
 
 class PlanSubgraphState(BaseSubgraphState, total=False):
@@ -55,6 +59,7 @@ class PlanSubgraphState(BaseSubgraphState, total=False):
     has_spec: bool  # True when a specification artifact exists
     plan_json: str  # Raw plan.json content (set by run_agent, read by save_artifacts)
     execution_waves: list  # Computed after agent completes (for IMPLEMENT)
+    plan_directive: dict  # SubagentDirective from plan-before-do split
 
 
 class TasksSubgraphState(BaseSubgraphState, total=False):
@@ -62,6 +67,7 @@ class TasksSubgraphState(BaseSubgraphState, total=False):
 
     plan_path: str
     spec_path: str  # Only for spec/critical_spec workflows
+    tasks_directive: dict  # SubagentDirective from plan-before-do split
 
 
 def _slice_list_reducer(
@@ -109,6 +115,11 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
 
     # Transient — populated per-Send by ``_route_slices``.
     active_slice: dict
+    # Transient — written by the per-branch plan node, read by the do node.
+    # Each parallel Send branch has its own state copy, so last-write-wins
+    # semantics are exactly what we want here (one writer per branch).
+    # See spine.agents.plan_do.SubagentDirective.
+    active_slice_directive: dict
 
     # Slice lists, all using the same custom reducer.
     pending_slices: Annotated[list[dict], _slice_list_reducer]
@@ -127,6 +138,12 @@ class VerifySubgraphState(BaseSubgraphState, total=False):
     spec_path: str | None  # Only for spec/critical_spec workflows
     plan_path: str | None
     execution_waves: list  # Execution waves from PLAN phase (for Send dispatch)
+
+    # Transient — populated per-Send by ``_verify_router``.
+    slice: dict
+    # Per-branch SubagentDirective written by the plan node, read by the do
+    # node. See ImplementSubgraphState for the same pattern.
+    active_slice_directive: dict
 
     # Accumulated per-slice verdicts from parallel Send dispatch (operator.add)
     verification_results: Annotated[list[dict], _op_add]
@@ -156,6 +173,7 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     structural_result: dict | None
     agent_result: dict | None
     validation_result: dict | None
+    critic_directive: dict  # SubagentDirective for the agent-check plan→do split
 
 
 class GapPlanSubgraphState(BaseSubgraphState, total=False):
@@ -168,6 +186,7 @@ class GapPlanSubgraphState(BaseSubgraphState, total=False):
     verify_path: str
     plan_path: str
     gap_plan_json: str  # Raw gap_plan.json content (for downstream phases)
+    gap_plan_directive: dict  # SubagentDirective for plan-before-do split
 
 
 class ExplorationSubgraphState(BaseSubgraphState, total=False):
@@ -187,6 +206,11 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     topics: Annotated[list[str], _op_add]  # Areas being explored this round
     findings: Annotated[list[dict], _op_add]  # ResearchFindings dicts from explore nodes
     scratchpad: Annotated[str, _op_add]  # Working memory accumulator for GC
+
+    # Per-Send transient: the evidence dossier produced by the explore_do
+    # node and consumed by the summarise node in the same branch. One
+    # writer per branch so no reducer is needed.
+    exploration_evidence: dict
 
     # Recall hits per topic from the topic_lookup node. Populated for the
     # latest round's NEW topics only — older rounds' entries are not
