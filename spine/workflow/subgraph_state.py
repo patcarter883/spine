@@ -212,6 +212,9 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     exploration_happened: bool  # True when research rounds executed (vs. skipped)
     synthesis_completed: bool  # True when synthesizer produced valid output
 
+    # SPECIFY-specific fields
+    specification_json: str  # Raw specification.json content (only used in SPECIFY phase)
+
     # PLAN-specific fields
     spec_path: str  # Path to specification.md (for PLAN explore agents)
     has_spec: bool  # True when a specification artifact exists

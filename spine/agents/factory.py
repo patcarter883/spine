@@ -725,6 +725,40 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     # implementation/verification phases. ReadCacheMiddleware now handles
     # the re-read problem at source, while ToolOutputTrimmer is retired.
 
+    # TokenBudgetCompactor — token-threshold eviction with hardened
+    # preservation rules (always keeps the last N tool results and any
+    # write/edit/artifact-writer outputs). Default off; opt in per-agent
+    # via .spine/config.yaml `token_compaction.thresholds` and the
+    # SPINE_TOKEN_COMPACTION env var.
+    if _os.getenv("SPINE_TOKEN_COMPACTION", "false").lower() in ("1", "true", "yes"):
+        from spine.agents.context_editing import TokenBudgetCompactor
+        from spine.config import SpineConfig
+
+        cfg = SpineConfig.load().token_compaction
+        threshold = cfg.thresholds.get(phase.value, cfg.default_threshold)
+        if threshold > 0:
+            middleware.append(
+                TokenBudgetCompactor(
+                    threshold_tokens=threshold,
+                    keep_recent=cfg.keep_recent,
+                    preserved_tools=frozenset(cfg.preserved_tools),
+                )
+            )
+            logger.info(
+                "TokenBudgetCompactor: phase=%s threshold=%d keep_recent=%d",
+                phase.value, threshold, cfg.keep_recent,
+            )
+        else:
+            logger.info(
+                "TokenBudgetCompactor: phase=%s SKIPPED (threshold=%d)",
+                phase.value, threshold,
+            )
+    else:
+        logger.info(
+            "TokenBudgetCompactor: phase=%s DISABLED (SPINE_TOKEN_COMPACTION env)",
+            phase.value,
+        )
+
 
 def _build_read_cache_middleware() -> Any:
     """Build the ReadCacheMiddleware that prevents re-reading files.

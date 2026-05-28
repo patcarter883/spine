@@ -60,6 +60,79 @@ _load_dotenv()
 
 
 @dataclass
+class ConvergenceConfig:
+    """Researcher convergence-steering thresholds."""
+
+    researcher_soft: int = 10
+    researcher_hard: int = 14
+    researcher_recursion_limit: int = 50
+
+
+@dataclass
+class TokenCompactionConfig:
+    """Token-budget compaction config for phase agents."""
+
+    enabled: bool = False
+    default_threshold: int = 0
+    thresholds: dict = field(default_factory=dict)
+    keep_recent: int = 6
+    preserved_tools: list = field(
+        default_factory=lambda: [
+            "write_file",
+            "edit_file",
+            "read_edit_lint",
+            "write_specification",
+            "write_plan",
+            "write_tasks",
+            "write_verification_report",
+        ]
+    )
+
+
+def _parse_convergence_config(raw: dict) -> ConvergenceConfig:
+    """Parse the ``convergence:`` block from .spine/config.yaml."""
+    if not isinstance(raw, dict):
+        return ConvergenceConfig()
+    soft = int(os.getenv("SPINE_RESEARCHER_SOFT", raw.get("researcher_soft", 25)))
+    hard = int(os.getenv("SPINE_RESEARCHER_HARD", raw.get("researcher_hard", 40)))
+    rlimit = int(
+        os.getenv(
+            "SPINE_RESEARCHER_RECURSION_LIMIT",
+            raw.get("researcher_recursion_limit", 50),
+        )
+    )
+    if hard < soft:
+        hard = soft
+    return ConvergenceConfig(
+        researcher_soft=soft,
+        researcher_hard=hard,
+        researcher_recursion_limit=rlimit,
+    )
+
+
+def _parse_token_compaction_config(raw: dict) -> TokenCompactionConfig:
+    """Parse the ``token_compaction:`` block from .spine/config.yaml."""
+    if not isinstance(raw, dict):
+        return TokenCompactionConfig()
+    enabled_raw = os.getenv(
+        "SPINE_TOKEN_COMPACTION", str(raw.get("enabled", False)).lower()
+    )
+    enabled = enabled_raw.lower() in ("1", "true", "yes")
+    thresholds_raw = raw.get("thresholds", {}) or {}
+    thresholds = {str(k): int(v) for k, v in thresholds_raw.items()}
+    preserved = raw.get("preserved_tools")
+    if not isinstance(preserved, list) or not preserved:
+        preserved = TokenCompactionConfig().preserved_tools
+    return TokenCompactionConfig(
+        enabled=enabled,
+        default_threshold=int(raw.get("default_threshold", 0)),
+        thresholds=thresholds,
+        keep_recent=int(raw.get("keep_recent", 6)),
+        preserved_tools=list(preserved),
+    )
+
+
+@dataclass
 class SpineConfig:
     """Runtime configuration for SPINE.
 
@@ -108,6 +181,13 @@ class SpineConfig:
     recall_gate_min_hits: int = 5
     specify_context_token_budget: int = 30000
 
+    # Token budget for the findings block injected into plan/specify
+    # synthesize prompts. Caps the rendered output of _format_findings
+    # so an accumulation of long research summaries can't dominate the
+    # synthesize prompt (trace 019e6d27: 42K plan-synthesize prompt
+    # vs 40K TokenBudgetCompactor threshold). 0 or negative = unbounded.
+    synthesize_findings_token_budget: int = 20000
+
     # Per-topic recall lookup (runs between research_manager and the
     # research_router). For each topic emitted by the manager, recall the
     # top-K symbols whose cosine similarity is at least this threshold —
@@ -115,6 +195,12 @@ class SpineConfig:
     # subagent.
     topic_lookup_top_k: int = 2
     topic_lookup_min_similarity: float = 0.5
+
+    # Researcher convergence steering (see ResearcherConvergenceMiddleware)
+    convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)
+
+    # Token-based phase compaction (see TokenBudgetCompactor); default off
+    token_compaction: TokenCompactionConfig = field(default_factory=TokenCompactionConfig)
 
     @staticmethod
     def _find_workspace_root() -> str:
@@ -299,9 +385,19 @@ class SpineConfig:
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)
             ),
+            synthesize_findings_token_budget=int(
+                os.getenv(
+                    "SPINE_SYNTHESIZE_FINDINGS_TOKEN_BUDGET",
+                    spine.get("synthesize_findings_token_budget", 20000),
+                )
+            ),
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 2)),
             topic_lookup_min_similarity=float(
                 spine.get("topic_lookup_min_similarity", 0.5)
+            ),
+            convergence=_parse_convergence_config(spine.get("convergence", {})),
+            token_compaction=_parse_token_compaction_config(
+                spine.get("token_compaction", {})
             ),
         )
 

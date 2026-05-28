@@ -483,3 +483,103 @@ class TestConfigToggle:
         config = SpineConfig()
         assert hasattr(config, "tool_schema_validation")
         assert config.tool_schema_validation is True
+
+
+# ── Hardened guards (invented keys, whitespace, markup, telemetry) ──
+
+from pydantic import ConfigDict
+
+
+class _SymbolNameSchema(BaseModel):
+    # extra='forbid' mirrors the strict schema MCP-wrapped tools expose,
+    # which is the surface the model actually fights with in production.
+    model_config = ConfigDict(extra="forbid")
+    name: str
+
+
+class TestInventedKeyCallout:
+    """Pydantic's default 'extra_forbidden' phrasing is misleading; the
+    validator must lead with an explicit invented-key callout listing
+    valid parameter names."""
+
+    def test_invented_key_listed_explicitly(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = make_mock_tool("mcp_codebase-index_search_codebase", _SymbolNameSchema)
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "mcp_codebase-index_search_codebase",
+            "args": {"queries": ["foo"]},  # 'queries' is invented; expected 'name'
+            "id": "tc_1",
+        }
+        result = validator.wrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        assert "unknown parameter(s) ['queries']" in result.content
+        assert "Valid parameters: ['name']" in result.content
+
+
+class TestWhitespaceValueGuard:
+    """Whitespace-only string fields must surface a targeted message."""
+
+    def test_whitespace_name_triggers_guard(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = make_mock_tool("mcp_codebase-index_get_function_source", _SymbolNameSchema)
+        request = MagicMock()
+        request.tool = tool
+        # Pydantic accepts the whitespace string at the schema level, so
+        # to exercise the guard we need a Pydantic failure too: pass an
+        # invented sibling key to trigger validation, while the whitespace
+        # value lives on a real key so the guard fires on top.
+        request.tool_call = {
+            "name": "mcp_codebase-index_get_function_source",
+            "args": {"name": "\n   ", "bogus": "x"},
+            "id": "tc_1",
+        }
+        result = validator.wrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        assert "whitespace-only" in result.content
+
+
+class TestMarkupLeakGuard:
+    """Tool-call markup leaking into a value must surface a targeted message."""
+
+    def test_markup_in_value_triggers_guard(self):
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = make_mock_tool("mcp_codebase-index_search_codebase", _SymbolNameSchema)
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "mcp_codebase-index_search_codebase",
+            "args": {"name": "spine.*</tool_call>", "bogus": "x"},
+            "id": "tc_1",
+        }
+        result = validator.wrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        assert "tool-call markup" in result.content
+
+
+class TestReboundTelemetryTags:
+    """Rebound log must include classification tags so a per-class
+    histogram can be built across runs."""
+
+    def test_tags_logged_on_validation_failure(self, caplog):
+        import logging
+        validator = ToolSchemaValidator()
+        handler = MagicMock(return_value="should_not_be_called")
+        tool = make_mock_tool("mcp_codebase-index_search_codebase", _SymbolNameSchema)
+        request = MagicMock()
+        request.tool = tool
+        request.tool_call = {
+            "name": "mcp_codebase-index_search_codebase",
+            "args": {"queries": ["foo"], "name": "  "},
+            "id": "tc_1",
+        }
+        caplog.set_level(logging.WARNING, logger="spine.agents.tool_schema_validator")
+        validator.wrap_tool_call(request, handler)
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "tags=" in joined
+        assert "unknown_keys" in joined
+        assert "whitespace_value" in joined

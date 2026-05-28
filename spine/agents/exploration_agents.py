@@ -747,27 +747,35 @@ async def run_explore_node(
                 e,
                 exc_info=True,
             )
-            # Keep the user-visible summary terse — full traceback stays in logs
-            # via exc_info=True. Embedding str(e) directly used to leak multi-line
-            # Pydantic / MCP errors straight into ResearchFindings.summary.
-            err_str = str(e).splitlines()[0].strip() if str(e).strip() else type(e).__name__
-            if len(err_str) > 300:
-                err_str = err_str[:299] + "…"
+            # The summary field is intentionally a neutral marker — NEVER
+            # embed the exception text here. Earlier versions wrote the raw
+            # GraphRecursionError / Pydantic stack into `summary`, and even
+            # though every render path filters error sentinels, the entry
+            # is still in `state["findings"]` for coverage bookkeeping, so
+            # any agent or sub-agent that introspects state directly was
+            # being fed the noise (observed in production trace where the
+            # synthesizer's input findings list carried "Research failed
+            # for topic '…': GraphRecursionError: …"). Full traceback stays
+            # in logs via exc_info=True. The structured `error_class` /
+            # `error_topic` fields are available for diagnostic introspection
+            # by anything that explicitly opts in.
             findings = [
                 {
-                    "summary": (
-                        f"Research failed for topic '{topic_str}': "
-                        f"{type(e).__name__}: {err_str}"
-                    ),
+                    "topic": topic_str,
+                    "summary": "(research did not converge on this topic)",
                     "patterns": [],
                     "file_map": {},
                     "dependencies": [],
-                    # Marker consumed by _summarize_findings and
-                    # _format_findings to drop this sentinel from
-                    # LLM-facing summaries. The entry is still kept in
-                    # state["findings"] so the manager's topic-coverage
-                    # bookkeeping sees the attempt.
+                    # Marker consumed by _summarize_findings,
+                    # _format_findings, _save_exploration_artifacts, and
+                    # export.format_export_markdown to drop this sentinel
+                    # from every LLM-facing or human-facing render path.
                     "error": True,
+                    # Structured diagnostic fields — explicit, no free-text
+                    # exception messages. The class name is the most you
+                    # should ever surface to a downstream consumer.
+                    "error_class": type(e).__name__,
+                    "error_topic": topic_str,
                 }
             ]
 

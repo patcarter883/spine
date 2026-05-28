@@ -126,37 +126,34 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "cli/__init__.py::index, spine/config.py::SpineConfig\"\n\n"
         "Use MCP tools to look up these specific symbols — get their source, "
         "dependencies, and dependents. Never guess their interfaces.\n\n"
-        "## Codebase navigation — USE MCP TOOLS FIRST\n"
-        "You have MCP codebase index tools for efficient structural navigation. "
-        "These answer symbol-level questions in sub-millisecond time with "
-        "minimal token usage — ALWAYS use them before reading files.\n\n"
+        "## Codebase navigation — USE `codebase_query` FIRST\n"
+        "You have ONE structural navigation tool, `codebase_query`. It "
+        "answers symbol-level questions in sub-millisecond time — ALWAYS "
+        "use it before reading files.\n\n"
         "### Batching and Parallel Tool Calling (CRITICAL)\n"
         "- **NEVER query symbols, function sources, or files sequentially turn-by-turn.** "
         "If you need to look up 3 function sources or search multiple directories, generate "
         "all those tool calls in parallel in a SINGLE response. This is highly efficient and avoids wasting turns.\n"
         "- **Plan your queries:** In your first turn, identify all symbols named in your "
         "topic, and issue ALL lookup calls in parallel, instead of requesting them one-by-one sequentially.\n\n"
-        "| Question | Tool to use |\n"
-        "|----------|-------------|\n"
-        "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
-        "| What does function X call? | `mcp_codebase-index_get_dependencies` |\n"
-        "| Who calls function X? | `mcp_codebase-index_get_dependents` |\n"
-        "| Show me function X's code | `mcp_codebase-index_get_function_source` |\n"
-        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n\n"
+        "| Question | Call |\n"
+        "|----------|------|\n"
+        '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
+        '| Show me X\'s source | `codebase_query(action="get_source", name="X")` |\n'
+        '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
+        '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
+        '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
         "## Tool surface\n"
-        "### Primary (use these FIRST)\n"
-        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type). "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_function_source` — get full function source. "
-        'Call with `{"name": "func_name"}`.\n'
-        "- `mcp_codebase-index_get_dependencies` — what a symbol calls/uses. "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol. "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_search_codebase` — regex search across all files. "
-        'Call with `{"pattern": "regex", "max_results": 20}`. Output is capped to ~8 KB / 50 hits; '
-        "refine the regex (anchors, file globs) rather than retrying naively.\n\n"
-        "### Fallback (only when MCP tools don't have what you need)\n"
+        "### Primary (use this FIRST)\n"
+        "- `codebase_query` — single tool, five actions. Pick `action`, "
+        "fill the one argument it needs:\n"
+        "  - `find_symbol`, `get_source`, `get_dependencies`, `get_dependents` "
+        "all take `name` (clean identifier — no whitespace, no module prefix, "
+        "no parentheses).\n"
+        "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
+        "50 hits — refine with anchors / file globs rather than retrying naively.\n"
+        "  - `name` and `pattern` are mutually exclusive. Do NOT pass both.\n\n"
+        "### Fallback (only when `codebase_query` doesn't have what you need)\n"
         "- `ast_extract_symbol` — fetch a single named symbol's body from the "
         "vector index (filesystem fallback when the symbol isn't indexed yet). "
         "Use when you know the symbol name and want the body straight from disk.\n"
@@ -168,20 +165,24 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- **NEVER** use absolute paths like `/home/user/project/...` — they "
         "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
         "## Research workflow (3-5 turns)\n"
-        "1. **Look up all symbols from your topic (1 turn):** Call "
-        "`mcp_codebase-index_get_function_source` for EVERY symbol named "
-        "in your research topic. Call `mcp_codebase-index_get_dependencies` "
-        "to trace relationships. Do ALL lookups in parallel in a single turn.\n"
-        "2. **Targeted follow-up (1 turn):** If the dependencies reveal more "
-        "relevant symbols, look those up too. Call `mcp_codebase-index_get_dependents` "
-        "to understand what calls a key function.\n"
-        "3. **Fallback search only if needed (0-1 turns):** If you need content-level "
-        "pattern matching the MCP tools don't provide, use `search_codebase`. "
-        "This should be RARE — MCP tools cover 90% of research needs.\n"
-        "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
-        "summarize key facts, signatures, conventions, and patterns.\n\n"
+        "1. **Look up all symbols from your topic (1 turn):** For EVERY "
+        "symbol named in your research topic, issue "
+        "`codebase_query(action=\"get_source\", name=...)` and "
+        "`codebase_query(action=\"get_dependencies\", name=...)` in parallel "
+        "in a single turn.\n"
+        "2. **Targeted follow-up (1 turn):** If the dependencies reveal "
+        "more relevant symbols, look those up too. Use "
+        "`codebase_query(action=\"get_dependents\", name=...)` to "
+        "understand what calls a key function.\n"
+        "3. **Fallback search only if needed (0-1 turns):** If you need "
+        "content-level pattern matching, use "
+        "`codebase_query(action=\"search\", pattern=...)`. This should be "
+        "RARE — the symbol actions cover 90% of research needs.\n"
+        "4. **Synthesize (1 turn):** Report findings. Do NOT include raw "
+        "file contents — summarize key facts, signatures, conventions, "
+        "and patterns.\n\n"
         "## Hard limits\n"
-        "- You MUST look up every symbol named in your topic before falling back to search_codebase.\n"
+        "- You MUST look up every symbol named in your topic before falling back to search.\n"
         "- Your file_map MUST contain at least 1 entry.\n"
         "- Your summary MUST be at least 2 sentences.\n"
         "- Total turns: 3-5. More than 5 calls without producing "
@@ -214,37 +215,34 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "cli/__init__.py::index, spine/config.py::SpineConfig\"\n\n"
         "Use MCP tools to look up these specific symbols — get their source, "
         "dependencies, and dependents. Never guess their interfaces.\n\n"
-        "## Codebase navigation — USE MCP TOOLS FIRST\n"
-        "You have MCP codebase index tools for efficient structural navigation. "
-        "These answer symbol-level questions in sub-millisecond time with "
-        "minimal token usage — ALWAYS use them before reading files.\n\n"
+        "## Codebase navigation — USE `codebase_query` FIRST\n"
+        "You have ONE structural navigation tool, `codebase_query`. It "
+        "answers symbol-level questions in sub-millisecond time — ALWAYS "
+        "use it before reading files.\n\n"
         "### Batching and Parallel Tool Calling (CRITICAL)\n"
         "- **NEVER query symbols, function sources, or files sequentially turn-by-turn.** "
         "If you need to look up 3 function sources or search multiple directories, generate "
         "all those tool calls in parallel in a SINGLE response. This is highly efficient and avoids wasting turns.\n"
         "- **Plan your queries:** In your first turn, identify all symbols named in your "
         "topic, and issue ALL lookup calls in parallel, instead of requesting them one-by-one sequentially.\n\n"
-        "| Question | Tool to use |\n"
-        "|----------|-------------|\n"
-        "| Where is X defined? | `mcp_codebase-index_find_symbol` |\n"
-        "| What does function X call? | `mcp_codebase-index_get_dependencies` |\n"
-        "| Who calls function X? | `mcp_codebase-index_get_dependents` |\n"
-        "| Show me function X's code | `mcp_codebase-index_get_function_source` |\n"
-        "| Search for pattern X everywhere | `mcp_codebase-index_search_codebase` |\n\n"
+        "| Question | Call |\n"
+        "|----------|------|\n"
+        '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
+        '| Show me X\'s source | `codebase_query(action="get_source", name="X")` |\n'
+        '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
+        '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
+        '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
         "## Tool surface\n"
-        "### Primary (use these FIRST)\n"
-        "- `mcp_codebase-index_find_symbol` — locate symbol definition (file, line, type). "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_function_source` — get full function source. "
-        'Call with `{"name": "func_name"}`.\n'
-        "- `mcp_codebase-index_get_dependencies` — what a symbol calls/uses. "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_get_dependents` — what calls/uses a symbol. "
-        'Call with `{"name": "symbol_name"}`.\n'
-        "- `mcp_codebase-index_search_codebase` — regex search across all files. "
-        'Call with `{"pattern": "regex", "max_results": 20}`. Output is capped to ~8 KB / 50 hits; '
-        "refine the regex (anchors, file globs) rather than retrying naively.\n\n"
-        "### Fallback (only when MCP tools don't have what you need)\n"
+        "### Primary (use this FIRST)\n"
+        "- `codebase_query` — single tool, five actions. Pick `action`, "
+        "fill the one argument it needs:\n"
+        "  - `find_symbol`, `get_source`, `get_dependencies`, `get_dependents` "
+        "all take `name` (clean identifier — no whitespace, no module prefix, "
+        "no parentheses).\n"
+        "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
+        "50 hits — refine with anchors / file globs rather than retrying naively.\n"
+        "  - `name` and `pattern` are mutually exclusive. Do NOT pass both.\n\n"
+        "### Fallback (only when `codebase_query` doesn't have what you need)\n"
         "- `ast_extract_symbol` — fetch a single named symbol's body from the "
         "vector index (filesystem fallback when the symbol isn't indexed yet). "
         "Use when you know the symbol name and want the body straight from disk.\n"
@@ -256,20 +254,23 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         "- **NEVER** use absolute paths like `/home/user/project/...` — they "
         "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
         "## Research workflow (3-5 turns)\n"
-        "1. **Look up all symbols from your topic (1 turn):** Call "
-        "`mcp_codebase-index_get_function_source` for EVERY symbol named "
-        "in your research topic. Call `mcp_codebase-index_get_dependencies` "
-        "to trace relationships. Do ALL lookups in parallel in a single turn.\n"
-        "2. **Targeted follow-up (1 turn):** If the dependencies reveal more "
-        "relevant symbols, look those up too. Call `mcp_codebase-index_get_dependents` "
-        "to understand what calls a key function.\n"
-        "3. **Fallback search only if needed (0-1 turns):** If you need content-level "
-        "pattern matching the MCP tools don't provide, use `search_codebase`. "
-        "This should be RARE — MCP tools cover 90% of research needs.\n"
+        "1. **Look up all symbols from your topic (1 turn):** For EVERY "
+        "symbol named in your research topic, issue "
+        "`codebase_query(action=\"get_source\", name=...)` and "
+        "`codebase_query(action=\"get_dependencies\", name=...)` in parallel "
+        "in a single turn.\n"
+        "2. **Targeted follow-up (1 turn):** If the dependencies reveal "
+        "more relevant symbols, look those up too. Use "
+        "`codebase_query(action=\"get_dependents\", name=...)` to "
+        "understand what calls a key function.\n"
+        "3. **Fallback search only if needed (0-1 turns):** If you need "
+        "content-level pattern matching, use "
+        "`codebase_query(action=\"search\", pattern=...)`. This should be "
+        "RARE — the symbol actions cover 90% of research needs.\n"
         "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
         "summarize key facts, signatures, conventions, and patterns.\n\n"
         "## Hard limits\n"
-        "- You MUST look up every symbol named in your topic before falling back to search_codebase.\n"
+        "- You MUST look up every symbol named in your topic before falling back to search.\n"
         "- Your file_map MUST contain at least 1 entry.\n"
         "- Your summary MUST be at least 2 sentences.\n"
         "- Total turns: 3-5. More than 5 calls without producing "
@@ -502,9 +503,25 @@ def _inject_mcp_tools(
             workspace_root=workspace_root,
         )
         if subagent_name == "researcher":
-            mcp_tools = [t for t in mcp_tools if t.name in _RESEARCHER_MCP_ALLOWLIST]
+            # Researcher gets ONE consolidated codebase_query tool instead of
+            # the 5 individual MCP wrappers. Collapsing the surface area
+            # eliminates the wrong-key / invented-arg failure class observed
+            # in trace 019e6cc4 (23/23 research branches failed with
+            # malformed args). The MCP tools themselves stay loaded in the
+            # cache so other subagents (slice-implementer) still get them.
+            from spine.agents.tools.codebase_query import CodebaseQueryTool
+
+            mcp_tools = [
+                CodebaseQueryTool(
+                    workspace_root=workspace_root,
+                    mcp_servers=config.mcp_servers,
+                )
+            ]
         tools.extend(mcp_tools)
-        logger.debug("Injected %d MCP tools into %s subagent", len(mcp_tools), subagent_name)
+        logger.info(
+            "Injected %d MCP-related tools into %s subagent: %s",
+            len(mcp_tools), subagent_name, [t.name for t in mcp_tools],
+        )
     except Exception:
         logger.debug("MCP tool injection skipped for %s subagent", subagent_name, exc_info=True)
 
@@ -774,8 +791,36 @@ def build_subagent_spec(
     # 8 KB cap on `mcp_codebase-index_search_codebase` output.
     subagent_middleware: list[Any] = []
     if name == "researcher":
-        from spine.agents.context_editing import ToolOutputTrimmer
+        import os as _os
+
+        from spine.agents.context_editing import (
+            ResearcherConvergenceMiddleware,
+            ToolOutputTrimmer,
+        )
+        from spine.config import SpineConfig
+
         subagent_middleware.append(ToolOutputTrimmer(max_full_tool_results=8))
+
+        _convergence_enabled = _os.getenv(
+            "SPINE_RESEARCHER_CONVERGENCE", "true"
+        ).lower() not in ("0", "false", "no")
+        if _convergence_enabled:
+            conv_cfg = SpineConfig.load().convergence
+            subagent_middleware.append(
+                ResearcherConvergenceMiddleware(
+                    soft_threshold=conv_cfg.researcher_soft,
+                    hard_threshold=conv_cfg.researcher_hard,
+                    recursion_limit=conv_cfg.researcher_recursion_limit,
+                )
+            )
+            logger.info(
+                "ResearcherConvergence: enabled (soft=%d hard=%d recursion_limit=%d)",
+                conv_cfg.researcher_soft,
+                conv_cfg.researcher_hard,
+                conv_cfg.researcher_recursion_limit,
+            )
+        else:
+            logger.info("ResearcherConvergence: DISABLED (SPINE_RESEARCHER_CONVERGENCE env)")
 
     spec: dict[str, Any] = {
         "name": name,
