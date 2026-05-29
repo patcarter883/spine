@@ -1,16 +1,27 @@
 """Read-edit-lint compound tool for the slice-implementer subagent.
 
-Replaces ``write_file`` + ``edit_file`` with a single tool that:
+Replaces ``write_file`` + ``edit_file`` with a single tool that resolves an
+edit in memory, runs a language-specific syntax check on the proposed new
+content, and only writes (atomically) when the check passes. On failure it
+returns a structured status WITHOUT touching disk so the model can correct
+and retry in-loop.
 
-1. Resolves the edit in memory (either an exact ``old_str`` → ``new_str``
-   substitution, or a ``full_replace`` rewrite).
-2. Runs a language-specific syntax check on the proposed new content.
-3. On pass, writes atomically. On fail, returns a syntax-error report
-   WITHOUT touching disk so the model can correct and retry.
+Four mutually-exclusive edit modes:
+
+1. ``old_str`` → ``new_str`` — exact, single-occurrence find-and-replace.
+2. ``full_replace`` — whole-file rewrite (also creates new files).
+3. ``edits`` — a batch of find-and-replace ops applied in order to one file,
+   **all-or-nothing**: the new content is built entirely in memory and only
+   written if every edit matches and the result passes the syntax check.
+4. ``start_line`` + ``end_line`` + ``replacement`` — line-range replacement,
+   anchored on current 1-indexed line numbers (token-efficient, and
+   disambiguates snippets that repeat in the file). An optional ``expected``
+   field guards against stale line numbers by verifying the current text of
+   the range before applying — borrowed from hashline's snapshot-verify idea.
 
 The exact-match contract on ``old_str`` mirrors Anthropic's ``str_replace``:
-no regex, no fuzzy matching, fail loudly if the snippet is missing or
-appears more than once.
+no regex, no fuzzy matching, fail loudly if the snippet is missing or appears
+more than once.
 """
 
 from __future__ import annotations
@@ -39,6 +50,18 @@ _LINT_LANG_BY_EXT: dict[str, str] = {
 }
 
 
+class FindReplaceEdit(BaseModel):
+    """A single exact find-and-replace operation within a batch."""
+
+    old_str: str = Field(
+        description="Exact string to replace. Must match exactly once in the working buffer."
+    )
+    new_str: str = Field(
+        default="",
+        description="Replacement string (may be empty to delete old_str).",
+    )
+
+
 class ReadEditLintInput(BaseModel):
     """Input schema for :class:`ReadEditLintTool`."""
 
@@ -49,7 +72,7 @@ class ReadEditLintInput(BaseModel):
         default=None,
         description=(
             "Exact string to replace. Must appear EXACTLY ONCE in the current file. "
-            "Pair with new_str. Mutually exclusive with full_replace."
+            "Pair with new_str. Mutually exclusive with the other edit modes."
         ),
     )
     new_str: Optional[str] = Field(
@@ -60,7 +83,40 @@ class ReadEditLintInput(BaseModel):
         default=None,
         description=(
             "Full file content to write (creates the file if absent). "
-            "Mutually exclusive with old_str/new_str."
+            "Mutually exclusive with the other edit modes."
+        ),
+    )
+    edits: Optional[list[FindReplaceEdit]] = Field(
+        default=None,
+        description=(
+            "Batch of exact find-and-replace edits applied IN ORDER to one file, "
+            "all-or-nothing: if any edit fails to match (or the result fails the "
+            "syntax check) nothing is written. Each edit must match exactly once "
+            "in the buffer at the time it is applied. Mutually exclusive with the "
+            "other edit modes."
+        ),
+    )
+    start_line: Optional[int] = Field(
+        default=None,
+        description="1-indexed first line of the range to replace (line-range mode).",
+    )
+    end_line: Optional[int] = Field(
+        default=None,
+        description="1-indexed last line of the range to replace, inclusive (line-range mode).",
+    )
+    replacement: Optional[str] = Field(
+        default=None,
+        description=(
+            "New text for lines start_line..end_line (line-range mode). "
+            "Empty string deletes the range. Mutually exclusive with the other modes."
+        ),
+    )
+    expected: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional staleness guard for line-range mode: the text you expect to "
+            "currently occupy start_line..end_line. If it no longer matches, the "
+            "edit is rejected as `stale` (re-read and retry) instead of applied."
         ),
     )
 
@@ -150,24 +206,154 @@ def _dispatch_lint(file_path: str, source: str) -> Optional[str]:
     return None
 
 
+# ── In-memory edit resolvers ────────────────────────────────────────
+# Each returns ``(new_content, None)`` on success or ``(None, error_payload)``
+# on failure, where error_payload is a kwargs dict for :func:`_result`.
+
+
+def _apply_find_replace(
+    current: str, old_str: str, new_str: str, file_path: str
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Resolve a single exact find-and-replace against ``current``."""
+    occurrences = current.count(old_str)
+    if occurrences == 0:
+        return None, {
+            "status": "no_match",
+            "detail": (
+                f"old_str not found in {file_path}. "
+                "Include more surrounding context to make the snippet unique."
+            ),
+        }
+    if occurrences > 1:
+        return None, {
+            "status": "ambiguous_match",
+            "detail": (
+                f"old_str matches {occurrences} locations in {file_path}. "
+                "Include more surrounding context to make the snippet unique."
+            ),
+        }
+    return current.replace(old_str, new_str, 1), None
+
+
+def _edit_pair(edit: Any) -> tuple[Optional[str], str]:
+    """Extract ``(old_str, new_str)`` from a batch item (model or dict)."""
+    if isinstance(edit, dict):
+        old = edit.get("old_str")
+        new = edit.get("new_str")
+    else:
+        old = getattr(edit, "old_str", None)
+        new = getattr(edit, "new_str", None)
+    return old, (new or "")
+
+
+def _apply_batch(
+    current: str, edits: list[Any], file_path: str
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Apply a batch of find-and-replace edits in order, all-or-nothing.
+
+    Each edit matches against the running buffer (so later edits see the
+    results of earlier ones). Any miss aborts the whole batch with the
+    offending ``edit_index``; nothing is written.
+    """
+    if not edits:
+        return None, {"status": "input_error", "detail": "edits must be a non-empty list."}
+    buffer = current
+    for index, edit in enumerate(edits):
+        old_str, new_str = _edit_pair(edit)
+        if old_str is None:
+            return None, {
+                "status": "input_error",
+                "detail": f"edits[{index}] is missing old_str.",
+                "edit_index": index,
+            }
+        occurrences = buffer.count(old_str)
+        if occurrences == 0:
+            return None, {
+                "status": "no_match",
+                "detail": (
+                    f"edits[{index}] old_str not found in {file_path} "
+                    "(after applying earlier edits). Add surrounding context."
+                ),
+                "edit_index": index,
+            }
+        if occurrences > 1:
+            return None, {
+                "status": "ambiguous_match",
+                "detail": (
+                    f"edits[{index}] old_str matches {occurrences} locations in "
+                    f"{file_path}. Add surrounding context to make it unique."
+                ),
+                "edit_index": index,
+            }
+        buffer = buffer.replace(old_str, new_str, 1)
+    return buffer, None
+
+
+def _apply_line_range(
+    current: str,
+    start_line: Optional[int],
+    end_line: Optional[int],
+    replacement: Optional[str],
+    expected: Optional[str],
+    file_path: str,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Replace 1-indexed lines ``start_line..end_line`` with ``replacement``."""
+    if start_line is None or end_line is None or replacement is None:
+        return None, {
+            "status": "input_error",
+            "detail": "start_line, end_line, and replacement are all required for line-range edits.",
+        }
+    lines = current.splitlines(keepends=True)
+    n_lines = len(lines)
+    if start_line < 1 or end_line < start_line or end_line > n_lines:
+        return None, {
+            "status": "range_error",
+            "detail": f"Invalid range {start_line}..{end_line} for {file_path} ({n_lines} lines).",
+        }
+
+    current_range = "".join(lines[start_line - 1 : end_line])
+    if expected is not None and current_range.rstrip("\n") != expected.rstrip("\n"):
+        return None, {
+            "status": "stale",
+            "detail": (
+                f"Lines {start_line}..{end_line} of {file_path} no longer match "
+                "`expected` — re-read the file and retry."
+            ),
+            "found": current_range,
+        }
+
+    before = "".join(lines[: start_line - 1])
+    after = "".join(lines[end_line:])
+    # Keep the file well-formed: if there is content after the range, or the
+    # last replaced line ended in a newline, ensure the replacement does too.
+    range_had_trailing_nl = lines[end_line - 1].endswith("\n")
+    if replacement and not replacement.endswith("\n") and (after or range_had_trailing_nl):
+        replacement = replacement + "\n"
+    return before + replacement + after, None
+
+
 class ReadEditLintTool(BaseTool):
     """Single write surface for the slice-implementer subagent.
 
-    Either:
-    - Substitute ``old_str`` → ``new_str`` (exact match, single occurrence), or
-    - Replace the entire file with ``full_replace``.
-
-    Then run a syntax check; only write to disk on success. On failure,
-    return ``{"status": "syntax_error", ...}`` and leave the file untouched.
+    Exactly one edit mode per call: ``old_str``/``new_str`` find-and-replace,
+    ``full_replace`` whole-file rewrite, an ``edits`` batch, or a
+    ``start_line``/``end_line``/``replacement`` line-range edit. After
+    resolving the edit in memory the tool runs a syntax check and only writes
+    to disk on success. On failure it returns a structured status
+    (``no_match`` / ``ambiguous_match`` / ``syntax_error`` / ``stale`` / …) and
+    leaves the file untouched.
     """
 
     name: str = "read_edit_lint"
     description: str = (
-        "Edit or create a file with a built-in syntax check. "
-        "Pass either old_str+new_str (exact find-and-replace, single occurrence) "
-        "OR full_replace (whole-file content). On a syntax error the write is "
-        "rejected without modifying the file — fix the snippet and call again. "
-        "Use this in place of write_file/edit_file."
+        "Edit or create a file with a built-in syntax check. Pass exactly ONE "
+        "edit mode: old_str+new_str (single-occurrence find-and-replace); "
+        "full_replace (whole-file content); edits (a batch of find-and-replace "
+        "ops applied atomically — all-or-nothing); or start_line+end_line+"
+        "replacement (line-range edit, with optional `expected` staleness "
+        "guard). On a syntax error or failed match the write is rejected "
+        "without modifying the file — fix and call again. Use this in place of "
+        "write_file/edit_file."
     )
     args_schema: Optional[ArgsSchema] = ReadEditLintInput
 
@@ -185,60 +371,71 @@ class ReadEditLintTool(BaseTool):
         old_str: Optional[str] = None,
         new_str: Optional[str] = None,
         full_replace: Optional[str] = None,
+        edits: Optional[list[Any]] = None,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        replacement: Optional[str] = None,
+        expected: Optional[str] = None,
     ) -> str:
-        # ── Validate the input shape ────────────────────────────────
-        has_replace = full_replace is not None
-        has_edit = old_str is not None or new_str is not None
-        if has_replace and has_edit:
+        # ── Determine the active mode (exactly one) ─────────────────
+        active: list[str] = []
+        if full_replace is not None:
+            active.append("full_replace")
+        if old_str is not None or new_str is not None:
+            active.append("find_replace")
+        if edits is not None:
+            active.append("edits")
+        if start_line is not None or end_line is not None or replacement is not None or expected is not None:
+            active.append("line_range")
+        if not active:
             return _result(
                 "input_error",
-                detail="Pass either full_replace OR old_str+new_str, not both.",
+                detail=(
+                    "Pass exactly one edit mode: full_replace; old_str+new_str; "
+                    "edits; or start_line+end_line+replacement."
+                ),
             )
-        if not has_replace and not has_edit:
+        if len(active) > 1:
             return _result(
                 "input_error",
-                detail="Pass either full_replace OR both old_str and new_str.",
+                detail=f"Pass exactly one edit mode, but several were provided: {active}.",
             )
-        if has_edit and (old_str is None or new_str is None):
-            return _result(
-                "input_error",
-                detail="old_str AND new_str are both required for find-and-replace.",
-            )
+        mode = active[0]
 
         path = self._resolve_path(file_path)
         existed = path.exists()
 
-        # ── Build the new content in memory ─────────────────────────
-        if has_replace:
+        # ── Build the new content in memory per mode ────────────────
+        if mode == "full_replace":
             new_content = full_replace or ""
         else:
             if not existed:
                 return _result(
                     "not_found",
-                    detail=f"Cannot find-and-replace in {file_path}: file does not exist.",
+                    detail=f"Cannot edit {file_path}: file does not exist.",
                 )
             try:
                 current = path.read_text(encoding="utf-8")
             except OSError as exc:
                 return _result("io_error", detail=f"Could not read {file_path}: {exc}")
-            occurrences = current.count(old_str or "")
-            if occurrences == 0:
-                return _result(
-                    "no_match",
-                    detail=(
-                        f"old_str not found in {file_path}. "
-                        "Include more surrounding context to make the snippet unique."
-                    ),
+
+            if mode == "find_replace":
+                if old_str is None or new_str is None:
+                    return _result(
+                        "input_error",
+                        detail="old_str AND new_str are both required for find-and-replace.",
+                    )
+                new_content, error = _apply_find_replace(current, old_str, new_str, file_path)
+            elif mode == "edits":
+                new_content, error = _apply_batch(current, edits or [], file_path)
+            else:  # line_range
+                new_content, error = _apply_line_range(
+                    current, start_line, end_line, replacement, expected, file_path
                 )
-            if occurrences > 1:
-                return _result(
-                    "ambiguous_match",
-                    detail=(
-                        f"old_str matches {occurrences} locations in {file_path}. "
-                        "Include more surrounding context to make the snippet unique."
-                    ),
-                )
-            new_content = current.replace(old_str or "", new_str or "", 1)
+
+            if error is not None:
+                return _result(**error)
+            assert new_content is not None
 
         # ── Lint the proposed content ───────────────────────────────
         lint_error = _dispatch_lint(file_path, new_content)
@@ -270,5 +467,20 @@ class ReadEditLintTool(BaseTool):
         old_str: Optional[str] = None,
         new_str: Optional[str] = None,
         full_replace: Optional[str] = None,
+        edits: Optional[list[Any]] = None,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        replacement: Optional[str] = None,
+        expected: Optional[str] = None,
     ) -> str:
-        return self._run(file_path, old_str=old_str, new_str=new_str, full_replace=full_replace)
+        return self._run(
+            file_path,
+            old_str=old_str,
+            new_str=new_str,
+            full_replace=full_replace,
+            edits=edits,
+            start_line=start_line,
+            end_line=end_line,
+            replacement=replacement,
+            expected=expected,
+        )

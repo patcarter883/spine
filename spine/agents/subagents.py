@@ -279,12 +279,18 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "- `ast_extract_symbol` — fetch a single named symbol's source "
             "straight from the index. Use when you know the symbol name and "
             "want its body without reading the whole file.\n"
-            "- `read_edit_lint` — the ONLY write tool. Pass either "
-            "`old_str`+`new_str` (exact, single-occurrence find-and-replace) "
-            "OR `full_replace` (whole-file content). The tool runs a syntax "
-            "check before writing — on a syntax error it returns "
-            "`{\"status\":\"syntax_error\",...}` and the file is left "
-            "untouched. Fix the snippet and call again.\n"
+            "- `read_edit_lint` — the ONLY write tool. Pass exactly ONE edit "
+            "mode: `old_str`+`new_str` (exact, single-occurrence "
+            "find-and-replace); `full_replace` (whole-file content); `edits` "
+            "(a batch of find-and-replace ops applied ATOMICALLY — all-or-"
+            "nothing, prefer this to make several changes to one file in a "
+            "single call); or `start_line`+`end_line`+`replacement` (replace a "
+            "line range — token-efficient and disambiguates repeated snippets; "
+            "pass `expected` with the current range text to guard against stale "
+            "line numbers). The tool runs a syntax check before writing — on a "
+            "syntax error or failed match it returns "
+            "`{\"status\":\"syntax_error\",...}` (or `no_match`/`ambiguous_match`"
+            "/`stale`) and the file is left untouched. Fix and call again.\n"
             "- `ls`, `glob`, `grep` — directory listing and text search.\n"
             "- `execute` — run shell commands (tests, linters, builds).",
         )
@@ -676,23 +682,18 @@ def build_subagent_spec(
     phase: PhaseName,
     state: WorkflowState,
     config: RunnableConfig | None = None,
-    *,
-    extra_skills: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a dict SubAgent spec for a SPINE subagent.
 
-    Resolves model, memory, and skills from the same sources as the parent
-    phase agent so there is no duplication.  The returned dict is ready to
-    pass directly into ``create_deep_agent(subagents=[...])``.
+    Resolves model and memory from the same sources as the parent phase
+    agent so there is no duplication.  The returned dict is ready to pass
+    directly into ``create_deep_agent(subagents=[...])``.
 
     Args:
         name: Subagent name (e.g. ``"researcher"``).
         phase: The parent phase (used for model resolution fallback).
         state: The current workflow state.
         config: LangGraph runtime config.
-        extra_skills: Additional skill directories to load for this subagent.
-            These are merged on top of any default skills the subagent type
-            would normally receive.
 
     Returns:
         A dictionary matching the DA ``SubAgent`` spec.
@@ -722,9 +723,6 @@ def build_subagent_spec(
 
     # ── Memory: include project AGENTS.md (skip for TASKS/CRITIC phases) ──
     memory = resolve_memory(workspace_root, phase=phase.value)
-
-    # ── Skills: default per subagent type + any extra ─────────────
-    skills = _resolve_subagent_skills(name, phase, workspace_root, extra_skills)
 
     # ── Tools: resolve string names to actual BaseTool instances ──
     # The SubAgent spec requires actual tool instances (BaseTool | Callable | dict),
@@ -844,60 +842,12 @@ def build_subagent_spec(
             )
     if memory:
         spec["memory"] = memory
-    if skills:
-        spec["skills"] = skills
 
     logger.debug(
-        "Built subagent spec %r for phase %s (model=%s, skills=%s)",
+        "Built subagent spec %r for phase %s (model=%s)",
         name,
         phase.value,
         model if isinstance(model, str) else type(model).__name__,
-        skills,
     )
 
     return spec
-
-
-def _resolve_subagent_skills(
-    name: str,
-    phase: PhaseName,
-    workspace_root: str,
-    extra_skills: list[str] | None = None,
-) -> list[str]:
-    """Resolve the skill list for a subagent.
-
-    Default skills are defined per subagent type.  Extra skills (from task
-    complexity analysis or explicit config) are appended.
-
-    Args:
-        name: Subagent name.
-        phase: Parent phase (for resolving phase-specific skills).
-        workspace_root: Project root for finding skill directories.
-        extra_skills: Additional skill directories to include.
-
-    Returns:
-        List of absolute skill directory paths.
-    """
-    from spine.agents.skills_resolver import resolve_skills
-
-    # Phase-specific skills are resolved for the subagent's parent phase.
-    # Most subagents get no phase skills — they are focused workers.
-    default_skills: list[str] = []
-
-    if name == "slice-verifier":
-        # The verifier benefits from code-review skills (VERIFY phase has this)
-        phase_skills = resolve_skills(
-            phase=phase.value,
-            workspace_root=workspace_root,
-        )
-        default_skills = phase_skills
-
-    # Merge extra skills (deduplicated, preserving order)
-    seen: set[str] = set()
-    merged: list[str] = []
-    for s in default_skills + list(extra_skills or []):
-        if s not in seen:
-            seen.add(s)
-            merged.append(s)
-
-    return merged

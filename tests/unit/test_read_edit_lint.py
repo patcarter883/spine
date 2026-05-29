@@ -141,3 +141,166 @@ def test_leading_slash_resolves_workspace_relative(workspace: Path) -> None:
     )
     assert out["status"] == "ok"
     assert (workspace / "src" / "leading_slash.py").exists()
+
+
+# ── Batch edits (all-or-nothing) ────────────────────────────────────
+
+
+def test_batch_edits_apply_in_order(workspace: Path) -> None:
+    target = workspace / "src" / "batch.py"
+    target.write_text("a = 1\nb = 2\nc = 3\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/batch.py",
+            edits=[
+                {"old_str": "a = 1", "new_str": "a = 10"},
+                {"old_str": "c = 3", "new_str": "c = 30"},
+            ],
+        )
+    )
+    assert out["status"] == "ok"
+    assert target.read_text() == "a = 10\nb = 2\nc = 30\n"
+
+
+def test_batch_edits_are_all_or_nothing(workspace: Path) -> None:
+    target = workspace / "src" / "atomic.py"
+    target.write_text("a = 1\nb = 2\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/atomic.py",
+            edits=[
+                {"old_str": "a = 1", "new_str": "a = 10"},
+                {"old_str": "not present", "new_str": "x"},
+            ],
+        )
+    )
+    assert out["status"] == "no_match"
+    assert out["edit_index"] == 1
+    # First edit must NOT have landed — the whole batch is rolled back.
+    assert target.read_text() == "a = 1\nb = 2\n"
+
+
+def test_batch_edit_sees_earlier_results(workspace: Path) -> None:
+    # The second edit targets text produced by the first.
+    target = workspace / "src" / "chain.py"
+    target.write_text("x = 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/chain.py",
+            edits=[
+                {"old_str": "x = 1", "new_str": "x = 2"},
+                {"old_str": "x = 2", "new_str": "x = 3"},
+            ],
+        )
+    )
+    assert out["status"] == "ok"
+    assert target.read_text() == "x = 3\n"
+
+
+def test_batch_rejected_when_result_has_syntax_error(workspace: Path) -> None:
+    target = workspace / "src" / "syn.py"
+    target.write_text("def f():\n    return 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/syn.py",
+            edits=[{"old_str": "    return 1", "new_str": "return 1"}],  # bad indent
+        )
+    )
+    assert out["status"] == "syntax_error"
+    assert target.read_text() == "def f():\n    return 1\n"
+
+
+# ── Line-range mode ─────────────────────────────────────────────────
+
+
+def test_line_range_replaces_lines(workspace: Path) -> None:
+    target = workspace / "src" / "range.py"
+    target.write_text("a = 1\nb = 2\nc = 3\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/range.py",
+            start_line=2,
+            end_line=2,
+            replacement="b = 20",
+        )
+    )
+    assert out["status"] == "ok"
+    assert target.read_text() == "a = 1\nb = 20\nc = 3\n"
+
+
+def test_line_range_deletes_when_replacement_empty(workspace: Path) -> None:
+    target = workspace / "src" / "del.py"
+    target.write_text("a = 1\nb = 2\nc = 3\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/del.py",
+            start_line=2,
+            end_line=2,
+            replacement="",
+        )
+    )
+    assert out["status"] == "ok"
+    assert target.read_text() == "a = 1\nc = 3\n"
+
+
+def test_line_range_out_of_bounds(workspace: Path) -> None:
+    target = workspace / "src" / "oob.py"
+    target.write_text("a = 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/oob.py",
+            start_line=1,
+            end_line=5,
+            replacement="x = 1",
+        )
+    )
+    assert out["status"] == "range_error"
+    assert target.read_text() == "a = 1\n"
+
+
+def test_line_range_expected_guard_rejects_stale(workspace: Path) -> None:
+    target = workspace / "src" / "stale.py"
+    target.write_text("a = 1\nb = 2\nc = 3\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/stale.py",
+            start_line=2,
+            end_line=2,
+            replacement="b = 20",
+            expected="something else",  # does not match current line 2
+        )
+    )
+    assert out["status"] == "stale"
+    assert target.read_text() == "a = 1\nb = 2\nc = 3\n"
+
+
+def test_line_range_expected_guard_allows_match(workspace: Path) -> None:
+    target = workspace / "src" / "fresh.py"
+    target.write_text("a = 1\nb = 2\nc = 3\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/fresh.py",
+            start_line=2,
+            end_line=2,
+            replacement="b = 20",
+            expected="b = 2",
+        )
+    )
+    assert out["status"] == "ok"
+    assert target.read_text() == "a = 1\nb = 20\nc = 3\n"
+
+
+def test_multiple_modes_rejected(workspace: Path) -> None:
+    target = workspace / "src" / "multi.py"
+    target.write_text("a = 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/multi.py",
+            old_str="a = 1",
+            new_str="a = 2",
+            start_line=1,
+            end_line=1,
+            replacement="a = 3",
+        )
+    )
+    assert out["status"] == "input_error"
