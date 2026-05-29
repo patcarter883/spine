@@ -150,6 +150,11 @@ def build_critic_agent(
         response_format=CriticReview,
         allowed_tools=[],
         skip_filesystem_middleware=True,
+        # CRITIC reads the reviewed phase's structured artifact and emits
+        # a CriticReview verdict. No code navigation; the MCP catalog
+        # would just give it tools that conflict with the empty
+        # allowed_tools filter. See trace 019e721d audit.
+        skip_default_mcp_injection=True,
     )
 
     return agent

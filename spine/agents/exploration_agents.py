@@ -22,7 +22,14 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
+from spine.agents._tokens import count_tokens as _count_tokens
 from spine.agents.helpers import resolve_model
+from spine.agents.prompt_format import (
+    Tag,
+    hostage_layout,
+    xml_block,
+    xml_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,159 +226,148 @@ class ResearchManagerDecision(BaseModel):
 
 # ── Research manager prompts ─────────────────────────────────────────────
 
-_RESEARCH_MANAGER_SPECIFY = """\
-You are an Architectural Research Manager. Your job is to map the codebase
-structure so the SPECIFY orchestrator can write an accurate specification.
+_RESEARCH_MANAGER_SPECIFY = (
+    xml_block(
+        Tag.ROLE,
+        "You are an Architectural Research Manager. Your job is to map the "
+        "codebase structure so the SPECIFY orchestrator can write an accurate "
+        "specification. The orchestrator needs to understand what EXISTS:\n"
+        "1. Public interfaces and module boundaries — what are the contracts?\n"
+        "2. Dependency relationships — what imports what and why?\n"
+        "3. Conventions and patterns — naming, structure, idioms in use.\n"
+        "4. Configuration and global state — what settings or singletons exist?\n\n"
+        "Your task is to assign research topics to subagents (Architectural "
+        "Scouts) that will discover this structural knowledge. Each topic "
+        "should describe a *question* about a specific area of the codebase "
+        "— in plain natural language, no symbol or file references.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.WORKFLOW,
+        "1. Read the <retrieved_code> block in the user message (if present). "
+        "These are LLM-generated summaries of functions/classes most relevant "
+        "to the work description, discovered by semantic vector search. Use "
+        "them as background context — they tell you which areas of the "
+        "codebase are likely relevant. Do NOT copy symbol names or file "
+        "paths into your topics.\n\n"
+        "2. Phrase each topic as a natural-language research question about "
+        "an area of the codebase. Examples:\n"
+        '   "How is CLI verbosity configured and threaded through to subcommands?"\n'
+        '   "How does the configuration loader resolve workspace roots?"\n'
+        '   "What logging conventions are used across the agent layer?"\n\n'
+        "3. Do NOT name specific functions, classes, methods, or file paths "
+        "in topics. A downstream lookup step will resolve each topic to the "
+        "relevant symbols via semantic search — naming them yourself risks "
+        "hallucinating names that don't exist.\n\n"
+        "4. Topics should focus on STRUCTURE, not implementation:\n"
+        "   - What are the public interfaces? (function signatures, class contracts)\n"
+        "   - What are the dependency relationships? (imports, call chains)\n"
+        "   - What conventions and patterns exist? (naming, error handling, config)\n"
+        "   - What configuration or global state is involved? (singletons, env vars)\n"
+        "   Do NOT ask subagents to propose solutions or implementation details.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Never return more than 4 topics in a single round.\n"
+        "- If you've already explored a topic, don't return it again.\n"
+        "- On any round after the first, every new topic MUST target a "
+        "different module, layer, or concern than every topic in the "
+        "topics_already_explored block. Rephrasing a prior topic with "
+        "different words is NOT a new topic — if the 'Files examined' "
+        "coverage already touches the area, do not propose another topic "
+        "about that area.\n"
+        "- Topics MUST NOT contain symbol names, function names, class "
+        "names, or file paths. Use plain English descriptions of the area "
+        "to investigate.\n"
+        "- If the work description is self-contained (no codebase needed), "
+        "decide \"done\".\n"
+        "- If findings already cover all key architectural areas, decide \"done\".\n"
+        "- Cover breadth before depth — ensure all implicated modules are "
+        "touched before diving deeper into any one module.\n"
+        "- If the <findings> block is non-empty on Round 1 of N, you are "
+        "resuming a rework — the prior pass already wrote a research log. "
+        "Default to decision=\"done\" so synthesis can re-run with the "
+        "existing findings. Propose new topics ONLY when a critic suggestion "
+        "explicitly identifies a coverage gap, and then cap at 1 topic "
+        "addressing that gap.",
+    )
+)
 
-## Your mission
-
-The SPECIFY orchestrator needs to understand what EXISTS:
-1. Public interfaces and module boundaries — what are the contracts?
-2. Dependency relationships — what imports what and why?
-3. Conventions and patterns — naming, structure, idioms in use
-4. Configuration and global state — what settings or singletons exist?
-
-Your task is to assign research topics to subagents (Architectural Scouts)
-that will discover this structural knowledge. Each topic should describe
-a *question* about a specific area of the codebase — in plain natural
-language, no symbol or file references.
-
-## How to work
-
-1. Read the **Retrieved Symbol Summaries** section below (if present).
-   These are LLM-generated summaries of functions/classes most relevant
-   to the work description, discovered by semantic vector search. Use
-   them as background context — they tell you which areas of the codebase
-   are likely relevant. Do NOT copy symbol names or file paths into your
-   topics.
-
-2. Phrase each topic as a natural-language research question about an
-   area of the codebase. Examples:
-   "How is CLI verbosity configured and threaded through to subcommands?"
-   "How does the configuration loader resolve workspace roots?"
-   "What logging conventions are used across the agent layer?"
-
-3. Do NOT name specific functions, classes, methods, or file paths in
-   topics. A downstream lookup step will resolve each topic to the
-   relevant symbols via semantic search — naming them yourself risks
-   hallucinating names that don't exist.
-
-4. Topics should focus on STRUCTURE, not implementation:
-   - What are the public interfaces? (function signatures, class contracts)
-   - What are the dependency relationships? (imports, call chains)
-   - What conventions and patterns exist? (naming, error handling, config)
-   - What configuration or global state is involved? (singletons, env vars)
-   Do NOT ask subagents to propose solutions or implementation details.
-
-Given:
-1. The work description
-2. The retrieved symbol summaries (semantic search results, for context only)
-3. A list of research topics already explored
-4. The findings accumulated so far
-
-Decide:
-- Are we done? (decision: "done") — structural coverage is sufficient
-- Or do we need more? (decision: "explore") — return 2-4 plain-language
-  topics framed as research questions
-
-Rules:
-- Never return more than 4 topics in a single round.
-- If you've already explored a topic, don't return it again.
-- On any round after the first, every new topic MUST target a different
-  module, layer, or concern than every topic in "Topics Already Explored".
-  Rephrasing a prior topic with different words is NOT a new topic — if
-  the "Files examined" coverage in Findings So Far already touches the
-  area, do not propose another topic about that area.
-- Topics MUST NOT contain symbol names, function names, class names, or
-  file paths. Use plain English descriptions of the area to investigate.
-- If the work description is self-contained (no codebase needed), decide "done".
-- If findings already cover all key architectural areas, decide "done".
-- Cover breadth before depth — ensure all implicated modules are touched
-  before diving deeper into any one module.
-- If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
-  rework — the prior pass already wrote a research log. Default to
-  decision="done" so synthesis can re-run with the existing findings.
-  Propose new topics ONLY when a critic suggestion explicitly identifies
-  a coverage gap, and then cap at 1 topic addressing that gap.
-"""
-
-_RESEARCH_MANAGER_PLAN = """\
-You are a Change Surface Research Manager. Your job is to identify the
-codebase areas that will need modification so the PLAN orchestrator can
-decompose the work into executable slices.
-
-## Your mission
-
-The PLAN orchestrator needs to understand what CHANGES:
-1. Touch points — which areas of the codebase will need edits?
-2. Dependency chains — what else will be affected by those changes?
-3. Risks — are there complex data flows, global state, or tight coupling to flag?
-
-Your task is to assign research topics to subagents (Blueprint Scouts)
-that will map the specification requirements to the codebase surface area.
-Each topic should describe — in plain natural language — an area of the
-codebase where changes will happen, framed as a research question.
-
-## How to work
-
-1. Read the **Specification** section below (always present in PLAN phase).
-   This describes what needs to be built or changed. Your research topics
-   MUST directly target the codebase areas that the specification requires.
-
-2. Read the **Retrieved Symbol Summaries** section below (if present).
-   These are LLM-generated summaries of functions/classes most relevant
-   to the work. Use them as background context to understand which areas
-   are implicated. Do NOT copy symbol names or file paths into your topics.
-
-3. Phrase each topic as a natural-language research question about an
-   area of the codebase. Examples:
-   "How does workspace-root resolution work for spec-path handling?"
-   "How do the CLI subcommands wire arguments through to the agent factory?"
-
-4. Do NOT name specific functions, classes, methods, or file paths in
-   topics. A downstream lookup step will resolve each topic to the
-   relevant symbols via semantic search — naming them yourself risks
-   hallucinating names that don't exist.
-
-5. Topics should focus on CHANGE SURFACE, not architecture:
-   - Which areas will need modification? (touch points)
-   - What imports or callers will be affected? (dependency chains)
-   - Are there complex data flows, global state, or tight coupling? (risks)
-   Do NOT ask subagents to propose solutions — only to identify what exists
-   and what will be impacted.
-
-Given:
-1. The specification (what needs to change)
-2. The retrieved symbol summaries (semantic search results, for context only)
-3. A list of research topics already explored
-4. The findings accumulated so far
-
-Decide:
-- Are we done? (decision: "done") — change surface is adequately mapped
-- Or do we need more? (decision: "explore") — return 2-4 plain-language
-  topics framed as research questions
-
-Rules:
-- Never return more than 4 topics in a single round.
-- If you've already explored a topic, don't return it again.
-- On any round after the first, every new topic MUST target a different
-  module, layer, or concern than every topic in "Topics Already Explored".
-  Rephrasing a prior topic with different words is NOT a new topic — if
-  the "Files examined" coverage in Findings So Far already touches the
-  area, do not propose another topic about that area.
-- Topics MUST NOT contain symbol names, function names, class names, or
-  file paths. Use plain English descriptions of the area to investigate.
-- If findings already cover all key change areas, decide "done".
-- Prioritize high-risk areas (glue code, shared state, widely-imported
-  modules) before peripheral concerns.
-- Cross-reference every topic against the specification — if the spec
-  doesn't mention an area, don't explore it.
-- If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
-  rework — the prior pass already wrote a research log. Default to
-  decision="done" so synthesis can re-run with the existing findings.
-  Propose new topics ONLY when a critic suggestion explicitly identifies
-  a coverage gap, and then cap at 1 topic addressing that gap.
-"""
+_RESEARCH_MANAGER_PLAN = (
+    xml_block(
+        Tag.ROLE,
+        "You are a Change Surface Research Manager. Your job is to identify "
+        "the codebase areas that will need modification so the PLAN "
+        "orchestrator can decompose the work into executable slices. The "
+        "orchestrator needs to understand what CHANGES:\n"
+        "1. Touch points — which areas of the codebase will need edits?\n"
+        "2. Dependency chains — what else will be affected by those changes?\n"
+        "3. Risks — complex data flows, global state, or tight coupling to flag?\n\n"
+        "Your task is to assign research topics to subagents (Blueprint "
+        "Scouts) that will map the specification requirements to the "
+        "codebase surface area. Each topic should describe — in plain "
+        "natural language — an area of the codebase where changes will "
+        "happen, framed as a research question.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.WORKFLOW,
+        "1. Read the <specification> block in the user message (always "
+        "present in PLAN phase). This describes what needs to be built or "
+        "changed. Your research topics MUST directly target the codebase "
+        "areas that the specification requires.\n\n"
+        "2. Read the <retrieved_code> block (if present). These are LLM-"
+        "generated summaries of functions/classes most relevant to the "
+        "work. Use them as background context. Do NOT copy symbol names or "
+        "file paths into your topics.\n\n"
+        "3. Phrase each topic as a natural-language research question about "
+        "an area of the codebase. Examples:\n"
+        '   "How does workspace-root resolution work for spec-path handling?"\n'
+        '   "How do the CLI subcommands wire arguments through to the agent factory?"\n\n'
+        "4. Do NOT name specific functions, classes, methods, or file paths "
+        "in topics. A downstream lookup step will resolve each topic to "
+        "the relevant symbols via semantic search.\n\n"
+        "5. Topics should focus on CHANGE SURFACE, not architecture:\n"
+        "   - Which areas will need modification? (touch points)\n"
+        "   - What imports or callers will be affected? (dependency chains)\n"
+        "   - Are there complex data flows, global state, or tight coupling? (risks)\n"
+        "   Do NOT ask subagents to propose solutions — only to identify "
+        "what exists and what will be impacted.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Never return more than 4 topics in a single round.\n"
+        "- If you've already explored a topic, don't return it again.\n"
+        "- On any round after the first, every new topic MUST target a "
+        "different module, layer, or concern than every topic in the "
+        "topics_already_explored block. Rephrasing a prior topic with "
+        "different words is NOT a new topic — if the 'Files examined' "
+        "coverage already touches the area, do not propose another topic "
+        "about that area.\n"
+        "- Topics MUST NOT contain symbol names, function names, class "
+        "names, or file paths. Use plain English descriptions of the area "
+        "to investigate.\n"
+        "- If findings already cover all key change areas, decide \"done\".\n"
+        "- Prioritize high-risk areas (glue code, shared state, widely-"
+        "imported modules) before peripheral concerns.\n"
+        "- Cross-reference every topic against the specification — if the "
+        "spec doesn't mention an area, don't explore it.\n"
+        "- If a <prior_research> block is present, it describes the "
+        "architectural map already gathered during SPECIFY. Treat its "
+        "'Key files' entries as covered territory — propose PLAN topics "
+        "that build on this map (touch points, change risk, dependency "
+        "chains) rather than topics that would just re-discover the same "
+        "files.\n"
+        "- If the <findings> block is non-empty on Round 1 of N, you are "
+        "resuming a rework — the prior pass already wrote a research log. "
+        "Default to decision=\"done\" so synthesis can re-run with the "
+        "existing findings. Propose new topics ONLY when a critic "
+        "suggestion explicitly identifies a coverage gap, and then cap at "
+        "1 topic addressing that gap.",
+    )
+)
 
 
 async def run_research_manager(
@@ -474,117 +470,115 @@ async def run_research_manager(
     # failed (we fall through to the loop anyway).
     task_category = state.get("task_category")
     retrieved = state.get("retrieved_context") or []
-    recall_section = ""
+    retrieved_code_body = ""
     if round_num == 0 and retrieved:
-        recall_section = (
-            "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
-            "These are the most relevant functions/classes discovered by "
-            "vector search. Use them ONLY as background context to identify "
-            "which areas of the codebase are relevant — do NOT copy symbol "
-            "names or file paths into your topics.\n\n"
-        )
-        for i, chunk in enumerate(retrieved, 1):
-            recall_section += (
+        chunks = [
+            (
                 f"### {chunk.get('symbol_name', '?')} "
                 f"({chunk.get('symbol_type', '?')} in {chunk.get('file_path', '?')})\n"
-                f"{chunk.get('enriched_summary', '')[:400]}\n\n"
+                f"{chunk.get('enriched_summary', '')[:400]}"
             )
+            for chunk in retrieved
+        ]
+        retrieved_code_body = "\n\n".join(chunks)
         logger.info(
             "[%s] Research manager: using %d pre-recalled summaries from gate",
             work_id, len(retrieved),
         )
 
     # ── Build the context for the manager ────────────────────────────
-    spec_section = ""
+    spec_body = ""
     if phase == "plan":
         spec_path = state.get("spec_path", "")
         if spec_path:
             full_path = Path(workspace_root) / spec_path / "specification.md"
             if full_path.exists():
                 try:
-                    raw_spec = full_path.read_text(encoding="utf-8")
-                    spec_section = (
-                        f"## Specification (use this to guide research decisions)\n"
-                        f"{raw_spec[:_MAX_SPEC_CHARS]}\n\n"
-                    )
+                    spec_body = full_path.read_text(encoding="utf-8")[:_MAX_SPEC_CHARS]
                 except OSError:
                     pass
 
+    # SPECIFY's research log carried across by the PLAN state mapper. The
+    # manager uses this to avoid proposing topics that would just re-map
+    # files SPECIFY already examined — see _RESEARCH_MANAGER_PLAN rules.
+    prior_research_body = ""
+    if phase == "plan":
+        prior_phase_findings = state.get("prior_phase_findings") or []
+        if prior_phase_findings:
+            from spine.config import SpineConfig as _SpineConfig
+
+            prior_research_body = format_findings(
+                prior_phase_findings,
+                budget=_SpineConfig.load().prior_phase_findings_token_budget,
+            )
+
     findings_summary = _summarize_findings(findings)
 
-    # Prior-round framing: whenever any topic has already been dispatched
-    # (round_num > 0 OR seeded from a prior research_log on rework), the
-    # manager must treat the explored set as territory to *extend past*,
-    # not territory to revisit. Without this, the LLM tends to rephrase
-    # prior topics — same modules, different words — because the
-    # natural-language "already explored" list alone is too soft a signal.
-    #
-    # When the critic also rejected the prior pass, the rework specifics
-    # (verdict, suggestions) layer on top of the always-on framing.
+    # Conditional rules / framing aggregated into one <constraints> block so
+    # the model sees "this turn's rules" as a single bounded region distinct
+    # from "this turn's data".
+    constraint_lines: list[str] = [
+        f"Round {round_num + 1} of max {max_rounds}.",
+    ]
     has_prior_round = round_num > 0 or bool(existing_topics) or bool(findings)
-    prior_round_section = ""
     if has_prior_round:
-        prior_round_section = (
-            "## Prior-Round Coverage — Extend, Do Not Repeat\n"
-            "The 'Topics Already Explored' and 'Findings So Far' sections "
-            "below describe ground that has already been mapped. Every new "
-            "topic you propose MUST target a different module / layer / "
-            "concern than what is already covered there. Use the 'Files "
-            "examined' line on each finding as the authoritative coverage "
-            "signal — if a file or area appears there, that area is "
-            "covered, regardless of how the prior topic was worded. "
-            "Rephrasing a prior topic ('How does X configure Y?' → 'How "
-            "are Y preferences managed in X?') is forbidden — those count "
-            "as the same topic. If findings already cover all relevant "
-            "areas, decide 'done'.\n\n"
-            "Before returning each topic, silently check: which module or "
-            "layer does this target, and is that module already in any "
-            "prior finding's 'Files examined'? If yes, drop the topic.\n\n"
+        constraint_lines.append(
+            "Prior-round coverage: the topics_already_explored and findings "
+            "blocks below describe ground already mapped. Every new topic "
+            "MUST target a different module / layer / concern. Use the "
+            "'Files examined' line on each finding as the authoritative "
+            "coverage signal — if a file appears there, that area is "
+            "covered regardless of how the prior topic was worded. "
+            "Rephrasing a prior topic counts as the same topic. If findings "
+            "already cover all relevant areas, decide 'done'. Before each "
+            "candidate topic, silently check: which module does it target, "
+            "and is that module already in a prior finding's 'Files "
+            "examined'? If yes, drop it."
         )
-    rework_section = ""
+    rework_body = ""
     if retry_count > 0 and last_critic_review:
         suggestions = last_critic_review.get("suggestions") or []
-        sug_text = (
-            "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  (none)"
-        )
-        rework_section = (
-            "## ⚠ Rework Pass — Critic Rejected Prior Output\n"
+        sug_text = "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  (none)"
+        rework_body = (
             f"Attempt: {last_critic_review.get('attempt', retry_count + 1)}\n"
             f"Verdict: {last_critic_review.get('status', 'needs_revision')} "
             f"(tier: {last_critic_review.get('tier', 'unknown')})\n"
             f"Reason: {last_critic_review.get('reason', '')}\n"
-            f"Suggestions:\n{sug_text}\n\n"
-            "Propose 2-4 NEW topics that close the specific gaps the critic "
-            "flagged (in addition to the prior-round rules above). If the "
-            "prior research is already sufficient to address the verdict, "
-            "decide 'done' so synthesis can rework with the existing "
-            "findings.\n\n"
+            f"Suggestions:\n{sug_text}"
         )
+        constraint_lines.append(
+            "Rework pass — the critic rejected the prior output (see "
+            "<critic_feedback> block). Propose 2-4 NEW topics that close the "
+            "specific gaps the critic flagged (in addition to the prior-round "
+            "rules above). If the prior research is already sufficient to "
+            "address the verdict, decide 'done' so synthesis can rework with "
+            "the existing findings."
+        )
+    constraints_body = "\n\n".join(constraint_lines)
 
     explored_roll_up = _render_explored_topic_roll_up(existing_topics, findings)
-    explored_block = (
-        f"## Topics Already Explored (with per-topic outcome)\n{explored_roll_up}\n\n"
-        if explored_roll_up
-        else ""
-    )
 
-    context = (
-        f"## Work Description\n{description}\n\n"
-        f"{spec_section}"
-        f"{recall_section}"
-        f"{prior_round_section}"
-        f"{rework_section}"
-        f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
-        f"{explored_block}"
-        f"## Findings So Far\n{findings_summary}\n\n"
-        "Decide: are we done, or do we need more research? "
-        "If exploring, return 2-4 plain-language topics framed as research "
-        "questions. Topics MUST NOT contain symbol names, function names, "
-        "class names, or file paths — a downstream lookup step resolves "
-        "each topic to the relevant symbols automatically. Cross-reference "
-        "each candidate topic against the 'Topics Already Explored' list "
-        "above before returning — if the same module/concern was already "
-        "investigated or attempted, drop the candidate or decide 'done'."
+    context = hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, description),
+            (Tag.SPECIFICATION, spec_body),
+            (Tag.PRIOR_RESEARCH, prior_research_body),
+            (Tag.RETRIEVED_CODE, retrieved_code_body),
+            (Tag.CRITIC_FEEDBACK, rework_body),
+            (Tag.CONSTRAINTS, constraints_body),
+            (Tag.TOPICS_ALREADY_EXPLORED, explored_roll_up),
+            (Tag.FINDINGS, findings_summary),
+        ),
+        (
+            "Decide: are we done, or do we need more research? If exploring, "
+            "return 2-4 plain-language topics framed as research questions. "
+            "Topics MUST NOT contain symbol names, function names, class "
+            "names, or file paths — a downstream lookup step resolves each "
+            "topic to the relevant symbols automatically. Cross-reference "
+            "each candidate topic against the topics_already_explored block "
+            "before returning — if the same module / concern was already "
+            "investigated or attempted, drop the candidate or decide 'done'."
+        ),
     )
 
     # ── Select the phase-appropriate manager prompt ─────────────────
@@ -822,27 +816,44 @@ async def run_explore_do_node(
     *,
     topic: str = "",
 ) -> dict[str, Any]:
-    """Drive the researcher subagent and return a structured evidence dossier.
+    """Drive the researcher via a supervisor↔worker micro-loop.
 
-    This is the "do" half of the explore→summarise split. It runs the
-    researcher's tool-using loop exactly like the legacy
-    ``run_explore_node`` body, but stops short of converting the result
-    into a :class:`ResearchFindings`. The conversion happens in the
-    separate :func:`run_summarise_node` so the model never has to switch
-    between "use tools" and "produce structured output" within a single
-    node.
+    Replaces the legacy "one big agent.astream() with a recursion cap"
+    pattern with a deterministic loop: the supervisor (no-tool LLM) emits
+    a :class:`SupervisorDirective` each cycle; the worker (tool-using
+    agent restricted to the supervisor's chosen tool class) executes one
+    move and reports a :class:`StructuredFinding`. The loop terminates
+    on ``directive.is_complete`` or the per-phase cycle cap fires.
+
+    See :mod:`spine.agents.researcher_supervisor` for the schemas and
+    helpers driving each cycle.
 
     Returns a dict with two keys:
 
     * ``exploration_evidence`` — a per-branch dict containing the
-      tool-result dossier, the researcher's narrative (if any), the
-      topic, and a ``recursion_capped`` flag. Last-write-wins per Send
-      branch.
+      assembled tool_results_text dossier, the supervisor's last
+      reasoning, the topic, and a ``recursion_capped`` flag. Last-write-
+      wins per Send branch. Shape is unchanged from the legacy node so
+      :func:`run_summarise_node` consumes it without modification.
     * ``read_cache`` — propagated to the parent state for cross-branch
       dedupe (same as the legacy node).
     """
-    from spine.agents.factory import build_phase_agent
+    # Note: ``build_phase_agent`` is no longer used here. Workers go
+    # through the model.bind_tools() direct-invocation path (no agent
+    # loop) — see _get_or_bind_model_for_class below. The supervisor
+    # uses ``resolve_model`` directly via ``run_supervisor_node``.
+    from spine.agents.researcher_supervisor import (
+        FindingStatus,
+        StructuredFinding,
+        SupervisorDirective,
+        ToolClass,
+        filter_extra_tools_for_class,
+        render_history_as_evidence,
+        run_supervisor_node,
+        run_worker_node,
+    )
     from spine.agents.subagents import build_subagent_spec
+    from spine.config import SpineConfig
     from spine.models.enums import PhaseName
 
     work_id = state.get("work_id", "unknown")
@@ -860,167 +871,211 @@ async def run_explore_do_node(
         work_id, phase, topic_str,
     )
 
-    result: dict[str, Any] = {}
-    try:
-        # Determine which PhaseName to use for model/skill resolution
-        phase_enum = PhaseName(phase)
+    # ── Resolve per-phase cycle cap ──────────────────────────────────
+    phase_enum = PhaseName(phase)
+    conv_cfg = SpineConfig.load().convergence
+    if phase_enum == PhaseName.PLAN:
+        max_cycles = conv_cfg.researcher_supervisor_max_cycles_plan
+    else:
+        max_cycles = conv_cfg.researcher_supervisor_max_cycles_specify
 
-        # Build the researcher subagent spec with the correct phase
-        subagent_spec = build_subagent_spec(
-            name="researcher",
-            phase=phase_enum,
-            state=state,  # type: ignore[arg-type]
-            config=config,
-        )
+    # ── Resolve spec content + prior SPECIFY findings (PLAN only) ────
+    # These get folded into both the supervisor's global_goal framing
+    # (so it understands what success looks like) and the topic string
+    # passed to workers. Compact rendering — the loop is cycle-bounded,
+    # so per-turn context bloat matters more than for one big stream.
+    spec_content = ""
+    if phase_enum == PhaseName.PLAN:
+        spec_path = state.get("spec_path", "")
+        if spec_path:
+            full_path = Path(workspace_root) / spec_path / "specification.md"
+            if full_path.exists():
+                try:
+                    spec_content = full_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
 
-        # Build a minimal agent for this subagent — no filesystem middleware,
-        # the tools are injected directly as extra_tools from the subagent spec.
-        # NOTE: commit_findings_and_clear_search is intentionally NOT injected
-        # here. The researcher's message loop is local to this one ainvoke and
-        # is discarded when the explore node returns; the eviction node at the
-        # subgraph level operates on the parent state, not the researcher's
-        # internal messages. Giving the tool to the researcher only causes its
-        # EVICTION_ANCHOR message to fool the model into believing its tool
-        # results are gone — after which the structured response collapses to
-        # an empty patterns/file_map/dependencies on most models.
-        extra_tools = list(subagent_spec.get("tools", []))
-        agent = build_phase_agent(
-            state=state,  # type: ignore[arg-type]
-            config=config,
-            phase=phase_enum,
-            system_prompt=subagent_spec["system_prompt"],
-            is_subagent=True,
-            extra_tools=extra_tools,
-            response_format=subagent_spec.get("response_format"),
-            skip_filesystem_middleware=True,
-        )
-
-        # ── Build the research prompt ─────────────────────────────────
-        # For PLAN phase: inject the specification content so the researcher
-        # maps spec requirements to codebase files, not just the generic topic.
-        spec_content = ""
-        if phase_enum == PhaseName.PLAN:
-            spec_path = state.get("spec_path", "")
-            if spec_path:
-                full_path = Path(workspace_root) / spec_path / "specification.md"
-                if full_path.exists():
-                    try:
-                        spec_content = full_path.read_text(encoding="utf-8")
-                    except OSError:
-                        pass
-
-        if spec_content:
-            prompt = (
-                f"## Plan Research Topic: {topic_str}\n\n"
-                f"## Specification (read this FIRST — your research must map this to "
-                f"the codebase)\n\n{spec_content[:_MAX_SPEC_CHARS]}\n\n"
-                f"## Research Task\n"
-                f"For the topic '{topic_str}', find the existing codebase files, "
-                f"patterns, conventions, and dependencies that map to the specification "
-                f"sections above. Use MCP tools for structural navigation. "
-                f"Return your findings in the ResearchFindings format with specific "
-                f"file paths and how they relate to the spec."
-            )
-        else:
-            prompt = (
-                f"## Research Topic\n{topic_str}\n\n"
-                f"Investigate this specific area of the codebase. "
-                f"Use MCP tools for structural navigation. "
-                f"Return your findings in the ResearchFindings format."
+    prior_findings_body = ""
+    if phase_enum == PhaseName.PLAN:
+        prior_findings = state.get("prior_phase_findings") or []
+        if prior_findings:
+            prior_findings_body = format_findings(
+                prior_findings,
+                budget=SpineConfig.load().prior_phase_findings_token_budget,
             )
 
-        # Inject scratchpad into researcher prompt if available
-        scratchpad = state.get("scratchpad", "")
-        if scratchpad:
-            prompt = prompt + "\n\n## Working Memory Scratchpad\n" + scratchpad + "\n"
+    # The "global_goal" passed to the supervisor and the per-worker prompt
+    # carry the topic plus (for PLAN) the spec + prior-findings context, all
+    # bounded as XML blocks so the supervisor sees the same hostage-laid
+    # payload the worker does. ``topic_str`` alone is the bare research
+    # question; the enriched form prepends it as the OBJECTIVE block and
+    # then layers SPECIFICATION / PRIOR_RESEARCH / SCRATCHPAD when present.
+    enriched_topic = topic_str
+    scratchpad = state.get("scratchpad", "")
+    enriched_blocks = xml_blocks(
+        (Tag.OBJECTIVE, topic_str),
+        (Tag.SPECIFICATION, spec_content[:_MAX_SPEC_CHARS] if spec_content else ""),
+        (Tag.PRIOR_RESEARCH, prior_findings_body),
+        (Tag.SCRATCHPAD, scratchpad),
+    )
+    # When only OBJECTIVE is present (no spec, no prior research, no
+    # scratchpad), keep the bare topic string so the supervisor's existing
+    # short-circuit / re-rendering logic stays compact. When ANY auxiliary
+    # block is present, ship the full XML payload.
+    if spec_content or prior_findings_body or scratchpad:
+        enriched_topic = enriched_blocks
 
-        # Build a SpineContext so ReadCacheMiddleware can dedupe MCP/read_file
-        # calls inside this researcher loop. Without context= the middleware
-        # bails on ctx=None and every lookup re-hits the live tool — which is
-        # exactly the failure mode the f51d448 deduper was supposed to fix.
-        from spine.agents.context import build_context as _build_context
+    # ── Build worker agents lazily, one per ToolClass ────────────────
+    # Each worker shares the researcher's system prompt + model; only
+    # extra_tools differ. Built on first use of each class so unused
+    # classes don't pay for agent construction.
+    subagent_spec = build_subagent_spec(
+        name="researcher",
+        phase=phase_enum,
+        state=state,  # type: ignore[arg-type]
+        config=config,
+    )
+    full_extra_tools = list(subagent_spec.get("tools", []))
+    worker_system_prompt = subagent_spec["system_prompt"]
 
-        ctx = _build_context(state, phase_enum)
-        # Cap the researcher's LangGraph recursion at ~50 steps (≈25
-        # model+tool round-trips). LangGraph's default is 25; the prior
-        # cap of 24 sat below that and routinely terminated survey-style
-        # branches mid-investigation (telemetry showed branches still
-        # productive at >50K prompt tokens when the wall hit). 50 gives
-        # enough headroom for breadth-first topics while still bounding
-        # runaway loops.
-        result = await _ainvoke_explore_collecting(
-            agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            work_id=work_id,
+    from spine.agents.context import build_context as _build_context
+
+    ctx = _build_context(state, phase_enum)
+
+    # ── Resolve the base chat model ONCE for the worker direct-bind path ──
+    # Workers no longer go through build_phase_agent — they call the model
+    # directly via ``model.bind_tools(...).ainvoke(...)`` per turn. This
+    # collapses each worker invocation from N model calls (the agent loop
+    # auto-cycled until a non-tool message) down to exactly ONE, which is
+    # what the supervisor's per-cycle directive expects. See audit #2 on
+    # trace 019e71b4 — the agent loop was the dominant prompt-bloat driver.
+    from spine.agents.helpers import resolve_model as _resolve_model
+
+    _raw_worker_model = subagent_spec.get("model") or _resolve_model(
+        config, session_id=work_id, phase=f"{phase_enum.value}/subagents/researcher"
+    )
+    if isinstance(_raw_worker_model, str):
+        from langchain.chat_models import init_chat_model
+
+        worker_base_model = init_chat_model(_raw_worker_model)
+    else:
+        worker_base_model = _raw_worker_model
+
+    # bound_models: ToolClass → (model_with_tools_bound, scoped_tools_list).
+    # Built lazily on first use per tool class so unused classes pay nothing.
+    bound_models: dict[ToolClass, tuple[Any, list[Any]]] = {}
+
+    def _get_or_bind_model_for_class(tool_class: ToolClass) -> None:
+        if tool_class in bound_models:
+            return
+        scoped_tools = filter_extra_tools_for_class(full_extra_tools, tool_class)
+        if not scoped_tools:
+            logger.warning(
+                "[%s] explore_do: no tools available for class=%s — "
+                "worker invocation will return EMPTY",
+                work_id, tool_class.value,
+            )
+        bound = worker_base_model.bind_tools(scoped_tools) if scoped_tools else worker_base_model
+        bound_models[tool_class] = (bound, scoped_tools)
+
+    # ── Supervisor↔worker loop ───────────────────────────────────────
+    history: list[StructuredFinding] = []
+    latest: StructuredFinding | None = None
+    last_directive: SupervisorDirective | None = None
+    cycle = 0
+    supervisor_phase_path = f"{phase_enum.value}/subagents/researcher/supervisor"
+
+    while cycle < max_cycles:
+        directive = await run_supervisor_node(
+            state=state,
+            config=config,
+            phase_path=supervisor_phase_path,
+            global_goal=enriched_topic,
+            latest_finding=latest,
+            evaluation_history=history,
+            cycle_idx=cycle,
+            max_cycles=max_cycles,
+        )
+        last_directive = directive
+        if directive.is_complete:
+            logger.info(
+                "[%s] explore_do: supervisor complete after %d cycle(s) "
+                "for topic=%r",
+                work_id, cycle, topic_str,
+            )
+            break
+
+        # Lazy-bind the model for this turn's tool class. Pre-populate
+        # the bound_models map so run_worker_node finds it.
+        if directive.allowed_tool_class is not None:
+            _get_or_bind_model_for_class(directive.allowed_tool_class)
+
+        # Direct-bind path: no agent loop, no middleware stack. The
+        # worker does ONE model call + ONE tool execution per cycle.
+        finding = await run_worker_node(
+            state=state,
+            config=config,
+            topic=enriched_topic,
+            directive=directive,
+            bound_models=bound_models,
+            system_prompt=worker_system_prompt,
             context=ctx,
-            config={"recursion_limit": 50},
         )
+        history.append(finding)
+        latest = finding
+        cycle += 1
 
-        # NOTE: the legacy run_explore_node called _finalize_research_findings
-        # here. That step now belongs to run_summarise_node — it's a
-        # separate graph node so the model never has to switch between
-        # "use tools" and "produce structured output" within one
-        # invocation. We pass the raw evidence forward instead.
-        messages = result.get("messages", []) if isinstance(result, dict) else []
-        evidence_text = collect_exploration_evidence(messages)
-        narrative = _last_ai_narrative(messages)
-        evidence: dict[str, Any] = {
-            "topic": topic_str,
-            "phase": phase,
-            "tool_results_text": evidence_text,
-            "narrative": narrative,
-            "recursion_capped": False,
-            "error_class": None,
-            "message_count": len(messages),
-        }
         logger.info(
-            "[%s] explore_do: topic=%r — %d evidence chars, %d narrative chars",
-            work_id,
-            topic_str,
-            len(evidence_text),
-            len(narrative),
+            "[%s] explore_do: cycle %d/%d done — class=%s status=%s tool=%s",
+            work_id, cycle, max_cycles,
+            (directive.allowed_tool_class.value
+             if directive.allowed_tool_class else "—"),
+            finding.status.value,
+            finding.tool_name,
         )
 
-    except Exception as e:
-        # On recursion cap (or any other failure) gather whatever the
-        # researcher accumulated and pass it forward. The summarise node
-        # decides whether to salvage it or emit an error sentinel — keeping
-        # that decision out of the do node means the do node never has to
-        # reason about output formatting.
-        # _ainvoke_explore_collecting attaches partial_state to any
-        # non-transient exception that carries accumulated stream state
-        # (GraphRecursionError, BadRequestError on context overflow, etc.).
-        # getattr fails closed when an exception type doesn't carry it.
-        partial_state = getattr(e, "partial_state", None)
-        partial_messages: list = []
-        if isinstance(partial_state, dict) and partial_state.get("messages"):
-            partial_messages = partial_state["messages"]
-            result = partial_state
-
-        evidence_text = collect_exploration_evidence(partial_messages) if partial_messages else ""
-        narrative = _last_ai_narrative(partial_messages) if partial_messages else ""
-        evidence = {
-            "topic": topic_str,
-            "phase": phase,
-            "tool_results_text": evidence_text,
-            "narrative": narrative,
-            "recursion_capped": isinstance(e, GraphRecursionError),
-            "error_class": type(e).__name__,
-            "message_count": len(partial_messages),
-        }
+    cap_hit = cycle >= max_cycles and (
+        last_directive is None or not last_directive.is_complete
+    )
+    if cap_hit:
         logger.warning(
-            "[%s] explore_do: topic=%r failed (%s) — captured %d evidence chars",
-            work_id,
-            topic_str,
-            type(e).__name__,
-            len(evidence_text),
-            exc_info=not isinstance(e, GraphRecursionError),
+            "[%s] explore_do: cycle cap (%d) reached without supervisor "
+            "completion for topic=%r — marking recursion_capped",
+            work_id, max_cycles, topic_str,
         )
+
+    evidence_text = render_history_as_evidence(history)
+    # Supervisor's last reasoning becomes the narrative — gives summarise
+    # a non-tool gloss on what the loop concluded.
+    narrative = ""
+    if last_directive is not None:
+        narrative = (last_directive.analysis_and_reasoning or "").strip()
+
+    evidence: dict[str, Any] = {
+        "topic": topic_str,
+        "phase": phase,
+        "tool_results_text": evidence_text,
+        "narrative": narrative,
+        "recursion_capped": cap_hit,
+        "error_class": None,
+        "message_count": len(history),
+        "supervisor_cycles": cycle,
+    }
+    logger.info(
+        "[%s] explore_do: topic=%r — %d cycles, %d evidence chars, "
+        "%d narrative chars",
+        work_id, topic_str, cycle, len(evidence_text), len(narrative),
+    )
 
     # Bubble the post-invocation deduper cache back into subgraph state so
     # sibling Send() researchers (and the next rework cycle) skip queries we
     # already ran. The reducer (_merge_read_cache) handles merge semantics.
-    cache_snapshot = result.get("read_cache") if isinstance(result, dict) else None
+    cache_snapshot: dict | None = None
+    if ctx is not None and hasattr(ctx, "read_cache"):
+        snap = getattr(ctx, "read_cache", None) or {}
+        if snap:
+            cache_snapshot = dict(snap)
+
     update: dict[str, Any] = {"exploration_evidence": evidence}
     if cache_snapshot:
         update["read_cache"] = cache_snapshot
@@ -1188,35 +1243,35 @@ async def summarise_evidence(
         )
         return None
 
-    sections: list[str] = []
-    if evidence_text:
-        sections.append("## Tool-result evidence\n" + evidence_text)
-    if narrative:
-        sections.append("## Researcher's own narrative\n" + narrative.strip())
-    body = "\n\n".join(sections) if sections else "(no evidence gathered)"
-
-    cap_warning = (
-        "\nNote: the researcher hit its step cap before producing a final report. "
-        "Treat the evidence as partial — leave fields empty when unsupported.\n"
-        if recursion_capped else ""
+    constraints_body = (
+        "- Use ONLY information present in the <findings> block below.\n"
+        "- Do NOT use the topic name to fill in fields. If the evidence does "
+        "not mention a file, pattern, or dependency, leave the field empty.\n"
+        "- file_map paths MUST appear in the evidence (as file paths, symbol "
+        "locations, or import targets).\n"
+        "- If a field has no support in the evidence, leave it empty "
+        "(``[]`` for lists, ``{}`` for file_map).\n"
+        "- summary should describe what was actually discovered in the "
+        "evidence, not what the agent was asked to investigate."
     )
+    if recursion_capped:
+        constraints_body += (
+            "\n- The researcher hit its step cap before producing a final "
+            "report. Treat the evidence as partial — leave fields empty "
+            "when unsupported."
+        )
 
-    summarise_prompt = (
-        "You will be given evidence gathered while researching a specific topic in a "
-        "codebase. Convert the evidence into the ResearchFindings JSON schema.\n\n"
-        "STRICT RULES:\n"
-        "- Use ONLY information present in the evidence below.\n"
-        "- Do NOT use the topic name to fill in fields. If the evidence does not "
-        "mention a file, pattern, or dependency, leave the field empty.\n"
-        "- file_map paths MUST appear in the evidence (as file paths, symbol locations, "
-        "or import targets).\n"
-        "- If a field has no support in the evidence, leave it empty (``[]`` for lists, "
-        "``{}`` for file_map).\n"
-        "- summary should describe what was actually discovered in the evidence, not "
-        "what the agent was asked to investigate.\n"
-        f"{cap_warning}\n"
-        f"## Topic\n{topic}\n\n"
-        f"{body}"
+    summarise_prompt = hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, topic),
+            (Tag.CONSTRAINTS, constraints_body),
+            (Tag.FINDINGS, evidence_text),
+            (Tag.SCRATCHPAD, narrative.strip() if narrative else ""),
+        ),
+        (
+            "Convert the evidence above into the ResearchFindings JSON "
+            "schema following the constraints."
+        ),
     )
 
     try:
@@ -1452,12 +1507,18 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
         logger.debug("Model does not support with_structured_output; skipping finalize", exc_info=True)
         return
 
-    finalize_prompt = (
-        "Convert the research report below into the ResearchFindings JSON schema. "
-        "Populate ALL fields: summary (2-3 paragraph synthesis), patterns "
-        "(distinct list items), file_map (path -> description), dependencies "
-        "(distinct list items). Do NOT invent — use only information present "
-        "in the report.\n\n## Report\n" + final_content
+    finalize_prompt = hostage_layout(
+        xml_blocks(
+            (Tag.FINDINGS, final_content),
+            (
+                Tag.CONSTRAINTS,
+                "Populate ALL fields: summary (2-3 paragraph synthesis), "
+                "patterns (distinct list items), file_map (path -> "
+                "description), dependencies (distinct list items). Do NOT "
+                "invent — use only information present in the report.",
+            ),
+        ),
+        "Convert the report above into the ResearchFindings JSON schema.",
     )
     try:
         parsed = await structured_model.ainvoke(
@@ -1547,24 +1608,29 @@ async def _finalize_research_findings_from_evidence(
         )
         return
 
-    salvage_prompt = (
-        "The researcher agent ran out of steps before producing a final "
-        "synthesis. Below is the raw evidence it gathered — tool results "
-        "from symbol lookups, dependency queries, and codebase searches, "
-        "plus any intermediate synthesis attempts.\n\n"
-        "Convert this evidence into the ResearchFindings JSON schema. "
-        "STRICT RULES:\n"
-        "- Use ONLY information present in the evidence below.\n"
-        "- Do NOT use the research topic name to fill in fields. If the "
-        "evidence does not mention a file, pattern, or dependency, do not "
-        "invent one.\n"
-        "- file_map paths MUST appear in the tool results (as file paths, "
-        "symbol locations, or import targets).\n"
-        "- If a field has no support in the evidence, leave it empty "
-        "(``[]`` for lists, ``{}`` for file_map).\n"
-        "- summary should describe what was actually discovered in the "
-        "tool results, not what the agent was asked to investigate.\n\n"
-        "## Evidence\n" + evidence
+    salvage_prompt = hostage_layout(
+        xml_blocks(
+            (Tag.FINDINGS, evidence),
+            (
+                Tag.CONSTRAINTS,
+                "- Use ONLY information present in the <findings> block.\n"
+                "- Do NOT use the research topic name to fill in fields. If "
+                "the evidence does not mention a file, pattern, or "
+                "dependency, do not invent one.\n"
+                "- file_map paths MUST appear in the tool results (as file "
+                "paths, symbol locations, or import targets).\n"
+                "- If a field has no support in the evidence, leave it "
+                "empty (``[]`` for lists, ``{}`` for file_map).\n"
+                "- summary should describe what was actually discovered in "
+                "the tool results, not what the agent was asked to "
+                "investigate.",
+            ),
+        ),
+        (
+            "The researcher agent ran out of steps before producing a final "
+            "synthesis — the <findings> block above is the raw evidence it "
+            "gathered. Convert it into the ResearchFindings JSON schema."
+        ),
     )
     try:
         parsed = await structured_model.ainvoke(
@@ -1699,3 +1765,85 @@ def _extract_findings(result: dict) -> list[dict]:
         ]
 
     return [{"summary": "(no findings)", "patterns": [], "file_map": {}, "dependencies": []}]
+
+
+# ── Shared findings renderer ────────────────────────────────────────────
+
+
+def format_findings(
+    findings: list[dict], *, budget: int | None = None,
+) -> str:
+    """Render accumulated findings for inclusion in an LLM prompt.
+
+    Used by:
+    - synthesizer prompts (plan/specify) — see exploration_subgraph
+    - PLAN per-topic researcher prompts (prior-phase findings inject)
+    - PLAN research-manager prompt (prior-phase findings inject)
+
+    Keeps individual findings compact — the consumer can read files
+    from disk if more detail is needed. Skips error-sentinel entries
+    (``error=True``) so they never leak into LLM-facing renders.
+
+    When ``budget`` is a positive int, accumulates tokens per appended
+    finding and stops once the next finding would push the total over
+    budget. A trailing marker tells the consumer how many findings were
+    omitted so it can request specific symbols if needed.
+    """
+    if not findings:
+        return "(no codebase research was performed)"
+
+    use_budget = isinstance(budget, int) and budget > 0
+    parts: list[str] = []
+    included = 0
+    omitted = 0
+    used_tokens = 0
+
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            continue
+        if f.get("error"):
+            continue
+        topic = f.get("topic", "")
+        summary = f.get("summary", "")
+        patterns = f.get("patterns", [])
+        file_map = f.get("file_map", {})
+        deps = f.get("dependencies", [])
+        header = f"### Finding {i + 1}"
+        if topic:
+            header += f" — Topic: {topic}"
+        block_parts: list[str] = [f"{header}\n{summary}"]
+        if patterns:
+            block_parts.append(f"Patterns: {', '.join(patterns)}")
+        if file_map:
+            block_parts.append(f"Key files: {json.dumps(file_map)}")
+        if deps:
+            block_parts.append(f"Dependencies: {', '.join(deps)}")
+        block = "\n\n".join(block_parts)
+
+        if use_budget:
+            block_tokens = _count_tokens(block)
+            if used_tokens + block_tokens > budget:
+                omitted = sum(
+                    1 for g in findings[i:]
+                    if isinstance(g, dict) and not g.get("error")
+                )
+                break
+            used_tokens += block_tokens
+        parts.append(block)
+        included += 1
+
+    if not parts:
+        return "(no codebase research was performed)"
+
+    rendered = "\n\n".join(parts)
+    if omitted > 0:
+        rendered += (
+            f"\n\n[truncated: {omitted} more findings omitted "
+            f"(over {budget}-token budget — request specific symbols if needed)]"
+        )
+    return rendered
+
+
+# Backwards-compatible alias for the legacy underscore name used by the
+# synthesizers in exploration_subgraph.py.
+_format_findings = format_findings

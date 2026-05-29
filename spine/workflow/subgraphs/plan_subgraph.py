@@ -32,6 +32,7 @@ from spine.agents.plan_do import (
     format_directive_for_prompt,
     run_plan_node,
 )
+from spine.agents.prompt_format import hostage_layout
 from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
@@ -110,29 +111,34 @@ async def _run_plan_agent(
 
         if has_spec and spec_path:
             spec_instruction = (
-                "Call `read_prior_artifacts` to load the specification — it returns "
-                "the spec content and prior context in one call. Your plan must "
-                "implement exactly what the spec describes.\n\n"
+                "Call `read_prior_artifacts` to load the specification — it "
+                "returns the spec content and prior context in one call. Your "
+                "plan must implement exactly what the spec describes."
             )
         else:
             spec_instruction = (
-                "No prior specification exists (quick workflow). "
-                "Work directly from the description returned by `read_prior_artifacts`.\n\n"
+                "No prior specification exists (quick workflow). Work directly "
+                "from the description returned by `read_prior_artifacts`."
             )
 
+        # ``format_directive_for_prompt`` already returns content wrapped in
+        # ``<directive>`` so we splice it directly into the hostage layout's
+        # blocks region rather than re-wrapping.
         directive_block = format_directive_for_prompt(
             directive_from_state(dict(state), "plan_directive")
         )
-        prompt = (
-            (directive_block + "\n" if directive_block else "")
-            + "Create a detailed technical plan with structured feature slices.\n\n"
-            + spec_instruction
-            + "Call `write_structured_plan` exactly once with structured fields "
-            "(architecture_overview, technology_choices, feature_slices, "
-            "testing_strategy, risks, codebase_map). The tool writes both plan.md "
-            "and plan.json for you — do not call write_file. The structured plan "
-            "is REQUIRED: the downstream implementation phase needs the feature_slices "
-            "array in plan.json to dispatch slice-implementer subagents."
+        prompt = hostage_layout(
+            directive_block,
+            (
+                "Create a detailed technical plan with structured feature slices. "
+                f"{spec_instruction} Call `write_structured_plan` exactly once "
+                "with structured fields (architecture_overview, "
+                "technology_choices, feature_slices, testing_strategy, risks, "
+                "codebase_map). The tool writes both plan.md and plan.json for "
+                "you — do not call write_file. The structured plan is REQUIRED: "
+                "the downstream implementation phase needs the feature_slices "
+                "array in plan.json to dispatch slice-implementer subagents."
+            ),
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)

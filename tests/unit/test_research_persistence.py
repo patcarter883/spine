@@ -101,3 +101,90 @@ def test_specify_state_mapper_preserves_retry_count_when_present(tmp_path):
     parent["retry_count"] = {"specify": 2}
     out = _specify_state_mapper(parent, config=None)
     assert out["retry_count"] == 2
+
+
+def test_plan_mapper_seeds_specify_findings_into_prior_phase_channel(tmp_path):
+    """SPECIFY's research_log.json is injected as prior_phase_findings on
+    PLAN entry — separately from PLAN's own findings/topics accumulator.
+    """
+    work_id = "wid-specify-inject"
+    specify_topics = ["What does the verbose flag plumbing look like?"]
+    specify_findings = [
+        {
+            "topic": "What does the verbose flag plumbing look like?",
+            "summary": "verbose flag propagates from CLI entrypoint into runner",
+            "file_map": {"spine/cli/__init__.py": "argparse entrypoint"},
+            "patterns": ["click.option pattern"],
+            "dependencies": ["click"],
+        }
+    ]
+    _write_research_log(tmp_path, work_id, "specify", specify_topics, specify_findings)
+
+    parent = _base_parent_state(tmp_path, work_id)
+    out = _plan_state_mapper(parent, config=None)
+
+    # SPECIFY findings land in the inter-phase channel
+    assert out["prior_phase_findings"] == specify_findings
+    # SPECIFY topics must NOT pollute PLAN's topic dedup state
+    assert "topics" not in out
+    # PLAN's own findings accumulator stays clean (no SPECIFY pollution)
+    assert "findings" not in out
+
+
+def test_plan_mapper_keeps_prior_phase_findings_distinct_from_plan_findings(tmp_path):
+    """When BOTH SPECIFY's and PLAN's research_log.json exist (PLAN rework
+    scenario), the channels stay separate: PLAN's prior findings seed the
+    `findings` accumulator; SPECIFY's seed `prior_phase_findings`.
+    """
+    work_id = "wid-both-logs"
+    specify_findings = [
+        {
+            "topic": "spec topic",
+            "summary": "spec map",
+            "file_map": {"a.py": "x"},
+            "patterns": [],
+            "dependencies": [],
+        }
+    ]
+    plan_findings = [
+        {
+            "topic": "plan topic",
+            "summary": "plan map",
+            "file_map": {"b.py": "y"},
+            "patterns": [],
+            "dependencies": [],
+        }
+    ]
+    _write_research_log(tmp_path, work_id, "specify", ["spec topic"], specify_findings)
+    _write_research_log(tmp_path, work_id, "plan", ["plan topic"], plan_findings)
+
+    parent = _base_parent_state(tmp_path, work_id)
+    out = _plan_state_mapper(parent, config=None)
+
+    assert out["findings"] == plan_findings
+    assert out["topics"] == ["plan topic"]
+    assert out["prior_phase_findings"] == specify_findings
+
+
+def test_plan_mapper_omits_prior_phase_findings_when_specify_log_missing(tmp_path):
+    """Quick workflows / SPECIFY-skipped paths leave the field absent so
+    nothing renders in the researcher / manager prompts.
+    """
+    parent = _base_parent_state(tmp_path, "wid-no-specify")
+    out = _plan_state_mapper(parent, config=None)
+    assert "prior_phase_findings" not in out
+
+
+def test_specify_mapper_does_not_set_prior_phase_findings(tmp_path):
+    """The cross-phase injection is a PLAN-only behaviour. SPECIFY's mapper
+    must not introduce a prior_phase_findings field of its own.
+    """
+    work_id = "wid-specify-only"
+    _write_research_log(
+        tmp_path, work_id, "specify",
+        ["t"],
+        [{"topic": "t", "summary": "s", "file_map": {}, "patterns": [], "dependencies": []}],
+    )
+    parent = _base_parent_state(tmp_path, work_id)
+    out = _specify_state_mapper(parent, config=None)
+    assert "prior_phase_findings" not in out

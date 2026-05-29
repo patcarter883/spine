@@ -207,6 +207,13 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     findings: Annotated[list[dict], _op_add]  # ResearchFindings dicts from explore nodes
     scratchpad: Annotated[str, _op_add]  # Working memory accumulator for GC
 
+    # Findings inherited from an earlier phase's research_log.json
+    # (e.g. SPECIFY's findings injected into PLAN). Seeded once by the
+    # state mapper; read-only inside the subgraph. Kept separate from
+    # ``findings`` so it does not pollute the topic-dedup, manager-summary,
+    # or persisted-research-log paths for the current phase.
+    prior_phase_findings: list[dict]
+
     # Per-Send transient: the evidence dossier produced by the explore_do
     # node and consumed by the summarise node in the same branch. One
     # writer per branch so no reducer is needed.

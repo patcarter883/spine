@@ -81,6 +81,12 @@ def build_plan_agent(
         system_prompt=system_prompt,
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
+        # The PLAN orchestrator's prompt names only read_prior_artifacts,
+        # search_codebase, and write_structured_plan — the MCP catalog is
+        # dead weight here (see trace 019e721d audit). All structural
+        # exploration happens in the exploration_subgraph; this
+        # orchestrator only synthesises.
+        skip_default_mcp_injection=True,
     )
 
     return agent
@@ -130,6 +136,12 @@ def build_plan_synthesizer(
         system_prompt=_build_plan_synthesizer_prompt(),
         extra_tools=synthesizer_tools,
         skip_filesystem_middleware=True,
+        # Synthesizer-only: read_prior_artifacts + write_structured_plan.
+        # Trace 019e721d showed this synthesizer mis-using MCP tools
+        # mid-synthesis (e.g. mcp_codebase-index_get_function_source
+        # called with file_path but no name) — eliminating the catalog
+        # removes the temptation.
+        skip_default_mcp_injection=True,
     )
 
 

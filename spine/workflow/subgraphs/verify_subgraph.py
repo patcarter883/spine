@@ -43,6 +43,7 @@ from spine.agents.artifacts import (
     materialize_phase_artifacts,
     scan_artifact_dir,
 )
+from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.plan_do import (
     directive_from_state,
     format_directive_for_prompt,
@@ -219,20 +220,35 @@ async def _run_slice_verifier_node(
             extra_tools=extra_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
+            # The subagent_spec already curated the verifier's tool surface
+            # (read/execute tools + MCP wrappers via _inject_mcp_tools in
+            # subagents.py). Letting build_phase_agent re-inject the full
+            # MCP catalog would duplicate the wrappers and emit a
+            # redundant mcp_guidance system-prompt block — see commits
+            # 7a26454 / 390df77 and the trace 019e721d audit.
+            skip_default_mcp_injection=True,
         )
 
         slice_json = json.dumps(slice_data, indent=2, ensure_ascii=False)
         directive_block = format_directive_for_prompt(
             directive_from_state(dict(state), "active_slice_directive")
         )
-        prompt = (
-            (directive_block + "\n" if directive_block else "")
-            + f"## Verify Slice: {slice_id}\n\n"
-            f"The full slice definition is in the JSON below. "
-            f"Verify the implementation against these acceptance criteria. "
-            f"Inspect the actual code files on disk — do not trust that "
-            f"the implementation summary matches reality.\n\n"
-            f"```json\n{slice_json}\n```"
+        # Hostage layout: data blocks first, plain-text directive at the
+        # absolute tail. The directive_block from format_directive_for_prompt
+        # is already wrapped in <directive> — splice it after xml_blocks
+        # rather than re-wrapping.
+        prompt = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, f"Verify slice: {slice_id}"),
+                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+            )
+            + ("\n\n" + directive_block if directive_block else ""),
+            (
+                "Verify the implementation against the acceptance_criteria "
+                "in the slice JSON above. Inspect the actual code files on "
+                "disk — do not trust that the implementation summary matches "
+                "reality."
+            ),
         )
 
         result = await ainvoke_with_retry(

@@ -27,6 +27,12 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
+from spine.agents.prompt_format import (
+    Tag,
+    hostage_layout,
+    xml_block,
+    xml_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,17 +80,23 @@ class SubagentDirective(BaseModel):
 
 
 _PLAN_SYSTEM_PROMPT = (
-    "You are the planner for a SPINE subagent step. You will be shown the "
-    "task description. Your job is to think about the APPROACH and return a "
-    "SubagentDirective JSON.\n\n"
-    "Rules:\n"
-    "- You do NOT have any tools. Do not attempt to call one.\n"
-    "- Do not implement the task. Plan it.\n"
-    "- Keep the directive short and concrete. The do node will read it.\n"
-    "- If the task names specific files, list them in target_files.\n"
-    "- If the task implies specific tool calls, list short labels in "
-    "tool_calls_to_make. If unsure, leave the list empty.\n"
-    "- acceptance bullets should be testable conditions, not vague goals.\n"
+    xml_block(
+        Tag.ROLE,
+        "You are the planner for a SPINE subagent step. You will be shown a "
+        "task description. Your job is to think about the APPROACH and return "
+        "a SubagentDirective JSON.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- You do NOT have any tools. Do not attempt to call one.\n"
+        "- Do not implement the task. Plan it.\n"
+        "- Keep the directive short and concrete. The do node will read it.\n"
+        "- If the task names specific files, list them in target_files.\n"
+        "- If the task implies specific tool calls, list short labels in "
+        "tool_calls_to_make. If unsure, leave the list empty.\n"
+        "- acceptance bullets should be testable conditions, not vague goals.",
+    )
 )
 
 
@@ -106,11 +118,13 @@ def empty_directive(reason: str = "") -> SubagentDirective:
 
 
 def format_directive_for_prompt(directive: SubagentDirective | dict) -> str:
-    """Render a SubagentDirective as a markdown block for prompt injection.
+    """Render a SubagentDirective wrapped in a ``<directive>`` block.
 
-    Accepts a SubagentDirective instance or a plain dict so callers that
-    pull the directive from LangGraph state (where it round-trips as a
-    dict) don't need to re-instantiate it.
+    Output is XML-bounded so it can be safely concatenated into a parent
+    user prompt without conflating with the surrounding instructions —
+    see :mod:`spine.agents.prompt_format` for the convention. Accepts
+    either a SubagentDirective instance or the dict shape LangGraph
+    round-trips through state.
     """
     if isinstance(directive, SubagentDirective):
         data = directive.model_dump()
@@ -119,7 +133,7 @@ def format_directive_for_prompt(directive: SubagentDirective | dict) -> str:
     else:
         return ""
 
-    lines: list[str] = ["## Plan Directive (from the planning step — read before acting)"]
+    lines: list[str] = []
     approach = (data.get("approach") or "").strip()
     if approach:
         lines.append(f"**Approach:** {approach}")
@@ -146,8 +160,10 @@ def format_directive_for_prompt(directive: SubagentDirective | dict) -> str:
     if notes:
         lines.append(f"**Notes:** {notes}")
 
-    lines.append("")
-    return "\n".join(lines)
+    body = "\n".join(lines).strip()
+    if not body:
+        return ""
+    return xml_block(Tag.DIRECTIVE, body)
 
 
 def _coerce_to_chat_model(model: Any) -> Any | None:
@@ -229,11 +245,12 @@ async def run_plan_node(
         )
         return empty_directive("structured output unsupported")
 
-    role_line = f"\n## Subagent role\n{role_hint.strip()}\n" if role_hint.strip() else ""
-    human_content = (
-        f"{role_line}"
-        f"\n## Task description\n{task_description.strip()}\n\n"
-        "Return a SubagentDirective JSON describing how the do node should proceed."
+    human_content = hostage_layout(
+        xml_blocks(
+            (Tag.ROLE, role_hint.strip()),
+            (Tag.OBJECTIVE, task_description.strip()),
+        ),
+        "Return a SubagentDirective JSON describing how the do node should proceed.",
     )
 
     try:

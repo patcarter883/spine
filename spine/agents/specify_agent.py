@@ -74,6 +74,12 @@ def build_specify_agent(
         system_prompt=system_prompt,
         extra_tools=all_tools,
         skip_filesystem_middleware=True,
+        # The SPECIFY orchestrator's prompt names only read_work_context,
+        # recall, and write_specification — the MCP catalog is dead
+        # weight here (see trace 019e721d audit). All structural
+        # exploration is done by per-topic researchers in the
+        # exploration_subgraph; this orchestrator only synthesises.
+        skip_default_mcp_injection=True,
     )
 
     return agent
@@ -117,6 +123,10 @@ def build_specify_synthesizer(
         system_prompt=system_prompt,
         extra_tools=list(orchestrator_tools),
         skip_filesystem_middleware=True,
+        # Synthesizer-only: needs read_work_context + write_specification
+        # only. The MCP catalog would just give the model paths to wander
+        # off into mid-synthesis. See trace 019e721d audit.
+        skip_default_mcp_injection=True,
     )
 
 

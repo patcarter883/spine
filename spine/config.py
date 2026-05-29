@@ -61,11 +61,25 @@ _load_dotenv()
 
 @dataclass
 class ConvergenceConfig:
-    """Researcher convergence-steering thresholds."""
+    """Researcher convergence-steering thresholds.
+
+    The ``researcher_soft`` / ``researcher_hard`` / ``researcher_recursion_limit``
+    fields are no-ops for the researcher subagent since the supervisor/worker
+    split replaced the free-form tool loop (see
+    ``spine/agents/researcher_supervisor.py``). They are retained for YAML
+    back-compat and for any future code path that still wants tool-call
+    convergence steering.
+
+    The ``researcher_supervisor_max_cycles_*`` fields cap the supervisor↔worker
+    loop per phase: SPECIFY (broad architectural mapping) gets a larger
+    budget than PLAN (focused change-surface scan).
+    """
 
     researcher_soft: int = 10
     researcher_hard: int = 14
     researcher_recursion_limit: int = 50
+    researcher_supervisor_max_cycles_specify: int = 12
+    researcher_supervisor_max_cycles_plan: int = 6
 
 
 @dataclass
@@ -103,10 +117,24 @@ def _parse_convergence_config(raw: dict) -> ConvergenceConfig:
     )
     if hard < soft:
         hard = soft
+    max_cycles_specify = int(
+        os.getenv(
+            "SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_SPECIFY",
+            raw.get("researcher_supervisor_max_cycles_specify", 12),
+        )
+    )
+    max_cycles_plan = int(
+        os.getenv(
+            "SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_PLAN",
+            raw.get("researcher_supervisor_max_cycles_plan", 6),
+        )
+    )
     return ConvergenceConfig(
         researcher_soft=soft,
         researcher_hard=hard,
         researcher_recursion_limit=rlimit,
+        researcher_supervisor_max_cycles_specify=max(1, max_cycles_specify),
+        researcher_supervisor_max_cycles_plan=max(1, max_cycles_plan),
     )
 
 
@@ -187,6 +215,13 @@ class SpineConfig:
     # synthesize prompt (trace 019e6d27: 42K plan-synthesize prompt
     # vs 40K TokenBudgetCompactor threshold). 0 or negative = unbounded.
     synthesize_findings_token_budget: int = 20000
+
+    # Token budget for the prior-phase findings injected into PLAN
+    # researcher / manager prompts (SPECIFY's research_log.json findings
+    # carried across into PLAN exploration). Tighter than the synthesis
+    # budget because the PLAN researcher prompt already carries the spec
+    # (~8K). 0 or negative = unbounded.
+    prior_phase_findings_token_budget: int = 6000
 
     # Global default for the model's ``max_completion_tokens`` request
     # field. Per-provider settings still win — this is the fallback used
@@ -400,6 +435,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_SYNTHESIZE_FINDINGS_TOKEN_BUDGET",
                     spine.get("synthesize_findings_token_budget", 20000),
+                )
+            ),
+            prior_phase_findings_token_budget=int(
+                os.getenv(
+                    "SPINE_PRIOR_PHASE_FINDINGS_TOKEN_BUDGET",
+                    spine.get("prior_phase_findings_token_budget", 6000),
                 )
             ),
             max_completion_tokens=int(

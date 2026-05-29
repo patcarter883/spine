@@ -48,6 +48,8 @@ from deepagents.graph import BASE_AGENT_PROMPT
 from deepagents.middleware.filesystem import FilesystemMiddleware, supports_execution
 from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+
+from spine.agents.prompt_format import Tag, xml_block
 from deepagents.middleware.skills import SkillsMiddleware
 
 from spine.models.enums import PhaseName
@@ -191,53 +193,66 @@ class StaticPrefixCacheMiddleware:
 # like "/home/user/project/.spine/..." double-nest.  This prompt teaches the
 # agent the correct convention.
 
-SPINE_FILESYSTEM_PROMPT = """\
-## Filesystem Tools — ls, read_file, write_file, edit_file, glob, grep
-
-You have access to a virtual filesystem rooted at the project workspace.
-
-**Path conventions — VIOLATIONS BREAK EVERYTHING:**
-- Use **relative paths** from the workspace root: `.spine/artifacts/file.md`, `spine/ui/pages.py`.
-- A leading `/` is treated as workspace-relative (e.g. `/spine/ui/pages.py` resolves correctly).
-- **NEVER use absolute Linux paths** like `/home/user/project/spine/ui/pages.py` — the
-  virtual filesystem treats `/home/user/...` as a virtual path, so it gets double-nested
-  under the workspace root and your files land at a path that does not exist and will never
-  be found by subsequent phases. Write `spine/ui/pages.py` NOT `/home/pat/Projects/spine/spine/ui/pages.py`.
-- **Path traversal** (`..`, `~`) is BLOCKED. Use relative paths only.
-- **Verify paths exist** before modifying: use `ls` on parent directories, or `search_codebase`
-  if available. Do not invent paths like `src/main.py` or `api/routes.py` — confirm they exist
-  or that the parent directory exists for new files.
-- Use **offset/limit** when reading large files. Read only what you need.
-
-Tools:
-- ls: list files in a directory
-- read_file: read a file (supports offset/limit for large files, plus images/PDFs)
-- write_file: create or overwrite a file at a relative path
-- edit_file: find-and-replace within a file (supports replace_all)
-- glob: find files matching a pattern (e.g. `**/*.py`)
-- grep: search file contents with multiple output modes
-
-## Batch reads
-Never read one file per turn. Always batch: read ≥3 files or use search_codebase
-instead. Sequential single-file reads waste turns and bloat context.
-
-## Large Tool Results
-When a tool result is too large, it may be offloaded to `/large_tool_results/<tool_call_id>` \
-instead of being returned inline. Use `read_file` to inspect in chunks, or `grep` within \
-`/large_tool_results/` to search across offloaded results."""
+SPINE_FILESYSTEM_PROMPT = (
+    xml_block(
+        Tag.TOOLS,
+        "Filesystem tools available: ls, read_file, write_file, edit_file, "
+        "glob, grep.\n\n"
+        "Descriptions:\n"
+        "- ls: list files in a directory\n"
+        "- read_file: read a file (supports offset/limit for large files, "
+        "plus images/PDFs)\n"
+        "- write_file: create or overwrite a file at a relative path\n"
+        "- edit_file: find-and-replace within a file (supports replace_all)\n"
+        "- glob: find files matching a pattern (e.g. `**/*.py`)\n"
+        "- grep: search file contents with multiple output modes\n\n"
+        "You have access to a virtual filesystem rooted at the project "
+        "workspace.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "Path conventions — VIOLATIONS BREAK EVERYTHING:\n"
+        "- Use relative paths from the workspace root: "
+        "`.spine/artifacts/file.md`, `spine/ui/pages.py`.\n"
+        "- A leading `/` is treated as workspace-relative (e.g. "
+        "`/spine/ui/pages.py` resolves correctly).\n"
+        "- NEVER use absolute Linux paths like "
+        "`/home/user/project/spine/ui/pages.py` — the virtual filesystem "
+        "treats `/home/user/...` as a virtual path, so it gets double-"
+        "nested under the workspace root and your files land at a path "
+        "that does not exist and will never be found by subsequent phases. "
+        "Write `spine/ui/pages.py` NOT "
+        "`/home/pat/Projects/spine/spine/ui/pages.py`.\n"
+        "- Path traversal (`..`, `~`) is BLOCKED. Use relative paths only.\n"
+        "- Verify paths exist before modifying: use `ls` on parent "
+        "directories, or `search_codebase` if available. Do not invent "
+        "paths — confirm they exist or that the parent directory exists "
+        "for new files.\n"
+        "- Use offset/limit when reading large files. Read only what you "
+        "need.\n"
+        "- Batch reads: never read one file per turn. Always read ≥3 files "
+        "or use search_codebase instead. Sequential single-file reads "
+        "waste turns and bloat context.\n"
+        "- Large tool results may be offloaded to "
+        "`/large_tool_results/<tool_call_id>` — use `read_file` to inspect "
+        "in chunks, or `grep` within `/large_tool_results/` to search "
+        "across offloaded results.",
+    )
+)
 
 SPINE_FILESYSTEM_EXEC_PROMPT = (
     SPINE_FILESYSTEM_PROMPT
-    + """
-
-## Execute Tool — execute
-
-You have access to an `execute` tool for running shell commands.
-Use it for commands, scripts, tests, builds, and other shell operations.
-Commands run in the workspace root directory.
-All paths in commands MUST be relative (e.g. `pytest tests/unit/` NOT `pytest /home/user/project/tests/unit/`).
-
-- execute: run a shell command (returns output and exit code)"""
+    + "\n\n"
+    + xml_block(
+        Tag.TOOLS,
+        "Additional tool available: execute.\n\n"
+        "- execute: run a shell command (returns output and exit code).\n\n"
+        "Use it for commands, scripts, tests, builds, and other shell "
+        "operations. Commands run in the workspace root directory. All "
+        "paths in commands MUST be relative (e.g. `pytest tests/unit/` "
+        "NOT `pytest /home/user/project/tests/unit/`).",
+    )
 )
 
 
@@ -306,6 +321,7 @@ def build_phase_agent(
     allowed_tools: list[str] | None = None,
     extra_tools: list[Any] | None = None,
     skip_filesystem_middleware: bool = False,
+    skip_default_mcp_injection: bool = False,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -336,6 +352,17 @@ def build_phase_agent(
             entirely. Pair with extra_tools to replace all filesystem access
             with purpose-built tools, removing any generic read/write fallback
             from the model's tool surface.
+        skip_default_mcp_injection: When True, do NOT auto-load the
+            ``SpineConfig.mcp_servers`` catalog and do NOT append it to the
+            agent's tool list / inject the MCP guidance prompt block. Use
+            for callers that have already curated the worker's tool surface
+            upstream (notably the supervisor↔worker loop in
+            :func:`spine.agents.exploration_agents.run_explore_do_node`,
+            which scopes ``extra_tools`` to a single ToolClass). Without
+            this, the default-MCP injection re-appends ~18 wrappers per
+            agent and silently undoes the upstream filter — trace
+            019e7164 showed a 226:1 prompt:completion ratio caused by
+            exactly this.
 
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
@@ -352,19 +379,26 @@ def build_phase_agent(
     work_id = state.get("work_id", "")
 
     # ── MCP tools ──────────────────────────────────────────────────────
-    from spine.config import SpineConfig
-    from spine.mcp.client import get_mcp_tools
-
+    # When ``skip_default_mcp_injection`` is True we deliberately do NOT
+    # call ``get_mcp_tools(...)``. This avoids:
+    #   (a) appending the full MCP catalog to ``all_tools`` below,
+    #   (b) emitting the ``mcp_guidance`` system-prompt block.
+    # Callers that opt out are responsible for curating the worker's tool
+    # surface upstream via ``extra_tools``.
     mcp_tools: list = []
-    try:
-        config_obj = SpineConfig.load()
-        mcp_tools = get_mcp_tools(
-            config_obj.mcp_servers,
-            cache_key=work_id or "default",
-            workspace_root=workspace_root,
-        )
-    except Exception:
-        logger.debug("MCP tool loading failed (non-fatal)", exc_info=True)
+    if not skip_default_mcp_injection:
+        from spine.config import SpineConfig
+        from spine.mcp.client import get_mcp_tools
+
+        try:
+            config_obj = SpineConfig.load()
+            mcp_tools = get_mcp_tools(
+                config_obj.mcp_servers,
+                cache_key=work_id or "default",
+                workspace_root=workspace_root,
+            )
+        except Exception:
+            logger.debug("MCP tool loading failed (non-fatal)", exc_info=True)
 
     # ── Resolve profile for prompt assembly ──────────────────────────
     # The HarnessProfile is registered per-provider by ensure_spine_profiles().
