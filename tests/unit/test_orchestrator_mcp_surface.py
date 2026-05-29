@@ -222,3 +222,54 @@ async def test_slice_implementer_dispatcher_skips_default_mcp(monkeypatch, tmp_p
         pass
 
     _assert_skip_flag_in(captured, "slice_implementer_node")
+
+
+@pytest.mark.asyncio
+async def test_slice_verifier_dispatcher_skips_default_mcp(monkeypatch, tmp_path):
+    """The verify subgraph's _run_slice_verifier_node curates its tool
+    surface via the subagent_spec — the factory must not re-inject the
+    full MCP catalog on top. Mirrors the slice-implementer contract.
+    """
+    captured = _stub_factory_and_helpers(monkeypatch)
+
+    class _FakeTool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    monkeypatch.setattr(
+        "spine.agents.subagents.build_subagent_spec",
+        lambda **kw: {
+            "system_prompt": "verifier",
+            "tools": [
+                _FakeTool("ls"),
+                _FakeTool("read_file"),
+                _FakeTool("execute"),
+                _FakeTool("mcp_codebase-index_find_symbol"),
+            ],
+            "model": object(),
+            "response_format": None,
+        },
+    )
+
+    from spine.workflow.subgraphs.verify_subgraph import _run_slice_verifier_node
+
+    state: dict[str, Any] = {
+        **_base_state(),
+        "phase": "verify",
+        "slice": {
+            "id": "slice-1",
+            "title": "test slice",
+            "description": "verify the thing",
+            "target_files": ["spine/x.py"],
+            "acceptance_criteria": ["X is verified"],
+        },
+        "verification_results": [],
+    }
+    try:
+        await _run_slice_verifier_node(state, config=None)
+    except Exception:
+        # As above — the fake agent fails on invocation, but
+        # build_phase_agent was called first with the flag we're checking.
+        pass
+
+    _assert_skip_flag_in(captured, "_run_slice_verifier_node")

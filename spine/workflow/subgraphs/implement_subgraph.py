@@ -32,6 +32,7 @@ from spine.agents.artifacts import (
     materialize_phase_artifacts,
     scan_artifact_dir,
 )
+from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.plan_do import (
     directive_from_state,
     format_directive_for_prompt,
@@ -234,14 +235,21 @@ async def _slice_implementer_node(
         directive_block = format_directive_for_prompt(
             directive_from_state(dict(state), "active_slice_directive")
         )
-        prompt = (
-            (directive_block + "\n" if directive_block else "")
-            + f"## Implement Slice: {slice_id}\n\n"
-            f"The full slice definition is in the JSON below. "
-            f"Read it carefully — it specifies target_files, "
-            f"acceptance_criteria, and (optionally) a description. "
-            f"Make only the changes described in the slice.\n\n"
-            f"```json\n{slice_json}\n```"
+        # Hostage layout: data blocks first, plain-text directive at the
+        # absolute tail. The directive_block from format_directive_for_prompt
+        # is already wrapped in <directive> — splice it after xml_blocks
+        # rather than re-wrapping.
+        prompt = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, f"Implement slice: {slice_id}"),
+                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+            )
+            + ("\n\n" + directive_block if directive_block else ""),
+            (
+                "Read the slice JSON above carefully — it specifies "
+                "target_files, acceptance_criteria, and (optionally) a "
+                "description. Make only the changes described in the slice."
+            ),
         )
 
         result = await ainvoke_with_retry(
