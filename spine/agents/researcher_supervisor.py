@@ -1,0 +1,769 @@
+"""Supervisor↔worker micro-loop for the per-topic researcher.
+
+Replaces the free-form "one big agent.astream() with a recursion cap"
+researcher pattern with a deterministic loop:
+
+1. ``run_supervisor_node`` — no-tool LLM call that emits a
+   :class:`SupervisorDirective` (analysis + ``is_complete`` flag + the
+   ``next_directive`` to execute + which :class:`ToolClass` the worker
+   may use this turn).
+
+2. ``run_worker_node`` — agent.invoke against a pre-built worker whose
+   tool surface is restricted to the supervisor's chosen tool class.
+   Returns a :class:`StructuredFinding` describing what the single turn
+   produced.
+
+The loop alternates these two until ``is_complete=True`` or the per-phase
+cycle cap (``ConvergenceConfig.researcher_supervisor_max_cycles_*``)
+fires. This module is the SHARED infrastructure for that pattern; the
+loop itself is driven from
+:func:`spine.agents.exploration_agents.run_explore_do_node`.
+
+This mirrors :mod:`spine.agents.plan_do` (single plan→do hop). The
+researcher case is a *looped* generalisation with one extra concept:
+tool-class allowlisting per worker turn.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from pydantic import BaseModel, Field
+
+from spine.agents.helpers import resolve_model
+
+if TYPE_CHECKING:
+    from langchain_core.runnables import RunnableConfig
+
+logger = logging.getLogger(__name__)
+
+
+# ── Schemas ────────────────────────────────────────────────────────────
+
+
+class ToolClass(str, Enum):
+    """Tool-class taxonomy the supervisor picks from each turn.
+
+    The four classes partition the researcher's seven callable actions
+    (codebase_query{find_symbol, get_source, get_dependencies,
+    get_dependents, search}, ast_extract_symbol, search_codebase) into
+    distinct investigation phases — name discovery, body inspection,
+    call-graph tracing, content search.
+    """
+
+    SEARCH = "search"
+    FIND_SYMBOL = "find_symbol"
+    READ_SOURCE = "read_source"
+    TRACE_DEPS = "trace_deps"
+
+
+# Tool-level allowlist per class. ``codebase_query`` spans multiple
+# classes (its ``action`` arg selects the behaviour), so action-level
+# restriction is enforced via the worker prompt + the directive's
+# ``next_directive`` text. Tool-level restriction here ensures the worker
+# can't reach for, say, ``ast_extract_symbol`` during a TRACE_DEPS turn.
+TOOL_CLASS_TO_TOOLNAMES: dict[ToolClass, frozenset[str]] = {
+    ToolClass.SEARCH: frozenset({"codebase_query", "search_codebase"}),
+    ToolClass.FIND_SYMBOL: frozenset({"codebase_query"}),
+    ToolClass.READ_SOURCE: frozenset({"codebase_query", "ast_extract_symbol"}),
+    ToolClass.TRACE_DEPS: frozenset({"codebase_query"}),
+}
+
+
+# Human-readable hint of the codebase_query action(s) appropriate for each
+# class. Rendered into the worker prompt so the model picks the correct
+# action and into the supervisor prompt so it understands its choices.
+TOOL_CLASS_ACTION_HINT: dict[ToolClass, str] = {
+    ToolClass.SEARCH: (
+        "codebase_query(action='search', pattern=...) or "
+        "search_codebase(queries=[...])"
+    ),
+    ToolClass.FIND_SYMBOL: "codebase_query(action='find_symbol', name=...)",
+    ToolClass.READ_SOURCE: (
+        "codebase_query(action='get_source', name=...) or "
+        "ast_extract_symbol(symbol=...)"
+    ),
+    ToolClass.TRACE_DEPS: (
+        "codebase_query(action='get_dependencies'|'get_dependents', name=...)"
+    ),
+}
+
+
+class FindingStatus(str, Enum):
+    """Status of a single worker turn's tool call."""
+
+    SUCCESS = "success"
+    EMPTY = "empty"
+    ERROR = "error"
+
+
+class StructuredFinding(BaseModel):
+    """One worker turn's compact result, fed back into the supervisor.
+
+    Distinct from :class:`spine.agents.subagents.ResearchFindings`, which
+    is the FINAL per-topic synthesis written into the subgraph's
+    ``findings`` channel. A ``StructuredFinding`` is per-cycle evidence
+    used to advance the supervisor's decision-making within the loop.
+    """
+
+    tool_name: str = Field(description="Name of the tool the worker invoked.")
+    tool_class: ToolClass = Field(description="Supervisor-assigned class for this turn.")
+    status: FindingStatus
+    target_path: str = Field(default="", description="File path the call landed on, if any.")
+    matched_symbols: list[str] = Field(
+        default_factory=list,
+        description="Symbols, file matches, or other anchors surfaced by the tool.",
+    )
+    structured_code_block: str = Field(
+        default="",
+        description="Capped body snippet returned by the tool (truncated to ~2 KB).",
+    )
+    execution_error_details: str = Field(
+        default="",
+        description="Error text when status=error. Empty otherwise.",
+    )
+
+
+class SupervisorDirective(BaseModel):
+    """Supervisor's verdict + next move (or terminate).
+
+    When ``is_complete=True``, the loop exits and the accumulated
+    findings get summarised. When False, ``next_directive`` and
+    ``allowed_tool_class`` MUST be populated — the worker uses both.
+    """
+
+    analysis_and_reasoning: str = Field(
+        description=(
+            "Two to four sentences naming what the latest finding adds, "
+            "what is still missing, and why the next move is the right "
+            "one. Concrete, not abstract."
+        )
+    )
+    is_complete: bool = Field(
+        description=(
+            "True only when the accumulated findings cover the topic well "
+            "enough to synthesise a ResearchFindings (summary + patterns + "
+            "file_map + dependencies). False otherwise."
+        )
+    )
+    next_directive: str = Field(
+        default="",
+        description=(
+            "When is_complete=False: ONE short sentence describing the "
+            "single tool call the worker should make this turn. Empty "
+            "when is_complete=True."
+        ),
+    )
+    allowed_tool_class: ToolClass | None = Field(
+        default=None,
+        description=(
+            "When is_complete=False: the tool class the worker may use this "
+            "turn (SEARCH / FIND_SYMBOL / READ_SOURCE / TRACE_DEPS). "
+            "Required when is_complete=False."
+        ),
+    )
+
+
+# ── Constants ──────────────────────────────────────────────────────────
+
+
+# Cap per-section code snippet at ~2 KB so a single worker turn returning
+# a multi-thousand-line file body doesn't blow the supervisor's prompt
+# on the next cycle. Matches the salvage-evidence cap used elsewhere.
+_FINDING_SNIPPET_CHAR_CAP = 2000
+
+
+# ── Supervisor ─────────────────────────────────────────────────────────
+
+
+_SUPERVISOR_SYSTEM_PROMPT = (
+    "You are the supervisor of a per-topic codebase researcher. The "
+    "researcher investigates ONE topic at a time via a worker that "
+    "executes a single tool call per turn from a restricted tool class.\n\n"
+    "Your job each cycle: read the latest StructuredFinding plus the "
+    "evaluation history, judge whether the accumulated evidence is "
+    "sufficient to write a ResearchFindings (summary + patterns + "
+    "file_map + dependencies), and emit a SupervisorDirective JSON.\n\n"
+    "Rules:\n"
+    "- You do NOT have tools. Do not attempt to call one.\n"
+    "- Be decisive. If the evidence is thin, pick a SINGLE next move "
+    "that produces concrete new information.\n"
+    "- One move per turn. next_directive is ONE short sentence naming "
+    "ONE tool call (e.g. 'get_source for SpineConfig.load').\n"
+    "- Tool classes available:\n"
+    "  * SEARCH       — codebase_query(action='search') or search_codebase: "
+    "regex / keyword discovery across files.\n"
+    "  * FIND_SYMBOL  — codebase_query(action='find_symbol'): locate a "
+    "single named symbol's definition.\n"
+    "  * READ_SOURCE  — codebase_query(action='get_source') or "
+    "ast_extract_symbol: fetch a symbol's body.\n"
+    "  * TRACE_DEPS   — codebase_query(action='get_dependencies'|'get_dependents'): "
+    "follow the call graph.\n"
+    "- Set is_complete=True only when file_map, patterns, and dependencies "
+    "can all be populated from the current history. When you set "
+    "is_complete=True, leave next_directive empty and allowed_tool_class "
+    "null.\n"
+    "- When is_complete=False, allowed_tool_class is REQUIRED.\n"
+)
+
+
+_SUPERVISOR_USER_TEMPLATE = """\
+## Strategic Objective (topic)
+{global_goal}
+
+## Cycle
+{cycle_idx} of {max_cycles} (hard cap)
+
+## Latest Finding
+{latest_finding_block}
+
+## Evaluation History ({history_count} prior finding(s))
+{history_summary}
+
+Analyse the structured payload above and emit your next directive."""
+
+
+def _render_finding_block(finding: StructuredFinding | None) -> str:
+    """Render a StructuredFinding as a labelled block for the supervisor."""
+    if finding is None:
+        return "(none — initialization cycle)"
+    matched = ", ".join(finding.matched_symbols) if finding.matched_symbols else "None"
+    snippet = finding.structured_code_block or "[No code returned]"
+    err = finding.execution_error_details or "None"
+    return (
+        f"- Tool Used: {finding.tool_name}\n"
+        f"- Tool Class: {finding.tool_class.value}\n"
+        f"- Execution Status: {finding.status.value}\n"
+        f"- Target File/Path: {finding.target_path or 'None'}\n"
+        f"- Extracted Symbols: {matched}\n"
+        f"- Error Logs (if any): {err}\n"
+        f"- Code Snippet:\n\"\"\"\n{snippet}\n\"\"\""
+    )
+
+
+def _render_history_summary(history: list[StructuredFinding]) -> str:
+    """Compact one-line-per-cycle render of prior findings for the supervisor."""
+    if not history:
+        return "(no prior cycles)"
+    lines: list[str] = []
+    for i, f in enumerate(history, 1):
+        matched = ", ".join(f.matched_symbols[:5]) if f.matched_symbols else "—"
+        lines.append(
+            f"{i}. [{f.tool_class.value}/{f.status.value}] "
+            f"{f.tool_name} → path={f.target_path or '—'} symbols={matched}"
+        )
+    return "\n".join(lines)
+
+
+def _initialization_directive(global_goal: str) -> SupervisorDirective:
+    """Seed directive emitted on cycle 0 without an LLM call.
+
+    Starts the loop with a SEARCH for the topic. This deterministically
+    primes the first worker turn instead of paying for a supervisor LLM
+    call that has no evidence to evaluate yet.
+    """
+    return SupervisorDirective(
+        analysis_and_reasoning=(
+            "Initialization pass — no findings yet. Begin with a discovery "
+            "call to identify symbols and files relevant to the topic."
+        ),
+        is_complete=False,
+        next_directive=(
+            f"Use search_codebase or codebase_query(action='search') to "
+            f"surface files and symbols related to: {global_goal}"
+        ),
+        allowed_tool_class=ToolClass.SEARCH,
+    )
+
+
+def _terminating_directive(reason: str) -> SupervisorDirective:
+    """Emit a complete=True directive when the supervisor can't run.
+
+    Used on resolve_model failure, structured-output unsupported, or any
+    invocation error — better to exit the loop and let summarise emit an
+    error sentinel than to spin without a supervisor.
+    """
+    return SupervisorDirective(
+        analysis_and_reasoning=f"(supervisor unavailable: {reason}) — terminating loop",
+        is_complete=True,
+        next_directive="",
+        allowed_tool_class=None,
+    )
+
+
+def _coerce_to_chat_model(model: Any) -> Any | None:
+    """Promote a model spec string to a chat model instance.
+
+    Duck-typed (not isinstance) — accepts any object with
+    ``with_structured_output``. Mirrors ``plan_do._coerce_to_chat_model``.
+    """
+    if isinstance(model, str):
+        try:
+            from langchain.chat_models import init_chat_model
+        except ImportError:
+            return None
+        try:
+            return init_chat_model(model)
+        except Exception:
+            logger.warning(
+                "researcher_supervisor: init_chat_model failed for %r",
+                model,
+                exc_info=True,
+            )
+            return None
+    if model is None:
+        return None
+    if hasattr(model, "with_structured_output"):
+        return model
+    return None
+
+
+async def run_supervisor_node(
+    *,
+    state: dict[str, Any],
+    config: "RunnableConfig | None",
+    phase_path: str,
+    global_goal: str,
+    latest_finding: StructuredFinding | None,
+    evaluation_history: list[StructuredFinding],
+    cycle_idx: int,
+    max_cycles: int,
+) -> SupervisorDirective:
+    """Run one supervisor turn — judge progress and emit the next directive.
+
+    Cycle 0 short-circuits to a deterministic seed directive (no LLM call
+    while history is empty). Any failure during model resolution or
+    structured-output invocation returns a terminating directive so the
+    loop exits cleanly rather than spinning.
+    """
+    work_id = state.get("work_id", "unknown")
+
+    # Cycle 0 → deterministic seed. No LLM call while we have nothing to
+    # analyse.
+    if cycle_idx == 0 and latest_finding is None and not evaluation_history:
+        return _initialization_directive(global_goal)
+
+    session_id = work_id if work_id and work_id != "unknown" else None
+
+    try:
+        raw_model = resolve_model(config, session_id=session_id, phase=phase_path)
+    except Exception:
+        logger.warning(
+            "[%s] researcher_supervisor: resolve_model failed for phase_path=%r",
+            work_id,
+            phase_path,
+            exc_info=True,
+        )
+        return _terminating_directive("resolve_model failed")
+
+    model = _coerce_to_chat_model(raw_model)
+    if model is None:
+        return _terminating_directive("could not build chat model")
+
+    try:
+        structured = model.with_structured_output(SupervisorDirective)
+    except Exception:
+        logger.debug(
+            "[%s] researcher_supervisor: model %r lacks with_structured_output",
+            work_id,
+            type(raw_model).__name__,
+            exc_info=True,
+        )
+        return _terminating_directive("structured output unsupported")
+
+    user_msg = _SUPERVISOR_USER_TEMPLATE.format(
+        global_goal=global_goal,
+        cycle_idx=cycle_idx + 1,
+        max_cycles=max_cycles,
+        latest_finding_block=_render_finding_block(latest_finding),
+        history_count=len(evaluation_history),
+        history_summary=_render_history_summary(evaluation_history),
+    )
+
+    try:
+        response: Any = await structured.ainvoke(
+            [
+                SystemMessage(content=_SUPERVISOR_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ]
+        )
+    except Exception:
+        logger.warning(
+            "[%s] researcher_supervisor: invocation failed for phase_path=%r",
+            work_id,
+            phase_path,
+            exc_info=True,
+        )
+        return _terminating_directive("supervisor invocation failed")
+
+    return _validate_directive_response(response, work_id)
+
+
+def _validate_directive_response(response: Any, work_id: str) -> SupervisorDirective:
+    """Coerce a model response to a SupervisorDirective.
+
+    Accepts the four shapes Pydantic structured output can return
+    (instance, ``.parsed`` wrapper, dict, JSON string). Falls back to a
+    terminating directive on unrecognisable output so the loop exits
+    rather than stalling.
+    """
+    if isinstance(response, SupervisorDirective):
+        return _enforce_directive_contract(response)
+    if hasattr(response, "parsed") and isinstance(response.parsed, SupervisorDirective):
+        parsed = response.parsed
+        response.parsed = None  # prevent Pydantic serialization warning
+        return _enforce_directive_contract(parsed)
+    if isinstance(response, dict):
+        try:
+            return _enforce_directive_contract(
+                SupervisorDirective.model_validate(response)
+            )
+        except Exception:
+            logger.warning(
+                "[%s] researcher_supervisor: dict response failed validation",
+                work_id,
+            )
+            return _terminating_directive("invalid directive shape")
+    if isinstance(response, str):
+        try:
+            return _enforce_directive_contract(
+                SupervisorDirective.model_validate(json.loads(response))
+            )
+        except Exception:
+            return _terminating_directive("non-JSON string response")
+    return _terminating_directive("unrecognized response shape")
+
+
+def _enforce_directive_contract(directive: SupervisorDirective) -> SupervisorDirective:
+    """Enforce the is_complete/allowed_tool_class invariant.
+
+    If the model returns ``is_complete=False`` but forgets to set a tool
+    class, we can't dispatch the worker. Treat that as a terminating
+    directive rather than guessing — keeps the loop deterministic.
+    """
+    if not directive.is_complete and directive.allowed_tool_class is None:
+        logger.warning(
+            "researcher_supervisor: directive missing allowed_tool_class "
+            "while is_complete=False — terminating loop"
+        )
+        return _terminating_directive("missing allowed_tool_class")
+    return directive
+
+
+# ── Worker ─────────────────────────────────────────────────────────────
+
+
+_WORKER_USER_TEMPLATE = """\
+## Research Topic
+{topic}
+
+## Supervisor Directive (execute exactly ONE tool call this turn)
+{directive_block}
+
+## Available Tools This Turn ({tool_class})
+{action_hint}
+
+Make ONE tool call now to satisfy the directive. After the tool result \
+returns, give a brief one-paragraph narration of what you found (no \
+further tool calls)."""
+
+
+def _render_directive_for_worker(directive: SupervisorDirective) -> str:
+    """Render the supervisor's directive as a worker-facing instruction block."""
+    return (
+        f"**Reasoning:** {directive.analysis_and_reasoning.strip()}\n"
+        f"**Do this:** {directive.next_directive.strip()}"
+    )
+
+
+def filter_extra_tools_for_class(
+    extra_tools: list[Any],
+    tool_class: ToolClass,
+) -> list[Any]:
+    """Return the subset of ``extra_tools`` allowed for ``tool_class``.
+
+    Uses the tool's ``.name`` attribute to match against
+    :data:`TOOL_CLASS_TO_TOOLNAMES`. Unknown tools (no ``.name``) are
+    dropped — the worker should only see explicitly-allowlisted tools.
+    """
+    allowed_names = TOOL_CLASS_TO_TOOLNAMES.get(tool_class) or frozenset()
+    out: list[Any] = []
+    for t in extra_tools:
+        name = getattr(t, "name", None)
+        if name and name in allowed_names:
+            out.append(t)
+    return out
+
+
+def _extract_finding_from_worker_messages(
+    *,
+    messages: list[Any],
+    tool_class: ToolClass,
+) -> StructuredFinding:
+    """Distil a worker invocation's messages into a StructuredFinding.
+
+    Walks the message list looking for the LAST ``ToolMessage`` (the
+    single call the worker made this turn) and builds a finding from it.
+    Falls back to a synthesised finding when no tool message is present
+    (the model declined to call a tool — counts as EMPTY).
+    """
+    last_tool_msg: ToolMessage | None = None
+    last_ai_msg: AIMessage | None = None
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            last_tool_msg = msg
+        elif isinstance(msg, AIMessage):
+            last_ai_msg = msg
+
+    if last_tool_msg is None:
+        narrative = ""
+        if last_ai_msg is not None:
+            content = getattr(last_ai_msg, "content", "")
+            if isinstance(content, str):
+                narrative = content[:_FINDING_SNIPPET_CHAR_CAP]
+            elif isinstance(content, list):
+                parts = [
+                    blk.get("text", "")
+                    for blk in content
+                    if isinstance(blk, dict) and blk.get("type") == "text"
+                ]
+                narrative = "".join(parts)[:_FINDING_SNIPPET_CHAR_CAP]
+        return StructuredFinding(
+            tool_name="(none)",
+            tool_class=tool_class,
+            status=FindingStatus.EMPTY,
+            target_path="",
+            matched_symbols=[],
+            structured_code_block=narrative,
+            execution_error_details="worker produced no tool call",
+        )
+
+    tool_name = getattr(last_tool_msg, "name", None) or "tool"
+    status_attr = getattr(last_tool_msg, "status", None)
+    raw_content = getattr(last_tool_msg, "content", "") or ""
+    if not isinstance(raw_content, str):
+        raw_content = str(raw_content)
+
+    if status_attr == "error":
+        return StructuredFinding(
+            tool_name=tool_name,
+            tool_class=tool_class,
+            status=FindingStatus.ERROR,
+            target_path="",
+            matched_symbols=[],
+            structured_code_block="",
+            execution_error_details=raw_content[:_FINDING_SNIPPET_CHAR_CAP],
+        )
+
+    body = raw_content.strip()
+    if not body:
+        return StructuredFinding(
+            tool_name=tool_name,
+            tool_class=tool_class,
+            status=FindingStatus.EMPTY,
+            target_path="",
+            matched_symbols=[],
+            structured_code_block="",
+            execution_error_details="tool returned empty result",
+        )
+
+    target_path, matched = _extract_anchors_from_tool_payload(body)
+    if len(body) > _FINDING_SNIPPET_CHAR_CAP:
+        body = body[: _FINDING_SNIPPET_CHAR_CAP - 1] + "…"
+
+    return StructuredFinding(
+        tool_name=tool_name,
+        tool_class=tool_class,
+        status=FindingStatus.SUCCESS,
+        target_path=target_path,
+        matched_symbols=matched,
+        structured_code_block=body,
+        execution_error_details="",
+    )
+
+
+def _extract_anchors_from_tool_payload(body: str) -> tuple[str, list[str]]:
+    """Best-effort: pull a primary file path + symbol names from tool output.
+
+    The researcher's tools return JSON-ish payloads. Parse-once with
+    ``json.loads`` and harvest the common keys ``file_path`` /
+    ``symbol_name`` / ``symbol`` / ``path`` / ``results``. Fail-open:
+    if the payload isn't JSON, return ``("", [])`` — the supervisor will
+    rely on the snippet body.
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return "", []
+
+    target_path = ""
+    symbols: list[str] = []
+
+    if isinstance(data, dict):
+        target_path = str(
+            data.get("file_path") or data.get("path") or ""
+        )
+        single_symbol = data.get("symbol_name") or data.get("symbol")
+        if single_symbol:
+            symbols.append(str(single_symbol))
+        results = data.get("results")
+        if isinstance(results, list):
+            for r in results[:10]:
+                if isinstance(r, dict):
+                    name = r.get("symbol_name") or r.get("name") or r.get("symbol")
+                    if name:
+                        symbols.append(str(name))
+                    if not target_path:
+                        target_path = str(
+                            r.get("file_path") or r.get("path") or ""
+                        )
+    elif isinstance(data, list):
+        for r in data[:10]:
+            if isinstance(r, dict):
+                name = r.get("symbol_name") or r.get("name")
+                if name:
+                    symbols.append(str(name))
+                if not target_path:
+                    target_path = str(r.get("file_path") or r.get("path") or "")
+
+    # De-dupe preserving order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in symbols:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+
+    return target_path, deduped
+
+
+async def run_worker_node(
+    *,
+    state: dict[str, Any],
+    config: "RunnableConfig | None",
+    topic: str,
+    directive: SupervisorDirective,
+    worker_agents: dict[ToolClass, Any],
+    context: Any = None,
+) -> StructuredFinding:
+    """Execute one supervisor-directed worker turn.
+
+    Picks the pre-built agent for the directive's ``allowed_tool_class``
+    and invokes it with a prompt containing the topic + the directive
+    text. Captures the resulting messages and distils them to a
+    :class:`StructuredFinding`.
+
+    The caller is responsible for handling the supervisor's
+    ``is_complete=True`` branch — by the time this function runs, the
+    directive has already been validated to carry a tool class.
+
+    Args:
+        context: Optional :class:`spine.agents.context.SpineContext` so
+            ``ReadCacheMiddleware`` dedupes MCP/read_file calls across
+            sibling worker turns within the same per-topic loop. Passed
+            through to ``agent.ainvoke(context=...)`` when not None.
+    """
+    work_id = state.get("work_id", "unknown")
+    tool_class = directive.allowed_tool_class
+    if tool_class is None:
+        # Defensive: _enforce_directive_contract already screens for this,
+        # but if a caller bypasses it, return a terminating finding rather
+        # than crashing the loop.
+        return StructuredFinding(
+            tool_name="(none)",
+            tool_class=ToolClass.SEARCH,
+            status=FindingStatus.ERROR,
+            execution_error_details="worker received directive without tool class",
+        )
+
+    agent = worker_agents.get(tool_class)
+    if agent is None:
+        logger.warning(
+            "[%s] researcher_supervisor: no worker agent for tool_class=%s",
+            work_id,
+            tool_class.value,
+        )
+        return StructuredFinding(
+            tool_name="(none)",
+            tool_class=tool_class,
+            status=FindingStatus.ERROR,
+            execution_error_details=f"no worker agent for tool_class={tool_class.value}",
+        )
+
+    action_hint = TOOL_CLASS_ACTION_HINT.get(tool_class, "")
+    prompt = _WORKER_USER_TEMPLATE.format(
+        topic=topic,
+        directive_block=_render_directive_for_worker(directive),
+        tool_class=tool_class.value,
+        action_hint=action_hint,
+    )
+
+    invoke_kwargs: dict[str, Any] = {}
+    if context is not None:
+        invoke_kwargs["context"] = context
+
+    try:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            **invoke_kwargs,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] researcher_supervisor: worker invocation failed (%s): %s",
+            work_id,
+            tool_class.value,
+            exc,
+            exc_info=False,
+        )
+        return StructuredFinding(
+            tool_name="(none)",
+            tool_class=tool_class,
+            status=FindingStatus.ERROR,
+            execution_error_details=f"{type(exc).__name__}: {exc}",
+        )
+
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    return _extract_finding_from_worker_messages(
+        messages=messages, tool_class=tool_class
+    )
+
+
+# ── Loop helpers (used by run_explore_do_node) ─────────────────────────
+
+
+def render_history_as_evidence(history: list[StructuredFinding]) -> str:
+    """Render the loop's history into the tool_results_text dossier shape
+    that :func:`spine.agents.exploration_agents.run_summarise_node` already
+    consumes.
+
+    Mirrors :func:`spine.agents.exploration_agents.collect_exploration_evidence`'s
+    output format (``### Tool result: <name>\\n<body>``) so the summarise
+    node needs no changes.
+    """
+    if not history:
+        return ""
+    sections: list[str] = []
+    for i, f in enumerate(history, 1):
+        if f.status == FindingStatus.ERROR:
+            # Skip error sections — summarise/sentinel logic already handles
+            # the no-evidence case, and we don't want error narration to
+            # become a "finding".
+            continue
+        if f.status == FindingStatus.EMPTY:
+            continue
+        body = f.structured_code_block or "(no body returned)"
+        sections.append(
+            f"### Tool result: {f.tool_name} "
+            f"(class={f.tool_class.value}, target={f.target_path or '—'})\n"
+            f"{body}"
+        )
+    return "\n\n".join(sections)

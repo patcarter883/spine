@@ -131,31 +131,49 @@ def test_salvage_sentinel_carries_no_exception_text_in_summary():
         assert needle not in sentinel["summary"], (
             f"summary leaks {needle!r}: {sentinel['summary']!r}"
         )
-    # And the same invariants must hold against the LIVE constructor in
-    # spine.agents.exploration_agents. Read the source and assert the
-    # forbidden tokens don't appear inside the salvage-sentinel literal.
-    import inspect
-    from spine.agents import exploration_agents
-    src = inspect.getsource(exploration_agents)
-    # Locate the salvage sentinel block: anchored on the structured
-    # error_class field that the rebuilt code introduces.
-    assert '"error_class": type(e).__name__' in src, (
-        "salvage sentinel structure changed — re-anchor this regression test"
+    # And the same invariants must hold against the LIVE sentinel
+    # constructor in spine.agents.exploration_agents._empty_research_finding.
+    # The supervisor↔worker refactor moved error capture inside
+    # run_worker_node — exceptions never bubble up to the explore_do node
+    # any more — but the canonical sentinel constructor still emits the
+    # finding that summarise / format_findings / save_artifacts filter on.
+    from spine.agents.exploration_agents import _empty_research_finding
+
+    live = _empty_research_finding(
+        "some topic",
+        error_class=type(err).__name__,
     )
-    # In the sentinel literal block, no f-string containing the exception
-    # message should land in `summary`. The next 30 lines after the marker
-    # are the literal dict — scan them for forbidden tokens.
-    marker_idx = src.index('"error_class": type(e).__name__')
-    block_start = src.rfind('"summary":', 0, marker_idx)
-    block_end = src.index("}\n", marker_idx)
-    block = src[block_start:block_end]
-    for needle in (
-        '{str(e)', '{e}', '{type(e).__name__}: {err_str}',
-        'Research failed for topic',
-    ):
-        assert needle not in block, (
-            f"salvage sentinel literal contains {needle!r} — exception text "
-            f"is being leaked back into a free-text field"
+    for needle in forbidden_in_summary:
+        assert needle not in live["summary"], (
+            f"live sentinel summary leaks {needle!r}: {live['summary']!r}"
+        )
+    # The structured error_class field IS allowed to contain the class
+    # name — downstream consumers key off ``error=True`` to drop these,
+    # so the class name is metadata not user-facing text.
+    assert live["error"] is True
+    assert live["error_class"] == "RuntimeError"
+    # And the StructuredFinding ERROR path (the new salvage point) must
+    # likewise route exception text away from any summary-like field.
+    from spine.agents.researcher_supervisor import (
+        FindingStatus,
+        StructuredFinding,
+        ToolClass,
+        render_history_as_evidence,
+    )
+
+    err_finding = StructuredFinding(
+        tool_name="codebase_query",
+        tool_class=ToolClass.READ_SOURCE,
+        status=FindingStatus.ERROR,
+        execution_error_details=str(err),  # safe — never reaches summary
+    )
+    # render_history_as_evidence DROPS error findings entirely, so
+    # forbidden tokens cannot leak into the evidence dossier even if a
+    # worker turn captures them in execution_error_details.
+    rendered = render_history_as_evidence([err_finding])
+    for needle in forbidden_in_summary:
+        assert needle not in rendered, (
+            f"history render leaks {needle!r}: {rendered!r}"
         )
 
 

@@ -40,140 +40,202 @@ _SPECIFY_FINDINGS = [
 
 
 # ── Per-topic researcher prompt (run_explore_do_node) ──────────────────
+#
+# The supervisor↔worker refactor moved the per-cycle prompt construction
+# into run_worker_node. The prior-SPECIFY-findings inject now flows
+# through the enriched topic string the loop passes as ``global_goal`` to
+# the supervisor and as ``topic`` to each worker turn. These tests stub
+# the supervisor/worker so they don't fire an LLM, and capture what the
+# loop passed in.
+
+
+def _stub_subagent_and_agent(monkeypatch) -> None:
+    """Shared scaffolding: stub subagent spec + phase agent + context build
+    so run_explore_do_node can drive a single loop iteration without
+    touching the real model / MCP layer."""
+
+    class _FakeTool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    monkeypatch.setattr(
+        "spine.agents.subagents.build_subagent_spec",
+        lambda **kw: {
+            "system_prompt": "scout-system",
+            "tools": [_FakeTool("codebase_query"), _FakeTool("search_codebase")],
+            "model": object(),
+        },
+    )
+    monkeypatch.setattr(
+        "spine.agents.factory.build_phase_agent", lambda **kw: object()
+    )
+    monkeypatch.setattr(
+        "spine.agents.context.build_context", lambda state, phase: None
+    )
 
 
 @pytest.mark.asyncio
 async def test_plan_researcher_prompt_includes_prior_specify_findings(
     monkeypatch, tmp_path
 ):
-    """When `phase=="plan"` and `prior_phase_findings` is set, the PLAN
-    Blueprint Scout's user prompt must contain a "Prior SPECIFY Research"
-    section with the rendered finding blocks and don't-re-investigate
-    framing.
+    """When ``phase=="plan"`` and ``prior_phase_findings`` is set, the
+    enriched topic the loop hands to both supervisor and worker must
+    contain a "Prior SPECIFY Research" block with the don't-re-investigate
+    framing and the actual file paths from the findings.
     """
+    _stub_subagent_and_agent(monkeypatch)
+
     captured: dict[str, Any] = {}
 
-    async def _fake_invoke(agent, input_, *, work_id, context, config):
-        captured["input"] = input_
-        return {"messages": []}
-
-    monkeypatch.setattr(
-        exploration_agents,
-        "_ainvoke_explore_collecting",
-        _fake_invoke,
+    from spine.agents import researcher_supervisor as rs
+    from spine.agents.researcher_supervisor import (
+        SupervisorDirective,
+        ToolClass,
+        StructuredFinding,
+        FindingStatus,
     )
 
-    # Stub the heavy subagent / agent factory wiring — we only care about
-    # the prompt string that flows into the agent invocation.
-    def _fake_build_subagent_spec(*args, **kwargs):
-        return {
-            "system_prompt": "scout-system",
-            "tools": [],
-            "model": object(),
-        }
+    async def _fake_supervisor(**kw):
+        captured.setdefault("supervisor_global_goal", kw["global_goal"])
+        # Cycle 0 returns continue with SEARCH; cycle 1 terminates.
+        if kw["cycle_idx"] == 0:
+            return SupervisorDirective(
+                analysis_and_reasoning="r",
+                is_complete=False,
+                next_directive="search",
+                allowed_tool_class=ToolClass.SEARCH,
+            )
+        return SupervisorDirective(analysis_and_reasoning="done", is_complete=True)
 
-    def _fake_build_phase_agent(**kwargs):
-        return object()
+    async def _fake_worker(**kw):
+        captured["worker_topic"] = kw["topic"]
+        return StructuredFinding(
+            tool_name="search_codebase",
+            tool_class=ToolClass.SEARCH,
+            status=FindingStatus.SUCCESS,
+            target_path="spine/x.py",
+            structured_code_block="body",
+        )
 
-    monkeypatch.setattr(
-        "spine.agents.subagents.build_subagent_spec", _fake_build_subagent_spec
-    )
-    monkeypatch.setattr(
-        "spine.agents.factory.build_phase_agent", _fake_build_phase_agent
-    )
+    monkeypatch.setattr(rs, "run_supervisor_node", _fake_supervisor)
+    monkeypatch.setattr(rs, "run_worker_node", _fake_worker)
 
     state = {
         "work_id": "w1",
         "phase": "plan",
         "workspace_root": str(tmp_path),
-        "spec_path": "",  # leave empty so we take the non-spec branch
+        "spec_path": "",  # leave empty so the spec section is omitted
         "prior_phase_findings": _SPECIFY_FINDINGS,
     }
-    await exploration_agents.run_explore_do_node(state, None, topic="touch points for verbose flag")
+    await exploration_agents.run_explore_do_node(
+        state, None, topic="touch points for verbose flag"
+    )
 
-    prompt = captured["input"]["messages"][0]["content"]
-    assert "## Prior SPECIFY Research" in prompt
-    assert "don't re-investigate" in prompt
-    assert "spine/config.py" in prompt
-    assert "spine/agents/factory.py" in prompt
-    # Topic still flows through normally
-    assert "touch points for verbose flag" in prompt
+    # Both the supervisor's global_goal and the worker's topic carry the
+    # enriched payload — they're the same string under the new design.
+    for label in ("supervisor_global_goal", "worker_topic"):
+        text = captured[label]
+        assert "## Prior SPECIFY Research" in text, (
+            f"{label} missing prior-findings block"
+        )
+        assert "don't re-investigate" in text
+        assert "spine/config.py" in text
+        assert "spine/agents/factory.py" in text
+        # Topic still flows through normally
+        assert "touch points for verbose flag" in text
 
 
 @pytest.mark.asyncio
 async def test_specify_researcher_prompt_does_not_include_prior_section(
     monkeypatch, tmp_path
 ):
-    """The prior-phase inject is PLAN-only. A SPECIFY researcher must not
-    receive a "Prior SPECIFY Research" section even if (theoretically)
-    the state contained one.
+    """The prior-phase inject is PLAN-only. A SPECIFY topic must not see
+    the prior-findings block even if the state mistakenly carries one.
     """
+    _stub_subagent_and_agent(monkeypatch)
+
     captured: dict[str, Any] = {}
 
-    async def _fake_invoke(agent, input_, *, work_id, context, config):
-        captured["input"] = input_
-        return {"messages": []}
-
-    monkeypatch.setattr(
-        exploration_agents,
-        "_ainvoke_explore_collecting",
-        _fake_invoke,
+    from spine.agents import researcher_supervisor as rs
+    from spine.agents.researcher_supervisor import (
+        SupervisorDirective,
+        ToolClass,
+        StructuredFinding,
+        FindingStatus,
     )
 
-    def _fake_build_subagent_spec(*args, **kwargs):
-        return {"system_prompt": "scout-system", "tools": [], "model": object()}
+    async def _fake_supervisor(**kw):
+        captured.setdefault("global_goal", kw["global_goal"])
+        if kw["cycle_idx"] == 0:
+            return SupervisorDirective(
+                analysis_and_reasoning="r",
+                is_complete=False,
+                next_directive="search",
+                allowed_tool_class=ToolClass.SEARCH,
+            )
+        return SupervisorDirective(analysis_and_reasoning="done", is_complete=True)
 
-    def _fake_build_phase_agent(**kwargs):
-        return object()
+    async def _fake_worker(**kw):
+        return StructuredFinding(
+            tool_name="search_codebase",
+            tool_class=ToolClass.SEARCH,
+            status=FindingStatus.SUCCESS,
+        )
 
-    monkeypatch.setattr(
-        "spine.agents.subagents.build_subagent_spec", _fake_build_subagent_spec
-    )
-    monkeypatch.setattr(
-        "spine.agents.factory.build_phase_agent", _fake_build_phase_agent
-    )
+    monkeypatch.setattr(rs, "run_supervisor_node", _fake_supervisor)
+    monkeypatch.setattr(rs, "run_worker_node", _fake_worker)
 
     state = {
         "work_id": "w1",
         "phase": "specify",
         "workspace_root": str(tmp_path),
-        # Even if a caller mistakenly seeded this on SPECIFY, the renderer
-        # must ignore it (the cross-phase contract is one-way SPECIFY → PLAN).
-        "prior_phase_findings": _SPECIFY_FINDINGS,
+        "prior_phase_findings": _SPECIFY_FINDINGS,  # mistakenly seeded
     }
-    await exploration_agents.run_explore_do_node(state, None, topic="boundary of cli")
-
-    prompt = captured["input"]["messages"][0]["content"]
-    assert "## Prior SPECIFY Research" not in prompt
+    await exploration_agents.run_explore_do_node(
+        state, None, topic="boundary of cli"
+    )
+    assert "## Prior SPECIFY Research" not in captured["global_goal"]
 
 
 @pytest.mark.asyncio
 async def test_plan_researcher_prompt_omits_section_when_field_absent(
     monkeypatch, tmp_path
 ):
-    """The quick-workflow / no-prior-research path must render unchanged."""
+    """The quick-workflow / no-prior-research path renders the topic
+    unchanged — no "Prior SPECIFY Research" block, no spec block.
+    """
+    _stub_subagent_and_agent(monkeypatch)
+
     captured: dict[str, Any] = {}
 
-    async def _fake_invoke(agent, input_, *, work_id, context, config):
-        captured["input"] = input_
-        return {"messages": []}
-
-    monkeypatch.setattr(
-        exploration_agents, "_ainvoke_explore_collecting", _fake_invoke
+    from spine.agents import researcher_supervisor as rs
+    from spine.agents.researcher_supervisor import (
+        SupervisorDirective,
+        ToolClass,
+        StructuredFinding,
+        FindingStatus,
     )
 
-    def _fake_build_subagent_spec(*args, **kwargs):
-        return {"system_prompt": "scout-system", "tools": [], "model": object()}
+    async def _fake_supervisor(**kw):
+        captured.setdefault("global_goal", kw["global_goal"])
+        if kw["cycle_idx"] == 0:
+            return SupervisorDirective(
+                analysis_and_reasoning="r",
+                is_complete=False,
+                next_directive="search",
+                allowed_tool_class=ToolClass.SEARCH,
+            )
+        return SupervisorDirective(analysis_and_reasoning="done", is_complete=True)
 
-    def _fake_build_phase_agent(**kwargs):
-        return object()
+    async def _fake_worker(**kw):
+        return StructuredFinding(
+            tool_name="search_codebase",
+            tool_class=ToolClass.SEARCH,
+            status=FindingStatus.SUCCESS,
+        )
 
-    monkeypatch.setattr(
-        "spine.agents.subagents.build_subagent_spec", _fake_build_subagent_spec
-    )
-    monkeypatch.setattr(
-        "spine.agents.factory.build_phase_agent", _fake_build_phase_agent
-    )
+    monkeypatch.setattr(rs, "run_supervisor_node", _fake_supervisor)
+    monkeypatch.setattr(rs, "run_worker_node", _fake_worker)
 
     state = {
         "work_id": "w1",
@@ -182,10 +244,10 @@ async def test_plan_researcher_prompt_omits_section_when_field_absent(
         "spec_path": "",
         # No prior_phase_findings key at all
     }
-    await exploration_agents.run_explore_do_node(state, None, topic="some plan topic")
-
-    prompt = captured["input"]["messages"][0]["content"]
-    assert "## Prior SPECIFY Research" not in prompt
+    await exploration_agents.run_explore_do_node(
+        state, None, topic="some plan topic"
+    )
+    assert "## Prior SPECIFY Research" not in captured["global_goal"]
 
 
 # ── Research-manager prompt (run_research_manager) ─────────────────────

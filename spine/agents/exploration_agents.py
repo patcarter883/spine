@@ -849,27 +849,41 @@ async def run_explore_do_node(
     *,
     topic: str = "",
 ) -> dict[str, Any]:
-    """Drive the researcher subagent and return a structured evidence dossier.
+    """Drive the researcher via a supervisor↔worker micro-loop.
 
-    This is the "do" half of the explore→summarise split. It runs the
-    researcher's tool-using loop exactly like the legacy
-    ``run_explore_node`` body, but stops short of converting the result
-    into a :class:`ResearchFindings`. The conversion happens in the
-    separate :func:`run_summarise_node` so the model never has to switch
-    between "use tools" and "produce structured output" within a single
-    node.
+    Replaces the legacy "one big agent.astream() with a recursion cap"
+    pattern with a deterministic loop: the supervisor (no-tool LLM) emits
+    a :class:`SupervisorDirective` each cycle; the worker (tool-using
+    agent restricted to the supervisor's chosen tool class) executes one
+    move and reports a :class:`StructuredFinding`. The loop terminates
+    on ``directive.is_complete`` or the per-phase cycle cap fires.
+
+    See :mod:`spine.agents.researcher_supervisor` for the schemas and
+    helpers driving each cycle.
 
     Returns a dict with two keys:
 
     * ``exploration_evidence`` — a per-branch dict containing the
-      tool-result dossier, the researcher's narrative (if any), the
-      topic, and a ``recursion_capped`` flag. Last-write-wins per Send
-      branch.
+      assembled tool_results_text dossier, the supervisor's last
+      reasoning, the topic, and a ``recursion_capped`` flag. Last-write-
+      wins per Send branch. Shape is unchanged from the legacy node so
+      :func:`run_summarise_node` consumes it without modification.
     * ``read_cache`` — propagated to the parent state for cross-branch
       dedupe (same as the legacy node).
     """
     from spine.agents.factory import build_phase_agent
+    from spine.agents.researcher_supervisor import (
+        FindingStatus,
+        StructuredFinding,
+        SupervisorDirective,
+        ToolClass,
+        filter_extra_tools_for_class,
+        render_history_as_evidence,
+        run_supervisor_node,
+        run_worker_node,
+    )
     from spine.agents.subagents import build_subagent_spec
+    from spine.config import SpineConfig
     from spine.models.enums import PhaseName
 
     work_id = state.get("work_id", "unknown")
@@ -887,191 +901,203 @@ async def run_explore_do_node(
         work_id, phase, topic_str,
     )
 
-    result: dict[str, Any] = {}
-    try:
-        # Determine which PhaseName to use for model/skill resolution
-        phase_enum = PhaseName(phase)
+    # ── Resolve per-phase cycle cap ──────────────────────────────────
+    phase_enum = PhaseName(phase)
+    conv_cfg = SpineConfig.load().convergence
+    if phase_enum == PhaseName.PLAN:
+        max_cycles = conv_cfg.researcher_supervisor_max_cycles_plan
+    else:
+        max_cycles = conv_cfg.researcher_supervisor_max_cycles_specify
 
-        # Build the researcher subagent spec with the correct phase
-        subagent_spec = build_subagent_spec(
-            name="researcher",
-            phase=phase_enum,
-            state=state,  # type: ignore[arg-type]
-            config=config,
+    # ── Resolve spec content + prior SPECIFY findings (PLAN only) ────
+    # These get folded into both the supervisor's global_goal framing
+    # (so it understands what success looks like) and the topic string
+    # passed to workers. Compact rendering — the loop is cycle-bounded,
+    # so per-turn context bloat matters more than for one big stream.
+    spec_content = ""
+    if phase_enum == PhaseName.PLAN:
+        spec_path = state.get("spec_path", "")
+        if spec_path:
+            full_path = Path(workspace_root) / spec_path / "specification.md"
+            if full_path.exists():
+                try:
+                    spec_content = full_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+
+    prior_findings_section = ""
+    if phase_enum == PhaseName.PLAN:
+        prior_findings = state.get("prior_phase_findings") or []
+        if prior_findings:
+            rendered_prior = format_findings(
+                prior_findings,
+                budget=SpineConfig.load().prior_phase_findings_token_budget,
+            )
+            prior_findings_section = (
+                "## Prior SPECIFY Research (already discovered — don't "
+                "re-investigate these files unless your topic requires "
+                "deeper detail)\n"
+                f"{rendered_prior}\n\n"
+            )
+
+    # The "global_goal" passed to the supervisor and the per-worker prompt
+    # carry the topic plus (for PLAN) the spec + prior-findings context.
+    # Suffix it onto the topic so the supervisor sees the same anchors as
+    # the worker.
+    enriched_topic = topic_str
+    suffix_parts: list[str] = []
+    if spec_content:
+        suffix_parts.append(
+            "## Specification (anchor your research to this)\n"
+            f"{spec_content[:_MAX_SPEC_CHARS]}"
         )
+    if prior_findings_section:
+        suffix_parts.append(prior_findings_section.strip())
+    scratchpad = state.get("scratchpad", "")
+    if scratchpad:
+        suffix_parts.append("## Working Memory Scratchpad\n" + scratchpad)
+    if suffix_parts:
+        enriched_topic = topic_str + "\n\n" + "\n\n".join(suffix_parts)
 
-        # Build a minimal agent for this subagent — no filesystem middleware,
-        # the tools are injected directly as extra_tools from the subagent spec.
-        # NOTE: commit_findings_and_clear_search is intentionally NOT injected
-        # here. The researcher's message loop is local to this one ainvoke and
-        # is discarded when the explore node returns; the eviction node at the
-        # subgraph level operates on the parent state, not the researcher's
-        # internal messages. Giving the tool to the researcher only causes its
-        # EVICTION_ANCHOR message to fool the model into believing its tool
-        # results are gone — after which the structured response collapses to
-        # an empty patterns/file_map/dependencies on most models.
-        extra_tools = list(subagent_spec.get("tools", []))
+    # ── Build worker agents lazily, one per ToolClass ────────────────
+    # Each worker shares the researcher's system prompt + model; only
+    # extra_tools differ. Built on first use of each class so unused
+    # classes don't pay for agent construction.
+    subagent_spec = build_subagent_spec(
+        name="researcher",
+        phase=phase_enum,
+        state=state,  # type: ignore[arg-type]
+        config=config,
+    )
+    full_extra_tools = list(subagent_spec.get("tools", []))
+
+    from spine.agents.context import build_context as _build_context
+
+    ctx = _build_context(state, phase_enum)
+
+    worker_agents: dict[ToolClass, Any] = {}
+
+    def _get_or_build_worker(tool_class: ToolClass) -> Any:
+        cached = worker_agents.get(tool_class)
+        if cached is not None:
+            return cached
+        scoped_tools = filter_extra_tools_for_class(full_extra_tools, tool_class)
+        if not scoped_tools:
+            logger.warning(
+                "[%s] explore_do: no tools available for class=%s — "
+                "worker invocation will error",
+                work_id, tool_class.value,
+            )
         agent = build_phase_agent(
             state=state,  # type: ignore[arg-type]
             config=config,
             phase=phase_enum,
             system_prompt=subagent_spec["system_prompt"],
             is_subagent=True,
-            extra_tools=extra_tools,
+            extra_tools=scoped_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
         )
+        worker_agents[tool_class] = agent
+        return agent
 
-        # ── Build the research prompt ─────────────────────────────────
-        # For PLAN phase: inject the specification content so the researcher
-        # maps spec requirements to codebase files, not just the generic topic.
-        spec_content = ""
-        if phase_enum == PhaseName.PLAN:
-            spec_path = state.get("spec_path", "")
-            if spec_path:
-                full_path = Path(workspace_root) / spec_path / "specification.md"
-                if full_path.exists():
-                    try:
-                        spec_content = full_path.read_text(encoding="utf-8")
-                    except OSError:
-                        pass
+    # ── Supervisor↔worker loop ───────────────────────────────────────
+    history: list[StructuredFinding] = []
+    latest: StructuredFinding | None = None
+    last_directive: SupervisorDirective | None = None
+    cycle = 0
+    supervisor_phase_path = f"{phase_enum.value}/subagents/researcher/supervisor"
 
-        # Inject SPECIFY's findings (carried across by the PLAN state mapper
-        # in spine/workflow/compose.py) so the Blueprint Scout starts from
-        # the architectural map already gathered, not from scratch. Gated
-        # on phase==PLAN because only PLAN's state mapper seeds the field.
-        prior_findings_section = ""
-        if phase_enum == PhaseName.PLAN:
-            prior_findings = state.get("prior_phase_findings") or []
-            if prior_findings:
-                from spine.config import SpineConfig
-
-                rendered_prior = format_findings(
-                    prior_findings,
-                    budget=SpineConfig.load().prior_phase_findings_token_budget,
-                )
-                prior_findings_section = (
-                    "## Prior SPECIFY Research (already discovered — use as "
-                    "starting context, don't re-investigate these files unless "
-                    "your topic specifically requires deeper detail than the "
-                    "summary below provides)\n"
-                    f"{rendered_prior}\n\n"
-                )
-
-        if spec_content:
-            prompt = (
-                f"## Plan Research Topic: {topic_str}\n\n"
-                f"## Specification (read this FIRST — your research must map this to "
-                f"the codebase)\n\n{spec_content[:_MAX_SPEC_CHARS]}\n\n"
-                f"{prior_findings_section}"
-                f"## Research Task\n"
-                f"For the topic '{topic_str}', find the existing codebase files, "
-                f"patterns, conventions, and dependencies that map to the specification "
-                f"sections above. Use MCP tools for structural navigation. "
-                f"Return your findings in the ResearchFindings format with specific "
-                f"file paths and how they relate to the spec."
+    while cycle < max_cycles:
+        directive = await run_supervisor_node(
+            state=state,
+            config=config,
+            phase_path=supervisor_phase_path,
+            global_goal=enriched_topic,
+            latest_finding=latest,
+            evaluation_history=history,
+            cycle_idx=cycle,
+            max_cycles=max_cycles,
+        )
+        last_directive = directive
+        if directive.is_complete:
+            logger.info(
+                "[%s] explore_do: supervisor complete after %d cycle(s) "
+                "for topic=%r",
+                work_id, cycle, topic_str,
             )
-        else:
-            prompt = (
-                f"## Research Topic\n{topic_str}\n\n"
-                f"{prior_findings_section}"
-                f"Investigate this specific area of the codebase. "
-                f"Use MCP tools for structural navigation. "
-                f"Return your findings in the ResearchFindings format."
-            )
+            break
 
-        # Inject scratchpad into researcher prompt if available
-        scratchpad = state.get("scratchpad", "")
-        if scratchpad:
-            prompt = prompt + "\n\n## Working Memory Scratchpad\n" + scratchpad + "\n"
+        # Lazy-build the worker for this turn's tool class. Pre-populate
+        # the worker_agents map so run_worker_node finds it.
+        if directive.allowed_tool_class is not None:
+            _get_or_build_worker(directive.allowed_tool_class)
 
-        # Build a SpineContext so ReadCacheMiddleware can dedupe MCP/read_file
-        # calls inside this researcher loop. Without context= the middleware
-        # bails on ctx=None and every lookup re-hits the live tool — which is
-        # exactly the failure mode the f51d448 deduper was supposed to fix.
-        from spine.agents.context import build_context as _build_context
-
-        ctx = _build_context(state, phase_enum)
-        # Cap the researcher's LangGraph recursion at ~50 steps (≈25
-        # model+tool round-trips). LangGraph's default is 25; the prior
-        # cap of 24 sat below that and routinely terminated survey-style
-        # branches mid-investigation (telemetry showed branches still
-        # productive at >50K prompt tokens when the wall hit). 50 gives
-        # enough headroom for breadth-first topics while still bounding
-        # runaway loops.
-        result = await _ainvoke_explore_collecting(
-            agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            work_id=work_id,
+        # Thread the shared SpineContext through so ReadCacheMiddleware
+        # dedupes MCP / read_file calls across sibling worker turns.
+        finding = await run_worker_node(
+            state=state,
+            config=config,
+            topic=enriched_topic,
+            directive=directive,
+            worker_agents=worker_agents,
             context=ctx,
-            config={"recursion_limit": 50},
         )
+        history.append(finding)
+        latest = finding
+        cycle += 1
 
-        # NOTE: the legacy run_explore_node called _finalize_research_findings
-        # here. That step now belongs to run_summarise_node — it's a
-        # separate graph node so the model never has to switch between
-        # "use tools" and "produce structured output" within one
-        # invocation. We pass the raw evidence forward instead.
-        messages = result.get("messages", []) if isinstance(result, dict) else []
-        evidence_text = collect_exploration_evidence(messages)
-        narrative = _last_ai_narrative(messages)
-        evidence: dict[str, Any] = {
-            "topic": topic_str,
-            "phase": phase,
-            "tool_results_text": evidence_text,
-            "narrative": narrative,
-            "recursion_capped": False,
-            "error_class": None,
-            "message_count": len(messages),
-        }
         logger.info(
-            "[%s] explore_do: topic=%r — %d evidence chars, %d narrative chars",
-            work_id,
-            topic_str,
-            len(evidence_text),
-            len(narrative),
+            "[%s] explore_do: cycle %d/%d done — class=%s status=%s tool=%s",
+            work_id, cycle, max_cycles,
+            (directive.allowed_tool_class.value
+             if directive.allowed_tool_class else "—"),
+            finding.status.value,
+            finding.tool_name,
         )
 
-    except Exception as e:
-        # On recursion cap (or any other failure) gather whatever the
-        # researcher accumulated and pass it forward. The summarise node
-        # decides whether to salvage it or emit an error sentinel — keeping
-        # that decision out of the do node means the do node never has to
-        # reason about output formatting.
-        # _ainvoke_explore_collecting attaches partial_state to any
-        # non-transient exception that carries accumulated stream state
-        # (GraphRecursionError, BadRequestError on context overflow, etc.).
-        # getattr fails closed when an exception type doesn't carry it.
-        partial_state = getattr(e, "partial_state", None)
-        partial_messages: list = []
-        if isinstance(partial_state, dict) and partial_state.get("messages"):
-            partial_messages = partial_state["messages"]
-            result = partial_state
-
-        evidence_text = collect_exploration_evidence(partial_messages) if partial_messages else ""
-        narrative = _last_ai_narrative(partial_messages) if partial_messages else ""
-        evidence = {
-            "topic": topic_str,
-            "phase": phase,
-            "tool_results_text": evidence_text,
-            "narrative": narrative,
-            "recursion_capped": isinstance(e, GraphRecursionError),
-            "error_class": type(e).__name__,
-            "message_count": len(partial_messages),
-        }
+    cap_hit = cycle >= max_cycles and (
+        last_directive is None or not last_directive.is_complete
+    )
+    if cap_hit:
         logger.warning(
-            "[%s] explore_do: topic=%r failed (%s) — captured %d evidence chars",
-            work_id,
-            topic_str,
-            type(e).__name__,
-            len(evidence_text),
-            exc_info=not isinstance(e, GraphRecursionError),
+            "[%s] explore_do: cycle cap (%d) reached without supervisor "
+            "completion for topic=%r — marking recursion_capped",
+            work_id, max_cycles, topic_str,
         )
+
+    evidence_text = render_history_as_evidence(history)
+    # Supervisor's last reasoning becomes the narrative — gives summarise
+    # a non-tool gloss on what the loop concluded.
+    narrative = ""
+    if last_directive is not None:
+        narrative = (last_directive.analysis_and_reasoning or "").strip()
+
+    evidence: dict[str, Any] = {
+        "topic": topic_str,
+        "phase": phase,
+        "tool_results_text": evidence_text,
+        "narrative": narrative,
+        "recursion_capped": cap_hit,
+        "error_class": None,
+        "message_count": len(history),
+        "supervisor_cycles": cycle,
+    }
+    logger.info(
+        "[%s] explore_do: topic=%r — %d cycles, %d evidence chars, "
+        "%d narrative chars",
+        work_id, topic_str, cycle, len(evidence_text), len(narrative),
+    )
 
     # Bubble the post-invocation deduper cache back into subgraph state so
     # sibling Send() researchers (and the next rework cycle) skip queries we
     # already ran. The reducer (_merge_read_cache) handles merge semantics.
-    cache_snapshot = result.get("read_cache") if isinstance(result, dict) else None
+    cache_snapshot: dict | None = None
+    if ctx is not None and hasattr(ctx, "read_cache"):
+        snap = getattr(ctx, "read_cache", None) or {}
+        if snap:
+            cache_snapshot = dict(snap)
+
     update: dict[str, Any] = {"exploration_evidence": evidence}
     if cache_snapshot:
         update["read_cache"] = cache_snapshot

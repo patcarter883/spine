@@ -777,36 +777,16 @@ def build_subagent_spec(
     # 8 KB cap on `mcp_codebase-index_search_codebase` output.
     subagent_middleware: list[Any] = []
     if name == "researcher":
-        import os as _os
-
-        from spine.agents.context_editing import (
-            ResearcherConvergenceMiddleware,
-            ToolOutputTrimmer,
-        )
-        from spine.config import SpineConfig
+        # ToolOutputTrimmer caps any single worker turn's tool-result blob
+        # so a large search hit doesn't bloat the next supervisor cycle's
+        # prompt. ResearcherConvergenceMiddleware was removed when the
+        # supervisor↔worker loop in spine.agents.exploration_agents took
+        # over convergence — the supervisor's explicit ``is_complete``
+        # flag is now the termination signal, governed by the per-phase
+        # cycle cap (ConvergenceConfig.researcher_supervisor_max_cycles_*).
+        from spine.agents.context_editing import ToolOutputTrimmer
 
         subagent_middleware.append(ToolOutputTrimmer(max_full_tool_results=8))
-
-        _convergence_enabled = _os.getenv(
-            "SPINE_RESEARCHER_CONVERGENCE", "true"
-        ).lower() not in ("0", "false", "no")
-        if _convergence_enabled:
-            conv_cfg = SpineConfig.load().convergence
-            subagent_middleware.append(
-                ResearcherConvergenceMiddleware(
-                    soft_threshold=conv_cfg.researcher_soft,
-                    hard_threshold=conv_cfg.researcher_hard,
-                    recursion_limit=conv_cfg.researcher_recursion_limit,
-                )
-            )
-            logger.info(
-                "ResearcherConvergence: enabled (soft=%d hard=%d recursion_limit=%d)",
-                conv_cfg.researcher_soft,
-                conv_cfg.researcher_hard,
-                conv_cfg.researcher_recursion_limit,
-            )
-        else:
-            logger.info("ResearcherConvergence: DISABLED (SPINE_RESEARCHER_CONVERGENCE env)")
 
     spec: dict[str, Any] = {
         "name": name,
