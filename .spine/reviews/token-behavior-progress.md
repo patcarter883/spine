@@ -1,6 +1,6 @@
 # Token-usage & model-behaviour progress
 
-**Window:** `2026-05-14 → 2026-05-28` (~80 commits). All hashes are real and resolvable in this repo.
+**Window:** `2026-05-14 → 2026-05-29` (~86 commits). All hashes are real and resolvable in this repo.
 
 This is a thematic, not chronological, view. Each section sketches the problem, the fixes that landed, and pointers to the commits that did the work. Use it as the entry point for the next round of trace audits.
 
@@ -16,6 +16,10 @@ This is a thematic, not chronological, view. Each section sketches the problem, 
 - **Structured I/O end-to-end, with critic alignment.** SPECIFY/PLAN JSON contract checks (`eab6229`), research-manager structured decisions (`ec0530f`), IMPLEMENT/VERIFY JSON reports + agentic GC (`24eb99c`), OpenRouter native `json_schema` for subagents (`f8f3108`), and the critic verdict now flows through a dedicated `last_critic_review` field rather than tail-scanning `feedback` (`d1a5672`).
 - **Cross-phase leak fixes.** Original work description no longer bleeds into downstream phases (`9527eb2`); failed result mappers actually surface `status=failed` (`15ecae7`); reviewed workflows now stop at `critic_plan` and don't silently run IMPLEMENT/VERIFY before the human gate (`15b085e`).
 - **`spine.max_completion_tokens` is wired.** The top-level config key was previously parsed but never applied; finite-window local providers ran without an output cap and 400'd at the provider once the prompt approached the model window (trace `019e6e53`). Now both model builders fall back to it when no per-provider value is set.
+- **The researcher is now a supervisor↔worker micro-loop, and the worker bypasses `create_agent` entirely.** `3f1741d` introduces a no-tool supervisor that decides convergence + tool class per cycle; `7296969` replaces the worker's `agent.ainvoke()` (which auto-cycled model→tool→model→tool, growing prompt 4 K→24 K per round) with one `model.bind_tools().ainvoke()` + manual tool execution per cycle. End-to-end P:C ratio went from **226 : 1 → 15.3 : 1** across four trace audits (`019e7164` → `019e723c`); a single SPECIFY run dropped from 13.9 M prompt tokens to ~668 K.
+- **All prompts are now XML-tagged + hostage-laid.** `9300a28` adds `spine/agents/prompt_format.py` (canonical Tag enum, `xml_block` / `xml_blocks` / `hostage_layout` helpers, `parse_tags` / `assert_hostage_layout` test helpers). Every dynamic data block (`<objective>`, `<findings>`, `<latest_finding>`, `<directive>`, `<critic_feedback>`, `<retrieved_code>`, `<scratchpad>`, …) is bounded; the plain-text directive sits after every closing tag (the "hostage" tail) — the high-attention tail of every prompt is what the model must do, not what was provided. Brittle substring tests retired in favour of structural tag checks.
+- **MCP catalog re-injection eliminated from every orchestrator and worker.** `7a26454` adds `skip_default_mcp_injection` to `build_phase_agent`; `390df77` opts every orchestrator (specify / plan / tasks / verify / gap_plan / critic / synthesizers / slice-implementer dispatcher) into the skip flag. Per-call ~3-6 KB of tool-schema overhead disappears + the `mcp_guidance` system-prompt block elides; the PLAN synthesizer stops hallucinating `mcp_codebase-index_*` calls because the catalog isn't bound.
+- **SPECIFY findings carried across into PLAN.** `7434b29` reads `research_log.json` from SPECIFY and injects it into both the PLAN per-topic researchers and the PLAN research-manager via a dedicated `prior_phase_findings` channel — separately from the PLAN-phase `findings` accumulator so topic dedup / manager summaries / persisted PLAN research-log stay uncontaminated. Capped by `prior_phase_findings_token_budget` (default 6 K).
 
 ---
 
@@ -68,6 +72,9 @@ Most of the late-window work clusters here. Each fix was driven by a specific tr
   2. **Sentinel topics surfaced to the manager.** `_summarize_findings` previously dropped `error=True` entries entirely, so a round whose explores all sentinelled left the manager reading "(no findings yet)" and re-proposing the same questions. The sentinel now renders as `(attempted; no usable findings — do NOT re-propose this topic)` — neutral marker, no error text (preserves the [[feedback_no_error_text_in_research_results]] rule).
   3. **Per-topic outcome roll-up** replaces the bare `"## Topics Already Explored\n{json.dumps([...])}"` block. Each prior topic now renders inline as `- <topic> — investigated; N file(s) examined` / `attempted; no usable findings` / `proposed; no result recorded`, paired against findings via `_normalise_topic` (matches enriched-suffix topics back to bare wording). The manager sees coverage and outcome in one place instead of having to cross-reference two disconnected sections.
   User-reported symptom: identical topic emitted across rounds 1 and 2 ("How does the CLI parse and handle flags?") on a live run.
+- `7434b29` — inject SPECIFY research findings into PLAN researcher + manager via a dedicated `prior_phase_findings` state channel (kept separate from the PLAN `findings` accumulator). Reuses the existing `_load_prior_research` helper in `compose.py` and the shared `format_findings` renderer. New `prior_phase_findings_token_budget` config knob caps the inject. Tests in `test_prior_phase_findings_inject.py` cover state-mapper seeding + both prompt injection sites.
+- `3f1741d` — **supervisor↔worker micro-loop replaces the free-form researcher tool stream.** New module `spine/agents/researcher_supervisor.py` defines `ToolClass` (SEARCH / FIND_SYMBOL / READ_SOURCE / TRACE_DEPS), `StructuredFinding`, `SupervisorDirective`. `run_explore_do_node` now alternates `run_supervisor_node` (no-tool LLM, structured-output-bound `SupervisorDirective`) ↔ `run_worker_node` (lazy-bound per ToolClass agent) until `is_complete=True` or per-phase cycle cap fires (12 SPECIFY / 6 PLAN, via new `ConvergenceConfig.researcher_supervisor_max_cycles_*`). `ResearcherConvergenceMiddleware` stripped from the researcher subagent — the supervisor now governs convergence. Outer subgraph topology unchanged: same Send fan-out, same `_op_add` findings reducer, same `_merge_read_cache` deduper.
+- `7296969` — **worker bypasses `create_agent` entirely.** Audit trace `019e71b4` showed the worker's `agent.ainvoke()` auto-cycling model→tool→model→tool 3-5 rounds per invocation, each round paying ~10 K input tokens + accumulating prior tool result into history (4 K → 24 K growth). The "make ONE tool call" instruction in the worker prompt was soft and routinely ignored by local models. Fix: `run_worker_node` now calls `bound_model.ainvoke([SystemMessage, HumanMessage])` ONCE and executes the FIRST `tool_call` from the response via `tool.ainvoke(args)` manually. No agent, no middleware stack, no tool-loop. Worker per-call input collapsed from ~22 K to ~10 K; total trace prompt 15.6 M → 668 K (23× reduction). Source traces `019e71b4`, `019e721d`. **The user's "is the worker actually one-and-done?" question was the diagnostic insight that surfaced this.**
 
 ## 5. Phase tool surface tightening
 
@@ -80,6 +87,8 @@ Curated, purpose-built tools replace the generic filesystem surface across orche
 - `9163957` — Send-API dispatch for IMPLEMENT & VERIFY subgraphs with fail-closed routers (raise `CriticalContractFailure` on missing/malformed `execution_waves`; `_research_router` also fail-closed).
 - `9299242` — SmallCode IMPLEMENT refactor: restricted-tool dispatch and decompose-on-failure, designed to keep Qwen3-class local models from looping on MCP codebase-index tools.
 - `02d2bd2` — **remove** `CodeInterpreterMiddleware` and the `task` PTC dispatcher from phase agents. `deepagents[quickjs]` and `langchain-quickjs` dropped. The eval/`tools.task` escape hatches were bypassing curated tool surfaces and producing brittle code-in-prompt patterns.
+- `7a26454` — `build_phase_agent` learns `skip_default_mcp_injection: bool = False`. When True, the factory does not call `get_mcp_tools()`, does not append the catalog to `all_tools`, and does not emit the `mcp_guidance` system-prompt block. Initially used only by the researcher worker. Source trace `019e7164` (P:C 226:1, the worker carried ~21 tool definitions / ~6 KB schema per call despite the per-class filter trying to expose only 1-2).
+- `390df77` — **every orchestrator opts into the skip flag.** `build_specify_agent` + `build_specify_synthesizer`, `build_plan_agent` + `build_plan_synthesizer`, `build_tasks_agent`, `build_verify_agent`, `build_gap_plan_agent`, `build_critic_agent`, and `_slice_implementer_node` in `implement_subgraph.py` all pass `skip_default_mcp_injection=True`. The slice-implementer's `restricted_tools` already carries the curated MCP subset filtered from the subagent_spec, so the factory's re-injection was pure duplication. Removed the prompt-side `mcp_guidance` block emission for every orchestrator (~200 tokens × N synthesizer calls). Audit trace `019e721d` had shown the PLAN synthesizer calling `mcp_codebase-index_get_function_source(file_path=..., max_lines=100)` missing the required `name` arg — too many similar-looking tools to choose from. Eliminated by removing the catalog. New `test_orchestrator_mcp_surface.py` pins the contract per builder. Verified by trace `019e723c` (P:C 15.3:1, HEALTHY band).
 
 ## 6. Structured I/O & critic alignment
 
@@ -104,9 +113,42 @@ JSON contracts replace markdown scraping for inter-phase communication, and the 
 Lifted from the commit text — these are intentional skips or empirical knobs, not regressions:
 
 - The `critical_reviewed_task` complexity heuristic is **intentionally skipped** (per `0432092`) — that tier is deliberately stress-testing SPECIFY/PLAN/critic gates.
-- `ResearcherConvergenceMiddleware` thresholds (soft nudge / hard stop) in `6faf0f2` are still empirical; they'll need trace data to tune.
+- `ResearcherConvergenceMiddleware` thresholds (soft nudge / hard stop) in `6faf0f2` are still empirical; they'll need trace data to tune. **Status (2026-05-29):** the middleware was REMOVED from the researcher in `3f1741d` — the supervisor↔worker loop's `is_complete` signal + per-phase cycle cap replaced it. Thresholds remain in `ConvergenceConfig` for any future caller that wants tool-call convergence steering.
 - `cb4f023` lands a `Round-1-with-findings → done` bias in the manager prompt and dedup based on enriched topic suffixes; both are heuristics worth revisiting after a few traces.
 - The salvage path in `ad90798`/`6578e4d`/`90cd8a0` keeps growing message-scanning helpers. Worth auditing for a single canonical extractor next time it's touched.
+- **Cache-read remains 0 % on the local provider.** Confirmed across four audit traces (`019e7164` → `019e723c`): every sampled `usage_metadata.input_token_details` block is empty. The endpoint is a LangSmith proxy fronting a local OpenAI-compatible server (likely vLLM / SGLang) that doesn't report `prompt_token_details.cached_tokens`. The existing `static_cacheable_prefix` machinery in `factory.py:422-427` plus `AnthropicPromptCachingMiddleware` will recover most of the duplicated-prefix cost automatically when running on an Anthropic-hosted model — no code change needed, just a provider switch.
+- **`skip_default_mcp_injection` default is still `False`.** Every current caller in spine passes `True` explicitly. Flipping the default would be safer (any new caller must opt INTO the full MCP catalog) but risks surprising external/test code. Worth doing in a follow-up after one more clean trace.
+- **The supervisor's HISTORY block grows linearly per cycle** (each cycle adds a `StructuredFinding` with a ~2 KB code snippet, capped). By cycle 12 a SPECIFY supervisor prompt can reach ~12 K input tokens. Only worth tackling if late-cycle supervisor calls show measurable bloat — `audit #4` did NOT show it, so deferred. The fix when needed: drop the `structured_code_block` from findings older than the most recent 2 in `_render_history_summary`.
+- **Orchestrator phases (specify / plan / tasks / etc.) still use `create_agent`'s tool loop.** Workers got the one-shot direct-bind treatment in `7296969` because they execute a single tool per turn by design. Orchestrators do legitimate multi-step planning + writing and need the loop. If audit data shows orchestrator-side tool-loop bloat, the same direct-bind treatment could be applied selectively — but no evidence of this in audits `019e721d` / `019e723c`.
+
+---
+
+## 9. Prompt-format refactor (semantic XML + hostage layout)
+
+Single-commit overhaul of every LLM-facing prompt site in the codebase, driven by the observation that smaller and MoE models (Qwen / DeepSeek / Llama-3 class) lose precision when prompts splice raw data into instruction prose without structural bounds, and that the U-shaped attention curve favours data-first + instruction-last layouts. No existing XML tagging existed before this; all prompts were markdown headers.
+
+- `9300a28` — adds `spine/agents/prompt_format.py` (canonical `Tag` enum + `xml_block` / `xml_blocks` / `hostage_layout` runtime helpers + `parse_tags` / `assert_hostage_layout` / `assert_has_tags` / `assert_tag_order` / `get_block` test helpers — pure stdlib, no langchain dependency). Refactors every prompt site through these helpers:
+  - **8 sub-renderer outputs** (`format_findings`, `_render_finding_block`, `_render_history_summary`, `_render_directive_for_worker`, `_render_explored_topic_roll_up`, `_format_retrieved_context`, `_render_rework_feedback`, `format_directive_for_prompt`) stripped of redundant outer markdown headers; callers wrap them in the appropriate Tag at composition time.
+  - **11 user-message templates** rebuilt with hostage layout — data blocks first, plain-text directive at the absolute tail. Sites: research-manager context, both synthesizers (plan/specify), supervisor + worker user messages, plan_do, classification, decomposer PLAN + FALLBACK, plan_subgraph, critic_subgraph, summarise_evidence, both `_finalize_research_findings*` paths, the per-topic researcher's enriched topic.
+  - **10 system prompts** retagged with `<role>` / `<tools>` / `<workflow>` / `<constraints>` / `<output_schema>` for data-shaped sections. The two researcher prompts (researcher / researcher-plan) previously duplicated ~85 % of their content; factored into a shared `_build_researcher_prompt` helper in `subagents.py`.
+  - 13 brittle substring assertions across 7 test files retired in favour of structural tag checks. New `test_prompt_format.py` (25 tests) covers the helper module; new `test_prompt_structural_sweep.py` (23 parametrised) pins every system-prompt constant's structural invariants and verifies `<output_schema>` / `<tools>` presence per site-type. Total test growth: 786 → 834 passing.
+
+The refactor was structural, not behavioural — prose preserved verbatim in role prompts; only the data-shaped chunks gained bounds. The runtime impact is small per-prompt (~50 tokens of XML overhead replaces ~50 tokens of markdown headers) but the *structural* impact is significant: data is now machine-parseable, the directive position is invariant, and the test suite no longer pins on transient wording.
+
+---
+
+## 10. Trace-audit timeline (2026-05-29)
+
+End-to-end audit cycle that started after `9300a28` shipped. Four traces, three commits.
+
+| Audit | Trace | Revision | Prompt | Completion | P:C | Wall time | Status |
+|---|---|---|---:|---:|---:|---:|---|
+| #1 baseline | `019e7164` | `9300a28-dirty` | 13.9 M | 62 K | 226 : 1 | 16+ min | pending (stalled) |
+| #2 after skip-MCP flag | `019e71b4` | `7a26454-dirty` | 15.6 M | 68 K | 228 : 1 | unknown | pending |
+| #3 after worker direct-bind | `019e721d` | `7a26454-dirty` (working dir = `7296969`) | 668 K | 32 K | 20.7 : 1 | 10 m 40 s | success |
+| #4 after orchestrator MCP skip | `019e723c` | `390df77-dirty` | 667 K | 44 K | 15.3 : 1 | 16 m 11 s | success |
+
+Total reduction: **prompt 21× smaller, P:C ratio from 226 → 15** across three commits. The dominant lever was `7296969` (worker direct-bind); the MCP-catalog fixes (`7a26454`, `390df77`) cleaned up the rest. Audit #2's misdiagnosis (blamed per-cycle context duplication; actual cause was agent-loop accumulation) is documented in audit #4's commit message for future reference.
 
 ---
 
