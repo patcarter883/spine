@@ -708,32 +708,51 @@ async def run_worker_node(
     config: "RunnableConfig | None",
     topic: str,
     directive: SupervisorDirective,
-    worker_agents: dict[ToolClass, Any],
-    context: Any = None,
+    bound_models: dict[ToolClass, tuple[Any, list[Any]]],
+    system_prompt: str,
+    context: Any = None,  # noqa: ARG001  — kept for API compat; unused in direct-bind path
 ) -> StructuredFinding:
-    """Execute one supervisor-directed worker turn.
+    """ONE-SHOT supervisor-directed worker turn.
 
-    Picks the pre-built agent for the directive's ``allowed_tool_class``
-    and invokes it with a prompt containing the topic + the directive
-    text. Captures the resulting messages and distils them to a
-    :class:`StructuredFinding`.
+    No agent loop. The previous implementation invoked a full
+    :func:`langchain.agents.create_agent` instance, which auto-cycles
+    model → tools → model → tools until the model produces a non-tool
+    message. The "make ONE tool call" instruction in the worker prompt
+    is soft and local models routinely ignored it — trace 019e71b4
+    showed worker invocations averaging 3-5 model calls each, with each
+    round paying the full prompt prefix PLUS the accumulated tool-result
+    history (~4 K → 24 K input tokens by round 3). That silently undid
+    the supervisor's per-cycle cap and was the dominant prompt-bloat
+    driver.
+
+    New shape:
+      1. Look up the model + scoped_tools for the directive's tool class.
+      2. ``model.bind_tools(scoped_tools).ainvoke(...)`` ONCE.
+      3. Execute the FIRST tool call from the response manually.
+      4. Return a :class:`StructuredFinding` distilled from the AI
+         message + tool result. No further model rounds.
 
     The caller is responsible for handling the supervisor's
     ``is_complete=True`` branch — by the time this function runs, the
     directive has already been validated to carry a tool class.
 
     Args:
-        context: Optional :class:`spine.agents.context.SpineContext` so
-            ``ReadCacheMiddleware`` dedupes MCP/read_file calls across
-            sibling worker turns within the same per-topic loop. Passed
-            through to ``agent.ainvoke(context=...)`` when not None.
+        bound_models: Map of ToolClass → (model_with_tools_bound,
+            scoped_tools_list). Built once per ToolClass by
+            ``run_explore_do_node`` and reused across cycles.
+        system_prompt: The researcher subagent's system prompt
+            (``SUBAGENT_PROMPTS["researcher"]`` / ``-plan``). Sent as a
+            SystemMessage to the bound model.
+        context: Unused. Kept in the signature for caller compatibility
+            after the agent-loop removal — ReadCacheMiddleware no longer
+            wraps the worker's tool execution because there is no
+            middleware stack to wrap. MCP / search tools cache
+            internally; the worker only does ONE tool call per turn
+            anyway, so cross-turn dedupe wasn't doing useful work here.
     """
     work_id = state.get("work_id", "unknown")
     tool_class = directive.allowed_tool_class
     if tool_class is None:
-        # Defensive: _enforce_directive_contract already screens for this,
-        # but if a caller bypasses it, return a terminating finding rather
-        # than crashing the loop.
         return StructuredFinding(
             tool_name="(none)",
             tool_class=ToolClass.SEARCH,
@@ -741,10 +760,10 @@ async def run_worker_node(
             execution_error_details="worker received directive without tool class",
         )
 
-    agent = worker_agents.get(tool_class)
-    if agent is None:
+    entry = bound_models.get(tool_class)
+    if entry is None:
         logger.warning(
-            "[%s] researcher_supervisor: no worker agent for tool_class=%s",
+            "[%s] researcher_supervisor: no bound model for tool_class=%s",
             work_id,
             tool_class.value,
         )
@@ -752,29 +771,28 @@ async def run_worker_node(
             tool_name="(none)",
             tool_class=tool_class,
             status=FindingStatus.ERROR,
-            execution_error_details=f"no worker agent for tool_class={tool_class.value}",
+            execution_error_details=f"no bound model for tool_class={tool_class.value}",
         )
+    bound_model, scoped_tools = entry
 
     action_hint = TOOL_CLASS_ACTION_HINT.get(tool_class, "")
-    prompt = _build_worker_user_message(
+    user_msg = _build_worker_user_message(
         topic=topic,
         directive_block=_render_directive_for_worker(directive),
         tool_class=tool_class.value,
         action_hint=action_hint,
     )
 
-    invoke_kwargs: dict[str, Any] = {}
-    if context is not None:
-        invoke_kwargs["context"] = context
-
     try:
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": prompt}]},
-            **invoke_kwargs,
+        ai_msg = await bound_model.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_msg),
+            ]
         )
     except Exception as exc:
         logger.warning(
-            "[%s] researcher_supervisor: worker invocation failed (%s): %s",
+            "[%s] researcher_supervisor: bound-model invocation failed (%s): %s",
             work_id,
             tool_class.value,
             exc,
@@ -787,9 +805,57 @@ async def run_worker_node(
             execution_error_details=f"{type(exc).__name__}: {exc}",
         )
 
-    messages = result.get("messages", []) if isinstance(result, dict) else []
+    # Execute the FIRST tool call ONLY. The model may have emitted more,
+    # but the supervisor governs convergence and explicitly asked for a
+    # single move this turn — extra tool calls would just inflate the
+    # next cycle's history block without changing the supervisor's
+    # decision-making.
+    tool_calls = getattr(ai_msg, "tool_calls", None) or []
+    if not tool_calls:
+        # Model declined to call a tool — return EMPTY with the narration.
+        return _extract_finding_from_worker_messages(
+            messages=[ai_msg], tool_class=tool_class,
+        )
+
+    tc = tool_calls[0]
+    tool_name = tc.get("name") or "(unknown)"
+    tool_args = tc.get("args") or {}
+    tool_id = tc.get("id") or "manual_tool_call"
+
+    tool_by_name = {
+        getattr(t, "name", None): t for t in scoped_tools if getattr(t, "name", None)
+    }
+    tool = tool_by_name.get(tool_name)
+    if tool is None:
+        return StructuredFinding(
+            tool_name=tool_name,
+            tool_class=tool_class,
+            status=FindingStatus.ERROR,
+            execution_error_details=(
+                f"tool {tool_name!r} not in scoped surface for class "
+                f"{tool_class.value}; available: {sorted(tool_by_name)}"
+            ),
+        )
+
+    try:
+        tool_output = await tool.ainvoke(tool_args)
+    except Exception as exc:
+        return StructuredFinding(
+            tool_name=tool_name,
+            tool_class=tool_class,
+            status=FindingStatus.ERROR,
+            execution_error_details=f"{type(exc).__name__}: {exc}",
+        )
+
+    # Wrap the tool output as a ToolMessage so the existing extractor
+    # (which expects a message list) keeps working unchanged.
+    tool_msg = ToolMessage(
+        content=str(tool_output) if tool_output is not None else "",
+        name=tool_name,
+        tool_call_id=tool_id,
+    )
     return _extract_finding_from_worker_messages(
-        messages=messages, tool_class=tool_class
+        messages=[ai_msg, tool_msg], tool_class=tool_class,
     )
 
 

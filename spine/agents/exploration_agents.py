@@ -838,7 +838,10 @@ async def run_explore_do_node(
     * ``read_cache`` — propagated to the parent state for cross-branch
       dedupe (same as the legacy node).
     """
-    from spine.agents.factory import build_phase_agent
+    # Note: ``build_phase_agent`` is no longer used here. Workers go
+    # through the model.bind_tools() direct-invocation path (no agent
+    # loop) — see _get_or_bind_model_for_class below. The supervisor
+    # uses ``resolve_model`` directly via ``run_supervisor_node``.
     from spine.agents.researcher_supervisor import (
         FindingStatus,
         StructuredFinding,
@@ -933,46 +936,47 @@ async def run_explore_do_node(
         config=config,
     )
     full_extra_tools = list(subagent_spec.get("tools", []))
+    worker_system_prompt = subagent_spec["system_prompt"]
 
     from spine.agents.context import build_context as _build_context
 
     ctx = _build_context(state, phase_enum)
 
-    worker_agents: dict[ToolClass, Any] = {}
+    # ── Resolve the base chat model ONCE for the worker direct-bind path ──
+    # Workers no longer go through build_phase_agent — they call the model
+    # directly via ``model.bind_tools(...).ainvoke(...)`` per turn. This
+    # collapses each worker invocation from N model calls (the agent loop
+    # auto-cycled until a non-tool message) down to exactly ONE, which is
+    # what the supervisor's per-cycle directive expects. See audit #2 on
+    # trace 019e71b4 — the agent loop was the dominant prompt-bloat driver.
+    from spine.agents.helpers import resolve_model as _resolve_model
 
-    def _get_or_build_worker(tool_class: ToolClass) -> Any:
-        cached = worker_agents.get(tool_class)
-        if cached is not None:
-            return cached
+    _raw_worker_model = subagent_spec.get("model") or _resolve_model(
+        config, session_id=work_id, phase=f"{phase_enum.value}/subagents/researcher"
+    )
+    if isinstance(_raw_worker_model, str):
+        from langchain.chat_models import init_chat_model
+
+        worker_base_model = init_chat_model(_raw_worker_model)
+    else:
+        worker_base_model = _raw_worker_model
+
+    # bound_models: ToolClass → (model_with_tools_bound, scoped_tools_list).
+    # Built lazily on first use per tool class so unused classes pay nothing.
+    bound_models: dict[ToolClass, tuple[Any, list[Any]]] = {}
+
+    def _get_or_bind_model_for_class(tool_class: ToolClass) -> None:
+        if tool_class in bound_models:
+            return
         scoped_tools = filter_extra_tools_for_class(full_extra_tools, tool_class)
         if not scoped_tools:
             logger.warning(
                 "[%s] explore_do: no tools available for class=%s — "
-                "worker invocation will error",
+                "worker invocation will return EMPTY",
                 work_id, tool_class.value,
             )
-        # skip_default_mcp_injection=True is REQUIRED here. The subagent
-        # spec already curated the worker's tool surface — collapsing the
-        # MCP catalog to a single CodebaseQueryTool — and the per-class
-        # filter above (filter_extra_tools_for_class) narrows that further
-        # to the supervisor's chosen ToolClass. Without this flag,
-        # build_phase_agent re-loads the full ~18-tool MCP catalog and
-        # appends it to scoped_tools (factory.py: all_tools.extend),
-        # silently undoing both filters and inflating every worker call's
-        # prefix by ~6 KB. See trace 019e7164 audit (P:C ratio 226:1).
-        agent = build_phase_agent(
-            state=state,  # type: ignore[arg-type]
-            config=config,
-            phase=phase_enum,
-            system_prompt=subagent_spec["system_prompt"],
-            is_subagent=True,
-            extra_tools=scoped_tools,
-            response_format=subagent_spec.get("response_format"),
-            skip_filesystem_middleware=True,
-            skip_default_mcp_injection=True,
-        )
-        worker_agents[tool_class] = agent
-        return agent
+        bound = worker_base_model.bind_tools(scoped_tools) if scoped_tools else worker_base_model
+        bound_models[tool_class] = (bound, scoped_tools)
 
     # ── Supervisor↔worker loop ───────────────────────────────────────
     history: list[StructuredFinding] = []
@@ -1001,19 +1005,20 @@ async def run_explore_do_node(
             )
             break
 
-        # Lazy-build the worker for this turn's tool class. Pre-populate
-        # the worker_agents map so run_worker_node finds it.
+        # Lazy-bind the model for this turn's tool class. Pre-populate
+        # the bound_models map so run_worker_node finds it.
         if directive.allowed_tool_class is not None:
-            _get_or_build_worker(directive.allowed_tool_class)
+            _get_or_bind_model_for_class(directive.allowed_tool_class)
 
-        # Thread the shared SpineContext through so ReadCacheMiddleware
-        # dedupes MCP / read_file calls across sibling worker turns.
+        # Direct-bind path: no agent loop, no middleware stack. The
+        # worker does ONE model call + ONE tool execution per cycle.
         finding = await run_worker_node(
             state=state,
             config=config,
             topic=enriched_topic,
             directive=directive,
-            worker_agents=worker_agents,
+            bound_models=bound_models,
+            system_prompt=worker_system_prompt,
             context=ctx,
         )
         history.append(finding)

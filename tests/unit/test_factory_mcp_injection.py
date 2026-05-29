@@ -215,11 +215,18 @@ def test_skip_flag_also_avoids_mcp_load_call(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_explore_do_node_passes_skip_flag_to_factory(monkeypatch, tmp_path):
-    """run_explore_do_node must opt into skip_default_mcp_injection when
-    lazy-building per-ToolClass workers. The supervisor's scoped extra_tools
-    is already the entire intended worker surface; without the flag, the
-    factory undoes the filter.
+async def test_explore_do_node_does_not_build_phase_agent_for_workers(
+    monkeypatch, tmp_path
+):
+    """After audit #2 (trace 019e71b4), workers bypass build_phase_agent
+    entirely. They go through ``model.bind_tools(...).ainvoke(...)`` per
+    turn — no agent loop, no middleware stack. This test pins that
+    contract: ``run_explore_do_node`` MUST NOT call ``build_phase_agent``
+    in the worker code path.
+
+    The fix shipped in 7a26454 (skip_default_mcp_injection) is now
+    redundant for the worker — kept as a guard for any future caller
+    that DOES want a curated tool set without the MCP catalog.
     """
     from spine.agents import exploration_agents, researcher_supervisor
     from spine.agents.researcher_supervisor import (
@@ -230,22 +237,26 @@ async def test_explore_do_node_passes_skip_flag_to_factory(monkeypatch, tmp_path
     )
 
     captured_builds: list[dict[str, Any]] = []
+    bind_log: list[list[str]] = []
 
     def _fake_build_phase_agent(**kw):
         captured_builds.append(
             {
                 "extra_tools": [getattr(t, "name", "?") for t in (kw.get("extra_tools") or [])],
-                "skip_default_mcp_injection": kw.get("skip_default_mcp_injection"),
-                "is_subagent": kw.get("is_subagent"),
             }
         )
         return object()
+
+    class _StubBaseModel:
+        def bind_tools(self, tools):
+            bind_log.append([getattr(t, "name", "?") for t in tools])
+            return object()
 
     def _fake_subagent_spec(**kw):
         return {
             "system_prompt": "role",
             "tools": [_FakeTool("codebase_query"), _FakeTool("search_codebase")],
-            "model": object(),
+            "model": _StubBaseModel(),
         }
 
     monkeypatch.setattr(
@@ -258,7 +269,6 @@ async def test_explore_do_node_passes_skip_flag_to_factory(monkeypatch, tmp_path
         "spine.agents.context.build_context", lambda state, phase: None
     )
 
-    # Drive one supervisor→worker→complete cycle.
     async def _fake_supervisor(**kw):
         if kw["cycle_idx"] == 0:
             return SupervisorDirective(
@@ -293,11 +303,12 @@ async def test_explore_do_node_passes_skip_flag_to_factory(monkeypatch, tmp_path
         topic="test topic",
     )
 
-    assert captured_builds, "expected at least one worker build"
-    for build in captured_builds:
-        assert build["skip_default_mcp_injection"] is True, (
-            f"worker built without skip_default_mcp_injection=True: {build}"
-        )
-        # And the per-class filter should leave only SEARCH-class tools.
-        assert "codebase_query" in build["extra_tools"]
-        assert "search_codebase" in build["extra_tools"]
+    # The headline contract: build_phase_agent MUST NOT be called for
+    # the worker path. The supervisor doesn't go through the factory
+    # either — it uses resolve_model directly via run_supervisor_node.
+    assert captured_builds == [], (
+        f"build_phase_agent must NOT be called for workers; got {captured_builds}"
+    )
+    # And the per-class bind DOES happen with the scoped tool set.
+    assert len(bind_log) == 1
+    assert set(bind_log[0]) == {"codebase_query", "search_codebase"}

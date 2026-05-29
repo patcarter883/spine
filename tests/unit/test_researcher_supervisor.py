@@ -391,10 +391,39 @@ def test_extract_anchors_from_non_json_returns_empty():
 # ── run_worker_node ────────────────────────────────────────────────────
 
 
+class _StubBoundModel:
+    """Stand-in for ``model.bind_tools(scoped_tools)`` — returns a
+    pre-canned AIMessage with the configured tool_calls on .ainvoke().
+    """
+
+    def __init__(self, ai_msg: AIMessage) -> None:
+        self._ai_msg = ai_msg
+
+    async def ainvoke(self, messages, **kwargs):
+        # Capture the messages on the instance so tests can inspect them.
+        self.last_messages = list(messages)
+        return self._ai_msg
+
+
+class _StubTool:
+    """Stand-in for a LangChain BaseTool — exposes .name and async .ainvoke."""
+
+    def __init__(self, name: str, result):
+        self.name = name
+        self._result = result
+        self.calls: list = []
+
+    async def ainvoke(self, args):
+        self.calls.append(args)
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
 @pytest.mark.asyncio
-async def test_worker_returns_error_finding_when_no_agent_for_class():
-    """If the supervisor picked a tool class the loop hasn't built a
-    worker for, return an ERROR finding rather than crashing — the
+async def test_worker_returns_error_finding_when_no_bound_model_for_class():
+    """If the supervisor picked a tool class the loop hasn't bound a
+    model for, return an ERROR finding rather than crashing — the
     supervisor sees it next cycle and can pick a different class.
     """
     directive = SupervisorDirective(
@@ -408,45 +437,47 @@ async def test_worker_returns_error_finding_when_no_agent_for_class():
         config=None,
         topic="x",
         directive=directive,
-        worker_agents={},  # empty — no agent built for TRACE_DEPS
+        bound_models={},  # empty — no model bound for TRACE_DEPS
+        system_prompt="role",
     )
     assert f.status == FindingStatus.ERROR
     assert f.tool_class == ToolClass.TRACE_DEPS
 
 
 @pytest.mark.asyncio
-async def test_worker_invokes_correct_agent_and_extracts_finding(monkeypatch):
+async def test_worker_invokes_correct_bound_model_and_executes_tool_once():
     """Happy path: supervisor picks READ_SOURCE → worker invokes that
-    class's agent → returns a SUCCESS finding distilled from the agent's
-    last tool message.
+    class's bound model ONCE → executes the FIRST tool call manually →
+    returns a SUCCESS finding distilled from the AIMessage + ToolMessage.
+
+    This pins the one-shot semantics that fix the agent-loop bloat: the
+    worker MUST NOT call the model a second time after the tool result.
     """
-    captured: dict[str, Any] = {}
+    payload = json.dumps({"file_path": "spine/x.py", "symbol_name": "X"})
 
-    class _Agent:
-        def __init__(self, label: str) -> None:
-            self.label = label
-
-        async def ainvoke(self, input_, **kw):
-            captured["agent_label"] = self.label
-            captured["input"] = input_
-            captured["context"] = kw.get("context")
-            payload = json.dumps(
-                {"file_path": "spine/x.py", "symbol_name": "X"}
-            )
-            return {
-                "messages": [
-                    HumanMessage(content="prompt"),
-                    AIMessage(content="calling tool"),
-                    ToolMessage(
-                        content=payload, name="codebase_query", tool_call_id="t1"
-                    ),
-                    AIMessage(content="found X"),
-                ]
+    # Build a stub AIMessage that the bound model returns — it carries a
+    # single tool_call which the worker must execute exactly once.
+    ai_msg = AIMessage(
+        content="calling tool",
+        tool_calls=[
+            {
+                "name": "codebase_query",
+                "args": {"action": "get_source", "name": "X"},
+                "id": "tc-1",
+                "type": "tool_call",
             }
+        ],
+    )
+    bound = _StubBoundModel(ai_msg)
+    tool = _StubTool("codebase_query", payload)
 
-    agents = {
-        ToolClass.SEARCH: _Agent("search"),
-        ToolClass.READ_SOURCE: _Agent("read_source"),
+    # Wrong class entry — must NOT be touched.
+    other_bound = _StubBoundModel(AIMessage(content="wrong class"))
+    other_tool = _StubTool("codebase_query", "should not run")
+
+    bound_models = {
+        ToolClass.SEARCH: (other_bound, [other_tool]),
+        ToolClass.READ_SOURCE: (bound, [tool]),
     }
 
     directive = SupervisorDirective(
@@ -455,29 +486,68 @@ async def test_worker_invokes_correct_agent_and_extracts_finding(monkeypatch):
         next_directive="get_source for X",
         allowed_tool_class=ToolClass.READ_SOURCE,
     )
-    sentinel_ctx = object()
     f = await run_worker_node(
         state={"work_id": "w"},
         config=None,
         topic="how does X work?",
         directive=directive,
-        worker_agents=agents,
-        context=sentinel_ctx,
+        bound_models=bound_models,
+        system_prompt="researcher-role",
     )
 
-    assert captured["agent_label"] == "read_source"  # right class chosen
-    assert captured["context"] is sentinel_ctx  # context threaded
+    # Right class chosen, wrong-class entries untouched.
+    assert len(tool.calls) == 1, "expected exactly ONE tool execution"
+    assert tool.calls[0] == {"action": "get_source", "name": "X"}
+    assert other_tool.calls == [], "wrong-class tool must not run"
+
+    # Finding distilled correctly.
     assert f.status == FindingStatus.SUCCESS
     assert f.tool_class == ToolClass.READ_SOURCE
     assert f.target_path == "spine/x.py"
-    prompt = captured["input"]["messages"][0]["content"]
-    assert "get_source for X" in prompt  # directive flows in
-    assert "READ_SOURCE" in prompt.upper() or "read_source" in prompt
+    assert "X" in f.matched_symbols
+
+    # Prompt structure: system + user, with directive + topic in user msg.
+    sys_msg, user_msg = bound.last_messages
+    assert sys_msg.content == "researcher-role"
+    user_text = user_msg.content
+    assert "get_source for X" in user_text  # directive flows in
+    assert "how does X work?" in user_text  # topic flows in
+    assert "read_source" in user_text.lower()  # action hint
 
 
 @pytest.mark.asyncio
-async def test_worker_returns_error_finding_when_agent_raises():
-    class _BoomAgent:
+async def test_worker_returns_empty_finding_when_no_tool_call_emitted():
+    """If the model declines to call a tool (returns a plain AIMessage),
+    record EMPTY with the narration — don't fabricate a tool result.
+    """
+    ai_msg = AIMessage(content="I think the answer is X.")
+    bound = _StubBoundModel(ai_msg)
+    tool = _StubTool("codebase_query", "should not run")
+
+    directive = SupervisorDirective(
+        analysis_and_reasoning="r",
+        is_complete=False,
+        next_directive="x",
+        allowed_tool_class=ToolClass.SEARCH,
+    )
+    f = await run_worker_node(
+        state={"work_id": "w"},
+        config=None,
+        topic="x",
+        directive=directive,
+        bound_models={ToolClass.SEARCH: (bound, [tool])},
+        system_prompt="role",
+    )
+    assert f.status == FindingStatus.EMPTY
+    assert tool.calls == []
+    assert "I think the answer" in f.structured_code_block
+
+
+@pytest.mark.asyncio
+async def test_worker_returns_error_finding_when_model_raises():
+    """Bound-model invocation failure surfaces as an ERROR finding."""
+
+    class _BoomBound:
         async def ainvoke(self, *a, **kw):
             raise RuntimeError("network down")
 
@@ -492,11 +562,75 @@ async def test_worker_returns_error_finding_when_agent_raises():
         config=None,
         topic="x",
         directive=directive,
-        worker_agents={ToolClass.SEARCH: _BoomAgent()},
+        bound_models={ToolClass.SEARCH: (_BoomBound(), [])},
+        system_prompt="role",
     )
     assert f.status == FindingStatus.ERROR
     assert "RuntimeError" in f.execution_error_details
     assert "network down" in f.execution_error_details
+
+
+@pytest.mark.asyncio
+async def test_worker_returns_error_when_tool_execution_raises():
+    """Tool-execution failure surfaces as an ERROR finding."""
+    ai_msg = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "codebase_query", "args": {"action": "search"}, "id": "t1", "type": "tool_call"}
+        ],
+    )
+    bound = _StubBoundModel(ai_msg)
+    tool = _StubTool("codebase_query", RuntimeError("MCP socket closed"))
+
+    directive = SupervisorDirective(
+        analysis_and_reasoning="r",
+        is_complete=False,
+        next_directive="x",
+        allowed_tool_class=ToolClass.SEARCH,
+    )
+    f = await run_worker_node(
+        state={"work_id": "w"},
+        config=None,
+        topic="x",
+        directive=directive,
+        bound_models={ToolClass.SEARCH: (bound, [tool])},
+        system_prompt="role",
+    )
+    assert f.status == FindingStatus.ERROR
+    assert "RuntimeError" in f.execution_error_details
+    assert "MCP socket closed" in f.execution_error_details
+
+
+@pytest.mark.asyncio
+async def test_worker_returns_error_when_tool_name_not_in_scoped_surface():
+    """Model hallucinated a tool name not in the scoped set → ERROR
+    (do not silently swallow; the supervisor sees this and adapts)."""
+    ai_msg = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "ghost_tool", "args": {}, "id": "t1", "type": "tool_call"}
+        ],
+    )
+    bound = _StubBoundModel(ai_msg)
+    tool = _StubTool("codebase_query", "won't run")
+
+    directive = SupervisorDirective(
+        analysis_and_reasoning="r",
+        is_complete=False,
+        next_directive="x",
+        allowed_tool_class=ToolClass.SEARCH,
+    )
+    f = await run_worker_node(
+        state={"work_id": "w"},
+        config=None,
+        topic="x",
+        directive=directive,
+        bound_models={ToolClass.SEARCH: (bound, [tool])},
+        system_prompt="role",
+    )
+    assert f.status == FindingStatus.ERROR
+    assert "ghost_tool" in f.execution_error_details
+    assert tool.calls == []
 
 
 # ── render_history_as_evidence ─────────────────────────────────────────

@@ -50,24 +50,30 @@ _SPECIFY_FINDINGS = [
 
 
 def _stub_subagent_and_agent(monkeypatch) -> None:
-    """Shared scaffolding: stub subagent spec + phase agent + context build
-    so run_explore_do_node can drive a single loop iteration without
-    touching the real model / MCP layer."""
+    """Shared scaffolding: stub subagent spec + context build so
+    ``run_explore_do_node`` can drive a single loop iteration without
+    touching the real model / MCP layer.
+
+    The model returned by the stubbed subagent spec exposes
+    ``bind_tools(...)`` (returning a bound stand-in) — required after
+    the worker direct-bind refactor that replaced the agent loop.
+    """
 
     class _FakeTool:
         def __init__(self, name: str) -> None:
             self.name = name
+
+    class _StubBaseModel:
+        def bind_tools(self, tools):
+            return object()
 
     monkeypatch.setattr(
         "spine.agents.subagents.build_subagent_spec",
         lambda **kw: {
             "system_prompt": "scout-system",
             "tools": [_FakeTool("codebase_query"), _FakeTool("search_codebase")],
-            "model": object(),
+            "model": _StubBaseModel(),
         },
-    )
-    monkeypatch.setattr(
-        "spine.agents.factory.build_phase_agent", lambda **kw: object()
     )
     monkeypatch.setattr(
         "spine.agents.context.build_context", lambda state, phase: None

@@ -20,19 +20,34 @@ from spine.agents.researcher_supervisor import (
 )
 
 
-def _stub_subagent_spec(monkeypatch) -> dict:
-    """Replace ``build_subagent_spec`` with a no-op returning the minimal
-    shape ``run_explore_do_node`` reads (tools, system_prompt).
+class _FakeTool:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _StubBaseModel:
+    """Stub for the base chat model returned by ``build_subagent_spec``.
+    Records every ``bind_tools`` call so tests can verify per-class
+    tool scoping happens correctly.
     """
 
-    class _FakeTool:
-        def __init__(self, name: str) -> None:
-            self.name = name
+    def __init__(self, bind_log: list[list[str]]) -> None:
+        self._bind_log = bind_log
 
+    def bind_tools(self, tools):
+        self._bind_log.append([getattr(t, "name", "?") for t in tools])
+        return object()  # bound model; tests stub run_worker_node so it's never invoked
+
+
+def _stub_subagent_spec(monkeypatch, *, bind_log: list[list[str]]) -> dict:
+    """Replace ``build_subagent_spec`` with a no-op returning the minimal
+    shape ``run_explore_do_node`` reads (tools, system_prompt, model with
+    ``bind_tools``).
+    """
     spec = {
         "name": "researcher",
         "system_prompt": "scout-system",
-        "model": object(),
+        "model": _StubBaseModel(bind_log),
         "tools": [
             _FakeTool("codebase_query"),
             _FakeTool("search_codebase"),
@@ -45,23 +60,6 @@ def _stub_subagent_spec(monkeypatch) -> dict:
         lambda **kw: spec,
     )
     return spec
-
-
-def _stub_build_phase_agent(monkeypatch, *, calls: list[dict]):
-    """Replace ``build_phase_agent`` with a fake that records the
-    ``extra_tools`` it was handed and returns a dummy agent the tests
-    don't actually invoke (the supervisor/worker calls are also stubbed).
-    """
-
-    def _fake(**kw):
-        calls.append(
-            {
-                "extra_tools": [getattr(t, "name", "?") for t in (kw.get("extra_tools") or [])],
-            }
-        )
-        return object()
-
-    monkeypatch.setattr("spine.agents.factory.build_phase_agent", _fake)
 
 
 def _stub_context(monkeypatch) -> object:
@@ -83,9 +81,8 @@ async def test_loop_terminates_when_supervisor_marks_complete(monkeypatch):
     turn returns a success finding; supervisor then says is_complete=True
     and the loop exits. Evidence carries the worker's tool output.
     """
-    _stub_subagent_spec(monkeypatch)
-    build_calls: list[dict] = []
-    _stub_build_phase_agent(monkeypatch, calls=build_calls)
+    bind_log: list[list[str]] = []
+    _stub_subagent_spec(monkeypatch, bind_log=bind_log)
     _stub_context(monkeypatch)
 
     supervisor_calls = 0
@@ -134,10 +131,11 @@ async def test_loop_terminates_when_supervisor_marks_complete(monkeypatch):
     assert evidence["supervisor_cycles"] == 1  # one worker turn ran
     assert "build_phase_agent" in evidence["tool_results_text"]
     assert "terminating" in evidence["narrative"]
-    # Built exactly one worker (SEARCH) — the second cycle was
-    # is_complete=True so no further worker built.
-    assert len(build_calls) == 1
-    assert set(build_calls[0]["extra_tools"]) == {"codebase_query", "search_codebase"}
+    # Bound exactly one model (SEARCH) — the second cycle was
+    # is_complete=True so no further bind. The bound surface contains the
+    # SEARCH-class tools only.
+    assert len(bind_log) == 1
+    assert set(bind_log[0]) == {"codebase_query", "search_codebase"}
     # 2 supervisor calls: cycle 0 (seed shortcut still invokes the function)
     # and cycle 1 (the terminating decision).
     assert supervisor_calls == 2
@@ -149,8 +147,7 @@ async def test_loop_hits_cap_when_supervisor_never_completes(monkeypatch):
     terminate at the per-phase cap (PLAN: 6 by default) and mark
     ``recursion_capped=True`` so the summarise sentinel path kicks in.
     """
-    _stub_subagent_spec(monkeypatch)
-    _stub_build_phase_agent(monkeypatch, calls=[])
+    _stub_subagent_spec(monkeypatch, bind_log=[])
     _stub_context(monkeypatch)
 
     async def _fake_supervisor(**kw):
@@ -197,14 +194,13 @@ async def test_loop_hits_cap_when_supervisor_never_completes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_loop_builds_separate_worker_per_tool_class(monkeypatch):
+async def test_loop_binds_separate_model_per_tool_class(monkeypatch):
     """When the supervisor picks distinct tool classes across cycles,
-    the loop lazy-builds one worker agent per class with that class's
-    filtered tool surface — and reuses the cached agent on revisit.
+    the loop lazy-binds one model per class with that class's filtered
+    tool surface — and reuses the cached bind on revisit.
     """
-    _stub_subagent_spec(monkeypatch)
-    build_calls: list[dict] = []
-    _stub_build_phase_agent(monkeypatch, calls=build_calls)
+    bind_log: list[list[str]] = []
+    _stub_subagent_spec(monkeypatch, bind_log=bind_log)
     _stub_context(monkeypatch)
 
     # Plan the supervisor's choices: SEARCH → READ_SOURCE → SEARCH → COMPLETE.
@@ -253,10 +249,10 @@ async def test_loop_builds_separate_worker_per_tool_class(monkeypatch):
     )
 
     assert out["exploration_evidence"]["supervisor_cycles"] == 3  # 3 worker turns
-    # 2 build_phase_agent calls — one for SEARCH, one for READ_SOURCE.
-    # The second SEARCH cycle hits the cache.
-    assert len(build_calls) == 2
-    tool_sets = [set(c["extra_tools"]) for c in build_calls]
+    # 2 bind_tools calls — one for SEARCH, one for READ_SOURCE. The
+    # second SEARCH cycle hits the cache and does not rebind.
+    assert len(bind_log) == 2
+    tool_sets = [set(names) for names in bind_log]
     assert {"codebase_query", "search_codebase"} in tool_sets   # SEARCH
     assert {"codebase_query", "ast_extract_symbol"} in tool_sets  # READ_SOURCE
 
@@ -267,8 +263,7 @@ async def test_loop_passes_shared_context_to_worker(monkeypatch):
     into every worker invocation so ReadCacheMiddleware dedupes across
     cycles.
     """
-    _stub_subagent_spec(monkeypatch)
-    _stub_build_phase_agent(monkeypatch, calls=[])
+    _stub_subagent_spec(monkeypatch, bind_log=[])
     ctx = _stub_context(monkeypatch)
 
     seen_contexts: list[Any] = []
@@ -323,8 +318,7 @@ async def test_loop_terminates_immediately_when_supervisor_seeds_complete(
     is_complete=True on the very first cycle (skipping all work), the
     loop must exit cleanly with zero worker turns and empty evidence.
     """
-    _stub_subagent_spec(monkeypatch)
-    _stub_build_phase_agent(monkeypatch, calls=[])
+    _stub_subagent_spec(monkeypatch, bind_log=[])
     _stub_context(monkeypatch)
 
     async def _fake_supervisor(**kw):
