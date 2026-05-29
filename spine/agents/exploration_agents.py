@@ -951,6 +951,15 @@ async def run_explore_do_node(
                 "worker invocation will error",
                 work_id, tool_class.value,
             )
+        # skip_default_mcp_injection=True is REQUIRED here. The subagent
+        # spec already curated the worker's tool surface — collapsing the
+        # MCP catalog to a single CodebaseQueryTool — and the per-class
+        # filter above (filter_extra_tools_for_class) narrows that further
+        # to the supervisor's chosen ToolClass. Without this flag,
+        # build_phase_agent re-loads the full ~18-tool MCP catalog and
+        # appends it to scoped_tools (factory.py: all_tools.extend),
+        # silently undoing both filters and inflating every worker call's
+        # prefix by ~6 KB. See trace 019e7164 audit (P:C ratio 226:1).
         agent = build_phase_agent(
             state=state,  # type: ignore[arg-type]
             config=config,
@@ -960,6 +969,7 @@ async def run_explore_do_node(
             extra_tools=scoped_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
+            skip_default_mcp_injection=True,
         )
         worker_agents[tool_class] = agent
         return agent

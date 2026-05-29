@@ -321,6 +321,7 @@ def build_phase_agent(
     allowed_tools: list[str] | None = None,
     extra_tools: list[Any] | None = None,
     skip_filesystem_middleware: bool = False,
+    skip_default_mcp_injection: bool = False,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -351,6 +352,17 @@ def build_phase_agent(
             entirely. Pair with extra_tools to replace all filesystem access
             with purpose-built tools, removing any generic read/write fallback
             from the model's tool surface.
+        skip_default_mcp_injection: When True, do NOT auto-load the
+            ``SpineConfig.mcp_servers`` catalog and do NOT append it to the
+            agent's tool list / inject the MCP guidance prompt block. Use
+            for callers that have already curated the worker's tool surface
+            upstream (notably the supervisor↔worker loop in
+            :func:`spine.agents.exploration_agents.run_explore_do_node`,
+            which scopes ``extra_tools`` to a single ToolClass). Without
+            this, the default-MCP injection re-appends ~18 wrappers per
+            agent and silently undoes the upstream filter — trace
+            019e7164 showed a 226:1 prompt:completion ratio caused by
+            exactly this.
 
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
@@ -367,19 +379,26 @@ def build_phase_agent(
     work_id = state.get("work_id", "")
 
     # ── MCP tools ──────────────────────────────────────────────────────
-    from spine.config import SpineConfig
-    from spine.mcp.client import get_mcp_tools
-
+    # When ``skip_default_mcp_injection`` is True we deliberately do NOT
+    # call ``get_mcp_tools(...)``. This avoids:
+    #   (a) appending the full MCP catalog to ``all_tools`` below,
+    #   (b) emitting the ``mcp_guidance`` system-prompt block.
+    # Callers that opt out are responsible for curating the worker's tool
+    # surface upstream via ``extra_tools``.
     mcp_tools: list = []
-    try:
-        config_obj = SpineConfig.load()
-        mcp_tools = get_mcp_tools(
-            config_obj.mcp_servers,
-            cache_key=work_id or "default",
-            workspace_root=workspace_root,
-        )
-    except Exception:
-        logger.debug("MCP tool loading failed (non-fatal)", exc_info=True)
+    if not skip_default_mcp_injection:
+        from spine.config import SpineConfig
+        from spine.mcp.client import get_mcp_tools
+
+        try:
+            config_obj = SpineConfig.load()
+            mcp_tools = get_mcp_tools(
+                config_obj.mcp_servers,
+                cache_key=work_id or "default",
+                workspace_root=workspace_root,
+            )
+        except Exception:
+            logger.debug("MCP tool loading failed (non-fatal)", exc_info=True)
 
     # ── Resolve profile for prompt assembly ──────────────────────────
     # The HarnessProfile is registered per-provider by ensure_spine_profiles().
