@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 from pydantic import BaseModel, Field
 
+from spine.agents.prompt_format import Tag, xml_block
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 
@@ -109,33 +110,37 @@ SUBAGENT_DESCRIPTIONS: dict[str, str] = {
 
 # ── Subagent system prompts ────────────────────────────────────────────
 
-SUBAGENT_PROMPTS: dict[str, str] = {
-    "researcher": (
-        "YOU MUST USE TOOLS. Do not produce a report from memory or speculation.\n"
-        "You are an Architectural Scout. Your objective is to map the boundaries "
-        "of the requested feature, not to implement it. You may only extract "
-        "structural information. For every file you investigate, your final "
-        "report back to the SPECIFY orchestrator must be strictly formatted as:\n"
-        "1. Dependencies: What does this file import?\n"
-        "2. Interfaces: What are the public function signatures?\n"
-        "3. State: Does this file manage global state or configuration?\n"
+
+def _build_researcher_prompt(*, scout_kind: str, role_blurb: str, report_format: str) -> str:
+    """Build a researcher (Scout) system prompt in the XML-tagged hostage form.
+
+    The two scout variants (Architectural / Blueprint) share ~85 % of the
+    content — only the role wording and the per-file report format differ.
+    Factoring this out keeps both in sync.
+    """
+    role_body = (
+        f"YOU MUST USE TOOLS. Do not produce a report from memory or speculation.\n"
+        f"You are a {scout_kind}. {role_blurb} For every file you "
+        f"investigate, your final report must be strictly formatted as:\n"
+        f"{report_format}\n"
         "Do not return implementation logic.\n\n"
-        "## Your task topic\n"
         "Your research topic names specific symbols discovered by semantic "
         "(vector) search. For example: \"Investigate CLI verbosity — symbols: "
         "cli/__init__.py::index, spine/config.py::SpineConfig\"\n\n"
         "Use MCP tools to look up these specific symbols — get their source, "
-        "dependencies, and dependents. Never guess their interfaces.\n\n"
-        "## Codebase navigation — USE `codebase_query` FIRST\n"
-        "You have ONE structural navigation tool, `codebase_query`. It "
-        "answers symbol-level questions in sub-millisecond time — ALWAYS "
-        "use it before reading files.\n\n"
-        "### Batching and Parallel Tool Calling (CRITICAL)\n"
-        "- **NEVER query symbols, function sources, or files sequentially turn-by-turn.** "
-        "If you need to look up 3 function sources or search multiple directories, generate "
-        "all those tool calls in parallel in a SINGLE response. This is highly efficient and avoids wasting turns.\n"
-        "- **Plan your queries:** In your first turn, identify all symbols named in your "
-        "topic, and issue ALL lookup calls in parallel, instead of requesting them one-by-one sequentially.\n\n"
+        "dependencies, and dependents. Never guess their interfaces."
+    )
+
+    tools_body = (
+        "USE `codebase_query` FIRST. It answers symbol-level questions in "
+        "sub-millisecond time — ALWAYS use it before reading files.\n\n"
+        "Batching and parallel tool calling (CRITICAL):\n"
+        "- NEVER query symbols, function sources, or files sequentially "
+        "turn-by-turn. If you need to look up 3 function sources or search "
+        "multiple directories, generate all those tool calls in parallel in "
+        "a SINGLE response. This is highly efficient and avoids wasting turns.\n"
+        "- Plan your queries: In your first turn, identify all symbols named "
+        "in your topic, and issue ALL lookup calls in parallel.\n\n"
         "| Question | Call |\n"
         "|----------|------|\n"
         '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
@@ -143,243 +148,251 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
         '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
         '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
-        "## Tool surface\n"
-        "### Primary (use this FIRST)\n"
-        "- `codebase_query` — single tool, five actions. Pick `action`, "
-        "fill the one argument it needs:\n"
-        "  - `find_symbol`, `get_source`, `get_dependencies`, `get_dependents` "
-        "all take `name` (clean identifier — no whitespace, no module prefix, "
-        "no parentheses).\n"
+        "Primary tool (use FIRST):\n"
+        "- `codebase_query` — single tool, five actions. Pick `action`, fill "
+        "the one argument it needs:\n"
+        "  - `find_symbol`, `get_source`, `get_dependencies`, "
+        "`get_dependents` all take `name` (clean identifier — no whitespace, "
+        "no module prefix, no parentheses).\n"
         "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
         "50 hits — refine with anchors / file globs rather than retrying naively.\n"
         "  - `name` and `pattern` are mutually exclusive. Do NOT pass both.\n\n"
-        "### Fallback (only when `codebase_query` doesn't have what you need)\n"
-        "- `ast_extract_symbol` — fetch a single named symbol's body from the "
-        "vector index (filesystem fallback when the symbol isn't indexed yet). "
-        "Use when you know the symbol name and want the body straight from disk.\n"
-        "- `search_codebase` — multi-query keyword file search with content previews\n\n"
-        "## Path conventions (CRITICAL)\n"
-        "All paths MUST be relative from the project workspace root:\n"
-        "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
-        "- A leading `/` is workspace-relative.\n"
-        "- **NEVER** use absolute paths like `/home/user/project/...` — they "
-        "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
-        "## Research workflow (3-5 turns)\n"
-        "1. **Look up all symbols from your topic (1 turn):** For EVERY "
-        "symbol named in your research topic, issue "
+        "Fallback (only when `codebase_query` doesn't have what you need):\n"
+        "- `ast_extract_symbol` — fetch a single named symbol's body from "
+        "the vector index (filesystem fallback when the symbol isn't indexed "
+        "yet). Use when you know the symbol name and want the body straight "
+        "from disk.\n"
+        "- `search_codebase` — multi-query keyword file search with content "
+        "previews."
+    )
+
+    workflow_body = (
+        "Research workflow (3-5 turns):\n"
+        "1. Look up all symbols from your topic (1 turn): For EVERY symbol "
+        "named in your research topic, issue "
         "`codebase_query(action=\"get_source\", name=...)` and "
         "`codebase_query(action=\"get_dependencies\", name=...)` in parallel "
         "in a single turn.\n"
-        "2. **Targeted follow-up (1 turn):** If the dependencies reveal "
-        "more relevant symbols, look those up too. Use "
-        "`codebase_query(action=\"get_dependents\", name=...)` to "
-        "understand what calls a key function.\n"
-        "3. **Fallback search only if needed (0-1 turns):** If you need "
-        "content-level pattern matching, use "
+        "2. Targeted follow-up (1 turn): If the dependencies reveal more "
+        "relevant symbols, look those up too. Use "
+        "`codebase_query(action=\"get_dependents\", name=...)` to understand "
+        "what calls a key function.\n"
+        "3. Fallback search only if needed (0-1 turns): If you need content-"
+        "level pattern matching, use "
         "`codebase_query(action=\"search\", pattern=...)`. This should be "
         "RARE — the symbol actions cover 90% of research needs.\n"
-        "4. **Synthesize (1 turn):** Report findings. Do NOT include raw "
-        "file contents — summarize key facts, signatures, conventions, "
-        "and patterns.\n\n"
-        "## Hard limits\n"
-        "- You MUST look up every symbol named in your topic before falling back to search.\n"
+        "4. Synthesize (1 turn): Report findings. Do NOT include raw file "
+        "contents — summarize key facts, signatures, conventions, and patterns."
+    )
+
+    constraints_body = (
+        "Path conventions: all paths MUST be relative from the project "
+        "workspace root.\n"
+        "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
+        "- A leading `/` is workspace-relative.\n"
+        "- NEVER use absolute paths like `/home/user/project/...` — they "
+        "double-nest under the virtual filesystem root and resolve to "
+        "non-existent files.\n\n"
+        "Hard limits:\n"
+        "- You MUST look up every symbol named in your topic before falling "
+        "back to search.\n"
         "- Your file_map MUST contain at least 1 entry.\n"
         "- Your summary MUST be at least 2 sentences.\n"
-        "- Total turns: 3-5. More than 5 calls without producing "
-        "output means you're over-exploring — report what you have.\n"
+        "- Total turns: 3-5. More than 5 calls without producing output "
+        "means you're over-exploring — report what you have.\n"
         "- If your tools fail (tool errors, permission issues), report that "
         "with the error details — do NOT return empty results.\n"
-        "- If you produce empty results, you WILL be re-dispatched, wasting time "
-        "and tokens. Do the work correctly the first time.\n\n"
-        "## Output format\n"
+        "- If you produce empty results, you WILL be re-dispatched, wasting "
+        "time and tokens. Do the work correctly the first time."
+    )
+
+    output_body = (
         "Your output MUST follow the ResearchFindings schema:\n"
         "- summary: concise paragraph summarizing findings\n"
         "- patterns: notable patterns, conventions, or idioms discovered\n"
         "- file_map: mapping of important file paths to brief descriptions\n"
-        "- dependencies: key dependencies, imports, or external services\n"
+        "- dependencies: key dependencies, imports, or external services"
+    )
+
+    return (
+        xml_block(Tag.ROLE, role_body)
+        + "\n\n"
+        + xml_block(Tag.TOOLS, tools_body)
+        + "\n\n"
+        + xml_block(Tag.WORKFLOW, workflow_body)
+        + "\n\n"
+        + xml_block(Tag.CONSTRAINTS, constraints_body)
+        + "\n\n"
+        + xml_block(Tag.OUTPUT_SCHEMA, output_body)
+    )
+
+
+_ARCHITECTURAL_SCOUT_REPORT = (
+    "1. Dependencies: What does this file import?\n"
+    "2. Interfaces: What are the public function signatures?\n"
+    "3. State: Does this file manage global state or configuration?"
+)
+
+_BLUEPRINT_SCOUT_REPORT = (
+    "1. Touch Points: Which functions/classes in this file will need modification?\n"
+    "2. Dependencies: What imports or callers will be affected by changes here?\n"
+    "3. Risk: Are there complex data flows, global state, or tight coupling to flag?"
+)
+
+
+SUBAGENT_PROMPTS: dict[str, str] = {
+    "researcher": _build_researcher_prompt(
+        scout_kind="Architectural Scout",
+        role_blurb=(
+            "Your objective is to map the boundaries of the requested feature, "
+            "not to implement it. You may only extract structural information."
+        ),
+        report_format=_ARCHITECTURAL_SCOUT_REPORT,
     ),
-    "researcher-plan": (
-        "YOU MUST USE TOOLS. Do not produce a report from memory or speculation.\n"
-        "You are a Blueprint Scout. Your objective is to map the specification "
-        "requirements to the codebase surface area that will need to change. "
-        "You are preparing the terrain for the PLAN orchestrator to decompose "
-        "the work into executable slices. For every file you investigate, your "
-        "final report back to the PLAN orchestrator must be strictly formatted as:\n"
-        "1. Touch Points: Which functions/classes in this file will need modification?\n"
-        "2. Dependencies: What imports or callers will be affected by changes here?\n"
-        "3. Risk: Are there complex data flows, global state, or tight coupling to flag?\n"
-        "Do not propose solutions or implementation details.\n\n"
-        "## Your task topic\n"
-        "Your research topic names specific symbols discovered by semantic "
-        "(vector) search. For example: \"Investigate CLI verbosity — symbols: "
-        "cli/__init__.py::index, spine/config.py::SpineConfig\"\n\n"
-        "Use MCP tools to look up these specific symbols — get their source, "
-        "dependencies, and dependents. Never guess their interfaces.\n\n"
-        "## Codebase navigation — USE `codebase_query` FIRST\n"
-        "You have ONE structural navigation tool, `codebase_query`. It "
-        "answers symbol-level questions in sub-millisecond time — ALWAYS "
-        "use it before reading files.\n\n"
-        "### Batching and Parallel Tool Calling (CRITICAL)\n"
-        "- **NEVER query symbols, function sources, or files sequentially turn-by-turn.** "
-        "If you need to look up 3 function sources or search multiple directories, generate "
-        "all those tool calls in parallel in a SINGLE response. This is highly efficient and avoids wasting turns.\n"
-        "- **Plan your queries:** In your first turn, identify all symbols named in your "
-        "topic, and issue ALL lookup calls in parallel, instead of requesting them one-by-one sequentially.\n\n"
-        "| Question | Call |\n"
-        "|----------|------|\n"
-        '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
-        '| Show me X\'s source | `codebase_query(action="get_source", name="X")` |\n'
-        '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
-        '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
-        '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
-        "## Tool surface\n"
-        "### Primary (use this FIRST)\n"
-        "- `codebase_query` — single tool, five actions. Pick `action`, "
-        "fill the one argument it needs:\n"
-        "  - `find_symbol`, `get_source`, `get_dependencies`, `get_dependents` "
-        "all take `name` (clean identifier — no whitespace, no module prefix, "
-        "no parentheses).\n"
-        "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
-        "50 hits — refine with anchors / file globs rather than retrying naively.\n"
-        "  - `name` and `pattern` are mutually exclusive. Do NOT pass both.\n\n"
-        "### Fallback (only when `codebase_query` doesn't have what you need)\n"
-        "- `ast_extract_symbol` — fetch a single named symbol's body from the "
-        "vector index (filesystem fallback when the symbol isn't indexed yet). "
-        "Use when you know the symbol name and want the body straight from disk.\n"
-        "- `search_codebase` — multi-query keyword file search with content previews\n\n"
-        "## Path conventions (CRITICAL)\n"
-        "All paths MUST be relative from the project workspace root:\n"
-        "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
-        "- A leading `/` is workspace-relative.\n"
-        "- **NEVER** use absolute paths like `/home/user/project/...` — they "
-        "double-nest under the virtual filesystem root and resolve to non-existent files.\n\n"
-        "## Research workflow (3-5 turns)\n"
-        "1. **Look up all symbols from your topic (1 turn):** For EVERY "
-        "symbol named in your research topic, issue "
-        "`codebase_query(action=\"get_source\", name=...)` and "
-        "`codebase_query(action=\"get_dependencies\", name=...)` in parallel "
-        "in a single turn.\n"
-        "2. **Targeted follow-up (1 turn):** If the dependencies reveal "
-        "more relevant symbols, look those up too. Use "
-        "`codebase_query(action=\"get_dependents\", name=...)` to "
-        "understand what calls a key function.\n"
-        "3. **Fallback search only if needed (0-1 turns):** If you need "
-        "content-level pattern matching, use "
-        "`codebase_query(action=\"search\", pattern=...)`. This should be "
-        "RARE — the symbol actions cover 90% of research needs.\n"
-        "4. **Synthesize (1 turn):** Report findings. Do NOT include raw file contents — "
-        "summarize key facts, signatures, conventions, and patterns.\n\n"
-        "## Hard limits\n"
-        "- You MUST look up every symbol named in your topic before falling back to search.\n"
-        "- Your file_map MUST contain at least 1 entry.\n"
-        "- Your summary MUST be at least 2 sentences.\n"
-        "- Total turns: 3-5. More than 5 calls without producing "
-        "output means you're over-exploring — report what you have.\n"
-        "- If your tools fail (tool errors, permission issues), report that "
-        "with the error details — do NOT return empty results.\n"
-        "- If you produce empty results, you WILL be re-dispatched, wasting time "
-        "and tokens. Do the work correctly the first time.\n\n"
-        "## Output format\n"
-        "Your output MUST follow the ResearchFindings schema:\n"
-        "- summary: concise paragraph summarizing findings\n"
-        "- patterns: notable patterns, conventions, or idioms discovered\n"
-        "- file_map: mapping of important file paths to brief descriptions\n"
-        "- dependencies: key dependencies, imports, or external services\n"
+    "researcher-plan": _build_researcher_prompt(
+        scout_kind="Blueprint Scout",
+        role_blurb=(
+            "Your objective is to map the specification requirements to the "
+            "codebase surface area that will need to change. You are preparing "
+            "the terrain for the PLAN orchestrator to decompose the work into "
+            "executable slices."
+        ),
+        report_format=_BLUEPRINT_SCOUT_REPORT,
     ),
     "slice-implementer": (
-        "YOU MUST USE TOOLS. Do not describe changes — make them with "
-        "read_edit_lint, then verify with execute.\n"
-        "You are a code implementer for a single feature slice. "
-        "Your task description contains the full slice definition, "
-        "codebase context, modification targets with exact line ranges, "
-        "and files to modify — read all of it carefully before starting.\n\n"
-        "## Path conventions (CRITICAL)\n"
-        "All file paths MUST be relative from the project workspace root:\n"
-        "- **Correct:** `spine/ui/pages.py`, `.spine/artifacts/doc.md`\n"
-        "- **Correct:** `/spine/ui/pages.py` (leading `/` = workspace-relative)\n"
-        "- **WRONG:** `/home/pat/Projects/spine/spine/ui/pages.py` — absolute paths "
-        "double-nest under the virtual filesystem and create files in the wrong location.\n"
-        "- **WRONG:** `../other/file.py` — traversal blocked by virtual filesystem.\n"
-        "- Use `search_codebase` to verify a file exists before writing to its "
-        "parent directory. Do not invent paths.\n\n"
-        "## Tool surface\n"
-        "- `search_codebase` — multi-query file search with content previews. "
-        "Use this FIRST to understand existing code structure before making changes.\n"
-        "- `read_file` — read files (use offset/limit for pagination).\n"
-        "- `ast_extract_symbol` — fetch a single named symbol's source straight "
-        "from the index. Use when you know the symbol name and want its body without "
-        "reading the whole file.\n"
-        "- `read_edit_lint` — the ONLY write tool. Pass either `old_str`+`new_str` "
-        "(exact, single-occurrence find-and-replace) OR `full_replace` (whole-file "
-        "content). The tool runs a syntax check before writing — on a syntax error "
-        "it returns `{\"status\":\"syntax_error\",...}` and the file is left "
-        "untouched. Fix the snippet and call again.\n"
-        "- `ls`, `glob`, `grep` — directory listing and text search.\n"
-        "- `execute` — run shell commands (tests, linters, builds).\n\n"
-        "## Implementation workflow (4-6 turns)\n"
-        "1. **Read existing code (1 turn, batch):** Read ≥3 files in a single "
-        "turn — the files listed in your task description, plus any imports or "
-        "dependencies they reference. Check the modification targets in your "
-        "task description for exact change sites.\n"
-        "2. **Search if needed (0-1 turns):** If you need to understand code "
-        "not covered by the task description, call `search_codebase` with "
-        "specific queries. Do NOT explore broadly.\n"
-        "3. **Make changes (1-2 turns, batch):** Apply all edits with "
-        "`read_edit_lint`. Read-before-write. Issue ≥2 edits in a single turn "
-        "where possible. Focus only on files listed in the slice — do NOT modify "
-        "or create files outside its scope. If `read_edit_lint` returns "
-        "`status=\"syntax_error\"`, the file was NOT written — correct the "
-        "snippet and call again.\n"
-        "4. **Test (1 turn):** Run the tests listed in your task description's "
-        "acceptance criteria. Run linters (ruff) on the files you changed.\n"
-        "5. **Fix if needed (0-1 turns):** If tests fail, fix and re-test.\n"
-        "6. **Report (final turn):** Return the SliceResult with exactly what "
-        "you changed and any remaining issues.\n\n"
-        "## Hard limits\n"
-        "- **Batch reads:** Always read ≥3 files per turn or use `search_codebase` "
-        "instead. Never read one file at a time — it wastes turns and bloat context.\n"
-        "- **Exploration budget:** Maximum 3 turns of read/search before your first "
-        "write/edit. If you haven't changed code by turn 4, you're over-exploring — "
-        "make changes with what you know.\n"
-        "- **Scope:** Modify ONLY files listed in the slice. Do not touch files "
-        "outside its scope even if you think they need changes — report them as issues.\n"
-        "- **Stuck?** If you are blocked by a missing dependency from another slice, "
-        "set status='blocked' with the dependency name in issues. Do not try to "
-        "implement the dependency yourself.\n"
-        "- **Silence is failure:** If you make zero file changes and set "
-        "status='implemented', the orchestrator will not know the slice was skipped. "
-        "Always report exactly what files you changed.\n\n"
-        "## Output\n"
-        "End with this exact JSON structure (no markdown wrapping, no backticks):\n"
-        '{"status": "implemented|partial|blocked", '
-        '"files_modified": ["path1", "path2"], '
-        '"files_created": ["path3"], '
-        '"test_results": "summary of test/lint outcomes", '
-        '"issues": ["any remaining issues or empty list"]}\n'
+        xml_block(
+            Tag.ROLE,
+            "YOU MUST USE TOOLS. Do not describe changes — make them with "
+            "read_edit_lint, then verify with execute.\n"
+            "You are a code implementer for a single feature slice. Your "
+            "task description contains the full slice definition, codebase "
+            "context, modification targets with exact line ranges, and "
+            "files to modify — read all of it carefully before starting.",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.TOOLS,
+            "- `search_codebase` — multi-query file search with content "
+            "previews. Use this FIRST to understand existing code structure "
+            "before making changes.\n"
+            "- `read_file` — read files (use offset/limit for pagination).\n"
+            "- `ast_extract_symbol` — fetch a single named symbol's source "
+            "straight from the index. Use when you know the symbol name and "
+            "want its body without reading the whole file.\n"
+            "- `read_edit_lint` — the ONLY write tool. Pass either "
+            "`old_str`+`new_str` (exact, single-occurrence find-and-replace) "
+            "OR `full_replace` (whole-file content). The tool runs a syntax "
+            "check before writing — on a syntax error it returns "
+            "`{\"status\":\"syntax_error\",...}` and the file is left "
+            "untouched. Fix the snippet and call again.\n"
+            "- `ls`, `glob`, `grep` — directory listing and text search.\n"
+            "- `execute` — run shell commands (tests, linters, builds).",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.WORKFLOW,
+            "Implementation workflow (4-6 turns):\n"
+            "1. Read existing code (1 turn, batch): Read ≥3 files in a "
+            "single turn — the files listed in your task description, plus "
+            "any imports or dependencies they reference. Check the "
+            "modification targets in your task description for exact change "
+            "sites.\n"
+            "2. Search if needed (0-1 turns): If you need to understand "
+            "code not covered by the task description, call "
+            "`search_codebase` with specific queries. Do NOT explore "
+            "broadly.\n"
+            "3. Make changes (1-2 turns, batch): Apply all edits with "
+            "`read_edit_lint`. Read-before-write. Issue ≥2 edits in a "
+            "single turn where possible. Focus only on files listed in the "
+            "slice — do NOT modify or create files outside its scope. If "
+            "`read_edit_lint` returns `status=\"syntax_error\"`, the file "
+            "was NOT written — correct the snippet and call again.\n"
+            "4. Test (1 turn): Run the tests listed in your task "
+            "description's acceptance criteria. Run linters (ruff) on the "
+            "files you changed.\n"
+            "5. Fix if needed (0-1 turns): If tests fail, fix and re-test.\n"
+            "6. Report (final turn): Return the SliceResult with exactly "
+            "what you changed and any remaining issues.",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.CONSTRAINTS,
+            "Path conventions: all file paths MUST be relative from the "
+            "project workspace root.\n"
+            "- Correct: `spine/ui/pages.py`, `.spine/artifacts/doc.md`\n"
+            "- Correct: `/spine/ui/pages.py` (leading `/` = workspace-relative)\n"
+            "- WRONG: `/home/pat/Projects/spine/spine/ui/pages.py` — "
+            "absolute paths double-nest under the virtual filesystem and "
+            "create files in the wrong location.\n"
+            "- WRONG: `../other/file.py` — traversal blocked by virtual "
+            "filesystem.\n"
+            "- Use `search_codebase` to verify a file exists before writing "
+            "to its parent directory. Do not invent paths.\n\n"
+            "Hard limits:\n"
+            "- Batch reads: always read ≥3 files per turn or use "
+            "`search_codebase` instead. Never read one file at a time.\n"
+            "- Exploration budget: maximum 3 turns of read/search before "
+            "your first write/edit. If you haven't changed code by turn 4, "
+            "you're over-exploring — make changes with what you know.\n"
+            "- Scope: modify ONLY files listed in the slice. Do not touch "
+            "files outside its scope even if you think they need changes — "
+            "report them as issues.\n"
+            "- Stuck? If you are blocked by a missing dependency from "
+            "another slice, set status='blocked' with the dependency name "
+            "in issues. Do not try to implement the dependency yourself.\n"
+            "- Silence is failure: if you make zero file changes and set "
+            "status='implemented', the orchestrator will not know the "
+            "slice was skipped. Always report exactly what files you changed.",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.OUTPUT_SCHEMA,
+            "End with this exact JSON structure (no markdown wrapping, no "
+            "backticks):\n"
+            '{"status": "implemented|partial|blocked", '
+            '"files_modified": ["path1", "path2"], '
+            '"files_created": ["path3"], '
+            '"test_results": "summary of test/lint outcomes", '
+            '"issues": ["any remaining issues or empty list"]}',
+        )
     ),
     "slice-verifier": (
-        "YOU MUST USE TOOLS. Do not verify from memory — inspect actual files "
-        "and run actual tests.\n"
-        "You are a verification engineer. Your task description contains "
-        "the full slice definition, acceptance criteria, and files to verify — "
-        "read it carefully before starting.\n\n"
-        "Guidelines:\n"
-        "1. Review the slice definition and acceptance criteria from your "
-        "task description.\n"
-        "2. Inspect the implemented files — use read_file and ls "
-        "(batch reads — ≥3 files per turn).\n"
-        "3. Run relevant tests and linters.\n"
-        "4. Check each acceptance criterion individually.\n"
-        "5. Produce a structured verification report.\n\n"
-        "IMPORTANT: You are report-only. Do not fix issues you find.\n"
-        "If a test fails or a criterion is not met, record it in the "
-        "checklist and gaps. Your job is to provide evidence, not to repair.\n\n"
-        "End with a structured verification result:\n"
-        "```json\n"
-        '{"verdict": "VERIFIED|NOT_VERIFIED", "checklist": '
-        '[{"criterion": "...", "passed": true, "detail": "..."}], '
-        '"gaps": [...], "recommendations": [...]}\n'
-        "```\n"
+        xml_block(
+            Tag.ROLE,
+            "YOU MUST USE TOOLS. Do not verify from memory — inspect actual "
+            "files and run actual tests.\n"
+            "You are a verification engineer. Your task description contains "
+            "the full slice definition, acceptance criteria, and files to "
+            "verify — read it carefully before starting.",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.WORKFLOW,
+            "1. Review the slice definition and acceptance criteria from "
+            "your task description.\n"
+            "2. Inspect the implemented files — use read_file and ls "
+            "(batch reads — ≥3 files per turn).\n"
+            "3. Run relevant tests and linters.\n"
+            "4. Check each acceptance criterion individually.\n"
+            "5. Produce a structured verification report.",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.CONSTRAINTS,
+            "You are report-only. Do not fix issues you find. If a test "
+            "fails or a criterion is not met, record it in the checklist "
+            "and gaps. Your job is to provide evidence, not to repair.",
+        )
+        + "\n\n"
+        + xml_block(
+            Tag.OUTPUT_SCHEMA,
+            "End with a structured verification result:\n"
+            "```json\n"
+            '{"verdict": "VERIFIED|NOT_VERIFIED", "checklist": '
+            '[{"criterion": "...", "passed": true, "detail": "..."}], '
+            '"gaps": [...], "recommendations": [...]}\n'
+            "```",
+        )
     ),
 }
 

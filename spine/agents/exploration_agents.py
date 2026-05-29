@@ -24,6 +24,12 @@ from pydantic import BaseModel, Field
 
 from spine.agents._tokens import count_tokens as _count_tokens
 from spine.agents.helpers import resolve_model
+from spine.agents.prompt_format import (
+    Tag,
+    hostage_layout,
+    xml_block,
+    xml_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,164 +226,148 @@ class ResearchManagerDecision(BaseModel):
 
 # ── Research manager prompts ─────────────────────────────────────────────
 
-_RESEARCH_MANAGER_SPECIFY = """\
-You are an Architectural Research Manager. Your job is to map the codebase
-structure so the SPECIFY orchestrator can write an accurate specification.
+_RESEARCH_MANAGER_SPECIFY = (
+    xml_block(
+        Tag.ROLE,
+        "You are an Architectural Research Manager. Your job is to map the "
+        "codebase structure so the SPECIFY orchestrator can write an accurate "
+        "specification. The orchestrator needs to understand what EXISTS:\n"
+        "1. Public interfaces and module boundaries — what are the contracts?\n"
+        "2. Dependency relationships — what imports what and why?\n"
+        "3. Conventions and patterns — naming, structure, idioms in use.\n"
+        "4. Configuration and global state — what settings or singletons exist?\n\n"
+        "Your task is to assign research topics to subagents (Architectural "
+        "Scouts) that will discover this structural knowledge. Each topic "
+        "should describe a *question* about a specific area of the codebase "
+        "— in plain natural language, no symbol or file references.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.WORKFLOW,
+        "1. Read the <retrieved_code> block in the user message (if present). "
+        "These are LLM-generated summaries of functions/classes most relevant "
+        "to the work description, discovered by semantic vector search. Use "
+        "them as background context — they tell you which areas of the "
+        "codebase are likely relevant. Do NOT copy symbol names or file "
+        "paths into your topics.\n\n"
+        "2. Phrase each topic as a natural-language research question about "
+        "an area of the codebase. Examples:\n"
+        '   "How is CLI verbosity configured and threaded through to subcommands?"\n'
+        '   "How does the configuration loader resolve workspace roots?"\n'
+        '   "What logging conventions are used across the agent layer?"\n\n'
+        "3. Do NOT name specific functions, classes, methods, or file paths "
+        "in topics. A downstream lookup step will resolve each topic to the "
+        "relevant symbols via semantic search — naming them yourself risks "
+        "hallucinating names that don't exist.\n\n"
+        "4. Topics should focus on STRUCTURE, not implementation:\n"
+        "   - What are the public interfaces? (function signatures, class contracts)\n"
+        "   - What are the dependency relationships? (imports, call chains)\n"
+        "   - What conventions and patterns exist? (naming, error handling, config)\n"
+        "   - What configuration or global state is involved? (singletons, env vars)\n"
+        "   Do NOT ask subagents to propose solutions or implementation details.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Never return more than 4 topics in a single round.\n"
+        "- If you've already explored a topic, don't return it again.\n"
+        "- On any round after the first, every new topic MUST target a "
+        "different module, layer, or concern than every topic in the "
+        "topics_already_explored block. Rephrasing a prior topic with "
+        "different words is NOT a new topic — if the 'Files examined' "
+        "coverage already touches the area, do not propose another topic "
+        "about that area.\n"
+        "- Topics MUST NOT contain symbol names, function names, class "
+        "names, or file paths. Use plain English descriptions of the area "
+        "to investigate.\n"
+        "- If the work description is self-contained (no codebase needed), "
+        "decide \"done\".\n"
+        "- If findings already cover all key architectural areas, decide \"done\".\n"
+        "- Cover breadth before depth — ensure all implicated modules are "
+        "touched before diving deeper into any one module.\n"
+        "- If the <findings> block is non-empty on Round 1 of N, you are "
+        "resuming a rework — the prior pass already wrote a research log. "
+        "Default to decision=\"done\" so synthesis can re-run with the "
+        "existing findings. Propose new topics ONLY when a critic suggestion "
+        "explicitly identifies a coverage gap, and then cap at 1 topic "
+        "addressing that gap.",
+    )
+)
 
-## Your mission
-
-The SPECIFY orchestrator needs to understand what EXISTS:
-1. Public interfaces and module boundaries — what are the contracts?
-2. Dependency relationships — what imports what and why?
-3. Conventions and patterns — naming, structure, idioms in use
-4. Configuration and global state — what settings or singletons exist?
-
-Your task is to assign research topics to subagents (Architectural Scouts)
-that will discover this structural knowledge. Each topic should describe
-a *question* about a specific area of the codebase — in plain natural
-language, no symbol or file references.
-
-## How to work
-
-1. Read the **Retrieved Symbol Summaries** section below (if present).
-   These are LLM-generated summaries of functions/classes most relevant
-   to the work description, discovered by semantic vector search. Use
-   them as background context — they tell you which areas of the codebase
-   are likely relevant. Do NOT copy symbol names or file paths into your
-   topics.
-
-2. Phrase each topic as a natural-language research question about an
-   area of the codebase. Examples:
-   "How is CLI verbosity configured and threaded through to subcommands?"
-   "How does the configuration loader resolve workspace roots?"
-   "What logging conventions are used across the agent layer?"
-
-3. Do NOT name specific functions, classes, methods, or file paths in
-   topics. A downstream lookup step will resolve each topic to the
-   relevant symbols via semantic search — naming them yourself risks
-   hallucinating names that don't exist.
-
-4. Topics should focus on STRUCTURE, not implementation:
-   - What are the public interfaces? (function signatures, class contracts)
-   - What are the dependency relationships? (imports, call chains)
-   - What conventions and patterns exist? (naming, error handling, config)
-   - What configuration or global state is involved? (singletons, env vars)
-   Do NOT ask subagents to propose solutions or implementation details.
-
-Given:
-1. The work description
-2. The retrieved symbol summaries (semantic search results, for context only)
-3. A list of research topics already explored
-4. The findings accumulated so far
-
-Decide:
-- Are we done? (decision: "done") — structural coverage is sufficient
-- Or do we need more? (decision: "explore") — return 2-4 plain-language
-  topics framed as research questions
-
-Rules:
-- Never return more than 4 topics in a single round.
-- If you've already explored a topic, don't return it again.
-- On any round after the first, every new topic MUST target a different
-  module, layer, or concern than every topic in "Topics Already Explored".
-  Rephrasing a prior topic with different words is NOT a new topic — if
-  the "Files examined" coverage in Findings So Far already touches the
-  area, do not propose another topic about that area.
-- Topics MUST NOT contain symbol names, function names, class names, or
-  file paths. Use plain English descriptions of the area to investigate.
-- If the work description is self-contained (no codebase needed), decide "done".
-- If findings already cover all key architectural areas, decide "done".
-- Cover breadth before depth — ensure all implicated modules are touched
-  before diving deeper into any one module.
-- If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
-  rework — the prior pass already wrote a research log. Default to
-  decision="done" so synthesis can re-run with the existing findings.
-  Propose new topics ONLY when a critic suggestion explicitly identifies
-  a coverage gap, and then cap at 1 topic addressing that gap.
-"""
-
-_RESEARCH_MANAGER_PLAN = """\
-You are a Change Surface Research Manager. Your job is to identify the
-codebase areas that will need modification so the PLAN orchestrator can
-decompose the work into executable slices.
-
-## Your mission
-
-The PLAN orchestrator needs to understand what CHANGES:
-1. Touch points — which areas of the codebase will need edits?
-2. Dependency chains — what else will be affected by those changes?
-3. Risks — are there complex data flows, global state, or tight coupling to flag?
-
-Your task is to assign research topics to subagents (Blueprint Scouts)
-that will map the specification requirements to the codebase surface area.
-Each topic should describe — in plain natural language — an area of the
-codebase where changes will happen, framed as a research question.
-
-## How to work
-
-1. Read the **Specification** section below (always present in PLAN phase).
-   This describes what needs to be built or changed. Your research topics
-   MUST directly target the codebase areas that the specification requires.
-
-2. Read the **Retrieved Symbol Summaries** section below (if present).
-   These are LLM-generated summaries of functions/classes most relevant
-   to the work. Use them as background context to understand which areas
-   are implicated. Do NOT copy symbol names or file paths into your topics.
-
-3. Phrase each topic as a natural-language research question about an
-   area of the codebase. Examples:
-   "How does workspace-root resolution work for spec-path handling?"
-   "How do the CLI subcommands wire arguments through to the agent factory?"
-
-4. Do NOT name specific functions, classes, methods, or file paths in
-   topics. A downstream lookup step will resolve each topic to the
-   relevant symbols via semantic search — naming them yourself risks
-   hallucinating names that don't exist.
-
-5. Topics should focus on CHANGE SURFACE, not architecture:
-   - Which areas will need modification? (touch points)
-   - What imports or callers will be affected? (dependency chains)
-   - Are there complex data flows, global state, or tight coupling? (risks)
-   Do NOT ask subagents to propose solutions — only to identify what exists
-   and what will be impacted.
-
-Given:
-1. The specification (what needs to change)
-2. The retrieved symbol summaries (semantic search results, for context only)
-3. A list of research topics already explored
-4. The findings accumulated so far
-
-Decide:
-- Are we done? (decision: "done") — change surface is adequately mapped
-- Or do we need more? (decision: "explore") — return 2-4 plain-language
-  topics framed as research questions
-
-Rules:
-- Never return more than 4 topics in a single round.
-- If you've already explored a topic, don't return it again.
-- On any round after the first, every new topic MUST target a different
-  module, layer, or concern than every topic in "Topics Already Explored".
-  Rephrasing a prior topic with different words is NOT a new topic — if
-  the "Files examined" coverage in Findings So Far already touches the
-  area, do not propose another topic about that area.
-- Topics MUST NOT contain symbol names, function names, class names, or
-  file paths. Use plain English descriptions of the area to investigate.
-- If findings already cover all key change areas, decide "done".
-- Prioritize high-risk areas (glue code, shared state, widely-imported
-  modules) before peripheral concerns.
-- Cross-reference every topic against the specification — if the spec
-  doesn't mention an area, don't explore it.
-- If a "Prior SPECIFY Research" section is present, it describes the
-  architectural map already gathered during SPECIFY. Treat its
-  ``Key files`` entries as covered territory — propose PLAN topics
-  that build on this map (touch points, change risk, dependency chains)
-  rather than topics that would just re-discover the same files.
-- If "Findings So Far" is non-empty on Round 1 of N, you are resuming a
-  rework — the prior pass already wrote a research log. Default to
-  decision="done" so synthesis can re-run with the existing findings.
-  Propose new topics ONLY when a critic suggestion explicitly identifies
-  a coverage gap, and then cap at 1 topic addressing that gap.
-"""
+_RESEARCH_MANAGER_PLAN = (
+    xml_block(
+        Tag.ROLE,
+        "You are a Change Surface Research Manager. Your job is to identify "
+        "the codebase areas that will need modification so the PLAN "
+        "orchestrator can decompose the work into executable slices. The "
+        "orchestrator needs to understand what CHANGES:\n"
+        "1. Touch points — which areas of the codebase will need edits?\n"
+        "2. Dependency chains — what else will be affected by those changes?\n"
+        "3. Risks — complex data flows, global state, or tight coupling to flag?\n\n"
+        "Your task is to assign research topics to subagents (Blueprint "
+        "Scouts) that will map the specification requirements to the "
+        "codebase surface area. Each topic should describe — in plain "
+        "natural language — an area of the codebase where changes will "
+        "happen, framed as a research question.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.WORKFLOW,
+        "1. Read the <specification> block in the user message (always "
+        "present in PLAN phase). This describes what needs to be built or "
+        "changed. Your research topics MUST directly target the codebase "
+        "areas that the specification requires.\n\n"
+        "2. Read the <retrieved_code> block (if present). These are LLM-"
+        "generated summaries of functions/classes most relevant to the "
+        "work. Use them as background context. Do NOT copy symbol names or "
+        "file paths into your topics.\n\n"
+        "3. Phrase each topic as a natural-language research question about "
+        "an area of the codebase. Examples:\n"
+        '   "How does workspace-root resolution work for spec-path handling?"\n'
+        '   "How do the CLI subcommands wire arguments through to the agent factory?"\n\n'
+        "4. Do NOT name specific functions, classes, methods, or file paths "
+        "in topics. A downstream lookup step will resolve each topic to "
+        "the relevant symbols via semantic search.\n\n"
+        "5. Topics should focus on CHANGE SURFACE, not architecture:\n"
+        "   - Which areas will need modification? (touch points)\n"
+        "   - What imports or callers will be affected? (dependency chains)\n"
+        "   - Are there complex data flows, global state, or tight coupling? (risks)\n"
+        "   Do NOT ask subagents to propose solutions — only to identify "
+        "what exists and what will be impacted.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Never return more than 4 topics in a single round.\n"
+        "- If you've already explored a topic, don't return it again.\n"
+        "- On any round after the first, every new topic MUST target a "
+        "different module, layer, or concern than every topic in the "
+        "topics_already_explored block. Rephrasing a prior topic with "
+        "different words is NOT a new topic — if the 'Files examined' "
+        "coverage already touches the area, do not propose another topic "
+        "about that area.\n"
+        "- Topics MUST NOT contain symbol names, function names, class "
+        "names, or file paths. Use plain English descriptions of the area "
+        "to investigate.\n"
+        "- If findings already cover all key change areas, decide \"done\".\n"
+        "- Prioritize high-risk areas (glue code, shared state, widely-"
+        "imported modules) before peripheral concerns.\n"
+        "- Cross-reference every topic against the specification — if the "
+        "spec doesn't mention an area, don't explore it.\n"
+        "- If a <prior_research> block is present, it describes the "
+        "architectural map already gathered during SPECIFY. Treat its "
+        "'Key files' entries as covered territory — propose PLAN topics "
+        "that build on this map (touch points, change risk, dependency "
+        "chains) rather than topics that would just re-discover the same "
+        "files.\n"
+        "- If the <findings> block is non-empty on Round 1 of N, you are "
+        "resuming a rework — the prior pass already wrote a research log. "
+        "Default to decision=\"done\" so synthesis can re-run with the "
+        "existing findings. Propose new topics ONLY when a critic "
+        "suggestion explicitly identifies a coverage gap, and then cap at "
+        "1 topic addressing that gap.",
+    )
+)
 
 
 async def run_research_manager(
@@ -480,138 +470,115 @@ async def run_research_manager(
     # failed (we fall through to the loop anyway).
     task_category = state.get("task_category")
     retrieved = state.get("retrieved_context") or []
-    recall_section = ""
+    retrieved_code_body = ""
     if round_num == 0 and retrieved:
-        recall_section = (
-            "## Retrieved Symbol Summaries (semantic search, filtered by task category)\n"
-            "These are the most relevant functions/classes discovered by "
-            "vector search. Use them ONLY as background context to identify "
-            "which areas of the codebase are relevant — do NOT copy symbol "
-            "names or file paths into your topics.\n\n"
-        )
-        for i, chunk in enumerate(retrieved, 1):
-            recall_section += (
+        chunks = [
+            (
                 f"### {chunk.get('symbol_name', '?')} "
                 f"({chunk.get('symbol_type', '?')} in {chunk.get('file_path', '?')})\n"
-                f"{chunk.get('enriched_summary', '')[:400]}\n\n"
+                f"{chunk.get('enriched_summary', '')[:400]}"
             )
+            for chunk in retrieved
+        ]
+        retrieved_code_body = "\n\n".join(chunks)
         logger.info(
             "[%s] Research manager: using %d pre-recalled summaries from gate",
             work_id, len(retrieved),
         )
 
     # ── Build the context for the manager ────────────────────────────
-    spec_section = ""
+    spec_body = ""
     if phase == "plan":
         spec_path = state.get("spec_path", "")
         if spec_path:
             full_path = Path(workspace_root) / spec_path / "specification.md"
             if full_path.exists():
                 try:
-                    raw_spec = full_path.read_text(encoding="utf-8")
-                    spec_section = (
-                        f"## Specification (use this to guide research decisions)\n"
-                        f"{raw_spec[:_MAX_SPEC_CHARS]}\n\n"
-                    )
+                    spec_body = full_path.read_text(encoding="utf-8")[:_MAX_SPEC_CHARS]
                 except OSError:
                     pass
 
     # SPECIFY's research log carried across by the PLAN state mapper. The
     # manager uses this to avoid proposing topics that would just re-map
     # files SPECIFY already examined — see _RESEARCH_MANAGER_PLAN rules.
-    prior_phase_section = ""
+    prior_research_body = ""
     if phase == "plan":
         prior_phase_findings = state.get("prior_phase_findings") or []
         if prior_phase_findings:
             from spine.config import SpineConfig as _SpineConfig
 
-            rendered_prior = format_findings(
+            prior_research_body = format_findings(
                 prior_phase_findings,
                 budget=_SpineConfig.load().prior_phase_findings_token_budget,
-            )
-            prior_phase_section = (
-                "## Prior SPECIFY Research (architectural map already gathered "
-                "— propose PLAN topics that build on this, do not re-map these "
-                "files)\n"
-                f"{rendered_prior}\n\n"
             )
 
     findings_summary = _summarize_findings(findings)
 
-    # Prior-round framing: whenever any topic has already been dispatched
-    # (round_num > 0 OR seeded from a prior research_log on rework), the
-    # manager must treat the explored set as territory to *extend past*,
-    # not territory to revisit. Without this, the LLM tends to rephrase
-    # prior topics — same modules, different words — because the
-    # natural-language "already explored" list alone is too soft a signal.
-    #
-    # When the critic also rejected the prior pass, the rework specifics
-    # (verdict, suggestions) layer on top of the always-on framing.
+    # Conditional rules / framing aggregated into one <constraints> block so
+    # the model sees "this turn's rules" as a single bounded region distinct
+    # from "this turn's data".
+    constraint_lines: list[str] = [
+        f"Round {round_num + 1} of max {max_rounds}.",
+    ]
     has_prior_round = round_num > 0 or bool(existing_topics) or bool(findings)
-    prior_round_section = ""
     if has_prior_round:
-        prior_round_section = (
-            "## Prior-Round Coverage — Extend, Do Not Repeat\n"
-            "The 'Topics Already Explored' and 'Findings So Far' sections "
-            "below describe ground that has already been mapped. Every new "
-            "topic you propose MUST target a different module / layer / "
-            "concern than what is already covered there. Use the 'Files "
-            "examined' line on each finding as the authoritative coverage "
-            "signal — if a file or area appears there, that area is "
-            "covered, regardless of how the prior topic was worded. "
-            "Rephrasing a prior topic ('How does X configure Y?' → 'How "
-            "are Y preferences managed in X?') is forbidden — those count "
-            "as the same topic. If findings already cover all relevant "
-            "areas, decide 'done'.\n\n"
-            "Before returning each topic, silently check: which module or "
-            "layer does this target, and is that module already in any "
-            "prior finding's 'Files examined'? If yes, drop the topic.\n\n"
+        constraint_lines.append(
+            "Prior-round coverage: the topics_already_explored and findings "
+            "blocks below describe ground already mapped. Every new topic "
+            "MUST target a different module / layer / concern. Use the "
+            "'Files examined' line on each finding as the authoritative "
+            "coverage signal — if a file appears there, that area is "
+            "covered regardless of how the prior topic was worded. "
+            "Rephrasing a prior topic counts as the same topic. If findings "
+            "already cover all relevant areas, decide 'done'. Before each "
+            "candidate topic, silently check: which module does it target, "
+            "and is that module already in a prior finding's 'Files "
+            "examined'? If yes, drop it."
         )
-    rework_section = ""
+    rework_body = ""
     if retry_count > 0 and last_critic_review:
         suggestions = last_critic_review.get("suggestions") or []
-        sug_text = (
-            "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  (none)"
-        )
-        rework_section = (
-            "## ⚠ Rework Pass — Critic Rejected Prior Output\n"
+        sug_text = "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  (none)"
+        rework_body = (
             f"Attempt: {last_critic_review.get('attempt', retry_count + 1)}\n"
             f"Verdict: {last_critic_review.get('status', 'needs_revision')} "
             f"(tier: {last_critic_review.get('tier', 'unknown')})\n"
             f"Reason: {last_critic_review.get('reason', '')}\n"
-            f"Suggestions:\n{sug_text}\n\n"
-            "Propose 2-4 NEW topics that close the specific gaps the critic "
-            "flagged (in addition to the prior-round rules above). If the "
-            "prior research is already sufficient to address the verdict, "
-            "decide 'done' so synthesis can rework with the existing "
-            "findings.\n\n"
+            f"Suggestions:\n{sug_text}"
         )
+        constraint_lines.append(
+            "Rework pass — the critic rejected the prior output (see "
+            "<critic_feedback> block). Propose 2-4 NEW topics that close the "
+            "specific gaps the critic flagged (in addition to the prior-round "
+            "rules above). If the prior research is already sufficient to "
+            "address the verdict, decide 'done' so synthesis can rework with "
+            "the existing findings."
+        )
+    constraints_body = "\n\n".join(constraint_lines)
 
     explored_roll_up = _render_explored_topic_roll_up(existing_topics, findings)
-    explored_block = (
-        f"## Topics Already Explored (with per-topic outcome)\n{explored_roll_up}\n\n"
-        if explored_roll_up
-        else ""
-    )
 
-    context = (
-        f"## Work Description\n{description}\n\n"
-        f"{spec_section}"
-        f"{prior_phase_section}"
-        f"{recall_section}"
-        f"{prior_round_section}"
-        f"{rework_section}"
-        f"## Round\n{round_num + 1} of max {max_rounds}\n\n"
-        f"{explored_block}"
-        f"## Findings So Far\n{findings_summary}\n\n"
-        "Decide: are we done, or do we need more research? "
-        "If exploring, return 2-4 plain-language topics framed as research "
-        "questions. Topics MUST NOT contain symbol names, function names, "
-        "class names, or file paths — a downstream lookup step resolves "
-        "each topic to the relevant symbols automatically. Cross-reference "
-        "each candidate topic against the 'Topics Already Explored' list "
-        "above before returning — if the same module/concern was already "
-        "investigated or attempted, drop the candidate or decide 'done'."
+    context = hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, description),
+            (Tag.SPECIFICATION, spec_body),
+            (Tag.PRIOR_RESEARCH, prior_research_body),
+            (Tag.RETRIEVED_CODE, retrieved_code_body),
+            (Tag.CRITIC_FEEDBACK, rework_body),
+            (Tag.CONSTRAINTS, constraints_body),
+            (Tag.TOPICS_ALREADY_EXPLORED, explored_roll_up),
+            (Tag.FINDINGS, findings_summary),
+        ),
+        (
+            "Decide: are we done, or do we need more research? If exploring, "
+            "return 2-4 plain-language topics framed as research questions. "
+            "Topics MUST NOT contain symbol names, function names, class "
+            "names, or file paths — a downstream lookup step resolves each "
+            "topic to the relevant symbols automatically. Cross-reference "
+            "each candidate topic against the topics_already_explored block "
+            "before returning — if the same module / concern was already "
+            "investigated or attempted, drop the candidate or decide 'done'."
+        ),
     )
 
     # ── Select the phase-appropriate manager prompt ─────────────────
@@ -925,39 +892,35 @@ async def run_explore_do_node(
                 except OSError:
                     pass
 
-    prior_findings_section = ""
+    prior_findings_body = ""
     if phase_enum == PhaseName.PLAN:
         prior_findings = state.get("prior_phase_findings") or []
         if prior_findings:
-            rendered_prior = format_findings(
+            prior_findings_body = format_findings(
                 prior_findings,
                 budget=SpineConfig.load().prior_phase_findings_token_budget,
             )
-            prior_findings_section = (
-                "## Prior SPECIFY Research (already discovered — don't "
-                "re-investigate these files unless your topic requires "
-                "deeper detail)\n"
-                f"{rendered_prior}\n\n"
-            )
 
     # The "global_goal" passed to the supervisor and the per-worker prompt
-    # carry the topic plus (for PLAN) the spec + prior-findings context.
-    # Suffix it onto the topic so the supervisor sees the same anchors as
-    # the worker.
+    # carry the topic plus (for PLAN) the spec + prior-findings context, all
+    # bounded as XML blocks so the supervisor sees the same hostage-laid
+    # payload the worker does. ``topic_str`` alone is the bare research
+    # question; the enriched form prepends it as the OBJECTIVE block and
+    # then layers SPECIFICATION / PRIOR_RESEARCH / SCRATCHPAD when present.
     enriched_topic = topic_str
-    suffix_parts: list[str] = []
-    if spec_content:
-        suffix_parts.append(
-            "## Specification (anchor your research to this)\n"
-            f"{spec_content[:_MAX_SPEC_CHARS]}"
-        )
-    if prior_findings_section:
-        suffix_parts.append(prior_findings_section.strip())
     scratchpad = state.get("scratchpad", "")
-    if scratchpad:
-        suffix_parts.append("## Working Memory Scratchpad\n" + scratchpad)
-    if suffix_parts:
-        enriched_topic = topic_str + "\n\n" + "\n\n".join(suffix_parts)
+    enriched_blocks = xml_blocks(
+        (Tag.OBJECTIVE, topic_str),
+        (Tag.SPECIFICATION, spec_content[:_MAX_SPEC_CHARS] if spec_content else ""),
+        (Tag.PRIOR_RESEARCH, prior_findings_body),
+        (Tag.SCRATCHPAD, scratchpad),
+    )
+    # When only OBJECTIVE is present (no spec, no prior research, no
+    # scratchpad), keep the bare topic string so the supervisor's existing
+    # short-circuit / re-rendering logic stays compact. When ANY auxiliary
+    # block is present, ship the full XML payload.
+    if spec_content or prior_findings_body or scratchpad:
+        enriched_topic = enriched_blocks
 
     # ── Build worker agents lazily, one per ToolClass ────────────────
     # Each worker shares the researcher's system prompt + model; only
@@ -1265,35 +1228,35 @@ async def summarise_evidence(
         )
         return None
 
-    sections: list[str] = []
-    if evidence_text:
-        sections.append("## Tool-result evidence\n" + evidence_text)
-    if narrative:
-        sections.append("## Researcher's own narrative\n" + narrative.strip())
-    body = "\n\n".join(sections) if sections else "(no evidence gathered)"
-
-    cap_warning = (
-        "\nNote: the researcher hit its step cap before producing a final report. "
-        "Treat the evidence as partial — leave fields empty when unsupported.\n"
-        if recursion_capped else ""
+    constraints_body = (
+        "- Use ONLY information present in the <findings> block below.\n"
+        "- Do NOT use the topic name to fill in fields. If the evidence does "
+        "not mention a file, pattern, or dependency, leave the field empty.\n"
+        "- file_map paths MUST appear in the evidence (as file paths, symbol "
+        "locations, or import targets).\n"
+        "- If a field has no support in the evidence, leave it empty "
+        "(``[]`` for lists, ``{}`` for file_map).\n"
+        "- summary should describe what was actually discovered in the "
+        "evidence, not what the agent was asked to investigate."
     )
+    if recursion_capped:
+        constraints_body += (
+            "\n- The researcher hit its step cap before producing a final "
+            "report. Treat the evidence as partial — leave fields empty "
+            "when unsupported."
+        )
 
-    summarise_prompt = (
-        "You will be given evidence gathered while researching a specific topic in a "
-        "codebase. Convert the evidence into the ResearchFindings JSON schema.\n\n"
-        "STRICT RULES:\n"
-        "- Use ONLY information present in the evidence below.\n"
-        "- Do NOT use the topic name to fill in fields. If the evidence does not "
-        "mention a file, pattern, or dependency, leave the field empty.\n"
-        "- file_map paths MUST appear in the evidence (as file paths, symbol locations, "
-        "or import targets).\n"
-        "- If a field has no support in the evidence, leave it empty (``[]`` for lists, "
-        "``{}`` for file_map).\n"
-        "- summary should describe what was actually discovered in the evidence, not "
-        "what the agent was asked to investigate.\n"
-        f"{cap_warning}\n"
-        f"## Topic\n{topic}\n\n"
-        f"{body}"
+    summarise_prompt = hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, topic),
+            (Tag.CONSTRAINTS, constraints_body),
+            (Tag.FINDINGS, evidence_text),
+            (Tag.SCRATCHPAD, narrative.strip() if narrative else ""),
+        ),
+        (
+            "Convert the evidence above into the ResearchFindings JSON "
+            "schema following the constraints."
+        ),
     )
 
     try:
@@ -1529,12 +1492,18 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
         logger.debug("Model does not support with_structured_output; skipping finalize", exc_info=True)
         return
 
-    finalize_prompt = (
-        "Convert the research report below into the ResearchFindings JSON schema. "
-        "Populate ALL fields: summary (2-3 paragraph synthesis), patterns "
-        "(distinct list items), file_map (path -> description), dependencies "
-        "(distinct list items). Do NOT invent — use only information present "
-        "in the report.\n\n## Report\n" + final_content
+    finalize_prompt = hostage_layout(
+        xml_blocks(
+            (Tag.FINDINGS, final_content),
+            (
+                Tag.CONSTRAINTS,
+                "Populate ALL fields: summary (2-3 paragraph synthesis), "
+                "patterns (distinct list items), file_map (path -> "
+                "description), dependencies (distinct list items). Do NOT "
+                "invent — use only information present in the report.",
+            ),
+        ),
+        "Convert the report above into the ResearchFindings JSON schema.",
     )
     try:
         parsed = await structured_model.ainvoke(
@@ -1624,24 +1593,29 @@ async def _finalize_research_findings_from_evidence(
         )
         return
 
-    salvage_prompt = (
-        "The researcher agent ran out of steps before producing a final "
-        "synthesis. Below is the raw evidence it gathered — tool results "
-        "from symbol lookups, dependency queries, and codebase searches, "
-        "plus any intermediate synthesis attempts.\n\n"
-        "Convert this evidence into the ResearchFindings JSON schema. "
-        "STRICT RULES:\n"
-        "- Use ONLY information present in the evidence below.\n"
-        "- Do NOT use the research topic name to fill in fields. If the "
-        "evidence does not mention a file, pattern, or dependency, do not "
-        "invent one.\n"
-        "- file_map paths MUST appear in the tool results (as file paths, "
-        "symbol locations, or import targets).\n"
-        "- If a field has no support in the evidence, leave it empty "
-        "(``[]`` for lists, ``{}`` for file_map).\n"
-        "- summary should describe what was actually discovered in the "
-        "tool results, not what the agent was asked to investigate.\n\n"
-        "## Evidence\n" + evidence
+    salvage_prompt = hostage_layout(
+        xml_blocks(
+            (Tag.FINDINGS, evidence),
+            (
+                Tag.CONSTRAINTS,
+                "- Use ONLY information present in the <findings> block.\n"
+                "- Do NOT use the research topic name to fill in fields. If "
+                "the evidence does not mention a file, pattern, or "
+                "dependency, do not invent one.\n"
+                "- file_map paths MUST appear in the tool results (as file "
+                "paths, symbol locations, or import targets).\n"
+                "- If a field has no support in the evidence, leave it "
+                "empty (``[]`` for lists, ``{}`` for file_map).\n"
+                "- summary should describe what was actually discovered in "
+                "the tool results, not what the agent was asked to "
+                "investigate.",
+            ),
+        ),
+        (
+            "The researcher agent ran out of steps before producing a final "
+            "synthesis — the <findings> block above is the raw evidence it "
+            "gathered. Convert it into the ResearchFindings JSON schema."
+        ),
     )
     try:
         parsed = await structured_model.ainvoke(

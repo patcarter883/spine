@@ -40,6 +40,12 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
+from spine.agents.prompt_format import (
+    Tag,
+    hostage_layout,
+    xml_block,
+    xml_blocks,
+)
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
@@ -186,50 +192,80 @@ _FINDING_SNIPPET_CHAR_CAP = 2000
 
 
 _SUPERVISOR_SYSTEM_PROMPT = (
-    "You are the supervisor of a per-topic codebase researcher. The "
-    "researcher investigates ONE topic at a time via a worker that "
-    "executes a single tool call per turn from a restricted tool class.\n\n"
-    "Your job each cycle: read the latest StructuredFinding plus the "
-    "evaluation history, judge whether the accumulated evidence is "
-    "sufficient to write a ResearchFindings (summary + patterns + "
-    "file_map + dependencies), and emit a SupervisorDirective JSON.\n\n"
-    "Rules:\n"
-    "- You do NOT have tools. Do not attempt to call one.\n"
-    "- Be decisive. If the evidence is thin, pick a SINGLE next move "
-    "that produces concrete new information.\n"
-    "- One move per turn. next_directive is ONE short sentence naming "
-    "ONE tool call (e.g. 'get_source for SpineConfig.load').\n"
-    "- Tool classes available:\n"
-    "  * SEARCH       — codebase_query(action='search') or search_codebase: "
-    "regex / keyword discovery across files.\n"
-    "  * FIND_SYMBOL  — codebase_query(action='find_symbol'): locate a "
-    "single named symbol's definition.\n"
-    "  * READ_SOURCE  — codebase_query(action='get_source') or "
-    "ast_extract_symbol: fetch a symbol's body.\n"
-    "  * TRACE_DEPS   — codebase_query(action='get_dependencies'|'get_dependents'): "
-    "follow the call graph.\n"
-    "- Set is_complete=True only when file_map, patterns, and dependencies "
-    "can all be populated from the current history. When you set "
-    "is_complete=True, leave next_directive empty and allowed_tool_class "
-    "null.\n"
-    "- When is_complete=False, allowed_tool_class is REQUIRED.\n"
+    xml_block(
+        Tag.ROLE,
+        "You are the supervisor of a per-topic codebase researcher. The "
+        "researcher investigates ONE topic at a time via a worker that "
+        "executes a single tool call per turn from a restricted tool class. "
+        "Your job each cycle: read the latest StructuredFinding plus the "
+        "evaluation history, judge whether the accumulated evidence is "
+        "sufficient to write a ResearchFindings (summary + patterns + "
+        "file_map + dependencies), and emit a SupervisorDirective JSON.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.TOOLS,
+        "Tool classes the worker may use (you choose one per turn):\n"
+        "- SEARCH       — codebase_query(action='search') or search_codebase: "
+        "regex / keyword discovery across files.\n"
+        "- FIND_SYMBOL  — codebase_query(action='find_symbol'): locate a "
+        "single named symbol's definition.\n"
+        "- READ_SOURCE  — codebase_query(action='get_source') or "
+        "ast_extract_symbol: fetch a symbol's body.\n"
+        "- TRACE_DEPS   — codebase_query(action='get_dependencies'|"
+        "'get_dependents'): follow the call graph.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- You do NOT have tools. Do not attempt to call one.\n"
+        "- Be decisive. If the evidence is thin, pick a SINGLE next move "
+        "that produces concrete new information.\n"
+        "- One move per turn. next_directive is ONE short sentence naming "
+        "ONE tool call (e.g. 'get_source for SpineConfig.load').\n"
+        "- Set is_complete=True only when file_map, patterns, and "
+        "dependencies can all be populated from the current history. When "
+        "you set is_complete=True, leave next_directive empty and "
+        "allowed_tool_class null.\n"
+        "- When is_complete=False, allowed_tool_class is REQUIRED.",
+    )
 )
 
 
-_SUPERVISOR_USER_TEMPLATE = """\
-## Strategic Objective (topic)
-{global_goal}
+def _build_supervisor_user_message(
+    *,
+    global_goal: str,
+    cycle_idx: int,
+    max_cycles: int,
+    latest_finding_block: str,
+    history_count: int,
+    history_summary: str,
+) -> str:
+    """Build the supervisor's hostage-layout user message.
 
-## Cycle
-{cycle_idx} of {max_cycles} (hard cap)
-
-## Latest Finding
-{latest_finding_block}
-
-## Evaluation History ({history_count} prior finding(s))
-{history_summary}
-
-Analyse the structured payload above and emit your next directive."""
+    Sections (in order): OBJECTIVE → cycle counter (inside CONSTRAINTS) →
+    LATEST_FINDING → HISTORY. Final plain-text directive sits AFTER every
+    closing tag per the project's hostage-prompt convention.
+    """
+    return hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, global_goal),
+            (
+                Tag.CONSTRAINTS,
+                f"Cycle {cycle_idx} of {max_cycles} (hard cap).",
+            ),
+            (Tag.LATEST_FINDING, latest_finding_block),
+            (
+                Tag.HISTORY,
+                (
+                    f"{history_count} prior finding(s).\n{history_summary}"
+                    if history_count
+                    else history_summary
+                ),
+            ),
+        ),
+        "Analyse the structured payload above and emit your next directive.",
+    )
 
 
 def _render_finding_block(finding: StructuredFinding | None) -> str:
@@ -380,7 +416,7 @@ async def run_supervisor_node(
         )
         return _terminating_directive("structured output unsupported")
 
-    user_msg = _SUPERVISOR_USER_TEMPLATE.format(
+    user_msg = _build_supervisor_user_message(
         global_goal=global_goal,
         cycle_idx=cycle_idx + 1,
         max_cycles=max_cycles,
@@ -462,23 +498,43 @@ def _enforce_directive_contract(directive: SupervisorDirective) -> SupervisorDir
 # ── Worker ─────────────────────────────────────────────────────────────
 
 
-_WORKER_USER_TEMPLATE = """\
-## Research Topic
-{topic}
+def _build_worker_user_message(
+    *,
+    topic: str,
+    directive_block: str,
+    tool_class: str,
+    action_hint: str,
+) -> str:
+    """Build the worker's hostage-layout user message.
 
-## Supervisor Directive (execute exactly ONE tool call this turn)
-{directive_block}
-
-## Available Tools This Turn ({tool_class})
-{action_hint}
-
-Make ONE tool call now to satisfy the directive. After the tool result \
-returns, give a brief one-paragraph narration of what you found (no \
-further tool calls)."""
+    Sections: OBJECTIVE (topic) → DIRECTIVE (supervisor's reasoning + next
+    move) → TOOLS (action hint scoped to the chosen tool class). The plain-
+    text directive at the tail tells the worker to make ONE tool call and
+    then narrate briefly.
+    """
+    return hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, topic),
+            (Tag.DIRECTIVE, directive_block),
+            (
+                Tag.TOOLS,
+                f"Allowed tool class this turn: {tool_class}.\n{action_hint}",
+            ),
+        ),
+        (
+            "Make ONE tool call now to satisfy the directive. After the "
+            "tool result returns, give a brief one-paragraph narration of "
+            "what you found (no further tool calls)."
+        ),
+    )
 
 
 def _render_directive_for_worker(directive: SupervisorDirective) -> str:
-    """Render the supervisor's directive as a worker-facing instruction block."""
+    """Render the supervisor's directive as a worker-facing block.
+
+    Returned text is the BODY content for a ``<directive>`` tag; the caller
+    wraps it via :func:`xml_blocks` / :func:`_build_worker_user_message`.
+    """
     return (
         f"**Reasoning:** {directive.analysis_and_reasoning.strip()}\n"
         f"**Do this:** {directive.next_directive.strip()}"
@@ -700,7 +756,7 @@ async def run_worker_node(
         )
 
     action_hint = TOOL_CLASS_ACTION_HINT.get(tool_class, "")
-    prompt = _WORKER_USER_TEMPLATE.format(
+    prompt = _build_worker_user_message(
         topic=topic,
         directive_block=_render_directive_for_worker(directive),
         tool_class=tool_class.value,

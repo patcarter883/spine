@@ -23,6 +23,7 @@ from spine.models.enums import PhaseName, ReviewStatus
 from spine.workflow.subgraph_state import CriticSubgraphState
 from spine.workflow.critic_review import structural_critic_check, agent_critic_check
 from spine.agents.plan_do import run_plan_node
+from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +41,14 @@ async def _critic_directive_node(
     work_id = state.get("work_id", "unknown")
     reviewed_phase = state.get("reviewed_phase", "unknown")
     description = state.get("description", "")
-    task = (
-        f"Plan a code review of the {reviewed_phase!r} phase output. The do node "
-        "will inspect the structured artifact (specification.json / plan.json / etc.) "
-        "and return a verdict (PASSED / NEEDS_REVISION / NEEDS_REVIEW). Identify "
-        "what to focus on.\n\n"
-        f"## Original work description\n{description}"
+    task = hostage_layout(
+        xml_blocks((Tag.OBJECTIVE, description)),
+        (
+            f"Plan a code review of the {reviewed_phase!r} phase output. The "
+            "do node will inspect the structured artifact "
+            "(specification.json / plan.json / etc.) and return a verdict "
+            "(PASSED / NEEDS_REVISION / NEEDS_REVIEW). Identify what to focus on."
+        ),
     )
     directive = await run_plan_node(
         state=dict(state),

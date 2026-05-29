@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
+from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -48,20 +49,30 @@ class TaskClassificationResult(BaseModel):
     reasoning: str = Field(default="", description="Brief reasoning for classification")
 
 
-_CLASSIFICATION_SYSTEM = """\
-You are a task classifier for an AI agent harness. Classify work descriptions
-into one of these categories:
-
-- Frontend/UI: User interfaces, components, views, pages, frontend logic
-- Backend/API: Server endpoints, routers, handlers, controllers, API logic
-- Database: Models, schemas, migrations, repositories, data access
-- Auth: Authentication, authorization, security middleware, guards
-- Testing: Unit tests, integration tests, test files, fixtures
-- Infrastructure: Configs, scripts, deployments, CI/CD, server setup
-- Generic: Non-code tasks or tasks that don't fit other categories
-
-Return ONLY valid JSON with keys: category (string), confidence (0-1), reasoning (string).
-"""
+_CLASSIFICATION_SYSTEM = (
+    xml_block(
+        Tag.ROLE,
+        "You are a task classifier for an AI agent harness. Classify work "
+        "descriptions into exactly one of the categories below.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Frontend/UI: User interfaces, components, views, pages, frontend logic\n"
+        "- Backend/API: Server endpoints, routers, handlers, controllers, API logic\n"
+        "- Database: Models, schemas, migrations, repositories, data access\n"
+        "- Auth: Authentication, authorization, security middleware, guards\n"
+        "- Testing: Unit tests, integration tests, test files, fixtures\n"
+        "- Infrastructure: Configs, scripts, deployments, CI/CD, server setup\n"
+        "- Generic: Non-code tasks or tasks that don't fit other categories",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.OUTPUT_SCHEMA,
+        "Return ONLY valid JSON with keys: category (string), "
+        "confidence (0-1), reasoning (string).",
+    )
+)
 
 
 async def classify_task(description: str, config: dict | None = None) -> TaskClassificationResult:
@@ -85,7 +96,10 @@ async def classify_task(description: str, config: dict | None = None) -> TaskCla
 
         model = init_chat_model(model)
 
-    prompt = f"Work description to classify:\n\n{description}"
+    prompt = hostage_layout(
+        xml_blocks((Tag.OBJECTIVE, description)),
+        "Classify the work description above and return the JSON.",
+    )
 
     try:
         response = await model.ainvoke(

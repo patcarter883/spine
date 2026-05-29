@@ -28,6 +28,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import resolve_model
+from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -48,36 +49,47 @@ class DecompositionResult(BaseModel):
     slices: list[FeatureSliceSchema] = Field(min_length=1)
 
 
-_PLAN_PROMPT = """\
-You are a structural decomposer. Given a specification, break it down
-into parallelizable FeatureSlice objects.
+_PLAN_PROMPT = (
+    xml_block(
+        Tag.ROLE,
+        "You are a structural decomposer. Given a specification, break it "
+        "down into parallelizable FeatureSlice objects.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Each slice must be self-contained: it can be implemented end-to-end "
+        "without waiting on a sibling slice.\n"
+        "- Slices in the same wave MUST NOT touch the same files. If two "
+        "pieces of work modify the same file, merge them into a single slice.\n"
+        "- Each slice MUST have at least one acceptance criterion that a "
+        "verifier could check against the working tree.\n"
+        "- Slice ids are lowercase slugs (e.g. 'add-token-refresh').",
+    )
+)
 
-Rules:
-- Each slice must be self-contained: it can be implemented end-to-end
-  without waiting on a sibling slice.
-- Slices in the same wave MUST NOT touch the same files. If two pieces
-  of work modify the same file, merge them into a single slice.
-- Each slice MUST have at least one acceptance criterion that a
-  verifier could check against the working tree.
-- Slice ids are lowercase slugs (e.g. 'add-token-refresh').
-"""
-
-_FALLBACK_PROMPT = """\
-You are a structural decomposer operating in FALLBACK mode. A previous
-slice-implementer subagent failed to land the slice below. Your job is
-to produce **2 to 3 micro-slices** that are strictly smaller in scope
-than the original — each addressing one specific aspect of the failure.
-
-Rules:
-- Each micro-slice modifies a small subset of the original target_files
-  (ideally one file).
-- Each micro-slice has tight, locally-checkable acceptance criteria.
-- Inherit the parent slice's id with a '-micro-N' suffix (you will be
-  reminded of the parent id below).
-- Do NOT propose work outside the parent slice's scope; if the failure
-  hints at a missing dependency, report it inside an acceptance criterion
-  rather than creating a slice for it.
-"""
+_FALLBACK_PROMPT = (
+    xml_block(
+        Tag.ROLE,
+        "You are a structural decomposer operating in FALLBACK mode. A "
+        "previous slice-implementer subagent failed to land the slice in the "
+        "user message. Your job is to produce 2 to 3 micro-slices that are "
+        "strictly smaller in scope than the original — each addressing one "
+        "specific aspect of the failure.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Each micro-slice modifies a small subset of the original "
+        "target_files (ideally one file).\n"
+        "- Each micro-slice has tight, locally-checkable acceptance criteria.\n"
+        "- Inherit the parent slice's id with a '-micro-N' suffix (you will "
+        "be reminded of the parent id below).\n"
+        "- Do NOT propose work outside the parent slice's scope; if the "
+        "failure hints at a missing dependency, report it inside an "
+        "acceptance criterion rather than creating a slice for it.",
+    )
+)
 
 
 async def run_decomposer(
@@ -129,22 +141,25 @@ async def run_decomposer(
 
     if mode == "PLAN":
         system_prompt = _PLAN_PROMPT
-        human_content = (
-            "## Specification\n"
-            f"{spec_markdown.strip()}\n\n"
-            "Return a DecompositionResult covering the work above."
+        human_content = hostage_layout(
+            xml_blocks((Tag.SPECIFICATION, spec_markdown.strip())),
+            "Return a DecompositionResult covering the specification above.",
         )
     else:
         parent_id = failed_slice["id"]
         slice_json = json.dumps(failed_slice, indent=2, ensure_ascii=False, default=str)
         system_prompt = _FALLBACK_PROMPT
-        human_content = (
-            f"## Parent slice id\n{parent_id}\n\n"
-            f"## Failed slice (full JSON)\n```json\n{slice_json}\n```\n\n"
-            f"## Failure detail\n```\n{error_traceback.strip()}\n```\n\n"
-            "Return a DecompositionResult with 2-3 micro-slices whose ids "
-            f"are '{parent_id}-micro-1', '{parent_id}-micro-2', and "
-            f"optionally '{parent_id}-micro-3'."
+        human_content = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, f"Parent slice id: {parent_id}"),
+                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+                (Tag.ERRORS, f"```\n{error_traceback.strip()}\n```"),
+            ),
+            (
+                f"Return a DecompositionResult with 2-3 micro-slices whose ids "
+                f"are '{parent_id}-micro-1', '{parent_id}-micro-2', and "
+                f"optionally '{parent_id}-micro-3'."
+            ),
         )
 
     response: Any = await structured.ainvoke(

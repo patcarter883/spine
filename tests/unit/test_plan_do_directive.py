@@ -41,6 +41,11 @@ class _FakeChatModel:
 
 
 def test_format_directive_renders_all_fields():
+    """All directive fields render INSIDE a <directive> XML block (the
+    project's prompt-format convention; see spine.agents.prompt_format).
+    """
+    from spine.agents.prompt_format import Tag, get_block
+
     d = SubagentDirective(
         approach="Investigate auth flow, then map symbols.",
         target_files=["spine/auth.py", "spine/config.py"],
@@ -49,28 +54,37 @@ def test_format_directive_renders_all_fields():
         notes="Watch out for jwt_secret env var.",
     )
     out = format_directive_for_prompt(d)
-    assert "Plan Directive" in out
-    assert "Investigate auth flow" in out
-    assert "spine/auth.py" in out
-    assert "codebase_query find_symbol login" in out
-    assert "Map of file paths" in out
-    assert "jwt_secret" in out
+    body = get_block(out, Tag.DIRECTIVE)
+    assert body, f"expected <directive> tag in {out!r}"
+    assert "Investigate auth flow" in body
+    assert "spine/auth.py" in body
+    assert "codebase_query find_symbol login" in body
+    assert "Map of file paths" in body
+    assert "jwt_secret" in body
 
 
 def test_format_directive_handles_dict_round_trip():
     """Directives round-trip through LangGraph state as dicts."""
+    from spine.agents.prompt_format import Tag, get_block
+
     d = SubagentDirective(approach="x", target_files=["a.py"])
     as_dict = d.model_dump()
     out = format_directive_for_prompt(as_dict)
-    assert "x" in out
-    assert "a.py" in out
+    body = get_block(out, Tag.DIRECTIVE)
+    assert "x" in body
+    assert "a.py" in body
 
 
-def test_format_directive_empty_object_still_includes_header():
+def test_format_directive_empty_object_still_renders_inside_tag():
+    """Even the stub directive renders inside the <directive> tag — there is
+    no separate markdown header (the tag IS the bound).
+    """
+    from spine.agents.prompt_format import Tag, get_block
+
     out = format_directive_for_prompt(empty_directive("test reason"))
-    assert "Plan Directive" in out
-    # The approach line is rendered even for the stub.
-    assert "no directive produced" in out
+    body = get_block(out, Tag.DIRECTIVE)
+    assert body, f"expected <directive> tag in {out!r}"
+    assert "no directive produced" in body
 
 
 def test_empty_directive_includes_reason():

@@ -30,6 +30,7 @@ from langgraph.types import Command, Send
 
 from spine.agents._tokens import count_tokens as _count_tokens
 from spine.agents.exploration_agents import format_findings as _format_findings
+from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ExplorationSubgraphState
@@ -670,33 +671,34 @@ async def _synthesize_plan(
             findings,
             budget=_SpineConfig.load().synthesize_findings_token_budget,
         )
-        rework_prefix = ""
+        feedback_body = ""
         if retry_count > 0:
-            rework_prefix = (
-                "⚠ **REWORK PASS**: Your primary objective is to revise "
-                "the prior plan. Address all points from the "
-                "critic feedback.\n\n"
-            )
-
-        prompt = (
-            f"{rework_prefix}Create a detailed technical plan with structured "
-            f"feature slices, incorporating the codebase research findings below.\n\n"
-            f"## Work Description\n{description}\n\n"
-            f"## Codebase Research Findings\n{findings_text}\n\n"
-            f"Call `read_prior_artifacts` to load the specification and prior context "
-            f"in one call. Then synthesize the spec + findings into structured "
-            f"feature_slices and call `write_structured_plan` exactly once — the tool "
-            f"writes both plan.md and plan.json for you. Do not call write_file."
-        )
-
-        if retry_count > 0:
-            feedback_text = _render_rework_feedback(last_critic_review, feedback)
-            if feedback_text:
-                prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
-
+            feedback_body = _render_rework_feedback(last_critic_review, feedback) or ""
         scratchpad = state.get("scratchpad", "")
-        if scratchpad:
-            prompt += f"\n\n## Working Memory Scratchpad\n{scratchpad}\n"
+        rework_lead = (
+            "REWORK PASS: your primary objective is to revise the prior "
+            "plan. Address all points from the <critic_feedback> block. "
+            if retry_count > 0
+            else ""
+        )
+        prompt = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, description),
+                (Tag.FINDINGS, findings_text),
+                (Tag.CRITIC_FEEDBACK, feedback_body),
+                (Tag.SCRATCHPAD, scratchpad),
+            ),
+            (
+                f"{rework_lead}Create a detailed technical plan with "
+                "structured feature slices, incorporating the research "
+                "findings above. Call `read_prior_artifacts` to load the "
+                "specification and prior context in one call. Then "
+                "synthesize the spec + findings into structured "
+                "feature_slices and call `write_structured_plan` exactly "
+                "once — the tool writes both plan.md and plan.json for you. "
+                "Do not call write_file."
+            ),
+        )
 
         ctx = build_context(dict(state), PhaseName.PLAN)
         result = await ainvoke_with_retry(
@@ -790,46 +792,45 @@ async def _synthesize_specify(
             findings,
             budget=_SpineConfig.load().synthesize_findings_token_budget,
         )
-        rework_prefix = ""
-        if retry_count > 0:
-            rework_prefix = (
-                "⚠ **REWORK PASS**: Your primary objective is to revise "
-                "the prior specification. Address all points from the "
-                "critic feedback.\n\n"
-            )
-
         # When the pre_research_gate fired (high confidence + sufficient
         # hits), it skips the exploration loop and we synthesize directly
         # from the recalled chunks.  Inject the raw per-symbol bodies
         # (tree-sitter-sliced — single function bodies, not whole files)
         # up to the configured token budget.
-        recall_section = _format_retrieved_context(
+        recall_body = _format_retrieved_context(
             state.get("retrieved_context") or []
         )
-
-        prompt = (
-            f"{rework_prefix}Create a detailed specification for the "
-            f"following work, incorporating the codebase research "
-            f"findings below.\n\n"
-            f"## Work Description\n{description}\n\n"
-            f"## Codebase Research Findings\n{findings_text}\n\n"
-            f"{recall_section}"
-            f"Call `read_work_context` once to load description, feedback, and any "
-            f"prior spec. Then synthesize the work description + research findings "
-            f"into the structured fields and call `write_specification` exactly once "
-            f"(fields: title, summary, objectives, requirements, constraints, "
-            f"scope_inclusions, scope_exclusions, known_risks). The tool renders "
-            f"markdown and emits JSON for you — do not call write_file."
-        )
-
+        feedback_body = ""
         if retry_count > 0:
-            feedback_text = _render_rework_feedback(last_critic_review, feedback)
-            if feedback_text:
-                prompt += f"\n\n## Previous Review Feedback\n{feedback_text}\n"
-
+            feedback_body = _render_rework_feedback(last_critic_review, feedback) or ""
         scratchpad = state.get("scratchpad", "")
-        if scratchpad:
-            prompt += f"\n\n## Working Memory Scratchpad\n{scratchpad}\n"
+        rework_lead = (
+            "REWORK PASS: your primary objective is to revise the prior "
+            "specification. Address all points from the <critic_feedback> "
+            "block. "
+            if retry_count > 0
+            else ""
+        )
+        prompt = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, description),
+                (Tag.FINDINGS, findings_text),
+                (Tag.RETRIEVED_CODE, recall_body),
+                (Tag.CRITIC_FEEDBACK, feedback_body),
+                (Tag.SCRATCHPAD, scratchpad),
+            ),
+            (
+                f"{rework_lead}Create a detailed specification for the work "
+                "above, incorporating the research findings. Call "
+                "`read_work_context` once to load description, feedback, "
+                "and any prior spec. Then synthesize the work description + "
+                "research findings into the structured fields and call "
+                "`write_specification` exactly once (fields: title, summary, "
+                "objectives, requirements, constraints, scope_inclusions, "
+                "scope_exclusions, known_risks). The tool renders markdown "
+                "and emits JSON for you — do not call write_file."
+            ),
+        )
 
         ctx = build_context(dict(state), PhaseName.SPECIFY)
         result = await ainvoke_with_retry(
@@ -927,8 +928,11 @@ def _format_retrieved_context(chunks: list[dict]) -> str:
     from spine.config import SpineConfig
 
     budget = SpineConfig.load().specify_context_token_budget
-    parts: list[str] = ["## Retrieved Codebase Context\n"]
-    used = _count_tokens(parts[0])
+    # No outer markdown header — caller wraps the returned text in
+    # ``xml_blocks((Tag.RETRIEVED_CODE, ...))`` per the project's tagging
+    # convention (see ``spine.agents.prompt_format``).
+    parts: list[str] = []
+    used = 0
 
     for i, chunk in enumerate(chunks, 1):
         symbol = chunk.get("symbol_name", "unknown")

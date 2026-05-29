@@ -133,16 +133,18 @@ async def test_plan_researcher_prompt_includes_prior_specify_findings(
 
     # Both the supervisor's global_goal and the worker's topic carry the
     # enriched payload — they're the same string under the new design.
+    # The enriched payload is XML-tagged (see spine.agents.prompt_format):
+    # <objective> holds the bare topic, <prior_research> carries the
+    # rendered SPECIFY findings.
+    from spine.agents.prompt_format import Tag, assert_has_tags, get_block
+
     for label in ("supervisor_global_goal", "worker_topic"):
         text = captured[label]
-        assert "## Prior SPECIFY Research" in text, (
-            f"{label} missing prior-findings block"
-        )
-        assert "don't re-investigate" in text
-        assert "spine/config.py" in text
-        assert "spine/agents/factory.py" in text
-        # Topic still flows through normally
-        assert "touch points for verbose flag" in text
+        assert_has_tags(text, Tag.OBJECTIVE, Tag.PRIOR_RESEARCH)
+        assert get_block(text, Tag.OBJECTIVE) == "touch points for verbose flag"
+        prior = get_block(text, Tag.PRIOR_RESEARCH)
+        assert "spine/config.py" in prior
+        assert "spine/agents/factory.py" in prior
 
 
 @pytest.mark.asyncio
@@ -194,7 +196,10 @@ async def test_specify_researcher_prompt_does_not_include_prior_section(
     await exploration_agents.run_explore_do_node(
         state, None, topic="boundary of cli"
     )
-    assert "## Prior SPECIFY Research" not in captured["global_goal"]
+    from spine.agents.prompt_format import Tag, parse_tags
+
+    tags = {name for name, _ in parse_tags(captured["global_goal"])}
+    assert Tag.PRIOR_RESEARCH.value not in tags
 
 
 @pytest.mark.asyncio
@@ -247,7 +252,10 @@ async def test_plan_researcher_prompt_omits_section_when_field_absent(
     await exploration_agents.run_explore_do_node(
         state, None, topic="some plan topic"
     )
-    assert "## Prior SPECIFY Research" not in captured["global_goal"]
+    from spine.agents.prompt_format import Tag, parse_tags
+
+    tags = {name for name, _ in parse_tags(captured["global_goal"])}
+    assert Tag.PRIOR_RESEARCH.value not in tags
 
 
 # ── Research-manager prompt (run_research_manager) ─────────────────────
@@ -294,16 +302,28 @@ async def test_plan_research_manager_context_includes_prior_findings(monkeypatch
     out = await exploration_agents.run_research_manager(state, None)
     assert out["manager_decision"] == "done"
 
-    ctx = captured["context"]
-    assert "## Prior SPECIFY Research" in ctx
-    assert "spine/config.py" in ctx
-    # Architectural-map framing — manager should not re-map these files
-    assert "do not re-map" in ctx
+    from spine.agents.prompt_format import (
+        Tag,
+        assert_has_tags,
+        assert_hostage_layout,
+        assert_tag_order,
+        get_block,
+    )
 
-    # System prompt picked the PLAN variant and references the new rule
+    ctx = captured["context"]
+    # Structural: prior_research sits between objective and findings, the
+    # directive sentence is the hostage tail.
+    assert_hostage_layout(ctx)
+    assert_has_tags(ctx, Tag.OBJECTIVE, Tag.PRIOR_RESEARCH, Tag.FINDINGS)
+    assert_tag_order(ctx, Tag.OBJECTIVE, Tag.PRIOR_RESEARCH, Tag.FINDINGS)
+    # Semantic: the SPECIFY map's file paths land in the prior_research block.
+    assert "spine/config.py" in get_block(ctx, Tag.PRIOR_RESEARCH)
+
+    # System prompt picked the PLAN variant and references the prior-research
+    # rule inside its <constraints> block.
     system = captured["system"]
-    assert "Change Surface Research Manager" in system
-    assert "Prior SPECIFY Research" in system
+    assert "Change Surface Research Manager" in get_block(system, Tag.ROLE)
+    assert "<prior_research>" in get_block(system, Tag.CONSTRAINTS)
 
 
 @pytest.mark.asyncio
@@ -341,7 +361,13 @@ async def test_specify_research_manager_context_excludes_prior_findings(monkeypa
     }
     await exploration_agents.run_research_manager(state, None)
 
+    from spine.agents.prompt_format import Tag, get_block, parse_tags
+
     ctx = captured["context"]
-    assert "## Prior SPECIFY Research" not in ctx
-    # System prompt is the SPECIFY variant
-    assert "Architectural Research Manager" in captured["system"]
+    # No prior_research tag emitted on SPECIFY even when the field is set.
+    ctx_tags = {name for name, _ in parse_tags(ctx)}
+    assert Tag.PRIOR_RESEARCH.value not in ctx_tags
+    # System prompt is the SPECIFY variant (role mentions Architectural).
+    assert "Architectural Research Manager" in get_block(
+        captured["system"], Tag.ROLE
+    )

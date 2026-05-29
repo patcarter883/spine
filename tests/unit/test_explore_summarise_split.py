@@ -85,7 +85,18 @@ def test_empty_research_finding_shape_matches_error_sentinel():
 
 @pytest.mark.asyncio
 async def test_summarise_evidence_uses_only_evidence_in_prompt():
-    """The summarise prompt must forbid topic-based hallucination."""
+    """The summarise prompt is built via the XML-tagged hostage layout
+    (see ``spine.agents.prompt_format``). The forbid-hallucination
+    constraints live in a ``<constraints>`` block; the topic in
+    ``<objective>``; the evidence in ``<findings>``. The directive sits
+    after every closing tag.
+    """
+    from spine.agents.prompt_format import (
+        Tag,
+        assert_has_tags,
+        assert_hostage_layout,
+        get_block,
+    )
     from spine.agents.subagents import ResearchFindings
 
     expected = ResearchFindings(
@@ -101,10 +112,17 @@ async def test_summarise_evidence_uses_only_evidence_in_prompt():
     assert out is not None
     assert out["summary"] == "x"
     prompt = captured["prompt"]
-    assert "Use ONLY information present in the evidence" in prompt
-    assert "Do NOT use the topic name" in prompt
-    assert "auth flow" in prompt
-    assert "found login()" in prompt
+    # Structural invariants — the data/instruction split is enforced by
+    # the prompt-format helpers, not by literal substring matching.
+    assert_hostage_layout(prompt)
+    assert_has_tags(prompt, Tag.OBJECTIVE, Tag.CONSTRAINTS, Tag.FINDINGS)
+    # Per-block semantic checks: the constraint text and the topic / evidence
+    # land in the correct tagged blocks.
+    constraints = get_block(prompt, Tag.CONSTRAINTS)
+    assert "Use ONLY information present" in constraints
+    assert "Do NOT use the topic name" in constraints
+    assert get_block(prompt, Tag.OBJECTIVE) == "auth flow"
+    assert "found login()" in get_block(prompt, Tag.FINDINGS)
 
 
 @pytest.mark.asyncio
