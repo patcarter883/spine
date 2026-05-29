@@ -113,7 +113,7 @@ providers:
   - name: local-embeddings
     type: openai-embedding
     model: Qwen3-Embedding-8B-GGUF
-    base_url: http://localhost:8010/v1
+    base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
   phases:
