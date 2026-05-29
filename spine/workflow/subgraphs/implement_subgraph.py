@@ -221,6 +221,13 @@ async def _slice_implementer_node(
             extra_tools=restricted_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
+            # The subagent_spec already injected MCP tools via
+            # _inject_mcp_tools in subagents.py — they live in
+            # ``restricted_tools`` above (filtered from spec_tools).
+            # Letting the factory re-inject them would duplicate the
+            # whole catalog and double-emit the mcp_guidance prompt
+            # block. See trace 019e721d audit.
+            skip_default_mcp_injection=True,
         )
 
         slice_json = json.dumps(active_slice, indent=2, ensure_ascii=False, default=str)

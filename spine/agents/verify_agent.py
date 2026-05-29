@@ -57,6 +57,10 @@ def build_verify_agent(
         system_prompt=system_prompt,
         extra_tools=custom_tools,
         skip_filesystem_middleware=True,
+        # VERIFY synthesises slice-verifier verdicts (already in context)
+        # into the combined verification report. No code navigation; the
+        # MCP catalog is dead weight. See trace 019e721d audit.
+        skip_default_mcp_injection=True,
     )
 
     return agent

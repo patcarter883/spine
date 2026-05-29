@@ -82,6 +82,10 @@ def build_gap_plan_agent(
         system_prompt=system_prompt,
         extra_tools=orchestrator_tools,
         skip_filesystem_middleware=True,
+        # GAP_PLAN reads verify feedback and writes a gap-fix plan. No
+        # structural navigation; the MCP catalog is dead weight. See
+        # trace 019e721d audit.
+        skip_default_mcp_injection=True,
     )
 
     return agent

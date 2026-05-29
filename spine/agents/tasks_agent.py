@@ -88,6 +88,10 @@ def build_tasks_agent(
         system_prompt=system_prompt,
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
+        # TASKS reads plan.json and writes per-slice task files. No
+        # structural navigation needed — the MCP catalog is dead weight.
+        # See trace 019e721d audit.
+        skip_default_mcp_injection=True,
     )
 
     return agent
