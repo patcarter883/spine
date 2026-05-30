@@ -130,6 +130,26 @@ async def _pre_research_gate(
     }
 
 
+# Verbs that mark a request as architecturally non-trivial — their presence
+# disqualifies the trivial fast path even for a short description. Kept in
+# sync with the SPECIFY critic's proportionality check (spine/critic/agent.py).
+_ARCHITECTURAL_VERBS: tuple[str, ...] = (
+    "design",
+    "refactor",
+    "rebuild",
+    "architect",
+    "redesign",
+    "migrate",
+    "overhaul",
+)
+
+
+def _has_architectural_verb(description: str) -> bool:
+    """True if the description contains an architecture-scale verb."""
+    lowered = description.lower()
+    return any(verb in lowered for verb in _ARCHITECTURAL_VERBS)
+
+
 def _gate_router(
     state: ExplorationSubgraphState,
 ) -> Literal["skip_to_synth", "explore"]:
@@ -162,6 +182,24 @@ def _gate_router(
         logger.info(
             "Recall gate firing: confidence=%.2f hits=%d → skip exploration",
             confidence, hits,
+        )
+        return "skip_to_synth"
+
+    # Trivial-task fast path: a short, high-confidence, non-architectural
+    # description short-circuits even when recall returned zero hits. The
+    # hits>=min check above never fires on a cold/empty index, so without
+    # this a one-line task burns a full multi-round research loop building
+    # context the synthesizer doesn't need (trace 019e77a7).
+    description = state.get("description", "") or ""
+    if (
+        confidence >= cfg.recall_gate_confidence
+        and len(description) <= cfg.recall_gate_trivial_max_chars
+        and not _has_architectural_verb(description)
+    ):
+        logger.info(
+            "Recall gate firing (trivial fast path): len=%d confidence=%.2f "
+            "hits=%d → skip exploration",
+            len(description), confidence, hits,
         )
         return "skip_to_synth"
     return "explore"

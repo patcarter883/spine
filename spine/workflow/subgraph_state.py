@@ -101,6 +101,19 @@ def _slice_list_reducer(
     return base + list(update)
 
 
+def _bool_or(existing: bool | None, update: bool | None) -> bool:
+    """OR-reducer for completion-invariant bools.
+
+    Parallel Send branches (one per slice) each return ``True`` for
+    ``slices_dispatched`` / ``implementation_files_written`` in the same
+    super-step. A plain ``bool`` channel rejects the concurrent writes with
+    ``InvalidUpdateError("Can receive only one value per step")`` (trace
+    019e784c crashed IMPLEMENT on any multi-slice plan). OR composes them:
+    once any branch sets it True it stays True.
+    """
+    return bool(existing) or bool(update)
+
+
 class ImplementSubgraphState(BaseSubgraphState, total=False):
     """IMPLEMENT phase — reads plan artifacts, dispatches slice-implementers.
 
@@ -127,8 +140,10 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     failed_slices: Annotated[list[dict], _slice_list_reducer]
 
     # ── Phase Completion Invariants ──
-    slices_dispatched: bool  # True when slice-implementers were dispatched
-    implementation_files_written: bool  # True when code files were created
+    # OR-reduced: parallel slice-implementer Send branches each write True in
+    # the same super-step, which a plain bool channel rejects (trace 019e784c).
+    slices_dispatched: Annotated[bool, _bool_or]  # True when slice-implementers dispatched
+    implementation_files_written: Annotated[bool, _bool_or]  # True when code files created
 
 
 class VerifySubgraphState(BaseSubgraphState, total=False):

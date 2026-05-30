@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, ToolException
 from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
@@ -205,6 +205,7 @@ def _coerce_str_list(value: Any, field: str) -> Any:
 
 class _SearchCodebaseInput(BaseModel):
     queries: list[str] = Field(
+        default_factory=list,
         description=(
             "REQUIRED. Non-empty list of search terms or topic keywords. "
             "Each query is run as a case-insensitive substring search across "
@@ -212,7 +213,6 @@ class _SearchCodebaseInput(BaseModel):
             "You MUST pass this as a list of strings — a bare string will be "
             "rejected."
         ),
-        min_length=1,
     )
     file_patterns: list[str] = Field(
         default_factory=list,
@@ -266,10 +266,23 @@ class SearchCodebaseTool(BaseTool):
 
     def _run(
         self,
-        queries: list[str],
+        queries: list[str] | None = None,
         file_patterns: list[str] | None = None,
         max_files: int = 6,
     ) -> str:
+        # Empty / missing queries used to 400 at the pydantic schema layer
+        # ("queries Field required"), an unrecoverable error the local model
+        # re-emitted verbatim (trace 019e77a7: 4× `search_codebase({})`).
+        # Raise a recoverable ToolException with a worked example instead —
+        # langchain returns it to the model as a ToolMessage it can act on.
+        queries = [q for q in (queries or []) if str(q).strip()]
+        if not queries:
+            raise ToolException(
+                "search_codebase: 'queries' is required and must be a non-empty "
+                "list of keyword strings. Retry like "
+                "queries=['WorkflowState', 'submit_work'] — a list of plain "
+                "search terms, not an empty call."
+            )
         # Resolve to an absolute path so candidate paths from rglob and
         # rg's output use the same representation. Trace 019e6974
         # showed total_files_found=0 for queries that obviously matched
@@ -282,11 +295,28 @@ class SearchCodebaseTool(BaseTool):
 
         # Build candidate file set: pattern-filtered or all source files
         candidates: set[Path] = set()
+        all_patterns_invalid = False
         if file_patterns:
+            invalid_patterns: list[str] = []
             for pattern in file_patterns:
-                candidates.update(root.glob(pattern))
-        else:
-            # Walk workspace, skip common non-code dirs
+                try:
+                    candidates.update(root.glob(pattern))
+                except ValueError as exc:
+                    # pathlib rejects malformed globs — a bare '**' or 'a**b'
+                    # raises "'**' can only be an entire path component"
+                    # (trace 019e784c crashed the whole search on one such
+                    # pattern from the slice-implementer). Skip the bad
+                    # pattern instead of crashing; remember it so an all-bad
+                    # set falls back to a full walk below.
+                    invalid_patterns.append(pattern)
+                    logger.warning(
+                        "search_codebase: skipping invalid glob pattern %r: %s",
+                        pattern, exc,
+                    )
+            all_patterns_invalid = len(invalid_patterns) == len(file_patterns)
+
+        if not file_patterns or all_patterns_invalid:
+            # No usable patterns → walk workspace, skip common non-code dirs.
             skip_dirs = {
                 ".venv",
                 "venv",

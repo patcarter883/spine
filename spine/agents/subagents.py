@@ -272,9 +272,9 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         + "\n\n"
         + xml_block(
             Tag.TOOLS,
-            "USE `codebase_query` FIRST. It answers symbol-level questions in "
-            "sub-millisecond time — use it before reading files to locate "
-            "exactly the code you need to change.\n\n"
+            "When a specific symbol you must call/extend is NOT already in "
+            "your task context, `codebase_query` answers symbol-level "
+            "questions in sub-millisecond time:\n\n"
             "| Question | Call |\n"
             "|----------|------|\n"
             '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
@@ -282,24 +282,25 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
             '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
             '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
-            "Primary navigation tool (use FIRST):\n"
-            "- `codebase_query` — single tool, five actions. Pick `action`, "
-            "fill the one argument it needs:\n"
+            "Your slice is ALREADY specified — target files, acceptance "
+            "criteria, and an implementation directive are in your task. "
+            "Codebase research happened upstream in PLAN. Do NOT survey the "
+            "codebase. Read the named files, edit, run tests. Reach for "
+            "`codebase_query` ONLY when a specific unknown symbol blocks an "
+            "edit.\n\n"
+            "Your tools:\n"
+            "- `read_file` — read files (use offset/limit for pagination). "
+            "Read the files named in your task FIRST.\n"
+            "- `codebase_query` — targeted symbol lookup (use ONLY when a "
+            "specific symbol you must call/extend isn't in your task context). "
+            "Pick `action`, fill the one argument it needs:\n"
             "  - `find_symbol`, `get_source`, `get_dependencies`, "
             "`get_dependents` all take `name` (clean identifier — no "
             "whitespace, no module prefix, no parentheses).\n"
             "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
-            "50 hits — refine with anchors / file globs rather than retrying "
-            "naively.\n"
+            "50 hits.\n"
             "  - `name` and `pattern` are mutually exclusive. Do NOT pass "
             "both.\n"
-            "- `search_codebase` — multi-query keyword file search with "
-            "content previews. Use when you need content-level matches that "
-            "`codebase_query` doesn't cover.\n"
-            "- `read_file` — read files (use offset/limit for pagination).\n"
-            "- `ast_extract_symbol` — fetch a single named symbol's source "
-            "straight from the index. Use when you know the symbol name and "
-            "want its body without reading the whole file.\n"
             "- `read_edit_lint` — the ONLY write tool. Pass exactly ONE edit "
             "mode: `old_str`+`new_str` (exact, single-occurrence "
             "find-and-replace); `full_replace` (whole-file content); `edits` "
@@ -323,10 +324,9 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "any imports or dependencies they reference. Check the "
             "modification targets in your task description for exact change "
             "sites.\n"
-            "2. Navigate if needed (0-1 turns): If you need to understand "
-            "code not covered by the task description, use `codebase_query` "
-            "to locate symbols, then `search_codebase` for content-level "
-            "matches. Do NOT explore broadly.\n"
+            "2. Navigate if needed (0-1 turns): ONLY if a specific symbol you "
+            "must call/extend isn't in your task context, use `codebase_query` "
+            "to locate it. Do NOT explore broadly — the slice is pre-specified.\n"
             "3. Make changes (1-2 turns, batch): Apply all edits with "
             "`read_edit_lint`. Read-before-write. Issue ≥2 edits in a "
             "single turn where possible. Focus only on files listed in the "
@@ -352,15 +352,13 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "create files in the wrong location.\n"
             "- WRONG: `../other/file.py` — traversal blocked by virtual "
             "filesystem.\n"
-            "- Use `codebase_query` or `search_codebase` to verify a file "
-            "exists before writing to its parent directory. Do not invent "
-            "paths.\n\n"
+            "- Use `codebase_query` to verify a symbol exists before calling "
+            "it. Do not invent paths.\n\n"
             "Hard limits:\n"
-            "- Navigate with `codebase_query` first, then batch reads: read "
-            "≥3 files per turn or use `search_codebase` instead. Never read "
-            "one file at a time.\n"
-            "- Exploration budget: maximum 3 turns of read/search before "
-            "your first write/edit. If you haven't changed code by turn 4, "
+            "- Batch reads: read the files named in your task in a single "
+            "turn (≥3 at once where applicable). Never read one file at a time.\n"
+            "- Exploration budget: maximum 2 turns of read/lookup before "
+            "your first write/edit. If you haven't changed code by turn 3, "
             "you're over-exploring — make changes with what you know.\n"
             "- Scope: modify ONLY files listed in the slice. Do not touch "
             "files outside its scope even if you think they need changes — "
@@ -443,11 +441,18 @@ _READ_ONLY_TOOLS: list[str] = [
     "ast_extract_symbol",
 ]
 
-_FULL_TOOLS: list[str] = [
+# Slice-implementer surface. A slice arrives fully specified — target_files,
+# acceptance criteria, and an upstream planning directive — and codebase
+# research already happened in PLAN. So the broad keyword search
+# (``search_codebase``, returns multi-file content previews) and the
+# redundant ``ast_extract_symbol`` are intentionally OMITTED: they let the
+# implementer "research half the codebase" (trace 019e784c: 83 LLM calls /
+# 1.39M prompt tokens on a one-line flag). Targeted symbol lookups still go
+# through the injected ``codebase_query`` wrapper when a specific unknown
+# symbol blocks an edit. Read the named files, edit, run tests.
+_IMPLEMENT_TOOLS: list[str] = [
     "read_file",
     "read_edit_lint",
-    "search_codebase",
-    "ast_extract_symbol",
     "execute",
 ]
 
@@ -462,7 +467,7 @@ _READ_AND_EXECUTE_TOOLS: list[str] = [
 
 SUBAGENT_TOOLS: dict[str, list[str]] = {
     "researcher": _READ_ONLY_TOOLS,
-    "slice-implementer": _FULL_TOOLS,
+    "slice-implementer": _IMPLEMENT_TOOLS,
     "slice-verifier": _READ_AND_EXECUTE_TOOLS,
 }
 

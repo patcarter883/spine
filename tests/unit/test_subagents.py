@@ -336,7 +336,13 @@ class TestSubagentFactory:
         assert "edit_file" not in impl_tools
         assert "read_edit_lint" in impl_tools
         assert "execute" in impl_tools
-        assert "ast_extract_symbol" in impl_tools
+        # The implementer's surface is intentionally narrow: the broad keyword
+        # search and redundant symbol-extractor are NOT bound, so it can't
+        # "research half the codebase" (trace 019e784c). Targeted lookups go
+        # through the injected codebase_query wrapper, not these.
+        assert "search_codebase" not in impl_tools
+        assert "ast_extract_symbol" not in impl_tools
+        assert "read_file" in impl_tools
 
         # Verifier can execute (tests/lint) but not write
         verifier_tools = SUBAGENT_TOOLS["slice-verifier"]

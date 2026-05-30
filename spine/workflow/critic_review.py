@@ -38,12 +38,37 @@ _STRUCTURED_STATE_FIELD: dict[str, str] = {
 logger = logging.getLogger(__name__)
 
 
+def _format_prior_review(prior_review: dict[str, Any] | None) -> str:
+    """Render the critic's own previous verdict for a rework pass.
+
+    Returns "" when there is no prior verdict (first review). Otherwise
+    renders the prior status + reason + suggestions so the critic can
+    confirm whether each point was addressed instead of shifting the
+    goalposts to brand-new issues every round.
+    """
+    if not prior_review:
+        return ""
+    reason = (prior_review.get("reason") or "").strip()
+    suggestions = prior_review.get("suggestions") or []
+    attempt = prior_review.get("attempt", 1)
+    lines = [
+        f"Your previous verdict on this phase (attempt {attempt}) was "
+        f"NEEDS_REVISION for this reason:",
+        f"  {reason}" if reason else "  (no reason recorded)",
+    ]
+    if suggestions:
+        lines.append("You asked for these specific changes:")
+        lines.extend(f"  - {s}" for s in suggestions)
+    return "\n".join(lines)
+
+
 def _build_review_prompt(
     *,
     reviewed_phase: str,
     structured_payload: str,
     description: str,
     spec_payload: str | None = None,
+    prior_review: dict[str, Any] | None = None,
 ) -> str:
     """Build the user-message prompt for the critic agent.
 
@@ -51,26 +76,47 @@ def _build_review_prompt(
     instruction in the hostage tail so small-model attention lands on
     "what to do" instead of trailing data. ``spec_payload`` is included
     only when reviewing the PLAN phase — that critic needs the spec's
-    scope lists to check slice-level scope creep.
+    scope lists to check slice-level scope creep. ``prior_review`` is the
+    critic's own previous verdict on this phase; when present (a rework
+    pass) it is injected so the critic checks whether its prior asks were
+    addressed rather than inventing new blocking issues each round.
     """
     from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 
     findings_block = (
         f"```json\n{structured_payload}\n```" if structured_payload else ""
     )
-    return hostage_layout(
-        xml_blocks(
-            (Tag.OBJECTIVE, description or ""),
-            (Tag.SPECIFICATION, spec_payload or ""),
-            (Tag.FINDINGS, findings_block),
-        ),
-        (
+    prior_block = _format_prior_review(prior_review)
+
+    if prior_block:
+        directive = (
+            f"This is a REWORK review of the {reviewed_phase}-phase output. "
+            "First, go through each point in the <critic_feedback> block above "
+            "and decide whether the new payload ADDRESSES it. If every prior "
+            "point is addressed, respond PASSED — do not block on issues you "
+            "did not raise last round. Only emit NEEDS_REVISION if a prior, "
+            "still-unaddressed point remains, or you find a genuinely NEW and "
+            "BLOCKING semantic defect (not a schema/field-name nitpick). Keep "
+            "your asks stable across rounds so the author can converge. "
+            "Everything you need is in the tagged blocks — do not read files."
+        )
+    else:
+        directive = (
             f"Review the {reviewed_phase}-phase structured output above. "
             "Do not attempt to read files or run commands; everything you "
             "need is in the tagged blocks. Respond with PASSED, "
             "NEEDS_REVISION, or NEEDS_REVIEW and include concrete reasons "
             "and suggestions."
+        )
+
+    return hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, description or ""),
+            (Tag.SPECIFICATION, spec_payload or ""),
+            (Tag.CRITIC_FEEDBACK, prior_block),
+            (Tag.FINDINGS, findings_block),
         ),
+        directive,
     )
 
 
@@ -227,11 +273,21 @@ async def agent_critic_check(
         if reviewed_phase == PhaseName.PLAN.value:
             spec_payload = state.get("specification_json")
 
+        # On a rework pass the critic should see its OWN prior verdict so it
+        # confirms whether its asks were met instead of raising fresh issues
+        # every round (the non-convergent death spiral in trace 019e77a7).
+        # last_critic_review is last-write-wins; only inject it when it belongs
+        # to the phase under review.
+        prior_review = state.get("last_critic_review") or None
+        if prior_review and prior_review.get("phase") != reviewed_phase:
+            prior_review = None
+
         prompt = _build_review_prompt(
             reviewed_phase=reviewed_phase,
             structured_payload=structured_payload,
             description=state.get("description") or "",
             spec_payload=spec_payload,
+            prior_review=prior_review,
         )
 
         # If the critic subgraph ran a plan-before-do step, prepend the

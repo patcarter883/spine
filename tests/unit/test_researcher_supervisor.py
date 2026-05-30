@@ -669,3 +669,128 @@ def test_render_history_drops_error_and_empty_findings():
 
 def test_render_history_empty_returns_empty_string():
     assert render_history_as_evidence([]) == ""
+
+
+# ── Single-shot worker: bounded retry on a teachable tool error (019e784c) ──
+
+
+class _SequenceBoundModel:
+    """Returns a queued AIMessage per ainvoke() call, recording every
+    message list it was handed so tests can assert the error was fed back.
+    """
+
+    def __init__(self, ai_msgs: list[AIMessage]) -> None:
+        self._ai_msgs = list(ai_msgs)
+        self.invocations: list[list] = []
+
+    async def ainvoke(self, messages, **kwargs):
+        self.invocations.append(list(messages))
+        return self._ai_msgs.pop(0)
+
+
+class _FlakyTool:
+    """Raises the configured exception on the FIRST call, then returns the
+    success payload on subsequent calls — models a malformed-then-corrected
+    argument sequence.
+    """
+
+    def __init__(self, name: str, error: Exception, success):
+        self.name = name
+        self._error = error
+        self._success = success
+        self.calls: list = []
+
+    async def ainvoke(self, args):
+        self.calls.append(args)
+        if len(self.calls) == 1:
+            raise self._error
+        return self._success
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_once_with_error_feedback_then_succeeds():
+    """A malformed first call that raises a teaching ToolException must
+    trigger ONE retry: the worker feeds the error back as a ToolMessage,
+    the model corrects its args, and the second call succeeds. The cycle is
+    salvaged instead of leaking an ERROR finding (trace 019e784c)."""
+    from langchain_core.tools import ToolException
+
+    payload = json.dumps({"file_path": "spine/x.py", "symbol_name": "X"})
+    bad = AIMessage(
+        content="searching",
+        tool_calls=[{"name": "codebase_query", "args": {"action": "search"},
+                     "id": "tc-1", "type": "tool_call"}],
+    )
+    good = AIMessage(
+        content="corrected",
+        tool_calls=[{"name": "codebase_query",
+                     "args": {"action": "search", "pattern": "def run"},
+                     "id": "tc-2", "type": "tool_call"}],
+    )
+    bound = _SequenceBoundModel([bad, good])
+    tool = _FlakyTool(
+        "codebase_query",
+        ToolException("codebase_query: 'pattern' is required for action='search'."),
+        payload,
+    )
+    directive = SupervisorDirective(
+        analysis_and_reasoning="r", is_complete=False,
+        next_directive="search", allowed_tool_class=ToolClass.SEARCH,
+    )
+
+    f = await run_worker_node(
+        state={"work_id": "w"}, config=None, topic="how does run work?",
+        directive=directive,
+        bound_models={ToolClass.SEARCH: (bound, [tool])},
+        system_prompt="role",
+    )
+
+    # Exactly two model calls (initial + one retry) and two tool executions.
+    assert len(bound.invocations) == 2, "expected exactly ONE retry"
+    assert len(tool.calls) == 2
+    # The retry conversation fed the teaching error back as a ToolMessage.
+    retry_msgs = bound.invocations[1]
+    tool_msgs = [m for m in retry_msgs if isinstance(m, ToolMessage)]
+    assert tool_msgs and "pattern" in tool_msgs[0].content
+    assert getattr(tool_msgs[0], "status", None) == "error"
+    # Outcome is the salvaged success, not an ERROR finding.
+    assert f.status == FindingStatus.SUCCESS
+    assert f.target_path == "spine/x.py"
+
+
+@pytest.mark.asyncio
+async def test_worker_retry_failure_returns_error_no_second_retry():
+    """If the retry ALSO fails, give up — no second retry, ERROR finding."""
+    from langchain_core.tools import ToolException
+
+    bad = AIMessage(
+        content="searching",
+        tool_calls=[{"name": "codebase_query", "args": {"action": "search"},
+                     "id": "tc-1", "type": "tool_call"}],
+    )
+    still_bad = AIMessage(
+        content="still wrong",
+        tool_calls=[{"name": "codebase_query", "args": {"action": "search"},
+                     "id": "tc-2", "type": "tool_call"}],
+    )
+    bound = _SequenceBoundModel([bad, still_bad])
+
+    class _AlwaysRaises:
+        name = "codebase_query"
+        def __init__(self): self.calls = []
+        async def ainvoke(self, args):
+            self.calls.append(args)
+            raise ToolException("codebase_query: 'pattern' is required for action='search'.")
+
+    tool = _AlwaysRaises()
+    directive = SupervisorDirective(
+        analysis_and_reasoning="r", is_complete=False,
+        next_directive="search", allowed_tool_class=ToolClass.SEARCH,
+    )
+    f = await run_worker_node(
+        state={"work_id": "w"}, config=None, topic="t", directive=directive,
+        bound_models={ToolClass.SEARCH: (bound, [tool])}, system_prompt="role",
+    )
+    assert len(bound.invocations) == 2  # initial + exactly one retry
+    assert len(tool.calls) == 2
+    assert f.status == FindingStatus.ERROR

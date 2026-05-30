@@ -702,6 +702,58 @@ def _extract_anchors_from_tool_payload(body: str) -> tuple[str, list[str]]:
     return target_path, deduped
 
 
+async def _execute_worker_first_tool(
+    ai_msg: Any,
+    tool_by_name: dict[str, Any],
+    tool_class: ToolClass,
+) -> tuple[str, Any]:
+    """Run the FIRST tool call on ``ai_msg`` and classify the outcome.
+
+    Returns ``(kind, payload)``:
+      - ``("finding", StructuredFinding)`` — the model emitted no tool call;
+        its narration was turned into a finding (terminal, no retry).
+      - ``("ok", (tool_name, ToolMessage))`` — the tool executed; the caller
+        extracts a finding from ``[ai_msg, ToolMessage]``.
+      - ``("error", (tool_id, tool_name, error_text))`` — the tool was missing
+        from the scoped surface or raised. ``error_text`` is the teaching
+        message the caller may feed back to the model for ONE retry.
+    """
+    tool_calls = getattr(ai_msg, "tool_calls", None) or []
+    if not tool_calls:
+        return "finding", _extract_finding_from_worker_messages(
+            messages=[ai_msg], tool_class=tool_class,
+        )
+
+    tc = tool_calls[0]
+    tool_name = tc.get("name") or "(unknown)"
+    tool_args = tc.get("args") or {}
+    tool_id = tc.get("id") or "manual_tool_call"
+
+    tool = tool_by_name.get(tool_name)
+    if tool is None:
+        return "error", (
+            tool_id,
+            tool_name,
+            f"tool {tool_name!r} is not in your scoped tool surface for class "
+            f"{tool_class.value}; available tools: {sorted(tool_by_name)}. "
+            f"Call exactly one of the available tools.",
+        )
+
+    try:
+        tool_output = await tool.ainvoke(tool_args)
+    except Exception as exc:
+        return "error", (tool_id, tool_name, f"{type(exc).__name__}: {exc}")
+
+    # Wrap the tool output as a ToolMessage so the existing extractor
+    # (which expects a message list) keeps working unchanged.
+    tool_msg = ToolMessage(
+        content=str(tool_output) if tool_output is not None else "",
+        name=tool_name,
+        tool_call_id=tool_id,
+    )
+    return "ok", (tool_name, tool_msg)
+
+
 async def run_worker_node(
     *,
     state: dict[str, Any],
@@ -805,57 +857,77 @@ async def run_worker_node(
             execution_error_details=f"{type(exc).__name__}: {exc}",
         )
 
-    # Execute the FIRST tool call ONLY. The model may have emitted more,
-    # but the supervisor governs convergence and explicitly asked for a
-    # single move this turn — extra tool calls would just inflate the
-    # next cycle's history block without changing the supervisor's
-    # decision-making.
-    tool_calls = getattr(ai_msg, "tool_calls", None) or []
-    if not tool_calls:
-        # Model declined to call a tool — return EMPTY with the narration.
-        return _extract_finding_from_worker_messages(
-            messages=[ai_msg], tool_class=tool_class,
-        )
-
-    tc = tool_calls[0]
-    tool_name = tc.get("name") or "(unknown)"
-    tool_args = tc.get("args") or {}
-    tool_id = tc.get("id") or "manual_tool_call"
-
     tool_by_name = {
         getattr(t, "name", None): t for t in scoped_tools if getattr(t, "name", None)
     }
-    tool = tool_by_name.get(tool_name)
-    if tool is None:
-        return StructuredFinding(
-            tool_name=tool_name,
-            tool_class=tool_class,
-            status=FindingStatus.ERROR,
-            execution_error_details=(
-                f"tool {tool_name!r} not in scoped surface for class "
-                f"{tool_class.value}; available: {sorted(tool_by_name)}"
-            ),
+    base_messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_msg),
+    ]
+
+    # Execute the FIRST tool call ONLY. The model may have emitted more, but
+    # the supervisor governs convergence and explicitly asked for a single
+    # move this turn — extra tool calls would just inflate the next cycle's
+    # history block.
+    kind, payload = await _execute_worker_first_tool(ai_msg, tool_by_name, tool_class)
+    if kind == "finding":
+        return payload  # no tool call — narration-only finding
+    if kind == "ok":
+        _name, tool_msg = payload
+        return _extract_finding_from_worker_messages(
+            messages=[ai_msg, tool_msg], tool_class=tool_class,
         )
 
-    try:
-        tool_output = await tool.ainvoke(tool_args)
-    except Exception as exc:
-        return StructuredFinding(
-            tool_name=tool_name,
-            tool_class=tool_class,
-            status=FindingStatus.ERROR,
-            execution_error_details=f"{type(exc).__name__}: {exc}",
-        )
-
-    # Wrap the tool output as a ToolMessage so the existing extractor
-    # (which expects a message list) keeps working unchanged.
-    tool_msg = ToolMessage(
-        content=str(tool_output) if tool_output is not None else "",
+    # kind == "error": the single move failed. The worker is one-and-done by
+    # design (7296969), but a malformed call that raised a *teaching* error
+    # (codebase_query / search_codebase emit one with a worked example) is
+    # recoverable in ONE more shot: feed the error back as a ToolMessage and
+    # let the model re-pick its arguments. Bounded to a single retry so the
+    # token economy stays flat. Without it the cycle is wasted AND the error
+    # text can leak into the evidence dossier (trace 019e784c).
+    tool_id, tool_name, error_text = payload
+    error_tool_msg = ToolMessage(
+        content=error_text,
         name=tool_name,
         tool_call_id=tool_id,
+        status="error",
     )
-    return _extract_finding_from_worker_messages(
-        messages=[ai_msg, tool_msg], tool_class=tool_class,
+    try:
+        retry_ai_msg = await bound_model.ainvoke([*base_messages, ai_msg, error_tool_msg])
+    except Exception as exc:
+        logger.warning(
+            "[%s] researcher_supervisor: retry invocation failed (%s): %s",
+            work_id, tool_class.value, exc,
+        )
+        return StructuredFinding(
+            tool_name=tool_name,
+            tool_class=tool_class,
+            status=FindingStatus.ERROR,
+            execution_error_details=f"retry invocation failed: {type(exc).__name__}: {exc}",
+        )
+
+    logger.info(
+        "[%s] researcher_supervisor: worker retried %s after teachable tool error",
+        work_id, tool_name,
+    )
+    kind2, payload2 = await _execute_worker_first_tool(
+        retry_ai_msg, tool_by_name, tool_class
+    )
+    if kind2 == "finding":
+        return payload2
+    if kind2 == "ok":
+        _name2, tool_msg2 = payload2
+        return _extract_finding_from_worker_messages(
+            messages=[retry_ai_msg, tool_msg2], tool_class=tool_class,
+        )
+    # Retry also failed — give up (no second retry). render_history_as_evidence
+    # skips ERROR findings, so the error text stays out of the dossier.
+    _tid2, tool_name2, error_text2 = payload2
+    return StructuredFinding(
+        tool_name=tool_name2,
+        tool_class=tool_class,
+        status=FindingStatus.ERROR,
+        execution_error_details=error_text2,
     )
 
 

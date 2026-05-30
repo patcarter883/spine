@@ -20,7 +20,7 @@ class TestSpineConfig:
 
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"
-        assert config.max_critic_retries == 3
+        assert config.max_critic_retries == 2
         assert config.work_type == "task"
         assert config.queue_backend == "sqlite"
         assert config.queue_path == ".spine/queue.db"
@@ -174,7 +174,7 @@ class TestSpineConfig:
         # Should use all defaults
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"
-        assert config.max_critic_retries == 3
+        assert config.max_critic_retries == 2
 
     # ── MCP config parsing ────────────────────────────────────────────
 

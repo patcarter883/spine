@@ -562,6 +562,23 @@ def _human_review_interrupt(state: WorkflowState) -> dict:
     }
 
 
+def _flag_needs_review_terminal(state: WorkflowState) -> dict:
+    """Terminal sink for needs_review on autonomous work types.
+
+    Reviewed work types pause at the ``human_review`` interrupt for a human
+    to resume. Autonomous types (task / critical_task) have no human in the
+    loop, so blocking on the interrupt strands the run. This node instead
+    records the flagged status and lets the graph reach END cleanly — the
+    dispatcher then surfaces ``needs_review`` to the caller (e.g. ``spine
+    status``) rather than an indefinitely-paused interrupt.
+    """
+    return {
+        "status": "needs_review",
+        "needs_review_phase": state.get("needs_review_phase")
+        or state.get("current_phase", ""),
+    }
+
+
 def _make_human_review_router(phase_seq: list[tuple[str, str | None]]):
     """Create a human review router that knows the phase sequence.
 
@@ -698,6 +715,19 @@ def build_workflow_graph(
 
     phase_seq = WORKFLOW_SEQUENCES[work_type]
     registry = get_registry()
+
+    # Reviewed work types (reviewed_task / critical_reviewed_task) END at
+    # critic_plan and are designed to pause for a human. Autonomous types
+    # (task / critical_task) have no human watching — routing their
+    # needs_review verdicts into the human_review interrupt strands the run
+    # waiting on input that never comes (trace 019e77a7: a plain `task` hit
+    # the interrupt after the rework cap). For those, terminate cleanly with
+    # status=needs_review instead.
+    is_reviewed = work_type in (
+        WorkType.REVIEWED_TASK.value,
+        WorkType.CRITICAL_REVIEWED_TASK.value,
+    )
+    needs_review_target = "human_review" if is_reviewed else "flag_needs_review"
 
     # Validate start_from_phase if provided
     if start_from_phase is not None:
@@ -855,6 +885,12 @@ def build_workflow_graph(
         _hr_ends,
     )
 
+    # Terminal needs_review sink for autonomous work types. Sets the flagged
+    # status and ends the graph instead of blocking on the human interrupt.
+    if not is_reviewed:
+        graph.add_node("flag_needs_review", _flag_needs_review_terminal)
+        graph.add_edge("flag_needs_review", END)
+
     # Reviewed work types terminate after critic_plan and never reach
     # IMPLEMENT/VERIFY/GAP_PLAN. Compiling the prereq gates and the
     # gap_plan recovery node anyway would leave conditional edges pointing
@@ -941,7 +977,7 @@ def build_workflow_graph(
             artifact_gate_router,
             {
                 "proceed": actual_dst,
-                "needs_review": "human_review",
+                "needs_review": needs_review_target,
             },
         )
 
@@ -997,7 +1033,7 @@ def build_workflow_graph(
                 {
                     "passed": critic_proceed_target,
                     "needs_revision": pre_critic,  # rework loop
-                    "needs_review": "human_review",  # interrupt for human
+                    "needs_review": needs_review_target,  # human gate or terminal flag
                     "failed": END,
                 },
             )
@@ -1016,7 +1052,7 @@ def build_workflow_graph(
                 {
                     "passed": END,
                     "needs_gap_fix": "prereq_gate_gap_plan",
-                    "needs_review": "human_review",
+                    "needs_review": needs_review_target,
                     "failed": END,
                 },
             )
@@ -1033,7 +1069,7 @@ def build_workflow_graph(
                 _phase_status_router,
                 {
                     "proceed": target,
-                    "needs_review": "human_review",
+                    "needs_review": needs_review_target,
                     "failed": END,
                 },
             )
@@ -1045,7 +1081,7 @@ def build_workflow_graph(
                 _phase_status_router,
                 {
                     "proceed": END,
-                    "needs_review": "human_review",
+                    "needs_review": needs_review_target,
                     "failed": END,
                 },
             )
@@ -1058,7 +1094,7 @@ def build_workflow_graph(
         _phase_status_router,
         {
             "proceed": PhaseName.PLAN.value,
-            "needs_review": "human_review",
+            "needs_review": needs_review_target,
             "failed": END,
         },
     )
@@ -1068,7 +1104,7 @@ def build_workflow_graph(
             _phase_status_router,
             {
                 "proceed": PhaseName.IMPLEMENT.value,
-                "needs_review": "human_review",
+                "needs_review": needs_review_target,
                 "failed": END,
             },
         )
@@ -1078,7 +1114,7 @@ def build_workflow_graph(
             _phase_status_router,
             {
                 "proceed": PhaseName.VERIFY.value,
-                "needs_review": "human_review",
+                "needs_review": needs_review_target,
                 "failed": END,
             },
         )
@@ -1087,7 +1123,7 @@ def build_workflow_graph(
             _phase_status_router,
             {
                 "proceed": PhaseName.GAP_PLAN.value,
-                "needs_review": "human_review",
+                "needs_review": needs_review_target,
                 "failed": END,
             },
         )

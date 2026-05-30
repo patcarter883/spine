@@ -1235,6 +1235,44 @@ async def run_summarise_node(
     return {"findings": [finding]}
 
 
+def _findings_structured_model(model: Any) -> Any | None:
+    """Bind ``ResearchFindings`` structured output with a tight token cap.
+
+    A findings JSON is small, but a local model can ramble to the global
+    window cap (16K) — 207s of generation that then raises
+    ``LengthFinishReasonError`` and gets discarded (trace 019e77fe). We copy
+    the model with ``summarise_max_completion_tokens`` so a degenerate run is
+    cut off in seconds and falls through to the sentinel, instead of burning
+    the whole window. Returns ``None`` if the model lacks structured output.
+    """
+    from spine.agents.subagents import ResearchFindings
+    from spine.config import SpineConfig
+
+    if model is None:
+        return None
+
+    capped = model
+    try:
+        cap = SpineConfig.load().summarise_max_completion_tokens
+        # ChatOpenAI exposes both fields; override whichever the builder set,
+        # defaulting to max_completion_tokens. model_copy keeps with_structured_output.
+        if getattr(model, "max_completion_tokens", None) is not None:
+            capped = model.model_copy(update={"max_completion_tokens": cap})
+        elif getattr(model, "max_tokens", None) is not None:
+            capped = model.model_copy(update={"max_tokens": cap})
+        else:
+            capped = model.model_copy(update={"max_completion_tokens": cap})
+    except Exception:
+        logger.debug("findings cap: model_copy failed — using uncapped model", exc_info=True)
+        capped = model
+
+    try:
+        return capped.with_structured_output(ResearchFindings)
+    except Exception:
+        logger.debug("findings cap: model lacks with_structured_output", exc_info=True)
+        return None
+
+
 async def summarise_evidence(
     *,
     model: Any,
@@ -1253,17 +1291,12 @@ async def summarise_evidence(
     Returns the parsed finding as a dict, or ``None`` if the model
     rejected the call or the structured output binding is unsupported.
     """
-    from spine.agents.subagents import ResearchFindings
-
     if model is None:
         return None
 
-    try:
-        structured_model = model.with_structured_output(ResearchFindings)
-    except Exception:
-        logger.debug(
-            "summarise_evidence: model lacks with_structured_output", exc_info=True
-        )
+    structured_model = _findings_structured_model(model)
+    if structured_model is None:
+        logger.debug("summarise_evidence: model lacks with_structured_output")
         return None
 
     constraints_body = (
@@ -1502,8 +1535,6 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
     ``result`` untouched so the markdown fallback in ``_extract_findings``
     still produces something.
     """
-    from spine.agents.subagents import ResearchFindings
-
     if model is None:
         return
     messages = result.get("messages", [])
@@ -1524,10 +1555,9 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
         )
         return
 
-    try:
-        structured_model = model.with_structured_output(ResearchFindings)
-    except Exception:
-        logger.debug("Model does not support with_structured_output; skipping finalize", exc_info=True)
+    structured_model = _findings_structured_model(model)
+    if structured_model is None:
+        logger.debug("Model does not support with_structured_output; skipping finalize")
         return
 
     finalize_prompt = hostage_layout(
@@ -1617,17 +1647,13 @@ async def _finalize_research_findings_from_evidence(
 
     Mutates ``result`` in place on success.
     """
-    from spine.agents.subagents import ResearchFindings
-
     if model is None or not evidence:
         return
 
-    try:
-        structured_model = model.with_structured_output(ResearchFindings)
-    except Exception:
+    structured_model = _findings_structured_model(model)
+    if structured_model is None:
         logger.debug(
-            "Model does not support with_structured_output; skipping salvage finalize",
-            exc_info=True,
+            "Model does not support with_structured_output; skipping salvage finalize"
         )
         return
 

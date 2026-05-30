@@ -170,7 +170,7 @@ class SpineConfig:
 
     checkpoint_path: str = ".spine/spine.db"
     artifact_path: str = ".spine/artifacts"
-    max_critic_retries: int = 3
+    max_critic_retries: int = 2
     work_type: str = "task"
     providers: dict = field(default_factory=dict)
     queue_backend: str = "sqlite"
@@ -207,6 +207,18 @@ class SpineConfig:
     # research_manager loop and synthesize directly from the recalled chunks.
     recall_gate_confidence: float = 0.75
     recall_gate_min_hits: int = 5
+    # Trivial-task fast path. A short, high-confidence description with no
+    # architectural verbs short-circuits SPECIFY exploration even when the
+    # recall index returns zero hits (cold/empty index). Without this, a
+    # one-line task like "add a --verbose flag" ran a full 3-round, 6-explore
+    # research loop (trace 019e77a7) purely because recall returned 0 chunks.
+    recall_gate_trivial_max_chars: int = 150
+    # Completion-token cap for the researcher's ResearchFindings structured
+    # summarisation calls (summarise / finalize / salvage). A findings JSON is
+    # small; without a tight cap a local model can ramble to the global window
+    # cap (16K) and 207s before raising LengthFinishReasonError, which is then
+    # discarded anyway (trace 019e77fe). Capping fails fast to the sentinel.
+    summarise_max_completion_tokens: int = 4096
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -406,7 +418,7 @@ class SpineConfig:
                 "SPINE_ARTIFACT_PATH", spine.get("artifact_path", ".spine/artifacts")
             ),
             max_critic_retries=int(
-                os.getenv("SPINE_MAX_CRITIC_RETRIES", spine.get("max_critic_retries", 3))
+                os.getenv("SPINE_MAX_CRITIC_RETRIES", spine.get("max_critic_retries", 2))
             ),
             work_type=os.getenv("SPINE_WORK_TYPE", spine.get("work_type", "task")),
             providers=config.get("providers", {}),
@@ -451,6 +463,12 @@ class SpineConfig:
             ),
             recall_gate_confidence=float(spine.get("recall_gate_confidence", 0.75)),
             recall_gate_min_hits=int(spine.get("recall_gate_min_hits", 5)),
+            recall_gate_trivial_max_chars=int(
+                spine.get("recall_gate_trivial_max_chars", 150)
+            ),
+            summarise_max_completion_tokens=int(
+                spine.get("summarise_max_completion_tokens", 4096)
+            ),
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)
             ),
