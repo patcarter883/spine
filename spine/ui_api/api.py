@@ -199,6 +199,31 @@ class UIApi:
                 return feedback
         return []
 
+    def get_critic_review(self, work_id: str) -> dict[str, Any] | None:
+        """Get the critic's final verdict for a work item.
+
+        Unlike ``get_feedback`` (which only surfaces needs_review entries),
+        this returns the ``last_critic_review`` state field — the critic's
+        most recent verdict — which is available for any flagged item,
+        including ``awaiting_approval`` plans whose critic review PASSED.
+
+        Args:
+            work_id: The work item ID.
+
+        Returns:
+            The review dict (keys: phase, status, tier, reason, suggestions,
+            attempt), or None if no critic review is available.
+        """
+        entry = self.get_work(work_id)
+        if entry is None:
+            return None
+        result = entry.get("result", {})
+        if isinstance(result, dict):
+            review = result.get("last_critic_review")
+            if isinstance(review, dict) and review:
+                return review
+        return None
+
     # ── Audit operations ──
 
     def get_audit_log(

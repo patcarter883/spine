@@ -270,3 +270,90 @@ class TestUIApiGetFeedback:
 
             result = api.get_feedback("test-work-456")
             assert result == []
+
+
+class TestUIApiGetCriticReview:
+    """Tests for get_critic_review() method."""
+
+    def test_returns_none_for_nonexistent_work(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+
+            _init_queue_db(config)
+            api = UIApi(config)
+
+            assert api.get_critic_review("nonexistent") is None
+
+    def test_returns_review_for_passed_plan(self):
+        """awaiting_approval plans PASS, so feedback is empty — but the
+        critic verdict must still be available via last_critic_review."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+
+            _init_queue_db(config)
+            api = UIApi(config)
+
+            from spine.work.dispatcher import get_work_db
+
+            work_db = get_work_db(config)
+            review = {
+                "phase": "plan",
+                "status": "passed",
+                "tier": "agent",
+                "reason": "Plan is well-structured and traceable.",
+                "suggestions": ["Consider adding a rollback step"],
+                "attempt": 1,
+            }
+            work_db["work_entries"].insert(
+                {
+                    "id": "plan-work-1",
+                    "description": "Plan work",
+                    "work_type": "reviewed_task",
+                    "status": "awaiting_approval",
+                    "current_phase": "critic",
+                    "created_at": "2024-01-01T00:00:00",
+                    "updated_at": "2024-01-01T00:00:00",
+                    "result": json.dumps(
+                        {"feedback": [], "last_critic_review": review}
+                    ),
+                }
+            )
+
+            # No needs_review feedback, but the critic verdict is available.
+            assert api.get_feedback("plan-work-1") == []
+            result = api.get_critic_review("plan-work-1")
+            assert result is not None
+            assert result["status"] == "passed"
+            assert result["reason"] == "Plan is well-structured and traceable."
+            assert result["suggestions"] == ["Consider adding a rollback step"]
+
+    def test_returns_none_when_review_missing_or_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+
+            _init_queue_db(config)
+            api = UIApi(config)
+
+            from spine.work.dispatcher import get_work_db
+
+            work_db = get_work_db(config)
+            work_db["work_entries"].insert(
+                {
+                    "id": "no-review-1",
+                    "description": "Work",
+                    "work_type": "task",
+                    "status": "completed",
+                    "current_phase": "verify",
+                    "created_at": "2024-01-01T00:00:00",
+                    "updated_at": "2024-01-01T00:00:00",
+                    "result": json.dumps({"last_critic_review": None}),
+                }
+            )
+
+            assert api.get_critic_review("no-review-1") is None

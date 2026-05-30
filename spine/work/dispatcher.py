@@ -514,6 +514,10 @@ async def submit_work(
                         "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
                         "feedback_count": len(feedback),
                         "feedback": needs_review_feedback,
+                        # The critic's final verdict — kept regardless of status
+                        # so reviewers can see it for awaiting_approval plans
+                        # (which PASS, and so leave needs_review_feedback empty).
+                        "last_critic_review": result.get("last_critic_review"),
                         "prompt_request": result.get("prompt_request"),
                     }
                 ),

@@ -1,6 +1,14 @@
-"""SPINE Work Detail page — combined view of work status and artifacts."""
+"""SPINE Work Detail page — combined view of work status and artifacts.
+
+This is the single surface for human review: it shows the critic's feedback
+and provides the review/feedback/approval actions for items flagged as
+``needs_review`` or ``awaiting_approval``. The Human Review page is only an
+index that links here.
+"""
 
 from __future__ import annotations
+
+import asyncio
 
 import streamlit as st
 
@@ -67,6 +75,53 @@ def _execution_duration(api: UIApi, work_id: str, entry: dict[str, object], stat
     else:
         # Unknown or pending — fall back to entry timestamps
         return format_duration(entry.get("created_at"), entry.get("updated_at"))
+
+
+def _render_critic_review(api: UIApi, work_id: str) -> None:
+    """Show the critic's verdict so the reviewer knows why it was flagged."""
+    review = api.get_critic_review(work_id)
+    if not review:
+        return
+
+    phase = review.get("phase", "")
+    status = review.get("status", "")
+    header = " · ".join(p for p in (phase, status) if p) or "Critic Review"
+    with st.expander(f"🔍 Critic Review — {header}", expanded=True):
+        st.caption(f"Review tier: {review.get('tier', 'unknown')}")
+        reason = review.get("reason")
+        if reason:
+            st.markdown(f"**Reason:** {reason}")
+        suggestions = review.get("suggestions") or []
+        if suggestions:
+            st.markdown("**Suggestions:**")
+            for suggestion in suggestions:
+                st.markdown(f"- {suggestion}")
+
+
+def _run_plan_action(api: UIApi, work_id: str, action: str, feedback: str | None) -> None:
+    """Submit an approve / request_revision / reject decision for a plan."""
+    with st.spinner(f"Submitting {action}..."):
+        result = asyncio.run(api.approve_plan(work_id, action=action, feedback=feedback))
+
+    if "error" in result or result.get("status") == "error":
+        st.error(f"Failed: {result.get('error', 'Unknown error')}")
+        return
+
+    if action == "approve":
+        spawned = result.get("spawned_ids", [])
+        if spawned:
+            st.success(f"Approved! Spawned {len(spawned)} task(s).")
+        else:
+            # Same work item continued from IMPLEMENT (no fresh spawn).
+            st.success(
+                f"Plan approved — continued from implement "
+                f"(status: {result.get('status', 'ok')})."
+            )
+    elif action == "request_revision":
+        st.info(f"Revision requested. Status: {result.get('status', 'submitted')}")
+    else:
+        st.info(f"Plan rejected. Status: {result.get('status', 'rejected')}")
+    st.rerun()
 
 
 # ── Fragment sections ──
@@ -377,6 +432,40 @@ def render(api: UIApi) -> None:
                 "The workflow will re-run from the beginning."
             )
             st.rerun()
+
+    elif status == "awaiting_approval":
+        st.warning(
+            "This plan is awaiting your approval before execution tasks are spawned."
+        )
+
+        # ── Critic verdict ──
+        _render_critic_review(api, work_id)
+
+        st.subheader("Approval")
+        st.caption(
+            "The specification and plan are shown in the Artifacts section above. "
+            "Approve to continue execution, request a revision with feedback, or reject."
+        )
+        plan_feedback = st.text_area(
+            "Feedback",
+            placeholder="Optional for approve/reject; required when requesting a revision.",
+            key=f"plan_feedback_{work_id}",
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("✅ Approve & Run", type="primary", key=f"plan_approve_{work_id}"):
+                _run_plan_action(api, work_id, "approve", plan_feedback or None)
+        with col2:
+            if st.button("🔄 Request Revision", key=f"plan_revise_{work_id}"):
+                if not plan_feedback.strip():
+                    st.error("Please add feedback explaining the requested revisions.")
+                else:
+                    _run_plan_action(api, work_id, "request_revision", plan_feedback)
+        with col3:
+            if st.button("❌ Reject", key=f"plan_reject_{work_id}"):
+                _run_plan_action(api, work_id, "reject", plan_feedback or None)
+
     elif status == "running":
         st.info("Work is currently in progress. Updates will appear automatically.")
 
