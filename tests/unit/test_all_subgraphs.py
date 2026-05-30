@@ -38,15 +38,6 @@ class TestAllSubgraphsCompile:
         assert "synthesize_implementation" in nodes
         assert "save_artifacts" in nodes
 
-    def test_tasks_subgraph_compiles(self):
-        from spine.workflow.subgraphs.tasks_subgraph import build_tasks_subgraph
-
-        graph = build_tasks_subgraph().compile()
-        assert graph is not None
-        nodes = set(graph.get_graph().nodes.keys())
-        assert "run_agent" in nodes
-        assert "save_artifacts" in nodes
-
     def test_specify_subgraph_compiles(self):
         from spine.workflow.subgraphs.specify_subgraph import build_specify_subgraph
 
@@ -187,23 +178,6 @@ class TestSubgraphStateMappers:
         assert result["spec_path"] == ".spine/artifacts/def/specify"
         assert result["has_spec"] is True
 
-    def test_tasks_state_mapper_task(self):
-        from spine.workflow.compose import _tasks_state_mapper
-
-        parent = {"work_id": "abc", "work_type": "task", "description": "d"}
-        result = _tasks_state_mapper(parent, None)
-        assert result["phase"] == "tasks"
-        assert result["plan_path"] == ".spine/artifacts/abc/plan"
-        assert result["spec_path"] == ".spine/artifacts/abc/specify"
-
-    def test_tasks_state_mapper_spec(self):
-        from spine.workflow.compose import _tasks_state_mapper
-
-        parent = {"work_id": "abc", "work_type": "task", "description": "d"}
-        result = _tasks_state_mapper(parent, None)
-        assert result["plan_path"] == ".spine/artifacts/abc/plan"
-        assert result["spec_path"] == ".spine/artifacts/abc/specify"
-
     def test_implement_state_mapper(self):
         from spine.workflow.compose import _implement_state_mapper
 
@@ -247,16 +221,6 @@ class TestSubgraphResultMappers:
         result = _plan_result_mapper(subgraph_result, {"work_id": "test"})
         assert result["status"] == "needs_review"
         assert result["needs_review_phase"] == "plan"
-
-    def test_tasks_result_mapper_error(self):
-        from spine.workflow.compose import _tasks_result_mapper
-
-        subgraph_result = {
-            "artifacts_output": {},
-            "phase_status": "error",
-        }
-        result = _tasks_result_mapper(subgraph_result, {"work_id": "test"})
-        assert result["status"] == "failed"
 
     def test_implement_result_mapper_success(self):
         from spine.workflow.compose import _implement_result_mapper

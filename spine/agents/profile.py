@@ -83,16 +83,12 @@ SPINE_BASE_PROMPT = (
     + xml_block(
         Tag.CONSTRAINTS,
         "Core behaviour:\n"
-        "- Act, don't narrate. Never say \"I'll now do X\" — just do it.\n"
-        "- Work until the phase objective is fully met. Do not yield early "
-        "with a summary of what you would do.\n"
-        "- If something fails repeatedly, stop and analyze *why* before "
-        "retrying. Don't pound the same broken approach.\n"
-        "- Your first attempt is rarely correct — iterate.\n"
-        "- Be concise in reasoning. Reserve verbosity for the final artifact.\n"
-        "- Batch independent operations. When you need to read ≥2 files or "
-        "run ≥2 searches, make all calls in one response instead of "
-        "sequentially.",
+        "- Act, don't narrate — execute steps rather than describing them.\n"
+        "- Work until the phase objective is fully met; do not yield early.\n"
+        "- On repeated failure, diagnose the cause before retrying.\n"
+        "- Be concise in reasoning; reserve detail for the final artifact.\n"
+        "- Batch independent operations — issue ≥2 reads/searches in one "
+        "response.",
     )
     + "\n\n"
     + xml_block(

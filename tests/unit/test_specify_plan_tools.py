@@ -169,6 +169,105 @@ class TestWriteSpecificationTool:
         assert (tmp_path / ".spine/artifacts/brand-new/specify/specification.md").exists()
         assert (tmp_path / ".spine/artifacts/brand-new/specify/specification.json").exists()
 
+    # ── Lever D: empty-scope pre-check for non-trivial work ───────────────
+
+    def _tool_with_description(
+        self, tmp_path: Path, description: str, work_id: str = "wk-d"
+    ) -> WriteSpecificationTool:
+        return WriteSpecificationTool(
+            workspace_root=str(tmp_path),
+            spec_dir=f".spine/artifacts/{work_id}/specify",
+            work_description=description,
+        )
+
+    def test_rejects_empty_scope_for_nontrivial_description(self, tmp_path):
+        """Long descriptions or descriptions containing implementation keywords
+        ('implement', 'refactor', etc.) trigger the empty-scope guard."""
+        tool = self._tool_with_description(
+            tmp_path,
+            description="Implement a project onboarding engine that ingests "
+            "repository metadata, builds a knowledge map, and routes new "
+            "engineers through a guided tour of the codebase.",
+            work_id="wk-nontrivial",
+        )
+        result = tool._run(
+            title="Onboarding",
+            summary="Build it.",
+            requirements=["FR1: ingest repo"],
+            scope_inclusions=[],
+            scope_exclusions=[],
+        )
+        assert result.startswith("VALIDATION_ERROR")
+        assert "scope_inclusions" in result
+        assert "scope_exclusions" in result
+        assert not (
+            tmp_path / ".spine/artifacts/wk-nontrivial/specify/specification.md"
+        ).exists()
+
+    def test_rejects_when_only_one_scope_field_is_empty(self, tmp_path):
+        tool = self._tool_with_description(
+            tmp_path,
+            description="Refactor the auth middleware to meet new compliance.",
+            work_id="wk-half",
+        )
+        result = tool._run(
+            title="t",
+            summary="s",
+            requirements=["FR1"],
+            scope_inclusions=["spine/auth"],
+            scope_exclusions=[],
+        )
+        assert result.startswith("VALIDATION_ERROR")
+        assert "scope_exclusions" in result
+        assert "scope_inclusions" not in result.split("MUST be non-empty: ")[1]
+
+    def test_allows_empty_scope_for_trivial_description(self, tmp_path):
+        """Short descriptions with no implementation verbs are exempt from
+        the empty-scope guard (proportionality rule)."""
+        tool = self._tool_with_description(
+            tmp_path,
+            description="Add a --verbose flag to spine CLI",
+            work_id="wk-trivial",
+        )
+        result = tool._run(
+            title="Verbose Flag",
+            summary="Add a --verbose flag.",
+            requirements=["FR1: --verbose echoes config path"],
+            scope_inclusions=[],
+            scope_exclusions=[],
+        )
+        assert not result.startswith("VALIDATION_ERROR")
+        assert (
+            tmp_path / ".spine/artifacts/wk-trivial/specify/specification.md"
+        ).exists()
+
+    def test_no_description_does_not_trigger_guard(self, tmp_path):
+        """A WriteSpecificationTool built without an injected work_description
+        (e.g. legacy callers) must not spuriously reject empty scope."""
+        tool = WriteSpecificationTool(
+            workspace_root=str(tmp_path),
+            spec_dir=".spine/artifacts/wk-bare/specify",
+        )
+        result = tool._run(
+            title="t",
+            summary="s",
+            requirements=["FR1"],
+            scope_inclusions=[],
+            scope_exclusions=[],
+        )
+        assert not result.startswith("VALIDATION_ERROR")
+
+    def test_factory_threads_description_into_write_tool(self, tmp_path):
+        tools = build_specify_orchestrator_tools(
+            workspace_root=str(tmp_path),
+            work_id="wf",
+            description="Implement onboarding engine",
+            work_type="task",
+        )
+        write_tool = next(t for t in tools if t.name == "write_specification")
+        assert isinstance(write_tool, WriteSpecificationTool)
+        assert write_tool.work_description == "Implement onboarding engine"
+
 
 # ── build_specify_orchestrator_tools ─────────────────────────────────────
 
@@ -333,6 +432,75 @@ class TestSearchCodebaseTool:
         assert result["total_files_found"] >= 1
 
 
+# ── SearchCodebaseTool arg coercion (trace 019e72f5) ──────────────────────
+
+
+class TestSearchCodebaseArgCoercion:
+    """Regression for trace 019e72f5: local models serialise `queries` as a
+    JSON-string or spill their tool-call XML into the value, and the bare
+    `list[str]` schema 400'd with an unhelpful `list_type` error. The
+    before-validator now coerces recoverable strings and rejects spilled
+    markup with a teaching message — mirroring the codebase_query hardening."""
+
+    def test_json_string_queries_coerced_to_list(self):
+        from spine.agents.plan_tools import _SearchCodebaseInput
+
+        m = _SearchCodebaseInput.model_validate({"queries": '["WorkflowState", "submit_work"]'})
+        assert m.queries == ["WorkflowState", "submit_work"]
+
+    def test_bare_string_query_wrapped_in_list(self):
+        from spine.agents.plan_tools import _SearchCodebaseInput
+
+        # Not valid JSON → treated as a single search term, not rejected.
+        m = _SearchCodebaseInput.model_validate({"queries": "build_phase_agent"})
+        assert m.queries == ["build_phase_agent"]
+
+    def test_clean_list_passes_through_unchanged(self):
+        from spine.agents.plan_tools import _SearchCodebaseInput
+
+        m = _SearchCodebaseInput.model_validate({"queries": ["a", "b"], "file_patterns": ["*.py"]})
+        assert m.queries == ["a", "b"]
+        assert m.file_patterns == ["*.py"]
+
+    def test_file_patterns_json_string_coerced(self):
+        from spine.agents.plan_tools import _SearchCodebaseInput
+
+        m = _SearchCodebaseInput.model_validate(
+            {"queries": ["x"], "file_patterns": '["spine/agents/*.py"]'}
+        )
+        assert m.file_patterns == ["spine/agents/*.py"]
+
+    def test_markup_spill_rejected_with_teaching_message(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from spine.agents.plan_tools import _SearchCodebaseInput
+
+        # The exact shape from trace 019e72f5: the model fused the
+        # file_patterns arg into the queries string and spilled its
+        # <arg_value> tool-call envelope.
+        bad = '["Click command group", "initialization\n<arg_key>file_patterns</arg_key>\n<arg_value>["*.py"]'
+        with pytest.raises(ValidationError, match="tool-call markup"):
+            _SearchCodebaseInput.model_validate({"queries": bad})
+
+    def test_markup_in_list_element_rejected(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from spine.agents.plan_tools import _SearchCodebaseInput
+
+        with pytest.raises(ValidationError, match="tool-call markup"):
+            _SearchCodebaseInput.model_validate({"queries": ["ok", "bad</arg_value>"]})
+
+    def test_invoke_with_json_string_queries_succeeds(self, tmp_path):
+        """End-to-end via the langchain tool path that 400'd in the trace:
+        a JSON-string `queries` arg now validates and runs."""
+        (tmp_path / "mod.py").write_text("def build_phase_agent():\n    pass\n")
+        tool = SearchCodebaseTool(workspace_root=str(tmp_path))
+        result = json.loads(tool.invoke({"queries": '["build_phase_agent"]'}))
+        assert result["queries_run"] == ["build_phase_agent"]
+
+
 # ── WritePlanTool ─────────────────────────────────────────────────────────
 
 
@@ -443,6 +611,95 @@ class TestStructuredWritePlanTool:
         tool._run(**self._full_args())
         assert (tmp_path / ".spine/artifacts/fresh/plan/plan.md").exists()
         assert (tmp_path / ".spine/artifacts/fresh/plan/plan.json").exists()
+
+    # ── Lever B: structural pre-validation inside the write tool ──────────
+
+    def test_rejects_unknown_dependency(self, tmp_path):
+        """A slice depending on a non-existent ID must be rejected BEFORE
+        the file write, so the synthesizer's tool loop can self-correct
+        without round-tripping through the critic."""
+        tool = self._tool(tmp_path, work_id="dep-bad")
+        args = self._full_args()
+        args["feature_slices"] = [
+            {
+                "id": "only-slice",
+                "title": "Only",
+                "target_files": ["x.py"],
+                "execution_requirements": "do",
+                "dependencies": ["does-not-exist"],
+                "acceptance_criteria": ["it works"],
+                "complexity": "small",
+            }
+        ]
+        result = tool._run(**args)
+        assert result.startswith("VALIDATION_ERROR")
+        assert "does-not-exist" in result
+        assert not (tmp_path / ".spine/artifacts/dep-bad/plan/plan.md").exists()
+        assert not (tmp_path / ".spine/artifacts/dep-bad/plan/plan.json").exists()
+
+    def test_rejects_cycle(self, tmp_path):
+        tool = self._tool(tmp_path, work_id="cyc")
+        args = self._full_args()
+        args["feature_slices"] = [
+            {
+                "id": "a",
+                "title": "A",
+                "target_files": ["a.py"],
+                "execution_requirements": "do",
+                "dependencies": ["b"],
+                "acceptance_criteria": ["ok"],
+                "complexity": "small",
+            },
+            {
+                "id": "b",
+                "title": "B",
+                "target_files": ["b.py"],
+                "execution_requirements": "do",
+                "dependencies": ["a"],
+                "acceptance_criteria": ["ok"],
+                "complexity": "small",
+            },
+        ]
+        result = tool._run(**args)
+        assert result.startswith("VALIDATION_ERROR")
+        assert "cycle" in result.lower()
+        assert not (tmp_path / ".spine/artifacts/cyc/plan/plan.md").exists()
+
+    def test_rejects_duplicate_ids(self, tmp_path):
+        tool = self._tool(tmp_path, work_id="dup")
+        args = self._full_args()
+        args["feature_slices"] = [
+            {
+                "id": "same",
+                "title": "First",
+                "target_files": ["a.py"],
+                "execution_requirements": "do",
+                "dependencies": [],
+                "acceptance_criteria": ["ok"],
+                "complexity": "small",
+            },
+            {
+                "id": "same",
+                "title": "Second",
+                "target_files": ["b.py"],
+                "execution_requirements": "do",
+                "dependencies": [],
+                "acceptance_criteria": ["ok"],
+                "complexity": "small",
+            },
+        ]
+        result = tool._run(**args)
+        assert result.startswith("VALIDATION_ERROR")
+        assert "same" in result
+        assert not (tmp_path / ".spine/artifacts/dup/plan/plan.md").exists()
+
+    def test_writes_when_valid_dag(self, tmp_path):
+        """Happy path: a clean DAG passes pre-validation and writes."""
+        tool = self._tool(tmp_path, work_id="ok")
+        result = tool._run(**self._full_args())
+        assert not result.startswith("VALIDATION_ERROR")
+        assert (tmp_path / ".spine/artifacts/ok/plan/plan.md").exists()
+        assert (tmp_path / ".spine/artifacts/ok/plan/plan.json").exists()
 
 
 # ── build_plan_agent_tools ────────────────────────────────────────────────

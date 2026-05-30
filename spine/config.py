@@ -242,6 +242,29 @@ class SpineConfig:
     topic_lookup_top_k: int = 2
     topic_lookup_min_similarity: float = 0.5
 
+    # Distributed onboarding engine (design Revision 2). The synthesis stage
+    # decomposes into a documentation-manager + section-worker hierarchy where
+    # no LLM ever sees the whole manifest. ``onboarding_section_token_cap`` is
+    # the hard per-fragment ceiling resolve_fragment() enforces (degrade
+    # key_symbols→names→truncate so a fragment never exceeds it);
+    # ``onboarding_max_sections`` caps call volume by ranking + grouping the
+    # module tail in the compact index. Per-phase model overrides resolve via
+    # the existing ``providers.phases`` convention under the keys
+    # ``onboarding/doc-manager`` and ``onboarding/section-worker`` (both
+    # default to the resolved default model when unset).
+    onboarding_section_token_cap: int = 6000
+    onboarding_max_sections: int = 32
+    # ``onboarding_distributed_analysis`` routes analysis through the
+    # deterministic map-reduce graph (one explorer Send per module unit); when
+    # ``False`` the manager calls ``RepoAnalyzer.analyze`` inline with 0 explorer
+    # Sends (the monolithic fallback for tiny repos). ``onboarding_explorer_llm``
+    # + ``onboarding_explorer_max_cycles`` gate the opt-in LLM-enriched explorer
+    # mode (NOT implemented yet — flags only; the deterministic branch is the
+    # only path today).
+    onboarding_distributed_analysis: bool = True
+    onboarding_explorer_llm: bool = False
+    onboarding_explorer_max_cycles: int = 3
+
     # Researcher convergence steering (see ResearcherConvergenceMiddleware)
     convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)
 
@@ -452,6 +475,34 @@ class SpineConfig:
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 2)),
             topic_lookup_min_similarity=float(
                 spine.get("topic_lookup_min_similarity", 0.5)
+            ),
+            onboarding_section_token_cap=int(
+                os.getenv(
+                    "SPINE_ONBOARDING_SECTION_TOKEN_CAP",
+                    spine.get("onboarding_section_token_cap", 6000),
+                )
+            ),
+            onboarding_max_sections=int(
+                os.getenv(
+                    "SPINE_ONBOARDING_MAX_SECTIONS",
+                    spine.get("onboarding_max_sections", 32),
+                )
+            ),
+            onboarding_distributed_analysis=os.getenv(
+                "SPINE_ONBOARDING_DISTRIBUTED_ANALYSIS",
+                str(spine.get("onboarding_distributed_analysis", True)).lower(),
+            )
+            not in ("0", "false", "no"),
+            onboarding_explorer_llm=os.getenv(
+                "SPINE_ONBOARDING_EXPLORER_LLM",
+                str(spine.get("onboarding_explorer_llm", False)).lower(),
+            )
+            in ("1", "true", "yes"),
+            onboarding_explorer_max_cycles=int(
+                os.getenv(
+                    "SPINE_ONBOARDING_EXPLORER_MAX_CYCLES",
+                    spine.get("onboarding_explorer_max_cycles", 3),
+                )
             ),
             convergence=_parse_convergence_config(spine.get("convergence", {})),
             token_compaction=_parse_token_compaction_config(

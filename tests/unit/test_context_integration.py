@@ -13,8 +13,6 @@ end-to-end integration of:
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -315,45 +313,6 @@ class TestEditFileEmptyOldString:
 # ── 3. PTC allowlist excludes read_file ─────────────────────────────────
 
 
-# ── 3. codebase-map prompt enrichment ───────────────────────────────────
-
-
-class TestCodebaseMapPromptEnrichment:
-    """Verify tasks agent prompt includes Modification Targets section and
-    snippet examples for the codebase-map artifact."""
-
-    def test_tasks_prompt_has_modification_targets(self) -> None:
-        """The tasks agent prompt must include a 'Modification Targets'
-        section that tells the agent to include code snippets around
-        change sites in codebase-map.md."""
-        import spine.agents.tasks_agent as tasks_mod
-
-        source = inspect.getsource(tasks_mod)
-        assert "Modification Targets" in source, (
-            "Tasks agent prompt must include a 'Modification Targets' section "
-            "in the codebase-map instructions"
-        )
-
-    def test_tasks_prompt_has_snippet_example(self) -> None:
-        """The tasks agent prompt must include an example code snippet
-        showing how to annotate modification targets with line ranges."""
-        import spine.agents.tasks_agent as tasks_mod
-
-        source = inspect.getsource(tasks_mod)
-        # The example should show a code snippet with line range annotation
-        assert "L" in source and "snippet" in source.lower() or "line range" in source.lower(), (
-            "Tasks agent prompt must include snippet examples with line ranges "
-            "for modification targets"
-        )
-
-    def test_tasks_prompt_references_codebase_map(self) -> None:
-        """The tasks agent prompt must reference codebase-map.md."""
-        import spine.agents.tasks_agent as tasks_mod
-
-        source = inspect.getsource(tasks_mod)
-        assert "codebase-map" in source, "Tasks agent prompt must reference codebase-map.md"
-
-
 # ── 5. Researcher minimum output requirements ───────────────────────────
 
 
@@ -367,11 +326,14 @@ class TestResearcherMinOutput:
         prompt = SUBAGENT_PROMPTS["researcher"]
         assert "Hard limits" in prompt, "Researcher prompt must include a Hard limits section"
 
-    def test_researcher_prompt_requires_at_least_2_files(self) -> None:
-        """The researcher must use at least 2 MCP tools (or read 2 files) before reporting."""
+    def test_researcher_prompt_requires_tool_use(self) -> None:
+        """The researcher must use tools (codebase_query) before reporting."""
         prompt = SUBAGENT_PROMPTS["researcher"]
-        assert "at least 2 MCP tools" in prompt or "at least 2 files" in prompt, (
+        assert "YOU MUST USE TOOLS" in prompt, (
             "Researcher prompt must require tool use before reporting"
+        )
+        assert "look up every symbol named in your topic" in prompt, (
+            "Researcher prompt must require symbol lookup before falling back to search"
         )
 
     def test_researcher_prompt_requires_file_map_entry(self) -> None:

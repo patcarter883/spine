@@ -1,12 +1,13 @@
 """IMPLEMENT phase subgraph — SmallCode refactor.
 
-The slice-implementer's filesystem tool surface is narrowed to a single
-Compound Tool ``ReadEditLintTool`` (read -> edit -> lint, atomic with
-revert on lint failure) plus the MCP codebase-index tools. Removing
-``read_file`` / ``write_file`` / ``edit_file`` / ``ls`` / ``glob`` /
-``grep`` / ``execute`` / ``search_codebase`` stops the Qwen3-class
-local model from looping on raw reads and surfaces lint errors before
-synthesis declares a slice "implemented".
+The slice-implementer's write surface is a single Compound Tool
+``ReadEditLintTool`` (read -> edit -> lint, atomic with revert on lint
+failure), the only tool that can mutate files. For navigation it carries
+the curated read/search surface — the ``codebase_query`` index wrapper
+plus ``read_file`` / ``search_codebase`` / ``ast_extract_symbol`` — and
+``execute`` for tests/linters. Generic ``write_file`` / ``edit_file`` and
+raw ``mcp_``-prefixed tools are never exposed, which surfaces lint errors
+before synthesis declares a slice "implemented".
 
 Dispatch is a loop driven by a single conditional edge ``_route_slices``:
 ``pending_slices`` -> ``slice_implementer`` (per-slice Sends),
@@ -171,15 +172,16 @@ async def _slice_implementer_node(
 ) -> dict[str, Any]:
     """Run a slice-implementer subagent on the active slice.
 
-    Tools available to the subagent are restricted to
-    ``ReadEditLintTool`` plus MCP codebase-index tools — raw filesystem
-    tools are stripped. Returns a state update that removes the active
-    slice from ``pending_slices`` and adds it (with outcome merged in)
-    to either ``completed_slices`` or ``failed_slices``.
+    The subagent's tool surface is the curated set built by
+    ``build_subagent_spec`` — ``read_edit_lint`` (the only write tool),
+    the ``codebase_query`` index wrapper, plus ``read_file`` /
+    ``search_codebase`` / ``ast_extract_symbol`` / ``execute``. No raw
+    ``mcp_``-prefixed tool is exposed. Returns a state update that removes
+    the active slice from ``pending_slices`` and adds it (with outcome
+    merged in) to either ``completed_slices`` or ``failed_slices``.
     """
     from spine.agents.factory import build_phase_agent
     from spine.agents.subagents import build_subagent_spec
-    from spine.agents.tools.read_edit_lint import ReadEditLintTool
 
     work_id = state.get("work_id", "unknown")
     workspace_root = state.get("workspace_root", ".")
@@ -201,16 +203,11 @@ async def _slice_implementer_node(
             config=config,
         )
 
-        spec_tools = list(subagent_spec.get("tools", []))
-        mcp_tools = [t for t in spec_tools if getattr(t, "name", "").startswith("mcp_")]
-        restricted_tools: list[Any] = [
-            ReadEditLintTool(workspace_root=workspace_root),
-            *mcp_tools,
-        ]
+        extra_tools = list(subagent_spec.get("tools", []))
         logger.info(
-            "[%s] slice_implementer: tool surface = read_edit_lint + %d MCP tool(s)",
+            "[%s] slice_implementer: tool surface = %s",
             work_id,
-            len(mcp_tools),
+            [getattr(t, "name", repr(t)) for t in extra_tools],
         )
 
         agent = build_phase_agent(
@@ -219,16 +216,12 @@ async def _slice_implementer_node(
             phase=PhaseName.IMPLEMENT,
             system_prompt=subagent_spec["system_prompt"],
             is_subagent=True,
-            extra_tools=restricted_tools,
+            extra_tools=extra_tools,
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
-            # The subagent_spec already injected MCP tools via
-            # _inject_mcp_tools in subagents.py — they live in
-            # ``restricted_tools`` above (filtered from spec_tools).
-            # Letting the factory re-inject them would duplicate the
-            # whole catalog and double-emit the mcp_guidance prompt
-            # block. See trace 019e721d audit.
-            skip_default_mcp_injection=True,
+            # The subagent_spec already curated the implementer's tool
+            # surface (read_edit_lint + codebase_query wrapper + read/search/
+            # execute via subagents.py) — they live in ``extra_tools`` above.
         )
 
         slice_json = json.dumps(active_slice, indent=2, ensure_ascii=False, default=str)

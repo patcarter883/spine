@@ -19,8 +19,8 @@ arbitrarily.
 PLAN research strategy: codebase exploration is handled UPSTREAM by the
 exploration subgraph (LangGraph Send API) before this agent runs.  The
 agent synthesises those findings to produce the plan.  ``search_codebase``
-and MCP tools are supplemental, used only for narrow targeted lookups that
-were not covered by the upstream exploration.
+is supplemental, used only for narrow targeted lookups that were not
+covered by the upstream exploration.
 """
 
 from __future__ import annotations
@@ -81,12 +81,6 @@ def build_plan_agent(
         system_prompt=system_prompt,
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
-        # The PLAN orchestrator's prompt names only read_prior_artifacts,
-        # search_codebase, and write_structured_plan — the MCP catalog is
-        # dead weight here (see trace 019e721d audit). All structural
-        # exploration happens in the exploration_subgraph; this
-        # orchestrator only synthesises.
-        skip_default_mcp_injection=True,
     )
 
     return agent
@@ -136,12 +130,6 @@ def build_plan_synthesizer(
         system_prompt=_build_plan_synthesizer_prompt(),
         extra_tools=synthesizer_tools,
         skip_filesystem_middleware=True,
-        # Synthesizer-only: read_prior_artifacts + write_structured_plan.
-        # Trace 019e721d showed this synthesizer mis-using MCP tools
-        # mid-synthesis (e.g. mcp_codebase-index_get_function_source
-        # called with file_path but no name) — eliminating the catalog
-        # removes the temptation.
-        skip_default_mcp_injection=True,
     )
 
 
@@ -200,8 +188,8 @@ def _build_plan_prompt() -> str:
         "`write_structured_plan`.\\n\\n"
         "## Rules\\n"
         "- Call `read_prior_artifacts` first.\\n"
-        "- Every target_file path must come from MCP, search_codebase, or "
-        "confirmed existing directory.\\n"
+        "- Every target_file path must come from `search_codebase`, the "
+        "exploration findings in your context, or a confirmed existing directory.\\n"
         "- Call `write_structured_plan` exactly once with all required fields.\\n"
         "- If not called by turn 4, write with current information.\\n"
     )

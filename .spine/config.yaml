@@ -101,7 +101,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 3
+    max_concurrent_calls: 4
   - name: tiny
     type: deepagents-model
     model: openai:Bonsai-8B-gguf
@@ -113,7 +113,7 @@ providers:
   - name: local-embeddings
     type: openai-embedding
     model: Qwen3-Embedding-8B-GGUF
-    base_url: http://localhost:8000/v1
+    base_url: http://localhost:8010/v1
     api_key: vllm
     stream_usage: true
   phases:

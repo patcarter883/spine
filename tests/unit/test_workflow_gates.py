@@ -4,20 +4,12 @@ from __future__ import annotations
 
 import json
 import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-# Stub the broken tasks_agent module (syntax error from incomplete refactor).
-# This unblocks the registry import chain without hiding real test failures.
-if "spine.agents.tasks_agent" not in sys.modules:
-    _stub = types.ModuleType("spine.agents.tasks_agent")
-    _stub.build_tasks_agent = lambda *a, **kw: None  # type: ignore[attr-defined]
-    sys.modules["spine.agents.tasks_agent"] = _stub
 
 
 # ── Artifact gate tests ──

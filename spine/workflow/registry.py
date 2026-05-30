@@ -128,7 +128,6 @@ def _import_phase_modules() -> None:
     """Import all phase modules to trigger their registration side effects."""
     import spine.phases.specify  # noqa: F401
     import spine.phases.plan  # noqa: F401
-    import spine.phases.tasks  # noqa: F401
     import spine.phases.implement  # noqa: F401
     import spine.phases.verify  # noqa: F401
     import spine.phases.critic  # noqa: F401

@@ -572,6 +572,9 @@ async def run_research_manager(
         (
             "Decide: are we done, or do we need more research? If exploring, "
             "return 2-4 plain-language topics framed as research questions. "
+            "Returning decision='explore' with an empty topics list is "
+            "invalid — if you cannot articulate at least one concrete topic, "
+            "decide 'done' instead. "
             "Topics MUST NOT contain symbol names, function names, class "
             "names, or file paths — a downstream lookup step resolves each "
             "topic to the relevant symbols automatically. Cross-reference "
@@ -633,7 +636,27 @@ async def run_research_manager(
             "[%s] Research manager: decision=%s topics=%s",
             work_id, parsed.decision, parsed.topics,
         )
-        result: dict[str, Any] = {"manager_decision": parsed.decision, "topics": parsed.topics}
+
+        # Small local models (trace 019e72bc) sometimes pick "explore" while
+        # leaving topics=[] — a structurally-valid but semantically-empty
+        # response that the downstream router treats as a contract failure.
+        # Treat the empty-topics shape as the model declining to research
+        # further and downgrade to "done" so synthesis can proceed. The
+        # alternative (generic-topic fallback) burns a whole research round
+        # on trivial tasks where the model already signalled it has nothing
+        # specific to investigate.
+        decision = parsed.decision
+        topics = parsed.topics
+        if decision == "explore" and not topics:
+            logger.warning(
+                "[%s] Research manager: model returned explore with empty "
+                "topics on round %d (phase=%s) — coercing to 'done' so the "
+                "workflow can proceed. Treat this as the model declining to "
+                "research further.",
+                work_id, round_num + 1, phase,
+            )
+            decision = "done"
+        result: dict[str, Any] = {"manager_decision": decision, "topics": topics}
         if task_category:
             result["task_category"] = task_category
         return result

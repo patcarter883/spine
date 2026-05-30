@@ -9,8 +9,6 @@ features:
   and referenced by path, not inlined into the prompt.
 - **Memory** — workspace AGENTS.md files are loaded via ``MemoryMiddleware``
   for always-injected project conventions.
-- **Skills** — phase-specific skills are loaded via ``SkillsMiddleware``
-  for progressive disclosure.
 - **Context schema** — ``SpineContext`` provides typed per-run context.
 - **Read cache** — ``ReadCacheMiddleware`` prevents re-read amnesia by
   returning cached metadata summaries for already-read files.
@@ -40,7 +38,6 @@ import logging
 from typing import Any
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import TodoListMiddleware
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.runnables import RunnableConfig
 
@@ -50,7 +47,6 @@ from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 
 from spine.agents.prompt_format import Tag, xml_block
-from deepagents.middleware.skills import SkillsMiddleware
 
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
@@ -129,9 +125,9 @@ def _supports_cache_control(model: Any) -> bool:
 class StaticPrefixCacheMiddleware:
     """Mark the static system prefix with an Anthropic ephemeral cache breakpoint.
 
-    The factory assembles the system prompt as ``user_prompt + BASE_AGENT_PROMPT
-    + mcp_guidance``. The *base prompt + MCP guidance* portion is identical
-    across every turn of a given phase agent, so it is the right thing to
+    The factory assembles the system prompt as ``user_prompt +
+    BASE_AGENT_PROMPT``. The *base prompt* portion is identical across every
+    turn of a given phase agent, so it is the right thing to
     cache. We split the system message into two content blocks so the
     cacheable static prefix lives in its own block, then stamp the
     ``cache_control`` breakpoint on that block.
@@ -321,7 +317,6 @@ def build_phase_agent(
     allowed_tools: list[str] | None = None,
     extra_tools: list[Any] | None = None,
     skip_filesystem_middleware: bool = False,
-    skip_default_mcp_injection: bool = False,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -352,17 +347,6 @@ def build_phase_agent(
             entirely. Pair with extra_tools to replace all filesystem access
             with purpose-built tools, removing any generic read/write fallback
             from the model's tool surface.
-        skip_default_mcp_injection: When True, do NOT auto-load the
-            ``SpineConfig.mcp_servers`` catalog and do NOT append it to the
-            agent's tool list / inject the MCP guidance prompt block. Use
-            for callers that have already curated the worker's tool surface
-            upstream (notably the supervisor↔worker loop in
-            :func:`spine.agents.exploration_agents.run_explore_do_node`,
-            which scopes ``extra_tools`` to a single ToolClass). Without
-            this, the default-MCP injection re-appends ~18 wrappers per
-            agent and silently undoes the upstream filter — trace
-            019e7164 showed a 226:1 prompt:completion ratio caused by
-            exactly this.
 
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
@@ -370,35 +354,13 @@ def build_phase_agent(
 
     from spine.agents.backend import build_backend
     from spine.agents.artifacts import materialize_artifacts
-    from spine.agents.skills_resolver import resolve_skills, resolve_memory
+    from spine.agents.skills_resolver import resolve_memory
 
     # ── Resolve model and backend ────────────────────────────────────
     model = resolve_model(config, session_id=state.get("work_id"), phase=phase.value)
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
     work_id = state.get("work_id", "")
-
-    # ── MCP tools ──────────────────────────────────────────────────────
-    # When ``skip_default_mcp_injection`` is True we deliberately do NOT
-    # call ``get_mcp_tools(...)``. This avoids:
-    #   (a) appending the full MCP catalog to ``all_tools`` below,
-    #   (b) emitting the ``mcp_guidance`` system-prompt block.
-    # Callers that opt out are responsible for curating the worker's tool
-    # surface upstream via ``extra_tools``.
-    mcp_tools: list = []
-    if not skip_default_mcp_injection:
-        from spine.config import SpineConfig
-        from spine.mcp.client import get_mcp_tools
-
-        try:
-            config_obj = SpineConfig.load()
-            mcp_tools = get_mcp_tools(
-                config_obj.mcp_servers,
-                cache_key=work_id or "default",
-                workspace_root=workspace_root,
-            )
-        except Exception:
-            logger.debug("MCP tool loading failed (non-fatal)", exc_info=True)
 
     # ── Resolve profile for prompt assembly ──────────────────────────
     # The HarnessProfile is registered per-provider by ensure_spine_profiles().
@@ -422,41 +384,17 @@ def build_phase_agent(
     else:
         final_system_prompt = system_prompt + "\n\n" + base_prompt
 
-    # ── MCP tool guidance ────────────────────────────────────────────
-    mcp_guidance = ""
-    if mcp_tools:
-        mcp_names = [getattr(t, "name", "?") for t in mcp_tools]
-        mcp_guidance = (
-            "\n\n## Codebase Navigation Tools (MCP)\n"
-            "You have access to MCP tools for efficient codebase navigation. "
-            "Use these for symbol lookup, dependency analysis, and change impact "
-            "assessment. They are MUCH more token-efficient than reading entire "
-            "files with glob/grep/read — use them FIRST when exploring the codebase.\n"
-            f"Available MCP tools: {', '.join(mcp_names[:10])}"
-        )
-        if len(mcp_names) > 10:
-            mcp_guidance += f" and {len(mcp_names) - 10} more"
-        final_system_prompt += mcp_guidance
-
-    # The static prefix — base prompt + MCP guidance — is what we want to
-    # mark with an ephemeral cache breakpoint.  It is identical across
-    # every turn of this phase agent, and lives entirely inside the
-    # system message.  Pass it through to the middleware stack so the
-    # StaticPrefixCacheMiddleware can find and stamp it.
-    static_cacheable_prefix = (base_prompt + mcp_guidance).strip()
+    # The static prefix — the base prompt — is what we want to mark with
+    # an ephemeral cache breakpoint.  It is identical across every turn of
+    # this phase agent, and lives entirely inside the system message.  Pass
+    # it through to the middleware stack so the StaticPrefixCacheMiddleware
+    # can find and stamp it.
+    static_cacheable_prefix = base_prompt.strip()
 
     # ── Memory ───────────────────────────────────────────────────────
     memory = resolve_memory(workspace_root, phase=phase.value)
     if memory:
         logger.debug("Phase %s: loading memory files: %s", phase.value, memory)
-
-    # ── Skills ───────────────────────────────────────────────────────
-    skills = resolve_skills(
-        phase=phase.value,
-        workspace_root=workspace_root,
-    )
-    if skills:
-        logger.debug("Phase %s: loading skills: %s", phase.value, skills)
 
     # ── Build the middleware stack ───────────────────────────────────
     middleware = _build_middleware_stack(
@@ -468,7 +406,6 @@ def build_phase_agent(
         tool_desc_overrides=tool_desc_overrides,
         profile=profile,
         memory=memory,
-        skills=skills,
         allowed_tools=allowed_tools,
         skip_filesystem_middleware=skip_filesystem_middleware,
         static_cacheable_prefix=static_cacheable_prefix,
@@ -479,25 +416,11 @@ def build_phase_agent(
 
     # ── Construct the agent ──────────────────────────────────────────
     all_tools = list(extra_tools) if extra_tools else []
-    all_tools.extend(mcp_tools)
-
-    # Deduplicate by tool name — callers that build SubAgent specs
-    # (e.g. run_explore_node) already inject MCP tools via _inject_mcp_tools(),
-    # and build_phase_agent loads them independently. Duplicate tool names
-    # cause 400 "Extra data" parse errors on strict backends (local vLLM).
-    seen_names: set[str] = set()
-    deduped: list = []
-    for tool in all_tools:
-        name = getattr(tool, "name", None) or str(tool)
-        if name not in seen_names:
-            seen_names.add(name)
-            deduped.append(tool)
-    all_tools = deduped
 
     agent = create_agent(
         model,
         system_prompt=final_system_prompt,
-        tools=all_tools,  # Custom tools + MCP tools + middleware tools
+        tools=all_tools,  # Custom tools + middleware tools
         middleware=middleware,
         response_format=response_format,
         context_schema=context_schema,
@@ -529,7 +452,6 @@ def _build_middleware_stack(
     tool_desc_overrides: dict[str, str],
     profile: Any,
     memory: list[str] | None,
-    skills: list[str] | None,
     allowed_tools: list[str] | None = None,
     skip_filesystem_middleware: bool = False,
     static_cacheable_prefix: str | None = None,
@@ -538,27 +460,18 @@ def _build_middleware_stack(
 
     Stack order (from outermost to innermost in the middleware chain):
 
-    1.  TodoListMiddleware         — task planning state
-    2.  SkillsMiddleware           — progressive skill disclosure
-    3.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
-    4.  ReadCacheMiddleware        — prevents re-read amnesia via SpineContext cache
-    5.  PatchToolCallsMiddleware   — tool call normalization
-    6.  SPINE-specific middleware  — ToolSchemaValidator
-    7.  User extra_middleware
-    8.  Profile extra_middleware
-    9.  AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
-    10. MemoryMiddleware           — AGENTS.md injection (when memory present)
+    1.  FilesystemMiddleware       — filesystem tools (skipped when skip_filesystem_middleware=True)
+    2.  ReadCacheMiddleware        — prevents re-read amnesia via SpineContext cache
+    3.  PatchToolCallsMiddleware   — tool call normalization
+    4.  SPINE-specific middleware  — ToolSchemaValidator
+    5.  User extra_middleware
+    6.  Profile extra_middleware
+    7.  AnthropicPromptCachingMiddleware — prompt caching (no-op for non-Anthropic)
+    8.  MemoryMiddleware           — AGENTS.md injection (when memory present)
     """
     middleware: list[Any] = []
 
-    # 1. Todo list — task planning state
-    middleware.append(TodoListMiddleware())
-
-    # 2. Skills — progressive disclosure of skill directories
-    if skills:
-        middleware.append(SkillsMiddleware(backend=backend, sources=skills))
-
-    # 3. Filesystem — core tool surface with custom SPINE prompt
+    # 1. Filesystem — core tool surface with custom SPINE prompt
     #    Skipped when skip_filesystem_middleware=True, which is used by
     #    the implement orchestrator to replace generic filesystem access
     #    with purpose-built tools (ReadSliceFilesTool, WriteImplementationReportTool)
@@ -583,27 +496,27 @@ def _build_middleware_stack(
             phase.value,
         )
 
-    # 4. Read cache — prevents re-reading already-seen files and re-issuing
+    # 2. Read cache — prevents re-reading already-seen files and re-issuing
     #    identical search_codebase / MCP lookups.  Checks SpineContext.read_cache
     #    before allowing the cached tools to execute.  Applied to subagents too:
     #    Explore researcher loops were re-running the same MCP lookups within a
     #    single invocation and leaking duplicate output into findings.
     middleware.append(_build_read_cache_middleware())
 
-    # 5. Patch tool calls — normalisation
+    # 3. Patch tool calls — normalisation
     middleware.append(PatchToolCallsMiddleware())
 
-    # 6. SPINE-specific middleware (tool validation, context editing).  Applied
+    # 4. SPINE-specific middleware (tool validation, context editing).  Applied
     #    to subagents too so that tool runtime errors become a compact
     #    ToolMessage(status="error") instead of a raw traceback that ends up
     #    serialized into ResearchFindings.summary.
     _add_spine_middleware(middleware, phase)
 
-    # 7. User-provided extra middleware
+    # 5. User-provided extra middleware
     if extra_middleware:
         middleware.extend(extra_middleware)
 
-    # 8. Profile extra middleware
+    # 6. Profile extra middleware
     if profile is not None:
         try:
             extra = profile.materialize_extra_middleware()
@@ -612,7 +525,7 @@ def _build_middleware_stack(
         except Exception:
             pass
 
-    # 9. Prompt caching — mark the static system prefix with an Anthropic
+    # 7. Prompt caching — mark the static system prefix with an Anthropic
     #    ephemeral cache breakpoint. Honored by direct Anthropic API and
     #    OpenRouter Anthropic routes; silently ignored by other providers
     #    (the field is added once per turn, negligible overhead).
@@ -621,7 +534,7 @@ def _build_middleware_stack(
     if _is_anthropic_model(model):
         middleware.append(AnthropicPromptCachingMiddleware())
 
-    # 10. Memory — AGENTS.md injection (when memory sources provided)
+    # 8. Memory — AGENTS.md injection (when memory sources provided)
     if memory:
         middleware.append(
             SpineProjectMemoryMiddleware(

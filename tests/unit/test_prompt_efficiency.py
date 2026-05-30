@@ -157,15 +157,6 @@ class TestContextEditing:
 class TestCodebaseMap:
     """Verify codebase map artifact support."""
 
-    def test_codebase_map_in_tasks_prompt(self):
-        """Tasks agent system prompt should reference codebase-map.md."""
-        import spine.agents.tasks_agent as mod
-
-        source = open(mod.__file__).read()
-        assert "codebase-map" in source, (
-            "tasks_agent.py must reference codebase-map.md in its prompt"
-        )
-
     def test_codebase_map_in_implement_prompt(self):
         """Implement agent system prompt should reference codebase-map.md."""
         import spine.agents.implement_agent as mod

@@ -221,12 +221,8 @@ async def _run_slice_verifier_node(
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
             # The subagent_spec already curated the verifier's tool surface
-            # (read/execute tools + MCP wrappers via _inject_mcp_tools in
-            # subagents.py). Letting build_phase_agent re-inject the full
-            # MCP catalog would duplicate the wrappers and emit a
-            # redundant mcp_guidance system-prompt block — see commits
-            # 7a26454 / 390df77 and the trace 019e721d audit.
-            skip_default_mcp_injection=True,
+            # (read + execute tools only — slice-verifier is not in the MCP
+            # injection set) — they live in ``extra_tools`` above.
         )
 
         slice_json = json.dumps(slice_data, indent=2, ensure_ascii=False)

@@ -98,6 +98,12 @@ def _spec_planning_render(api: UIApi) -> None:
     render(api)
 
 
+def _onboarding() -> None:
+    from spine.ui._pages.onboarding import render
+
+    render(api)
+
+
 pages = {
     "": [
         st.Page(_dashboard, title="Dashboard", icon="🏠", url_path="dashboard"),
@@ -110,6 +116,12 @@ pages = {
             title="Spec & Planning",
             icon="📐",
             url_path="spec-planning",
+        ),
+        st.Page(
+            _onboarding,
+            title="Project Onboarding",
+            icon="🚀",
+            url_path="onboarding",
         ),
     ],
     "Work": [

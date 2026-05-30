@@ -52,7 +52,6 @@ from spine.workflow.subgraph_wrapper import (
 )
 from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
 from spine.workflow.subgraphs.implement_subgraph import build_implement_subgraph
-from spine.workflow.subgraphs.tasks_subgraph import build_tasks_subgraph
 from spine.workflow.subgraphs.specify_subgraph import build_specify_subgraph
 from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
 from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
@@ -86,7 +85,6 @@ def get_subgraph_builder(phase: str) -> Callable | None:
 # Register all phase builders at import time.
 register_subgraph_builder(PhaseName.VERIFY.value, build_verify_subgraph)
 register_subgraph_builder(PhaseName.IMPLEMENT.value, build_implement_subgraph)
-register_subgraph_builder(PhaseName.TASKS.value, build_tasks_subgraph)
 register_subgraph_builder(PhaseName.SPECIFY.value, build_specify_subgraph)
 register_subgraph_builder(PhaseName.PLAN.value, build_plan_subgraph)
 # Critic is parameterized by reviewed_phase — register keyed variants.
@@ -235,18 +233,6 @@ def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     }
 
 
-def _tasks_state_mapper(parent_state: WorkflowState, config) -> dict:
-    work_id = parent_state.get("work_id", "")
-    # All work types now run specify, so has_spec is always True
-    return {
-        **_base_state_mapper(parent_state, config),
-        "phase": PhaseName.TASKS.value,
-        "retry_count": parent_state.get("retry_count", {}).get(PhaseName.TASKS.value, 0),
-        "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
-        "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
-    }
-
-
 def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
     verify_attempts = parent_state.get("verify_attempts", 0)
@@ -354,21 +340,6 @@ def _implement_result_mapper(subgraph_result: dict, parent_state: WorkflowState)
     base["implement_completed"] = phase_status == "success"
     base["slices_dispatched"] = subgraph_result.get("slices_dispatched", False)
     base["implementation_files_written"] = subgraph_result.get("implementation_files_written", False)
-    return base
-
-
-def _tasks_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
-    """Map TasksSubgraphState output back to parent WorkflowState."""
-    base = make_success_result_mapper(PhaseName.TASKS.value)(subgraph_result, parent_state)
-    phase_status = subgraph_result.get("phase_status", "")
-    if phase_status == "needs_review":
-        base["status"] = "needs_review"
-        base["needs_review_phase"] = PhaseName.TASKS.value
-    elif phase_status == "error":
-        base["status"] = "failed"
-    # Set completion invariants
-    base["tasks_completed"] = phase_status == "success"
-    base["work_units_count"] = len(subgraph_result.get("work_units", []))
     return base
 
 
@@ -804,7 +775,6 @@ def build_workflow_graph(
             _STATE_MAPPERS = {
                 PhaseName.VERIFY.value: _verify_state_mapper,
                 PhaseName.IMPLEMENT.value: _implement_state_mapper,
-                PhaseName.TASKS.value: _tasks_state_mapper,
                 PhaseName.SPECIFY.value: _specify_state_mapper,
                 PhaseName.PLAN.value: _plan_state_mapper,
                 PhaseName.GAP_PLAN.value: _gap_plan_state_mapper,
@@ -812,7 +782,6 @@ def build_workflow_graph(
             _RESULT_MAPPERS = {
                 PhaseName.VERIFY.value: _verify_result_mapper,
                 PhaseName.IMPLEMENT.value: _implement_result_mapper,
-                PhaseName.TASKS.value: _tasks_result_mapper,
                 PhaseName.SPECIFY.value: _specify_result_mapper,
                 PhaseName.PLAN.value: _plan_result_mapper,
                 PhaseName.GAP_PLAN.value: _gap_plan_result_mapper,

@@ -46,16 +46,21 @@ _PLAN_REVIEW_INSTRUCTIONS = (
     "   pass (roughly one focused PR). Flag slices that look too large or\n"
     "   that bundle unrelated changes.\n\n"
     "## Scope Creep Detection\n\n"
-    "The specification includes `scope_inclusions` and `scope_exclusions` lists.\n"
-    "Review each slice's `target_files` and `execution_requirements` to ensure:\n\n"
-    "- **Inclusions check**: Slices\n"
-    "Every slice should primarily work within the areas listed in\n"
-    "`scope_inclusions`. If a slice's target files or requirements go significantly\n"
-    "beyond these inclusions, flag it as potential scope creep.\n\n"
-    "- **Exclusions check**:\n"
-    "If any slice's target files or requirements overlap with items in\n"
-    "`scope_exclusions`, this is a **VIOLATION**. Flag it and suggest the slice\n"
-    "be revised to exclude the forbidden areas.\n\n"
+    "The user message includes the spec in a `<specification>` block — pull\n"
+    "the `scope_inclusions` and `scope_exclusions` lists from there. These\n"
+    "are SPEC-level fields and never appear on the plan itself. If the\n"
+    "`<specification>` block is absent or its scope lists are empty, do\n"
+    "NOT invent scope concerns — note the missing data and proceed with\n"
+    "the structural checks above.\n\n"
+    "Review each slice's `target_files` and `execution_requirements`:\n\n"
+    "- **Inclusions check**: Every slice should primarily work within the\n"
+    "  areas listed in `scope_inclusions`. If a slice's target files or\n"
+    "  requirements go significantly beyond these inclusions, flag it as\n"
+    "  potential scope creep.\n\n"
+    "- **Exclusions check**: If any slice's target files or requirements\n"
+    "  overlap with items in `scope_exclusions`, this is a **VIOLATION**.\n"
+    "  Flag it and suggest the slice be revised to exclude the forbidden\n"
+    "  areas.\n\n"
     "- **Reporting**: For each scope violation, list:\n"
     "  - The slice ID\n"
     "  - The excluded area being touched\n"
@@ -150,11 +155,6 @@ def build_critic_agent(
         response_format=CriticReview,
         allowed_tools=[],
         skip_filesystem_middleware=True,
-        # CRITIC reads the reviewed phase's structured artifact and emits
-        # a CriticReview verdict. No code navigation; the MCP catalog
-        # would just give it tools that conflict with the empty
-        # allowed_tools filter. See trace 019e721d audit.
-        skip_default_mcp_injection=True,
     )
 
     return agent

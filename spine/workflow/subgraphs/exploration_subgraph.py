@@ -487,11 +487,18 @@ def _research_router(
 
     topics: list[str] = state.get("topics", [])
     if not topics:
-        raise CriticalContractFailure(
-            phase="exploration",
-            reason="manager_decision is 'explore' but topics list is empty — "
-                   "the research_manager_node produced malformed structured output.",
+        # Defence-in-depth: run_research_manager already coerces this shape
+        # to decision="done" before reaching the router (trace 019e72bc).
+        # If a caller bypasses that coercion, treat empty topics as a signal
+        # to synthesise rather than crashing the whole subgraph — the
+        # decision is recoverable.
+        logger.warning(
+            "Research manager returned decision='explore' with empty topics "
+            "— routing to synthesize instead of dispatching researchers. "
+            "This usually means the manager coercion at "
+            "run_research_manager was bypassed; investigate if it recurs."
         )
+        return "synthesize"  # type: ignore[return-value]
 
     new_topics = _new_topics(state)
     if not new_topics:

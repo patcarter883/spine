@@ -26,10 +26,23 @@ from typing import Any, Optional
 
 from langchain_core.tools import BaseTool
 from langchain_core.tools.base import ArgsSchema
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
+from spine.agents.artifacts import artifact_path
+# Reuse the canonical tool-call-markup token list so search_codebase and
+# codebase_query agree on what a spilled <tool_call>/<arg_value> envelope
+# looks like (codebase_query.py imports nothing from spine at module level,
+# so this does not reintroduce the circular-import hazard noted below).
+from spine.agents.tools.codebase_query import _FORBIDDEN_MARKUP_TOKENS
+from spine.models.types import FeatureSlice as _SchedFeatureSlice
 
 logger = logging.getLogger(__name__)
-from spine.agents.artifacts import artifact_path
+
+# NOTE: ``spine.workflow.slice_scheduler.validate_feature_slices`` is imported
+# lazily inside ``write_structured_plan`` (below). Importing it at module level
+# pulls in ``spine.workflow`` -> compose -> the phase subgraphs, which re-import
+# this module — a circular import that breaks ``import spine.agents.plan_tools``
+# when it is the first module loaded.
 
 # File extensions worth reading when doing codebase search
 _CODE_EXTENSIONS = {
@@ -132,6 +145,64 @@ class ReadPriorArtifactsTool(BaseTool):
 # ── search_codebase ───────────────────────────────────────────────────────
 
 
+def _reject_tool_markup(value: str, field: str) -> None:
+    """Raise ``ValueError`` if a model-supplied string carries tool-call markup.
+
+    Reuses :data:`codebase_query._FORBIDDEN_MARKUP_TOKENS` so the two
+    research tools agree on what a spilled tool-call envelope looks like.
+    """
+    for token in _FORBIDDEN_MARKUP_TOKENS:
+        if token in value:
+            raise ValueError(
+                f"search_codebase: {field!r} contains tool-call markup "
+                f"({token!r}). Pass {field} as a clean JSON array of strings "
+                f'(e.g. {field}=["WorkflowState", "submit_work"]); do not echo '
+                f"the <tool_call>/<arg_value> envelope or merge other arguments in."
+            )
+
+
+def _clean_str_item(item: Any, field: str) -> str:
+    """Stringify, markup-check, and strip a single list element."""
+    text = item if isinstance(item, str) else str(item)
+    _reject_tool_markup(text, field)
+    return text.strip()
+
+
+def _coerce_str_list(value: Any, field: str) -> Any:
+    """Coerce a model-supplied ``list[str]`` tool argument into a real list.
+
+    Local models intermittently serialise list args as a JSON-encoded string
+    (``'["a", "b"]'``), a single bare keyword, or a fragment with their own
+    tool-call XML spilled in. Trace ``019e72f5`` showed two PLAN
+    ``search_codebase`` calls fail with a bare Pydantic ``list_type`` error
+    for exactly this reason, and the unhelpful message taught the model
+    nothing. Mirror the ``codebase_query`` hardening: reject spilled markup
+    with a teaching message, otherwise coerce strings into the expected list
+    so a recoverable call succeeds instead of failing. Empty elements are
+    dropped (``queries`` then trips its own ``min_length`` guard).
+
+    Non-string / non-list values (``None``, dicts, ints) pass through
+    untouched so Pydantic raises its own type error.
+    """
+    if isinstance(value, list):
+        return [s for item in value if (s := _clean_str_item(item, field))]
+    if isinstance(value, str):
+        _reject_tool_markup(value, field)
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            # Not JSON — treat the whole string as a single search term.
+            return [stripped]
+        if isinstance(parsed, list):
+            return [s for item in parsed if (s := _clean_str_item(item, field))]
+        # JSON scalar (string/number) — wrap as a one-element list.
+        return [text] if (text := str(parsed).strip()) else []
+    return value
+
+
 class _SearchCodebaseInput(BaseModel):
     queries: list[str] = Field(
         description=(
@@ -157,6 +228,14 @@ class _SearchCodebaseInput(BaseModel):
         le=20,
         description="Maximum number of files to return content for (default 6).",
     )
+
+    @field_validator("queries", "file_patterns", mode="before")
+    @classmethod
+    def _coerce_list_args(cls, value: Any, info: ValidationInfo) -> Any:
+        # Runs BEFORE list[str] type validation so a JSON-string / bare-string
+        # arg is salvaged instead of 400-ing at the schema layer (trace
+        # 019e72f5). Markup-spilled values are rejected with a teaching error.
+        return _coerce_str_list(value, info.field_name or "queries")
 
 
 class SearchCodebaseTool(BaseTool):
@@ -470,6 +549,35 @@ class StructuredWritePlanTool(BaseTool):
         ]
         tech_choices = [c.strip() for c in (technology_choices or []) if c and c.strip()]
         risk_items = [r.strip() for r in (risks or []) if r and r.strip()]
+
+        # Run the same structural validation the downstream scheduler will run
+        # (unique IDs, dependency integrity, no cycles). Pulling it upstream
+        # lets the synthesizer's tool loop self-correct within the same agent
+        # invocation instead of round-tripping through a critic rework cycle.
+        scheduler_slices = [
+            _SchedFeatureSlice(
+                id=sl.id,
+                title=sl.title,
+                target_files=list(sl.target_files),
+                execution_requirements=[sl.execution_requirements]
+                if isinstance(sl.execution_requirements, str)
+                else list(sl.execution_requirements),
+                dependencies=list(sl.dependencies),
+                acceptance_criteria=list(sl.acceptance_criteria),
+                complexity=sl.complexity,
+            )
+            for sl in validated_slices
+        ]
+        # Lazy import to avoid a module-load circular import (see top of file).
+        from spine.workflow.slice_scheduler import validate_feature_slices
+
+        try:
+            validate_feature_slices(scheduler_slices)
+        except ValueError as exc:
+            return (
+                f"VALIDATION_ERROR: plan rejected before writing.\n{exc}\n"
+                "Fix the structural issue and call write_structured_plan again."
+            )
 
         # ── Prepare output directory ──────────────────────────────────
         plan_path = Path(self.workspace_root) / self.plan_dir

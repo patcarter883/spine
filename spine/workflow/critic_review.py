@@ -43,28 +43,34 @@ def _build_review_prompt(
     reviewed_phase: str,
     structured_payload: str,
     description: str,
+    spec_payload: str | None = None,
 ) -> str:
     """Build the user-message prompt for the critic agent.
 
-    Inlines the original user description (when present) so phase-specific
-    critic augmentations such as :data:`_SPECIFY_REVIEW_INSTRUCTIONS` can
-    check spec-to-description traceability without re-reading state.
+    Wraps each dynamic block in a semantic XML tag and places the
+    instruction in the hostage tail so small-model attention lands on
+    "what to do" instead of trailing data. ``spec_payload`` is included
+    only when reviewing the PLAN phase — that critic needs the spec's
+    scope lists to check slice-level scope creep.
     """
-    description = (description or "").strip()
-    description_section = (
-        f"## Original User Description\n{description}\n\n"
-        if description
-        else ""
+    from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+
+    findings_block = (
+        f"```json\n{structured_payload}\n```" if structured_payload else ""
     )
-    return (
-        f"Review ONLY the structured output below for the {reviewed_phase} "
-        "phase. Do not attempt to read files or run commands; everything "
-        "you need is inlined.\n\n"
-        f"{description_section}"
-        "## Structured Output Under Review\n"
-        f"```json\n{structured_payload}\n```\n\n"
-        "Respond with PASSED, NEEDS_REVISION, or NEEDS_REVIEW and include "
-        "concrete reasons and suggestions."
+    return hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, description or ""),
+            (Tag.SPECIFICATION, spec_payload or ""),
+            (Tag.FINDINGS, findings_block),
+        ),
+        (
+            f"Review the {reviewed_phase}-phase structured output above. "
+            "Do not attempt to read files or run commands; everything you "
+            "need is in the tagged blocks. Respond with PASSED, "
+            "NEEDS_REVISION, or NEEDS_REVIEW and include concrete reasons "
+            "and suggestions."
+        ),
     )
 
 
@@ -217,10 +223,15 @@ async def agent_critic_check(
                 ),
             )
 
+        spec_payload: str | None = None
+        if reviewed_phase == PhaseName.PLAN.value:
+            spec_payload = state.get("specification_json")
+
         prompt = _build_review_prompt(
             reviewed_phase=reviewed_phase,
             structured_payload=structured_payload,
             description=state.get("description") or "",
+            spec_payload=spec_payload,
         )
 
         # If the critic subgraph ran a plan-before-do step, prepend the

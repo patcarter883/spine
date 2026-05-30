@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import pytest
 
 from spine.config import SpineConfig
-from spine.models.types import PlanDecomposition, WorkUnit
 from spine.work.dispatcher import _get_work_db, list_work
 
 
@@ -197,89 +196,91 @@ class TestApproveAndSpawn:
     # ── Success path ──────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_approve_plan_success(self):
-        """Happy path — approve a plan with valid artifacts and spawn succeeds."""
+    async def test_approve_continues_from_implement(self):
+        """Approve re-keys the SAME work item to 'task' and continues it from
+        IMPLEMENT, reusing the approved plan — no fresh spawn, no new work_id.
+
+        (The earlier version mocked ArtifactStore + resolve_plan_to_units and
+        asserted the spawn behavior; that masked both an AttributeError and the
+        wrong-altitude restart. This asserts the real continuation path.)
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self._make_config(tmpdir)
             self._insert_plan_entry(config)
 
-            # Create the artifact file for real, then mock artifact_path to point to it
-            artifact_file = Path(config.artifact_path) / self.PLAN_ID / "plan" / "plan.md"
-            artifact_file.parent.mkdir(parents=True, exist_ok=True)
-            plan_content = "# Test Plan\n\n## Slice 1\nDo something.\n"
-            artifact_file.write_text(plan_content, encoding="utf-8")
+            # The reviewed run's checkpoint holds the plan state IMPLEMENT needs.
+            saved_state = {
+                "execution_waves": [[{"id": "slice-1", "title": "Do it"}]],
+                "plan_json": {"feature_slices": [{"id": "slice-1"}]},
+                "specification_json": {"title": "Spec"},
+                "artifacts": {"plan": {"plan.md": "# Plan"}},
+            }
+            mock_ckpt = MagicMock()
+            mock_ckpt.get_state = AsyncMock(return_value=saved_state)
+            mock_ckpt.delete_state = AsyncMock(return_value=True)
 
-            decomposition = PlanDecomposition(
-                units=[
-                    WorkUnit(title="Slice 1", description="Do something"),
-                    WorkUnit(title="Slice 2", description="Do more"),
-                ]
+            run_graph = AsyncMock(
+                return_value={"work_id": self.PLAN_ID, "status": "completed", "work_type": "task"}
             )
 
-            specs = [
-                {"description": "Slice 1: Do something", "work_type": "task"},
-                {"description": "Slice 2: Do more", "work_type": "task"},
-            ]
-
-            mock_artifact_store = MagicMock()
-            mock_artifact_store.artifact_path.return_value = str(artifact_file)
-
             with (
-                patch("spine.work.dispatcher.ArtifactStore", return_value=mock_artifact_store),
                 patch("spine.work.dispatcher.AuditService", MagicMock()),
-                patch(
-                    "spine.work.plan_resolver.resolve_plan_to_units",
-                    AsyncMock(return_value=decomposition),
-                ),
-                patch(
-                    "spine.work.plan_resolver.create_work_spawn_specs",
-                    return_value=specs,
-                ),
-                patch(
-                    "spine.work.dispatcher.submit_work",
-                    AsyncMock(
-                        side_effect=[
-                            {"work_id": "spawned-1"},
-                            {"work_id": "spawned-2"},
-                        ]
-                    ),
-                ),
+                patch("spine.persistence.checkpoint.CheckpointStore", return_value=mock_ckpt),
+                patch("spine.work.dispatcher._run_workflow_graph", run_graph),
             ):
                 from spine.work.dispatcher import approve_and_spawn
 
                 result = await approve_and_spawn(config=config, plan_id=self.PLAN_ID)
 
-            assert result["status"] == "approved"
-            assert result["spawned_ids"] == self.SPAWNED_IDS
-            assert "decomposition" in result
-            assert self._get_db_status(config) == "approved"
+            # Continuation, not spawn.
+            assert result["status"] == "completed"
+            assert result["spawned_ids"] == []
+            assert result["continued_from"] == "implement"
+            assert result["work_type"] == "task"
 
-    # ── Missing artifact ──────────────────────────────────────────────────
+            # The SAME work item is re-keyed to the execution work type.
+            db = _get_work_db(config)
+            assert db["work_entries"].get(self.PLAN_ID)["work_type"] == "task"
+
+            # The execution graph ran from IMPLEMENT, seeded with approved waves.
+            run_graph.assert_awaited_once()
+            kwargs = run_graph.await_args.kwargs
+            assert kwargs["work_type"] == "task"
+            assert kwargs["start_from_phase"] == "implement"
+            assert kwargs["is_restart"] is True
+            assert kwargs["initial_state"]["execution_waves"] == saved_state["execution_waves"]
+
+    # ── No recoverable plan state ─────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_approve_plan_missing_artifact(self):
-        """Plan approval fails when the plan.md artifact does not exist."""
+    async def test_approve_without_recoverable_plan_state_raises(self):
+        """If neither checkpoint state nor plan.json yields execution_waves,
+        approval raises and the work item is NOT advanced or re-keyed."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self._make_config(tmpdir)
             self._insert_plan_entry(config)
 
-            # Mock artifact_path to return a path that doesn't exist
-            missing_path = str(Path(config.artifact_path) / self.PLAN_ID / "plan" / "plan.md")
-
-            mock_artifact_store = MagicMock()
-            mock_artifact_store.artifact_path.return_value = missing_path
+            mock_ckpt = MagicMock()
+            mock_ckpt.get_state = AsyncMock(return_value=None)
+            mock_ckpt.delete_state = AsyncMock(return_value=True)
+            run_graph = AsyncMock()
 
             with (
-                patch("spine.work.dispatcher.ArtifactStore", return_value=mock_artifact_store),
                 patch("spine.work.dispatcher.AuditService", MagicMock()),
+                patch("spine.persistence.checkpoint.CheckpointStore", return_value=mock_ckpt),
+                patch("spine.work.dispatcher._run_workflow_graph", run_graph),
             ):
                 from spine.work.dispatcher import approve_and_spawn
 
-                with pytest.raises(FileNotFoundError):
+                with pytest.raises(ValueError, match="execution_waves"):
                     await approve_and_spawn(config=config, plan_id=self.PLAN_ID)
 
-            # DB must NOT be updated to "approved"
-            assert self._get_db_status(config) == "awaiting_approval"
+            # Did not advance: status + work_type unchanged, graph never ran.
+            db = _get_work_db(config)
+            entry = db["work_entries"].get(self.PLAN_ID)
+            assert entry["status"] == "awaiting_approval"
+            assert entry["work_type"] == "reviewed_task"
+            run_graph.assert_not_awaited()
 
     # ── Reject ────────────────────────────────────────────────────────────
 

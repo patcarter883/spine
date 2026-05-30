@@ -109,18 +109,23 @@ class TestSpineProfileRegistration:
             )
 
     def test_spine_base_prompt_preserves_useful_da_behaviour(self) -> None:
-        """The SPINE base prompt should preserve useful behavioural guidance from DA."""
+        """The SPINE base prompt should preserve useful behavioural guidance.
+
+        The <constraints> block was reworked into crisp directives (dropping
+        prose like "Don't pound the same broken approach"), but the underlying
+        behavioural intent must survive in the tightened wording.
+        """
         from spine.agents.profile import SPINE_BASE_PROMPT
 
-        # Useful DA behavioural guidance that we want to keep
+        # Behavioural intent we want to keep, in the reworked phrasing.
         useful_phrases = [
-            "stop and analyze",
-            "first attempt is rarely correct",
-            "iterate",
+            "Act, don't narrate",
+            "do not yield early",
+            "diagnose the cause before retrying",
         ]
         for phrase in useful_phrases:
             assert phrase in SPINE_BASE_PROMPT, (
-                f"SPINE base prompt lost useful DA guidance: {phrase!r}"
+                f"SPINE base prompt lost useful behavioural guidance: {phrase!r}"
             )
 
     def test_spine_base_prompt_not_empty(self) -> None:

@@ -127,8 +127,8 @@ def _build_researcher_prompt(*, scout_kind: str, role_blurb: str, report_format:
         "Your research topic names specific symbols discovered by semantic "
         "(vector) search. For example: \"Investigate CLI verbosity — symbols: "
         "cli/__init__.py::index, spine/config.py::SpineConfig\"\n\n"
-        "Use MCP tools to look up these specific symbols — get their source, "
-        "dependencies, and dependents. Never guess their interfaces."
+        "Use `codebase_query` to look up these specific symbols — get their "
+        "source, dependencies, and dependents. Never guess their interfaces."
     )
 
     tools_body = (
@@ -272,9 +272,30 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         + "\n\n"
         + xml_block(
             Tag.TOOLS,
-            "- `search_codebase` — multi-query file search with content "
-            "previews. Use this FIRST to understand existing code structure "
-            "before making changes.\n"
+            "USE `codebase_query` FIRST. It answers symbol-level questions in "
+            "sub-millisecond time — use it before reading files to locate "
+            "exactly the code you need to change.\n\n"
+            "| Question | Call |\n"
+            "|----------|------|\n"
+            '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
+            '| Show me X\'s source | `codebase_query(action="get_source", name="X")` |\n'
+            '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
+            '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
+            '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
+            "Primary navigation tool (use FIRST):\n"
+            "- `codebase_query` — single tool, five actions. Pick `action`, "
+            "fill the one argument it needs:\n"
+            "  - `find_symbol`, `get_source`, `get_dependencies`, "
+            "`get_dependents` all take `name` (clean identifier — no "
+            "whitespace, no module prefix, no parentheses).\n"
+            "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
+            "50 hits — refine with anchors / file globs rather than retrying "
+            "naively.\n"
+            "  - `name` and `pattern` are mutually exclusive. Do NOT pass "
+            "both.\n"
+            "- `search_codebase` — multi-query keyword file search with "
+            "content previews. Use when you need content-level matches that "
+            "`codebase_query` doesn't cover.\n"
             "- `read_file` — read files (use offset/limit for pagination).\n"
             "- `ast_extract_symbol` — fetch a single named symbol's source "
             "straight from the index. Use when you know the symbol name and "
@@ -291,7 +312,6 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "syntax error or failed match it returns "
             "`{\"status\":\"syntax_error\",...}` (or `no_match`/`ambiguous_match`"
             "/`stale`) and the file is left untouched. Fix and call again.\n"
-            "- `ls`, `glob`, `grep` — directory listing and text search.\n"
             "- `execute` — run shell commands (tests, linters, builds).",
         )
         + "\n\n"
@@ -303,10 +323,10 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "any imports or dependencies they reference. Check the "
             "modification targets in your task description for exact change "
             "sites.\n"
-            "2. Search if needed (0-1 turns): If you need to understand "
-            "code not covered by the task description, call "
-            "`search_codebase` with specific queries. Do NOT explore "
-            "broadly.\n"
+            "2. Navigate if needed (0-1 turns): If you need to understand "
+            "code not covered by the task description, use `codebase_query` "
+            "to locate symbols, then `search_codebase` for content-level "
+            "matches. Do NOT explore broadly.\n"
             "3. Make changes (1-2 turns, batch): Apply all edits with "
             "`read_edit_lint`. Read-before-write. Issue ≥2 edits in a "
             "single turn where possible. Focus only on files listed in the "
@@ -332,11 +352,13 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "create files in the wrong location.\n"
             "- WRONG: `../other/file.py` — traversal blocked by virtual "
             "filesystem.\n"
-            "- Use `search_codebase` to verify a file exists before writing "
-            "to its parent directory. Do not invent paths.\n\n"
+            "- Use `codebase_query` or `search_codebase` to verify a file "
+            "exists before writing to its parent directory. Do not invent "
+            "paths.\n\n"
             "Hard limits:\n"
-            "- Batch reads: always read ≥3 files per turn or use "
-            "`search_codebase` instead. Never read one file at a time.\n"
+            "- Navigate with `codebase_query` first, then batch reads: read "
+            "≥3 files per turn or use `search_codebase` instead. Never read "
+            "one file at a time.\n"
             "- Exploration budget: maximum 3 turns of read/search before "
             "your first write/edit. If you haven't changed code by turn 4, "
             "you're over-exploring — make changes with what you know.\n"
@@ -422,11 +444,8 @@ _READ_ONLY_TOOLS: list[str] = [
 ]
 
 _FULL_TOOLS: list[str] = [
-    "ls",
     "read_file",
     "read_edit_lint",
-    "glob",
-    "grep",
     "search_codebase",
     "ast_extract_symbol",
     "execute",
@@ -463,20 +482,6 @@ _RE_RESEARCH_PROMPT_SUFFIX = (
 # ── Factory functions ──────────────────────────────────────────────────
 
 
-# MCP tools the researcher (Explore) loop is actually allowed to call.
-# The upstream codebase-index server exposes 21+ tools, but the researcher
-# prompts (Blueprint Scout / Architectural Scout) only describe these five.
-# Loading the others is dead schema in the prefix — each tool description
-# costs ~150-400 prefix tokens per researcher turn. Trim aggressively.
-_RESEARCHER_MCP_ALLOWLIST: frozenset[str] = frozenset({
-    "mcp_codebase-index_find_symbol",
-    "mcp_codebase-index_get_function_source",
-    "mcp_codebase-index_get_dependencies",
-    "mcp_codebase-index_get_dependents",
-    "mcp_codebase-index_search_codebase",
-})
-
-
 def _inject_mcp_tools(
     tools: list, workspace_root: str, *, subagent_name: str = "researcher"
 ) -> None:
@@ -486,10 +491,11 @@ def _inject_mcp_tools(
     ``BaseTool``.  Errors during MCP tool loading are logged and swallowed
     — subagents fall back to filesystem tools if MCP is unavailable.
 
-    The cache_key now includes the subagent name (researcher vs slice-implementer)
-    so the two subagents do not collide in the tool cache and both receive
-    the full MCP index surface — critical for preventing the 11× redundant
-    `dispatcher.py` reads seen in trace 019e486e.
+    The cache_key includes the subagent name (researcher vs slice-implementer)
+    so the two subagents do not collide in the tool cache. Both receive a
+    single ``CodebaseQueryTool`` wrapper (tool name ``codebase_query``) that
+    collapses the raw MCP index surface — no raw ``mcp_``-prefixed tool is
+    ever appended to a subagent's tool list.
 
     Args:
         tools: The subagent's tool list (mutated in place).
@@ -507,13 +513,14 @@ def _inject_mcp_tools(
             cache_key=cache_key,
             workspace_root=workspace_root,
         )
-        if subagent_name == "researcher":
-            # Researcher gets ONE consolidated codebase_query tool instead of
-            # the 5 individual MCP wrappers. Collapsing the surface area
+        if subagent_name in ("researcher", "slice-implementer"):
+            # Both subagents get ONE consolidated codebase_query tool instead
+            # of the individual raw MCP wrappers. Collapsing the surface area
             # eliminates the wrong-key / invented-arg failure class observed
             # in trace 019e6cc4 (23/23 research branches failed with
-            # malformed args). The MCP tools themselves stay loaded in the
-            # cache so other subagents (slice-implementer) still get them.
+            # malformed args) and ensures no raw mcp_-prefixed tool reaches
+            # any agent. The MCP tools stay loaded in the cache so the
+            # wrapper can dispatch against them.
             from spine.agents.tools.codebase_query import CodebaseQueryTool
 
             mcp_tools = [
@@ -770,10 +777,11 @@ def build_subagent_spec(
             )
         )
 
-    # ── Inject MCP codebase-index tools for researcher + slice-implementer ─
+    # ── Inject codebase_query wrapper for researcher + slice-implementer ──
     # Both subagents benefit enormously from structural queries instead of
     # full-file reads (see trace 019e486e: 11× redundant dispatcher.py reads
-    # during implement).  MCP gives "where is X / who calls X" in milliseconds.
+    # during implement).  The codebase_query wrapper gives "where is X / who
+    # calls X" in milliseconds without exposing any raw mcp_-prefixed tool.
     # slice-verifier is read+execute only and rarely needs deep navigation.
     if name in ("researcher", "slice-implementer"):
         _inject_mcp_tools(tools, workspace_root, subagent_name=name)

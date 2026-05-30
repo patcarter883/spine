@@ -7,6 +7,7 @@ principle: CLI and UI share the same backend code paths.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -108,6 +109,46 @@ class UIApi:
             "queue_id": queue_id,
             "status": "pending",
             "work_type": work_type,
+        }
+
+    def enqueue_onboarding(
+        self,
+        workspace_root: str,
+        mode: str,
+        tech_stack: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Enqueue a repository-onboarding job via the RalphLoopWorker.
+
+        Non-blocking, mirroring :meth:`enqueue_work`: serialises the onboarding
+        parameters into the queue item's JSON description and enqueues it with
+        ``work_type="onboarding"``. The dispatcher routes that work_type to the
+        onboarding engine (analyse/scaffold/synthesise) instead of the LangGraph
+        workflow. The Onboarding page polls ``get_queue_overview()`` for
+        progress, exactly like the queue page.
+
+        Args:
+            workspace_root: Absolute path to the project to onboard.
+            mode: ``"greenfield"`` or ``"brownfield"``.
+            tech_stack: Optional stack tags (seed for greenfield).
+
+        Returns:
+            Dict with ``queue_id``, ``status``, and ``work_type``.
+        """
+        worker = get_worker(self._config)
+        description = json.dumps(
+            {
+                "workspace_root": workspace_root,
+                "mode": mode,
+                "tech_stack": list(tech_stack or []),
+            }
+        )
+        queue_id = worker.enqueue(description=description, work_type="onboarding")
+        worker.start()  # no-op if already running
+        logger.info(f"Enqueued onboarding via RalphLoopWorker: queue_id={queue_id}")
+        return {
+            "queue_id": queue_id,
+            "status": "pending",
+            "work_type": "onboarding",
         }
 
     # ── Artifact operations ──

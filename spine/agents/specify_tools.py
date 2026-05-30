@@ -163,6 +163,31 @@ def _render_spec_markdown(spec: Specification) -> str:
     return "".join(parts)
 
 
+_NONTRIVIAL_KEYWORDS: tuple[str, ...] = (
+    "implement",
+    "design",
+    "refactor",
+    "rebuild",
+    "architect",
+    "build",
+)
+
+
+def _is_nontrivial_description(description: str) -> bool:
+    """Mirror the SPECIFY critic's proportionality heuristic.
+
+    Long descriptions or descriptions that name implementation-class verbs
+    require the spec to make scope decisions explicit; trivial flags or
+    one-line tweaks do not.
+    """
+    if not description:
+        return False
+    if len(description) > 200:
+        return True
+    desc_lower = description.lower()
+    return any(kw in desc_lower for kw in _NONTRIVIAL_KEYWORDS)
+
+
 class WriteSpecificationTool(BaseTool):
     """Write the specification artifacts (specification.md + specification.json).
 
@@ -183,6 +208,9 @@ class WriteSpecificationTool(BaseTool):
 
     workspace_root: str = ""
     spec_dir: str = ""
+    # Injected at build time so the empty-scope pre-check can apply the
+    # proportionality heuristic without re-reading state.
+    work_description: str = ""
 
     def _run(
         self,
@@ -195,6 +223,29 @@ class WriteSpecificationTool(BaseTool):
         scope_exclusions: list[str] | None = None,
         known_risks: list[str] | None = None,
     ) -> str:
+        # Pre-validate: non-trivial descriptions MUST declare scope. Without
+        # scope lists the downstream PLAN critic has nothing to check slice
+        # scope-creep against and will reject every plan — better to fail
+        # the synthesizer's tool call so it self-corrects in the same loop.
+        if _is_nontrivial_description(self.work_description):
+            missing: list[str] = []
+            inclusions = scope_inclusions or []
+            exclusions = scope_exclusions or []
+            if not any(s and s.strip() for s in inclusions):
+                missing.append("scope_inclusions")
+            if not any(s and s.strip() for s in exclusions):
+                missing.append("scope_exclusions")
+            if missing:
+                desc_preview = self.work_description[:80]
+                return (
+                    f"VALIDATION_ERROR: specification rejected before writing.\n"
+                    f"For non-trivial work ('{desc_preview}…'), the "
+                    f"following fields MUST be non-empty: {missing}. "
+                    f"Without these, the downstream PLAN critic cannot perform "
+                    f"scope-creep validation and will reject every plan. "
+                    f"Re-call write_specification with these fields populated."
+                )
+
         spec = Specification(
             title=title,
             summary=summary,
@@ -277,5 +328,6 @@ def build_specify_orchestrator_tools(
         WriteSpecificationTool(
             workspace_root=workspace_root,
             spec_dir=spec_dir,
+            work_description=description,
         ),
     ]

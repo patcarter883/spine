@@ -24,7 +24,7 @@ from typing import Any
 import sqlite_utils
 
 from spine.config import SpineConfig
-from spine.models.enums import TaskStatus
+from spine.models.enums import PhaseName, TaskStatus, WorkType
 from spine.persistence.artifacts import ArtifactStore
 from spine.services.audit_service import AuditService
 
@@ -209,6 +209,28 @@ async def submit_work(
     config.ensure_dirs()
 
     work_id = work_id or str(uuid.uuid4())[:8]
+
+    # ── Onboarding work routes off the LangGraph phase sequence ──
+    # The onboarding engine is not a workflow graph — it analyses/scaffolds a
+    # repo and synthesises docs directly.  The JSON description carries its
+    # parameters.  run_onboarding returns the same {work_id, status, work_type}
+    # dict the queue worker's _loop already consumes, so queue-row finalisation
+    # is unchanged.
+    if work_type == "onboarding":
+        try:
+            params = json.loads(description)
+        except (json.JSONDecodeError, TypeError):
+            params = {}
+        from spine.work.onboarding.engine import run_onboarding
+
+        return await run_onboarding(
+            workspace_root=params.get("workspace_root", config.workspace_root),
+            mode=params.get("mode", "brownfield"),
+            tech_stack=params.get("tech_stack"),
+            config=config,
+            work_id=work_id,
+        )
+
     audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
     artifacts = ArtifactStore(base_path=config.artifact_path)
 
@@ -1249,6 +1271,10 @@ async def restart_from_phase(
     from spine.persistence.checkpoint import CheckpointStore
 
     checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+    # Recover the prior run's execution state BEFORE purging — IMPLEMENT/VERIFY
+    # consume execution_waves / plan_json from checkpoint state (not disk), so a
+    # restart at those phases would otherwise have nothing to implement.
+    prior_state = await checkpoint_store.get_state(work_id) or {}
     saver = await checkpoint_store.get_checkpointer()
     await saver.adelete_thread(work_id)
     logger.info(f"[{work_id}] Purged checkpoint for restart from phase '{phase_name}'")
@@ -1289,6 +1315,12 @@ async def restart_from_phase(
         "retry_count": {},
         "max_retries": config.max_critic_retries,
         "artifacts": existing_artifacts,
+        # Carry execution state forward so a restart at IMPLEMENT/VERIFY has the
+        # slices to run; harmless for restarts at SPECIFY/PLAN (recomputed there).
+        "execution_waves": prior_state.get("execution_waves", []),
+        "plan_json": prior_state.get("plan_json"),
+        "specification_json": prior_state.get("specification_json"),
+        "read_cache": prior_state.get("read_cache", {}),
         "feedback": [],
         "status": "running",
         "prompt_request": None,
@@ -1678,12 +1710,14 @@ async def split_work_plan(
     # Get tasks text from artifact if not provided
     if tasks_text is None:
         artifacts = ArtifactStore(base_path=config.artifact_path)
-        tasks_path = artifacts.artifact_path(plan_id, "tasks", "tasks.md")
-        try:
-            tasks_text = Path(tasks_path).read_text(encoding="utf-8")
-        except FileNotFoundError:
-            tasks_path = artifacts.artifact_path(plan_id, "tasks", "tasks.txt")
-            tasks_text = Path(tasks_path).read_text(encoding="utf-8")
+        tasks_text = (
+            artifacts.load_artifact(plan_id, "tasks", "tasks.md")
+            or artifacts.load_artifact(plan_id, "tasks", "tasks.txt")
+        )
+        if tasks_text is None:
+            raise FileNotFoundError(
+                f"No tasks artifact found for {plan_id} (looked for tasks.md / tasks.txt)"
+            )
 
     # Parse tasks — each section starting with ## or # followed by text
     # becomes a separate work item. Simple heuristic: split on
@@ -1800,8 +1834,10 @@ async def approve_and_spawn(
         config: Optional SpineConfig.
 
     Returns:
-        A dict with keys: ``plan_id``, ``status``, ``spawned_ids``,
-        ``decomposition``.
+        For "approve": ``{plan_id, work_id, status, spawned_ids (empty),
+        continued_from, work_type}`` — the SAME work item is re-keyed to its
+        execution work type and continued from IMPLEMENT. For "reject" /
+        "request_revision": ``{plan_id, status, spawned_ids}``.
     """
     if config is None:
         config = SpineConfig.load()
@@ -2069,81 +2105,129 @@ async def approve_and_spawn(
             pass
         return {"plan_id": plan_id, "status": final_status, "spawned_ids": []}
 
-    # Approve the plan — load/spawn FIRST, then commit status atomically
-    # Load the plan artifact
-    plan_content = ""
-    plan_path = artifacts.artifact_path(plan_id, "plan", "plan.md")
-    try:
-        plan_content = Path(plan_path).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        # Try alternative path
-        plan_path = artifacts.artifact_path(plan_id, "plan", "plan.txt")
-        plan_content = Path(plan_path).read_text(encoding="utf-8")
+    # Approve the plan — CONTINUE this same work item from IMPLEMENT, reusing the
+    # already-approved spec + plan, instead of spawning fresh tasks that re-run
+    # SPECIFY/PLAN. The reviewed (gated) work type is re-keyed to its execution
+    # counterpart (whose WORKFLOW_SEQUENCES includes IMPLEMENT + VERIFY), then the
+    # graph is re-run from IMPLEMENT against the persisted plan state.
+    from spine.persistence.checkpoint import CheckpointStore
+    from spine.workflow.compose import WORKFLOW_SEQUENCES
 
-    # Resolve plan to work units
-    from spine.work.plan_resolver import resolve_plan_to_units, create_work_spawn_specs
+    exec_work_type = {
+        WorkType.REVIEWED_TASK.value: WorkType.TASK.value,
+        WorkType.CRITICAL_REVIEWED_TASK.value: WorkType.CRITICAL_TASK.value,
+    }.get(work_type, WorkType.TASK.value)
 
-    state = {
-        "work_id": plan_id,
-        "work_type": work_type,
-        "messages": [],
-    }
-
-    decomposition = await resolve_plan_to_units(
-        plan_content=plan_content,
-        work_type="task",  # Default to task for spawned tasks
-        state=state,
+    phase_seq = WORKFLOW_SEQUENCES.get(exec_work_type, [])
+    impl_index = next(
+        (i for i, (name, _) in enumerate(phase_seq) if name == PhaseName.IMPLEMENT.value),
+        None,
     )
-
-    # Create spawn specs and submit work items
-    specs = create_work_spawn_specs(
-        decomposition=decomposition,
-        plan_id=plan_id,
-        base_description=entry.get("description", "Plan execution"),
-    )
-
-    spawned_ids: list[str] = []
-    for spec in specs:
-        result = await submit_work(
-            description=spec["description"],
-            work_type=spec.get("work_type", "task"),
-            config=config,
-            plan_id=plan_id,
+    if impl_index is None:
+        raise ValueError(
+            f"No '{PhaseName.IMPLEMENT.value}' phase in WORKFLOW_SEQUENCES for "
+            f"'{exec_work_type}' — cannot continue {plan_id} from implement."
         )
-        spawned_ids.append(result["work_id"])
 
-    # All validation and spawning succeeded — now commit the approved status
+    # Recover the plan-phase state IMPLEMENT consumes (execution_waves / plan_json
+    # / specification_json / artifacts). The reviewed run's checkpoint still holds
+    # it; if the checkpoint is gone, rebuild execution_waves from the approved
+    # plan.json's feature_slices.
+    checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
+    saved_state = await checkpoint_store.get_state(plan_id) or {}
+
+    execution_waves = saved_state.get("execution_waves") or []
+    plan_json = saved_state.get("plan_json")
+    specification_json = saved_state.get("specification_json")
+    prior_artifacts = saved_state.get("artifacts") or {}
+    read_cache = saved_state.get("read_cache") or {}
+
+    if not execution_waves and isinstance(plan_json, dict) and plan_json.get("feature_slices"):
+        from spine.models.types import FeatureSlice
+        from spine.workflow.slice_scheduler import (
+            compute_execution_waves,
+            slices_to_state_dict,
+        )
+
+        slices = [FeatureSlice(**s) for s in plan_json["feature_slices"]]
+        execution_waves = slices_to_state_dict(compute_execution_waves(slices))
+
+    if not execution_waves:
+        raise ValueError(
+            f"Cannot continue {plan_id} from IMPLEMENT: the approved plan has no "
+            f"execution_waves in its checkpoint state and none could be rebuilt "
+            f"from plan.json feature_slices."
+        )
+
+    # Re-key the work item to its execution type so status/restart logic uses the
+    # IMPLEMENT/VERIFY sequence and it will NOT relabel back to awaiting_approval.
     db["work_entries"].update(
         plan_id,
         {
-            "status": TaskStatus.APPROVED.value,
+            "work_type": exec_work_type,
+            "status": TaskStatus.RUNNING.value,
+            "current_phase": PhaseName.IMPLEMENT.value,
             "updated_at": datetime.now().isoformat(),
-        },
-    )
-    audit.log_event(plan_id, "plan_approved", "dispatcher", {})
-
-    # Update the plan entry with spawned work IDs
-    db["work_entries"].update(
-        plan_id,
-        {
             "result": json.dumps(
-                {"approved": True, "spawned_ids": spawned_ids, "units_count": len(specs)}
+                {"approved": True, "continued_from": PhaseName.IMPLEMENT.value}
             ),
         },
     )
-
     audit.log_event(
         plan_id,
-        "plan_spawned_execution",
+        "plan_approved",
         "dispatcher",
-        {"spawned_count": len(spawned_ids)},
+        {"continued_work_type": exec_work_type, "from_phase": PhaseName.IMPLEMENT.value},
     )
 
+    # Seed the IMPLEMENT-onward run with the approved artifacts + plan state so
+    # SPECIFY/PLAN are not re-run.
+    initial_state: dict[str, Any] = {
+        "work_id": plan_id,
+        "work_type": exec_work_type,
+        "description": entry.get("description", ""),
+        "current_phase": PhaseName.IMPLEMENT.value,
+        "phase_index": impl_index,
+        "retry_count": {},
+        "max_retries": config.max_critic_retries,
+        "artifacts": prior_artifacts,
+        "execution_waves": execution_waves,
+        "plan_json": plan_json,
+        "specification_json": specification_json,
+        "read_cache": read_cache,
+        "feedback": [],
+        "status": "running",
+        "prompt_request": None,
+        "critic_reviewing": "",
+        "workspace_root": config.workspace_root,
+    }
+
+    # Purge the gated graph's checkpoint so the execution graph starts cleanly at
+    # IMPLEMENT from initial_state instead of restoring the critic_plan stop point.
+    await checkpoint_store.delete_state(plan_id)
+
+    run_result = await _run_workflow_graph(
+        work_id=plan_id,
+        work_type=exec_work_type,
+        config=config,
+        db=db,
+        audit=audit,
+        artifact_store=artifacts,
+        initial_state=initial_state,
+        checkpoint_store=checkpoint_store,
+        is_restart=True,
+        start_from_phase=PhaseName.IMPLEMENT.value,
+    )
+
+    # No fresh work is spawned — the same work_id continued. `spawned_ids` stays
+    # empty for backward compatibility with the UI/result consumers.
     return {
         "plan_id": plan_id,
-        "status": "approved",
-        "spawned_ids": spawned_ids,
-        "decomposition": decomposition.model_dump(),
+        "work_id": plan_id,
+        "status": run_result.get("status", "completed"),
+        "spawned_ids": [],
+        "continued_from": PhaseName.IMPLEMENT.value,
+        "work_type": exec_work_type,
     }
 
 

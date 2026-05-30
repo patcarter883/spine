@@ -64,8 +64,7 @@ def build_gap_plan_agent(
         "- Do NOT implement fixes yourself. Your only output is gap_plan.md + gap_plan.json.\n\n"
         "## Your Tool Surface (ONLY these tools)\n"
         "- `read_verification_findings` — loads all verification inputs in ONE call. No arguments.\n"
-        "- `write_structured_gap_plan` — writes gap_plan.md + gap_plan.json. Call this LAST.\n"
-        "- `eval` — JavaScript REPL for any analysis you need to do.\n\n"
+        "- `write_structured_gap_plan` — writes gap_plan.md + gap_plan.json. Call this LAST.\n\n"
         "Use ONLY these tools. Cannot access generic filesystem tools."
     )
 
@@ -82,10 +81,6 @@ def build_gap_plan_agent(
         system_prompt=system_prompt,
         extra_tools=orchestrator_tools,
         skip_filesystem_middleware=True,
-        # GAP_PLAN reads verify feedback and writes a gap-fix plan. No
-        # structural navigation; the MCP catalog is dead weight. See
-        # trace 019e721d audit.
-        skip_default_mcp_injection=True,
     )
 
     return agent
