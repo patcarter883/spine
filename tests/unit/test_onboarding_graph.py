@@ -33,6 +33,10 @@ from spine.work.onboarding.manifest import (
     SymbolRef,
 )
 from spine.work.onboarding.onboarding_graph import build_onboarding_graph
+from spine.work.onboarding.manifest_index import (
+    manifest_index,
+    validate_fragment_keys,
+)
 from spine.work.onboarding.synthesis_nodes import (
     _doc_manager_node,
     build_synthesis_graph,
@@ -133,6 +137,9 @@ class _StubStructured:
 class _StubModel:
     """Structured calls return a canned plan (manager) or section (worker)."""
 
+    def model_copy(self, *, update: dict | None = None, **_: Any) -> "_StubModel":
+        return self
+
     def with_structured_output(self, schema: Any) -> _StubStructured:
         return _StubStructured(schema, self._make)
 
@@ -165,12 +172,69 @@ class _RaisingModel:
         raise RuntimeError("local model unavailable")
 
 
+class _InvalidKeysModel(_StubModel):
+    """Manager returns a 4-doc plan that invents a module name (finding #5).
+
+    The plan covers all four documents (so doc-id coverage passes) but the
+    ARCHITECTURE_MAP section references a module absent from the index, which the
+    fragment-key validator must reject.
+    """
+
+    def _make(self, schema: Any) -> Any:
+        if schema is SectionPlanSet:
+            sections = []
+            for doc in ONBOARDING_DOC_NAMES:
+                keys: dict[str, Any] = {"doc_id": doc}
+                if doc == "ARCHITECTURE_MAP":
+                    keys["modules"] = ["does.not.exist"]
+                sections.append(
+                    {
+                        "doc_id": doc,
+                        "order": 0,
+                        "title": f"{doc} (refined)",
+                        "fragment_keys": keys,
+                        "instruction": f"Write {doc}.",
+                    }
+                )
+            return SectionPlanSet(sections=sections)
+        return super()._make(schema)
+
+
+class _FailOnceWorkerModel(_StubModel):
+    """Worker structured call raises on its FIRST invocation, then succeeds.
+
+    Exercises the bounded per-section retry (finding #6): one transient failure
+    must NOT mark the section status="error"; the retry recovers and the run
+    completes. The manager (SectionPlanSet) call is never failed.
+    """
+
+    def __init__(self) -> None:
+        self._worker_calls = 0
+
+    def with_structured_output(self, schema: Any) -> Any:
+        if schema is SectionPlanSet:
+            return _StubStructured(schema, self._make)
+        return self._FlakyWorkerStructured(self)
+
+    class _FlakyWorkerStructured:
+        def __init__(self, parent: "_FailOnceWorkerModel") -> None:
+            self._parent = parent
+
+        async def ainvoke(self, messages: list[Any], **_: Any) -> Any:
+            self._parent._worker_calls += 1
+            if self._parent._worker_calls == 1:
+                raise RuntimeError("transient local-model hiccup")
+            return SectionResult(
+                doc_id="", order=0, markdown="Recovered body.", status="ok"
+            )
+
+
 def _patch_resolve(monkeypatch, model: Any) -> None:
     def fake_resolve_model(config: Any, session_id: Any = None, phase: Any = None) -> Any:
         return model
 
     monkeypatch.setattr(
-        "spine.work.onboarding.synthesis_nodes.resolve_model", fake_resolve_model
+        "spine.work.onboarding.synthesis_nodes.resolve_chat_model", fake_resolve_model
     )
 
 
@@ -204,6 +268,64 @@ class TestDocManager:
         assert out["sections"] == expected
         assert all("refined" not in s["title"] for s in out["sections"])
 
+    def test_falls_back_when_refined_plan_has_invalid_fragment_keys(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A refined plan that invents a module name is rejected → skeleton.
+
+        Finding #5: the acceptance gate must validate fragment_keys, not just
+        doc-id coverage. A plan covering all four docs but referencing a module
+        absent from the index must fall back to the deterministic skeleton so
+        the resulting docs are real, not hollow.
+        """
+        manifest = _brownfield_manifest(str(tmp_path))
+        _patch_resolve(monkeypatch, _InvalidKeysModel())
+        out = asyncio.run(
+            _doc_manager_node(_initial_state(manifest, str(tmp_path), "wk"), None)
+        )
+        index = out["manifest_index"]
+        expected = deterministic_section_plan(index, "brownfield")
+        # Rejected → deterministic skeleton (whose selectors all resolve).
+        assert out["sections"] == expected
+        assert all("refined" not in s["title"] for s in out["sections"])
+
+
+# ── Fragment-key validator (finding #5) ─────────────────────────────────────
+
+
+class TestValidateFragmentKeys:
+    def test_skeleton_keys_all_resolve(self, tmp_path: Path) -> None:
+        manifest = _brownfield_manifest(str(tmp_path))
+        index = manifest_index(manifest)
+        # Every key the deterministic skeleton emits must resolve against the
+        # index it was built from.
+        for section in deterministic_section_plan(index, "brownfield"):
+            keys = dict(section["fragment_keys"])
+            keys.setdefault("doc_id", section["doc_id"])
+            assert validate_fragment_keys(index, keys) == []
+
+    def test_unknown_module_reported(self, tmp_path: Path) -> None:
+        manifest = _brownfield_manifest(str(tmp_path))
+        index = manifest_index(manifest)
+        reasons = validate_fragment_keys(
+            index, {"doc_id": "ARCHITECTURE_MAP", "modules": ["nope.module"]}
+        )
+        assert any("nope.module" in r for r in reasons)
+
+    def test_unknown_doc_id_reported(self, tmp_path: Path) -> None:
+        manifest = _brownfield_manifest(str(tmp_path))
+        index = manifest_index(manifest)
+        reasons = validate_fragment_keys(index, {"doc_id": "BOGUS"})
+        assert any("doc_id" in r for r in reasons)
+
+    def test_empty_selector_is_valid(self, tmp_path: Path) -> None:
+        manifest = _brownfield_manifest(str(tmp_path))
+        index = manifest_index(manifest)
+        # An empty list means "the full set" and must not be flagged.
+        assert validate_fragment_keys(
+            index, {"doc_id": "ARCHITECTURE_MAP", "modules": []}
+        ) == []
+
 
 # ── Full synthesis graph ─────────────────────────────────────────────────────
 
@@ -228,9 +350,74 @@ class TestSynthesisGraph:
         # the other docs' sections — i.e. real per-section fan-out happened.
         assert len(final["section_results"]) >= len(ONBOARDING_DOC_NAMES)
 
+    def test_invalid_fragment_keys_fall_back_and_write_real_docs(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Finding #5: a refined plan with invented module names must not yield
+        hollow docs. The manager rejects it, falls back to the skeleton, and the
+        run still writes four documents with REAL content (no placeholder)."""
+        manifest = _brownfield_manifest(str(tmp_path))
+        _patch_resolve(monkeypatch, _InvalidKeysModel())
+        final = self._run(manifest, tmp_path, "wk-invalid")
+
+        doc_dir = tmp_path / ".spine/artifacts" / "wk-invalid" / ONBOARDING_PHASE
+        for doc in ONBOARDING_DOC_NAMES:
+            path = doc_dir / f"{doc}.md"
+            assert path.exists()
+            text = path.read_text(encoding="utf-8")
+            # Real content, not the hollow placeholder.
+            assert "_No content could be synthesised" not in text
+            assert "Section body." in text
+        assert set(final["written"]) == set(ONBOARDING_DOC_NAMES)
+        # No placeholder-only docs: every doc got real worker content.
+        assert not final.get("placeholder_docs")
+
+    def test_placeholder_only_doc_raises(self, tmp_path: Path, monkeypatch) -> None:
+        """Finding #4: a document whose sections produce no real content is
+        written as a placeholder stub, but the run must FAIL (placeholder-only
+        is not a completed doc). We force ONE doc to have only empty sections."""
+        manifest = _brownfield_manifest(str(tmp_path))
+        _patch_resolve(monkeypatch, _StubModel())
+
+        import spine.work.onboarding.synthesis_nodes as nodes
+
+        real_assemble = nodes._assemble_docs_node
+
+        def gutted_assemble(state: dict[str, Any]) -> dict[str, Any]:
+            # Drop every OK section for ONE doc so it assembles placeholder-only.
+            results = list(state.get("section_results", []) or [])
+            kept = [
+                r for r in results if r.get("doc_id") != "CODING_GUIDELINES"
+            ]
+            return real_assemble({**state, "section_results": kept})
+
+        monkeypatch.setattr(nodes, "_assemble_docs_node", gutted_assemble)
+        graph = nodes.build_synthesis_graph().compile()
+
+        with pytest.raises(RuntimeError, match="placeholder-only"):
+            asyncio.run(
+                graph.ainvoke(_initial_state(manifest, str(tmp_path), "wk-hollow"))
+            )
+
+    def test_section_retry_recovers_then_completes(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Finding #6: a worker that fails once then succeeds must not nuke the
+        run. The bounded retry recovers and all four docs are written."""
+        manifest = _brownfield_manifest(str(tmp_path))
+        _patch_resolve(monkeypatch, _FailOnceWorkerModel())
+        final = self._run(manifest, tmp_path, "wk-retry")
+
+        doc_dir = tmp_path / ".spine/artifacts" / "wk-retry" / ONBOARDING_PHASE
+        for doc in ONBOARDING_DOC_NAMES:
+            assert (doc_dir / f"{doc}.md").exists()
+        assert set(final["written"]) == set(ONBOARDING_DOC_NAMES)
+        # No section ended up status="error" despite the one transient failure.
+        assert all(r.get("status") == "ok" for r in final["section_results"])
+
     def test_greenfield_minimal_plan(self, tmp_path: Path, monkeypatch) -> None:
         manifest = _greenfield_manifest(str(tmp_path))
-        # Greenfield skips the LLM refine, but resolve_model is still patched
+        # Greenfield skips the LLM refine, but resolve_chat_model is still patched
         # defensively (workers run for the four minimal sections).
         _patch_resolve(monkeypatch, _StubModel())
         final = self._run(manifest, tmp_path, "wk-green")
@@ -325,7 +512,7 @@ class TestComposedOnboardingGraph:
             return model
 
         monkeypatch.setattr(
-            "spine.work.onboarding.synthesis_nodes.resolve_model", fake_resolve_model
+            "spine.work.onboarding.synthesis_nodes.resolve_chat_model", fake_resolve_model
         )
 
     def test_brownfield_analyze_then_synthesize_writes_four_docs(

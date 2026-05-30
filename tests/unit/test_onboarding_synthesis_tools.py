@@ -222,6 +222,9 @@ class _StubModel:
     def __init__(self, worker_status: str = "ok") -> None:
         self._worker_status = worker_status
 
+    def model_copy(self, *, update: dict | None = None, **_: Any) -> "_StubModel":
+        return self
+
     def with_structured_output(self, schema: Any) -> _StubStructured:
         return _StubStructured(schema, self._make)
 
@@ -259,13 +262,13 @@ class _StubModel:
 
 
 def _patch_models(monkeypatch, worker_status: str = "ok") -> None:
-    """Replace the bare-LLM ``resolve_model`` in synthesis_nodes with a stub."""
+    """Replace the bare-LLM ``resolve_chat_model`` in synthesis_nodes with a stub."""
 
     def fake_resolve_model(config: Any, session_id: Any = None, phase: Any = None) -> Any:
         return _StubModel(worker_status=worker_status)
 
     monkeypatch.setattr(
-        "spine.work.onboarding.synthesis_nodes.resolve_model", fake_resolve_model
+        "spine.work.onboarding.synthesis_nodes.resolve_chat_model", fake_resolve_model
     )
 
 
@@ -336,3 +339,70 @@ class TestSynthesizeArtifacts:
                     config=None,  # type: ignore[arg-type]
                 )
             )
+
+
+# ── Section completion-token cap (trace 019e7855) ─────────────────────────────
+
+
+def test_section_max_completion_tokens_default() -> None:
+    """_section_max_completion_tokens returns 2048 when no config is provided."""
+    from spine.work.onboarding.synthesis_nodes import _section_max_completion_tokens
+
+    assert _section_max_completion_tokens(None) == 2048
+
+
+def test_section_max_completion_tokens_from_spine_config() -> None:
+    """_section_max_completion_tokens reads onboarding_section_max_completion_tokens."""
+    from unittest.mock import MagicMock
+
+    from spine.work.onboarding.synthesis_nodes import _section_max_completion_tokens
+
+    spine_cfg = MagicMock()
+    spine_cfg.onboarding_section_max_completion_tokens = 512
+    config = {"configurable": {"spine_config": spine_cfg}}
+    assert _section_max_completion_tokens(config) == 512
+
+
+def test_section_worker_applies_completion_cap(tmp_path: Path, monkeypatch) -> None:
+    """_section_worker_node must call model.model_copy(update={max_completion_tokens:...}).
+
+    Verifies the cap is passed so a local model cannot run to the global 16K
+    window before LengthFinishReasonError fires (trace 019e7855).
+    """
+    import asyncio
+
+    copy_calls: list[dict] = []
+
+    class _CapturingStubModel(_StubModel):
+        def model_copy(self, *, update: dict | None = None, **_: Any) -> "_CapturingStubModel":
+            copy_calls.append(dict(update or {}))
+            return self
+
+    def fake_resolve(config: Any, session_id: Any = None, phase: Any = None) -> Any:
+        return _CapturingStubModel()
+
+    monkeypatch.setattr("spine.work.onboarding.synthesis_nodes.resolve_chat_model", fake_resolve)
+
+    work_id = "wk-cap"
+    manifest = _brownfield_manifest(str(tmp_path))
+    _write_manifest_to_disk(tmp_path, manifest, work_id)
+
+    from spine.work.onboarding.synthesis import synthesize_artifacts
+
+    asyncio.run(
+        synthesize_artifacts(
+            manifest=manifest,
+            workspace_root=str(tmp_path),
+            work_id=work_id,
+            config=None,
+        )
+    )
+
+    # Every section-worker call must have applied a max_completion_tokens cap.
+    # (doc_manager also calls resolve_chat_model but its model_copy path is
+    # tested separately; we assert at least one worker applied the cap.)
+    worker_caps = [c.get("max_completion_tokens") for c in copy_calls if c]
+    assert worker_caps, "no model_copy(update=...) calls recorded — cap not applied"
+    assert all(c == 2048 for c in worker_caps), (
+        f"unexpected cap values: {worker_caps}"
+    )

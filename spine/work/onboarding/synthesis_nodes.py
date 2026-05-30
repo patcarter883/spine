@@ -30,9 +30,10 @@ size**, because **no LLM ever receives the whole manifest**:
   ``"error"``.
 
 Both LLM tiers follow the bare-LLM-call primitive (the ``run_research_manager``
-shape, NOT ``build_phase_agent``): ``resolve_model`` → ``init_chat_model`` if a
-string → ``model.with_structured_output(Schema)`` → a single ``ainvoke``, with
-the instance/``.parsed``/dict coercion handled defensively.
+shape, NOT ``build_phase_agent``): :func:`spine.agents.helpers.resolve_chat_model`
+→ ``model.with_structured_output(Schema)`` → a single ``ainvoke``, with the
+instance/``.parsed``/dict coercion handled defensively by
+:func:`spine.agents.helpers.coerce_structured_output`.
 
 :func:`build_synthesis_graph` wires Tier A → B → C → aggregate into an
 uncompiled ``StateGraph`` for the back-compat shim and the unit tests.
@@ -51,10 +52,15 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from spine.agents.helpers import resolve_model
+from spine.agents.helpers import coerce_structured_output, resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+from spine.persistence.artifacts import ArtifactStore
 from spine.work.onboarding.manifest import RepoManifest
-from spine.work.onboarding.manifest_index import manifest_index, resolve_fragment
+from spine.work.onboarding.manifest_index import (
+    manifest_index,
+    resolve_fragment_from_dict,
+    validate_fragment_keys,
+)
 from spine.work.onboarding.onboarding_state import OnboardingGraphState
 from spine.work.onboarding.synthesis_plan import (
     SectionPlan,
@@ -77,6 +83,7 @@ _ARTIFACTS_BASE = ".spine/artifacts"
 # explicit ``onboarding_section_token_cap``.
 _DEFAULT_SECTION_TOKEN_CAP = 6000
 _DEFAULT_MAX_SECTIONS = 32
+_DEFAULT_SECTION_MAX_COMPLETION_TOKENS = 2048
 
 
 # ── Doc-level voice / role strings ───────────────────────────────────────────
@@ -114,6 +121,13 @@ _DEFAULT_VOICE = (
 
 _GENERIC_SECTION_ERROR = "section generation failed; section omitted"
 
+# Bounded retries for a single section's bare-LLM structured call. A transient
+# failure or one empty/unparseable response is retried up to this many extra
+# times before the section is marked status="error" (finding #6) — so one
+# flaky call no longer nukes the whole run, while we stay fail-loud after the
+# budget is exhausted.
+_SECTION_MAX_RETRIES = 2
+
 
 # ── Manager (Tier A) prompts ─────────────────────────────────────────────────
 
@@ -148,6 +162,29 @@ def _section_token_cap(config: RunnableConfig | None) -> int:
     return cap if cap > 0 else _DEFAULT_SECTION_TOKEN_CAP
 
 
+def _section_max_completion_tokens(config: RunnableConfig | None) -> int:
+    """Per-section completion-token cap for the structured LLM call.
+
+    Prevents runaway generation when the local model tries to fill the global
+    max_completion_tokens window (16K) before the JSON schema closes, causing
+    LengthFinishReasonError and a 290-450s wall-clock penalty per worker.
+    """
+    cap = _DEFAULT_SECTION_MAX_COMPLETION_TOKENS
+    if config:
+        configurable = config.get("configurable", {}) or {}
+        spine_config = configurable.get("spine_config")
+        if spine_config is not None:
+            cap = int(
+                getattr(
+                    spine_config,
+                    "onboarding_section_max_completion_tokens",
+                    cap,
+                )
+                or cap
+            )
+    return cap if cap > 0 else _DEFAULT_SECTION_MAX_COMPLETION_TOKENS
+
+
 def _max_sections(config: RunnableConfig | None) -> int:
     """Cap on the number of index modules / call volume, from config."""
     cap = _DEFAULT_MAX_SECTIONS
@@ -168,34 +205,33 @@ def _manifest_from_state(state: OnboardingGraphState) -> RepoManifest:
 def _coerce_plan(response: Any) -> SectionPlanSet | None:
     """Coerce a ``with_structured_output`` response into a :class:`SectionPlanSet`.
 
-    Handles the three shapes seen across LangChain/provider versions: the
-    Pydantic instance directly, ``AIMessage.parsed``, or a plain dict. Returns
-    ``None`` when the shape is unrecognised so the caller falls back to the
-    deterministic skeleton.
+    Delegates to :func:`spine.agents.helpers.coerce_structured_output`, which
+    handles the three shapes seen across LangChain/provider versions (the
+    Pydantic instance directly, ``AIMessage.parsed``, or a plain dict) and
+    returns ``None`` when the shape is unrecognised so the caller falls back to
+    the deterministic skeleton.
     """
-    if isinstance(response, SectionPlanSet):
-        return response
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, SectionPlanSet):
-        try:
-            response.parsed = None  # prevent Pydantic serialization warning
-        except Exception:  # noqa: BLE001 - response may be immutable
-            pass
-        return parsed
-    if isinstance(response, dict):
-        try:
-            return SectionPlanSet.model_validate(response)
-        except Exception:  # noqa: BLE001 - malformed dict → skeleton fallback
-            return None
-    return None
+    return coerce_structured_output(response, SectionPlanSet)
 
 
-def _plan_is_coherent(sections: list[dict[str, Any]]) -> bool:
-    """A refined plan is usable only if it covers all four documents.
+def _plan_is_coherent(
+    sections: list[dict[str, Any]],
+    index: dict[str, Any],
+) -> bool:
+    """A refined plan is usable only if it covers all four docs AND resolves.
 
-    A weak local model may drop a document or emit a structurally-valid but
-    empty plan; in either case we fall back to the deterministic skeleton so
-    every document still gets at least one section.
+    Two gates (design finding #5):
+
+    1. **Coverage** — a weak local model may drop a document or emit a
+       structurally-valid but empty plan; the plan must carry at least one
+       section per document.
+    2. **Resolvability** — every section's ``fragment_keys`` must reference only
+       a known ``doc_id`` and only module/category/domain names present in the
+       compact *index*. A single unresolvable selector means the LLM invented a
+       name (→ hollow section), so the whole plan is rejected.
+
+    On either failure the caller falls back to the deterministic skeleton, whose
+    selectors are guaranteed to resolve.
     """
     if not sections:
         return False
@@ -204,7 +240,17 @@ def _plan_is_coherent(sections: list[dict[str, Any]]) -> bool:
         for s in sections
         if isinstance(s, dict) and s.get("doc_id") in ONBOARDING_DOC_NAMES
     }
-    return covered == set(ONBOARDING_DOC_NAMES)
+    if covered != set(ONBOARDING_DOC_NAMES):
+        return False
+
+    for s in sections:
+        if not isinstance(s, dict):
+            return False
+        fragment_keys = dict(s.get("fragment_keys", {}) or {})
+        fragment_keys.setdefault("doc_id", s.get("doc_id", ""))
+        if validate_fragment_keys(index, fragment_keys):
+            return False
+    return True
 
 
 def _section_to_dict(section: SectionPlan) -> dict[str, Any]:
@@ -268,11 +314,9 @@ async def _refine_plan_with_llm(
 ) -> list[dict[str, Any]]:
     """Make the single bare manager call; return the skeleton on any failure."""
     try:
-        model = resolve_model(config, session_id=work_id, phase="onboarding/doc-manager")
-        if isinstance(model, str):
-            from langchain.chat_models import init_chat_model
-
-            model = init_chat_model(model)
+        model = resolve_chat_model(
+            config, session_id=work_id, phase="onboarding/doc-manager"
+        )
 
         index_json = json.dumps(index, ensure_ascii=False)
         draft_json = json.dumps(skeleton, ensure_ascii=False)
@@ -305,9 +349,10 @@ async def _refine_plan_with_llm(
             return skeleton
 
         refined = [_section_to_dict(s) for s in plan_set.sections]
-        if not _plan_is_coherent(refined):
+        if not _plan_is_coherent(refined, index):
             logger.warning(
-                "[%s] doc_manager: refined plan incoherent (covers %d/4 docs) → skeleton",
+                "[%s] doc_manager: refined plan rejected (incoherent or "
+                "references unknown manifest keys; covers %d/4 docs) → skeleton",
                 work_id,
                 len({s.get("doc_id") for s in refined}),
             )
@@ -333,14 +378,20 @@ def _section_router(state: OnboardingGraphState) -> list[Send]:
     """Fan out one ``Send("section_worker", ...)`` per planned section.
 
     The router resolves each section's bounded fragment HERE (via
-    :func:`resolve_fragment`, hard-capped) and ships it inside ``active_section``
-    so the worker node receives ONLY its fragment — no manifest, no read tool.
+    :func:`resolve_fragment_from_dict`, hard-capped) and ships it inside
+    ``active_section`` so the worker node receives ONLY its fragment — no
+    manifest, no read tool.
+
+    The projection reads the in-state manifest DICT (``state["manifest"]``)
+    directly, so the previous per-section ``RepoManifest.from_dict`` ->
+    ``manifest.to_dict`` deep-copy round-trip (O(sections x full-manifest)) is
+    gone — every section now slices the same shared dict (finding #8).
     """
     sections = list(state.get("sections", []) or [])
     if not sections:
         return []
 
-    manifest = _manifest_from_state(state)
+    manifest_dict: dict[str, Any] = state.get("manifest") or {}
     # ``_section_router`` is a plain conditional-edge function and cannot read
     # config; the manager seeds ``section_token_cap`` into state for it.
     token_cap = int(
@@ -352,7 +403,7 @@ def _section_router(state: OnboardingGraphState) -> list[Send]:
     for section in sections:
         fragment_keys = dict(section.get("fragment_keys", {}) or {})
         fragment_keys.setdefault("doc_id", section.get("doc_id", ""))
-        fragment = resolve_fragment(manifest, fragment_keys, token_cap)
+        fragment = resolve_fragment_from_dict(manifest_dict, fragment_keys, token_cap)
         active = {
             "doc_id": section.get("doc_id", ""),
             "order": int(section.get("order", 0) or 0),
@@ -392,22 +443,12 @@ def _worker_prompt(active: dict[str, Any], voice: str) -> str:
 
 
 def _coerce_section_result(response: Any) -> SectionResult | None:
-    """Coerce a worker ``with_structured_output`` response to a SectionResult."""
-    if isinstance(response, SectionResult):
-        return response
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, SectionResult):
-        try:
-            response.parsed = None
-        except Exception:  # noqa: BLE001
-            pass
-        return parsed
-    if isinstance(response, dict):
-        try:
-            return SectionResult.model_validate(response)
-        except Exception:  # noqa: BLE001
-            return None
-    return None
+    """Coerce a worker ``with_structured_output`` response to a SectionResult.
+
+    Delegates to :func:`spine.agents.helpers.coerce_structured_output` (the
+    same instance / ``.parsed`` / dict-validate handling the doc manager uses).
+    """
+    return coerce_structured_output(response, SectionResult)
 
 
 async def _section_worker_node(
@@ -418,8 +459,11 @@ async def _section_worker_node(
 
     Input is ONLY ``state["active_section"]`` (fragment + instruction + title).
     Returns ``{"section_results": [one SectionResult dict]}`` for the
-    ``operator.add`` channel. On any failure it returns a result with
-    ``status="error"`` and a GENERIC reason (never raw exception text).
+    ``operator.add`` channel. The bare structured call is retried up to
+    :data:`_SECTION_MAX_RETRIES` extra times on exception or empty/unparseable
+    output so a single transient failure does not nuke the run (finding #6).
+    After the budget is exhausted it returns a result with ``status="error"``
+    and a GENERIC reason (never raw exception text).
     """
     active = state.get("active_section", {}) or {}
     doc_id = active.get("doc_id", "")
@@ -436,43 +480,72 @@ async def _section_worker_node(
         }
 
     try:
-        model = resolve_model(config, session_id=work_id, phase="onboarding/section-worker")
-        if isinstance(model, str):
-            from langchain.chat_models import init_chat_model
-
-            model = init_chat_model(model)
+        model = resolve_chat_model(
+            config, session_id=work_id, phase="onboarding/section-worker"
+        )
+        comp_cap = _section_max_completion_tokens(config)
+        model = model.model_copy(update={"max_completion_tokens": comp_cap})
 
         prompt = _worker_prompt(active, voice)
         structured = model.with_structured_output(SectionResult)
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", message=r".*PydanticSerializationUnexpectedValue.*parsed.*"
-            )
-            warnings.filterwarnings("ignore", message=r".*Expected `none`.*parsed.*")
-            response = await structured.ainvoke(
-                [SystemMessage(content=voice), HumanMessage(content=prompt)]
-            )
+        messages = [SystemMessage(content=voice), HumanMessage(content=prompt)]
 
-        result = _coerce_section_result(response)
-        if result is None or not (result.markdown or "").strip():
-            logger.warning(
-                "[%s] section_worker: empty/unparseable section %s#%d",
-                work_id,
-                doc_id,
-                order,
-            )
-            return {"section_results": [_error_result()]}
+        # Bounded retry: a single transient LLM failure or one empty/unparseable
+        # response should not nuke the whole run (finding #6). Retry the bare
+        # structured call up to _SECTION_MAX_RETRIES extra times, then fall back
+        # to a generic status="error" (never leaking exception text).
+        for attempt in range(_SECTION_MAX_RETRIES + 1):
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r".*PydanticSerializationUnexpectedValue.*parsed.*",
+                    )
+                    warnings.filterwarnings(
+                        "ignore", message=r".*Expected `none`.*parsed.*"
+                    )
+                    response = await structured.ainvoke(messages)
+                result = _coerce_section_result(response)
+            except Exception as exc:  # noqa: BLE001 - never leak exception text into docs
+                result = None
+                if attempt >= _SECTION_MAX_RETRIES:
+                    logger.warning(
+                        "[%s] section_worker: section %s#%d failed after %d "
+                        "attempt(s) (%s)",
+                        work_id,
+                        doc_id,
+                        order,
+                        attempt + 1,
+                        type(exc).__name__,
+                    )
+                    return {"section_results": [_error_result()]}
+                continue
 
-        return {
-            "section_results": [
-                {
-                    "doc_id": doc_id,
-                    "order": order,
-                    "markdown": result.markdown,
-                    "status": "ok",
+            if result is not None and (result.markdown or "").strip():
+                return {
+                    "section_results": [
+                        {
+                            "doc_id": doc_id,
+                            "order": order,
+                            "markdown": result.markdown,
+                            "status": "ok",
+                        }
+                    ]
                 }
-            ]
-        }
+
+            if attempt >= _SECTION_MAX_RETRIES:
+                logger.warning(
+                    "[%s] section_worker: empty/unparseable section %s#%d after "
+                    "%d attempt(s)",
+                    work_id,
+                    doc_id,
+                    order,
+                    attempt + 1,
+                )
+                return {"section_results": [_error_result()]}
+
+        # Unreachable: the loop always returns. Defensive floor.
+        return {"section_results": [_error_result()]}
     except Exception as exc:  # noqa: BLE001 - never leak exception text into docs
         logger.warning(
             "[%s] section_worker: section %s#%d failed (%s)",
@@ -514,6 +587,7 @@ def _assemble_docs_node(state: OnboardingGraphState) -> dict[str, Any]:
     )
 
     written: dict[str, str] = {}
+    placeholder_only: list[str] = []
     doc_dir = _doc_dir(workspace_root, work_id)
 
     for doc in ONBOARDING_DOC_NAMES:
@@ -530,15 +604,24 @@ def _assemble_docs_node(state: OnboardingGraphState) -> dict[str, Any]:
         if body_parts:
             content = f"# {title}\n\n" + "\n\n".join(body_parts) + "\n"
         else:
+            # Idempotent placeholder so the all-four-exist invariant is still
+            # observable, but record the doc so the aggregator FAILS the run:
+            # a placeholder-only document carries no real content (finding #4).
             content = (
                 f"# {title}\n\n"
                 "_No content could be synthesised for this document._\n"
             )
+            placeholder_only.append(doc)
         writer._run(doc=doc, content=content)
         written[doc] = str(doc_dir / f"{doc}.md")
 
-    logger.info("[%s] assemble_docs: wrote %d documents", work_id, len(written))
-    return {"written": written}
+    logger.info(
+        "[%s] assemble_docs: wrote %d documents (%d placeholder-only)",
+        work_id,
+        len(written),
+        len(placeholder_only),
+    )
+    return {"written": written, "placeholder_docs": placeholder_only}
 
 
 # ── Aggregator ───────────────────────────────────────────────────────────────
@@ -568,12 +651,15 @@ def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
         )
 
     doc_dir = _doc_dir(workspace_root, work_id)
+    # Verify existence through the same ArtifactStore WriteOnboardingDocTool
+    # writes through, rather than hand-rolling Path checks, so the read/write
+    # path scheme can never drift.
+    store = ArtifactStore(base_path=str(Path(workspace_root) / _ARTIFACTS_BASE))
     written: dict[str, str] = {}
     missing: list[str] = []
     for doc in ONBOARDING_DOC_NAMES:
-        path = doc_dir / f"{doc}.md"
-        if path.exists():
-            written[doc] = str(path)
+        if store.load_artifact(work_id, ONBOARDING_PHASE, f"{doc}.md") is not None:
+            written[doc] = str(doc_dir / f"{doc}.md")
         else:
             missing.append(doc)
 
@@ -582,6 +668,18 @@ def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
             f"onboarding synthesis incomplete for work {work_id}: "
             f"{len(missing)}/{len(ONBOARDING_DOC_NAMES)} document(s) not written: "
             f"{missing}. Wrote: {sorted(written)}."
+        )
+
+    # A document written as a placeholder-only stub (no OK sections produced any
+    # real content) carries no substance. The "all four docs" contract means
+    # four documents with REAL content, not four files (finding #4) — so a
+    # placeholder-only doc must FAIL the run loudly even though its file exists.
+    placeholder_docs = sorted(state.get("placeholder_docs", []) or [])
+    if placeholder_docs:
+        raise RuntimeError(
+            f"onboarding synthesis incomplete for work {work_id}: "
+            f"{len(placeholder_docs)}/{len(ONBOARDING_DOC_NAMES)} document(s) "
+            f"have no synthesised content (placeholder-only): {placeholder_docs}."
         )
 
     logger.info(
@@ -593,6 +691,39 @@ def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
 
 
 # ── Graph builder ────────────────────────────────────────────────────────────
+
+
+#: Destinations of the doc manager's ``_section_router`` (one ``Send`` per
+#: section → ``section_worker``). Hoisted so the half-builder and the composed
+#: onboarding graph share ONE route-map literal.
+SECTION_ROUTE_MAP: list[str] = ["section_worker"]
+
+
+def add_synthesis_nodes_and_edges(graph: StateGraph) -> None:
+    """Add the synthesis-phase nodes + INTERIOR edges to ``graph`` in place.
+
+    Adds ``doc_manager`` / ``section_worker`` / ``assemble_docs`` /
+    ``aggregate_synthesis`` and the interior wiring (manager ``Send`` fan-out →
+    section_worker → assemble_docs → aggregate_synthesis), but NOT the ``START``
+    entry edge or any terminal edge — the caller owns those so the same wiring
+    can serve both the standalone half-graph (``START`` → … → ``END``) and the
+    composed onboarding graph (entered via ``aggregate_analysis`` →
+    ``doc_manager``). This is the single source of truth for Phase B's topology,
+    shared with
+    :func:`spine.work.onboarding.onboarding_graph.build_onboarding_graph`.
+    """
+    graph.add_node("doc_manager", _doc_manager_node)
+    graph.add_node("section_worker", _section_worker_node)
+    graph.add_node("assemble_docs", _assemble_docs_node)
+    graph.add_node("aggregate_synthesis", _aggregate_synthesis_node)
+
+    graph.add_conditional_edges(
+        "doc_manager",
+        _section_router,
+        SECTION_ROUTE_MAP,
+    )
+    graph.add_edge("section_worker", "assemble_docs")
+    graph.add_edge("assemble_docs", "aggregate_synthesis")
 
 
 def build_synthesis_graph() -> StateGraph:
@@ -607,23 +738,12 @@ def build_synthesis_graph() -> StateGraph:
         → aggregate_synthesis → END
 
     Used by the :func:`spine.work.onboarding.synthesis.synthesize_artifacts`
-    back-compat shim and the synthesis unit tests.
+    back-compat shim and the synthesis unit tests. The interior nodes/edges are
+    shared with the composed graph via :func:`add_synthesis_nodes_and_edges`;
+    this builder only adds the ``START`` and ``END`` boundary edges.
     """
     graph: StateGraph = StateGraph(OnboardingGraphState)
-
-    graph.add_node("doc_manager", _doc_manager_node)
-    graph.add_node("section_worker", _section_worker_node)
-    graph.add_node("assemble_docs", _assemble_docs_node)
-    graph.add_node("aggregate_synthesis", _aggregate_synthesis_node)
-
+    add_synthesis_nodes_and_edges(graph)
     graph.add_edge(START, "doc_manager")
-    graph.add_conditional_edges(
-        "doc_manager",
-        _section_router,
-        ["section_worker"],
-    )
-    graph.add_edge("section_worker", "assemble_docs")
-    graph.add_edge("assemble_docs", "aggregate_synthesis")
     graph.add_edge("aggregate_synthesis", END)
-
     return graph

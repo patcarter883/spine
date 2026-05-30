@@ -33,6 +33,44 @@ from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES
 # single synthetic "other modules" entry so the index is O(K), not O(repo).
 _DEFAULT_MAX_MODULES: int = 32
 
+# First path components that indicate a filesystem-derived artifact domain
+# rather than a real code module. These arise when absolute paths outside the
+# workspace root (e.g. /home/pat/Projects/spine/spine/log.py) leak into the
+# AST indexer and get turned into dotted names like ``home.pat`` instead of
+# the correct ``spine.log.py``. Filtering them prevents hallucinated sections.
+_FILESYSTEM_ARTIFACT_PREFIXES: frozenset[str] = frozenset(
+    {
+        "home",
+        "users",
+        "tmp",
+        "temp",
+        "var",
+        "etc",
+        "usr",
+        "opt",
+        "root",
+        "mnt",
+        "media",
+        "srv",
+        "volumes",
+        "private",
+    }
+)
+
+
+def _is_path_artifact(name: str) -> bool:
+    """Return True if *name* looks like an absolute-path-derived artifact domain.
+
+    Checks whether the first dotted or slash-delimited component of *name* is a
+    known filesystem root directory (``home``, ``users``, ``tmp``, …). Boundaries
+    with such names should be excluded from the index and fragment projection so
+    section workers never receive them.
+    """
+    if not name:
+        return False
+    first = name.split(".")[0].split("/")[0].lower()
+    return first in _FILESYSTEM_ARTIFACT_PREFIXES
+
 
 def _module_symbol_count(boundary: dict[str, Any]) -> int:
     """Number of key symbols recorded for a serialised module boundary."""
@@ -87,7 +125,10 @@ def manifest_index(
         ``totals``, and ``notes``.
     """
     data = manifest.to_dict()
-    boundaries: list[dict[str, Any]] = list(data.get("module_boundaries", []) or [])
+    boundaries: list[dict[str, Any]] = [
+        b for b in (data.get("module_boundaries", []) or [])
+        if not _is_path_artifact(b.get("name", ""))
+    ]
     edges: list[dict[str, Any]] = list(data.get("dependency_chains", []) or [])
     patterns: list[dict[str, Any]] = list(data.get("patterns", []) or [])
 
@@ -141,7 +182,10 @@ def manifest_index(
     return {
         "mode": data.get("mode", ""),
         "tech_stack": list(data.get("tech_stack", []) or []),
-        "core_domains": list(data.get("core_domains", []) or []),
+        "core_domains": [
+            d for d in (data.get("core_domains", []) or [])
+            if not _is_path_artifact(d)
+        ],
         "modules": modules,
         "pattern_categories": pattern_categories,
         "edge_counts": edge_counts,
@@ -167,14 +211,61 @@ def _fragment_token_count(fragment: dict[str, Any]) -> int:
 def _doc_kind_of(fragment_keys: dict[str, Any]) -> str:
     """Resolve the onboarding doc kind a fragment-key set targets.
 
-    Accepts an explicit ``doc_id`` key; otherwise defaults to the architecture
-    map (the densest projection) so an under-specified key set still produces a
-    bounded fragment rather than raising.
+    Requires an explicit, valid ``doc_id`` key. An unknown / missing ``doc_id``
+    raises ``ValueError`` so a hollow plan never silently resolves to the
+    architecture map (design finding #5). Callers that need a tolerant default
+    must validate up front via :func:`validate_fragment_keys`.
     """
     doc_id = fragment_keys.get("doc_id", "")
     if doc_id in ONBOARDING_DOC_NAMES:
         return doc_id
-    return "ARCHITECTURE_MAP"
+    raise ValueError(f"unknown onboarding doc_id: {doc_id!r}")
+
+
+def validate_fragment_keys(
+    index: dict[str, Any],
+    fragment_keys: dict[str, Any],
+) -> list[str]:
+    """Return the list of unresolvable selectors in *fragment_keys*.
+
+    A refined :class:`SectionPlan` references manifest entries by stable key.
+    This checks those keys against the compact *index* (the only repo view the
+    documentation manager ever sees) and returns a list of human-readable
+    reasons for every selector that cannot be resolved:
+
+    - a ``doc_id`` that is not one of :data:`ONBOARDING_DOC_NAMES`;
+    - any ``modules`` name absent from the index modules (the synthetic
+      ``"__other_modules__"`` tail entry is accepted);
+    - any ``categories`` name absent from the index ``pattern_categories``;
+    - any ``domains`` name absent from the index ``core_domains``.
+
+    An empty selector list (e.g. ``"modules": []``) means "the full set for this
+    doc kind" and is always valid. The returned list is empty when every
+    selector resolves; a non-empty list means the plan must be rejected.
+    """
+    reasons: list[str] = []
+
+    doc_id = fragment_keys.get("doc_id", "")
+    if doc_id not in ONBOARDING_DOC_NAMES:
+        reasons.append(f"unknown doc_id: {doc_id!r}")
+
+    known_modules = {
+        m.get("name", "") for m in (index.get("modules", []) or []) if isinstance(m, dict)
+    }
+    known_categories = set(index.get("pattern_categories", []) or [])
+    known_domains = set(index.get("core_domains", []) or [])
+
+    for name in fragment_keys.get("modules", []) or []:
+        if name not in known_modules:
+            reasons.append(f"unknown module: {name!r}")
+    for name in fragment_keys.get("categories", []) or []:
+        if name not in known_categories:
+            reasons.append(f"unknown category: {name!r}")
+    for name in fragment_keys.get("domains", []) or []:
+        if name not in known_domains:
+            reasons.append(f"unknown domain: {name!r}")
+
+    return reasons
 
 
 def _matching_modules(
@@ -334,6 +425,12 @@ def resolve_fragment(
     :func:`_enforce_token_cap`, which degrades ``key_symbols`` -> names ->
     truncate so the returned fragment **never** exceeds *token_cap*.
 
+    This is a thin wrapper over :func:`resolve_fragment_from_dict` for callers
+    that hold a :class:`RepoManifest`; the graph's ``_section_router`` already
+    holds the manifest *dict* (``state["manifest"]``) and calls the dict variant
+    directly, avoiding a per-section ``from_dict``/``to_dict`` round-trip
+    (finding #8).
+
     Args:
         manifest: The full :class:`RepoManifest`.
         fragment_keys: ``{"doc_id": <NAME>, "modules"|"categories"|"domains":
@@ -345,8 +442,35 @@ def resolve_fragment(
     Returns:
         A small, JSON-serialisable dict at or under *token_cap* tokens.
     """
-    data = manifest.to_dict()
-    boundaries: list[dict[str, Any]] = list(data.get("module_boundaries", []) or [])
+    return resolve_fragment_from_dict(manifest.to_dict(), fragment_keys, token_cap)
+
+
+def resolve_fragment_from_dict(
+    data: dict[str, Any],
+    fragment_keys: dict[str, Any],
+    token_cap: int,
+) -> dict[str, Any]:
+    """Project the bounded manifest slice from an already-serialised manifest.
+
+    Identical projection to :func:`resolve_fragment` but operates directly on a
+    :meth:`RepoManifest.to_dict` dict (the form the graph carries in
+    ``state["manifest"]``). This eliminates the per-section
+    ``RepoManifest.from_dict`` -> ``manifest.to_dict`` deep-copy round-trip the
+    router previously paid once per section (finding #8). The output is
+    byte-identical to :func:`resolve_fragment` for the same manifest + keys.
+
+    Args:
+        data: A manifest dict as produced by :meth:`RepoManifest.to_dict`.
+        fragment_keys: See :func:`resolve_fragment`.
+        token_cap: See :func:`resolve_fragment`.
+
+    Returns:
+        A small, JSON-serialisable dict at or under *token_cap* tokens.
+    """
+    boundaries: list[dict[str, Any]] = [
+        b for b in (data.get("module_boundaries", []) or [])
+        if not _is_path_artifact(b.get("name", ""))
+    ]
     edges: list[dict[str, Any]] = list(data.get("dependency_chains", []) or [])
     patterns: list[dict[str, Any]] = list(data.get("patterns", []) or [])
 
@@ -373,7 +497,13 @@ def resolve_fragment(
 
     elif kind == "PROJECT_DEFINITION":
         wanted = list(fragment_keys.get("domains", []) or [])
-        domains = wanted if wanted else list(data.get("core_domains", []) or [])
+        if wanted:
+            domains = [d for d in wanted if not _is_path_artifact(d)]
+        else:
+            domains = [
+                d for d in (data.get("core_domains", []) or [])
+                if not _is_path_artifact(d)
+            ]
         domain_set = {d for d in domains}
         # A domain maps to a module of the same name (core_domains are derived
         # from boundary names); surface those modules' roles only.

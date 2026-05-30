@@ -11,7 +11,7 @@ mocked:
 - the return dict shape is preserved;
 - a re-run for the same ``work_id`` is idempotent (overwrites cleanly).
 
-No live model is used — the synthesis tiers' ``resolve_model`` is patched to a
+No live model is used — the synthesis tiers' ``resolve_chat_model`` is patched to a
 stub that returns a canned plan (manager) / section (worker). Analysis is
 deterministic Python over a tiny real temp repo.
 """
@@ -47,6 +47,9 @@ class _StubStructured:
 
 class _StubModel:
     """Returns a canned plan for the manager and a section body for workers."""
+
+    def model_copy(self, *, update: dict | None = None, **_: Any) -> "_StubModel":
+        return self
 
     def with_structured_output(self, schema: Any) -> _StubStructured:
         return _StubStructured(schema, self._make)
@@ -111,7 +114,7 @@ def _patch_llm(monkeypatch) -> None:
         return _StubModel()
 
     monkeypatch.setattr(
-        "spine.work.onboarding.synthesis_nodes.resolve_model", fake_resolve_model
+        "spine.work.onboarding.synthesis_nodes.resolve_chat_model", fake_resolve_model
     )
 
 
@@ -162,6 +165,17 @@ class TestRunOnboardingBrownfield:
         assert result["work_type"] == "onboarding"
         assert set(result["artifacts"]) == {f"{d}.md" for d in ONBOARDING_DOC_NAMES}
         assert Path(result["manifest_path"]).exists()
+        # The result dict carries workspace_root + mode so the UI can resolve
+        # the (possibly external) artifact base and the correct phase bar.
+        assert result["workspace_root"] == str(tmp_path)
+        assert result["mode"] == "brownfield"
+
+        # ...and they are persisted into work_entries.result for the UI.
+        from spine.work.dispatcher import get_work_db as _get_db
+
+        persisted = json.loads(_get_db(config)["work_entries"].get("wk-brown")["result"])
+        assert persisted["workspace_root"] == str(tmp_path)
+        assert persisted["mode"] == "brownfield"
 
         # All four docs written.
         doc_dir = _doc_dir(tmp_path, "wk-brown")
@@ -229,6 +243,8 @@ class TestRunOnboardingGreenfield:
 
         assert result["status"] == TaskStatus.COMPLETED.value
         assert result["work_type"] == "onboarding"
+        assert result["workspace_root"] == str(tmp_path)
+        assert result["mode"] == "greenfield"
 
         # Greenfield phase order: scaffold (pre-graph) → analyze (seed) → synthesize.
         assert phases == ["scaffold", "analyze", "synthesize"]
@@ -259,7 +275,7 @@ class TestRunOnboardingFailure:
             return _ErrorWorkerModel()
 
         monkeypatch.setattr(
-            "spine.work.onboarding.synthesis_nodes.resolve_model", fake_resolve_model
+            "spine.work.onboarding.synthesis_nodes.resolve_chat_model", fake_resolve_model
         )
 
         result = asyncio.run(
@@ -283,3 +299,91 @@ class TestRunOnboardingFailure:
         # The recorded result is the generic engine error envelope, not doc text.
         recorded = json.loads(row["result"])
         assert "error" in recorded
+
+
+class TestUIApiResolvesExternalArtifactStore:
+    """Finding #1: docs for an EXTERNAL onboarding target must display.
+
+    The engine writes the manifest + four docs under
+    ``<workspace_root>/.spine/artifacts``. When the onboarded repo differs from
+    spine's own ``artifact_path``, ``UIApi.read_artifact``/``get_artifacts`` must
+    resolve the store from the work item's recorded ``workspace_root`` — not the
+    global spine store — or the UI shows nothing.
+    """
+
+    def test_read_artifact_resolves_workspace_root_store(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from spine.ui_api import UIApi
+
+        # spine's own state lives under spine_home; the onboarded TARGET repo
+        # lives under a SEPARATE external_repo dir, so the two artifact bases
+        # genuinely differ (the bug condition).
+        spine_home = tmp_path / "spine_home"
+        spine_home.mkdir()
+        external_repo = tmp_path / "external_repo"
+        external_repo.mkdir()
+        _write_sample_repo(external_repo)
+
+        spine_dir = spine_home / ".spine"
+        spine_dir.mkdir(parents=True, exist_ok=True)
+        config = SpineConfig(
+            queue_path=str(spine_dir / "queue.db"),
+            artifact_path=str(spine_dir / "artifacts"),
+            checkpoint_path=str(spine_dir / "spine.db"),
+            workspace_root=str(spine_home),
+        )
+        _patch_llm(monkeypatch)
+
+        result = asyncio.run(
+            run_onboarding(
+                workspace_root=str(external_repo),
+                mode="brownfield",
+                tech_stack=["python"],
+                config=config,
+                work_id="wk-ext",
+            )
+        )
+        assert result["status"] == TaskStatus.COMPLETED.value
+
+        # The docs were written under the EXTERNAL repo, not spine's store.
+        external_doc_dir = (
+            external_repo / ".spine" / "artifacts" / "wk-ext" / ONBOARDING_PHASE
+        )
+        for doc in ONBOARDING_DOC_NAMES:
+            assert (external_doc_dir / f"{doc}.md").exists()
+        # spine's own global store has NOTHING for this work item.
+        assert not (spine_dir / "artifacts" / "wk-ext").exists()
+
+        api = UIApi(config=config)
+
+        # The global store would read nothing; the resolved store finds the docs.
+        for doc in ONBOARDING_DOC_NAMES:
+            content = api.read_artifact("wk-ext", ONBOARDING_PHASE, f"{doc}.md")
+            assert content, f"UIApi failed to resolve external artifact {doc}"
+        listed = {a.get("name") for a in api.get_artifacts("wk-ext")}
+        for doc in ONBOARDING_DOC_NAMES:
+            assert f"{doc}.md" in listed
+
+    def test_non_onboarding_read_unchanged(self, tmp_path: Path) -> None:
+        """A non-onboarding work item reads from the global store untouched."""
+        from spine.ui_api import UIApi
+
+        spine_dir = tmp_path / ".spine"
+        spine_dir.mkdir(parents=True, exist_ok=True)
+        config = SpineConfig(
+            queue_path=str(spine_dir / "queue.db"),
+            artifact_path=str(spine_dir / "artifacts"),
+            checkpoint_path=str(spine_dir / "spine.db"),
+            workspace_root=str(tmp_path),
+        )
+        api = UIApi(config=config)
+        # Save an artifact through the global store, then read it back: the
+        # resolver must fall through to the global store for non-onboarding ids.
+        api._artifacts.save_artifact(
+            work_id="wk-spec",
+            phase="specify",
+            name="spec.md",
+            content="# Spec\nhello",
+        )
+        assert api.read_artifact("wk-spec", "specify", "spec.md") == "# Spec\nhello"

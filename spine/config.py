@@ -266,6 +266,13 @@ class SpineConfig:
     # default to the resolved default model when unset).
     onboarding_section_token_cap: int = 6000
     onboarding_max_sections: int = 32
+    # Hard cap on completion tokens for the section-worker's single
+    # with_structured_output call. Sections are 100-700 tokens of markdown;
+    # without a tight cap a local model can run to the global max_completion_tokens
+    # window (16K) before raising LengthFinishReasonError, costing 290-450s per
+    # affected worker before the retry. 2048 is safe headroom above the largest
+    # observed section (2498 chars ≈ 700 tokens). Trace 019e7855.
+    onboarding_section_max_completion_tokens: int = 2048
     # ``onboarding_distributed_analysis`` routes analysis through the
     # deterministic map-reduce graph (one explorer Send per module unit); when
     # ``False`` the manager calls ``RepoAnalyzer.analyze`` inline with 0 explorer
@@ -504,6 +511,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_ONBOARDING_MAX_SECTIONS",
                     spine.get("onboarding_max_sections", 32),
+                )
+            ),
+            onboarding_section_max_completion_tokens=int(
+                os.getenv(
+                    "SPINE_ONBOARDING_SECTION_MAX_COMPLETION_TOKENS",
+                    spine.get("onboarding_section_max_completion_tokens", 2048),
                 )
             ),
             onboarding_distributed_analysis=os.getenv(
