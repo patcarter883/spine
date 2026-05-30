@@ -24,24 +24,32 @@ import streamlit as st
 
 from spine.ui.utils import format_duration, status_icon, truncate
 from spine.ui_api import UIApi
+from spine.work.onboarding.phases import (
+    PHASE_ANALYZE,
+    PHASE_COMPLETED,
+    PHASE_SCAFFOLD,
+    PHASE_SYNTHESIZE,
+    PHASES_BY_MODE,
+)
 
 # ── Fragment refresh interval (seconds) ──
 # The progress section auto-refreshes via @st.fragment(run_every=...) so only
 # that fragment re-renders while the form inputs above keep their state.
 _POLL_INTERVAL = 10
 
-# Fixed phase sequences per mode.  Brownfield skips the scaffold step;
-# greenfield scaffolds an empty project before synthesising defaults.
-_PHASES_BY_MODE: dict[str, list[str]] = {
-    "greenfield": ["analyze", "scaffold", "synthesize"],
-    "brownfield": ["analyze", "synthesize"],
-}
+# Fixed phase sequences per mode (shared with the engine via
+# spine.work.onboarding.phases so the phase-bar contract cannot drift).
+# Brownfield skips the scaffold step; greenfield scaffolds an empty project
+# BEFORE analysing/synthesising defaults, so "scaffold" comes first to keep the
+# progress bar monotonic (the engine fires "scaffold" pre-graph, then "analyze",
+# then "synthesize").
+_PHASES_BY_MODE: dict[str, list[str]] = PHASES_BY_MODE
 
 _PHASE_EMOJI: dict[str, str] = {
-    "analyze": "🔍",
-    "scaffold": "🏗️",
-    "synthesize": "📝",
-    "completed": "✅",
+    PHASE_ANALYZE: "🔍",
+    PHASE_SCAFFOLD: "🏗️",
+    PHASE_SYNTHESIZE: "📝",
+    PHASE_COMPLETED: "✅",
 }
 
 # The four artifacts the onboarding engine always produces, in display order.
@@ -75,7 +83,7 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
         current_idx = phases.index(current)
     except ValueError:
         # "completed" (or any unknown terminal phase) means every step is done.
-        current_idx = len(phases) if current == "completed" else -1
+        current_idx = len(phases) if current == PHASE_COMPLETED else -1
 
     for i, (col, phase) in enumerate(zip(cols, phases)):
         icon = _PHASE_EMOJI.get(phase, "⚙️")
@@ -118,7 +126,7 @@ def _render_progress(api: UIApi) -> None:
     queue_id = active.get("id")
     display_id = work_id or f"queue-{queue_id}"
     status = active.get("status", "unknown")
-    current_phase = active.get("current_phase") or "analyze"
+    current_phase = active.get("current_phase") or PHASE_ANALYZE
     created_at = active.get("created_at") or ""
     updated_at = active.get("updated_at") or ""
 
@@ -171,11 +179,11 @@ def _phases_for_active(active: dict[str, object]) -> list[str]:
 def _render_artifacts(api: UIApi, work_id: str) -> None:
     """Render the four onboarding documents inline for review.
 
-    Lists artifacts via ``api.get_artifacts(work_id)`` and shows each known
-    onboarding doc via ``api.read_artifact(work_id, "onboarding", name)`` in an
-    expander + markdown block, mirroring human_review.py's review pattern.
-    Reads are done exclusively through ``api.read_artifact`` (no filesystem
-    access here).
+    Shows each known onboarding doc via
+    ``api.read_artifact(work_id, "onboarding", name)`` in an expander + markdown
+    block, mirroring human_review.py's review pattern. Reads are done
+    exclusively through ``api.read_artifact`` (no filesystem access here); a doc
+    that returns no content is simply skipped.
 
     Args:
         api: The UI gateway.
@@ -184,16 +192,11 @@ def _render_artifacts(api: UIApi, work_id: str) -> None:
     if not work_id:
         return
 
-    artifacts = api.get_artifacts(work_id) or []
-    available_names = {a.get("name") for a in artifacts if isinstance(a, dict)}
-
     st.subheader("📚 Onboarding Documents")
     rendered_any = False
     for name in _ONBOARDING_DOCS:
         content = api.read_artifact(work_id, _ONBOARDING_PHASE, name)
         if not content:
-            if available_names and name not in available_names:
-                continue
             continue
         rendered_any = True
         with st.expander(f"📄 {name}", expanded=False):

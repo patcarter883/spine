@@ -144,3 +144,5 @@ providers:
       provider: pat
     summarization:
       provider: pat
+    onboarding:
+      provider: pat

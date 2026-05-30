@@ -332,8 +332,50 @@ def test_phase_bar_helper_handles_completed(fake_st: _FakeStreamlit) -> None:
     onboarding._render_phase_bar([], "analyze")
 
 
+def test_phases_for_active_brownfield(fake_st: _FakeStreamlit) -> None:
+    """A brownfield active job selects the analyze→synthesize sequence."""
+    onboarding = _load_onboarding()
+
+    phases = onboarding._phases_for_active({"mode": "brownfield"})
+    assert phases == ["analyze", "synthesize"]
+
+
+def test_phases_for_active_greenfield_is_scaffold_first(
+    fake_st: _FakeStreamlit,
+) -> None:
+    """Greenfield order is scaffold-first so the progress bar stays monotonic
+    (the engine fires "scaffold" pre-graph before "analyze")."""
+    onboarding = _load_onboarding()
+
+    phases = onboarding._phases_for_active({"mode": "greenfield"})
+    assert phases == ["scaffold", "analyze", "synthesize"]
+    # scaffold precedes analyze.
+    assert phases.index("scaffold") < phases.index("analyze")
+
+
+def test_phases_for_active_unknown_mode_defaults_to_greenfield_superset(
+    fake_st: _FakeStreamlit,
+) -> None:
+    """Missing/unknown mode falls back to the greenfield (scaffold-first) list."""
+    onboarding = _load_onboarding()
+
+    assert onboarding._phases_for_active({}) == ["scaffold", "analyze", "synthesize"]
+    assert onboarding._phases_for_active({"mode": "???"}) == [
+        "scaffold",
+        "analyze",
+        "synthesize",
+    ]
+
+
 def test_page_does_not_import_dispatcher_or_engine() -> None:
-    """Zero-duplication: the page must not import the dispatcher or engine."""
+    """Zero-duplication: the page must not import the dispatcher, engine, or graph.
+
+    The page may import the dependency-free ``spine.work.onboarding.phases``
+    constants module (the shared phase-bar vocabulary, single source of truth
+    with the engine) — but NOT the dispatcher, the onboarding engine, the
+    workflow graph, or any other backend module that does real work, so all
+    backend access still flows through ``UIApi``.
+    """
     source = (
         Path(__file__).resolve().parent.parent.parent
         / "spine"
@@ -342,5 +384,12 @@ def test_page_does_not_import_dispatcher_or_engine() -> None:
         / "onboarding.py"
     ).read_text()
     assert "spine.work.dispatcher" not in source
-    assert "spine.work.onboarding" not in source
+    assert "spine.work.onboarding.engine" not in source
+    assert "spine.work.onboarding.onboarding_graph" not in source
+    assert "spine.work.onboarding.synthesis" not in source
+    assert "spine.work.onboarding.analysis" not in source
     assert "build_workflow_graph" not in source
+    # The page may ONLY reach into the dependency-free phase-constant module.
+    for line in source.splitlines():
+        if "spine.work.onboarding" in line:
+            assert "spine.work.onboarding.phases" in line

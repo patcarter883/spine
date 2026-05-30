@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 # Cache to avoid opening the same phase DB multiple times per workflow.
 _phase_checkpointer_cache: dict[str, AsyncSqliteSaver] = {}
 
+# ``AsyncSqliteSaver.from_conn_string`` is an async context manager that opens
+# the aiosqlite connection inside its own ``async with`` and yields the saver.
+# The saver holds the connection but NOT the context-manager object, so if the
+# ctx is dropped its ``__aexit__`` runs on GC and CLOSES the connection out from
+# under a still-running graph ("Connection closed"). Hold every entered ctx here
+# for the process lifetime so the connection thread survives until exit.
+_phase_checkpointer_ctx_cache: dict[str, Any] = {}
+
 
 def _ensure_checkpoint_dir(base_path: str) -> bool:
     """Create the checkpoint base directory if it doesn't exist."""
@@ -34,6 +42,32 @@ def _ensure_checkpoint_dir(base_path: str) -> bool:
     except OSError:
         logger.error(f"Failed to create checkpoint directory: {base_path}")
         return False
+
+
+def _saver_connection_alive(saver: AsyncSqliteSaver) -> bool:
+    """Best-effort check that a cached saver's aiosqlite connection is usable.
+
+    A cached :class:`AsyncSqliteSaver` is only reusable while its underlying
+    aiosqlite connection (and the worker thread bound to the event loop that
+    opened it) is still alive. When the same ``work_id`` is processed again in a
+    NEW event loop — e.g. a re-run under a fresh ``asyncio.run`` — the old
+    connection is dead, so reusing it raises "Connection closed" /
+    "no active connection". We detect that here so the caller can transparently
+    reopen. On any uncertainty we report "not alive" so the caller rebuilds (a
+    fresh connection is always safe; a stale one is not).
+    """
+    conn = getattr(saver, "conn", None)
+    if conn is None:
+        return False
+    # aiosqlite sets ``_connection`` to None on close, and runs the real sqlite3
+    # connection on a dedicated ``_thread``. Treat the saver as alive only when
+    # both are present and the worker thread is still running.
+    if getattr(conn, "_connection", None) is None:
+        return False
+    thread = getattr(conn, "_thread", None)
+    if thread is not None and not thread.is_alive():
+        return False
+    return True
 
 
 async def _get_phase_checkpointer(
@@ -69,14 +103,25 @@ async def _get_phase_checkpointer(
             checkpoint_base_dir = str(pkg_dir / ".spine" / "checkpoints")
 
     cache_key = f"{work_id}/{phase}"
-    if cache_key in _phase_checkpointer_cache:
-        return _phase_checkpointer_cache[cache_key]
+    cached = _phase_checkpointer_cache.get(cache_key)
+    if cached is not None and _saver_connection_alive(cached):
+        return cached
+    if cached is not None:
+        # A cached saver whose aiosqlite connection was bound to an
+        # already-closed event loop (e.g. a re-run of the same work_id in a
+        # fresh ``asyncio.run`` loop) is unusable — drop it and reopen below so
+        # the second run gets a live connection instead of "Connection closed".
+        _phase_checkpointer_cache.pop(cache_key, None)
+        _phase_checkpointer_ctx_cache.pop(cache_key, None)
 
     db_path = Path(checkpoint_base_dir) / work_id / f"{phase}.db"
     _ensure_checkpoint_dir(str(db_path.parent))
 
     ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
     saver = await ctx.__aenter__()
+    # Hold the context manager so its ``__aexit__`` does not run on GC and close
+    # the aiosqlite connection while the graph is still using it.
+    _phase_checkpointer_ctx_cache[cache_key] = ctx
     _phase_checkpointer_cache[cache_key] = saver
     logger.debug(f"[{work_id}] [{phase}] per-phase checkpointer: {db_path}")
     return saver

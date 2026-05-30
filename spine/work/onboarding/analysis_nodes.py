@@ -115,19 +115,23 @@ def _symbol_from_dict(data: dict[str, Any]) -> Symbol:
     )
 
 
-def _summaries_from_state(state: OnboardingGraphState) -> dict[tuple[str, str], str]:
-    """Rebuild the ``(file_path, symbol_name) -> summary`` map from state.
+def _summaries_from_entries(raw: Any) -> dict[tuple[str, str], str]:
+    """Rebuild the ``(file_path, symbol_name) -> summary`` map from a triple list.
 
-    The manager serialises summaries as a list of ``[file_path, symbol_name,
-    summary]`` triples (tuple keys are not JSON/state friendly); the explorers
-    rebuild the lookup map from that list.
+    Summaries are serialised as a list of ``[file_path, symbol_name, summary]``
+    triples (tuple keys are not JSON/state friendly). Used for both the per-unit
+    slice carried on ``active_unit`` (finding #9) and the legacy global channel.
     """
-    raw = state.get("summaries") or []
     out: dict[tuple[str, str], str] = {}
-    for entry in raw:
+    for entry in raw or []:
         if isinstance(entry, (list, tuple)) and len(entry) == 3:
             out[(entry[0], entry[1])] = entry[2]
     return out
+
+
+def _summaries_from_state(state: OnboardingGraphState) -> dict[tuple[str, str], str]:
+    """Rebuild the global summaries map from the legacy ``state["summaries"]``."""
+    return _summaries_from_entries(state.get("summaries"))
 
 
 # ── Manager (map prelude) ────────────────────────────────────────────────────
@@ -207,15 +211,28 @@ async def _analysis_manager_node(
     units: list[dict[str, Any]] = []
     for name in sorted(grouped):
         unit_symbols, path = grouped[name]
+        # Slice the global summaries map down to ONLY this unit's symbols and
+        # attach it to the unit (finding #9). Each ``Send`` then carries just the
+        # summaries the explorer can actually use — ``_build_boundary_for_unit``
+        # / ``_extract_patterns_for_unit`` only ever look up ``(file_path,
+        # symbol_name)`` pairs from this unit — instead of re-hydrating the whole
+        # global map per fan-out. The merged manifest is unchanged because the
+        # union of every unit's slice equals the global map for the keys any
+        # explorer reads.
+        unit_summaries = [
+            [s.file_path, s.symbol_name, summaries[(s.file_path, s.symbol_name)]]
+            for s in unit_symbols
+            if (s.file_path, s.symbol_name) in summaries
+        ]
         units.append(
             {
                 "name": name,
                 "path": path,
                 "symbols": [_symbol_to_dict(s) for s in unit_symbols],
+                "summaries": unit_summaries,
             }
         )
 
-    summaries_list = [[fp, sn, text] for (fp, sn), text in summaries.items()]
     # Global symbol scan order (discovery order) so the aggregator can re-cap
     # pattern evidence in exactly the order the monolithic ``_extract_patterns``
     # would scan — guaranteeing byte-parity regardless of per-unit fan-out.
@@ -229,8 +246,10 @@ async def _analysis_manager_node(
         parsed_files,
     )
     return {
+        # ``summaries`` is no longer seeded into shared state: each unit carries
+        # its own sliced summaries (finding #9), so a giant global map is never
+        # serialised once per explorer Send.
         "analysis_units": units,
-        "summaries": summaries_list,
         "symbol_order": symbol_order,
         "tech_stack": tech,
         "file_count": parsed_files,
@@ -283,7 +302,13 @@ def _analysis_explorer_node(
     name = active.get("name", "")
     path = active.get("path", "")
     unit_symbols = [_symbol_from_dict(s) for s in active.get("symbols", []) or []]
-    summaries = _summaries_from_state(state)
+    # Summaries are sliced per unit at fan-out (finding #9): read the unit's own
+    # slice from ``active_unit`` rather than re-parsing a global map. Fall back to
+    # the legacy global ``state["summaries"]`` channel for back-compat callers
+    # that still seed it.
+    summaries = _summaries_from_entries(active.get("summaries"))
+    if not summaries:
+        summaries = _summaries_from_state(state)
 
     spine_config = _spine_config(config)
     analyzer = RepoAnalyzer(config=spine_config)
@@ -540,6 +565,37 @@ def _persist(
 # ── Graph builder ────────────────────────────────────────────────────────────
 
 
+#: Destinations of the analysis manager's ``_analysis_router`` (Send per unit
+#: → ``analysis_explorer``, or ``aggregate_analysis`` when there are no units).
+#: Hoisted so the half-builder and the composed onboarding graph share ONE
+#: route-map literal.
+ANALYSIS_ROUTE_MAP: list[str] = ["analysis_explorer", "aggregate_analysis"]
+
+
+def add_analysis_nodes_and_edges(graph: StateGraph) -> None:
+    """Add the analysis-phase nodes + INTERIOR edges to ``graph`` in place.
+
+    Adds ``analysis_manager`` / ``analysis_explorer`` / ``aggregate_analysis``
+    and the interior wiring (manager ``Send`` fan-out → explorer →
+    ``aggregate_analysis``), but NOT the ``START`` entry edge or any terminal
+    edge — the caller owns those so the same wiring can serve both the
+    standalone half-graph (``START`` → … → ``END``) and the composed onboarding
+    graph (``aggregate_analysis`` → ``doc_manager``). This is the single source
+    of truth for Phase A's topology, shared with
+    :func:`spine.work.onboarding.onboarding_graph.build_onboarding_graph`.
+    """
+    graph.add_node("analysis_manager", _analysis_manager_node)
+    graph.add_node("analysis_explorer", _analysis_explorer_node)
+    graph.add_node("aggregate_analysis", _aggregate_analysis_node)
+
+    graph.add_conditional_edges(
+        "analysis_manager",
+        _analysis_router,
+        ANALYSIS_ROUTE_MAP,
+    )
+    graph.add_edge("analysis_explorer", "aggregate_analysis")
+
+
 def build_analysis_graph() -> StateGraph:
     """Build the analysis half of the onboarding graph (manager → explorer → agg).
 
@@ -549,21 +605,13 @@ def build_analysis_graph() -> StateGraph:
         analysis_manager → (Send per unit) → analysis_explorer
         → aggregate_analysis → END
 
-    Used by :mod:`tests.unit.test_onboarding_analysis_parity`.
+    Used by :mod:`tests.unit.test_onboarding_analysis_parity`. The interior
+    nodes/edges are shared with the composed graph via
+    :func:`add_analysis_nodes_and_edges`; this builder only adds the ``START``
+    and ``END`` boundary edges.
     """
     graph: StateGraph = StateGraph(OnboardingGraphState)
-
-    graph.add_node("analysis_manager", _analysis_manager_node)
-    graph.add_node("analysis_explorer", _analysis_explorer_node)
-    graph.add_node("aggregate_analysis", _aggregate_analysis_node)
-
+    add_analysis_nodes_and_edges(graph)
     graph.add_edge(START, "analysis_manager")
-    graph.add_conditional_edges(
-        "analysis_manager",
-        _analysis_router,
-        ["analysis_explorer", "aggregate_analysis"],
-    )
-    graph.add_edge("analysis_explorer", "aggregate_analysis")
     graph.add_edge("aggregate_analysis", END)
-
     return graph

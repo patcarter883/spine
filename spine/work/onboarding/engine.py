@@ -21,10 +21,12 @@ compiles it with a per-work :class:`AsyncSqliteSaver`, and ``ainvoke``s it.
 
 Progress is tracked through the same mechanism the LangGraph dispatcher uses —
 :func:`spine.work.dispatcher._update_work_progress` and
-:func:`spine.work.dispatcher.update_work_phase_started` — threaded into the
-graph as a ``progress`` callback on the ``RunnableConfig`` so graph nodes fire
-it at phase boundaries. The UI's ``get_queue_overview()`` polling and the
-ws_bus events work unchanged. The recorded ``current_phase`` values are
+:func:`spine.work.dispatcher.update_work_phase_started`. The engine streams the
+graph's node updates (``astream(stream_mode="updates")``) and maps the
+``analysis_manager`` / ``doc_manager`` node boundaries to phases, so progress
+reporting lives entirely in the engine (the graph nodes stay pure). The UI's
+``get_queue_overview()`` polling and the ws_bus events work unchanged. The
+recorded ``current_phase`` values (see :mod:`spine.work.onboarding.phases`) are
 ``"scaffold"`` (greenfield, pre-graph), ``"analyze"`` (at analysis_manager),
 ``"synthesize"`` (at doc_manager), then ``"completed"``.
 
@@ -47,17 +49,18 @@ from spine.models.enums import TaskStatus
 from spine.persistence.artifacts import ArtifactStore
 from spine.work.onboarding.manifest import RepoManifest
 from spine.work.onboarding.onboarding_graph import build_onboarding_graph
+from spine.work.onboarding.phases import (
+    PHASE_ANALYZE,
+    PHASE_COMPLETED,
+    PHASE_SCAFFOLD,
+    PHASE_SYNTHESIZE,
+)
 from spine.work.onboarding.scaffold import scaffold_project
 from spine.work.onboarding.synthesis_tools import ONBOARDING_PHASE
 
 logger = logging.getLogger(__name__)
 
 _MANIFEST_NAME = "repo_manifest.json"
-
-# Keep per-work checkpointer context managers alive for the duration of the
-# process so the underlying aiosqlite connection thread isn't torn down by GC
-# mid-run (mirrors the cache in ``subgraph_wrapper``). Keyed by work_id.
-_checkpointer_ctx_cache: dict[str, Any] = {}
 
 # The four onboarding artifacts produced by synthesis (display order).
 _ONBOARDING_DOCS: tuple[str, ...] = (
@@ -142,10 +145,13 @@ async def _compile_onboarding_graph(
 ) -> Any:
     """Compile :func:`build_onboarding_graph` with a per-work checkpointer.
 
-    Mirrors :func:`spine.workflow.subgraph_wrapper._get_phase_checkpointer`:
-    each onboarding run writes to its own SQLite database at
-    ``<workspace_root>/.spine/checkpoints/<work_id>/onboarding.db`` so the run
-    is resumable (a re-run can skip already-written sections). On any failure
+    Reuses :func:`spine.workflow.subgraph_wrapper._get_phase_checkpointer`
+    (phase :data:`ONBOARDING_PHASE`) so onboarding shares ONE checkpointer
+    implementation with the phase subgraphs: the same
+    ``<workspace_root>/.spine/checkpoints/<work_id>/onboarding.db`` path scheme,
+    the same context-manager cache that keeps the aiosqlite connection thread
+    alive, AND its package-dir fallback when ``workspace_root`` is unset (so a
+    ``/root`` or ``/tmp`` CWD doesn't cause permission errors). On any failure
     opening the checkpointer we fall back to compiling WITHOUT one — strictly
     >= today's non-resumable behaviour (design Risk #8).
 
@@ -153,18 +159,13 @@ async def _compile_onboarding_graph(
     """
     graph = build_onboarding_graph()
     try:
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        from spine.workflow.subgraph_wrapper import _get_phase_checkpointer
 
-        db_path = (
-            Path(workspace_root) / ".spine" / "checkpoints" / work_id / "onboarding.db"
+        checkpointer = await _get_phase_checkpointer(
+            work_id,
+            ONBOARDING_PHASE,
+            workspace_root=workspace_root or None,
         )
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
-        checkpointer = await ctx.__aenter__()
-        # Hold the context manager so its aiosqlite connection thread is not
-        # closed by GC while the graph is still running.
-        _checkpointer_ctx_cache[work_id] = ctx
-        logger.debug("[%s] onboarding per-work checkpointer: %s", work_id, db_path)
         return graph.compile(checkpointer=checkpointer)
     except Exception as exc:  # noqa: BLE001 - fall back to no checkpointer
         logger.warning(
@@ -198,8 +199,11 @@ async def run_onboarding(
             uuid4 prefix.
 
     Returns:
-        ``{"work_id", "status", "work_type": "onboarding", "artifacts": [...names],
-        "manifest_path": ...}``.
+        ``{"work_id", "status", "work_type": "onboarding", "workspace_root",
+        "mode", "artifacts": [...names], "manifest_path": ...}``. ``workspace_root``
+        and ``mode`` are also persisted into ``work_entries.result`` so the UI can
+        (a) select the correct phase bar (``mode``) and (b) resolve the artifact
+        base path for an EXTERNAL onboarding target (``workspace_root``).
     """
     if config is None:
         config = SpineConfig.load()
@@ -243,7 +247,7 @@ async def run_onboarding(
     try:
         # ── Phase: scaffold (greenfield only, deterministic, BEFORE graph) ─
         if mode == "greenfield":
-            _progress("scaffold")
+            _progress(PHASE_SCAFFOLD)
             scaffold_project(workspace_root, seed_stack)
 
         # ── Build + compile the composed onboarding graph (per-work CP) ────
@@ -258,7 +262,6 @@ async def run_onboarding(
         runnable_config: dict[str, Any] = {
             "configurable": {
                 "spine_config": config,
-                "progress": _progress,
                 "work_id": work_id,
                 "thread_id": work_id,
             }
@@ -269,14 +272,15 @@ async def run_onboarding(
         # (via ``_persist_manifest`` using ``spine_config`` from config); the
         # synthesis tier writes the four ``.md`` artifacts idempotently.
         #
-        # We stream node updates so the ``current_phase`` progression fires at
-        # node boundaries (``analyze`` at analysis_manager, ``synthesize`` at
-        # doc_manager) regardless of whether the non-serialisable ``progress``
-        # callable survives LangGraph's per-super-step config copy. The callback
-        # is also threaded through ``configurable["progress"]`` (read by the
-        # node wrappers) so the contract is honoured both ways; double-firing is
-        # harmless (the DB update is idempotent).
-        _node_phase = {"analysis_manager": "analyze", "doc_manager": "synthesize"}
+        # Progress reporting lives ONLY here: we stream node updates so the
+        # ``current_phase`` progression fires at node boundaries (``analyze`` at
+        # analysis_manager, ``synthesize`` at doc_manager). The graph nodes stay
+        # pure — there is no in-graph progress wrapper — so this is the single
+        # progress mechanism. ``_progress`` is idempotent per phase.
+        _node_phase = {
+            "analysis_manager": PHASE_ANALYZE,
+            "doc_manager": PHASE_SYNTHESIZE,
+        }
         final_state: dict[str, Any] = {}
         async for chunk in compiled.astream(
             initial_state, config=runnable_config, stream_mode="updates"
@@ -303,11 +307,12 @@ async def run_onboarding(
             work_id,
             {
                 "status": final_status,
-                "current_phase": "completed",
+                "current_phase": PHASE_COMPLETED,
                 "updated_at": datetime.now().isoformat(),
                 "result": json.dumps(
                     {
                         "mode": mode,
+                        "workspace_root": workspace_root,
                         "artifacts": artifact_names,
                         "manifest_path": manifest_path,
                         "symbol_count": manifest.symbol_count if manifest else 0,
@@ -316,7 +321,7 @@ async def run_onboarding(
                 ),
             },
         )
-        _update_work_progress(db, work_id, "completed", final_status)
+        _update_work_progress(db, work_id, PHASE_COMPLETED, final_status)
 
         try:
             from spine.ui.ws_bus import get_bus
@@ -331,6 +336,8 @@ async def run_onboarding(
             "work_id": work_id,
             "status": final_status,
             "work_type": "onboarding",
+            "workspace_root": workspace_root,
+            "mode": mode,
             "artifacts": artifact_names,
             "manifest_path": manifest_path,
         }
@@ -350,7 +357,13 @@ async def run_onboarding(
                     "status": TaskStatus.FAILED.value,
                     "current_phase": last_phase,
                     "updated_at": datetime.now().isoformat(),
-                    "result": json.dumps({"error": str(exc)}),
+                    "result": json.dumps(
+                        {
+                            "error": str(exc),
+                            "workspace_root": workspace_root,
+                            "mode": mode,
+                        }
+                    ),
                 },
             )
         except Exception:

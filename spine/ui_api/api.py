@@ -153,6 +153,31 @@ class UIApi:
 
     # ── Artifact operations ──
 
+    def _artifact_store_for(self, work_id: str) -> ArtifactStore:
+        """Resolve the :class:`ArtifactStore` that holds *work_id*'s artifacts.
+
+        Onboarding jobs write their manifest + four docs under
+        ``<workspace_root>/.spine/artifacts`` where ``workspace_root`` is the
+        *target* repo being onboarded — which, for an EXTERNAL repo, differs
+        from spine's own ``artifact_path``. The engine records that
+        ``workspace_root`` in the work entry's result payload, so we read it and
+        point the store at the matching base. Any non-onboarding item (or an
+        onboarding item without a recorded ``workspace_root``) falls back to the
+        global store, leaving all other artifact reads unchanged.
+        """
+        from pathlib import Path
+
+        entry = get_work_status(work_id, self._config)
+        if entry and entry.get("work_type") == "onboarding":
+            result = entry.get("result")
+            if isinstance(result, dict):
+                workspace_root = result.get("workspace_root")
+                if isinstance(workspace_root, str) and workspace_root:
+                    base = str(Path(workspace_root) / ".spine" / "artifacts")
+                    if base != self._config.artifact_path:
+                        return ArtifactStore(base_path=base)
+        return self._artifacts
+
     def get_artifacts(self, work_id: str) -> list[dict[str, Any]]:
         """List all artifacts for a work item.
 
@@ -162,7 +187,7 @@ class UIApi:
         Returns:
             List of artifact metadata dicts.
         """
-        return self._artifacts.list_artifacts(work_id)
+        return self._artifact_store_for(work_id).list_artifacts(work_id)
 
     def read_artifact(self, work_id: str, phase: str, name: str) -> str | None:
         """Read the content of a specific artifact.
@@ -175,7 +200,7 @@ class UIApi:
         Returns:
             The artifact content, or None.
         """
-        return self._artifacts.load_artifact(work_id, phase, name)
+        return self._artifact_store_for(work_id).load_artifact(work_id, phase, name)
 
     def get_feedback(self, work_id: str) -> list[dict[str, Any]]:
         """Get feedback entries for a work item.
@@ -644,6 +669,16 @@ class UIApi:
         for key in ("current_phase", "created_at", "updated_at"):
             if key in entry and entry[key]:
                 active[key] = entry[key]
+
+        # Onboarding jobs record their mode ("greenfield" | "brownfield") in the
+        # work entry's result payload. Surface it onto the active dict so the
+        # Onboarding page picks the correct phase sequence instead of always
+        # defaulting to the greenfield superset.
+        result = entry.get("result")
+        if isinstance(result, dict):
+            mode = result.get("mode")
+            if isinstance(mode, str) and mode:
+                active["mode"] = mode
 
         # Surface the work entry's status separately so the UI can detect
         # stalled items while still trusting the queue table's authoritative

@@ -81,6 +81,7 @@ class OnboardingGraphState(TypedDict, total=False):
     # ── PHASE B: synthesis fan-out (TIER B/C) ──
     section_results: Annotated[list[dict], _op_add]  # each worker appends [one SectionResult]
     written: dict  # {doc_name: path}; set ONCE by aggregate_synthesis
+    placeholder_docs: list  # docs written placeholder-only; set ONCE by assemble_docs
 
     # ── shared dedupe (LLM-enriched explorer mode ONLY) ──
     read_cache: Annotated[dict, _merge_read_cache]

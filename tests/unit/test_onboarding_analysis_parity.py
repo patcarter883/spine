@@ -109,6 +109,24 @@ def _write_fixture(root: Path) -> None:
         path.write_text(content, encoding="utf-8")
 
 
+def _build_summary_map(
+    root: Path, config: SpineConfig
+) -> dict[tuple[str, str], str]:
+    """A synthetic ``(file_path, symbol_name) -> summary`` map for every symbol.
+
+    Built outside any running event loop so it can back a synchronous
+    ``_load_summaries`` patch (the manager calls ``_load_summaries`` while inside
+    its own coroutine).
+    """
+    analyzer = RepoAnalyzer(config=config)
+    files = asyncio.run(analyzer._discover_files(str(root)))  # noqa: SLF001
+    symbols, _ = analyzer._extract_symbols(str(root), files)  # noqa: SLF001
+    return {
+        (s.file_path, s.symbol_name): f"summary::{s.file_path}::{s.symbol_name}"
+        for s in symbols
+    }
+
+
 def _hermetic_config(root: Path) -> SpineConfig:
     """No MCP (forces os.walk) + bogus vector db (no summaries)."""
     return SpineConfig(
@@ -278,6 +296,92 @@ def test_greenfield_zero_units(tmp_path: Path) -> None:
     assert manifest.module_boundaries == []
     assert manifest.symbol_count == 0
     assert final["manifest_path"]
+
+
+def test_per_unit_summary_slices_union_to_global_map(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Finding #9: each unit carries ONLY its own summaries, and the union of
+    every unit's slice equals the global map for the keys explorers read.
+
+    The manager must NOT seed a global ``summaries`` channel any more, and no
+    summary key may appear in more than one unit (no whole-map re-hydration per
+    Send). We inject a fake summaries map so every unit symbol is enriched.
+    """
+    _write_fixture(tmp_path)
+    config = _hermetic_config(tmp_path)
+    runnable_config = {"configurable": {"spine_config": config}}
+
+    global_map = _build_summary_map(tmp_path, config)
+    monkeypatch.setattr(
+        RepoAnalyzer, "_load_summaries", lambda self: dict(global_map)
+    )
+
+    out = asyncio.run(
+        _analysis_manager_node(
+            {
+                "work_id": "slices",
+                "workspace_root": str(tmp_path),
+                "mode": "brownfield",
+                "tech_stack": [],
+            },
+            runnable_config,
+        )
+    )
+
+    # The manager no longer seeds a global summaries channel.
+    assert "summaries" not in out
+
+    units = out["analysis_units"]
+    assert units, "expected at least one analysis unit"
+
+    union: dict[tuple[str, str], str] = {}
+    seen_keys: set[tuple[str, str]] = set()
+    for unit in units:
+        unit_summaries = unit.get("summaries")
+        assert unit_summaries is not None, "each unit must carry its own slice"
+        # Every summary key in a unit must belong to that unit's own symbols.
+        unit_symbol_keys = {(s["file_path"], s["symbol_name"]) for s in unit["symbols"]}
+        for fp, sn, text in unit_summaries:
+            assert (fp, sn) in unit_symbol_keys
+            assert (fp, sn) not in seen_keys, "a summary key leaked across units"
+            seen_keys.add((fp, sn))
+            union[(fp, sn)] = text
+
+    # The union of per-unit slices equals the global map the monolith built.
+    assert union == global_map
+
+
+def test_distributed_matches_monolith_with_summaries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Per-unit summary slicing yields a manifest byte-identical to the monolith.
+
+    With a non-empty global summaries map, the distributed path (which now
+    slices summaries per unit at fan-out) must still produce the SAME manifest as
+    the monolithic ``analyze`` (which uses the whole global map).
+    """
+    _write_fixture(tmp_path)
+    config = _hermetic_config(tmp_path)
+
+    global_map = _build_summary_map(tmp_path, config)
+    monkeypatch.setattr(
+        RepoAnalyzer, "_load_summaries", lambda self: dict(global_map)
+    )
+
+    monolith = asyncio.run(
+        RepoAnalyzer(config=config).analyze(str(tmp_path), mode="brownfield")
+    )
+    monolith_norm = _normalise(monolith)
+
+    # Plain and shuffled completion order both match (slices looked up by key).
+    distributed = _run_distributed(tmp_path, "brownfield", config)
+    assert _normalise(distributed) == monolith_norm
+    for seed in range(3):
+        shuffled = _run_distributed(
+            tmp_path, "brownfield", config, shuffle=True, seed=seed
+        )
+        assert _normalise(shuffled) == monolith_norm, f"mismatch at seed {seed}"
 
 
 def test_monolithic_fallback_flag_off(tmp_path: Path) -> None:

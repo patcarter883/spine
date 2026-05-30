@@ -9,10 +9,13 @@ to eliminate duplication and ensure consistent behavior.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, TypeVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel
+
+_StructuredT = TypeVar("_StructuredT", bound=BaseModel)
 
 
 def resolve_model(
@@ -82,6 +85,83 @@ def resolve_model(
             return _build_local_model(model_spec, provider_cfg)
 
     return model_spec
+
+
+def resolve_chat_model(
+    config: RunnableConfig | None,
+    session_id: str | None = None,
+    phase: str | None = None,
+) -> BaseChatModel:
+    """Resolve a ready-to-invoke :class:`BaseChatModel` from config.
+
+    Thin wrapper over :func:`resolve_model` that always returns a built model
+    instance: when ``resolve_model`` returns a string spec (the common case
+    where no provider-specific kwargs are needed), it is coerced via
+    ``init_chat_model``. This consolidates the ``resolve_model`` + ``if
+    isinstance(model, str): init_chat_model(model)`` block that every bare-LLM
+    call site (onboarding doc-manager / section-worker, research manager) had
+    copied verbatim.
+
+    Args:
+        config: LangGraph runtime config (may contain ``configurable.model``).
+        session_id: Optional session identifier (typically the work_id) passed
+            through to :func:`resolve_model` for OpenRouter request grouping.
+        phase: Optional phase or phase/subagent path for model override
+            resolution.
+
+    Returns:
+        A ``BaseChatModel`` instance ready for ``.with_structured_output`` or
+        ``.ainvoke``.
+    """
+    model = resolve_model(config, session_id=session_id, phase=phase)
+    if isinstance(model, str):
+        from langchain.chat_models import init_chat_model
+
+        return init_chat_model(model)
+    return model
+
+
+def coerce_structured_output(
+    response: Any,
+    schema: type[_StructuredT],
+) -> _StructuredT | None:
+    """Coerce a ``with_structured_output`` response into a ``schema`` instance.
+
+    Handles the three response shapes seen across LangChain/provider versions:
+
+    1. the Pydantic ``schema`` instance directly;
+    2. an ``AIMessage`` carrying the parsed model on ``.parsed`` (which is
+       reset to ``None`` afterwards to avoid the
+       ``PydanticSerializationUnexpectedValue`` warning on re-serialisation);
+    3. a plain ``dict`` validated through ``schema.model_validate``.
+
+    Returns ``None`` when the shape is unrecognised or a dict fails validation
+    so callers can fall back to a deterministic floor (e.g. the skeleton plan
+    or a generic error result) — it never raises.
+
+    Args:
+        response: The raw return value of ``model.with_structured_output(...)
+            .ainvoke(...)``.
+        schema: The expected Pydantic model class.
+
+    Returns:
+        A ``schema`` instance, or ``None`` if the response can't be coerced.
+    """
+    if isinstance(response, schema):
+        return response
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, schema):
+        try:
+            response.parsed = None  # prevent Pydantic serialization warning
+        except Exception:  # noqa: BLE001 - response may be immutable
+            pass
+        return parsed
+    if isinstance(response, dict):
+        try:
+            return schema.model_validate(response)
+        except Exception:  # noqa: BLE001 - malformed dict → caller falls back
+            return None
+    return None
 
 
 def _model_spec_from_config(config: RunnableConfig | None, phase: str | None = None) -> str:
