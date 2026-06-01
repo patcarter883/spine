@@ -98,47 +98,34 @@ def _render_summary(api: UIApi) -> None:
     overview = api.get_queue_overview()
     summary = overview.get("status_summary", {})
 
+    # "Running" and "Pending" come from the live overview (which counts
+    # every running job, including restart/resume that never touch the
+    # queue table) rather than the queue-row status tallies.
+    running = len(overview.get("active_jobs", []))
+    pending = len(overview.get("pending", []))
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pending", summary.get("pending", 0))
-    c2.metric("Running", summary.get("running", 0))
+    c1.metric("Pending", pending)
+    c2.metric("Running", running)
     c3.metric("Failed", summary.get("failed", 0) + summary.get("stalled", 0))
     c4.metric("Completed", summary.get("completed", 0))
 
 
-@st.fragment(run_every=_POLL_INTERVAL)
-def _render_active_job(api: UIApi) -> None:
-    """Active job detail — auto-refreshing fragment."""
-    overview = api.get_queue_overview()
-    active = overview.get("active")
-    worker_status = api.get_worker_status()
-    worker_running = worker_status.get("running", False)
+def _render_reset_button(api: UIApi) -> None:
+    """Render the 'reset stuck running items' button + handler."""
+    if st.button("🔄 Reset stuck running items", key="reset_stuck"):
+        reset_count = api.reset_stuck_items()
+        if reset_count:
+            st.success(
+                f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed."
+            )
+        else:
+            st.info("No stuck running items found.")
+        st.rerun()
 
-    # Worker not running — show the start button and return.
-    if not worker_running:
-        st.info("⏸️ RalphLoopWorker is not running. Jobs will not be processed until started.")
-        if st.button("▶️ Start Worker", use_container_width=True):
-            from spine.work.ralph_worker import get_worker
 
-            worker = get_worker(api._config)
-            worker.start()
-            st.rerun()
-        return
-
-    if not active:
-        st.markdown(":gray[No active job — queue is idle or all jobs completed]")
-        # Reset stuck items button (useful even when no active job)
-        if st.button("🔄 Reset stuck running items", key="reset_stuck"):
-            reset_count = api.reset_stuck_items()
-            if reset_count:
-                st.success(
-                    f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed."
-                )
-            else:
-                st.info("No stuck running items found.")
-            st.rerun()
-        return
-
-    # ── Active job present — render once, cleanly ──
+def _render_one_active_job(api: UIApi, active: dict) -> None:
+    """Render a single active job card."""
     # Prefer the work_id (UUID prefix from dispatcher) over the queue
     # sequence number for the displayed ID.  The queue PK is purely a
     # queue-internal sequence; work_id is the canonical identifier.
@@ -153,7 +140,9 @@ def _render_active_job(api: UIApi) -> None:
     updated_at = active.get("updated_at") or ""
     description = active.get("description", "")
 
-    st.subheader("🔄 Active Job")
+    # Per-card header carries the id so stacked cards read distinctly when
+    # several jobs run at once.
+    st.subheader(f"🔄 Active Job · `{display_id}`")
     st.caption(
         f"Work ID: `{display_id}`" + (f"  ·  Queue #{queue_id}" if work_id and queue_id else "")
     )
@@ -172,9 +161,8 @@ def _render_active_job(api: UIApi) -> None:
 
     # Stop button for active running job
     if work_id:
-        st.divider()
         if st.button("⏹ Stop Work", key=f"stop_work_{work_id}"):
-            result = api.stop_work(work_id)
+            api.stop_work(work_id)
             st.success(f"Stop requested for work `{work_id}`. The job will be cancelled.")
             st.rerun()
 
@@ -225,25 +213,52 @@ def _render_active_job(api: UIApi) -> None:
             pass
 
     # Stalled detection (RC4)
-    work_status = active.get("work_status")
-    if work_status == "stalled":
+    if active.get("work_status") == "stalled":
         st.warning(
             "⚠️ This job appears to be **stalled**. "
             "The workflow hasn't produced output since the stall timeout. "
             "Use the Reset button below to retry."
         )
 
-    # Reset stuck items button
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_active_job(api: UIApi) -> None:
+    """Active job detail — auto-refreshing fragment.
+
+    The worker-running notice is informational only: jobs running outside
+    the queue loop (restart/resume) must still appear even when the loop
+    thread is down, so the banner never short-circuits the active list.
+    """
+    overview = api.get_queue_overview()
+    active_jobs = overview.get("active_jobs") or []
+    worker_status = api.get_worker_status()
+    worker_running = worker_status.get("running", False)
+
+    # Worker not running — show an informational banner + start button, but
+    # still render any jobs that are actively running below it.
+    if not worker_running:
+        st.info(
+            "⏸️ The worker loop is not running. Queued jobs won't be picked up "
+            "until it is started (jobs already running still appear below)."
+        )
+        if st.button("▶️ Start Worker", use_container_width=True):
+            api.ensure_worker_running()
+            st.rerun()
+
+    if not active_jobs:
+        st.markdown(":gray[No active job — queue is idle or all jobs completed]")
+        _render_reset_button(api)
+        return
+
+    for idx, active in enumerate(active_jobs):
+        if idx:
+            st.divider()
+        with st.container(border=True):
+            _render_one_active_job(api, active)
+
+    # Reset stuck items button (once, below the active jobs).
     st.divider()
-    if st.button("🔄 Reset stuck running items", key="reset_stuck"):
-        reset_count = api.reset_stuck_items()
-        if reset_count:
-            st.success(
-                f"Reset {reset_count} stuck item(s) back to pending. They will be reprocessed."
-            )
-        else:
-            st.info("No stuck running items found.")
-        st.rerun()
+    _render_reset_button(api)
 
 
 @st.fragment(run_every=_POLL_INTERVAL)

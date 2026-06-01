@@ -120,9 +120,18 @@ def _render_progress(api: UIApi) -> None:
     single source of truth and the ws_bus only as a refresh hint.
     """
     overview = api.get_queue_overview()
-    active = overview.get("active") or {}
+    # Select the onboarding job specifically — other work (e.g. a task
+    # restart) may be running concurrently and appear first in the list.
+    active = next(
+        (
+            job
+            for job in overview.get("active_jobs", [])
+            if job.get("work_type") == _ONBOARDING_PHASE
+        ),
+        None,
+    )
 
-    if not active or active.get("work_type") != _ONBOARDING_PHASE:
+    if not active:
         st.caption("No onboarding job is currently running.")
         return
 

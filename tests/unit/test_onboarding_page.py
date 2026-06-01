@@ -296,19 +296,26 @@ def test_progress_renders_active_onboarding(fake_st: _FakeStreamlit) -> None:
     onboarding = _load_onboarding()
 
     api = _make_api()
+    onboarding_job = {
+        "id": 3,
+        "work_id": "wid42",
+        "work_type": "onboarding",
+        "mode": "brownfield",
+        "status": "running",
+        "current_phase": "analyze",
+        "created_at": "2026-05-29T10:00:00",
+        "updated_at": "2026-05-29T10:01:00",
+        "description": "Onboard legacy app",
+    }
     api.get_queue_overview.return_value = {
         "pending": [],
-        "active": {
-            "id": 3,
-            "work_id": "wid42",
-            "work_type": "onboarding",
-            "mode": "brownfield",
-            "status": "running",
-            "current_phase": "analyze",
-            "created_at": "2026-05-29T10:00:00",
-            "updated_at": "2026-05-29T10:01:00",
-            "description": "Onboard legacy app",
-        },
+        # A concurrent non-onboarding job appears first; the page must still
+        # find the onboarding job in active_jobs.
+        "active_jobs": [
+            {"work_id": "other1", "work_type": "task", "status": "running"},
+            onboarding_job,
+        ],
+        "active": onboarding_job,
         "recent": [],
         "status_summary": {},
     }

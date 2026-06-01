@@ -51,7 +51,40 @@ class RalphLoopWorker:
         self.config.ensure_dirs()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._executor: Any = None
+        self._executor_lock = threading.Lock()
         self.running = False
+
+    def is_alive(self) -> bool:
+        """Whether the processing-loop thread is currently alive.
+
+        This is the authoritative signal for "is the worker running" —
+        unlike the ``running`` flag it cannot go stale if the daemon
+        thread dies (e.g. an unhandled error), so the queue page reports
+        the real state rather than a remembered one.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
+    def get_executor(self) -> Any:
+        """Return the shared background executor for out-of-band jobs.
+
+        Restart and resume run outside the queue loop. They previously
+        each spawned a throwaway ``ThreadPoolExecutor`` that was never
+        shut down; routing them through one persistent, worker-owned
+        pool keeps those jobs tracked alongside the worker.
+        """
+        import concurrent.futures
+
+        # Double-checked locking: concurrent restart/resume calls (Streamlit
+        # re-runs across threads) must not each build a separate pool and
+        # leak all but one.
+        if self._executor is None:
+            with self._executor_lock:
+                if self._executor is None:
+                    self._executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=4, thread_name_prefix="ralph-oob"
+                    )
+        return self._executor
 
     def _get_db(self) -> sqlite_utils.Database:
         """Return a fresh connection — safe across threads."""
@@ -124,13 +157,21 @@ class RalphLoopWorker:
         return rows[0] if rows else None
 
     def start(self) -> None:
-        """Start the worker loop in a background daemon thread."""
-        if self.running:
-            logger.warning("Worker already running")
+        """Start the worker loop in a background daemon thread.
+
+        Idempotent and self-healing: guards on actual thread liveness, so
+        a worker whose thread previously died is restarted rather than
+        left permanently wedged by a stale ``running`` flag.
+        """
+        if self.is_alive():
+            logger.debug("Worker already running")
+            self.running = True
             return
 
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="ralph-worker"
+        )
         self._thread.start()
         self.running = True
         logger.info("RalphLoopWorker started")
@@ -284,12 +325,20 @@ class RalphLoopWorker:
                     "result": "",
                 },
             )
-            # Purge any LangGraph checkpoint so the graph starts fresh
-            # (must use async purge via the checkpointer)
+            # Purge any LangGraph checkpoint so the graph starts fresh.
+            # Best-effort: a purge failure (no checkpoint, version skew)
+            # must not abort the queue-row reset, which is the point.
             import asyncio
 
-            saver = asyncio.run(checkpoint_store.get_checkpointer())
-            asyncio.run(saver.apurge({"configurable": {"thread_id": str(item_id)}}))
+            try:
+                saver = asyncio.run(checkpoint_store.get_checkpointer())
+                asyncio.run(saver.adelete_thread(str(item_id)))
+            except Exception:
+                logger.warning(
+                    "Checkpoint purge failed for queue item %s (continuing)",
+                    item_id,
+                    exc_info=True,
+                )
             count += 1
             logger.info(f"Reset stuck queue item {item_id}")
 
@@ -342,6 +391,24 @@ class RalphLoopWorker:
             )
         )
         return rows[0] if rows else None
+
+    def list_running(self) -> list[dict[str, Any]]:
+        """List every queue item currently in the ``running`` state.
+
+        Normally there is at most one (the loop is sequential), but the
+        caller correlates these against ``work_entries`` to build the
+        full active set, so return all of them.
+
+        Returns:
+            List of running queue item dicts, oldest first.
+        """
+        return list(
+            self._get_db()["queue"].rows_where(
+                "status = ?",
+                ["running"],
+                order_by="started_at",
+            )
+        )
 
     def list_recent_completed(self, limit: int = 20) -> list[dict[str, Any]]:
         """List recently terminated queue items (all non-pending, non-running statuses).
@@ -433,7 +500,7 @@ class RalphLoopWorker:
 
         try:
             saver = asyncio.run(checkpoint_store.get_checkpointer())
-            asyncio.run(saver.apurge({"configurable": {"thread_id": work_id}}))
+            asyncio.run(saver.adelete_thread(work_id))
         except Exception:
             pass
 

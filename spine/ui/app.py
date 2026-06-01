@@ -34,6 +34,12 @@ start_ws_server()
 
 api: UIApi = st.session_state.api
 
+# ── Ensure the queue worker loop is alive (idempotent) ──
+# Boot it here so the queue is always being serviced and the worker
+# status the Queue page reports reflects reality rather than "not running
+# until the first job is enqueued".
+api.ensure_worker_running()
+
 # ── LLM debug logging ──
 if os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes"):
     from spine.agents.debug_callback import install_global

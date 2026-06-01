@@ -629,103 +629,164 @@ class UIApi:
     def get_worker_status(self) -> dict[str, Any]:
         """Get the RalphLoopWorker queue status.
 
+        ``running`` reflects the actual liveness of the worker's
+        processing-loop thread (not a remembered flag), so the queue page
+        never reports "not running" while the loop is in fact alive.
+
         Returns:
             Dict with queue item counts by status.
         """
         worker = get_worker(self._config)
         return {
-            "running": worker.running,
+            "running": worker.is_alive(),
             "queue": worker.queue_status(),
         }
+
+    def ensure_worker_running(self) -> None:
+        """Start the background worker loop if it isn't already alive.
+
+        Idempotent — safe to call on every Streamlit re-run. Called at
+        app boot so the queue is always being serviced and the worker
+        status the UI shows is truthful.
+        """
+        worker = get_worker(self._config)
+        if not worker.is_alive():
+            worker.start()
 
     # ── Queue operations ──
 
     def get_queue_overview(self) -> dict[str, Any]:
-        """Get a combined view of the queue: pending items, active job with
-        phase and timing, and recent history.
+        """Get a combined view of the queue: pending items, every active
+        job with phase and timing, and recent history.
 
-        The active job is sourced from the **queue** table (via
-        ``RalphLoopWorker.get_active()``) rather than the ``work_entries``
-        table.  The ``work_entries`` status can go stale because
-        ``dispatcher.py`` finalises it independently of the worker's queue
-        lifecycle.  The queue table is the authoritative source for the
-        currently-running item.
-
-        Phase-timing details (``current_phase``, ``created_at``,
-        ``updated_at``) are enriched from the corresponding ``work_entries``
-        record, so the UI can display a live phase progress bar and timing
-        captions.
+        Active jobs are sourced from the **work_entries** table, which is
+        the one record updated by *every* execution path — the normal
+        queue loop, onboarding, restart, and resume all mark a work entry
+        ``running``. The **queue** table only knows about jobs that went
+        through the queue loop, so sourcing the active set from it alone
+        hid restart/resume jobs (and reported the worker idle while they
+        ran). Each running work entry is enriched with its queue row
+        (queue id, enqueued-at) when one exists.
 
         Returns:
-            Dict with keys: pending, active, recent, status_summary.
+            Dict with keys: pending, active_jobs (list), active (the first
+            active job, for back-compat), recent, status_summary.
         """
         worker = get_worker(self._config)
         pending = worker.list_pending()
         recent = worker.list_recent_completed()
-
-        # Active job from the queue table (authoritative source).
-        active = worker.get_active()
-
-        # Enrich with phase-timing details from work_entries.
-        if active is not None:
-            self._enrich_active_with_work_entry(active)
+        active_jobs = self._active_jobs(worker)
 
         return {
             "pending": pending,
-            "active": active,
+            "active_jobs": active_jobs,
+            "active": active_jobs[0] if active_jobs else None,
             "recent": recent,
             "status_summary": worker.queue_status(),
         }
 
-    def _enrich_active_with_work_entry(self, active: dict[str, Any]) -> None:
-        """Merge ``current_phase``, ``created_at``, ``updated_at`` from the
-        corresponding ``work_entries`` record into *active* (mutated in
-        place).
+    def _active_jobs(self, worker: Any) -> list[dict[str, Any]]:
+        """Return every work item currently executing, whatever launched it.
 
-        Correlation logic:
-        1. If the queue row already has a ``work_id`` (stored by the worker
-           after ``submit_work()`` returns), use it directly.
-        2. Otherwise, fall back to finding the most recently-created
-           ``work_entries`` row with ``status = "running"``.  Since the
-           worker processes items sequentially, there should be at most
-           one running work entry at any time.
+        Two sources, unioned by work_id:
+
+        1. **Running queue rows** — jobs the worker loop is actively
+           processing. Each is enriched with its work entry fetched *by
+           work_id* (whatever its status), so a job whose work entry was
+           marked ``stalled`` mid-run still surfaces that signal on its
+           active card. Rows with no work entry yet (the hand-off window)
+           are kept so the list never flickers empty.
+        2. **Running work entries with no running queue row** — restart,
+           resume, and any other path that executes off the queue loop and
+           only updates ``work_entries``.
+
+        A reset/finalised job leaves both sources (its queue row goes
+        ``pending`` and its work entry leaves ``running``), so it correctly
+        drops out of the active set.
         """
-        work_id = active.get("work_id")
-        if not work_id:
-            # Fallback: find the running work entry by status.
-            entries = list_work(status="running", limit=1, config=self._config)
-            if entries:
-                work_id = entries[0].get("id")
-                if work_id:
-                    # Surface the work_id so the UI can display it.
-                    active["work_id"] = work_id
+        active: list[dict[str, Any]] = []
+        seen_work_ids: set[str] = set()
 
-        if not work_id:
-            return
+        # 1. Queue rows the worker is processing right now.
+        for row in worker.list_running():
+            work_id = row.get("work_id")
+            entry = get_work_status(work_id, self._config) if work_id else None
+            if work_id:
+                seen_work_ids.add(work_id)
+            active.append(self._build_active_job(entry, row))
 
-        entry = get_work_status(work_id, self._config)
-        if entry is None:
-            return
+        # 2. Off-queue in-flight work (restart/resume) the queue table can't
+        #    see. Include "stalled" as well as "running" so a stuck off-queue
+        #    job stays visible with its stalled banner instead of silently
+        #    vanishing the moment the stall-timeout fires.
+        for entry in self._off_queue_active_entries():
+            work_id = entry.get("id")
+            if work_id and work_id in seen_work_ids:
+                continue
+            if work_id:
+                seen_work_ids.add(work_id)
+            active.append(self._build_active_job(entry, None))
 
-        for key in ("current_phase", "created_at", "updated_at"):
-            if key in entry and entry[key]:
-                active[key] = entry[key]
+        return active
 
-        # Onboarding jobs record their mode ("greenfield" | "brownfield") in the
-        # work entry's result payload. Surface it onto the active dict so the
-        # Onboarding page picks the correct phase sequence instead of always
-        # defaulting to the greenfield superset.
-        result = entry.get("result")
-        if isinstance(result, dict):
-            mode = result.get("mode")
-            if isinstance(mode, str) and mode:
-                active["mode"] = mode
+    def _off_queue_active_entries(self) -> list[dict[str, Any]]:
+        """Work entries that count as in-flight: ``running`` or ``stalled``."""
+        return list_work(
+            status="running", limit=50, config=self._config
+        ) + list_work(status="stalled", limit=50, config=self._config)
 
-        # Surface the work entry's status separately so the UI can detect
-        # stalled items while still trusting the queue table's authoritative
-        # status for queue lifecycle display.
-        if "status" in entry and entry["status"]:
-            active["work_status"] = entry["status"]
+    def _build_active_job(
+        self,
+        entry: dict[str, Any] | None,
+        queue_row: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Normalise a running job into the shape the queue/onboarding
+        pages expect, merging the work entry (phase, timing, work status)
+        with its queue row (queue id, enqueued-at) when available.
+        """
+        active: dict[str, Any] = {"status": "running"}
+
+        if queue_row is not None:
+            active.update(
+                {
+                    "id": queue_row.get("id"),
+                    "work_id": queue_row.get("work_id") or "",
+                    "work_type": queue_row.get("work_type"),
+                    "enqueued_at": queue_row.get("enqueued_at"),
+                    "started_at": queue_row.get("started_at"),
+                    "created_at": queue_row.get("started_at"),
+                    "description": queue_row.get("description", ""),
+                }
+            )
+
+        if entry is not None:
+            active["work_id"] = entry.get("id") or active.get("work_id", "")
+            for key in (
+                "work_type",
+                "current_phase",
+                "created_at",
+                "updated_at",
+                "description",
+            ):
+                value = entry.get(key)
+                if value:
+                    active[key] = value
+            # Work-entry status drives stalled detection; queue lifecycle
+            # status stays "running" for the active card.
+            if entry.get("status"):
+                active["work_status"] = entry["status"]
+            # Onboarding jobs record their mode in the result payload; surface
+            # it so the Onboarding page picks the right phase sequence.
+            result = entry.get("result")
+            if isinstance(result, dict):
+                mode = result.get("mode")
+                if isinstance(mode, str) and mode:
+                    active["mode"] = mode
+
+        active.setdefault("work_type", "spec")
+        active.setdefault("description", "")
+        active.setdefault("work_id", "")
+        return active
 
     # ── Resume operations ──
 
@@ -756,18 +817,16 @@ class UIApi:
         # shows progress right away.
         self._mark_running(work_id)
 
-        # Run resume in the background via RalphLoopWorker thread pool
+        # Run resume in the background via the worker's shared executor.
         import asyncio
-        import concurrent.futures
 
         def _run():
             asyncio.run(_async_resume(work_id, human_feedback, action, self._config))
 
-        # Submit to the worker's executor (or a fresh one)
-        executor = getattr(get_worker(self._config), "_executor", None)
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        executor.submit(_run)
+        # Run on the worker's shared, persistent out-of-band pool so the
+        # job is tracked alongside the worker rather than on a throwaway
+        # executor that is never shut down.
+        get_worker(self._config).get_executor().submit(_run)
 
         return {
             "work_id": work_id,
@@ -804,17 +863,16 @@ class UIApi:
         # shows progress right away.
         self._mark_running(work_id)
 
-        # Run resume in the background via RalphLoopWorker thread pool
+        # Run resume in the background via the worker's shared executor.
         import asyncio
-        import concurrent.futures
 
         def _run():
             asyncio.run(_async_resume(work_id, action, feedback, self._config))
 
-        executor = getattr(get_worker(self._config), "_executor", None)
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        executor.submit(_run)
+        # Run on the worker's shared, persistent out-of-band pool so the
+        # job is tracked alongside the worker rather than on a throwaway
+        # executor that is never shut down.
+        get_worker(self._config).get_executor().submit(_run)
 
         return {
             "work_id": work_id,
@@ -849,19 +907,15 @@ class UIApi:
         """
         from spine.work.dispatcher import restart_work
 
-        import concurrent.futures
-
         def _run() -> None:
             import asyncio
 
             asyncio.run(restart_work(work_id, self._config, clear_artifacts=clear_artifacts))
 
-        # Submit to the worker's executor (or a fresh one)
-        executor = getattr(get_worker(self._config), "_executor", None)
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-        executor.submit(_run)
+        # Run on the worker's shared, persistent out-of-band pool so the
+        # job is tracked alongside the worker rather than on a throwaway
+        # executor that is never shut down.
+        get_worker(self._config).get_executor().submit(_run)
 
         return {
             "work_id": work_id,
@@ -899,8 +953,6 @@ class UIApi:
         """
         from spine.work.dispatcher import restart_from_phase as _async_restart
 
-        import concurrent.futures
-
         # Mark the work entry as running immediately so the UI
         # shows progress right away.
         self._mark_running(work_id)
@@ -912,12 +964,10 @@ class UIApi:
                 _async_restart(work_id, phase_name, self._config, clear_artifacts=clear_artifacts)
             )
 
-        # Submit to the worker's executor (or a fresh one)
-        executor = getattr(get_worker(self._config), "_executor", None)
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-        executor.submit(_run)
+        # Run on the worker's shared, persistent out-of-band pool so the
+        # job is tracked alongside the worker rather than on a throwaway
+        # executor that is never shut down.
+        get_worker(self._config).get_executor().submit(_run)
 
         return {
             "work_id": work_id,
@@ -958,32 +1008,50 @@ class UIApi:
         Returns:
             Dict with work_id, status, and action.
         """
-        import concurrent.futures
-
         def _run() -> None:
             worker = get_worker(self._config)
-            # Try to cancel a pending item first
+            # Try to cancel a running queue item first.
             active = worker.get_active()
             if active and active.get("work_id") == work_id:
-                # Running item — cancel by work_id
                 worker.cancel_running(work_id)
-            else:
-                # Try to find and cancel pending item by work_id
-                # (work_id is stored in queue items after submission)
-                db = worker._get_db()
-                item = db["queue"].rows_where(
-                    "work_id = ? AND status = ?",
-                    [work_id, "pending"],
-                    limit=1,
-                )
-                item = item[0] if item else None
-                if item:
-                    worker.cancel_item(item["id"])
+                return
 
-        executor = getattr(get_worker(self._config), "_executor", None)
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        executor.submit(_run)
+            # Then a pending queue item (work_id is stored after submission).
+            db = worker._get_db()
+            item = db["queue"].rows_where(
+                "work_id = ? AND status = ?",
+                [work_id, "pending"],
+                limit=1,
+            )
+            item = item[0] if item else None
+            if item:
+                worker.cancel_item(item["id"])
+                return
+
+            # No queue row — this is a restart/resume job running on the
+            # out-of-band pool. Mark the work entry cancelled and purge its
+            # checkpoint so it drops out of the active set and can be
+            # restarted cleanly. (The detached thread isn't force-killed,
+            # but the graph honours the cancelled status at its next step.)
+            from spine.persistence.checkpoint import CheckpointStore
+            from spine.work.dispatcher import update_work_status
+
+            # "cancelled" matches the literal the queue table uses; there is
+            # no TaskStatus.CANCELLED member.
+            update_work_status(work_id, "cancelled", config=self._config)
+            try:
+                import asyncio
+
+                store = CheckpointStore(db_path=self._config.checkpoint_path)
+                saver = asyncio.run(store.get_checkpointer())
+                asyncio.run(saver.adelete_thread(work_id))
+            except Exception:
+                pass
+
+        # Run on the worker's shared, persistent out-of-band pool so the
+        # job is tracked alongside the worker rather than on a throwaway
+        # executor that is never shut down.
+        get_worker(self._config).get_executor().submit(_run)
 
         return {
             "work_id": work_id,
@@ -998,11 +1066,85 @@ class UIApi:
         the worker or UI died mid-execution and items are permanently
         stuck in the 'running' state.
 
+        Also finalises lingering ``work_entries`` rows. Because the active
+        set is now sourced from in-flight work entries (not just queue
+        rows), a job whose thread died leaves its entry stuck
+        ``running``/``stalled`` and would otherwise show as a permanent
+        phantom active card — including off-queue restart/resume jobs that
+        never had a queue row at all, which the queue-only reset could
+        never clear. Every in-flight entry not backed by a *live* running
+        queue row is marked terminal (``failed``) and its checkpoint
+        purged, so it leaves the active set.
+
         Returns:
-            The number of items that were reset.
+            The number of items that were reset/finalised.
         """
+        from spine.work.dispatcher import update_work_status
+
         worker = get_worker(self._config)
-        return worker.reset_stuck_items()
+
+        # Snapshot BEFORE resetting so we don't catch a job the worker loop
+        # reprocesses in the meantime. A "live" work_id is one currently
+        # backed by a running queue row; everything else that is in-flight
+        # is a ghost to finalise.
+        live_work_ids = {
+            row.get("work_id")
+            for row in worker.list_running()
+            if row.get("work_id")
+        }
+        ghosts = [
+            entry
+            for entry in self._off_queue_active_entries()
+            if entry.get("id") and entry["id"] not in live_work_ids
+        ]
+
+        # Reset stuck queue rows (running/stalled -> pending) for reprocessing.
+        reset_count = worker.reset_stuck_items()
+
+        # Finalise the ghost work entries so they drop out of the active set.
+        # The queue-correlated ones (live_work_ids) get a fresh work_id on
+        # reprocess, so finalising their stale entry here is safe too.
+        finalised = self._finalise_ghost_entries(
+            ghosts + [{"id": wid} for wid in live_work_ids]
+        )
+
+        return reset_count + finalised
+
+    def _finalise_ghost_entries(self, entries: list[dict[str, Any]]) -> int:
+        """Mark each lingering work entry ``failed`` and purge its checkpoint.
+
+        ``failed`` is terminal and not part of the in-flight set, so the
+        entry leaves the active list. Returns the count actually finalised
+        (entries already terminal are skipped).
+        """
+        from spine.persistence.checkpoint import CheckpointStore
+        from spine.work.dispatcher import update_work_status
+
+        store = CheckpointStore(db_path=self._config.checkpoint_path)
+        seen: set[str] = set()
+        count = 0
+        for entry in entries:
+            work_id = entry.get("id")
+            if not work_id or work_id in seen:
+                continue
+            seen.add(work_id)
+            current = get_work_status(work_id, self._config)
+            if not current or current.get("status") not in ("running", "stalled"):
+                continue
+            update_work_status(work_id, "failed", config=self._config)
+            try:
+                import asyncio
+
+                saver = asyncio.run(store.get_checkpointer())
+                asyncio.run(saver.adelete_thread(work_id))
+            except Exception:
+                logger.warning(
+                    "Checkpoint purge failed for ghost work %s (continuing)",
+                    work_id,
+                    exc_info=True,
+                )
+            count += 1
+        return count
 
     # ── Planning operations ──
 

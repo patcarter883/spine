@@ -186,6 +186,244 @@ class TestUIApiGetQueueOverviewOrdering:
             assert len(overview["recent"]) == 1
 
 
+class TestUIApiActiveJobs:
+    """active_jobs sourcing: every running path shows up, not just queued ones."""
+
+    def _api(self, tmpdir: str) -> tuple[UIApi, RalphLoopWorker, SpineConfig]:
+        config = SpineConfig()
+        config.queue_path = str(Path(tmpdir) / "queue.db")
+        config.ensure_dirs()
+        worker = _init_queue_db(config)
+        return UIApi(config), worker, config
+
+    def _insert_running_entry(self, config: SpineConfig, work_id: str, **kw) -> None:
+        from spine.work.dispatcher import get_work_db
+
+        db = get_work_db(config)
+        db["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": kw.get("description", "a job"),
+                "work_type": kw.get("work_type", "task"),
+                "status": kw.get("status", "running"),
+                "current_phase": kw.get("current_phase", "implement"),
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:01:00",
+                "result": json.dumps(kw.get("result", {})),
+            }
+        )
+
+    def test_restart_job_without_queue_row_shows_as_active(self):
+        """A running work entry with no queue row (restart/resume) is active."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _worker, config = self._api(tmpdir)
+            self._insert_running_entry(config, "restart01", current_phase="plan")
+
+            overview = api.get_queue_overview()
+            active_jobs = overview["active_jobs"]
+
+            assert len(active_jobs) == 1
+            job = active_jobs[0]
+            assert job["work_id"] == "restart01"
+            assert job["status"] == "running"
+            assert job["current_phase"] == "plan"
+            # Back-compat single-active key still populated.
+            assert overview["active"]["work_id"] == "restart01"
+
+    def test_onboarding_job_correlates_queue_row_with_work_entry(self):
+        """An onboarding job (queue row + work entry) shows queue id + phase/mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 7,
+                    "description": "onboard repo",
+                    "work_type": "onboarding",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "onb12345",
+                }
+            )
+            self._insert_running_entry(
+                config,
+                "onb12345",
+                work_type="onboarding",
+                current_phase="analyze",
+                result={"mode": "brownfield"},
+            )
+
+            overview = api.get_queue_overview()
+            active_jobs = overview["active_jobs"]
+
+            assert len(active_jobs) == 1
+            job = active_jobs[0]
+            assert job["id"] == 7  # queue id surfaced
+            assert job["work_id"] == "onb12345"
+            assert job["work_type"] == "onboarding"
+            assert job["current_phase"] == "analyze"
+            assert job["mode"] == "brownfield"
+
+    def test_queue_running_row_without_work_entry_still_active(self):
+        """The hand-off window (queue running, work entry not yet created)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, _config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 3,
+                    "description": "just started",
+                    "work_type": "task",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "handoff1",
+                }
+            )
+
+            overview = api.get_queue_overview()
+            assert len(overview["active_jobs"]) == 1
+            assert overview["active_jobs"][0]["work_id"] == "handoff1"
+
+    def test_no_double_count_when_queue_and_entry_share_work_id(self):
+        """A queued job with a matching work entry appears exactly once."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 1,
+                    "description": "dual",
+                    "work_type": "task",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "dup00001",
+                }
+            )
+            self._insert_running_entry(config, "dup00001")
+
+            overview = api.get_queue_overview()
+            assert len(overview["active_jobs"]) == 1
+            assert overview["active_jobs"][0]["id"] == 1
+
+    def test_running_queue_row_surfaces_stalled_work_status(self):
+        """A job whose queue row is still running but whose work entry was
+        marked stalled mid-run surfaces work_status='stalled' (drives the
+        stalled banner)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 9,
+                    "description": "slow job",
+                    "work_type": "task",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "stall001",
+                }
+            )
+            self._insert_running_entry(config, "stall001", status="stalled")
+
+            active_jobs = api.get_queue_overview()["active_jobs"]
+            assert len(active_jobs) == 1
+            # Queue lifecycle status stays "running"; the stalled signal is
+            # carried separately for the banner.
+            assert active_jobs[0]["status"] == "running"
+            assert active_jobs[0]["work_status"] == "stalled"
+
+    def test_reset_clears_ghost_work_entry_of_stuck_queue_item(self):
+        """Resetting a stuck queue item also stalls its work entry so it
+        stops showing as a ghost active job."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 5,
+                    "description": "crashed mid-run",
+                    "work_type": "task",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "ghost001",
+                }
+            )
+            self._insert_running_entry(config, "ghost001")
+
+            assert len(api.get_queue_overview()["active_jobs"]) == 1
+            api.reset_stuck_items()
+
+            entry = api.get_work("ghost001")
+            assert entry["status"] == "failed"
+            assert api.get_queue_overview()["active_jobs"] == []
+
+    def test_reset_clears_offqueue_ghost_without_queue_row(self):
+        """A restart/resume job whose thread died leaves a running work entry
+        with NO queue row. Reset must still be able to finalise it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _worker, config = self._api(tmpdir)
+            self._insert_running_entry(config, "offq0001")
+
+            assert len(api.get_queue_overview()["active_jobs"]) == 1
+            count = api.reset_stuck_items()
+
+            assert count == 1
+            assert api.get_work("offq0001")["status"] == "failed"
+            assert api.get_queue_overview()["active_jobs"] == []
+
+    def test_offqueue_stalled_entry_still_shows_as_active(self):
+        """A stalled off-queue job stays visible (with its stalled signal)
+        rather than silently vanishing from the active list."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _worker, config = self._api(tmpdir)
+            self._insert_running_entry(config, "stallq01", status="stalled")
+
+            active_jobs = api.get_queue_overview()["active_jobs"]
+            assert len(active_jobs) == 1
+            assert active_jobs[0]["work_id"] == "stallq01"
+            assert active_jobs[0]["work_status"] == "stalled"
+
+    def test_no_running_work_means_empty_active(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _worker, _config = self._api(tmpdir)
+            overview = api.get_queue_overview()
+            assert overview["active_jobs"] == []
+            assert overview["active"] is None
+
+
+class TestUIApiWorkerStatus:
+    """Worker status reflects real thread liveness, not a stale flag."""
+
+    def test_worker_not_started_reports_not_running(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+            _init_queue_db(config)
+            api = UIApi(config)
+            assert api.get_worker_status()["running"] is False
+
+    def test_stale_running_flag_does_not_fake_liveness(self):
+        """A dead thread with a left-over running=True flag reports not running."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.ensure_dirs()
+            worker = _init_queue_db(config)
+            worker.running = True  # stale flag, but no live thread
+            api = UIApi(config)
+            assert api.get_worker_status()["running"] is False
+
+
 class TestUIApiGetFeedback:
     """Tests for get_feedback() method."""
 
