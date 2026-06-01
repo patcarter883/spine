@@ -116,7 +116,7 @@ async def test_run_plan_node_returns_directive_on_happy_path(monkeypatch):
         target_files=["spine/auth.py"],
         acceptance=["JWT validation present", "Tests pass"],
     )
-    monkeypatch.setattr(plan_do, "resolve_model", lambda *a, **kw: _FakeChatModel(expected))
+    monkeypatch.setattr(plan_do, "resolve_chat_model", lambda *a, **kw: _FakeChatModel(expected))
     out = await run_plan_node(
         state={"work_id": "w1"},
         config=None,
@@ -133,7 +133,7 @@ async def test_run_plan_node_returns_empty_when_resolve_fails(monkeypatch):
     def _bad_resolve(*args, **kwargs):
         raise RuntimeError("config missing")
 
-    monkeypatch.setattr(plan_do, "resolve_model", _bad_resolve)
+    monkeypatch.setattr(plan_do, "resolve_chat_model", _bad_resolve)
     out = await run_plan_node(
         state={"work_id": "w1"},
         config=None,
@@ -141,7 +141,7 @@ async def test_run_plan_node_returns_empty_when_resolve_fails(monkeypatch):
         task_description="...",
     )
     assert isinstance(out, SubagentDirective)
-    assert "resolve_model failed" in out.approach
+    assert "resolve_chat_model failed" in out.approach
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,7 @@ async def test_run_plan_node_returns_empty_when_model_lacks_structured_output(mo
         def with_structured_output(self, _schema):
             raise NotImplementedError
 
-    monkeypatch.setattr(plan_do, "resolve_model", lambda *a, **kw: _NoStructured())
+    monkeypatch.setattr(plan_do, "resolve_chat_model", lambda *a, **kw: _NoStructured())
     out = await run_plan_node(
         state={"work_id": "w1"},
         config=None,
@@ -170,7 +170,7 @@ async def test_run_plan_node_returns_empty_when_invocation_raises(monkeypatch):
         def with_structured_output(self, _schema):
             return _Boom()
 
-    monkeypatch.setattr(plan_do, "resolve_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(plan_do, "resolve_chat_model", lambda *a, **kw: _Model())
     out = await run_plan_node(
         state={"work_id": "w1"},
         config=None,
@@ -185,7 +185,7 @@ async def test_run_plan_node_accepts_dict_response(monkeypatch):
     """Some providers return a dict instead of the pydantic instance."""
     monkeypatch.setattr(
         plan_do,
-        "resolve_model",
+        "resolve_chat_model",
         lambda *a, **kw: _FakeChatModel({"approach": "ok", "target_files": ["a.py"]}),
     )
     out = await run_plan_node(

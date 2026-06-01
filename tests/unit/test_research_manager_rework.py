@@ -96,7 +96,7 @@ def test_rework_with_findings_skips_exploration_on_format_critic(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "spine.agents.exploration_agents.resolve_model",
+        "spine.agents.exploration_agents.resolve_chat_model",
         _fail_resolve_model,
     )
 
@@ -137,7 +137,7 @@ def test_rework_without_prior_findings_still_explores(monkeypatch):
         raise RuntimeError("ok — reached the model path")
 
     monkeypatch.setattr(
-        "spine.agents.exploration_agents.resolve_model",
+        "spine.agents.exploration_agents.resolve_chat_model",
         _fake_resolve_model,
     )
 
@@ -183,7 +183,7 @@ def test_rework_skipped_when_critic_demands_more_research(monkeypatch):
         raise RuntimeError("reached the model path")
 
     monkeypatch.setattr(
-        "spine.agents.exploration_agents.resolve_model",
+        "spine.agents.exploration_agents.resolve_chat_model",
         _fake_resolve_model,
     )
 

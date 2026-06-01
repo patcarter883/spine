@@ -153,8 +153,27 @@ def resolve_chat_model(
     if isinstance(model, str):
         from langchain.chat_models import init_chat_model
 
-        return init_chat_model(model)
+        provider_cfg = _active_provider_config(phase=phase)
+        cap_kwargs: dict[str, Any] = {}
+        if provider_cfg:
+            _apply_concurrency_cap(cap_kwargs, provider_cfg)
+        return init_chat_model(model, **cap_kwargs) if cap_kwargs else init_chat_model(model)
     return model
+
+
+def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
+    """Return a model_copy with the completion-token cap on the correct field.
+
+    ``ChatOpenAI`` stores the cap as ``max_tokens`` (with ``max_completion_tokens``
+    as a Pydantic alias).  ``model_copy(update={"max_completion_tokens": n})``
+    silently leaves the underlying ``max_tokens`` field unchanged, so the API
+    call still uses the original value.  We detect which field is actually set
+    and update that one — matching the defensive pattern already used in
+    ``exploration_agents._cap_findings_model``.
+    """
+    if getattr(model, "max_tokens", None) is not None:
+        return model.model_copy(update={"max_tokens": cap})
+    return model.model_copy(update={"max_completion_tokens": cap})
 
 
 def coerce_structured_output(

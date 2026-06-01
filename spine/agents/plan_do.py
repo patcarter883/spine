@@ -26,7 +26,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_model
+from spine.agents.helpers import resolve_chat_model
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -220,19 +220,15 @@ async def run_plan_node(
     session_id = work_id if work_id and work_id != "unknown" else None
 
     try:
-        raw_model = resolve_model(config, session_id=session_id, phase=phase_path)
+        model = resolve_chat_model(config, session_id=session_id, phase=phase_path)
     except Exception:
         logger.warning(
-            "[%s] plan_do: resolve_model failed for phase_path=%r",
+            "[%s] plan_do: resolve_chat_model failed for phase_path=%r",
             work_id,
             phase_path,
             exc_info=True,
         )
-        return empty_directive("resolve_model failed")
-
-    model = _coerce_to_chat_model(raw_model)
-    if model is None:
-        return empty_directive("could not build chat model")
+        return empty_directive("resolve_chat_model failed")
 
     try:
         structured = model.with_structured_output(SubagentDirective)
@@ -240,7 +236,7 @@ async def run_plan_node(
         logger.debug(
             "[%s] plan_do: model %r lacks with_structured_output — skipping plan",
             work_id,
-            type(raw_model).__name__,
+            type(model).__name__,
             exc_info=True,
         )
         return empty_directive("structured output unsupported")

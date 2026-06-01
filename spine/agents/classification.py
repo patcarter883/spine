@@ -16,7 +16,7 @@ from typing import Literal
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_model
+from spine.agents.helpers import resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
 logger = logging.getLogger(__name__)
@@ -79,13 +79,7 @@ async def classify_task(description: str, config: dict | None = None) -> TaskCla
     Returns:
         TaskClassificationResult with category, confidence, and reasoning.
     """
-    model = resolve_model(config, phase="classification")
-
-    # Convert to BaseChatModel if string
-    if isinstance(model, str):
-        from langchain.chat_models import init_chat_model
-
-        model = init_chat_model(model)
+    model = resolve_chat_model(config, phase="classification")
 
     prompt = hostage_layout(
         xml_blocks((Tag.OBJECTIVE, description)),

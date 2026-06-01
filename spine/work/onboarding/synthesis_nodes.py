@@ -52,6 +52,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from spine.agents.helpers import (
+    cap_completion_tokens,
     coerce_structured_output,
     resolve_chat_model,
     suppress_parsed_serializer_warning,
@@ -479,7 +480,7 @@ async def _section_worker_node(
             config, session_id=work_id, phase="onboarding/section-worker"
         )
         comp_cap = _section_max_completion_tokens(config)
-        model = model.model_copy(update={"max_completion_tokens": comp_cap})
+        model = cap_completion_tokens(model, comp_cap)
 
         prompt = _worker_prompt(active, voice)
         structured = model.with_structured_output(SectionResult)

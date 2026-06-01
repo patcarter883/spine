@@ -290,7 +290,7 @@ async def test_plan_research_manager_context_includes_prior_findings(monkeypatch
             return _StructuredStub()
 
     monkeypatch.setattr(
-        exploration_agents, "resolve_model", lambda *a, **kw: _ModelStub()
+        exploration_agents, "resolve_chat_model", lambda *a, **kw: _ModelStub()
     )
 
     state = {
@@ -350,7 +350,7 @@ async def test_specify_research_manager_context_excludes_prior_findings(monkeypa
             return _StructuredStub()
 
     monkeypatch.setattr(
-        exploration_agents, "resolve_model", lambda *a, **kw: _ModelStub()
+        exploration_agents, "resolve_chat_model", lambda *a, **kw: _ModelStub()
     )
 
     state = {

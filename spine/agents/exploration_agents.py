@@ -23,7 +23,7 @@ from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 from spine.agents._tokens import count_tokens as _count_tokens
-from spine.agents.helpers import resolve_model
+from spine.agents.helpers import cap_completion_tokens, resolve_chat_model
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -454,13 +454,7 @@ async def run_research_manager(
         )
         return {"manager_decision": "done", "topics": []}
 
-    model = resolve_model(config, session_id=work_id, phase="exploration/manager")
-
-    # resolve_model may return a string spec or a pre-built BaseChatModel.
-    if isinstance(model, str):
-        from langchain.chat_models import init_chat_model
-
-        model = init_chat_model(model)
+    model = resolve_chat_model(config, session_id=work_id, phase="exploration/manager")
 
     # ── Recall context from state ────────────────────────────────────
     # The pre_research_gate (exploration_subgraph._pre_research_gate)
@@ -972,17 +966,14 @@ async def run_explore_do_node(
     # auto-cycled until a non-tool message) down to exactly ONE, which is
     # what the supervisor's per-cycle directive expects. See audit #2 on
     # trace 019e71b4 — the agent loop was the dominant prompt-bloat driver.
-    from spine.agents.helpers import resolve_model as _resolve_model
-
-    _raw_worker_model = subagent_spec.get("model") or _resolve_model(
-        config, session_id=work_id, phase=f"{phase_enum.value}/subagents/researcher"
-    )
-    if isinstance(_raw_worker_model, str):
-        from langchain.chat_models import init_chat_model
-
-        worker_base_model = init_chat_model(_raw_worker_model)
-    else:
+    _raw_worker_model = subagent_spec.get("model")
+    if _raw_worker_model and not isinstance(_raw_worker_model, str):
+        # Pre-built model injected by the caller (e.g. test harness).
         worker_base_model = _raw_worker_model
+    else:
+        worker_base_model = resolve_chat_model(
+            config, session_id=work_id, phase=f"{phase_enum.value}/subagents/researcher"
+        )
 
     # bound_models: ToolClass → (model_with_tools_bound, scoped_tools_list).
     # Built lazily on first use per tool class so unused classes pay nothing.
@@ -1256,12 +1247,7 @@ def _findings_structured_model(model: Any) -> Any | None:
         cap = SpineConfig.load().summarise_max_completion_tokens
         # ChatOpenAI exposes both fields; override whichever the builder set,
         # defaulting to max_completion_tokens. model_copy keeps with_structured_output.
-        if getattr(model, "max_completion_tokens", None) is not None:
-            capped = model.model_copy(update={"max_completion_tokens": cap})
-        elif getattr(model, "max_tokens", None) is not None:
-            capped = model.model_copy(update={"max_tokens": cap})
-        else:
-            capped = model.model_copy(update={"max_completion_tokens": cap})
+        capped = cap_completion_tokens(model, cap)
     except Exception:
         logger.debug("findings cap: model_copy failed — using uncapped model", exc_info=True)
         capped = model

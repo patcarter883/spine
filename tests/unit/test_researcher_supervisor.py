@@ -183,9 +183,9 @@ async def test_supervisor_cycle_zero_skips_llm_call(monkeypatch):
     """
 
     def _boom(*args, **kwargs):
-        raise AssertionError("resolve_model must not be called on cycle 0")
+        raise AssertionError("resolve_chat_model must not be called on cycle 0")
 
-    monkeypatch.setattr(rs, "resolve_model", _boom)
+    monkeypatch.setattr(rs, "resolve_chat_model", _boom)
 
     d = await run_supervisor_node(
         state={"work_id": "w"},
@@ -222,7 +222,7 @@ async def test_supervisor_happy_path_dict_response(monkeypatch):
         def with_structured_output(self, schema):
             return _Structured()
 
-    monkeypatch.setattr(rs, "resolve_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
 
     finding = StructuredFinding(
         tool_name="codebase_query",
@@ -252,11 +252,11 @@ async def test_supervisor_happy_path_dict_response(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_supervisor_terminates_when_resolve_model_fails(monkeypatch):
+async def test_supervisor_terminates_when_resolve_chat_model_fails(monkeypatch):
     def _boom(*args, **kwargs):
         raise RuntimeError("no model")
 
-    monkeypatch.setattr(rs, "resolve_model", _boom)
+    monkeypatch.setattr(rs, "resolve_chat_model", _boom)
 
     d = await run_supervisor_node(
         state={"work_id": "w"},
@@ -279,7 +279,7 @@ async def test_supervisor_terminates_when_structured_output_unsupported(monkeypa
         def with_structured_output(self, schema):
             raise NotImplementedError("not supported by this model")
 
-    monkeypatch.setattr(rs, "resolve_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
 
     d = await run_supervisor_node(
         state={"work_id": "w"},

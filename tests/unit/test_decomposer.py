@@ -41,7 +41,7 @@ def _make_structured_mock(result: DecompositionResult) -> MagicMock:
 @pytest.mark.asyncio
 async def test_plan_mode_returns_slice_dicts():
     model = _make_structured_mock(_decomposition("a", "b"))
-    with patch("spine.agents.decomposer.resolve_model", return_value=model):
+    with patch("spine.agents.decomposer.resolve_chat_model", return_value=model):
         slices = await run_decomposer(
             mode="PLAN",
             spec_markdown="# Spec\n\nDo the thing.",
@@ -61,7 +61,7 @@ async def test_fallback_mode_assigns_micro_suffix_ids():
     # Decomposer returns ids that DON'T follow the convention; the wrapper
     # must rewrite them to '<parent>-micro-N'.
     model = _make_structured_mock(_decomposition("alpha", "beta"))
-    with patch("spine.agents.decomposer.resolve_model", return_value=model):
+    with patch("spine.agents.decomposer.resolve_chat_model", return_value=model):
         slices = await run_decomposer(
             mode="FALLBACK",
             failed_slice={"id": "parent-slice", "title": "Parent", "target_files": ["x.py"]},
@@ -75,7 +75,7 @@ async def test_fallback_mode_preserves_correct_suffix():
     model = _make_structured_mock(
         _decomposition("parent-slice-micro-1", "parent-slice-micro-2")
     )
-    with patch("spine.agents.decomposer.resolve_model", return_value=model):
+    with patch("spine.agents.decomposer.resolve_chat_model", return_value=model):
         slices = await run_decomposer(
             mode="FALLBACK",
             failed_slice={"id": "parent-slice"},

@@ -64,7 +64,7 @@ def test_explore_with_empty_topics_coerced_to_done(monkeypatch, caplog):
     an empty topics list. Manager must downgrade to 'done' with a warning."""
 
     monkeypatch.setattr(
-        "spine.agents.exploration_agents.resolve_model",
+        "spine.agents.exploration_agents.resolve_chat_model",
         lambda *a, **kw: _FakeModel("explore", []),  # noqa: ARG005
     )
 
@@ -92,7 +92,7 @@ def test_explore_with_topics_passes_through(monkeypatch):
         "What logging conventions are used across the agent layer?",
     ]
     monkeypatch.setattr(
-        "spine.agents.exploration_agents.resolve_model",
+        "spine.agents.exploration_agents.resolve_chat_model",
         lambda *a, **kw: _FakeModel("explore", topics),  # noqa: ARG005
     )
 
@@ -106,7 +106,7 @@ def test_done_with_empty_topics_passes_through(monkeypatch, caplog):
     expected shape and must not produce a coercion warning."""
 
     monkeypatch.setattr(
-        "spine.agents.exploration_agents.resolve_model",
+        "spine.agents.exploration_agents.resolve_chat_model",
         lambda *a, **kw: _FakeModel("done", []),  # noqa: ARG005
     )
 
@@ -144,12 +144,12 @@ def test_directive_forbids_empty_topics_explore():
 
     import spine.agents.exploration_agents as ea
 
-    original = ea.resolve_model
-    ea.resolve_model = lambda *a, **kw: _CaptureModel()  # noqa: ARG005
+    original = ea.resolve_chat_model
+    ea.resolve_chat_model = lambda *a, **kw: _CaptureModel()  # noqa: ARG005
     try:
         asyncio.run(run_research_manager(_base_state(), None))
     finally:
-        ea.resolve_model = original
+        ea.resolve_chat_model = original
 
     human_msg = captured["messages"][1]
     text = getattr(human_msg, "content", str(human_msg))
