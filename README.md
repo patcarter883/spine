@@ -259,6 +259,12 @@ SPINE builds on and draws inspiration from several excellent projects:
 - **[LangSmith](https://smith.langchain.com)** — tracing and observability for agent runs
 - **[mcp-codebase-index](https://github.com/mcp-codebase-index/mcp-codebase-index)** — structural codebase query tools exposed via MCP
 
+The following projects were direct inspirations for SPINE's design:
+
+- **[workspine](https://github.com/PatrickSys/workspine)** — pioneered the pattern of persisting plans, decisions, and verification artifacts to a `.planning/` directory so that structured deliverables survive across agent sessions and runtimes; SPINE's artifact store and phase checkpoint model owes a great deal to this approach
+- **[smallcode](https://github.com/Doorman11991/smallcode)** — a terminal-native coding agent built for local small LLMs (8B–35B) with context budget management, forgiving tool-call parsing, and patch-first editing; influenced SPINE's thinking around local vLLM routing and context engineering for the implement phase
+- **[learnship](https://github.com/FavioVazquez/learnship)** — a spec-driven development harness for multiple AI coding assistants with structured phase loops and persistent memory; shaped the philosophy behind SPINE's sequential phase discipline and critic gate design
+
 ---
 
 ## License
