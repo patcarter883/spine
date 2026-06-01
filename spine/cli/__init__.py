@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from spine.cli.git_commands import gate
 from spine.config import SpineConfig
 from spine.log import configure_logging
 
@@ -472,3 +473,60 @@ def export(work_id: str, output: str | None, output_format: str, config_path: st
         console.print(f"[green]Exported to {output}[/green]")
     else:
         console.print(out)
+
+
+@main.command()
+@click.argument("path", default=".")
+@click.option(
+    "--tech-stack",
+    "tech_stack",
+    multiple=True,
+    help="Technology tag for the config header (repeatable, e.g. --tech-stack python --tech-stack langgraph).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite an existing .spine/config.yaml even if its content differs.",
+)
+def init(path: str, tech_stack: tuple[str, ...], force: bool) -> None:
+    """Initialize SPINE in a project directory.
+
+    Creates .spine/skills/, .spine/artifacts/, and a baseline .spine/config.yaml
+    under PATH (default: current directory). Existing src/ and tests/ are left
+    untouched. Re-running is idempotent; an existing config is preserved unless
+    --force is passed.
+    """
+    from spine.work.onboarding.init import init_workspace
+
+    managed, preserved = init_workspace(path, list(tech_stack), force=force)
+
+    config_path = f"{path.rstrip('/')}/.spine/config.yaml"
+    config = SpineConfig.load(path=config_path)
+    config.ensure_dirs()
+
+    table = Table(title="Scaffolded files", show_header=True, header_style="bold")
+    table.add_column("Path")
+    table.add_column("Status")
+    for rel in managed:
+        status = "[yellow]preserved[/yellow]" if rel in preserved else "[green]written[/green]"
+        table.add_row(rel, status)
+    console.print(table)
+
+    if preserved:
+        console.print(
+            f"[yellow]Preserved {len(preserved)} existing file(s). "
+            f"Re-run with --force to overwrite.[/yellow]"
+        )
+
+    next_steps = (
+        f"[bold]Next steps[/bold]\n\n"
+        f"  1. Edit [cyan]{config_path}[/cyan] — uncomment and fill in one entry under\n"
+        f"     [cyan]providers.llm[/cyan] and [cyan]providers.embedding[/cyan].\n"
+        f"  2. Run [cyan]spine index[/cyan] to build the RAG vector index.\n"
+        f"  3. Run [cyan]spine run \"your task description\"[/cyan] to start a work item.\n"
+    )
+    console.print(Panel(next_steps, title="SPINE initialized", border_style="green"))
+
+
+main.add_command(gate)

@@ -35,6 +35,7 @@ spine ui
 
 | Command | Description |
 |---------|-------------|
+| `spine init [path]` | Scaffold `.spine/` and a baseline `config.yaml` (use `--tech-stack` and `--force`) |
 | `spine run "description"` | Start new work item (use `--type task` or `--type critical_task`) |
 | `spine status <work_id>` | Show current workflow status |
 | `spine list` | List active work items |

@@ -28,6 +28,11 @@ def baseline_config_yaml(tech_stack: list[str]) -> str:
     synthesis step) can see what the project was seeded with without it
     affecting config parsing.
 
+    The ``providers:`` section is emitted as an empty ``llm: []`` / ``embedding: []``
+    pair followed by commented-out stubs.  The empty arrays keep the parsed config
+    structurally valid (``SpineConfig._load_providers`` is happy) while the
+    commented stubs give the user a concrete editing target.
+
     Args:
         tech_stack: Technologies the project is seeded with, e.g.
             ``["python", "langgraph"]``.  Used only for the comment header.
@@ -59,7 +64,48 @@ def baseline_config_yaml(tech_stack: list[str]) -> str:
         f"# Tech stack: {stack}\n"
         "# Add LLM/embedding providers under `providers:` before running work.\n"
     )
-    return header + body
+    return header + body + _provider_stub_comment()
+
+
+def _provider_stub_comment() -> str:
+    """Return commented-out provider examples appended after the YAML body.
+
+    These are pure YAML comments (every line starts with ``#``) so the document
+    parses identically with or without them.  The shapes mirror the production
+    config: ``deepagents-model`` for LLMs and ``openai-embedding`` for
+    embeddings.  A user uncomments one of each, fills in ``base_url``/``model``,
+    and points ``api_key`` at the env var holding their credential.
+    """
+    return (
+        "\n"
+        "# ── Example providers ─────────────────────────────────────────────\n"
+        "# Uncomment and edit one LLM entry and one embedding entry, then move\n"
+        "# them under `providers.llm:` / `providers.embedding:` above.\n"
+        "#\n"
+        "# providers:\n"
+        "#   llm:\n"
+        "#   - name: openrouter-default\n"
+        "#     type: deepagents-model\n"
+        "#     model: openrouter:deepseek/deepseek-v4-pro\n"
+        "#     api_key: ${OPENROUTER_API_KEY}\n"
+        "#     enabled: true\n"
+        "#     guided_decoding: false\n"
+        "#   - name: local-vllm\n"
+        "#     type: deepagents-model\n"
+        "#     model: openai:Qwen3.6-35B-A3B\n"
+        "#     base_url: http://localhost:8000/v1\n"
+        "#     api_key: vllm\n"
+        "#     enabled: false\n"
+        "#   embedding:\n"
+        "#   - name: local-embeddings\n"
+        "#     type: openai-embedding\n"
+        "#     model: Qwen3-Embedding-8B-GGUF\n"
+        "#     base_url: http://localhost:8010/v1\n"
+        "#     api_key: vllm\n"
+        "#\n"
+        "# After editing, run `spine index` to build the RAG vector index,\n"
+        "# then `spine run \"your task description\"`.\n"
+    )
 
 
 def _gitkeep_seed() -> str:
