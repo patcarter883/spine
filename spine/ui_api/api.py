@@ -41,6 +41,42 @@ class UIApi:
         self._audit = AuditService(
             db_path=str(__import__("pathlib").Path(self._config.queue_path).parent / "audit.db")
         )
+        from spine.persistence.project_store import ProjectStore
+
+        self._projects = ProjectStore(base_path=self._config.project_path)
+
+    # ── Project operations (read-only) ──
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        """Return a project spec as a dict, or None if it does not exist."""
+        spec = self._projects.load_project(project_id)
+        return spec.model_dump() if spec else None
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        """List all projects with id, title, and member count."""
+        out: list[dict[str, Any]] = []
+        for pid in self._projects.list_projects():
+            spec = self._projects.load_project(pid)
+            if spec:
+                out.append(
+                    {"id": spec.id, "title": spec.title, "members": len(spec.member_work_ids)}
+                )
+        return out
+
+    def get_project_coverage(self, project_id: str) -> dict[str, Any] | None:
+        """Compute deterministic requirement coverage for a project, or None.
+
+        Wraps the async aggregator with ``asyncio.run`` so Streamlit's sync
+        pages can call it directly.
+        """
+        import asyncio
+
+        spec = self._projects.load_project(project_id)
+        if spec is None:
+            return None
+        from spine.project.aggregator import aggregate_project_coverage
+
+        return asyncio.run(aggregate_project_coverage(spec, self._config))
 
     # ── Work operations ──
 

@@ -196,6 +196,7 @@ class SpineConfig:
 
     checkpoint_path: str = ".spine/spine.db"
     artifact_path: str = ".spine/artifacts"
+    project_path: str = ".spine/project"
     max_critic_retries: int = 2
     work_type: str = "task"
     providers: dict = field(default_factory=dict)
@@ -466,6 +467,9 @@ class SpineConfig:
             ),
             artifact_path=os.getenv(
                 "SPINE_ARTIFACT_PATH", spine.get("artifact_path", ".spine/artifacts")
+            ),
+            project_path=os.getenv(
+                "SPINE_PROJECT_PATH", spine.get("project_path", ".spine/project")
             ),
             max_critic_retries=int(
                 os.getenv("SPINE_MAX_CRITIC_RETRIES", spine.get("max_critic_retries", 2))
@@ -800,3 +804,4 @@ class SpineConfig:
         """Create all necessary directories if they don't exist."""
         for p in [self.checkpoint_path, self.artifact_path, self.queue_path]:
             Path(p).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.project_path).mkdir(parents=True, exist_ok=True)

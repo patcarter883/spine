@@ -174,6 +174,7 @@ async def submit_work(
     created_at: str | None = None,
     work_id: str | None = None,
     plan_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Submit a new work item for processing.
 
@@ -201,6 +202,10 @@ async def submit_work(
             sequence number.
         plan_id: Optional reference to an approved planning work item
             whose spec/plan this execution derives from.
+        project_id: Optional project this work item belongs to. Orthogonal to
+            ``plan_id`` — it is a project-membership back-reference, NOT a
+            planning-source pointer, and the two never imply a hierarchy. When
+            set, the work item is registered as a member of the project.
 
     Returns:
         A dict with keys: ``work_id``, ``status``, ``work_type``.
@@ -257,6 +262,14 @@ async def submit_work(
         except Exception:
             logger.warning("Could not add plan_id column — may already exist", exc_info=True)
 
+    # Ensure the project_id column exists (migration). project_id is a project-
+    # membership back-reference, orthogonal to plan_id — see submit_work docstring.
+    if "project_id" not in db["work_entries"].columns_dict:
+        try:
+            db["work_entries"].add_column("project_id", str)
+        except Exception:
+            logger.warning("Could not add project_id column — may already exist", exc_info=True)
+
     db["work_entries"].insert(
         {
             "id": work_id,
@@ -268,8 +281,25 @@ async def submit_work(
             "updated_at": now,
             "result": "{}",
             "plan_id": plan_id,
+            "project_id": project_id,
         }
     )
+
+    # Register membership in the project store (source of truth). The DB column
+    # above is only a reverse-lookup convenience. Missing project → warn, don't
+    # fail the submission.
+    if project_id:
+        try:
+            from spine.persistence.project_store import ProjectStore
+
+            ProjectStore(base_path=config.project_path).add_members(project_id, [work_id])
+        except KeyError:
+            logger.warning(
+                "Work %s submitted with project_id=%s but no such project exists; "
+                "membership not recorded in the project store.",
+                work_id,
+                project_id,
+            )
 
     # Build and run the workflow graph
     try:

@@ -44,12 +44,25 @@ def main(ctx: click.Context, verbose: bool) -> None:
     help="Path to config file.",
 )
 @click.option(
+    "--project",
+    "project_id",
+    default=None,
+    help="Associate this work item with a project (membership back-reference; "
+    "independent of plan_id). The project must already exist.",
+)
+@click.option(
     "--debug-llm",
     is_flag=True,
     default=False,
     help="Log all chat model messages (sent and received) to the console.",
 )
-def run(description: str, work_type: str, config_path: str, debug_llm: bool) -> None:
+def run(
+    description: str,
+    work_type: str,
+    config_path: str,
+    project_id: str | None,
+    debug_llm: bool,
+) -> None:
     """Submit a new work item and run the workflow.
 
     DESCRIPTION is the work prompt for the agent.
@@ -65,10 +78,14 @@ def run(description: str, work_type: str, config_path: str, debug_llm: bool) -> 
     config = SpineConfig.load(path=config_path)
     console.print(f"[bold blue]Submitting work:[/bold blue] {description[:100]}")
     console.print(f"[dim]Work type: {work_type}[/dim]")
+    if project_id:
+        console.print(f"[dim]Project: {project_id}[/dim]")
 
     from spine.work.dispatcher import submit_work
 
-    result = asyncio.run(submit_work(description, work_type, config))
+    result = asyncio.run(
+        submit_work(description, work_type, config, project_id=project_id)
+    )
 
     if "error" in result:
         console.print(f"[bold red]Failed:[/bold red] {result['error']}")
@@ -527,6 +544,170 @@ def init(path: str, tech_stack: tuple[str, ...], force: bool) -> None:
         f"  3. Run [cyan]spine run \"your task description\"[/cyan] to start a work item.\n"
     )
     console.print(Panel(next_steps, title="SPINE initialized", border_style="green"))
+
+
+@main.group()
+def project() -> None:
+    """Manage project/milestone envelopes spanning many work items."""
+
+
+@project.command(name="create")
+@click.argument("project_id")
+@click.option("--title", default=None, help="Project title (defaults to the id).")
+@click.option(
+    "--from-json",
+    "from_json",
+    default=None,
+    help="Path to a JSON file with ProjectSpec fields (title, requirements, roadmap, ...).",
+)
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def project_create(
+    project_id: str, title: str | None, from_json: str | None, config_path: str
+) -> None:
+    """Create a new project. PROJECT_ID is the unique project slug."""
+    from datetime import datetime
+    from pathlib import Path
+
+    from spine.models.types import ProjectSpec
+    from spine.persistence.project_store import ProjectStore
+
+    config = SpineConfig.load(path=config_path)
+    store = ProjectStore(base_path=config.project_path)
+
+    if store.load_project(project_id) is not None:
+        console.print(f"[bold red]Project '{project_id}' already exists.[/bold red]")
+        sys.exit(1)
+
+    now = datetime.now().isoformat()
+    if from_json:
+        import json
+
+        data = json.loads(Path(from_json).read_text(encoding="utf-8"))
+        data["id"] = project_id
+        data.setdefault("title", title or project_id)
+        data.setdefault("created_at", now)
+        data["updated_at"] = now
+        spec = ProjectSpec.model_validate(data)
+    else:
+        spec = ProjectSpec(
+            id=project_id,
+            title=title or project_id,
+            created_at=now,
+            updated_at=now,
+        )
+
+    store.save_project(spec)
+    console.print(
+        Panel(
+            f"Project: {spec.id}\nTitle: {spec.title}\n"
+            f"Requirements: {len(spec.requirements)}\nMembers: {len(spec.member_work_ids)}",
+            title="Project Created",
+        )
+    )
+
+
+@project.command(name="add")
+@click.argument("project_id")
+@click.argument("work_ids", nargs=-1, required=True)
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def project_add(project_id: str, work_ids: tuple[str, ...], config_path: str) -> None:
+    """Add one or more WORK_IDS to PROJECT_ID's membership."""
+    from spine.persistence.project_store import ProjectStore
+
+    config = SpineConfig.load(path=config_path)
+    store = ProjectStore(base_path=config.project_path)
+    try:
+        spec = store.add_members(project_id, list(work_ids))
+    except KeyError:
+        console.print(f"[bold red]Project '{project_id}' not found.[/bold red]")
+        sys.exit(1)
+
+    console.print(
+        f"[green]Project '{project_id}' now has {len(spec.member_work_ids)} member(s).[/green]"
+    )
+
+
+@project.command(name="show")
+@click.argument("project_id")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def project_show(project_id: str, config_path: str) -> None:
+    """Show a project and its deterministic requirement-coverage rollup."""
+    from spine.persistence.project_store import ProjectStore
+    from spine.project.aggregator import aggregate_project_coverage
+
+    config = SpineConfig.load(path=config_path)
+    store = ProjectStore(base_path=config.project_path)
+    spec = store.load_project(project_id)
+    if spec is None:
+        console.print(f"[bold red]Project '{project_id}' not found.[/bold red]")
+        sys.exit(1)
+
+    coverage = asyncio.run(aggregate_project_coverage(spec, config))
+    summary = coverage["summary"]
+
+    console.print(
+        Panel(
+            f"Title: {spec.title}\n"
+            f"Members: {coverage['total_members']} "
+            f"({coverage['members_with_state']} with state, "
+            f"{coverage['verified_members']} verified)\n"
+            f"Requirements: [green]{summary['satisfied']} satisfied[/green], "
+            f"[yellow]{summary['partial']} partial[/yellow], "
+            f"[red]{summary['unsatisfied']} unsatisfied[/red]",
+            title=f"Project: {project_id}",
+        )
+    )
+
+    if coverage["requirements"]:
+        status_colors = {"satisfied": "green", "partial": "yellow", "unsatisfied": "red"}
+        table = Table(title="Requirement Coverage")
+        table.add_column("ID", style="bold")
+        table.add_column("Requirement")
+        table.add_column("Status")
+        table.add_column("Verified / Covering")
+        for r in coverage["requirements"]:
+            color = status_colors.get(r["status"], "white")
+            table.add_row(
+                r["id"],
+                r["text"][:60],
+                f"[{color}]{r['status']}[/{color}]",
+                f"{len(r['verified'])}/{len(r['covering'])}",
+            )
+        console.print(table)
+
+    if coverage["phases"]:
+        phase_colors = {"complete": "green", "in_progress": "yellow", "pending": "white"}
+        lines = [
+            f"[{phase_colors.get(p['status'], 'white')}]{p['status']}[/] — "
+            f"{p['id']}: {p['title']}"
+            for p in coverage["phases"]
+        ]
+        console.print(Panel("\n".join(lines), title="Roadmap Phases"))
+
+
+@project.command(name="list")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def project_list(config_path: str) -> None:
+    """List all projects."""
+    from spine.persistence.project_store import ProjectStore
+
+    config = SpineConfig.load(path=config_path)
+    store = ProjectStore(base_path=config.project_path)
+    ids = store.list_projects()
+    if not ids:
+        console.print("[dim]No projects found.[/dim]")
+        return
+
+    table = Table(title="Projects")
+    table.add_column("ID", style="bold")
+    table.add_column("Title")
+    table.add_column("Members")
+    for pid in ids:
+        spec = store.load_project(pid)
+        if spec is None:
+            continue
+        table.add_row(spec.id, spec.title, str(len(spec.member_work_ids)))
+    console.print(table)
 
 
 main.add_command(gate)

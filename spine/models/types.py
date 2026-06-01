@@ -139,6 +139,73 @@ class Specification(BaseModel):
     known_risks: list[str] = Field(description="Known risks", default_factory=list)
 
 
+# ── Project / Milestone Layer Models ──
+# A persistent project-level envelope spanning many work items. A project is an
+# EXPLICIT list of top-level work_ids (membership stored project-side); it does
+# NOT rely on the dead ``spawned_work_ids`` field, and ``project_id`` is
+# orthogonal to ``plan_id`` (both are back-references, not a hierarchy).
+
+
+class RequirementRef(BaseModel):
+    """A project-level requirement with a stable, caller-assigned ID.
+
+    ``id`` is assigned once at creation (e.g. "R-001") and is IMMUTABLE for the
+    project's lifetime: the coverage aggregator keys per-requirement status off
+    it, so renumbering would silently invalidate all historical coverage. Treat
+    any ID change as a breaking operation.
+    """
+
+    id: str = Field(description="Stable requirement ID, e.g. 'R-001'. Immutable.")
+    text: str = Field(description="The requirement statement.")
+    rationale: str = Field(default="", description="Why this requirement exists.")
+
+
+class RoadmapPhase(BaseModel):
+    """One phase/milestone of a project roadmap. Status is DERIVED by the
+    aggregator from member verification state — never stored here."""
+
+    id: str = Field(description="Stable phase ID, e.g. 'M-001'. Immutable.")
+    title: str = Field(description="Phase title.")
+    description: str = Field(default="", description="What the phase delivers.")
+    requirement_ids: list[str] = Field(
+        default_factory=list,
+        description="RequirementRef.id values this phase is responsible for.",
+    )
+    member_work_ids: list[str] = Field(
+        default_factory=list,
+        description="Subset of the project's member work_ids assigned to this phase.",
+    )
+
+
+class Roadmap(BaseModel):
+    """An ordered list of roadmap phases."""
+
+    phases: list[RoadmapPhase] = Field(default_factory=list)
+
+
+class ProjectSpec(BaseModel):
+    """Persistent project-level specification + roadmap spanning many work items.
+
+    Membership (``member_work_ids``) is the source of truth for which work items
+    belong to the project. Coverage is computed read-only by
+    ``spine.project.aggregator``: it reflects members that have RUN AND PASSED
+    verification; members whose checkpoint state is absent (purged on approve or
+    never run) are treated as unverified, not as failures.
+    """
+
+    id: str = Field(description="Unique project slug; the on-disk directory key.")
+    title: str = Field(description="Project title.")
+    summary: str = Field(default="", description="Executive summary.")
+    objectives: list[str] = Field(default_factory=list)
+    requirements: list[RequirementRef] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    hard_boundaries: list[str] = Field(default_factory=list)
+    roadmap: Roadmap = Field(default_factory=Roadmap)
+    member_work_ids: list[str] = Field(default_factory=list)
+    created_at: str = Field(description="ISO timestamp of project creation.")
+    updated_at: str = Field(description="ISO timestamp of last modification.")
+
+
 class FixInstruction(BaseModel):
     """Structured fix instruction for one gap."""
 
