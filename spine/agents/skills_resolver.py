@@ -133,3 +133,134 @@ def resolve_memory(
         memory_paths.append(str(spine_agents))
 
     return memory_paths
+
+
+# ── Onboarding documents ─────────────────────────────────────────────────
+
+# Per-phase PRIMARY onboarding document — the one injected in full into the
+# system prompt (hybrid injection). The remaining documents are referenced by
+# path for on-demand reading. The mapping reflects which document each phase
+# most needs:
+#   specify           — what to build      → PROJECT_DEFINITION
+#   plan / tasks       — where it goes      → ARCHITECTURE_MAP
+#   implement / verify — how to write it    → CODING_GUIDELINES
+#   critic             — assist boundaries  → SPINE_ASSISTANCE_REQUIREMENTS
+#   gap_plan           — structure          → ARCHITECTURE_MAP
+_PHASE_PRIMARY_DOC: dict[str, str] = {
+    PhaseName.SPECIFY.value: "PROJECT_DEFINITION.md",
+    PhaseName.PLAN.value: "ARCHITECTURE_MAP.md",
+    PhaseName.TASKS.value: "ARCHITECTURE_MAP.md",
+    PhaseName.IMPLEMENT.value: "CODING_GUIDELINES.md",
+    PhaseName.VERIFY.value: "CODING_GUIDELINES.md",
+    PhaseName.CRITIC.value: "SPINE_ASSISTANCE_REQUIREMENTS.md",
+    PhaseName.GAP_PLAN.value: "ARCHITECTURE_MAP.md",
+}
+
+# One-line purpose per document, shown in the reference block so an agent knows
+# which file to read on demand.
+_DOC_PURPOSE: dict[str, str] = {
+    "PROJECT_DEFINITION.md": "what the project is and does — purpose, domains",
+    "ARCHITECTURE_MAP.md": "module responsibilities, execution paths, dependencies",
+    "CODING_GUIDELINES.md": "typing, error-handling, testing, and naming conventions",
+    "SPINE_ASSISTANCE_REQUIREMENTS.md": "where to assist + context/token guardrails",
+}
+
+# Size cap (bytes) for the injected primary document. Above this it is demoted to
+# reference-only so the always-on injection can never blow the bounded token
+# budget that project AGENTS.md is itself skipped to protect (see
+# ``_SKIP_AGENTS_MD``).
+_ONBOARDING_INJECT_BYTE_CAP = 12_000
+
+
+def resolve_onboarding_docs(
+    workspace_root: str | None,
+    phase: str,
+) -> tuple[str | None, list[tuple[str, str]]]:
+    """Resolve onboarding context for a phase agent (hybrid injection).
+
+    Onboarding writes four markdown documents to a single stable location,
+    ``<workspace_root>/.spine/onboarding/`` (see
+    :func:`spine.work.onboarding.synthesis_tools.onboarding_docs_dir`). This
+    selects the phase's PRIMARY document to inject in full and lists the rest as
+    references the agent may read on demand.
+
+    Args:
+        workspace_root: Project workspace root (holds ``.spine/onboarding/``).
+        phase: Phase name (e.g. ``"specify"``).
+
+    Returns:
+        ``(inject_path, reference)`` where ``inject_path`` is the absolute path to
+        the primary document to inject in full — or ``None`` when it is absent or
+        exceeds :data:`_ONBOARDING_INJECT_BYTE_CAP` (demoted to reference-only) —
+        and ``reference`` is a list of ``(filename, abs_path)`` for the other
+        existing onboarding documents.
+    """
+    from spine.work.onboarding.synthesis_tools import (
+        ONBOARDING_DOC_NAMES,
+        onboarding_docs_dir,
+    )
+
+    if not workspace_root:
+        return None, []
+
+    docs_dir = onboarding_docs_dir(workspace_root)
+    if not docs_dir.is_dir():
+        return None, []
+
+    # Choose the primary doc to inject, subject to the size guard.
+    inject_path: str | None = None
+    primary = _PHASE_PRIMARY_DOC.get(phase)
+    if primary:
+        ppath = docs_dir / primary
+        if ppath.is_file():
+            try:
+                within_cap = ppath.stat().st_size <= _ONBOARDING_INJECT_BYTE_CAP
+            except OSError:
+                within_cap = False
+            if within_cap:
+                inject_path = str(ppath)
+            else:
+                logger.debug(
+                    "Phase %s: onboarding doc %s exceeds inject cap — "
+                    "demoting to reference-only",
+                    phase,
+                    primary,
+                )
+
+    # Everything else (existing docs not injected in full) becomes a reference.
+    reference: list[tuple[str, str]] = []
+    for name in ONBOARDING_DOC_NAMES:
+        fname = f"{name}.md"
+        fpath = docs_dir / fname
+        if not fpath.is_file():
+            continue
+        if inject_path is not None and str(fpath) == inject_path:
+            continue
+        reference.append((fname, str(fpath)))
+
+    return inject_path, reference
+
+
+def build_onboarding_reference(reference: list[tuple[str, str]]) -> str:
+    """Build the ``<onboarding_documentation>`` reference block.
+
+    Lists each referenced onboarding document by absolute path plus a one-line
+    purpose, mirroring the "files on disk — read what you need" pattern of
+    :func:`spine.agents.artifacts.build_artifact_prompt`. Returns ``""`` when
+    there is nothing to reference (so the block elides cleanly).
+    """
+    from spine.agents.prompt_format import Tag, xml_block
+
+    if not reference:
+        return ""
+
+    lines = [
+        "The project's onboarding documentation is available on disk. Read a "
+        "file with your read tool only if you need it for this task:",
+    ]
+    for fname, path in reference:
+        purpose = _DOC_PURPOSE.get(fname, "")
+        suffix = f" — {purpose}" if purpose else ""
+        lines.append(f"- `{path}`{suffix}")
+
+    return xml_block(Tag.ONBOARDING_DOCS, "\n".join(lines))

@@ -46,7 +46,7 @@ from spine.work.onboarding.synthesis_plan import (
     SectionResult,
     deterministic_section_plan,
 )
-from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES, ONBOARDING_PHASE
+from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -342,7 +342,7 @@ class TestSynthesisGraph:
         _patch_resolve(monkeypatch, _StubModel())
         final = self._run(manifest, tmp_path, "wk-graph")
 
-        doc_dir = tmp_path / ".spine/artifacts" / "wk-graph" / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (doc_dir / f"{doc}.md").exists()
         assert set(final["written"]) == set(ONBOARDING_DOC_NAMES)
@@ -360,7 +360,7 @@ class TestSynthesisGraph:
         _patch_resolve(monkeypatch, _InvalidKeysModel())
         final = self._run(manifest, tmp_path, "wk-invalid")
 
-        doc_dir = tmp_path / ".spine/artifacts" / "wk-invalid" / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             path = doc_dir / f"{doc}.md"
             assert path.exists()
@@ -408,7 +408,7 @@ class TestSynthesisGraph:
         _patch_resolve(monkeypatch, _FailOnceWorkerModel())
         final = self._run(manifest, tmp_path, "wk-retry")
 
-        doc_dir = tmp_path / ".spine/artifacts" / "wk-retry" / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (doc_dir / f"{doc}.md").exists()
         assert set(final["written"]) == set(ONBOARDING_DOC_NAMES)
@@ -422,7 +422,7 @@ class TestSynthesisGraph:
         _patch_resolve(monkeypatch, _StubModel())
         final = self._run(manifest, tmp_path, "wk-green")
 
-        doc_dir = tmp_path / ".spine/artifacts" / "wk-green" / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (doc_dir / f"{doc}.md").exists()
         # Greenfield = exactly one section per document.
@@ -542,7 +542,7 @@ class TestComposedOnboardingGraph:
         assert manifest.module_boundaries  # discovered sample_pkg.* modules
 
         # Phase B wrote all four documents.
-        doc_dir = tmp_path / ".spine/artifacts" / "wk-e2e" / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (doc_dir / f"{doc}.md").exists()
         assert set(final["written"]) == set(ONBOARDING_DOC_NAMES)
@@ -567,7 +567,7 @@ class TestComposedOnboardingGraph:
         manifest = RepoManifest.from_dict(final["manifest"])
         assert manifest.mode == "greenfield"
 
-        doc_dir = tmp_path / ".spine/artifacts" / "wk-green-e2e" / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (doc_dir / f"{doc}.md").exists()
         # Greenfield = exactly one section per document.

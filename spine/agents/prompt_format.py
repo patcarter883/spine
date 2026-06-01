@@ -51,6 +51,8 @@ class Tag(str, Enum):
         CRITIC_FEEDBACK: last critic verdict + suggestions (rework path).
         SCRATCHPAD: working-memory accumulator.
         ERRORS: tool / system error dossier.
+        ONBOARDING_DOCS: references to the project's on-disk onboarding
+            documentation (paths the agent may read on demand).
         DIRECTIVE: supervisor's next-step instruction (when shown to a worker
             as a data block — distinct from the plain-text final-instruction
             tail that lives outside any tag, see :func:`hostage_layout`).
@@ -77,6 +79,7 @@ class Tag(str, Enum):
     SCRATCHPAD = "scratchpad"
     ERRORS = "errors"
     DIRECTIVE = "directive"
+    ONBOARDING_DOCS = "onboarding_documentation"
 
     # Role / system
     ROLE = "role"

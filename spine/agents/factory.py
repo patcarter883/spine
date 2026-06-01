@@ -305,6 +305,21 @@ class SpineProjectMemoryMiddleware(MemoryMiddleware):
 # ── Main factory function ────────────────────────────────────────────────
 
 
+def _onboarding_injection_enabled() -> bool:
+    """Whether onboarding-document injection is enabled (config flag, default on).
+
+    Reads ``SpineConfig.onboarding_context_injection`` the same way the rest of
+    the factory reads config (``SpineConfig.load()``). Any load failure defaults
+    to enabled so the feature is on out of the box.
+    """
+    try:
+        from spine.config import SpineConfig
+
+        return bool(SpineConfig.load().onboarding_context_injection)
+    except Exception:
+        return True
+
+
 def build_phase_agent(
     state: WorkflowState,
     config: RunnableConfig | None,
@@ -354,7 +369,11 @@ def build_phase_agent(
 
     from spine.agents.backend import build_backend
     from spine.agents.artifacts import materialize_artifacts
-    from spine.agents.skills_resolver import resolve_memory
+    from spine.agents.skills_resolver import (
+        build_onboarding_reference,
+        resolve_memory,
+        resolve_onboarding_docs,
+    )
 
     # ── Resolve model and backend ────────────────────────────────────
     model = resolve_model(config, session_id=state.get("work_id"), phase=phase.value)
@@ -377,12 +396,31 @@ def build_phase_agent(
     if not is_subagent:
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
+    # ── Onboarding documentation (hybrid injection) ──────────────────
+    # The relevant onboarding document for this phase is injected in full (via
+    # the memory middleware, below); the remaining documents are referenced by
+    # path for on-demand reading. Disabled when onboarding_context_injection is
+    # off. Subagents are leaf workers and skip this — their parent already
+    # carries the context.
+    onboarding_inject: str | None = None
+    onboarding_ref_block = ""
+    if not is_subagent and _onboarding_injection_enabled():
+        onboarding_inject, onboarding_ref = resolve_onboarding_docs(
+            workspace_root, phase.value
+        )
+        onboarding_ref_block = build_onboarding_reference(onboarding_ref)
+
     # ── Assemble final system prompt ─────────────────────────────────
-    # Assembly order: user system_prompt → base prompt (CUSTOM slot)
-    if system_prompt is None:
-        final_system_prompt: str = base_prompt
-    else:
-        final_system_prompt = system_prompt + "\n\n" + base_prompt
+    # Assembly order: user system_prompt → onboarding references → base prompt.
+    # The reference block sits before the base prompt so the base prompt stays
+    # the trailing static chunk the StaticPrefixCacheMiddleware stamps.
+    prompt_parts: list[str] = []
+    if system_prompt is not None:
+        prompt_parts.append(system_prompt)
+    if onboarding_ref_block:
+        prompt_parts.append(onboarding_ref_block)
+    prompt_parts.append(base_prompt)
+    final_system_prompt: str = "\n\n".join(prompt_parts)
 
     # The static prefix — the base prompt — is what we want to mark with
     # an ephemeral cache breakpoint.  It is identical across every turn of
@@ -393,6 +431,10 @@ def build_phase_agent(
 
     # ── Memory ───────────────────────────────────────────────────────
     memory = resolve_memory(workspace_root, phase=phase.value)
+    # Inject the phase's primary onboarding doc in full, reusing the memory
+    # middleware's <project_documentation> wrapper + cache breakpoint.
+    if onboarding_inject:
+        memory = [*memory, onboarding_inject]
     if memory:
         logger.debug("Phase %s: loading memory files: %s", phase.value, memory)
 

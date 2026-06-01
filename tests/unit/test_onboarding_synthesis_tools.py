@@ -141,15 +141,11 @@ class TestReadRepoManifestTool:
 
 
 class TestWriteOnboardingDocTool:
-    def _tool(self, tmp_path: Path, work_id: str = "wk-onb") -> WriteOnboardingDocTool:
-        return WriteOnboardingDocTool(
-            workspace_root=str(tmp_path),
-            work_id=work_id,
-            out_dir=str(tmp_path / ".spine/artifacts"),
-        )
+    def _tool(self, tmp_path: Path) -> WriteOnboardingDocTool:
+        return WriteOnboardingDocTool(docs_dir=str(tmp_path / ".spine/onboarding"))
 
-    def _doc_dir(self, tmp_path: Path, work_id: str = "wk-onb") -> Path:
-        return tmp_path / ".spine/artifacts" / work_id / ONBOARDING_PHASE
+    def _doc_dir(self, tmp_path: Path) -> Path:
+        return tmp_path / ".spine/onboarding"
 
     def test_writes_named_doc(self, tmp_path: Path) -> None:
         tool = self._tool(tmp_path)
@@ -188,9 +184,7 @@ class TestBuildSynthesisTools:
     def test_returns_two_named_tools(self, tmp_path: Path) -> None:
         tools = build_synthesis_tools(
             workspace_root=str(tmp_path),
-            work_id="wk-onb",
             manifest_dir=artifact_path("wk-onb", ONBOARDING_PHASE),
-            out_dir=str(tmp_path / ".spine/artifacts"),
         )
         names = {t.name for t in tools}
         assert names == {"read_repo_manifest", "write_onboarding_doc"}
@@ -288,7 +282,7 @@ class TestSynthesizeArtifacts:
             )
         )
 
-        doc_dir = tmp_path / ".spine/artifacts" / work_id / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (doc_dir / f"{doc}.md").exists()
             assert result[doc] == str(doc_dir / f"{doc}.md")
@@ -318,7 +312,7 @@ class TestSynthesizeArtifacts:
             )
         )
         assert set(first) == set(second) == set(ONBOARDING_DOC_NAMES)
-        doc_dir = tmp_path / ".spine/artifacts" / work_id / ONBOARDING_PHASE
+        doc_dir = tmp_path / ".spine/onboarding"
         md_files = sorted(p.name for p in doc_dir.glob("*.md"))
         assert md_files == sorted(f"{d}.md" for d in ONBOARDING_DOC_NAMES)
 

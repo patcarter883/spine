@@ -202,6 +202,47 @@ class UIApi:
         """
         return self._artifact_store_for(work_id).load_artifact(work_id, phase, name)
 
+    def _onboarding_workspace_root(self, work_id: str) -> str | None:
+        """Resolve the onboarded project's workspace root for *work_id*.
+
+        The onboarding engine records the target ``workspace_root`` in the work
+        entry's result payload (so EXTERNAL repos resolve correctly). Returns it,
+        or ``None`` when the item is not an onboarding job or carries no root.
+        """
+        entry = get_work_status(work_id, self._config)
+        if entry and entry.get("work_type") == "onboarding":
+            result = entry.get("result")
+            if isinstance(result, dict):
+                workspace_root = result.get("workspace_root")
+                if isinstance(workspace_root, str) and workspace_root:
+                    return workspace_root
+        return None
+
+    def read_onboarding_doc(self, work_id: str, name: str) -> str | None:
+        """Read one onboarding document from the stable docs directory.
+
+        Onboarding documents are a single source of truth written to
+        ``<workspace_root>/.spine/onboarding/<NAME>.md`` (independent of the
+        onboarding job's ``work_id``). Resolve ``workspace_root`` from the job's
+        recorded result, then read the file directly.
+
+        Args:
+            work_id: The onboarding work item ID.
+            name: The document filename (e.g. ``PROJECT_DEFINITION.md``).
+
+        Returns:
+            The document content, or ``None`` if unavailable.
+        """
+        from spine.work.onboarding.synthesis_tools import onboarding_docs_dir
+
+        workspace_root = self._onboarding_workspace_root(work_id)
+        if workspace_root is None:
+            return None
+        try:
+            return (onboarding_docs_dir(workspace_root) / name).read_text(encoding="utf-8")
+        except OSError:
+            return None
+
     def get_feedback(self, work_id: str) -> list[dict[str, Any]]:
         """Get feedback entries for a work item.
 

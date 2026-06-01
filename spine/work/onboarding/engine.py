@@ -56,19 +56,15 @@ from spine.work.onboarding.phases import (
     PHASE_SYNTHESIZE,
 )
 from spine.work.onboarding.scaffold import scaffold_project
-from spine.work.onboarding.synthesis_tools import ONBOARDING_PHASE
+from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES, ONBOARDING_PHASE
 
 logger = logging.getLogger(__name__)
 
 _MANIFEST_NAME = "repo_manifest.json"
 
-# The four onboarding artifacts produced by synthesis (display order).
-_ONBOARDING_DOCS: tuple[str, ...] = (
-    "PROJECT_DEFINITION.md",
-    "CODING_GUIDELINES.md",
-    "ARCHITECTURE_MAP.md",
-    "SPINE_ASSISTANCE_REQUIREMENTS.md",
-)
+# The four onboarding document filenames (display order) — derived from the
+# canonical doc-name constant so the set is defined in exactly one place.
+_ONBOARDING_DOCS: tuple[str, ...] = tuple(f"{name}.md" for name in ONBOARDING_DOC_NAMES)
 
 
 def _ensure_work_entry(

@@ -283,6 +283,11 @@ class SpineConfig:
     onboarding_distributed_analysis: bool = True
     onboarding_explorer_llm: bool = False
     onboarding_explorer_max_cycles: int = 3
+    # When True (default), phase agents receive the relevant onboarding document
+    # injected into their system prompt (hybrid: the most-relevant doc per phase
+    # in full, the rest referenced by path). Set False to disable injection if it
+    # regresses small-model behaviour. See spine.agents.skills_resolver.
+    onboarding_context_injection: bool = True
 
     # Researcher convergence steering (see ResearcherConvergenceMiddleware)
     convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)

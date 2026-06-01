@@ -54,7 +54,6 @@ from langgraph.types import Send
 
 from spine.agents.helpers import coerce_structured_output, resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
-from spine.persistence.artifacts import ArtifactStore
 from spine.work.onboarding.manifest import RepoManifest
 from spine.work.onboarding.manifest_index import (
     manifest_index,
@@ -70,14 +69,11 @@ from spine.work.onboarding.synthesis_plan import (
 )
 from spine.work.onboarding.synthesis_tools import (
     ONBOARDING_DOC_NAMES,
-    ONBOARDING_PHASE,
     WriteOnboardingDocTool,
+    onboarding_docs_dir,
 )
 
 logger = logging.getLogger(__name__)
-
-# Base directory for the ArtifactStore (matches the store's own default).
-_ARTIFACTS_BASE = ".spine/artifacts"
 
 # Hard fallback for the per-fragment token ceiling when config carries no
 # explicit ``onboarding_section_token_cap``.
@@ -560,10 +556,9 @@ async def _section_worker_node(
 # ── Document assembler (Tier C) ──────────────────────────────────────────────
 
 
-def _doc_dir(workspace_root: str, work_id: str) -> Path:
-    """Resolve the onboarding doc output directory (matches the write tool)."""
-    out_dir = Path(workspace_root) / _ARTIFACTS_BASE
-    return out_dir / work_id / ONBOARDING_PHASE
+def _doc_dir(workspace_root: str) -> Path:
+    """Resolve the stable onboarding doc directory (matches the write tool)."""
+    return onboarding_docs_dir(workspace_root)
 
 
 def _assemble_docs_node(state: OnboardingGraphState) -> dict[str, Any]:
@@ -579,16 +574,11 @@ def _assemble_docs_node(state: OnboardingGraphState) -> dict[str, Any]:
     work_id = state.get("work_id", "unknown")
     results = list(state.get("section_results", []) or [])
 
-    out_dir = str(Path(workspace_root) / _ARTIFACTS_BASE)
-    writer = WriteOnboardingDocTool(
-        workspace_root=workspace_root,
-        work_id=work_id,
-        out_dir=out_dir,
-    )
+    doc_dir = _doc_dir(workspace_root)
+    writer = WriteOnboardingDocTool(docs_dir=str(doc_dir))
 
     written: dict[str, str] = {}
     placeholder_only: list[str] = []
-    doc_dir = _doc_dir(workspace_root, work_id)
 
     for doc in ONBOARDING_DOC_NAMES:
         doc_sections = sorted(
@@ -650,16 +640,15 @@ def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
             f"{len(errored)} section(s) failed: {errored}."
         )
 
-    doc_dir = _doc_dir(workspace_root, work_id)
-    # Verify existence through the same ArtifactStore WriteOnboardingDocTool
-    # writes through, rather than hand-rolling Path checks, so the read/write
-    # path scheme can never drift.
-    store = ArtifactStore(base_path=str(Path(workspace_root) / _ARTIFACTS_BASE))
+    doc_dir = _doc_dir(workspace_root)
+    # Verify existence at the same stable directory WriteOnboardingDocTool
+    # writes to, so the read/write path scheme can never drift.
     written: dict[str, str] = {}
     missing: list[str] = []
     for doc in ONBOARDING_DOC_NAMES:
-        if store.load_artifact(work_id, ONBOARDING_PHASE, f"{doc}.md") is not None:
-            written[doc] = str(doc_dir / f"{doc}.md")
+        doc_path = doc_dir / f"{doc}.md"
+        if doc_path.exists():
+            written[doc] = str(doc_path)
         else:
             missing.append(doc)
 

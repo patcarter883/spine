@@ -15,7 +15,7 @@ The page lets the user:
 * watch live progress through an auto-refreshing phase bar fed by
   ``api.get_queue_overview()``,
 * review the four generated ``.md`` documents inline via
-  ``api.read_artifact(work_id, "onboarding", name)``.
+  ``api.read_onboarding_doc(work_id, name)``.
 """
 
 from __future__ import annotations
@@ -52,7 +52,10 @@ _PHASE_EMOJI: dict[str, str] = {
     PHASE_COMPLETED: "✅",
 }
 
-# The four artifacts the onboarding engine always produces, in display order.
+# The four documents the onboarding engine always produces, in display order.
+# Mirrors the canonical ``ONBOARDING_DOC_NAMES`` set, kept local so this UI page
+# imports no onboarding-engine internals (zero-duplication: all backend access
+# goes through ``api``).
 _ONBOARDING_DOCS: tuple[str, ...] = (
     "PROJECT_DEFINITION.md",
     "CODING_GUIDELINES.md",
@@ -60,6 +63,7 @@ _ONBOARDING_DOCS: tuple[str, ...] = (
     "SPINE_ASSISTANCE_REQUIREMENTS.md",
 )
 
+# The work_type string for onboarding jobs (used to match the active queue row).
 _ONBOARDING_PHASE = "onboarding"
 
 
@@ -179,11 +183,10 @@ def _phases_for_active(active: dict[str, object]) -> list[str]:
 def _render_artifacts(api: UIApi, work_id: str) -> None:
     """Render the four onboarding documents inline for review.
 
-    Shows each known onboarding doc via
-    ``api.read_artifact(work_id, "onboarding", name)`` in an expander + markdown
-    block, mirroring human_review.py's review pattern. Reads are done
-    exclusively through ``api.read_artifact`` (no filesystem access here); a doc
-    that returns no content is simply skipped.
+    Shows each known onboarding doc via ``api.read_onboarding_doc(work_id, name)``
+    in an expander + markdown block, mirroring human_review.py's review pattern.
+    Reads are done exclusively through the UI gateway (no filesystem access here);
+    a doc that returns no content is simply skipped.
 
     Args:
         api: The UI gateway.
@@ -195,7 +198,7 @@ def _render_artifacts(api: UIApi, work_id: str) -> None:
     st.subheader("📚 Onboarding Documents")
     rendered_any = False
     for name in _ONBOARDING_DOCS:
-        content = api.read_artifact(work_id, _ONBOARDING_PHASE, name)
+        content = api.read_onboarding_doc(work_id, name)
         if not content:
             continue
         rendered_any = True

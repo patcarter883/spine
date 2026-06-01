@@ -11,9 +11,10 @@ Tools:
   conventions without reading any source files at runtime.
 - ``write_onboarding_doc`` — the ONLY write surface. Accepts a fixed document
   name (one of the four onboarding artifacts) and its markdown ``content``;
-  writes ``<NAME>.md`` idempotently to the onboarding artifact directory via
-  the :class:`ArtifactStore` (phase ``"onboarding"``). Re-running cleanly
-  overwrites without filesystem errors.
+  writes ``<NAME>.md`` idempotently to the stable onboarding docs directory
+  (``<workspace_root>/.spine/onboarding``) — a single source of truth,
+  independent of the onboarding job's ``work_id``. Re-running cleanly overwrites
+  without filesystem errors.
 
 This mirrors the constrained-tool pattern used by
 :mod:`spine.agents.plan_tools` / :mod:`spine.agents.specify_tools`: BaseTool
@@ -32,8 +33,6 @@ from langchain_core.tools import BaseTool
 from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field
 
-from spine.persistence.artifacts import ArtifactStore
-
 logger = logging.getLogger(__name__)
 
 # The four onboarding artifacts. The canonical document keys (what the agent
@@ -45,8 +44,28 @@ ONBOARDING_DOC_NAMES: tuple[str, ...] = (
     "SPINE_ASSISTANCE_REQUIREMENTS",
 )
 
-# Phase under which onboarding artifacts are persisted in the ArtifactStore.
+# Phase under which onboarding artifacts (e.g. ``repo_manifest.json``) are
+# persisted in the work-id-keyed ArtifactStore.
 ONBOARDING_PHASE = "onboarding"
+
+# Stable, work-id-independent location for the four onboarding documents,
+# relative to the onboarded project's root. The documents are a single source
+# of truth for the project — one copy, overwritten on each re-run — so phase
+# agents (which run under a DIFFERENT work_id than the onboarding job) can
+# always find them at the same path. See ``onboarding_docs_dir``.
+ONBOARDING_DOCS_SUBDIR = ".spine/onboarding"
+
+
+def onboarding_docs_dir(workspace_root: str) -> Path:
+    """Resolve the stable directory holding the four onboarding documents.
+
+    Returns ``<workspace_root>/.spine/onboarding``. Unlike the per-run
+    ``.spine/artifacts/<work_id>/onboarding`` artifact path, this location is
+    independent of the onboarding job's ``work_id`` so later phase agents can
+    locate the documents without knowing which run produced them.
+    """
+    base = Path(workspace_root) if workspace_root else Path(".")
+    return base / ".spine" / "onboarding"
 
 
 # ── read_repo_manifest ─────────────────────────────────────────────────────
@@ -148,10 +167,12 @@ class WriteOnboardingDocTool(BaseTool):
     """Write one onboarding markdown document idempotently.
 
     This is the ONLY write surface for the synthesis agent. Given a fixed
-    document name and its markdown content, writes ``<NAME>.md`` to the
-    onboarding artifact directory via :meth:`ArtifactStore.save_artifact`
-    (phase ``"onboarding"``, ``overwrite_shorter=True`` so re-runs cleanly
-    overwrite). Rejects any document name outside the fixed set of four.
+    document name and its markdown content, writes ``<NAME>.md`` to the stable
+    onboarding docs directory (``<workspace_root>/.spine/onboarding``) — a
+    single source of truth, independent of the onboarding job's ``work_id``.
+    The plain file write is inherently idempotent: a re-synthesised (possibly
+    shorter) document overwrites the prior file cleanly, never raising
+    ``FileExistsError``. Rejects any document name outside the fixed set of four.
     """
 
     name: str = "write_onboarding_doc"
@@ -164,10 +185,9 @@ class WriteOnboardingDocTool(BaseTool):
     )
     args_schema: Optional[ArgsSchema] = _WriteOnboardingDocInput
 
-    # Injected at build time.
-    workspace_root: str = ""
-    work_id: str = ""
-    out_dir: str = ""
+    # Injected at build time: the stable onboarding docs directory
+    # (``<workspace_root>/.spine/onboarding``), as an absolute path string.
+    docs_dir: str = ""
 
     def _run(self, doc: str, content: str) -> str:
         if doc not in ONBOARDING_DOC_NAMES:
@@ -182,24 +202,14 @@ class WriteOnboardingDocTool(BaseTool):
             )
 
         filename = f"{doc}.md"
-        # ``out_dir`` is the base path passed to ArtifactStore — the store
-        # writes to ``out_dir/{work_id}/{phase}/{filename}``. Using
-        # overwrite_shorter=True makes re-runs idempotent: a re-synthesised
-        # (possibly shorter) document still replaces the prior file cleanly,
-        # never raising FileExistsError.
-        store = ArtifactStore(base_path=self.out_dir)
+        out_path = Path(self.docs_dir) / filename
         try:
-            path = store.save_artifact(
-                work_id=self.work_id,
-                phase=ONBOARDING_PHASE,
-                name=filename,
-                content=content,
-                overwrite_shorter=True,
-            )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: Could not write {filename}: {exc}"
 
-        return f"{filename} ({len(content)} chars) written to {path}."
+        return f"{filename} ({len(content)} chars) written to {out_path}."
 
     async def _arun(self, doc: str, content: str) -> str:
         return self._run(doc=doc, content=content)
@@ -210,16 +220,14 @@ class WriteOnboardingDocTool(BaseTool):
 
 def build_synthesis_tools(
     workspace_root: str,
-    work_id: str,
     manifest_dir: str,
-    out_dir: str,
 ) -> list[BaseTool]:
     """Build the custom tool set for the onboarding synthesis agent.
 
     Returns two tools:
     - ``read_repo_manifest``: loads ``repo_manifest.json`` in one call.
     - ``write_onboarding_doc``: the only write surface, writes the four
-      ``<NAME>.md`` documents idempotently.
+      ``<NAME>.md`` documents idempotently to ``<workspace_root>/.spine/onboarding``.
 
     These replace all generic filesystem tools — pair with
     ``build_phase_agent(..., extra_tools=..., skip_filesystem_middleware=True)``
@@ -227,11 +235,8 @@ def build_synthesis_tools(
 
     Args:
         workspace_root: Absolute path to the project workspace root.
-        work_id: The current onboarding work item ID.
         manifest_dir: Workspace-relative directory holding ``repo_manifest.json``
             (e.g. ``.spine/artifacts/<work_id>/onboarding``).
-        out_dir: Base path for the :class:`ArtifactStore` that receives the
-            written documents (e.g. the absolute path to ``.spine/artifacts``).
 
     Returns:
         List of two :class:`BaseTool` instances.
@@ -242,8 +247,6 @@ def build_synthesis_tools(
             manifest_dir=manifest_dir,
         ),
         WriteOnboardingDocTool(
-            workspace_root=workspace_root,
-            work_id=work_id,
-            out_dir=out_dir,
+            docs_dir=str(onboarding_docs_dir(workspace_root)),
         ),
     ]

@@ -10,7 +10,7 @@ The page must:
   * call ``api.enqueue_onboarding(workspace_root, mode, tech_stack)`` with the
     toggled mode + entered path when Execute is clicked,
   * default the project-path input to ``api._config.workspace_root``,
-  * read review documents exclusively via ``api.read_artifact(...)``,
+  * read review documents exclusively via ``api.read_onboarding_doc(...)``,
   * never import ``spine.work.dispatcher`` or ``spine.work.onboarding`` (the
     onboarding engine) directly — asserted via source inspection.
 """
@@ -174,6 +174,7 @@ def _make_api(workspace_root: str = "/tmp/proj") -> MagicMock:
     }
     api.get_artifacts.return_value = []
     api.read_artifact.return_value = None
+    api.read_onboarding_doc.return_value = None
     return api
 
 
@@ -268,26 +269,18 @@ def test_artifact_review_reads_via_api_only(fake_st: _FakeStreamlit) -> None:
     onboarding = _load_onboarding()
 
     api = _make_api()
-    api.get_artifacts.return_value = [
-        {"name": "PROJECT_DEFINITION.md"},
-        {"name": "CODING_GUIDELINES.md"},
-        {"name": "ARCHITECTURE_MAP.md"},
-        {"name": "SPINE_ASSISTANCE_REQUIREMENTS.md"},
-    ]
 
-    def _read(work_id: str, phase: str, name: str) -> str:
-        return f"# {name}\ncontent for {work_id} / {phase}"
+    def _read(work_id: str, name: str) -> str:
+        return f"# {name}\ncontent for {work_id}"
 
-    api.read_artifact.side_effect = _read
+    api.read_onboarding_doc.side_effect = _read
     fake_st.text_input_values["onboarding_review_id"] = "abc123"
 
     onboarding.render(api)
 
-    # All four docs read through api.read_artifact under phase "onboarding".
-    read_calls = api.read_artifact.call_args_list
-    read_names = {c.args[2] for c in read_calls}
-    read_phases = {c.args[1] for c in read_calls}
-    assert read_phases == {"onboarding"}
+    # All four docs read through api.read_onboarding_doc.
+    read_calls = api.read_onboarding_doc.call_args_list
+    read_names = {c.args[1] for c in read_calls}
     for doc in (
         "PROJECT_DEFINITION.md",
         "CODING_GUIDELINES.md",
@@ -296,7 +289,7 @@ def test_artifact_review_reads_via_api_only(fake_st: _FakeStreamlit) -> None:
     ):
         assert doc in read_names
     # Rendered content surfaced via st.markdown.
-    assert any("content for abc123 / onboarding" in m for m in fake_st.markdowns)
+    assert any("content for abc123" in m for m in fake_st.markdowns)
 
 
 def test_progress_renders_active_onboarding(fake_st: _FakeStreamlit) -> None:

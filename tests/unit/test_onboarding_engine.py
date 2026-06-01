@@ -30,7 +30,7 @@ from spine.config import SpineConfig
 from spine.models.enums import TaskStatus
 from spine.work.onboarding.engine import run_onboarding
 from spine.work.onboarding.synthesis_plan import SectionPlanSet, SectionResult
-from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES, ONBOARDING_PHASE
+from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES
 
 
 # ── Stub bare-LLM model (manager + worker) ───────────────────────────────────
@@ -134,7 +134,8 @@ def _spy_phase_starts(monkeypatch) -> list[str]:
 
 
 def _doc_dir(tmp_path: Path, work_id: str) -> Path:
-    return tmp_path / ".spine" / "artifacts" / work_id / ONBOARDING_PHASE
+    # The four documents live at a single stable location, independent of work_id.
+    return tmp_path / ".spine" / "onboarding"
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -304,11 +305,12 @@ class TestRunOnboardingFailure:
 class TestUIApiResolvesExternalArtifactStore:
     """Finding #1: docs for an EXTERNAL onboarding target must display.
 
-    The engine writes the manifest + four docs under
-    ``<workspace_root>/.spine/artifacts``. When the onboarded repo differs from
-    spine's own ``artifact_path``, ``UIApi.read_artifact``/``get_artifacts`` must
-    resolve the store from the work item's recorded ``workspace_root`` — not the
-    global spine store — or the UI shows nothing.
+    The engine writes the four documents to the stable
+    ``<workspace_root>/.spine/onboarding`` location (and the manifest under
+    ``<workspace_root>/.spine/artifacts``). When the onboarded repo differs from
+    spine's own ``artifact_path``, ``UIApi.read_onboarding_doc`` must resolve the
+    target from the work item's recorded ``workspace_root`` — not the global
+    spine store — or the UI shows nothing.
     """
 
     def test_read_artifact_resolves_workspace_root_store(
@@ -346,10 +348,9 @@ class TestUIApiResolvesExternalArtifactStore:
         )
         assert result["status"] == TaskStatus.COMPLETED.value
 
-        # The docs were written under the EXTERNAL repo, not spine's store.
-        external_doc_dir = (
-            external_repo / ".spine" / "artifacts" / "wk-ext" / ONBOARDING_PHASE
-        )
+        # The docs were written to the stable location under the EXTERNAL repo,
+        # not spine's store.
+        external_doc_dir = external_repo / ".spine" / "onboarding"
         for doc in ONBOARDING_DOC_NAMES:
             assert (external_doc_dir / f"{doc}.md").exists()
         # spine's own global store has NOTHING for this work item.
@@ -357,13 +358,10 @@ class TestUIApiResolvesExternalArtifactStore:
 
         api = UIApi(config=config)
 
-        # The global store would read nothing; the resolved store finds the docs.
+        # The resolver finds the docs at the external repo's stable location.
         for doc in ONBOARDING_DOC_NAMES:
-            content = api.read_artifact("wk-ext", ONBOARDING_PHASE, f"{doc}.md")
-            assert content, f"UIApi failed to resolve external artifact {doc}"
-        listed = {a.get("name") for a in api.get_artifacts("wk-ext")}
-        for doc in ONBOARDING_DOC_NAMES:
-            assert f"{doc}.md" in listed
+            content = api.read_onboarding_doc("wk-ext", f"{doc}.md")
+            assert content, f"UIApi failed to resolve external onboarding doc {doc}"
 
     def test_non_onboarding_read_unchanged(self, tmp_path: Path) -> None:
         """A non-onboarding work item reads from the global store untouched."""
