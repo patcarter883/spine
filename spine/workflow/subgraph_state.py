@@ -145,6 +145,11 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     slices_dispatched: Annotated[bool, _bool_or]  # True when slice-implementers dispatched
     implementation_files_written: Annotated[bool, _bool_or]  # True when code files created
 
+    # Sorted, de-duplicated list of every file the implementer reported
+    # touching. Written once by ``synthesize_implementation`` (single node,
+    # so plain last-write semantics), consumed by the scope-boundary gate.
+    files_written: list[str]
+
 
 class VerifySubgraphState(BaseSubgraphState, total=False):
     """VERIFY phase — confirms implementation."""

@@ -129,6 +129,18 @@ class _WriteSpecificationInput(BaseModel):
         default_factory=list,
         description="Areas explicitly out of scope as a list of short strings.",
     )
+    hard_boundaries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "No-touch file path globs, workspace-root-relative (fnmatch syntax, "
+            "e.g. 'spine/billing/**', 'migrations/*'). These are ENFORCED: if the "
+            "implementation writes any file matching one of these, the run is "
+            "halted for human review. Use for surfaces that must stay untouched "
+            "(other teams' modules, generated code, sensitive subsystems). Leave "
+            "empty if no path is strictly off-limits — this is stricter than the "
+            "prose scope_exclusions."
+        ),
+    )
     known_risks: list[str] = Field(
         default_factory=list,
         description="Known risks / open questions as a list of short strings.",
@@ -158,6 +170,7 @@ def _render_spec_markdown(spec: Specification) -> str:
     _bullets("Constraints", spec.constraints)
     _bullets("Scope — Inclusions", spec.scope_inclusions)
     _bullets("Scope — Exclusions", spec.scope_exclusions)
+    _bullets("Hard Boundaries (no-touch)", spec.hard_boundaries)
     _bullets("Known Risks", spec.known_risks)
 
     return "".join(parts)
@@ -201,7 +214,7 @@ class WriteSpecificationTool(BaseTool):
     description: str = (
         "Write the specification artifacts (specification.md + specification.json). "
         "Provide structured fields (title, summary, objectives, requirements, "
-        "constraints, scope_inclusions, scope_exclusions, known_risks). "
+        "constraints, scope_inclusions, scope_exclusions, hard_boundaries, known_risks). "
         "The tool renders markdown and emits JSON for you — do not call write_file."
     )
     args_schema: Optional[ArgsSchema] = _WriteSpecificationInput
@@ -221,6 +234,7 @@ class WriteSpecificationTool(BaseTool):
         constraints: list[str] | None = None,
         scope_inclusions: list[str] | None = None,
         scope_exclusions: list[str] | None = None,
+        hard_boundaries: list[str] | None = None,
         known_risks: list[str] | None = None,
     ) -> str:
         # Pre-validate: non-trivial descriptions MUST declare scope. Without
@@ -254,6 +268,7 @@ class WriteSpecificationTool(BaseTool):
             constraints=constraints or [],
             scope_inclusions=scope_inclusions or [],
             scope_exclusions=scope_exclusions or [],
+            hard_boundaries=hard_boundaries or [],
             known_risks=known_risks or [],
         )
 

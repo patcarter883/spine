@@ -143,6 +143,12 @@ class WorkflowState(TypedDict, total=False):
     verification_attempted: bool  # True when VERIFY phase ran
     verification_passed: bool  # True when VERIFY phase passed
     implementation_files_written: bool  # True when IMPLEMENT wrote files
+    files_written: list[str]  # Sorted, de-duplicated paths the implementer
+    # reported creating/modifying. Forwarded from the IMPLEMENT subgraph by
+    # _implement_result_mapper and read by the scope-boundary check to enforce
+    # Specification.hard_boundaries deterministically. Last-write-wins (no
+    # reducer): each IMPLEMENT run, including gap-fix re-runs, reports its own
+    # file set rather than accumulating across cycles.
     slices_dispatched: bool  # True when IMPLEMENT dispatched slice subagents
     gaps_identified: int  # Number of gaps found by GAP_PLAN
     work_units_count: int  # Number of work units from TASKS phase

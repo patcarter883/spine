@@ -6,45 +6,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-from spine.models.enums import ReviewStatus, TaskStatus, WorkType
+from spine.models.enums import ReviewStatus, TaskStatus
 from typing import Literal
-
-
-# ── Work Unit Models (for plan decomposition) ──
-
-
-class WorkUnit(BaseModel):
-    """A single unit of execution spawned from a planning work item."""
-
-    title: str
-    description: str
-    priority: str = "medium"  # "low" | "medium" | "high" | "critical"
-    is_critical: bool = False
-
-
-class PlanDecomposition(BaseModel):
-    """Output from the plan resolver - a decomposition of a plan into work units."""
-
-    units: list[WorkUnit]
-
-    @field_validator("units")
-    @classmethod
-    def units_non_empty(cls, v: list[WorkUnit]) -> list[WorkUnit]:
-        if not v:
-            raise ValueError("Plan decomposition must contain at least one work unit")
-        return v
-
-
-class WorkSpawnSpec(BaseModel):
-    """Specification for spawning work items from an approved plan."""
-
-    title: str
-    description: str
-    work_type: WorkType = WorkType.TASK
-    plan_id: str
-    priority: str = "medium"  # "low" | "medium" | "high" | "critical"
 
 
 # ── Legacy Task Models ──
@@ -160,6 +125,16 @@ class Specification(BaseModel):
     )
     scope_exclusions: list[str] = Field(
         description="Scope exclusions", default_factory=list
+    )
+    hard_boundaries: list[str] = Field(
+        description=(
+            "No-touch file path globs (workspace-root-relative, fnmatch syntax, "
+            "e.g. 'spine/billing/**'). Files written by IMPLEMENT that match any "
+            "of these are a hard scope violation and are enforced deterministically "
+            "by the scope-boundary gate — distinct from the prose scope_exclusions, "
+            "which remain advisory input to the critic."
+        ),
+        default_factory=list,
     )
     known_risks: list[str] = Field(description="Known risks", default_factory=list)
 

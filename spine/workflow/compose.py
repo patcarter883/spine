@@ -44,6 +44,7 @@ from spine.workflow.critic_review import critic_router
 from spine.workflow.artifact_gate import (
     make_artifact_gate_node,
     artifact_gate_router,
+    check_scope_boundaries,
 )
 from spine.agents.artifacts import artifact_path
 from spine.workflow.subgraph_wrapper import (
@@ -340,6 +341,30 @@ def _implement_result_mapper(subgraph_result: dict, parent_state: WorkflowState)
     base["implement_completed"] = phase_status == "success"
     base["slices_dispatched"] = subgraph_result.get("slices_dispatched", False)
     base["implementation_files_written"] = subgraph_result.get("implementation_files_written", False)
+    # Forward the implementer's reported file set so the scope-boundary check
+    # (and any downstream consumer) can read it from parent state.
+    files_written = subgraph_result.get("files_written", []) or []
+    base["files_written"] = files_written
+
+    # Deterministic anti-drift gate: if IMPLEMENT wrote inside a declared
+    # hard_boundary, downgrade an otherwise-successful phase to human review.
+    # Run only when the phase didn't already fail/need review — a real failure
+    # takes precedence and its own routing should not be masked.
+    if base.get("status") not in ("needs_review", "failed"):
+        scope_ok, scope_reason = check_scope_boundaries(
+            {**parent_state, "files_written": files_written}
+        )
+        if not scope_ok:
+            base["status"] = "needs_review"
+            base["needs_review_phase"] = PhaseName.IMPLEMENT.value
+            base["feedback"] = base.get("feedback", []) + [
+                {
+                    "status": "needs_review",
+                    "tier": "structural",
+                    "reason": f"Scope-boundary gate: {scope_reason}",
+                    "suggestions": [],
+                }
+            ]
     return base
 
 

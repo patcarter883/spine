@@ -475,6 +475,10 @@ async def _synthesize_implementation_node(
     slice_results.extend(completed)
     slice_results.extend(_failed_to_blocked(s) for s in failed)
 
+    # Deterministic record of every file the implementer reported touching —
+    # consumed by the scope-boundary gate in _implement_result_mapper.
+    files_written = _collect_files_written(slice_results)
+
     if not slice_results:
         logger.warning("[%s] IMPLEMENT synthesize: zero slice results", work_id)
         return {
@@ -483,6 +487,7 @@ async def _synthesize_implementation_node(
             "phase_status": "needs_review",
             "slices_dispatched": False,
             "implementation_files_written": False,
+            "files_written": [],
         }
 
     # ── Honesty guard ────────────────────────────────────────────────
@@ -535,6 +540,7 @@ async def _synthesize_implementation_node(
             "phase_status": "error",
             "slices_dispatched": True,
             "implementation_files_written": False,
+            "files_written": files_written,
         }
 
     logger.info(
@@ -550,7 +556,24 @@ async def _synthesize_implementation_node(
         "phase_status": "needs_review" if all_claimed_no_files else "success",
         "slices_dispatched": True,
         "implementation_files_written": True,
+        "files_written": files_written,
     }
+
+
+def _collect_files_written(slice_results: list[dict]) -> list[str]:
+    """Aggregate every file path the implementer reported creating or modifying.
+
+    Returns a sorted, de-duplicated list across all slice results. Non-string
+    entries are skipped defensively so a malformed subagent report cannot crash
+    the scope-boundary gate downstream.
+    """
+    seen: set[str] = set()
+    for r in slice_results:
+        for key in ("files_modified", "files_created"):
+            for path in r.get(key, []) or []:
+                if isinstance(path, str) and path.strip():
+                    seen.add(path.strip())
+    return sorted(seen)
 
 
 def _build_implementation_summary(slice_results: list[dict]) -> str:

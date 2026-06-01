@@ -34,6 +34,7 @@ Extended checks for plan→implement:
   target_files, execution_requirements, dependencies, acceptance_criteria.
 """
 
+import fnmatch
 import json
 import logging
 import re
@@ -655,6 +656,111 @@ def _check_verify_prerequisite(state: WorkflowState) -> tuple[bool, str]:
         "GAP_PLAN phase requires VERIFY to have run at least once. "
         "The verification artifact is missing or VERIFY did not execute. "
         "Run VERIFY before GAP_PLAN can produce a remediation plan.",
+    )
+
+
+# ── Scope-Boundary Check (deterministic anti-drift gate) ─────────────────
+# Turns the Specification.hard_boundaries contract into a computed invariant:
+# files the implementer actually wrote are matched against the declared
+# no-touch globs. This replaces "the critic notices scope creep by judgment"
+# with "scope creep is detected by set membership". scope_exclusions remain
+# advisory (prose, not globs) and are left to the critic.
+
+
+def _load_specification(state: WorkflowState) -> dict | None:
+    """Parse ``specification_json`` from state into a dict, tolerating either a
+    raw JSON string or an already-decoded dict. Returns None when absent or
+    unparseable — a missing/garbled spec is not a scope violation."""
+    raw = state.get("specification_json")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _normalize_to_workspace_relative(path: str, workspace_root: str) -> str:
+    """Return ``path`` as a workspace-root-relative POSIX path.
+
+    Absolute paths under the workspace are made relative; paths already
+    relative are returned with normalized separators. Paths outside the
+    workspace are returned unchanged (still matchable by an absolute glob).
+    """
+    p = Path(path)
+    root = Path(workspace_root)
+    if p.is_absolute():
+        try:
+            return p.relative_to(root).as_posix()
+        except ValueError:
+            return p.as_posix()
+    return p.as_posix()
+
+
+def _matches_boundary(rel_path: str, glob: str) -> bool:
+    """True if ``rel_path`` falls under the no-touch ``glob``.
+
+    Supports two forms:
+    - wildcard globs (``*``/``?``/``[``) via fnmatch, where ``*`` spans path
+      separators (so ``spine/billing/*`` covers nested files);
+    - plain paths with no wildcard, treated as a file or directory prefix
+      (``spine/billing`` matches the dir and everything under it).
+    """
+    glob = glob.strip().lstrip("./")
+    if not glob:
+        return False
+    if any(ch in glob for ch in "*?["):
+        return fnmatch.fnmatch(rel_path, glob)
+    return rel_path == glob or rel_path.startswith(glob.rstrip("/") + "/")
+
+
+def check_scope_boundaries(state: WorkflowState) -> tuple[bool, str]:
+    """Check that IMPLEMENT did not write inside any declared hard boundary.
+
+    Reads ``Specification.hard_boundaries`` (no-touch globs) from
+    ``specification_json`` and the ``files_written`` recorded by the IMPLEMENT
+    synthesize node, then computes the intersection deterministically.
+
+    Returns ``(passed, reason)``: ``passed=False`` with a human-readable reason
+    naming the violating files and the boundary each matched. Absent boundaries
+    or absent file list → pass (nothing to enforce).
+    """
+    spec = _load_specification(state)
+    if not spec:
+        return True, ""
+
+    boundaries = [b for b in (spec.get("hard_boundaries") or []) if isinstance(b, str)]
+    if not boundaries:
+        return True, ""
+
+    files_written = [
+        f for f in (state.get("files_written") or []) if isinstance(f, str)
+    ]
+    if not files_written:
+        return True, ""
+
+    workspace_root = state.get("workspace_root", ".") or "."
+
+    violations: list[str] = []
+    for raw_path in files_written:
+        rel = _normalize_to_workspace_relative(raw_path, workspace_root)
+        for glob in boundaries:
+            if _matches_boundary(rel, glob):
+                violations.append(f"{rel} (matched hard_boundary '{glob.strip()}')")
+                break
+
+    if not violations:
+        return True, ""
+
+    return (
+        False,
+        "IMPLEMENT wrote files inside declared hard_boundaries — scope violation. "
+        f"Offending files: {violations}. The specification marked these surfaces "
+        "no-touch; either narrow the implementation to stay within scope or update "
+        "hard_boundaries in the specification if the boundary was wrong.",
     )
 
 
