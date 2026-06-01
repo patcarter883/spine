@@ -13,6 +13,56 @@ from spine.config import SpineConfig
 from spine.work.ralph_worker import RalphLoopWorker
 
 
+def _fresh_worker(tmpdir: str) -> RalphLoopWorker:
+    """Create an isolated RalphLoopWorker (resets the singleton)."""
+    import spine.work.ralph_worker as rw_mod
+
+    rw_mod._WORKER_INSTANCE = None
+    config = SpineConfig()
+    config.queue_path = str(Path(tmpdir) / "queue.db")
+    config.checkpoint_path = str(Path(tmpdir) / "spine.db")
+    config.ensure_dirs()
+    return RalphLoopWorker(config)
+
+
+class TestCancelRunning:
+    """cancel_running() must actually flip a running queue row to cancelled.
+
+    Regression: ``rows_where(...)`` returns a generator, so the previous
+    ``item = item[0] if item else None`` raised ``TypeError`` (a generator is
+    truthy but not subscriptable) on every call — silently breaking Stop Work
+    for a running job.
+    """
+
+    def test_flips_running_row_to_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            db = worker._get_db()
+            db["queue"].insert(
+                {
+                    "id": 1,
+                    "description": "job",
+                    "work_type": "task",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:01",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "wk-1",
+                }
+            )
+
+            # purge_checkpoint=False avoids touching a non-existent checkpoint DB.
+            assert worker.cancel_running("wk-1", purge_checkpoint=False) is True
+            assert db["queue"].get(1)["status"] == "cancelled"
+
+    def test_returns_false_when_no_running_row(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            worker._get_db()  # ensure the table exists
+            assert worker.cancel_running("nope", purge_checkpoint=False) is False
+
+
 class TestRalphLoopWorkerListPendingOrdering:
     """Tests for list_pending() ordering (enqueued_at DESC, newest first)."""
 

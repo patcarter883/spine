@@ -56,3 +56,8 @@ class TaskStatus(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
     REJECTED = "rejected"
+    # Terminal status for a user-requested Stop Work. Because it is a member of
+    # this enum it is included in RalphLoopWorker._TERMINAL_STATUSES, so the
+    # queue loop preserves it instead of remapping a cancelled run to
+    # "completed", and it is excluded from the UI's running/stalled active set.
+    CANCELLED = "cancelled"

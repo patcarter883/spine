@@ -457,28 +457,37 @@ class RalphLoopWorker:
         logger.info(f"Cancelled queue item {item_id}")
         return True
 
-    def cancel_running(self, work_id: str) -> bool:
+    def cancel_running(self, work_id: str, purge_checkpoint: bool = True) -> bool:
         """Cancel a running work item by work_id.
 
-        This marks the queue item as cancelled and purges the LangGraph
+        Marks the queue item as cancelled and (optionally) purges the LangGraph
         checkpoint so the graph can be restarted cleanly if needed.
 
         Args:
             work_id: The work ID to cancel.
+            purge_checkpoint: When True, delete the LangGraph checkpoint thread.
+                Pass False for a cooperative stop of a job that is still
+                streaming (e.g. onboarding): deleting the checkpoint out from
+                under a live run only races with its in-flight superstep write —
+                the run halts at its next node boundary on its own, and a later
+                reset purges any stale checkpoint.
 
         Returns:
             True if a running item was cancelled, False if not found.
         """
-        from spine.persistence.checkpoint import CheckpointStore
-
         db = self._get_db()
-        # Find the queue item by work_id
-        item = db["queue"].rows_where(
-            "work_id = ? AND status = ?",
-            [work_id, "running"],
-            limit=1,
+        # Find the queue item by work_id. ``rows_where`` returns a generator —
+        # materialise it before indexing (a generator is always truthy and not
+        # subscriptable, so ``rows[0] if rows`` on the raw generator raised
+        # TypeError and silently broke every running-job cancel).
+        rows = list(
+            db["queue"].rows_where(
+                "work_id = ? AND status = ?",
+                [work_id, "running"],
+                limit=1,
+            )
         )
-        item = item[0] if item else None
+        item = rows[0] if rows else None
 
         if not item:
             return False
@@ -494,18 +503,32 @@ class RalphLoopWorker:
             },
         )
 
-        # Purge the checkpoint
-        checkpoint_store = CheckpointStore(db_path=self.config.checkpoint_path)
-        import asyncio
-
-        try:
-            saver = asyncio.run(checkpoint_store.get_checkpointer())
-            asyncio.run(saver.adelete_thread(work_id))
-        except Exception:
-            pass
+        if purge_checkpoint:
+            self._purge_checkpoint(work_id)
 
         logger.info(f"Cancelled running work {work_id} (queue item {item_id})")
         return True
+
+    def _purge_checkpoint(self, work_id: str) -> None:
+        """Best-effort delete of a work item's LangGraph checkpoint thread.
+
+        Runs the async getter + delete inside ONE event loop. The previous code
+        called ``asyncio.run`` twice, so the saver built in the first loop was
+        bound to a loop that was already closed before ``adelete_thread`` ran in
+        the second — every purge silently failed. Failures here are non-fatal.
+        """
+        from spine.persistence.checkpoint import CheckpointStore
+        import asyncio
+
+        async def _purge() -> None:
+            store = CheckpointStore(db_path=self.config.checkpoint_path)
+            saver = await store.get_checkpointer()
+            await saver.adelete_thread(work_id)
+
+        try:
+            asyncio.run(_purge())
+        except Exception:
+            logger.debug("Checkpoint purge for %s failed (continuing)", work_id, exc_info=True)
 
 
 def get_worker(config: SpineConfig | None = None) -> RalphLoopWorker:

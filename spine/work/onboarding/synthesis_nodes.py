@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import json
 import logging
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +51,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from spine.agents.helpers import coerce_structured_output, resolve_chat_model
+from spine.agents.helpers import (
+    coerce_structured_output,
+    resolve_chat_model,
+    suppress_parsed_serializer_warning,
+)
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.work.onboarding.manifest import RepoManifest
 from spine.work.onboarding.manifest_index import (
@@ -328,11 +331,7 @@ async def _refine_plan_with_llm(
         )
 
         structured = model.with_structured_output(SectionPlanSet)
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", message=r".*PydanticSerializationUnexpectedValue.*parsed.*"
-            )
-            warnings.filterwarnings("ignore", message=r".*Expected `none`.*parsed.*")
+        with suppress_parsed_serializer_warning():
             response = await structured.ainvoke(
                 [SystemMessage(content=_MANAGER_ROLE), HumanMessage(content=prompt)]
             )
@@ -492,14 +491,7 @@ async def _section_worker_node(
         # to a generic status="error" (never leaking exception text).
         for attempt in range(_SECTION_MAX_RETRIES + 1):
             try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message=r".*PydanticSerializationUnexpectedValue.*parsed.*",
-                    )
-                    warnings.filterwarnings(
-                        "ignore", message=r".*Expected `none`.*parsed.*"
-                    )
+                with suppress_parsed_serializer_warning():
                     response = await structured.ainvoke(messages)
                 result = _coerce_section_result(response)
             except Exception as exc:  # noqa: BLE001 - never leak exception text into docs

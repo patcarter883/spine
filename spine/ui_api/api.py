@@ -1033,44 +1033,52 @@ class UIApi:
             Dict with work_id, status, and action.
         """
         def _run() -> None:
+            from spine.work.dispatcher import update_work_status
+
             worker = get_worker(self._config)
-            # Try to cancel a running queue item first.
+
+            # 1. Mark the work entry cancelled FIRST. This is the cooperative
+            #    signal a cancellation-aware run (the onboarding engine) polls
+            #    at each node boundary, and it also drops the job out of the
+            #    UI's running/stalled active set immediately — so the click has
+            #    a visible effect even though the detached run isn't
+            #    force-killed.
+            try:
+                update_work_status(
+                    work_id, TaskStatus.CANCELLED.value, config=self._config
+                )
+            except Exception:
+                pass
+
+            # 2. Flip any RUNNING queue row to cancelled so the queue loop
+            #    records a terminal cancellation rather than overwriting it
+            #    with the run's eventual result. ``purge_checkpoint=False``: the
+            #    run is still streaming, so leave its checkpoint alone — it
+            #    halts cooperatively at its next node boundary.
             active = worker.get_active()
             if active and active.get("work_id") == work_id:
-                worker.cancel_running(work_id)
+                worker.cancel_running(work_id, purge_checkpoint=False)
                 return
 
-            # Then a pending queue item (work_id is stored after submission).
+            # 3. Otherwise a PENDING queue row — cancel it before it starts.
+            #    ``rows_where`` yields a generator; materialise before indexing.
             db = worker._get_db()
-            item = db["queue"].rows_where(
-                "work_id = ? AND status = ?",
-                [work_id, "pending"],
-                limit=1,
+            rows = list(
+                db["queue"].rows_where(
+                    "work_id = ? AND status = ?",
+                    [work_id, "pending"],
+                    limit=1,
+                )
             )
-            item = item[0] if item else None
+            item = rows[0] if rows else None
             if item:
                 worker.cancel_item(item["id"])
                 return
 
-            # No queue row — this is a restart/resume job running on the
-            # out-of-band pool. Mark the work entry cancelled and purge its
-            # checkpoint so it drops out of the active set and can be
-            # restarted cleanly. (The detached thread isn't force-killed,
-            # but the graph honours the cancelled status at its next step.)
-            from spine.persistence.checkpoint import CheckpointStore
-            from spine.work.dispatcher import update_work_status
-
-            # "cancelled" matches the literal the queue table uses; there is
-            # no TaskStatus.CANCELLED member.
-            update_work_status(work_id, "cancelled", config=self._config)
-            try:
-                import asyncio
-
-                store = CheckpointStore(db_path=self._config.checkpoint_path)
-                saver = asyncio.run(store.get_checkpointer())
-                asyncio.run(saver.adelete_thread(work_id))
-            except Exception:
-                pass
+            # 4. No queue row — an off-queue restart/resume job. The work entry
+            #    is already cancelled above; purge its checkpoint so it can be
+            #    restarted cleanly.
+            worker._purge_checkpoint(work_id)
 
         # Run on the worker's shared, persistent out-of-band pool so the
         # job is tracked alongside the worker rather than on a throwaway
@@ -1079,7 +1087,7 @@ class UIApi:
 
         return {
             "work_id": work_id,
-            "status": TaskStatus.RUNNING.value,
+            "status": TaskStatus.CANCELLED.value,
             "action": "stop",
         }
 
@@ -1103,8 +1111,6 @@ class UIApi:
         Returns:
             The number of items that were reset/finalised.
         """
-        from spine.work.dispatcher import update_work_status
-
         worker = get_worker(self._config)
 
         # Snapshot BEFORE resetting so we don't catch a job the worker loop

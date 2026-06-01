@@ -15,6 +15,7 @@ STATUS_COLORS = {
     "failed": "🔴",
     "pending": "⚪",
     "stalled": "🟠",
+    "cancelled": "⚫",
 }
 
 STATUS_BADGE = {
@@ -25,6 +26,7 @@ STATUS_BADGE = {
     "failed": "❌",
     "pending": "⏳",
     "stalled": "🕐",
+    "cancelled": "⏹️",
 }
 
 

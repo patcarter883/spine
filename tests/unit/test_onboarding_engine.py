@@ -302,6 +302,147 @@ class TestRunOnboardingFailure:
         assert "error" in recorded
 
 
+class TestOnboardingTracing:
+    """The onboarding run must opt into LangSmith tracing like every other work
+    task — previously it streamed the raw ``astream`` and produced no traces."""
+
+    def test_run_streams_through_traced_astream(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _write_sample_repo(tmp_path)
+        _patch_llm(monkeypatch)
+        config = _config(tmp_path)
+
+        import spine.work.onboarding.engine as engine_mod
+
+        calls: list[tuple[str, str]] = []
+
+        def spy_traced_astream(stream: Any, work_id: str, work_type: str) -> Any:
+            calls.append((work_id, work_type))
+
+            async def _gen() -> Any:
+                async for chunk in stream:
+                    yield chunk
+
+            return _gen()
+
+        monkeypatch.setattr(engine_mod, "traced_astream", spy_traced_astream)
+
+        result = asyncio.run(
+            run_onboarding(
+                workspace_root=str(tmp_path),
+                mode="brownfield",
+                tech_stack=["python"],
+                config=config,
+                work_id="wk-trace",
+            )
+        )
+
+        assert result["status"] == TaskStatus.COMPLETED.value
+        # The graph stream was wrapped by traced_astream with onboarding tags —
+        # this is the single entrypoint that enables LangSmith tracing.
+        assert calls == [("wk-trace", "onboarding")]
+
+
+# ── Cooperative cancellation (Stop Work) ─────────────────────────────────────
+
+
+class _CancelOnSynthesisModel(_StubModel):
+    """Stub that flags the work entry ``cancelled`` on its first LLM call.
+
+    The analysis phase is deterministic Python, so the first structured-output
+    call belongs to the synthesis doc-manager — flipping the status there
+    simulates a Stop Work click landing mid-run.
+    """
+
+    def __init__(self, config: SpineConfig, work_id: str) -> None:
+        self._config = config
+        self._work_id = work_id
+        self._fired = False
+
+    def with_structured_output(self, schema: Any) -> "_CancelStub":
+        return _CancelStub(schema, self)
+
+
+class _CancelStub:
+    def __init__(self, schema: Any, model: _CancelOnSynthesisModel) -> None:
+        self._schema = schema
+        self._model = model
+
+    async def ainvoke(self, messages: list[Any], **_: Any) -> Any:
+        if not self._model._fired:
+            self._model._fired = True
+            from spine.work.dispatcher import update_work_status
+
+            update_work_status(
+                self._model._work_id, "cancelled", config=self._model._config
+            )
+        return self._model._make(self._schema)
+
+
+class TestOnboardingCancellation:
+    def test_cancelled_midrun_returns_cancelled_not_completed(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _write_sample_repo(tmp_path)
+        config = _config(tmp_path)
+        model = _CancelOnSynthesisModel(config, "wk-cancel")
+        monkeypatch.setattr(
+            "spine.work.onboarding.synthesis_nodes.resolve_chat_model",
+            lambda *a, **k: model,
+        )
+
+        result = asyncio.run(
+            run_onboarding(
+                workspace_root=str(tmp_path),
+                mode="brownfield",
+                tech_stack=["python"],
+                config=config,
+                work_id="wk-cancel",
+            )
+        )
+
+        # The run halted cooperatively rather than streaming to completion.
+        assert result["status"] == TaskStatus.CANCELLED.value
+        assert result["work_type"] == "onboarding"
+
+        from spine.work.dispatcher import get_work_db
+
+        row = get_work_db(config)["work_entries"].get("wk-cancel")
+        assert row["status"] == TaskStatus.CANCELLED.value
+        # It never reached the completed phase (it stopped at the synthesis
+        # boundary), and the result envelope is not flipped back to completed.
+        assert row["current_phase"] != "completed"
+
+    def test_progress_does_not_resurrect_a_cancelled_run(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A late phase boundary must not clobber the cancellation back to
+        ``running`` — otherwise the cooperative signal would be lost."""
+        _write_sample_repo(tmp_path)
+        config = _config(tmp_path)
+        model = _CancelOnSynthesisModel(config, "wk-cancel2")
+        monkeypatch.setattr(
+            "spine.work.onboarding.synthesis_nodes.resolve_chat_model",
+            lambda *a, **k: model,
+        )
+
+        asyncio.run(
+            run_onboarding(
+                workspace_root=str(tmp_path),
+                mode="brownfield",
+                tech_stack=["python"],
+                config=config,
+                work_id="wk-cancel2",
+            )
+        )
+
+        from spine.work.dispatcher import get_work_db
+
+        row = get_work_db(config)["work_entries"].get("wk-cancel2")
+        assert row["status"] == TaskStatus.CANCELLED.value
+
+
 class TestUIApiResolvesExternalArtifactStore:
     """Finding #1: docs for an EXTERNAL onboarding target must display.
 

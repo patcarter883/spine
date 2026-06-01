@@ -9,13 +9,49 @@ to eliminate duplication and ensure consistent behavior.
 from __future__ import annotations
 
 import os
-from typing import Any, TypeVar
+import warnings
+from contextlib import contextmanager
+from typing import Any, Iterator, TypeVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
 _StructuredT = TypeVar("_StructuredT", bound=BaseModel)
+
+
+@contextmanager
+def suppress_parsed_serializer_warning() -> Iterator[None]:
+    """Silence the benign ``parsed`` Pydantic serialization warning.
+
+    ``with_structured_output`` round-trips through provider response models
+    (e.g. OpenAI's ``ParsedChatCompletionMessage``) whose ``parsed`` field is a
+    generic typed ``Optional[...]``; serialising one carrying a structured
+    instance makes pydantic-core emit::
+
+        UserWarning: Pydantic serializer warnings:
+          PydanticSerializationUnexpectedValue(Expected `none` - serialized value
+          may not be as expected [field_name='parsed', input_value=...,
+          input_type=...])
+
+    It is cosmetic — the parsed object is still correct — but it floods logs
+    during onboarding synthesis (one per section worker / manager call).
+
+    The ``message`` regex MUST account for the warning text being multi-line:
+    ``warnings.filterwarnings`` matches it with ``re.match`` (anchored at the
+    start) and ``.`` does not cross newlines by default, so a naive
+    ``.*PydanticSerializationUnexpectedValue.*parsed`` never matches (it can't
+    get past the first ``\\n``). We anchor on the real first line and enable
+    DOTALL via ``(?s)`` so ``.*`` reaches the ``parsed`` field on line two — a
+    targeted filter that leaves every other serializer warning visible.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"(?s)Pydantic serializer warnings.*parsed",
+            category=UserWarning,
+        )
+        yield
 
 
 def resolve_model(

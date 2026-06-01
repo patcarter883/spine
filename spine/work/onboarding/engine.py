@@ -44,8 +44,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from spine.agents.helpers import suppress_parsed_serializer_warning
 from spine.config import SpineConfig
 from spine.models.enums import TaskStatus
+from spine.observability import traced_astream
 from spine.persistence.artifacts import ArtifactStore
 from spine.work.onboarding.manifest import RepoManifest
 from spine.work.onboarding.onboarding_graph import build_onboarding_graph
@@ -172,6 +174,58 @@ async def _compile_onboarding_graph(
         return graph.compile()
 
 
+def _finalise_cancelled(
+    db: Any,
+    work_id: str,
+    workspace_root: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Record a cooperatively-cancelled onboarding run and return its dict.
+
+    Stamps the work entry ``cancelled`` (preserving the phase it stopped at),
+    publishes a ``work_cancelled`` bus event, and returns the same envelope
+    shape the success/failure paths use so the queue loop finalises the row as
+    a terminal ``cancelled`` (see :data:`TaskStatus.CANCELLED`) rather than
+    flipping it back to ``completed``.
+    """
+    last_phase = ""
+    try:
+        row = db["work_entries"].get(work_id)
+        last_phase = row.get("current_phase", "") if row else ""
+    except Exception:
+        pass
+    try:
+        db["work_entries"].update(
+            work_id,
+            {
+                "status": TaskStatus.CANCELLED.value,
+                "current_phase": last_phase,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps(
+                    {"cancelled": True, "workspace_root": workspace_root, "mode": mode}
+                ),
+            },
+        )
+    except Exception:
+        logger.warning("Could not record onboarding cancellation for %s", work_id)
+
+    try:
+        from spine.ui.ws_bus import get_bus
+
+        get_bus().publish_sync("work_cancelled", {"work_id": work_id})
+    except Exception:
+        pass
+
+    logger.info("[%s] onboarding cancelled", work_id)
+    return {
+        "work_id": work_id,
+        "status": TaskStatus.CANCELLED.value,
+        "work_type": "onboarding",
+        "workspace_root": workspace_root,
+        "mode": mode,
+    }
+
+
 async def run_onboarding(
     workspace_root: str,
     mode: str,
@@ -230,11 +284,27 @@ async def run_onboarding(
     # ``completed`` is recorded after the graph finishes.
     _fired_phases: set[str] = set()
 
+    def _is_cancelled() -> bool:
+        # Cooperative-cancellation signal: ``UIApi.stop_work`` marks the work
+        # entry ``cancelled``. We poll it at each node boundary so a Stop Work
+        # click actually halts the run instead of letting it stream to
+        # completion (which silently overwrote the cancellation).
+        try:
+            row = db["work_entries"].get(work_id)
+        except Exception:
+            return False
+        return bool(row) and row.get("status") == TaskStatus.CANCELLED.value
+
     def _progress(phase: str) -> None:
         # Idempotent per phase: the node wrappers (via the config callback) and
         # the engine's stream loop may both report the same boundary; we record
         # each ``current_phase`` exactly once.
         if phase in _fired_phases:
+            return
+        # Never resurrect a cancelled run back to "running" — a late phase
+        # boundary firing after a Stop Work click must not clobber the
+        # cancellation signal _is_cancelled() relies on.
+        if _is_cancelled():
             return
         _fired_phases.add(phase)
         update_work_phase_started(db, work_id, phase)
@@ -278,17 +348,37 @@ async def run_onboarding(
             "doc_manager": PHASE_SYNTHESIZE,
         }
         final_state: dict[str, Any] = {}
-        async for chunk in compiled.astream(
-            initial_state, config=runnable_config, stream_mode="updates"
-        ):
-            if not isinstance(chunk, dict):
-                continue
-            for node_name, node_update in chunk.items():
-                phase = _node_phase.get(node_name)
-                if phase:
-                    _progress(phase)  # idempotent per phase
-                if isinstance(node_update, dict):
-                    final_state.update(node_update)
+        cancelled = False
+        # ``traced_astream`` opts this run into LangSmith tracing (off
+        # process-wide by default) with work_type/work_id tags, exactly like
+        # the LangGraph dispatcher's task runs — onboarding previously streamed
+        # the raw ``astream`` and so produced no traces at all.
+        # ``suppress_parsed_serializer_warning`` covers the benign ``parsed``
+        # serializer warning emitted while the tracer/checkpointer dump the
+        # structured-output messages mid-stream.
+        with suppress_parsed_serializer_warning():
+            async for chunk in traced_astream(
+                compiled.astream(
+                    initial_state, config=runnable_config, stream_mode="updates"
+                ),
+                work_id,
+                "onboarding",
+            ):
+                if _is_cancelled():
+                    cancelled = True
+                    logger.info("[%s] onboarding cancelled — halting stream", work_id)
+                    break
+                if not isinstance(chunk, dict):
+                    continue
+                for node_name, node_update in chunk.items():
+                    phase = _node_phase.get(node_name)
+                    if phase:
+                        _progress(phase)  # idempotent per phase
+                    if isinstance(node_update, dict):
+                        final_state.update(node_update)
+
+        if cancelled or _is_cancelled():
+            return _finalise_cancelled(db, work_id, workspace_root, mode)
 
         manifest_dict = dict(final_state.get("manifest", {}) or {})
         manifest = RepoManifest.from_dict(manifest_dict) if manifest_dict else None
@@ -339,6 +429,11 @@ async def run_onboarding(
         }
 
     except Exception as exc:
+        # A Stop Work click can interrupt the stream mid-step (e.g. the
+        # checkpoint being purged out from under it). If the work was
+        # cancelled, report it as cancelled — not a failure.
+        if _is_cancelled():
+            return _finalise_cancelled(db, work_id, workspace_root, mode)
         logger.error("Onboarding %s failed: %s", work_id, exc, exc_info=True)
         last_phase = ""
         try:

@@ -35,7 +35,7 @@ class TestTerminalStatuses:
     """Tests for _TERMINAL_STATUSES frozenset."""
 
     def test_terminal_statuses_includes_all_non_running_non_pending(self):
-        """Verify _TERMINAL_STATUSES equals exactly the 7 terminal statuses."""
+        """Verify _TERMINAL_STATUSES equals exactly the terminal statuses."""
         expected = frozenset({
             "completed",
             "failed",
@@ -44,6 +44,9 @@ class TestTerminalStatuses:
             "awaiting_approval",
             "approved",
             "rejected",
+            # A user-requested Stop Work is terminal; the queue loop must
+            # preserve it rather than remapping it to "completed".
+            "cancelled",
         })
         assert _TERMINAL_STATUSES == expected
 

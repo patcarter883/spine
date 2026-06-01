@@ -31,6 +31,64 @@ def _init_queue_db(config: SpineConfig) -> RalphLoopWorker:
     return worker
 
 
+class TestUIApiStopWork:
+    """Stop Work must take effect — mark the work entry cancelled so the job
+    drops out of the running active set (and a cancellation-aware run halts)."""
+
+    def test_stop_work_marks_work_entry_cancelled(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpineConfig()
+            config.queue_path = str(Path(tmpdir) / "queue.db")
+            config.checkpoint_path = str(Path(tmpdir) / "spine.db")
+            config.artifact_path = str(Path(tmpdir) / "artifacts")
+            config.ensure_dirs()
+            _init_queue_db(config)
+
+            # Seed a RUNNING, off-queue work entry (restart/resume shape — no
+            # queue row), so stop_work exercises the work-entry + purge path.
+            from spine.work.dispatcher import get_work_db
+
+            db = get_work_db(config)
+            db["work_entries"].insert(
+                {
+                    "id": "wk-stop",
+                    "description": "x",
+                    "work_type": "task",
+                    "status": "running",
+                    "current_phase": "implement",
+                    "created_at": "2024-01-01T00:00:00",
+                    "updated_at": "2024-01-01T00:00:00",
+                    "result": "{}",
+                },
+                pk="id",
+            )
+
+            # stop_work submits its work to a background executor; run it inline
+            # and skip the real checkpoint purge so the test is deterministic.
+            class _InlineExecutor:
+                def submit(self, fn, *args, **kwargs):
+                    fn(*args, **kwargs)
+                    return None
+
+            monkeypatch.setattr(
+                RalphLoopWorker, "get_executor", lambda self: _InlineExecutor()
+            )
+            monkeypatch.setattr(
+                RalphLoopWorker, "_purge_checkpoint", lambda self, work_id: None
+            )
+
+            api = UIApi(config=config)
+            out = api.stop_work("wk-stop")
+
+            # The API reports the requested terminal state...
+            assert out["status"] == "cancelled"
+            assert out["action"] == "stop"
+            # ...and the work entry is actually flipped to cancelled, so the UI
+            # active set (running/stalled only) no longer shows it.
+            row = get_work_db(config)["work_entries"].get("wk-stop")
+            assert row["status"] == "cancelled"
+
+
 class TestUIApiGetQueueOverviewOrdering:
     """Tests for get_queue_overview() ordering."""
 

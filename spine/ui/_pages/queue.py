@@ -163,7 +163,9 @@ def _render_one_active_job(api: UIApi, active: dict) -> None:
     if work_id:
         if st.button("⏹ Stop Work", key=f"stop_work_{work_id}"):
             api.stop_work(work_id)
-            st.success(f"Stop requested for work `{work_id}`. The job will be cancelled.")
+            # st.toast survives the rerun below; a st.success here would be
+            # wiped instantly and read as "nothing happened".
+            st.toast(f"⏹ Stop requested for `{work_id}` — cancelling.", icon="⏹️")
             st.rerun()
 
     # Phase progress bar
@@ -280,7 +282,7 @@ def _render_pending(api: UIApi) -> None:
                 work_id = item.get("work_id")
                 if work_id and pc4.button("⏹ Stop", key=f"stop_pending_{item.get('id')}"):
                     api.stop_work(work_id)
-                    st.success(f"Stop requested for work `{work_id}`.")
+                    st.toast(f"⏹ Stop requested for `{work_id}`.", icon="⏹️")
                     st.rerun()
 
 
