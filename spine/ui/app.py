@@ -110,6 +110,12 @@ def _onboarding() -> None:
     render(api)
 
 
+def _gate_run() -> None:
+    from spine.ui._pages.gate_run import render
+
+    render(api)
+
+
 pages = {
     "": [
         st.Page(_dashboard, title="Dashboard", icon="🏠", url_path="dashboard"),
@@ -133,6 +139,7 @@ pages = {
     "Work": [
         st.Page(_work_detail, title="Work Details", icon="🔍", url_path="work-detail"),
         st.Page(_work_history, title="Work History", icon="📜", url_path="work-history"),
+        st.Page(_gate_run, title="Git Gate", icon="🔒", url_path="git-gate"),
     ],
     "System": [
         st.Page(_human_review, title="Human Review", icon="👤", url_path="human-review"),

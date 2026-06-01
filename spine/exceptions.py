@@ -61,3 +61,39 @@ class CriticalContractFailure(SpineError):
         self.phase = phase
         self.reason = reason
         super().__init__(f"Critical contract failure in '{phase}': {reason}")
+
+
+class GitOrchestratorError(SpineError):
+    """Base exception for the transactional git-sandbox orchestrator."""
+
+
+class SandboxPreparationError(GitOrchestratorError):
+    """Failed to create the sandbox worktree or branch.
+
+    Raised when the working tree is dirty or the underlying ``git
+    worktree``/``git checkout`` command exits non-zero.
+    """
+
+
+class ValidationError(GitOrchestratorError):
+    """A validation gate in the pipeline failed.
+
+    Carries the offending gate's name, the command that was run, and the
+    captured combined output so callers can surface actionable detail.
+    """
+
+    def __init__(self, gate_name: str, command: str, output: str) -> None:
+        self.gate_name = gate_name
+        self.command = command
+        self.output = output
+        super().__init__(
+            f"Validation gate '{gate_name}' failed (command: {command}):\n{output}"
+        )
+
+
+class MergeError(GitOrchestratorError):
+    """A fast-forward merge of the verified patch branch failed.
+
+    Typically indicates the main branch advanced and the patch can no
+    longer be fast-forwarded (a conflict).
+    """

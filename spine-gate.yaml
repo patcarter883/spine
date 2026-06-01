@@ -1,0 +1,40 @@
+# SPINE transactional git-sandbox gate configuration.
+#
+# Controls how a workflow run is wrapped in an isolated git sandbox,
+# which validation gates must pass, and whether a passing run is
+# auto-merged to the main branch.
+
+git:
+  main_branch: main
+  branch_prefix: "spine/patch-"
+  strategy: worktree            # "worktree" (isolated dir) or "branch" (in-place)
+  sandbox_dir: /tmp/spine-sandbox
+
+# Validation gates run IN ORDER (dict insertion order) inside the sandbox.
+# The first failing gate aborts the pipeline and triggers rollback.
+validation_pipeline:
+  lint:
+    command: .venv/bin/ruff check .
+    timeout_seconds: 120
+    failure_message: "Lint failed — run '.venv/bin/ruff check .' and fix reported issues."
+  typecheck:
+    command: .venv/bin/mypy spine/
+    timeout_seconds: 300
+    failure_message: "Type check failed — run '.venv/bin/mypy spine/' and resolve type errors."
+  test:
+    command: .venv/bin/pytest tests/ -x -q
+    timeout_seconds: 600
+    failure_message: "Tests failed — run '.venv/bin/pytest tests/ -x -q' to reproduce."
+
+artifact_path: .spine/artifacts
+
+# When true, a fully-validated patch is committed and fast-forward merged
+# to the main branch automatically.
+auto_merge_on_success: true
+
+# Workflow phases that must be marked completed in the checkpoint state
+# before validation/merge is allowed. Entries may be either "implement" or
+# "implement_completed" form.
+require_successful_phases:
+  - implement_completed
+  - verify_completed
