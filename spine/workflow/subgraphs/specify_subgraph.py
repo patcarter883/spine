@@ -54,17 +54,13 @@ async def _early_commitment(
     )
 
     config_obj = SpineConfig.load()
-    recall = RecallTool(
-        db_path=config_obj.checkpoint_path,
-        embedding_provider=config_obj.embedding_model,
-    )
+    recall = RecallTool(db_path=config_obj.checkpoint_path)
 
     import json as _json
 
     recall_result = await recall._arun(
         query=description,
         k=config_obj.recall_k,
-        task_category=task_category,
         max_tokens=50000,
     )
     result_data = _json.loads(recall_result)
@@ -143,7 +139,6 @@ async def _run_specify_agent(
                 result_text = await recall._arun(
                     query=description,
                     k=config_obj.recall_k,
-                    task_category=task_category,
                     max_tokens=50000,
                 )
                 import json as _json

@@ -220,7 +220,19 @@ class SpineConfig:
 
     # RAG (Retrieval-Augmented Generation) configuration
     embedding_provider: str = "openai-embeddings"
-    recall_k: int = 3
+    recall_k: int = 10
+    # Index test files into the vector store. Default off: test chunks
+    # have verbose docstrings that score high on NL similarity but tell a
+    # researcher nothing about production code, and they otherwise swamp
+    # the index (~66% of symbols). See tests/recall_eval baseline.
+    index_tests: bool = False
+    # Reciprocal-rank-fusion channel weights for hybrid recall. The local
+    # embedding space is weak/anisotropic for code, so the vector channel
+    # is down-weighted relative to lexical BM25. Tuned on tests/recall_eval:
+    # 0.4/1.0 took miss@50 from 0.037 → 0.000 and MRR 0.41 → 0.49 vs equal
+    # weighting. Env overrides: SPINE_RRF_VECTOR_WEIGHT / SPINE_RRF_BM25_WEIGHT.
+    rrf_vector_weight: float = 0.4
+    rrf_bm25_weight: float = 1.0
     vector_indexing: dict = field(
         default_factory=lambda: {
             "max_concurrent_chunks": 5,
@@ -277,7 +289,7 @@ class SpineConfig:
     # top-K symbols whose cosine similarity is at least this threshold —
     # those are then attached to the topic that gets sent to the explore
     # subagent.
-    topic_lookup_top_k: int = 2
+    topic_lookup_top_k: int = 5
     topic_lookup_min_similarity: float = 0.5
 
     # Distributed onboarding engine (design Revision 2). The synthesis stage
@@ -491,7 +503,10 @@ class SpineConfig:
             )
             in ("1", "true", "yes"),
             embedding_provider=spine.get("embedding_provider", "openai-embeddings"),
-            recall_k=int(spine.get("recall_k", 3)),
+            recall_k=int(spine.get("recall_k", 10)),
+            index_tests=str(spine.get("index_tests", False)).lower() in ("1", "true", "yes"),
+            rrf_vector_weight=float(spine.get("rrf_vector_weight", 0.4)),
+            rrf_bm25_weight=float(spine.get("rrf_bm25_weight", 1.0)),
             vector_indexing=spine.get(
                 "vector_indexing",
                 {
@@ -528,7 +543,7 @@ class SpineConfig:
                     spine.get("max_completion_tokens", 0),
                 )
             ),
-            topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 2)),
+            topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 5)),
             topic_lookup_min_similarity=float(
                 spine.get("topic_lookup_min_similarity", 0.5)
             ),

@@ -43,6 +43,14 @@ class Symbol:
     start_byte: int
     end_byte: int
     lang: str
+    parent_class: str | None = None
+
+    @property
+    def qualified_name(self) -> str:
+        """``ClassName.method`` for methods nested in a class, else ``symbol_name``."""
+        if self.parent_class and self.symbol_type in {"method"}:
+            return f"{self.parent_class}.{self.symbol_name}"
+        return self.symbol_name
 
 
 # S-expression queries per language. Each query captures the symbol's
@@ -80,6 +88,38 @@ _NODE_TYPE_TO_SYMBOL_TYPE: dict[str, str] = {
     "interface_declaration": "interface",
     "variable_declarator": "function",  # arrow function assigned to const
 }
+
+
+_CLASS_NODE_TYPES: frozenset[str] = frozenset({
+    "class_definition",  # python
+    "class_declaration",  # php, typescript
+})
+
+
+def _enclosing_class_name(node: Any, source_bytes: bytes) -> str | None:
+    """Walk up the tree from ``node`` and return the nearest enclosing class name.
+
+    A method's tree-sitter ``def`` node is nested inside the class's
+    body; tree-sitter exposes ``.parent`` to walk up. Returns ``None`` if
+    the symbol is not inside a class. Python's ``function_definition``
+    inside ``class_definition`` is treated as a method even though the
+    grammar uses the same node type — handled by the caller via
+    ``symbol_type`` re-tagging.
+    """
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if cur.type in _CLASS_NODE_TYPES:
+            for child in cur.children:
+                if child.type in ("identifier", "name", "type_identifier"):
+                    try:
+                        return source_bytes[child.start_byte : child.end_byte].decode(
+                            "utf-8", errors="replace"
+                        )
+                    except (UnicodeDecodeError, AttributeError):
+                        return None
+            return None
+        cur = getattr(cur, "parent", None)
+    return None
 
 
 # Cached parsers/queries — built lazily on first use per language.
@@ -178,6 +218,13 @@ def extract_symbols(full_path: str, rel_path: str) -> list[Symbol]:
         name_node = name_nodes[0]
         node_type = def_node.type
         symbol_type = _NODE_TYPE_TO_SYMBOL_TYPE.get(node_type, "symbol")
+        parent_class = _enclosing_class_name(def_node, source_bytes)
+        # Python's grammar has no distinct ``method_definition`` node — a
+        # function nested in a class is still ``function_definition``.
+        # Re-tag as ``method`` when we see one inside a class so the
+        # qualified name pipeline behaves uniformly across languages.
+        if symbol_type == "function" and parent_class:
+            symbol_type = "method"
 
         try:
             symbol_name = source_bytes[name_node.start_byte : name_node.end_byte].decode(
@@ -202,6 +249,7 @@ def extract_symbols(full_path: str, rel_path: str) -> list[Symbol]:
                 start_byte=def_node.start_byte,
                 end_byte=def_node.end_byte,
                 lang=lang,
+                parent_class=parent_class,
             )
         )
 

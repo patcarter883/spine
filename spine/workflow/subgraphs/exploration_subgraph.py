@@ -111,7 +111,6 @@ async def _pre_research_gate(
         result_text = await recall._arun(
             query=description,
             k=cfg.recall_k,
-            task_category=task_category,
             max_tokens=cfg.specify_context_token_budget,
             summaries_only=summaries_only,
         )
@@ -385,16 +384,7 @@ async def _topic_lookup_node(
     # Request more than top_k so we still have ≥top_k after threshold filtering.
     request_k = max(top_k * 3, cfg.recall_k)
 
-    recall = RecallTool(
-        db_path=cfg.checkpoint_path,
-        embedding_provider=cfg.embedding_provider,
-    )
-    # NOTE: deliberately NOT passing task_category. CATEGORY_TO_SYMBOL_TYPES
-    # in spine/agents/classification.py maps every non-Generic category to
-    # symbol_types like "endpoint", "component", "middleware" — but the
-    # indexer only writes "function" and "class". Filtering by category
-    # eliminates 100% of rows and gives 0 results for every topic.
-    # Semantic similarity is already the right discriminator here.
+    recall = RecallTool(db_path=cfg.checkpoint_path)
     hits_map: dict[str, list[dict]] = {}
 
     logger.warning(
@@ -408,7 +398,6 @@ async def _topic_lookup_node(
             raw = await recall._arun(
                 query=topic,
                 k=request_k,
-                task_category=None,
                 max_tokens=cfg.specify_context_token_budget,
                 summaries_only=True,
             )
@@ -431,10 +420,24 @@ async def _topic_lookup_node(
             hits_map[topic] = []
             continue
 
-        filtered = [
-            r for r in results
-            if isinstance(r, dict) and float(r.get("similarity", 0.0)) >= min_sim
-        ]
+        # Hybrid recall returns RRF-fused results already ordered best-first
+        # and carrying ``rrf_score``; the per-row ``similarity`` is no longer
+        # a calibrated cosine (BM25-only hits carry a BM25 score), so the
+        # absolute ``min_similarity`` cosine threshold doesn't apply. Rank by
+        # the fused score and rely on top_k. Only the legacy pure-vector path
+        # (no rrf_score — e.g. stubbed tests) keeps the cosine threshold.
+        is_fused = any(isinstance(r, dict) and "rrf_score" in r for r in results)
+
+        def _score(r: dict) -> float:
+            return float(r.get("rrf_score", r.get("similarity", 0.0)))
+
+        if is_fused:
+            filtered = [r for r in results if isinstance(r, dict)]
+        else:
+            filtered = [
+                r for r in results
+                if isinstance(r, dict) and float(r.get("similarity", 0.0)) >= min_sim
+            ]
         # Drop test-file matches unless the topic itself is about tests.
         # See _is_test_artifact for the trace 019e6974 evidence.
         if not _topic_mentions_tests(topic):
@@ -443,10 +446,7 @@ async def _topic_lookup_node(
             test_dropped = before_test_filter - len(filtered)
         else:
             test_dropped = 0
-        filtered.sort(
-            key=lambda r: float(r.get("similarity", 0.0)),
-            reverse=True,
-        )
+        filtered.sort(key=_score, reverse=True)
         kept = filtered[:top_k]
         hits_map[topic] = kept
 
@@ -466,7 +466,7 @@ async def _topic_lookup_node(
                 min_sim, test_dropped, len(kept),
                 [
                     f"{h.get('symbol_name', '?')}({h.get('file_path', '?')})"
-                    f"@{float(h.get('similarity', 0.0)):.3f}"
+                    f"@{_score(h):.4f}"
                     for h in kept
                 ],
             )

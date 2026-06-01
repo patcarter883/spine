@@ -462,9 +462,8 @@ def test_topic_lookup_filters_threshold_and_top_k(monkeypatch):
     # The stub was called once (only one new topic).
     assert len(captured_calls) == 1
     assert captured_calls[0]["query"] == "auth-module"
-    # task_category is intentionally NOT forwarded — see comment in
-    # _topic_lookup_node about the broken CATEGORY_TO_SYMBOL_TYPES filter.
-    assert captured_calls[0]["task_category"] is None
+    # task_category is no longer part of the recall API — see classification.py.
+    assert "task_category" not in captured_calls[0]
 
 
 def test_topic_lookup_drops_test_artifacts(monkeypatch):

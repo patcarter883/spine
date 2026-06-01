@@ -1,0 +1,362 @@
+{
+  "n_queries": 54,
+  "n_scored": 54,
+  "n_errors": 0,
+  "retrieve_k": 50,
+  "metrics": {
+    "hit@5": 0.1111,
+    "hit@10": 0.2222,
+    "hit@20": 0.3333,
+    "mrr": 0.0769,
+    "miss@50": 0.5185,
+    "set_recall@20": 0.2105
+  },
+  "errors": [],
+  "per_query": [
+    {
+      "query": "Where is the semantic search recall tool implemented?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the vector store run cosine similarity search over embeddings?",
+      "source": "curated",
+      "first_hit_rank": 3,
+      "n_results": 50
+    },
+    {
+      "query": "Where is the background job that indexes the codebase into the vector store?",
+      "source": "curated",
+      "first_hit_rank": 37,
+      "n_results": 50
+    },
+    {
+      "query": "How are code symbols extracted from source files using tree-sitter?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "Where is a work description classified into a task category?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does per-topic recall filter hits by a similarity threshold and drop test artifacts?",
+      "source": "curated",
+      "first_hit_rank": 9,
+      "n_results": 50
+    },
+    {
+      "query": "Where is the pre-research gate that short-circuits exploration on high-confidence recall?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How is runtime configuration loaded from the yaml config file?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How is the embedding provider resolved from configuration by name?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "Where does the SPECIFY phase build its agent and run early commitment recall?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How are tokens counted for prompt budgeting?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "Where are LLM prompts wrapped in semantic XML tags and the hostage layout?",
+      "source": "curated",
+      "first_hit_rank": 1,
+      "n_results": 50
+    },
+    {
+      "query": "How is the workflow graph composed from phase subgraphs?",
+      "source": "curated",
+      "first_hit_rank": 33,
+      "n_results": 50
+    },
+    {
+      "query": "Where is the CLI command that indexes the workspace into the vector store?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the research manager decide the next topics to explore or stop?",
+      "source": "curated",
+      "first_hit_rank": 26,
+      "n_results": 50
+    },
+    {
+      "query": "Where is the retry-with-backoff wrapper for model invocation?",
+      "source": "curated",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the AST extraction layer currently identify and categorize modules, dependencies, and architectural patterns within existing codebases?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Ralph Loop Worker orchestrate background tasks and what is its queue-based communication mechanism?",
+      "source": "mined",
+      "first_hit_rank": 4,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Tree-sitter AST extraction layer work to analyze existing code repositories for structural analysis?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the artifact generation and persistence layer work for creating the four foundational markdown documents?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How is the Ralph Loop Worker structured and what queue mechanism does it use for background processing?",
+      "source": "mined",
+      "first_hit_rank": 7,
+      "n_results": 50
+    },
+    {
+      "query": "What are the mechanisms for tech stack configuration and greenfield project scaffolding?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What are the patterns for saving and managing the generated guideline artifacts in the project structure?",
+      "source": "mined",
+      "first_hit_rank": 2,
+      "n_results": 50
+    },
+    {
+      "query": "What configuration system and global state management patterns exist across the Spine framework?",
+      "source": "mined",
+      "first_hit_rank": 23,
+      "n_results": 50
+    },
+    {
+      "query": "What configuration systems and global settings exist for controlling application behavior?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What is the current artifact persistence mechanism and where are generated markdown files stored in the project structure?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What is the structure and API of the AST-targeted search-and-extract pipeline used for codebase analysis?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What validation mechanisms exist for ensuring generated markdown artifacts meet structural and content quality standards?",
+      "source": "mined",
+      "first_hit_rank": 19,
+      "n_results": 50
+    },
+    {
+      "query": "How does the RAG pipeline handle repository indexing and vector storage for codebase analysis?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Ralph Loop Worker handle job queue processing and what is its interface for triggering brownfield repository analysis?",
+      "source": "mined",
+      "first_hit_rank": 8,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Ralph Loop Worker queue and process background tasks for project analysis, and what progress hooks are available for UI integration?",
+      "source": "mined",
+      "first_hit_rank": 15,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Spine framework currently handle project initialization and directory scaffolding a additional modules in existing repositories?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Streamlit UI handle form controls and state management for user inputs like project paths and mode toggles?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the existing AST extraction layer identify core business domains and module boundaries in a codebase?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the persistence layer manage artifacts, checkpoints, and workflow state across different phases?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How is the Ralph Loop Worker triggered and coordinated for background processing of structural repository analysis tasks?",
+      "source": "mined",
+      "first_hit_rank": 15,
+      "n_results": 50
+    },
+    {
+      "query": "How is the Streamlit UI structured to support new pages and what component patterns are used for long-running task monitoring?",
+      "source": "mined",
+      "first_hit_rank": 11,
+      "n_results": 50
+    },
+    {
+      "query": "What configuration settings and environment variables control the behavior of the background task workers?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Ralph Loop Worker communicate progress and status for real-time UI updates?",
+      "source": "mined",
+      "first_hit_rank": 5,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Streamlit UI route to and render new pages within the application framework?",
+      "source": "mined",
+      "first_hit_rank": 21,
+      "n_results": 50
+    },
+    {
+      "query": "How does the existing workflow orchestration engine manage phase transitions, immutable state updates, and LangGraph subgraph composition for multi-step processes?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What configuration systems and global state patterns are used across the agent layer?",
+      "source": "mined",
+      "first_hit_rank": 13,
+      "n_results": 50
+    },
+    {
+      "query": "What is the existing Streamlit UI structure and navigation pattern used for adding new pages?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What middleware or preprocessing steps are available for context trimming and token optimization during large-scale code analysis and documentation generation phases?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Streamlit UI currently handle real-time progress monitoring and what WebSocket-based patterns exist for long-running task updates?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "What markdown rendering and approval panel patterns are used in the Streamlit UI for displaying generated guideline artifacts to users?",
+      "source": "mined",
+      "first_hit_rank": 6,
+      "n_results": 50
+    },
+    {
+      "query": "What patterns govern error handling, retry logic, and graceful degradation in the workflow orchestration layer?",
+      "source": "mined",
+      "first_hit_rank": 26,
+      "n_results": 50
+    },
+    {
+      "query": "How are external service integrations configured and managed, particularly for audit logging and MCP tool access?",
+      "source": "mined",
+      "first_hit_rank": null,
+      "n_results": 50
+    },
+    {
+      "query": "How does the Streamlit UI currently implement page registration and navigation for new feature pages?",
+      "source": "mined",
+      "first_hit_rank": 22,
+      "n_results": 50
+    },
+    {
+      "query": "What are the patterns for agent construction and LLM integration across different workflow phases?",
+      "source": "mined",
+      "first_hit_rank": 6,
+      "n_results": 50
+    },
+    {
+      "query": "How does the existing workflow system manage project initialization and structural mapping phases?",
+      "source": "mined",
+      "first_hit_rank": 3,
+      "n_results": 50
+    },
+    {
+      "query": "How is the Streamlit UI currently structured to visualize workflow phases and controls, and what integration points exist for connecting frontend interactions to backend workflow execution?",
+      "source": "mined",
+      "first_hit_rank": 9,
+      "n_results": 50
+    },
+    {
+      "query": "How is the user interface structured and what frameworks or patterns are used for rendering?",
+      "source": "mined",
+      "first_hit_rank": 25,
+      "n_results": 50
+    },
+    {
+      "query": "What are the main architectural layers and module boundaries in the codebase?",
+      "source": "mined",
+      "first_hit_rank": 20,
+      "n_results": 50
+    }
+  ],
+  "by_source": {
+    "curated": {
+      "hit@5": 0.125,
+      "hit@10": 0.1875,
+      "hit@20": 0.1875,
+      "mrr": 0.0963,
+      "miss@50": 0.625,
+      "set_recall@20": 0.1875
+    },
+    "mined": {
+      "hit@5": 0.1053,
+      "hit@10": 0.2368,
+      "hit@20": 0.3947,
+      "mrr": 0.0688,
+      "miss@50": 0.4737,
+      "set_recall@20": 0.2202
+    }
+  },
+  "label": "baseline-phase1",
+  "generated_at": "2026-06-01T00:04:17.344948+00:00",
+  "db": ".spine/spine.db"
+}

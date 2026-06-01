@@ -64,15 +64,11 @@ async def _early_commitment(
 
     # Step 2: Retrieve relevant code using RecallTool
     config_obj = SpineConfig.load()
-    recall_tool = RecallTool(
-        db_path=config_obj.checkpoint_path,
-        embedding_provider=config_obj.embedding_model,
-    )
+    recall_tool = RecallTool(db_path=config_obj.checkpoint_path)
 
     recall_result = await recall_tool._arun(
         query=description,
         k=config_obj.recall_k,
-        task_category=task_category,
         max_tokens=50000,
     )
 
@@ -95,7 +91,7 @@ async def call_specify(
     (retry > 0), includes prior critic feedback in the prompt.
 
     Performs early commitment before agent invocation:
-    1. Classify the task type for targeted vector search
+    1. Classify the task type (recorded as metadata for downstream prompts)
     2. Retrieve relevant code chunks via RecallTool
 
     Args:

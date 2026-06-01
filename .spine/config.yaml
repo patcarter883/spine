@@ -10,7 +10,15 @@ spine:
   max_completion_tokens: 16000
   # RAG configuration
   embedding_provider: local-embeddings
-  recall_k: 3
+  recall_k: 10
+  topic_lookup_top_k: 5
+  # Hybrid recall (BM25 + vector, RRF-fused). Tests are excluded from the
+  # index by default (they swamped ~66% of symbols). The vector channel is
+  # down-weighted vs lexical BM25 because the local embedding space is weak
+  # for code — tuned on tests/recall_eval (miss@50 0.52 → 0.00).
+  index_tests: false
+  rrf_vector_weight: 0.4
+  rrf_bm25_weight: 1.0
   vector_indexing:
     max_concurrent_chunks: 10
     batch_size: 100
@@ -108,14 +116,25 @@ providers:
     base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
-  # Embedding providers
+  # Embedding providers.
+  #
+  # query_prefix / document_prefix support asymmetric models. The embedding
+  # dimension is auto-probed from the live model at index time, so no `dim`
+  # setting is needed — just `spine index --wipe` after swapping models.
+  #
+  # For nomic-embed-text-v2 (768-dim) the prefixes below are REQUIRED:
+  #     model: nomic-embed-text-v2        # whatever name vLLM serves it as
+  #     query_prefix: "search_query: "
+  #     document_prefix: "search_document: "
   embedding:
   - name: local-embeddings
     type: openai-embedding
-    model: Qwen3-Embedding-8B-GGUF
-    base_url: http://localhost:8010/v1
+    model: nomic-embed-text-v2-moe-GGUF
+    base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
+    query_prefix: "search_query: "
+    document_prefix: "search_document: "
   phases:
     specify:
       provider: pat

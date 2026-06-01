@@ -1,7 +1,10 @@
 """Task classification for early commitment in SPECIFY phase.
 
 Uses a lightweight model to classify work descriptions into categories
-that enable vector search filtering.
+that downstream prompts use as metadata. The category does NOT filter
+vector search — the AST extractor only emits function/class/method/
+interface symbol types, so any category→type mapping would zero-result
+on every non-Generic classification.
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_block
 
 logger = logging.getLogger(__name__)
 
-# Fixed taxonomy of task categories for filtering vector search
 TaskCategory = Literal[
     "Frontend/UI",
     "Backend/API",
@@ -28,17 +30,6 @@ TaskCategory = Literal[
     "Infrastructure",
     "Generic",
 ]
-
-# Mapping from task category to symbol_type filters for vector search
-CATEGORY_TO_SYMBOL_TYPES: dict[TaskCategory, list[str]] = {
-    "Frontend/UI": ["component", "view", "page", "frontend", "ui"],
-    "Backend/API": ["endpoint", "router", "handler", "controller", "api"],
-    "Database": ["model", "schema", "migration", "repository", "dao"],
-    "Auth": ["middleware", "guard", "auth", "authentication", "authorization"],
-    "Testing": ["test", "spec", "fixture"],
-    "Infrastructure": ["config", "script", "deploy", "ci", "infra"],
-    "Generic": [],  # No filter - search all
-}
 
 
 class TaskClassificationResult(BaseModel):
@@ -78,8 +69,8 @@ _CLASSIFICATION_SYSTEM = (
 async def classify_task(description: str, config: dict | None = None) -> TaskClassificationResult:
     """Classify a work description into a task category.
 
-    Uses a lightweight model to categorize the task, enabling vector search
-    filtering by symbol_type in the recall tool.
+    The category is recorded on workflow state as metadata for
+    downstream prompts. It is NOT used as a recall filter.
 
     Args:
         description: The work description to classify.
@@ -146,13 +137,3 @@ async def classify_task(description: str, config: dict | None = None) -> TaskCla
         )
 
 
-def get_symbol_type_filter(category: TaskCategory) -> list[str] | None:
-    """Get the symbol_type filter for a task category.
-
-    Args:
-        category: The task category.
-
-    Returns:
-        List of symbol types to filter by, or None for no filter.
-    """
-    return CATEGORY_TO_SYMBOL_TYPES.get(category) or None

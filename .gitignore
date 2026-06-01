@@ -35,3 +35,6 @@ test_root.py.langgraph_api/
 
 # Scratch files
 test_root.py
+
+# Claude Code local settings & runtime
+.claude/
