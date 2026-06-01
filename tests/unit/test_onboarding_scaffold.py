@@ -75,6 +75,19 @@ class TestBaselineConfigYaml:
         text = baseline_config_yaml([])
         assert yaml.safe_load(text) is not None
 
+    def test_scaffolds_codebase_index_mcp_server(self) -> None:
+        # Without an active mcp_servers block, a freshly scaffolded project
+        # logs "mcp_codebase-index_list_files tool not available" on
+        # `spine index`. The codebase-index server ships as a hard spine
+        # dependency, so the baseline config wires it up by default.
+        data = yaml.safe_load(baseline_config_yaml(["python"]))
+        server = data["mcp_servers"]["codebase-index"]
+        assert server["command"] == "mcp-codebase-index"
+        assert server["transport"] == "stdio"
+        # PROJECT_ROOT is injected at load time from workspace_root, so it
+        # must NOT be pinned in the scaffolded config.
+        assert "PROJECT_ROOT" not in server.get("env", {})
+
 
 class TestScaffoldProject:
     """End-to-end scaffolding behaviour and acceptance criteria."""

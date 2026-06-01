@@ -52,8 +52,28 @@ def baseline_config_yaml(tech_stack: list[str]) -> str:
         "workspace_root": "",
         "work_type": defaults.work_type,
     }
+    # The codebase-index MCP server ships as a hard dependency of spine
+    # (see pyproject `mcp-codebase-index`), so its `mcp-codebase-index`
+    # entry point is always on PATH alongside spine. Emit an active server
+    # block so the RAG indexer's `mcp_codebase-index_list_files` discovery
+    # and the researcher's structural query tools work out of the box —
+    # without this, a freshly scaffolded project logs "tool not available"
+    # on `spine index`. PROJECT_ROOT is auto-injected by
+    # spine.mcp.client.get_mcp_tools from the active workspace_root, so it
+    # is intentionally not set here.
+    mcp_block: dict[str, object] = {
+        "codebase-index": {
+            "transport": "stdio",
+            "command": "mcp-codebase-index",
+            "args": [],
+        }
+    }
     body = yaml.safe_dump(
-        {"spine": spine_block, "providers": {"llm": [], "embedding": []}},
+        {
+            "spine": spine_block,
+            "mcp_servers": mcp_block,
+            "providers": {"llm": [], "embedding": []},
+        },
         sort_keys=False,
         default_flow_style=False,
     )
