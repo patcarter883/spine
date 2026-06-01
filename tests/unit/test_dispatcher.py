@@ -449,3 +449,73 @@ class TestApproveAndSpawn:
 
                 with pytest.raises(ValueError, match="not found"):
                     await approve_and_spawn(config=config, plan_id="nonexistent-plan")
+
+
+class TestGhostPrevention:
+    """The shared graph runner must finalise a work entry to 'failed' on an
+    unhandled error so it never lingers as a phantom 'running' (ghost) job."""
+
+    def _config(self, tmpdir: str) -> SpineConfig:
+        config = SpineConfig()
+        config.queue_path = str(Path(tmpdir) / "queue.db")
+        config.ensure_dirs()
+        return config
+
+    def _insert_running(self, config: SpineConfig, work_id: str):
+        db = _get_work_db(config)
+        db["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": "a job",
+                "work_type": "task",
+                "status": "running",
+                "current_phase": "implement",
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:00:00",
+                "result": "{}",
+            }
+        )
+        return db
+
+    def test_run_workflow_graph_finalises_failed_on_error(self):
+        import asyncio
+
+        import spine.work.dispatcher as disp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            db = self._insert_running(config, "ghost-x")
+            boom = RuntimeError("node exploded")
+
+            with patch.object(
+                disp, "_run_workflow_graph_inner", new=AsyncMock(side_effect=boom)
+            ):
+                with pytest.raises(RuntimeError, match="node exploded"):
+                    asyncio.run(
+                        disp._run_workflow_graph(
+                            work_id="ghost-x",
+                            work_type="task",
+                            config=config,
+                            db=db,
+                            audit=MagicMock(),
+                            artifact_store=MagicMock(),
+                            initial_state={},
+                            checkpoint_store=MagicMock(),
+                        )
+                    )
+
+            # The entry must be terminal, not a lingering "running" ghost.
+            assert db["work_entries"].get("ghost-x")["status"] == "failed"
+
+    def test_finalise_failed_work_marks_failed_with_error(self):
+        from spine.work.dispatcher import _finalise_failed_work
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            db = self._insert_running(config, "ghost-y")
+
+            _finalise_failed_work(db, "ghost-y", None, RuntimeError("boom"))
+
+            row = db["work_entries"].get("ghost-y")
+            assert row["status"] == "failed"
+            assert "boom" in (row["result"] or "")

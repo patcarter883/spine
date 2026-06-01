@@ -986,31 +986,38 @@ async def resume_interrupted_work(
         {"action": action, "feedback": feedback[:200]},
     )
 
-    # Stream the rest of the graph from the interrupt point
+    # Stream the rest of the graph from the interrupt point. Guard the run
+    # so an unhandled error finalises the work entry to "failed" instead of
+    # leaving it stuck "running" as a ghost — this path runs on the detached
+    # resume executor thread, where the exception is otherwise just dropped.
     result: dict[str, Any] = {}
-    async for chunk in traced_astream(
-        graph.astream(
-            command,
-            thread_config,
-            stream_mode=["updates", "messages"],
-            subgraphs=True,
-            version="v2",
-        ),
-        work_id,
-        work_type,
-    ):
-        if not isinstance(chunk, dict) or chunk.get("type") != "updates":
-            continue
-        if chunk.get("ns", ()) != ():
-            continue
+    try:
+        async for chunk in traced_astream(
+            graph.astream(
+                command,
+                thread_config,
+                stream_mode=["updates", "messages"],
+                subgraphs=True,
+                version="v2",
+            ),
+            work_id,
+            work_type,
+        ):
+            if not isinstance(chunk, dict) or chunk.get("type") != "updates":
+                continue
+            if chunk.get("ns", ()) != ():
+                continue
 
-        data = chunk.get("data", {})
-        for _node_name, node_output in data.items():
-            result.update(node_output)
-            phase = node_output.get("current_phase", "")
-            status = node_output.get("status", "")
-            if phase or status:
-                _update_work_progress(db, work_id, phase, status)
+            data = chunk.get("data", {})
+            for _node_name, node_output in data.items():
+                result.update(node_output)
+                phase = node_output.get("current_phase", "")
+                status = node_output.get("status", "")
+                if phase or status:
+                    _update_work_progress(db, work_id, phase, status)
+    except Exception as e:
+        _finalise_failed_work(db, work_id, audit, e)
+        raise
 
     final_status = result.get("status", "completed")
     final_phase = result.get("current_phase", "")
@@ -1378,6 +1385,87 @@ async def restart_from_phase(
 
 
 async def _run_workflow_graph(
+    *,
+    work_id: str,
+    work_type: str,
+    config: SpineConfig,
+    db: sqlite_utils.Database,
+    audit: AuditService,
+    artifact_store: ArtifactStore,
+    initial_state: dict[str, Any],
+    checkpoint_store: CheckpointStore,
+    is_restart: bool = False,
+    start_from_phase: str | None = None,
+) -> dict[str, Any]:
+    """Run a workflow graph, guaranteeing the work entry is finalised.
+
+    Thin guard around :func:`_run_workflow_graph_inner`. If execution
+    raises, the work entry is finalised to ``failed`` *before* the error
+    propagates. Without this, a restart/resume job — which runs on a
+    detached executor thread where the exception is simply logged and
+    dropped — would leave its work entry stuck ``running`` forever and
+    show as a phantom "active" job in the queue UI (a ghost). The normal
+    queue path's ``submit_work`` already had its own handler; this makes
+    the guarantee hold for every caller.
+    """
+    try:
+        return await _run_workflow_graph_inner(
+            work_id=work_id,
+            work_type=work_type,
+            config=config,
+            db=db,
+            audit=audit,
+            artifact_store=artifact_store,
+            initial_state=initial_state,
+            checkpoint_store=checkpoint_store,
+            is_restart=is_restart,
+            start_from_phase=start_from_phase,
+        )
+    except Exception as e:
+        _finalise_failed_work(db, work_id, audit, e)
+        raise
+
+
+def _finalise_failed_work(
+    db: sqlite_utils.Database,
+    work_id: str,
+    audit: AuditService | None,
+    error: BaseException,
+) -> None:
+    """Mark a work entry ``failed`` and emit failure events.
+
+    The ghost-prevention backstop: an in-flight work entry must never be
+    left ``running`` when its execution raises, or it shows as a phantom
+    "active" job in the queue UI (which sources active jobs from in-flight
+    work entries). Best-effort throughout — finalising must not itself
+    raise and mask the original error.
+    """
+    logger.error(f"[{work_id}] Workflow execution failed: {error}", exc_info=True)
+    try:
+        db["work_entries"].update(
+            work_id,
+            {
+                "status": TaskStatus.FAILED.value,
+                "updated_at": datetime.now().isoformat(),
+                "result": json.dumps({"error": str(error)}),
+            },
+        )
+    except Exception:
+        logger.exception(f"[{work_id}] Could not finalise work entry after failure")
+    if audit is not None:
+        try:
+            audit.log_event(work_id, "work_failed", "", {"error": str(error)})
+        except Exception:
+            pass
+    try:
+        from spine.ui.ws_bus import get_bus
+
+        get_bus().publish_sync("work_failed", {"work_id": work_id, "error": str(error)})
+    except Exception:
+        pass
+
+
+async def _run_workflow_graph_inner(
     *,
     work_id: str,
     work_type: str,
