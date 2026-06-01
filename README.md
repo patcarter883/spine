@@ -203,7 +203,7 @@ is tuned for a 60K threshold (see `token_compaction` in config).
 | `deepseek/deepseek-v4-flash` | OpenRouter | Cheaper/faster; solid default for most phases. |
 | `z-ai/glm-5.1` | OpenRouter | Capable general model; reliable tool calling. |
 | `google/gemini-3.5-flash` | OpenRouter | Fast, cheap; good for classification/summarization phases. |
-| `poolside/laguna-m.1` | OpenRouter (free tier) | Useful for low-cost runs. |
+| `poolside/laguna-m.1` | OpenRouter (free tier) / local | Poolside's larger model — more capable than `laguna-xs.2`; a good step up when the smaller model falls short. |
 | **`poolside/laguna-xs.2`** | OpenRouter (free tier) / local | **Recommended local model** — the most reliable small model tested for the IMPLEMENT phase; good tool-calling and structured output on modest hardware. |
 
 > Reliability varies between models — some local models we evaluated produced
