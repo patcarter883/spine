@@ -358,9 +358,12 @@ class TestUIApiResolvesExternalArtifactStore:
 
         api = UIApi(config=config)
 
-        # The resolver finds the docs at the external repo's stable location.
+        # The reader finds the docs at the external repo's stable location when
+        # given its workspace root directly (no work ID needed).
         for doc in ONBOARDING_DOC_NAMES:
-            content = api.read_onboarding_doc("wk-ext", f"{doc}.md")
+            content = api.read_onboarding_doc(
+                f"{doc}.md", workspace_root=str(external_repo)
+            )
             assert content, f"UIApi failed to resolve external onboarding doc {doc}"
 
     def test_non_onboarding_read_unchanged(self, tmp_path: Path) -> None:

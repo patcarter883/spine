@@ -268,19 +268,19 @@ def test_no_execute_means_no_enqueue(fake_st: _FakeStreamlit) -> None:
 def test_artifact_review_reads_via_api_only(fake_st: _FakeStreamlit) -> None:
     onboarding = _load_onboarding()
 
-    api = _make_api()
+    api = _make_api(workspace_root="/srv/myrepo")
 
-    def _read(work_id: str, name: str) -> str:
-        return f"# {name}\ncontent for {work_id}"
+    def _read(name: str, workspace_root: str | None = None) -> str:
+        return f"# {name}\ncontent from {workspace_root}"
 
     api.read_onboarding_doc.side_effect = _read
-    fake_st.text_input_values["onboarding_review_id"] = "abc123"
 
     onboarding.render(api)
 
-    # All four docs read through api.read_onboarding_doc.
+    # All four docs read through api.read_onboarding_doc — no work ID supplied;
+    # documents display straight from the project path (single source of truth).
     read_calls = api.read_onboarding_doc.call_args_list
-    read_names = {c.args[1] for c in read_calls}
+    read_names = {c.args[0] for c in read_calls}
     for doc in (
         "PROJECT_DEFINITION.md",
         "CODING_GUIDELINES.md",
@@ -288,8 +288,10 @@ def test_artifact_review_reads_via_api_only(fake_st: _FakeStreamlit) -> None:
         "SPINE_ASSISTANCE_REQUIREMENTS.md",
     ):
         assert doc in read_names
+    # Docs resolve from the project path, not a work ID.
+    assert all(c.args[1] == "/srv/myrepo" for c in read_calls)
     # Rendered content surfaced via st.markdown.
-    assert any("content for abc123" in m for m in fake_st.markdowns)
+    assert any("content from /srv/myrepo" in m for m in fake_st.markdowns)
 
 
 def test_progress_renders_active_onboarding(fake_st: _FakeStreamlit) -> None:

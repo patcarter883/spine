@@ -15,7 +15,8 @@ The page lets the user:
 * watch live progress through an auto-refreshing phase bar fed by
   ``api.get_queue_overview()``,
 * review the four generated ``.md`` documents inline via
-  ``api.read_onboarding_doc(work_id, name)``.
+  ``api.read_onboarding_doc(name, workspace_root)`` — a single source of truth
+  per project, so no work ID is needed.
 """
 
 from __future__ import annotations
@@ -189,25 +190,25 @@ def _phases_for_active(active: dict[str, object]) -> list[str]:
     return _PHASES_BY_MODE["greenfield"]
 
 
-def _render_artifacts(api: UIApi, work_id: str) -> None:
+def _render_artifacts(api: UIApi, workspace_root: str) -> None:
     """Render the four onboarding documents inline for review.
 
-    Shows each known onboarding doc via ``api.read_onboarding_doc(work_id, name)``
-    in an expander + markdown block, mirroring human_review.py's review pattern.
-    Reads are done exclusively through the UI gateway (no filesystem access here);
-    a doc that returns no content is simply skipped.
+    Onboarding documents are a single source of truth stored at
+    ``<workspace_root>/.spine/onboarding/<NAME>.md`` — one version per project,
+    not per onboarding run — so no work ID is needed. Shows each known doc via
+    ``api.read_onboarding_doc(name, workspace_root)`` in an expander + markdown
+    block, mirroring human_review.py's review pattern. Reads are done exclusively
+    through the UI gateway (no filesystem access here); a doc that returns no
+    content is simply skipped.
 
     Args:
         api: The UI gateway.
-        work_id: The completed onboarding work item ID.
+        workspace_root: The project whose onboarding documents to display.
     """
-    if not work_id:
-        return
-
     st.subheader("📚 Onboarding Documents")
     rendered_any = False
     for name in _ONBOARDING_DOCS:
-        content = api.read_onboarding_doc(work_id, name)
+        content = api.read_onboarding_doc(name, workspace_root or None)
         if not content:
             continue
         rendered_any = True
@@ -215,7 +216,10 @@ def _render_artifacts(api: UIApi, work_id: str) -> None:
             st.markdown(content)
 
     if not rendered_any:
-        st.caption("No onboarding documents are available yet for this work item.")
+        st.caption(
+            "No onboarding documents are available yet for this project. "
+            "Run onboarding above to generate them."
+        )
 
 
 # ── Page ──
@@ -285,13 +289,8 @@ def render(api: UIApi) -> None:
     st.subheader("▸ Progress")
     _render_progress(api)
 
-    # ── Artifact review ──
+    # ── Document review ──
+    # Onboarding documents are a single source of truth per project, so they
+    # display straight from the project path above — no work ID required.
     st.divider()
-    review_work_id = st.text_input(
-        "Review work ID",
-        value="",
-        key="onboarding_review_id",
-        help="Enter a completed onboarding work ID to review its documents.",
-    )
-    if review_work_id.strip():
-        _render_artifacts(api, review_work_id.strip())
+    _render_artifacts(api, workspace_root.strip())
