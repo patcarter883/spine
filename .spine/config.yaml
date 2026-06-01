@@ -111,7 +111,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 4
+    max_concurrent_calls: 3
   - name: tiny
     type: deepagents-model
     model: openai:Bonsai-8B-gguf
