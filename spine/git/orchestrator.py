@@ -364,6 +364,16 @@ class SpineGitOrchestrator:
         Prepares a sandbox, runs the workflow, checks phase prerequisites,
         validates the result, then merges or rolls back atomically.
 
+        .. deprecated::
+            Worktree sandboxing is now mandatory inside the dispatcher
+            itself (see :class:`spine.git.sandbox.WorktreeSandbox`), so
+            every ``submit_work`` already isolates code-producing runs.
+            Do NOT call this against ``submit_work`` — it would prepare a
+            *second* nested sandbox. Retained only for the standalone
+            sandbox primitives and their tests. The
+            ``prepare_sandbox`` / ``commit_and_merge`` / ``rollback_workspace``
+            methods remain the live mechanism the mandatory path builds on.
+
         Args:
             description: The work description to submit.
             work_type: The work type to dispatch.

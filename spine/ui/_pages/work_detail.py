@@ -228,6 +228,10 @@ def _render_audit_log(api: UIApi, work_id: str) -> None:
 def render(api: UIApi) -> None:
     """Render the work detail page with combined status and artifacts."""
     st.title("🔍 Work Details")
+    st.caption(
+        "🌳 Restarting or resuming a task re-runs the IMPLEMENT phase in an isolated "
+        "git worktree sandbox — changes merge to main only on success, else roll back."
+    )
 
     # Get work ID from URL query parameters or user input
     work_id = st.query_params.get("work_id", "")

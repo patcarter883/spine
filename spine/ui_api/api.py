@@ -677,62 +677,6 @@ class UIApi:
         if not worker.is_alive():
             worker.start()
 
-    # ── Git-gate operations ──
-
-    def submit_gated_work(self, description: str, work_type: str = "task") -> dict[str, Any]:
-        """Run a git-gated transactional work lifecycle without blocking Streamlit.
-
-        Mirrors :meth:`restart_work`: the gated lifecycle (isolate sandbox →
-        run validation pipeline → ff-merge or rollback) runs in the background
-        on the RalphLoopWorker's shared executor and returns immediately so the
-        Streamlit thread is never blocked.
-
-        Args:
-            description: Work description for the gated run.
-            work_type: Workflow type to execute (default ``"task"``).
-
-        Returns:
-            Dict with status, work_type, and action.
-        """
-
-        def _run() -> None:
-            import asyncio  # noqa: F401  (kept for parity with other executor jobs)
-
-            from spine.git.orchestrator import SpineGitOrchestrator
-
-            SpineGitOrchestrator(base_config=self._config).execute_transactional_run(
-                description, work_type
-            )
-
-        # Run on the worker's shared, persistent out-of-band pool so the
-        # job is tracked alongside the worker rather than on a throwaway
-        # executor that is never shut down.
-        get_worker(self._config).get_executor().submit(_run)
-
-        return {
-            "status": "running",
-            "work_type": work_type,
-            "action": "gate_run",
-        }
-
-    def get_gate_status(self) -> dict[str, Any]:
-        """Return the git-gate sandbox status.
-
-        Defensive: any failure constructing the orchestrator or reading its
-        status yields ``{"active": False}`` so the UI never crashes.
-
-        Returns:
-            Dict with active, branch, sandbox_dir, strategy — or
-            ``{"active": False}`` on error.
-        """
-        try:
-            from spine.git.orchestrator import SpineGitOrchestrator
-
-            return SpineGitOrchestrator(base_config=self._config).status()
-        except Exception:
-            logger.exception("Failed to read git-gate status")
-            return {"active": False}
-
     # ── Queue operations ──
 
     def get_queue_overview(self) -> dict[str, Any]:

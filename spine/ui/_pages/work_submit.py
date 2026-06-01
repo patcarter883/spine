@@ -23,6 +23,15 @@ def render(api: UIApi) -> None:
         "use the **Spec & Planning** page instead."
     )
 
+    st.info(
+        "🌳 **Runs in an isolated git worktree sandbox.** Both task types reach "
+        "the IMPLEMENT phase, so the agent's code changes are made in a throwaway "
+        "git worktree — never your live working tree. The patch is fast-forward "
+        "merged into the main branch **only when the run completes successfully**; "
+        "any other outcome (needs-review, stalled, failed) is rolled back so main "
+        "is never left dirty."
+    )
+
     # ── Input form ──
     description = st.text_area(
         "Work Description",

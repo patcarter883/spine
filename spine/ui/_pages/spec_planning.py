@@ -26,6 +26,12 @@ def render(api: UIApi) -> None:
         "before committing to implementation."
     )
 
+    st.caption(
+        "🌳 Planning itself writes no code. When you **approve** a plan, the work "
+        "continues into the IMPLEMENT phase inside an isolated git worktree sandbox — "
+        "the resulting patch merges to main only on success and rolls back otherwise."
+    )
+
     # ── Tabs ──
     tab1, tab2 = st.tabs(["📝 Submit Planning Work", "📋 Review Planning Work"])
 

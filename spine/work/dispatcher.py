@@ -307,12 +307,23 @@ async def submit_work(
         from spine.workflow.compose import build_workflow_graph
         from spine.agents.retry import reset_token_budget
 
+        from spine.git import WorktreeSandbox
+
         checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
         checkpointer = await checkpoint_store.get_checkpointer()
 
         # Clear any stale cumulative token count from a prior run of the
         # same work_id (e.g. a restart) so the budget enforcer starts fresh.
         reset_token_budget(work_id)
+
+        # ── Mandatory worktree sandbox for code-producing work ──
+        # Work types that run IMPLEMENT edit the repo, so the graph runs
+        # against an isolated git worktree and is fast-forward merged to
+        # main only on success (rolled back on any other outcome). For
+        # planning / onboarding work types this is a no-op and run_config
+        # is the original config.
+        sandbox = WorktreeSandbox(config, work_type)
+        run_config = sandbox.enter()
 
         graph = build_workflow_graph(work_type, checkpointer=checkpointer)
 
@@ -329,7 +340,7 @@ async def submit_work(
             "status": "running",
             "prompt_request": None,
             "critic_reviewing": "",
-            "workspace_root": config.workspace_root,
+            "workspace_root": run_config.workspace_root,
             "plan_id": plan_id,
         }
 
@@ -342,7 +353,7 @@ async def submit_work(
                 # _model_spec_from_config() in helpers.py and force every
                 # phase to use the default provider, ignoring
                 # providers.phases.<phase> overrides.
-                "spine_config": config,
+                "spine_config": run_config,
             }
         }
 
@@ -571,6 +582,12 @@ async def submit_work(
             },
         )
 
+        # ── Land or discard the sandbox patch ──
+        # Code-producing work ran against an isolated worktree; merge it to
+        # main on success, roll it back on any other terminal status. No-op
+        # for non-code work types.
+        sandbox.finalize(final_status)
+
         # ── Push completion event to WebSocket bus ──
         try:
             from spine.ui.ws_bus import get_bus
@@ -590,6 +607,12 @@ async def submit_work(
 
     except Exception as e:
         logger.error(f"Work {work_id} failed: {e}", exc_info=True)
+        # Discard the isolated worktree (if one was created) so a crashed
+        # run never leaves the main tree dirty. Best-effort; never masks the
+        # original error.
+        _sandbox = locals().get("sandbox")
+        if _sandbox is not None:
+            _sandbox.abort()
         last_phase = ""
         if isinstance(locals().get("result"), dict):
             last_phase = result.get("current_phase", "")  # type: ignore[possibly-undefined]
@@ -733,9 +756,15 @@ async def resume_work(
     # ── Rebuild and re-run the workflow graph ──
     try:
         from spine.workflow.compose import WORKFLOW_SEQUENCES, build_workflow_graph
+        from spine.git import WorktreeSandbox
 
         checkpointer = await checkpoint_store.get_checkpointer()
         graph = build_workflow_graph(work_type, checkpointer=checkpointer)
+
+        # Resuming code-producing work re-runs IMPLEMENT, so isolate it in a
+        # worktree just like a fresh submission. No-op for planning types.
+        sandbox = WorktreeSandbox(config, work_type)
+        run_config = sandbox.enter()
 
         # Delete the old checkpoint so the graph starts fresh with our resume_state
         # instead of restoring the previous checkpoint state
@@ -771,7 +800,7 @@ async def resume_work(
             "status": "running",
             "prompt_request": None,
             "critic_reviewing": "",
-            "workspace_root": config.workspace_root,
+            "workspace_root": run_config.workspace_root,
         }
 
         thread_config = {
@@ -783,7 +812,7 @@ async def resume_work(
                 # _model_spec_from_config() in helpers.py and force every
                 # phase to use the default provider, ignoring
                 # providers.phases.<phase> overrides.
-                "spine_config": config,
+                "spine_config": run_config,
             }
         }
 
@@ -899,6 +928,9 @@ async def resume_work(
             {"status": final_status, "resumed": True},
         )
 
+        # Land or discard the worktree patch based on the resumed outcome.
+        sandbox.finalize(final_status)
+
         try:
             from spine.ui.ws_bus import get_bus
 
@@ -917,6 +949,9 @@ async def resume_work(
 
     except Exception as e:
         logger.error(f"Resume of work {work_id} failed: {e}", exc_info=True)
+        _sandbox = locals().get("sandbox")
+        if _sandbox is not None:
+            _sandbox.abort()
         last_phase = ""
         if isinstance(locals().get("result"), dict):
             last_phase = result.get("current_phase", "")
@@ -1437,12 +1472,29 @@ async def _run_workflow_graph(
     show as a phantom "active" job in the queue UI (a ghost). The normal
     queue path's ``submit_work`` already had its own handler; this makes
     the guarantee hold for every caller.
+
+    This guard is also the mandatory-sandbox chokepoint for every path
+    that re-runs the graph (restart, restart-from-phase, approved-plan
+    continuation): code-producing work types run against an isolated git
+    worktree, which is fast-forward merged to main only on success and
+    rolled back on every other outcome.
     """
+    from spine.git import WorktreeSandbox
+
+    # Isolate code-producing runs in a throwaway worktree. enter() swaps
+    # workspace_root to the sandbox (and is a no-op for planning work types,
+    # returning the original config). enter() is inside the guard so that a
+    # sandbox-preparation failure (e.g. a dirty tree) finalises the work
+    # entry to 'failed' rather than escaping as a phantom 'running' ghost.
+    sandbox = WorktreeSandbox(config, work_type)
     try:
-        return await _run_workflow_graph_inner(
+        run_config = sandbox.enter()
+        if run_config is not config:
+            initial_state = {**initial_state, "workspace_root": run_config.workspace_root}
+        result = await _run_workflow_graph_inner(
             work_id=work_id,
             work_type=work_type,
-            config=config,
+            config=run_config,
             db=db,
             audit=audit,
             artifact_store=artifact_store,
@@ -1452,8 +1504,12 @@ async def _run_workflow_graph(
             start_from_phase=start_from_phase,
         )
     except Exception as e:
+        sandbox.abort()
         _finalise_failed_work(db, work_id, audit, e)
         raise
+    # Land the patch on main (success) or discard the worktree (otherwise).
+    sandbox.finalize(result.get("status", ""))
+    return result
 
 
 def _finalise_failed_work(

@@ -10,7 +10,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from spine.cli.git_commands import gate
 from spine.config import SpineConfig
 from spine.log import configure_logging
 
@@ -713,6 +712,3 @@ def project_list(config_path: str) -> None:
             continue
         table.add_row(spec.id, spec.title, str(len(spec.member_work_ids)))
     console.print(table)
-
-
-main.add_command(gate)

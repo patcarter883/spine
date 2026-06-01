@@ -321,6 +321,10 @@ def _render_recent(api: UIApi) -> None:
 def render(api: UIApi) -> None:
     """Render the Queue page."""
     st.title("🚦 Queue")
+    st.caption(
+        "🌳 Task and critical-task jobs run in an isolated git worktree sandbox — "
+        "their code changes merge to main only on success, and roll back otherwise."
+    )
 
     # ── Summary metrics ──
     _render_summary(api)
