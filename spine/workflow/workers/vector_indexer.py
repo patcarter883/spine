@@ -8,6 +8,7 @@ summarize with LLM, and embed for vector search.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from typing import Any
@@ -108,13 +109,19 @@ class VectorIndexer:
         self._document_prefix = provider_cfg.get("document_prefix", "")
 
     async def index_codebase(self, workspace_root: str | None = None) -> dict[str, Any]:
-        """Index the entire codebase into the vector store.
+        """Incrementally index the codebase into the vector store.
+
+        Only files whose content hash differs from the last index are
+        re-processed; files removed from the tree have their symbols
+        pruned. A full re-index happens naturally after ``--wipe`` (which
+        clears the ledger, so every file looks new).
 
         Args:
             workspace_root: Optional workspace root override.
 
         Returns:
-            Dict with stats: total_processed, skipped, errors.
+            Dict with stats: files_total, files_changed, files_removed,
+            files_skipped, symbols_indexed, errors.
         """
         workspace_root = workspace_root or self.config.workspace_root
 
@@ -127,36 +134,92 @@ class VectorIndexer:
         logger.info("Embedding dimension probed: %d", self.store.embedding_dim)
         self.store.ensure_schema()
 
-        symbols = await self._discover_symbols(workspace_root)
-        logger.info("Discovered %d symbols for indexing", len(symbols))
+        target_files = await self._discover_target_files(workspace_root)
+
+        # Compute current content hashes; diff against the ledger.
+        current: dict[str, tuple[float, str]] = {}
+        for rel in target_files:
+            state = self._file_state(os.path.join(workspace_root, rel))
+            if state is not None:
+                current[rel] = state
+        prev = self.store.get_indexed_files()
+        target_set = set(current)
+
+        removed = [p for p in prev if p not in target_set]
+        changed = [p for p in current if current[p][1] != prev.get(p)]
+        skipped = len(current) - len(changed)
+
+        # Prune files that vanished from the tree (or became excluded).
+        for rel in removed:
+            self.store.delete_file_symbols(rel)
+        if removed:
+            logger.info("Pruned %d removed file(s) from the index", len(removed))
+
+        logger.info(
+            "Incremental index: %d target, %d changed, %d skipped, %d removed",
+            len(current), len(changed), skipped, len(removed),
+        )
+
+        # Clear stale symbols for changed files, then extract their symbols.
+        symbols: list[dict[str, Any]] = []
+        for rel in changed:
+            self.store.delete_file_symbols(rel)
+            full_path = os.path.join(workspace_root, rel)
+            symbols.extend(self._extract_symbols_from_file(full_path, rel))
 
         max_concurrent = self.config.vector_indexing.get("max_concurrent_chunks", 5)
         semaphore = asyncio.Semaphore(max_concurrent)
-
         results = await asyncio.gather(
-            *[
-                self._process_symbol(symbol, semaphore, workspace_root)
-                for symbol in symbols
-            ],
+            *[self._process_symbol(s, semaphore, workspace_root) for s in symbols],
             return_exceptions=True,
         )
 
-        success_count = sum(1 for r in results if r is True)
-        error_count = sum(1 for r in results if isinstance(r, Exception))
+        # A changed file is "indexed at this hash" only if every one of its
+        # symbols stored cleanly (files with zero symbols count as clean, so
+        # they aren't re-extracted every run). Files with a failure are left
+        # out of the ledger and retried next run.
+        file_ok: dict[str, bool] = {rel: True for rel in changed}
+        success_count = 0
+        error_count = 0
+        for sym, res in zip(symbols, results):
+            ok = res is True
+            success_count += 1 if ok else 0
+            if not ok:
+                error_count += 1
+                file_ok[sym["file_path"]] = False
+
+        for rel in changed:
+            if file_ok.get(rel):
+                mtime, content_hash = current[rel]
+                self.store.upsert_indexed_file(rel, mtime, content_hash)
 
         return {
-            "total_processed": len(symbols),
-            "success": success_count,
+            "files_total": len(current),
+            "files_changed": len(changed),
+            "files_removed": len(removed),
+            "files_skipped": skipped,
+            "symbols_indexed": success_count,
             "errors": error_count,
         }
 
-    async def _discover_symbols(self, workspace_root: str) -> list[dict[str, Any]]:
-        """Discover symbols using MCP for file listing, tree-sitter for parsing.
+    @staticmethod
+    def _file_state(full_path: str) -> tuple[float, str] | None:
+        """Return ``(mtime, sha256_hex)`` for a file, or None if unreadable."""
+        try:
+            mtime = os.stat(full_path).st_mtime
+            with open(full_path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            return mtime, digest
+        except OSError as exc:
+            logger.debug("Could not stat/read %s: %s", full_path, exc)
+            return None
 
-        Uses mcp-codebase-index for file discovery (fast, cached), then
-        local tree-sitter parsing for symbol extraction.  Each symbol is
-        sliced to its own byte range — ``raw_code`` is the function/class
-        body, NOT the containing file.
+    async def _discover_target_files(self, workspace_root: str) -> list[str]:
+        """List indexable source files via mcp-codebase-index, filtered.
+
+        Applies the extension allow-list, the excluded-dirs blacklist, and
+        the test-file exclusion (unless ``index_tests``). Returns
+        workspace-relative paths.
         """
         from spine.mcp.client import get_mcp_tools
 
@@ -184,21 +247,11 @@ class VectorIndexer:
                 and not _is_excluded(f)
                 and (index_tests or not _is_test_file(f))
             ]
-
             logger.info(
-                "Found %d indexable files (post-blacklist, index_tests=%s), parsing for symbols...",
+                "Found %d indexable files (post-blacklist, index_tests=%s)",
                 len(target), index_tests,
             )
-
-            symbols: list[dict[str, Any]] = []
-            for file_path in target:
-                if not isinstance(file_path, str):
-                    continue
-                full_path = os.path.join(workspace_root, file_path)
-                symbols.extend(self._extract_symbols_from_file(full_path, file_path))
-
-            logger.info("Discovered %d symbols across %d files", len(symbols), len(target))
-            return symbols
+            return target
 
         except Exception as e:
             logger.error("MCP discovery failed: %s", e, exc_info=True)

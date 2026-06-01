@@ -246,6 +246,18 @@ class VectorStore:
             END
         """)
 
+        # Incremental-indexing ledger: one row per source file, holding the
+        # content hash last indexed. The indexer skips files whose hash is
+        # unchanged so a re-index only touches what actually changed.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS indexed_files (
+                file_path TEXT PRIMARY KEY,
+                mtime REAL,
+                content_hash TEXT NOT NULL,
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         conn.commit()
 
         # Backfill the FTS index for stores populated before the lexical
@@ -551,9 +563,67 @@ class VectorStore:
         conn.commit()
 
     def delete_all(self) -> None:
-        """Delete all vectors and metadata from the store."""
+        """Delete all vectors, metadata, and the incremental-index ledger."""
         conn = self._get_connection()
         conn.execute("DELETE FROM symbol_vectors")
         conn.execute("DELETE FROM symbol_metadata")
+        # Clear the ledger too so a wipe forces a genuine full re-index.
+        try:
+            conn.execute("DELETE FROM indexed_files")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         logger.info("Vector store cleared")
+
+    # ── Incremental indexing ────────────────────────────────────────────
+
+    def get_indexed_files(self) -> dict[str, str]:
+        """Return ``{file_path: content_hash}`` for every file in the ledger."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT file_path, content_hash FROM indexed_files"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {r["file_path"]: r["content_hash"] for r in rows}
+
+    def upsert_indexed_file(self, file_path: str, mtime: float, content_hash: str) -> None:
+        """Record (or update) the content hash last indexed for a file."""
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT INTO indexed_files (file_path, mtime, content_hash, indexed_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(file_path) DO UPDATE SET
+                mtime = excluded.mtime,
+                content_hash = excluded.content_hash,
+                indexed_at = CURRENT_TIMESTAMP
+            """,
+            (file_path, mtime, content_hash),
+        )
+        conn.commit()
+
+    def delete_file_symbols(self, file_path: str) -> int:
+        """Delete all symbols (and their vectors + ledger row) for one file.
+
+        The metadata delete fires the FTS sync trigger; the vec0 table has
+        no FK cascade, so its rows are removed explicitly by id.
+
+        Returns:
+            The number of symbol rows removed.
+        """
+        conn = self._get_connection()
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM symbol_metadata WHERE file_path = ?", (file_path,)
+            ).fetchall()
+        ]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(f"DELETE FROM symbol_vectors WHERE rowid IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM symbol_metadata WHERE id IN ({placeholders})", ids)
+        conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (file_path,))
+        conn.commit()
+        return len(ids)

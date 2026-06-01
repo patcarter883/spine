@@ -227,13 +227,24 @@ class SpineConfig:
     # researcher nothing about production code, and they otherwise swamp
     # the index (~66% of symbols). See tests/recall_eval baseline.
     index_tests: bool = False
-    # Reciprocal-rank-fusion channel weights for hybrid recall. The local
-    # embedding space is weak/anisotropic for code, so the vector channel
-    # is down-weighted relative to lexical BM25. Tuned on tests/recall_eval:
-    # 0.4/1.0 took miss@50 from 0.037 → 0.000 and MRR 0.41 → 0.49 vs equal
-    # weighting. Env overrides: SPINE_RRF_VECTOR_WEIGHT / SPINE_RRF_BM25_WEIGHT.
-    rrf_vector_weight: float = 0.4
+    # Reciprocal-rank-fusion channel weights for hybrid recall. Lexical BM25
+    # is the workhorse for code-symbol search; the dense vector channel was
+    # found to add nothing and even hurt ranking on tests/recall_eval (pure
+    # BM25 scored the best MRR, 0.55, across curated, mined, AND deliberately
+    # paraphrastic queries — for both Qwen3 and nomic embeddings). The vector
+    # channel is kept at a small weight as a hedge for queries unlike the eval
+    # set. Env overrides: SPINE_RRF_VECTOR_WEIGHT / SPINE_RRF_BM25_WEIGHT.
+    rrf_vector_weight: float = 0.2
     rrf_bm25_weight: float = 1.0
+    # Cross-encoder reranking. When ``reranker_provider`` names a provider in
+    # providers.reranker[], hybrid retrieves ``rerank_pool`` candidates and a
+    # cross-encoder re-orders them to the final ``recall_k``. Empty name =
+    # disabled (the fused RRF order is returned as-is). A cross-encoder reads
+    # query+candidate jointly, so it can lift ranking even though the
+    # bi-encoder vector channel is weak. Off by default — enable + measure on
+    # tests/recall_eval before trusting it.
+    reranker_provider: str = ""
+    rerank_pool: int = 50
     vector_indexing: dict = field(
         default_factory=lambda: {
             "max_concurrent_chunks": 5,
@@ -509,8 +520,10 @@ class SpineConfig:
             embedding_provider=spine.get("embedding_provider", "openai-embeddings"),
             recall_k=int(spine.get("recall_k", 10)),
             index_tests=str(spine.get("index_tests", False)).lower() in ("1", "true", "yes"),
-            rrf_vector_weight=float(spine.get("rrf_vector_weight", 0.4)),
+            rrf_vector_weight=float(spine.get("rrf_vector_weight", 0.2)),
             rrf_bm25_weight=float(spine.get("rrf_bm25_weight", 1.0)),
+            reranker_provider=spine.get("reranker_provider", ""),
+            rerank_pool=int(spine.get("rerank_pool", 50)),
             vector_indexing=spine.get(
                 "vector_indexing",
                 {
@@ -797,6 +810,21 @@ class SpineConfig:
         """
         for provider in self.providers.get("embedding", []):
             if provider.get("name") == self.embedding_provider:
+                return provider
+        return None
+
+    def resolve_reranker_provider(self) -> dict | None:
+        """Resolve the reranker provider config.
+
+        Uses the ``reranker_provider`` name to look it up in
+        ``providers.reranker[]``. Returns None when reranking is disabled
+        (empty name) or the named provider is absent — callers treat that
+        as "no reranking" and fall back to the fused order.
+        """
+        if not self.reranker_provider:
+            return None
+        for provider in self.providers.get("reranker", []):
+            if provider.get("name") == self.reranker_provider:
                 return provider
         return None
 

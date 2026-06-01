@@ -138,9 +138,22 @@ class RecallTool(BaseTool):
         # down-weighted because it is noisy); env overrides for eval sweeps.
         v_w = float(os.getenv("SPINE_RRF_VECTOR_WEIGHT", str(cfg.rrf_vector_weight)))
         b_w = float(os.getenv("SPINE_RRF_BM25_WEIGHT", str(cfg.rrf_bm25_weight)))
+
+        # Optional cross-encoder rerank: retrieve a larger candidate pool,
+        # then re-order it to the final k. Disabled unless a reranker
+        # provider is configured (env SPINE_RERANK=off force-disables).
+        reranker_cfg = cfg.resolve_reranker_provider()
+        rerank_on = reranker_cfg is not None and os.getenv("SPINE_RERANK", "").lower() != "off"
+        fetch_k = max(k, cfg.rerank_pool) if rerank_on else k
+
         results = store.search_hybrid(
-            embedding, query, k=k, vector_weight=v_w, bm25_weight=b_w
+            embedding, query, k=fetch_k, vector_weight=v_w, bm25_weight=b_w
         )
+
+        if rerank_on:
+            from spine.agents.tools.reranker import rerank_hits
+
+            results = await rerank_hits(reranker_cfg, query, results, top_k=k)
 
         results = self._apply_token_budget(results, max_tokens)
 

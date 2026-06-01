@@ -114,18 +114,20 @@ def run(
     "--wipe",
     is_flag=True,
     default=False,
-    help="Drop all existing vector rows before indexing (required after the "
-    "tree-sitter migration — older rows hold whole-file raw_code).",
+    help="Drop all rows and the incremental ledger before indexing, forcing a "
+    "full re-index. Use after a model swap or a change to the indexing logic.",
 )
 def index(workspace_root: str | None, config_path: str, wipe: bool) -> None:
     """Index the workspace into the vector store for RAG.
 
     Discovers source files (.py, .php, .ts, .tsx), extracts per-symbol
     byte slices via tree-sitter, summarizes with LLM, and stores
-    embeddings for semantic search in the SPECIFY phase.
+    embeddings for hybrid search.
 
-    Use ``--wipe`` after upgrading from the pre-tree-sitter ingestion to
-    drop legacy rows that store whole-file ``raw_code``.
+    Indexing is incremental: only files whose content changed since the
+    last run are re-processed, and files removed from the tree are pruned.
+    Use ``--wipe`` to force a full rebuild (e.g. after an embedding-model
+    swap or a change to how documents are built).
     """
     config = SpineConfig.load(path=config_path)
 
@@ -146,8 +148,11 @@ def index(workspace_root: str | None, config_path: str, wipe: bool) -> None:
 
     console.print(
         Panel(
-            f"Processed: {result.get('total_processed', 0)}\n"
-            f"Succeeded: {result.get('success', 0)}\n"
+            f"Files: {result.get('files_total', 0)} "
+            f"({result.get('files_changed', 0)} changed, "
+            f"{result.get('files_skipped', 0)} unchanged, "
+            f"{result.get('files_removed', 0)} removed)\n"
+            f"Symbols indexed: {result.get('symbols_indexed', 0)}\n"
             f"Errors: {result.get('errors', 0)}",
             title="Indexing Result",
         )

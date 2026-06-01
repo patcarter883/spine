@@ -9,15 +9,17 @@ spine:
   synthesize_findings_token_budget: 20000
   max_completion_tokens: 16000
   # RAG configuration
+  reranker_provider: bge-reranker
   embedding_provider: local-embeddings
   recall_k: 10
   topic_lookup_top_k: 5
   # Hybrid recall (BM25 + vector, RRF-fused). Tests are excluded from the
-  # index by default (they swamped ~66% of symbols). The vector channel is
-  # down-weighted vs lexical BM25 because the local embedding space is weak
-  # for code — tuned on tests/recall_eval (miss@50 0.52 → 0.00).
+  # index by default (they swamped ~66% of symbols). Lexical BM25 dominates
+  # code-symbol search; the dense vector channel added nothing on
+  # tests/recall_eval (pure BM25 had the best MRR), so it is kept at a small
+  # hedge weight rather than removed. Env: SPINE_RRF_VECTOR_WEIGHT.
   index_tests: false
-  rrf_vector_weight: 0.4
+  rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
     max_concurrent_chunks: 10
@@ -135,6 +137,18 @@ providers:
     stream_usage: true
     query_prefix: "search_query: "
     document_prefix: "search_document: "
+  # Cross-encoder rerankers (optional, OFF by default). To enable, serve a
+  # reranker (e.g. bge-reranker-v2-m3) behind a Cohere/Jina/vLLM-compatible
+  # /rerank endpoint, add it here, and set `reranker_provider: bge-reranker`
+  # plus `rerank_pool` under the top-level `spine:` block. Then measure with
+  # tests/recall_eval before trusting it.
+  reranker:
+  - name: bge-reranker
+    model: bge-reranker-v2-m3-GGUF
+    base_url: http://localhost:8000/v1
+    api_key: vllm
+    # llama.cpp rerank route. Omit to auto-probe (/rerank then /reranking).
+    rerank_path: "/reranking"
   phases:
     specify:
       provider: pat
