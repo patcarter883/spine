@@ -25,6 +25,7 @@ import sqlite_utils
 
 from spine.config import SpineConfig
 from spine.models.enums import PhaseName, TaskStatus, WorkType
+from spine.observability import traced_astream
 from spine.persistence.artifacts import ArtifactStore
 from spine.services.audit_service import AuditService
 
@@ -336,13 +337,20 @@ async def submit_work(
         # (e.g. the LLM connection dropped silently).  Token-level streaming
         # means the timer resets on every LLM token, so only a genuine
         # hang triggers the stall — not a legitimately long agent run.
+        # Trace this work run to LangSmith.  Tracing is off process-wide by
+        # default (see spine.config / spine.observability); only genuine work
+        # task runs opt in by streaming through traced_astream.
         result: dict[str, Any] = dict(initial_state)
-        stream_iter = graph.astream(
-            initial_state,
-            thread_config,
-            stream_mode=["updates", "messages"],
-            subgraphs=True,
-            version="v2",
+        stream_iter = traced_astream(
+            graph.astream(
+                initial_state,
+                thread_config,
+                stream_mode=["updates", "messages"],
+                subgraphs=True,
+                version="v2",
+            ),
+            work_id,
+            work_type,
         )
         stalled = False
         while True:
@@ -753,12 +761,16 @@ async def resume_work(
         # (same pattern as submit_work — uses stream_mode=["updates", "messages"]
         # with subgraphs=True and version="v2" for consistent StreamPart format)
         result: dict[str, Any] = dict(resume_state)
-        async for chunk in graph.astream(
-            resume_state,
-            thread_config,
-            stream_mode=["updates", "messages"],
-            subgraphs=True,
-            version="v2",
+        async for chunk in traced_astream(
+            graph.astream(
+                resume_state,
+                thread_config,
+                stream_mode=["updates", "messages"],
+                subgraphs=True,
+                version="v2",
+            ),
+            work_id,
+            work_type,
         ):
             # V2 format: each chunk is a StreamPart dict:
             #   {"type": "updates"|"messages", "ns": (...), "data": ...}
@@ -976,12 +988,16 @@ async def resume_interrupted_work(
 
     # Stream the rest of the graph from the interrupt point
     result: dict[str, Any] = {}
-    async for chunk in graph.astream(
-        command,
-        thread_config,
-        stream_mode=["updates", "messages"],
-        subgraphs=True,
-        version="v2",
+    async for chunk in traced_astream(
+        graph.astream(
+            command,
+            thread_config,
+            stream_mode=["updates", "messages"],
+            subgraphs=True,
+            version="v2",
+        ),
+        work_id,
+        work_type,
     ):
         if not isinstance(chunk, dict) or chunk.get("type") != "updates":
             continue
@@ -1402,12 +1418,16 @@ async def _run_workflow_graph(
     }
 
     result: dict[str, Any] = dict(initial_state)
-    stream_iter = graph.astream(
-        initial_state,
-        thread_config,
-        stream_mode=["updates", "messages"],
-        subgraphs=True,
-        version="v2",
+    stream_iter = traced_astream(
+        graph.astream(
+            initial_state,
+            thread_config,
+            stream_mode=["updates", "messages"],
+            subgraphs=True,
+            version="v2",
+        ),
+        work_id,
+        work_type,
     )
     stalled = False
 

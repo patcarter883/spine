@@ -59,6 +59,32 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+# ── Disable LangSmith tracing by default ──
+# Tracing is opt-in *per work task run* (see spine.observability.work_run_tracing).
+# Without this, merely importing/using LangGraph anywhere — codebase indexing,
+# the test suite, onboarding repo analysis — emits traces, because .env sets
+# LANGSMITH_TRACING=true for the work runs that DO want it.  We force the
+# ambient flag off here and let work runs re-enable it on demand via a
+# contextvar-scoped tracer.  The API key / endpoint / project vars are left
+# intact so those work runs can still reach LangSmith.
+#
+# Escape hatch: set SPINE_TRACE_ALL=1 to keep tracing on globally (trace
+# everything, including indexing and tests) for debugging.
+
+
+def _disable_global_tracing() -> None:
+    """Force LangSmith tracing off unless ``SPINE_TRACE_ALL`` is set."""
+    if os.environ.get("SPINE_TRACE_ALL", "").lower() in ("1", "true", "yes"):
+        return
+    # Both the current (LANGSMITH_*) and legacy (LANGCHAIN_*) flags must be
+    # cleared — langchain-core honours either when deciding to auto-trace.
+    for var in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"):
+        os.environ[var] = "false"
+
+
+_disable_global_tracing()
+
+
 @dataclass
 class ConvergenceConfig:
     """Researcher convergence-steering thresholds.
