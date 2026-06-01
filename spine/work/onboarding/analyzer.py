@@ -220,7 +220,10 @@ class RepoAnalyzer:
             for f in all_files
             if isinstance(f, str)
             and os.path.splitext(f)[1].lower() in _INDEXABLE_EXTENSIONS
-            and not any(part in _SKIP_DIRS for part in f.replace("\\", "/").split("/"))
+            and not any(
+                part in _SKIP_DIRS or part.startswith(".")
+                for part in f.replace("\\", "/").split("/")
+            )
         ]
 
     @staticmethod
