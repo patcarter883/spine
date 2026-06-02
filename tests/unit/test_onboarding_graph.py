@@ -38,7 +38,9 @@ from spine.work.onboarding.manifest_index import (
     validate_fragment_keys,
 )
 from spine.work.onboarding.synthesis_nodes import (
+    SECTION_ROUTE_MAP,
     _doc_manager_node,
+    _section_router,
     build_synthesis_graph,
 )
 from spine.work.onboarding.synthesis_plan import (
@@ -572,3 +574,31 @@ class TestComposedOnboardingGraph:
             assert (doc_dir / f"{doc}.md").exists()
         # Greenfield = exactly one section per document.
         assert len(final["section_results"]) == len(ONBOARDING_DOC_NAMES)
+
+
+class TestSectionRouter:
+    """``_section_router`` must never dead-end the graph (latent hang fix)."""
+
+    def test_routes_one_send_per_section(self) -> None:
+        from langgraph.types import Send
+
+        state = {
+            "sections": [
+                {"doc_id": "PROJECT_DEFINITION", "order": 0, "fragment_keys": {}},
+                {"doc_id": "CODING_GUIDELINES", "order": 1, "fragment_keys": {}},
+            ],
+            "manifest": {},
+            "section_token_cap": 1000,
+        }
+        sends = _section_router(state)  # type: ignore[arg-type]
+        assert isinstance(sends, list)
+        assert len(sends) == 2
+        assert all(isinstance(s, Send) and s.node == "section_worker" for s in sends)
+
+    def test_empty_sections_route_to_assemble_not_deadend(self) -> None:
+        """Zero sections must hop straight to ``assemble_docs`` — returning an
+        empty Send list would leave doc_manager with no edge and hang."""
+        result = _section_router({"sections": [], "manifest": {}})  # type: ignore[arg-type]
+        assert result == "assemble_docs"
+        # The conditional-edge route map must declare that destination.
+        assert "assemble_docs" in SECTION_ROUTE_MAP

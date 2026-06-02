@@ -458,6 +458,116 @@ class TestUIApiActiveJobs:
             assert overview["active"] is None
 
 
+class TestUIApiReconcileOrphans:
+    """Startup reconcile finalises phantom in-flight entries without touching
+    queue rows, and never twice or while a job is genuinely live."""
+
+    def _api(self, tmpdir: str) -> tuple[UIApi, RalphLoopWorker, SpineConfig]:
+        config = SpineConfig()
+        config.queue_path = str(Path(tmpdir) / "queue.db")
+        config.ensure_dirs()
+        worker = _init_queue_db(config)
+        return UIApi(config), worker, config
+
+    def _insert_running_entry(self, config: SpineConfig, work_id: str, **kw) -> None:
+        from spine.work.dispatcher import get_work_db
+
+        db = get_work_db(config)
+        db["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": kw.get("description", "a job"),
+                "work_type": kw.get("work_type", "onboarding"),
+                "status": kw.get("status", "running"),
+                "current_phase": kw.get("current_phase", "synthesize"),
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:01:00",
+                "result": json.dumps(kw.get("result", {})),
+            }
+        )
+
+    def test_reconcile_finalises_offqueue_onboarding_ghost(self):
+        """The incident shape: a running onboarding entry with NO queue row
+        (worker thread killed mid-synthesis) is finalised to failed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _worker, config = self._api(tmpdir)
+            self._insert_running_entry(config, "synth001", current_phase="synthesize")
+
+            assert len(api.get_queue_overview()["active_jobs"]) == 1
+            count = api.reconcile_orphaned_entries()
+
+            assert count == 1
+            assert api.get_work("synth001")["status"] == "failed"
+            assert api.get_queue_overview()["active_jobs"] == []
+
+    def test_reconcile_leaves_queue_rows_untouched(self):
+        """Unlike reset_stuck_items, reconcile must NOT reset queue rows to
+        pending (no surprise auto-reprocessing)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, _config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 9,
+                    "description": "onboard repo",
+                    "work_type": "onboarding",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "live0001",
+                }
+            )
+
+            api.reconcile_orphaned_entries()
+
+            # The running queue row is still running — reconcile only finalises
+            # work entries, it does not reset the queue.
+            assert worker._get_db()["queue"].get(9)["status"] == "running"
+
+    def test_reconcile_excludes_live_queue_backed_job(self):
+        """A work entry backed by a live running queue row is NOT finalised."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, worker, config = self._api(tmpdir)
+            worker._get_db()["queue"].insert(
+                {
+                    "id": 4,
+                    "description": "live",
+                    "work_type": "onboarding",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:05",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "alive001",
+                }
+            )
+            self._insert_running_entry(config, "alive001")
+
+            count = api.reconcile_orphaned_entries()
+
+            assert count == 0
+            assert api.get_work("alive001")["status"] == "running"
+
+    def test_reconcile_once_runs_at_most_once_per_process(self):
+        """The process-global guard makes a second call a no-op, so a session
+        opened mid-run can never finalise a then-live job."""
+        import spine.ui_api.api as api_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _worker, config = self._api(tmpdir)
+            api_module._ORPHAN_RECONCILE_DONE = False  # reset for a clean assertion
+
+            self._insert_running_entry(config, "first001")
+            assert api.reconcile_orphaned_entries_once() == 1
+            assert api.get_work("first001")["status"] == "failed"
+
+            # A second entry appearing later must NOT be touched by _once again.
+            self._insert_running_entry(config, "second02")
+            assert api.reconcile_orphaned_entries_once() == 0
+            assert api.get_work("second02")["status"] == "running"
+
+
 class TestUIApiWorkerStatus:
     """Worker status reflects real thread liveness, not a stale flag."""
 

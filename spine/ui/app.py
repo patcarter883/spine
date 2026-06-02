@@ -34,6 +34,13 @@ start_ws_server()
 
 api: UIApi = st.session_state.api
 
+# ── Clear phantom in-flight work left by a previous (killed) process ──
+# Runs once per process, BEFORE the worker loop restarts: a fresh process has
+# nothing executing, so any work entry still marked running/stalled is a ghost
+# — including off-queue onboarding runs that never had a queue row and so would
+# otherwise show as a permanent "synthesize" card. Idempotent thereafter.
+api.reconcile_orphaned_entries_once()
+
 # ── Ensure the queue worker loop is alive (idempotent) ──
 # Boot it here so the queue is always being serviced and the worker
 # status the Queue page reports reflects reality rather than "not running

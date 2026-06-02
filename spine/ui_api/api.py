@@ -21,6 +21,15 @@ from spine.work.ralph_worker import get_worker
 
 logger = logging.getLogger(__name__)
 
+# Process-global guard so the startup orphan-reconcile runs EXACTLY ONCE per
+# process (see ``UIApi.reconcile_orphaned_entries_once``). Streamlit re-executes
+# the entry script on every interaction and spins a fresh ``UIApi`` per browser
+# session, so a per-session/per-instance flag would re-fire mid-run and could
+# finalise a genuinely live off-queue job. A module global is bound once at
+# import and shared across all sessions in the process, which is exactly the
+# "first thing after boot, before the worker loop starts" semantics we need.
+_ORPHAN_RECONCILE_DONE = False
+
 
 class UIApi:
     """The sole read/write interface for Streamlit UI pages.
@@ -1175,6 +1184,58 @@ class UIApi:
                 )
             count += 1
         return count
+
+    def reconcile_orphaned_entries(self) -> int:
+        """Finalise in-flight work entries left behind by a dead process.
+
+        Unlike :meth:`reset_stuck_items`, this does NOT reset queue rows to
+        ``pending`` (no surprise auto-reprocessing) — it only clears phantom
+        ``running``/``stalled`` work entries that are not backed by a live
+        running queue row. That is precisely the off-queue onboarding case: a
+        worker thread killed mid-synthesis leaves a ``running`` work entry with
+        no queue row, which the queue-only :meth:`RalphLoopWorker.reset_stuck_items`
+        can never see, so the UI shows it as a permanent "synthesize" card.
+
+        A queue-correlated row that is genuinely still running is excluded via
+        ``list_running()`` so an active queue job is never finalised.
+
+        Returns:
+            The number of work entries finalised.
+        """
+        live_work_ids = {
+            row.get("work_id")
+            for row in get_worker(self._config).list_running()
+            if row.get("work_id")
+        }
+        ghosts = [
+            entry
+            for entry in self._off_queue_active_entries()
+            if entry.get("id") and entry["id"] not in live_work_ids
+        ]
+        return self._finalise_ghost_entries(ghosts)
+
+    def reconcile_orphaned_entries_once(self) -> int:
+        """Run :meth:`reconcile_orphaned_entries` at most once per process.
+
+        Called from the UI entry script at startup, BEFORE the worker loop is
+        (re)started. At that point this process has launched nothing, so any
+        in-flight work entry is a ghost from a previous (killed) process and is
+        safe to finalise. The :data:`_ORPHAN_RECONCILE_DONE` module guard makes
+        repeat calls (every Streamlit re-run, every new browser session) no-ops,
+        so a session opened mid-run never finalises a live job.
+        """
+        global _ORPHAN_RECONCILE_DONE
+        if _ORPHAN_RECONCILE_DONE:
+            return 0
+        _ORPHAN_RECONCILE_DONE = True
+        try:
+            finalised = self.reconcile_orphaned_entries()
+        except Exception:
+            logger.warning("Startup orphan reconcile failed (continuing)", exc_info=True)
+            return 0
+        if finalised:
+            logger.info("Startup reconcile finalised %d orphaned work entry(ies)", finalised)
+        return finalised
 
     # ── Planning operations ──
 

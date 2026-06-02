@@ -386,7 +386,7 @@ async def _refine_plan_with_llm(
 # ── Section router (Tier A → Tier B fan-out) ─────────────────────────────────
 
 
-def _section_router(state: OnboardingGraphState) -> list[Send]:
+def _section_router(state: OnboardingGraphState) -> list[Send] | str:
     """Fan out one ``Send("section_worker", ...)`` per planned section.
 
     The router resolves each section's bounded fragment HERE (via
@@ -401,7 +401,11 @@ def _section_router(state: OnboardingGraphState) -> list[Send]:
     """
     sections = list(state.get("sections", []) or [])
     if not sections:
-        return []
+        # No sections planned (degenerate/empty manifest, or a refine step that
+        # produced an empty plan). Route straight to assembly: returning an
+        # empty Send list would leave ``doc_manager`` with no outgoing edge and
+        # hang the graph indefinitely. ``assemble_docs`` handles zero sections.
+        return "assemble_docs"
 
     manifest_dict: dict[str, Any] = state.get("manifest") or {}
     # ``_section_router`` is a plain conditional-edge function and cannot read
@@ -691,10 +695,12 @@ def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
 # ── Graph builder ────────────────────────────────────────────────────────────
 
 
-#: Destinations of the doc manager's ``_section_router`` (one ``Send`` per
-#: section → ``section_worker``). Hoisted so the half-builder and the composed
-#: onboarding graph share ONE route-map literal.
-SECTION_ROUTE_MAP: list[str] = ["section_worker"]
+#: Destinations of the doc manager's ``_section_router``: one ``Send`` per
+#: section → ``section_worker``, OR a direct hop to ``assemble_docs`` when the
+#: plan has zero sections (an empty Send list would dead-end the graph). Hoisted
+#: so the half-builder and the composed onboarding graph share ONE route-map
+#: literal.
+SECTION_ROUTE_MAP: list[str] = ["section_worker", "assemble_docs"]
 
 
 def add_synthesis_nodes_and_edges(graph: StateGraph) -> None:
