@@ -1,408 +1,429 @@
 # Project Definition
 
-### Domain: spine.agents
-
-The `spine.agents` domain provides fundamental agent infrastructure and utilities within the Spine ecosystem. This domain encompasses the core components necessary for building and managing autonomous agents across different technology stacks.
-
-**Purpose:**
-
-The primary purpose of `spine.agents` is to establish a standardized foundation for agent-based systems, enabling consistent development patterns and shared functionality across Python and TypeScript implementations.
-
-**Key Components:**
-
-This domain implements:
-- **Core Agent Classes**: Fundamental agent types and interfaces that define the base behavior for all agents
-- **Agent Utilities**: Helper functions and tools for agent initialization, configuration, and management
-- **Agent Methods**: Shared behavioral implementations that agents can inherit or compose
-
-**Technical Scope:**
-
-The domain supports both Python and TypeScript technologies, ensuring cross-platform compatibility and consistent agent behavior regardless of implementation language. With 63 classes/interfaces, 200 functions, and 90 methods, this domain provides substantial infrastructure for agent-related functionality.
-
-**Integration Points:**
-
-As a foundational domain, `spine.agents` integrates with other Spine subsystems to provide agent orchestration, messaging, and lifecycle management capabilities.
-
-## Domain: spine.workflow
-
-The `spine.workflow` domain provides workflow orchestration capabilities. It is implemented by the `spine/workflow` module, which exposes 188 symbols including 12 classes/interfaces, 162 functions, and 14 methods.
-
-**Purpose**: Enable the definition, execution, and management of business workflows across Python and TypeScript environments.
-
-**Key Components**:
-- **Classes/Interfaces (12)**: Define workflow structures, execution contexts, and state management abstractions
-- **Functions (162)**: Provide workflow construction, transformation, and utility operations
-- **Methods (14)**: Handle workflow instance lifecycle and execution control
-
-## Domain: spine.work
-
-spine.work is a comprehensive framework designed to streamline enterprise application development by providing essential architectural components and utilities. The domain encompasses a robust set of 15 classes and interfaces, supplemented by 108 functions and 48 methods, totaling 171 symbols that serve as the foundation for building scalable applications.
+## Domain: spine.agents
 
 ### Purpose
-
-The primary purpose of spine.work is to offer developers a standardized toolkit that facilitates the creation of maintainable, testable, and high-performance enterprise software. It achieves this by providing common patterns and best practices into reusable modules.
-
-### Implementation
-
-The spine.work domain is implemented through the `spine/work` module path, which aggregates all necessary components to support enterprise development workflows. This module serves as the central hub for developers, providing direct access to core functionalities such as:
-
-- **Architectural | Classes and Interfaces**: Define contracts and base implementations for application components.
-- **Functions**: Provide utility operations and helper methods for common tasks.
-- **Methods**: Enable object-oriented behaviors within the defined classes and interfaces.
-
-By leveraging spine.work, development teams can accelerate their delivery cycle while maintaining consistency across different projects and teams. The domain's technology stack support includes both Python and TypeScript, ensuring flexibility for diverse development environments.
-
-## tests.unit Domain
-
-The `tests.unit` domain is responsible for **software unit testing within the project**. It provides a comprehensive testing framework implemented in Python and TypeScript, enabling developers to validate individual components and functions in isolation.
-
-### Purpose
-This domain ensures code quality and reliability by offering tools and structures for creating, organizing, and executing unit tests. It serves as the foundation for automated testing practices across the project.
-
-### Key Modules
-The domain is implemented through modules located in the `tests/unit` directory, containing:
-- **264 classes/interfaces** for test organization and mocking
-- **527 test functions** for individual test cases
-- **976 test methods** for detailed verification logic
-
-These modules collectively provide the infrastructure needed for developers to write robust, isolated unit tests for both Python and TypeScript components.
-
-## Domain: spine.persistence
-
-The `spine.persistence` domain provides data persistence capabilities for the Spine framework. Located at `spine/persistence`, this domain comprises 44 symbols including 4 classes/interfaces, 5 functions, and 35 methods. It implements the core persistence infrastructure, enabling reliable storage and retrieval mechanisms for domain objects. This domain interfaces with both Python and TypeScript technology stacks, ensuring consistent persistence behavior across different runtime environments.
-
-## Domain: spine.ui
-
-The `spine.ui` domain provides a cross-language UI framework implementation spanning both Python and TypeScript environments. This domain serves as the foundational user interface layer responsible for rendering, interaction management, and component orchestration.
-
-### Purpose
-The primary purpose of `spine.ui` is to deliver consistent, high-performance user interface components that abstract platform-specific rendering details while maintaining native capabilities. It enables developers to build responsive interfaces through a unified API that works across technology stacks.
-
-### Implementation Modules
-- **spine/ui** - Core implementation module containing 78 symbols total (2 classes/interfaces, 66 functions, and 10 methods) that collectively handle UI component lifecycle, event propagation, rendering pipelines, and state management.
-
-### Technology Stack Integration
-This domain directly supports both Python and TypeScript targets, ensuring UI consistency whether deployed in backend services, desktop applications, or web environments.
-
-## Domain: spine.ui_api
-
-The `spine.ui_api` domain defines the core user interface API contracts and service interfaces for the Spine framework. This module serves as the foundational abstraction layer providing standardized interfaces for UI components, ensuring consistency across different implementation layers.
-
-### Purpose
-The primary purpose of `spine.ui_api` is to establish a clear contract between UI consumers and UI providers, enabling loose coupling and facilitating. It defines the structural and behavioral expectations for user interface interactions without prescribing specific implementation strategies.
-
-### Implementation
-All functionality is contained within the `spine/ui_api` directory, where 51 methods and 1 class/interface are defined to establish a comprehensive API surface. The domain encompasses both Python and TypeScript technologies, supporting cross-platform UI integration scenarios.
-
-### Key Characteristics
-- **Interface-heavy**: Focuses on defining contracts rather than concrete implementations
-- **Technology-Agnostic**: Supports multiple runtime environments through polyglot implementation
-- **Extensible**: Provides a stable foundation for future UI module development
-
-## Domain: tests.integration
-
-The `tests.integration` domain encompasses integration testing capabilities. This domain is implemented by the `tests/integration` module path and contains 115 symbols including 22 classes/interfaces, 32 functions, and 61 methods.
-
-### Purpose
-Integration tests verify that multiple components work together correctly as a system. This domain provides the scaffolding framework, utilities, and test cases needed to validate end-to-end workflows and cross-module interactions within the project.
+This domain encapsulates agent-related functionality, likely defining the structure and behavior of autonomous or AI-powered agents within the project's ecosystem.
 
 ### Modules
-- **tests.integration** - Primary implementation module containing all integration testing infrastructure and test suites
+The `spine.agents` module is located at `spine/agents` and comprises 353 symbols. It includes:
+- **63 classes/interfaces** that likely define core agent models, protocols, and type contracts.
+- **200 functions** that probably contain utility and factory methods for agent instantiation and management.
+- **90 methods** embedded within classes to implement specific agent behaviors and interactions.
 
-: ## Domain: spine.models
-
-This domain provides a set of reusable models and utilities that serve as the foundational data structures across the application. It defines the core entities and common behaviors, enabling consistency and type safety throughout the codebase.
-
-### Purpose
-- Centralized location for fundamental data models.
-- Provides 25 symbols (20 classes/interfaces, 3 functions, and 2 methods) to support diverse domain needs.
-- Acts Python and TypeScript implementations, ensuring cross-language consistency.
-
-### Key Modules
-- `spine/models`: The primary module containing all model definitions and related utilities.
-
-### Boundary Considerations
-- This domain is strictly for **models and basic utilities**; avoid placing business logic or services here.
-- Serves content should be self-contained and have minimal dependencies on other internal modules.
-- Designed to be consumed by other domains such as spine8n.Focus, spine.infrastructure, and spine.application.
-
-## Domain: spine.git
-
-The `spine.git` domain encapsulates Git version control integration capabilities. It provides the foundational Git operations needed for managing repositories, commits, branches, and other version control features.
-
-### Purpose
-This domain serves as the interface layer between the spined system and Git operations, enabling programmatic to interact with Git repositories programmatically.
-
-### Modules
-| Module | Path | Description |
-|--------|------|-------------|
-| spine.git | spine/git |
-
-### Implementation Details
-- **Symbols**: 18 total (2 classes/interfaces, 2 functions, 14 methods)
-- **Technology Stack**: Python, TypeScript
-
-This domain acts as a bridge between the application and Git functionality, providing version control operations through a standardized interface.
-
-## Domain: spine.config.py
-
-The `spine.config.py` domain provides configuration management capabilities for Python-based spine
-applications
-This domain is implemented by the module `spine/config.py` which contains 16 symbols:
-
-- **3 classes/interfaces** - Core abstractions for configuration handling
-- **4 functions** - Public API for configuration operations
-- **9 methods** - Implementation details across the configuration classes
-
-### Purpose
-
-This domain serves as the foundational configuration layer that enables other parts of the
-project to manage settings, parameters, and runtime configurations in a structured way.
-
-### Boundaries
-
-The `spine.config.py` domain:
-- Exposes a clean configuration API for consumers within the project
-- Encapsulates all Python-specific configuration logic
-- Maintains with the broader project configuration infrastructure
-
-### Technology Stack
-
-This domain utilizes both Python and TypeScript, with `spine/config.py` being the primary
-Python implementation for configuration management.
-
-## Domain: spine.exceptions.py
-
-### Purpose
-The `.exceptions.py domain provides centralized exception handling and error management capabilities for the spine framework. It defines a comprehensive hierarchy of custom exception classes and interfaces that standardize error representation and propagation across the system.
-
-### Implementation Modules
-| Module | Path | Responsibility |
-|--------|------|----------------|
-| spine.exceptions.py | spine/exceptions.py | Primary implementation containing 13 exception classes/interfaces and 4 methods for handling framework-specific error scenarios |
-
-### Technology Stack
-- Python
-- TypeScript
-
-This domain serves as the foundational error handling layer for the framework operations.
-
-# Domain: spine.phases
-
-The `spine.phases` domain provides functional phase management utilities that enable the definition, execution, and orchestration of sequential or parallel processing workflows. This domain serves as the backbone for controlling the lifecycle of operations, ensuring predictable state transitions and clean separation of concerns across execution stages.
-
-## Purpose
-The core purpose of `spine.phases` is to offer lightweight, composable functions that allow developers to:
-- Define discrete processing phases with clear boundaries and responsibilities
-- Execute phases in either sequential or parallel configurations
-- Manage phase dependencies and data flow between stages
-- Provide hooks for pre/post-phase actions without coupling business logic
-
-This domain operates as a foundational layer that higher-level components depend on for orchestrating accurate workflow orchestration, particularly in scenarios requiring audit trails, deterministic behavior, or testable execution paths.
-
-## Modules & Implementation
-The entire `spine.phases` domain is implemented through a single module located at:
-
-- **`spine/phases`** – Contains 14 pure functions that collectively manage all phase-related behaviors including phase definition, scheduling, running, and result aggregation. The module is language-agnostic in design, with implementations available in both Python and TypeScript as specified in the tech stack.
-
-No classes or interfaces are exposed; all functionality centers around function functions that can be piped
+This domain serves as the foundational layer for any component that requires agent capabilities, acting as the spine centralized reference for agent logic across the system.
 
 ## Domain: spine.cli
 
-The `spine.cli` domain provides command-line interface functionality for the Spine project. This domain is implemented through a collection of 16 functions located in the `spine/cli` module path, with no classes or interfaces required. The functions within this domain handle all user-facing command-line interactions, argument parsing, and output formatting necessary for the Spine system's operability.
-
-**Module Implementation:**
-- `spine/cli`: Contains 16 CLI-specific functions that directly implement the command-line interface capabilities
-
-This domain serves as the primary user interaction layer for Spine's command-line operations, enabling users to execute system commands, configure operations, and receive structured feedback through terminal-based interfaces.
-
-## spine Exchange: spine.mcp\n\nAnThe `.mcp domain is responsible for managing the Model Context Protocol (MCP) communication layer within the Spine framework. It serves as the bridge between external MCP clients and the internal domain logic, enabling seamless integration and data exchange through standardized protocols.\n\n### Purpose\n\nThis domain abstracts the complexities of MCP message handling, providing a clean interface for registering capabilities, processing requests, and managing session state. It ensures that MCP interactions are decoupled-fluid, type-safe, and compatible with both Python-based backend services and TypeScript-based client applications.\n\n### Modules\n\nThe spine.mcp module is implemented at `spine/mcp` and consists of 12 function-level symbols that collectively handle:\n- Capabilityn MCP initialization and lifecycle management\n- Ability registration and capability negotiation\n- Request routing and response serialization\n- Session context propagation\n- Protocol compliance validation\n- Error handling and telemetry reporting\n\nAll functionality is exposed through pure functions without classes or interfaces, promoting a functional programming approach that integrates cleanly with the broader spine domain-driven design of the Spine framework.\n\n### Technology Stack\n\nThis domain leverages both Python (for server-side MCP service implementation) and TypeScript (for type-safe client-side protocol interactions), ensuring end-to-end type consistency across the MCP communication boundary.
-
-## Domain: spine.project
-
-The `spine.project` domain provides project management and configuration capabilities. This domain contains 4 functions that handle core project operations.
+The `spine.cli` domain provides a command-line interface for interacting with Spine. It is implemented by the `spine/cli` module, which exposes 16 functions and no classes or interfaces. This domain is written in Python.
 
 ### Modules
+- `spine/cli`: The CLI implementation module, containing 16 functions that provide the command-line interface functionality.
 
-| Module | Path | Role |
-|--------|------|------|
-| spine.project | spine/project | Contains 4 project management functions |
+## Domain: spine.config.py
 
-### Purpose
-This domain serves as the foundational layer for project-related functionality, enabling configuration management, project initialization, and operational utilities required by other system components.
+The `spine.config.py` domain provides centralized configuration management for Python components within the Spine ecosystem. This module serves as the foundation for managing application settings, environment variables, and runtime configuration across different deployment contexts.
 
-## Domain: `tests.conftest.py`
+**Purpose:** 
+- Abstract configuration complexity from business logic
+- Provide type-safe configuration access
+- Support multiple configuration sources (files, environment variables, defaults)
+- Enable consistent configuration patterns across Python services
 
-This domain encompasses the test configuration and fixture management layer for the project. It centralizes pytest setup, lifecycle hooks, and shared test utilities to ensure consistent and maintainable testing practices.
+**Core Implementation:** `spine/config.py`
+This single module implements the entire `spine.config.py` domain with:
+- **3 classes/interfaces**: Core abstractions for configuration entities
+- **4 functions**: Public API for configuration operations
+- **9 methods**: Internal implementation details supporting the configuration lifecycle
 
-### Purpose
-The `tests.conftest.py` module serves as the backbone of the project's testing infrastructure. It defines fixtures used across multiple test files, configures test-wide settings, and implements hooks that control test execution behavior (e.g., setup/teardown logic, reporting, or conditional skipping).
-
-### Implemented Modules
-- `tests/conftest.py`: The sole module in this domain, containing 11 functions that provide:
-  - Pytest fixtures for mocking, data generation, and environment configuration.
-  - Custom test hooks for controlling test flow.
-  - Shared utilities for test isolation and resource cleanup.
-
-This domain is critical for enabling scalable and modular testing, allowing individual test modules to consume pre-configured dependencies without duplicating setup logic.
-
-### Technology Context
-Python (pytest framework), with potential TypeScript test counterparts in adjacent domains.
-
-## Domain: tests.fixtures
-
-The `tests.fixtures` domain provides test data management and mock object generation capabilities. It encompasses 6 symbols including 2 classes/interfaces, 2 functions, and 2 methods. This domain serves as a foundational layer for creating consistent, reproducible test environments across both Python and TypeScript implementations.
-
-## Domain: tests.test_core.py
-
-This domain encompasses the core testing infrastructure for the project. It provides comprehensive validation mechanisms for the system's fundamental components.
-
-**Purpose:**
-The `tests.test_core.py` module serves as the primary testing framework, ensuring that core functionalities operate as intended through structured test cases and validation procedures.
-
-**Implemented Modules:**
-- `tests/test_core.py`: Houses 13 symbols including 1 class/interface and 12 methods, forming the backbone of the testing infrastructure.
-
-## Domain: tests.test_restart.py
-
-**Purpose:** This domain contains unit tests for verifying the restart functionality of the application. It ensures that restarting the application or services behaves as expected under various conditions.
-
-**Modules:**
-- `tests/test_restart.py`: This test module includes 25 symbols (5 classes/interfaces, 3 functions, and 17 methods) that collectively validate restart behaviors. It is written in Python and is part of the test suite for the project.
-
-## Domain: tests.recall_eval
-
-The `tests.recall_eval` domain encompasses a suite of testing utilities designed to validate recall evaluation functionality within the project. This domain is implemented entirely through a collection of functions, with no classes or interfaces, providing modular and focused testing capabilities.
-
-### Purpose
-The primary purpose of this domain is to ensure the correctness and reliability of recall evaluation mechanisms by providing comprehensive test coverage through function-based implementations.
-
-### Implementation Modules
-- **tests/recall_eval**: The sole module in this domain, containing 15 functions that implement all testing logic for recall evaluation scenarios. The module structure follows a flat hierarchy with no class-based encapsulation, emphasizing direct function-based testing approaches.
-
-## Domain: tests.test_work_ordering.py
-
-This domain contains the test suite for verifying work ordering functionality.
-
-### Purpose
-- Validates correct sequencing and execution order of work operations
-- Ensures work items are processed in the intended sequential manner
-
-### Implementing Modules
-- `tests/test_work_ordering.py`: Contains 1 class with 8 test methods that verify work ordering behavior
-
-### Technical Context
-- Primary implementation: Python
-- Related technologies: TypeScript (potentially native extensions)
-
-## Domain: tests.smoke
-
-This domain encompasses smoke tests implemented in both Python and TypeScript. It provides basic validation to ensure core functionality works as expected, serving as an initial quality gate for the project. The "tests.smoke" module contains 2 function symbols (no classes or interfaces) that implement this testing capability.
-
-## Domain: scratch.test_explore_flash.py
-
-This domain provides exploratory
-
-- **Module**: `scratch/test_explore_flash.py`
-- **Symbols**: 0 classes/interfaces, 3 functions, 0 methods
-
-no additional domain context is available for this module.
-
-## Domain: alembic.env.py
-
-The `alembic.env.py` domain encapsulates the environment configuration for database migrations using Alembic. This module serves as the primary entry point for Alembic's migration engine, defining the runtime environment setup and configuration loading mechanism.
-
-### Purpose
-
-This domain is responsible for:
-- Initializing the migration context and configuration
-- Loading database connection settings from external configuration sources
-- Providing the `run_migrations_online()` and `run_migrations_offline()` functions that control how migrations are executed
-
-### Implementation
-
-Implemented by the following module:
-- **`alembic/env.py`** – Contains the core implementation with 2 functions that define the migration execution environment
-
-These functions collectively enable Alembic to perform database schema migrations in either online (connected to database) or offline (generate SQL without execution) modes.
-
-## Domain: alembic.versions
-
-The `alembic.versions` domain provides utilities for managing Alembic database migration versions. It contains modules that implement functions for:
-- Handling version directory operations
-- Managing migration script discovery
-
-This domain is implemented by modules in the `alembic/versions` path and exposes 2 key functions for version management operations.
-
-**Purpose**: Enable programmatic access to Alembic migration version discovery and directory management within Python and TypeScript environments.
-
-**Modules**
-- `alembic.`: Core implementation providing 2 functions for version handling operations.
-
-## Domain: spine.observability.py
-
-The `spine.observability.py` domain is responsible for providing observability capabilities within the Python ecosystem of the Spine framework. This domain focuses on exposing internal framework metrics, tracing information, and operational insights through a clean Python interface.
-
-### Purpose
-This domain enables Python applications built on Spine to monitor, debug, and analyze their runtime behavior by providing structured access to observability observability
-- **Metrics**: Quantitative measurements of system performance and resource utilization.
-- **Tracing**: End-to-end tracking of request flows and operation sequences.
-- **Operational Insights**: Contextual data for understanding system behavior and diagnosing issues.
-
-### Implementation Modules
-The domain is implemented by the following module:
-
-- **`spine/observability.py`**: The primary module containing 2 functions that expose observability data and utilities for Python applications. This module serves as the main interface for developers seeking to integrate Spine's observability features into their Python services.
-
-### Technology Context
-This domain utilizes components from the broader Spine technology stack, specifically leveraging Python as the implementation language while maintaining alignment with TypeScript-based observability (Card) infrastructure components.
-
-## spine Domain: spine.services
-
-The `spine.services` domain provides the service infrastructure for the Spine application framework. This module contains 6 symbols (1 class/interface plus 5 methods) that work together to implement service-related functionality within the framework. The domain is implemented in TypeScript and supports the overall service orchestration within the larger Spine ecosystem.
+The module handles parsing, validation, and access patterns for configuration data, ensuring components can reliably retrieve their settings without direct dependency on configuration sources.
 
 ## Domain: spine.critic
 
-The `spine.critic` domain provides a single, focused function for evaluating and validating content or data structures. Implemented in Python and TypeScript, this module serves as a utility layer for quality assessment within the broader system.
+The `spine.critic` module provides a single function for performing criticism operations within the spine1 framework. Located at `spine/critic`, this domain is implemented in both Python and TypeScript.
 
-**Purpose:**
-- Deliver a centralized interface for content criticism and validation logic
-- Support cross-platform consistency through dual-language implementation
+- **Purpose**: Execute criticism functionality
+- **Implementation**: Contains 1 function symbol
+- **Technology**: Supports both Python and TypeScript implementations
 
-**Key Module:**
-- `spine/critic` — exposes the primary function symbol for criticism operations
+## Domain: spine.exceptions.py
 
-This domain operates independently of other system components and is designed to be embedded or invoked by higher-level services requiring validation or evaluation capabilities.
+The `spine.exceptions.py` domain provides a centralized exception handling framework within the Python component of the system. Located at `spine/exceptions.py`, this module implements 13 classes/interfaces and 4 methods dedicated to managing error conditions and exceptional states.
+
+This domain serves as the foundation for consistent error handling across the application, enabling developers to define, raise, and catch domain-specific exceptions with standardized behavior. The module is a critical infrastructure component written in Python, supporting the broader TypeScript-based system through well-defined exception contracts.
+
+### spine.git
+
+The **spine.git** domain provides a framework for building Git-integrated applications. It establishes the foundational abstractions for Git object modeling, reference management, and repository operations, serving as the core library that higher-level Git workflows depend upon.
+
+This domain implements:
+- A Git object model with type-safe interfaces for commits, trees, blobs, and tags
+- Reference management for branches, HEAD, and remote tracking
+- Repository-level operations with lazy loading and memory-efficient traversal
+
+The implementation is split across Python and TypeScript modules, reflecting the polyglot nature of the framework where Git operations can be executed natively or compiled to JavaScript for web environments. This dual-language approach allows the same domain logic to power both CLI tools and browser-based Git visualizations.
+
+Key components include the `Git` class as the primary entry point, `Commit`, `Tree`, and `Blob` classes for object representation, and utilities for OID parsing, content decoding, and reference resolution.
 
 ## Domain: spine.log.py
 
+The spine `spine.log.py` domain is implemented by the module located at `spine/log.py`. This module delivers logging functionality through a single exported symbol: a function that enables consistent, centralized log message generation across the system. The module serves as the foundation for structured, traceable output in the Python execution context, aligning with the broader TypeScript orchestration layer. Its scope is strictly limited to Python-side logging concerns and does not include formatting, routing, or consumer-specific logic, which are delegated with other components in the architecture.
+
+**Key Implementation Module:**
+- `spine/log.py` – Contains the core logging function that provides the `spine.log.py` interface.
+
+## Domain: spine.mcp
+
+The `spine.mcp` domain is implemented by the `spine/mcp` module. It exposes 12 functions and no classes or interfaces, focusing on providing MCP (Machine Code Processing) capabilities. This domain is part of the larger project built with Python and TypeScript.
+
+### Module Roles
+
+- **spine.mcp**: Located at `spine/mcp`, this module implements the core MCP functionality through a collection of 12 standalone functions, serving as the primary interface for machine code processing operations.
+
+## Domain: spine.models
+
 ### Purpose
-The spine `spine.log.py` domain provides a foundational Python logging facade
-interface used throughout the project. It encapsulates basic logging
-capabilities
-capabilities within a single function exposed via `spine/log.py`.
+The `spine.models` domain provides core data structures and type definitions used across the project. It centralizes model-related functionality to ensure consistency and type safety in both Python and TypeScript implementations.
+
+### Modules
+- **spine.models**: Contains 20 classes/interfaces, 3 functions, and 2 methods that implement the core modeling capabilities. Located at `spine/models`, this module serves as the primary implementation of the models domain.
+
+### Technology Stack
+Python and TypeScript are used to deliver cross-platform type definitions, enabling seamless integration across different technology stacks within the project.
+
+## Domain: spine.observability.py
+
+The `spine.observability.py` domain provides observability with the means tools and interfaces required by the Python components of the system. This module serves as the foundational layer layer, enabling debugging, monitoring, and telemetry collection across Python-based services.
+
+This domain currently implements:
+- **2 Functions**: Core utility functions that support logging, metric collection, and trace propagation for Python services, ensuring consistent observability across the application stack.
+
+The module operates within a technology ecosystem that includes both Python and TypeScript, though this specific domain is exclusively concerned with Python runtime observability concerns.
+
+## Domain: spine.persistence
+
+The `spine.persistence` domain provides data persistence capabilities for application state management. This domain encapsulates all interactions with data storage systems, ensuring the details of data serialization, deserialization, and storage mechanisms from the core application logic.
+
+### Purpose
+
+This domain serves as the persistence layer in the architecture, responsible for:
+- Managing the storage and retrieval of application data
+- Providing abstraction over different storage backends
+- Ensuring data consistency and integrity
+- Handling data migration and versioning
 
 ### Implementation
-The domain is implemented by a single module:
 
-- **`spine/log.py`**: Exposes a logging function symbol for consistent
-  application-wide log message handling.
+The `spine.persistence` module implements the persistence functionality with:
+- **Location**: `spine/persistence`
+- **Components**: 44 total symbols including:
+  - 4 classes/interfaces defining the core persistence contracts
+  - 5 functions for utility operations
+  - 35 methods implementing the actual persistence logic
 
-This domain serves as the primary conduit for logging concerns in the Python
-codebase, integrating with the broader tech stack that includes both
-Python and TypeScript components.
+### Technology Stack
 
-### Responsibilities
----
+This domain is implemented in both Python and TypeScript, providing cross-platform persistence capabilities.
+
+## Domain: spine.phases
+
+The `spine.phases` domain provides a collection of utility functions designed to support phase-based operations.
+
+This domain consists of a single module, `spine.phases`, which exports 14 function symbols. As a pure functional interface, it contains no classes or interfaces—only standalone functions that can be composed or invoked directly.
+
+The module serves as a foundational tooling layer, offering reusable logic likely related to workflow, lifecycle, or transformation phases across the project’s Python and TypeScript implementations.
+
+## spine.project
+
+The `spine.project` domain is a Python/TypeScript module that provides project-level abstractions and utilities.
+
+### Purpose
+This module serves as the foundational layer for project management within the system, handling core operations like project creation, validation, and configuration. It acts as the primary interface between high-level project workflows and lower-level implementation details.
+
+### Module Structure
+- **Path**: `spine/project`
+- **Language**: Python and TypeScript implementations
+- **Symbols**: 4 functions providing project-related operations
+
+### Key Functions
+The module exposes four main functions that cover essential project management tasks:
+1. Project initialization and setup routines
+2. Project validation and integrity checks
+3. Configuration loading and processing
+4. Project state management utilities
+
+This domain operates independently of other system components while providing stable APIs that other modules depend upon for project-scoped spine elements of the platform.
+
+## Domain: spine.services
+
+The `spine.services` domain provides core service management capabilities within the Spine framework. This domain is implemented through the `spine/services` module path and contains 6 symbols total - comprising 1 class or interface along with 5 methods that implement service-related functionality.
+
+### Purpose
+
+This domain serves as the foundation for service-oriented architecture patterns, enabling the registration, configuration, and lifecycle management of application services.
+
+### Implementation
+
+The `spine/services` module delivers these capabilities through:
+
+- **Service Registration**: Methods for registering and configuring services within the dependency injection container
+- **Service Discovery**: Interfaces for locating and retrieving service instances
+- **Lifecycle Management**: Methods controlling service initialization, startup, and shutdown sequences
+
+This domain operates within the broader Spine ecosystem to provide consistent service management across Python and TypeScript implementations.
+
+## Domain: spine.ui
+
+The `spine.ui` domain provides a comprehensive user interface framework designed to streamline the development of interactive applications. This domain serves as the primary interface layer, offering essential building blocks and utilities for creating responsive and dynamic user experiences.
+
+### Purpose
+The core purpose of `spine.ui` is to abstract complex UI interactions into manageable, reusable components. It bridges the gap between raw data and visual representation, ensuring that developers can focus on application logic rather than low-level UI manipulations.
+
+### Modules and Implementation
+The `spine.ui` module is implemented in the `spine/ui` directory and consists of:
+
+- **2 Classes/Interfaces**: These define the fundamental structures and contracts for UI components, establishing a consistent API for extension and integration.
+- **66 Functions**: A rich collection of utility and factory functions that handle rendering, event management, state manipulation, and component lifecycle. These functions provide the operational backbone of the UI system.
+- **10 Methods**: Behavioral implementations within classes or interfaces that define how UI elements respond to user actions and data changes.
+
+This modular structure ensures that `spine.ui` remains flexible, maintainable, and scalable, supporting both simple widgets and complex application interfaces through a unified programming model.
+
+## Domain: spine.ui_api
+
+The `spine.ui_api` is a Python/TypeScript API for building user interfaces in a speech recognition system. It contains 54 symbols total: 1 class or interface, and 53 methods implemented across the module. This domain provides the core infrastructure for composing and interacting with UI elements programmatically.
+
+## Domain: spine.work
+
+The `spine.work` domain provides the core workflow orchestration and execution framework for distributed task processing. It defines the abstractions and runtime components necessary to model, schedule, and execute work units across distributed systems.
+
+### Purpose
+
+`spine.work` serves as the foundation for building scalable, observable, and resilient task processing pipelines. It enables developers to define work units with explicit state transitions, dependency management, and failure handling strategies while abstracting away infrastructure concerns.
+
+### Key Modules
+
+- **spine.work** (`spine/work`): Contains 172 symbols implementing the domain:
+  - 15 classes/interfaces defining core contracts and data models
+  - 108 functions providing utilities for work lifecycle management
+  - 49 methods implementing state transitions and execution logic
+
+### Technology
+
+Implemented in both Python and TypeScript, supporting polyglot microservices architectures.
+
+## Domain: spine.workflow
+
+The `spine.workflow` domain provides a foundational workflow management system for orchestrating complex business processes. This domain encompasses 12 classes and interfaces, 162 functions, and 14 methods, totaling 188 symbols that enable the definition, execution, and monitoring of multi-step workflows.
+
+### Purpose
+This domain serves as the core orchestration layer within the Spine ecosystem, allowing developers to model business processes as directed graphs of discrete steps, manage state transitions, handle conditional branching, and coordinate dependent tasks across distributed systems.
+
+### Implementation Modules
+- **spine/workflow**: The primary module implementing all workflow-related functionality, housing the core abstractions for workflow definition, execution contexts, step processors, and runtime orchestration mechanisms.
 
 ## Domain: src.utils
 
-The `src.utils` domain provides a collection of utility functions that support common operations across the application. This module is designed to centralize no-classes-or-interfaces, offering straightforward, reusable functions that enhance code maintainability and reduce duplication. The primary objective of this domain is to centralize shared logic, making it easily accessible throughout the project.
+### Purpose
+The `src.utils` domain provides a collection of shared utility functions used across the project. These utilities are designed to be language-agnostic helpers that support common operations and cross-cutting concerns.
 
 ### Implemented Modules
+The following module implements this domain:
 
-- **`src/utils`**: Contains 1 utility function that performs a specific, generalized operation. This function is intended to be imported and used by other components in the application, ensuring consistent behavior and reducing the need for repeated implementations.
+- **src/utils**: A utility module containing 1 function that provides reusable logic for general-purpose operations. This module serves as the central location for helper functions that can be imported and used throughout the codebase.
+
+### Technical Notes
+This domain is implemented in both Python and TypeScript, ensuring consistent utility functionality across the project's polyglot architecture.
+
+---
+
+## Domain: tests.conftest.py
+
+### Purpose
+The `tests.conftest.py` domain provides centralized pytest configuration and shared fixtures for the test suite. This module consolidates
+'tests'
+ directory infrastructure to streamline test setup, teardown, and common test utilities.
+
+### Implementation Modules
+- **tests/conftest.py** — Contains 11 functions that implement the domain's functionality. This module serves as the primary location for pytest fixtures, configuration hooks, and test-wide setup logic. All functions in this module are directly accessible to test files within the `tests` directory.
+
+## Domain: tests.fixtures
+
+The `tests.fixtures` module provides a centralized location for managing test data and setup routines across the test suite. It serves as an organizational layer that abstracts away the complexity of creating consistent, reproducible test environments.
 
 ### Purpose
 
-The `src.utils` domain serves as the foundational layer for utility-related tasks, leveraging a multi-language approach with Python and TypeScript to accommodate diverse implementation needs. By isolating these utilities, the project promotes a clean, modular architecture where each function has a single responsibility and clear, well-defined inputs and outputs.
+This domain exists to:
+
+- **Centralize test data management**: Provide a single source of truth for test inputs, expected outputs, and sample datasets
+- **Standardize test setup**: Ensure all tests can access common fixtures through a uniform interface
+- **Reduce test duplication**: Eliminateardless of the implementation language (Python or TypeScript), tests reference the same fixture definitions
+
+### Implementation
+
+The domain is implemented through the `tests/fixtures` path structure and includes:
+
+- **Classes/Interfaces**: Core contract definitions that fixture how fixtures are structured and accessed
+- **Functions**: Utility methods for creating, loading, or manipulating test data
+- **Methods**: Instance behaviors that support fixture lifecycle management
+
+All fixtures are designed to work seamlessly across both Python and TypeScript testing environments, ensuring language-agnostic test data consistency.
+
+## Domain: tests.integration
+
+This domain encompasses integration testing capabilities implemented within the project. It serves as a dedicated testing layer that validates the interactions and integrations between different components of the system.
+
+### Purpose
+The integration test domain ensures that various system components work together as expected, verifying the correctness of interfaces, data flows, and service interactions that cannot be fully validated through unit tests alone.
+
+### Implementation
+The implementation resides in `tests/integration` and provides a comprehensive testing framework with:
+- **22 classes/interfaces** - defining test structures, mock objects, and assertion mechanisms
+- **32 functions** - utility functions for test setup, execution, and validation
+- **61 methods** - individual test methods and helper implementations across the test classes
+
+This domain is primarily implemented in Python and TypeScript, supporting cross-language integration testing scenarios.
+
+## Domain: tests.recall_eval
+
+The `tests.recall_eval` module provides evaluation utilities for testing recall performance in machine learning models. This domain focuses on implementing and validating how effectively models retrieve relevant items from large candidate sets.
+
+### Purpose
+This module exists to standardize extreme scale scenarios where traditional evaluation approaches become computationally prohibitive. It provides lightweight functions for assessing recall@K metrics without requiring full model re-execution or complete dataset traversal.
+
+### Implementation
+The domain is implemented through the `tests/recall_eval` directory, which exposes 15 functions for direct use in evaluation pipelines. These utilities handle:
+
+- **Metric Computation**: Functions for calculating precision, recall, and F1 scores at various K thresholds
+- **Result Validation**: Helpers Mark both relevant and irrelevant retrieval outcomes against ground truth data
+- **Performance Optimization**: Sampling and early-stopping strategies to reduce evaluation overhead
+- **Statistical Analysis**: Confidence interval estimation and significance testing for evaluation results
+
+### Boundaries
+This module operates strictly within the evaluation layer and does not modify model behavior or training procedures. It consumes precomputed embeddings or similarity scores and produces standardized metrics for comparison across different retrieval configurations.
+
+> **Note**: While implemented in Python per the tech stack, TypeScript wrappers may expose these evaluations through specific integration points defined in the broader project architecture.
+
+No classes or interfaces are exposed—only 15 standalone functions designed for composability in automated testing workflows.
+
+## Domain: tests.smoke
+
+The `tests.smoke` domain provides lightweight validation tests to verify basic system functionality. It contains 2 test functions implemented in Python that execute smoke checks across the codebase.
+
+**Purpose:**
+- Execute minimal test coverage to validate core system behavior
+- Provide rapid feedback on fundamental system health
+
+**Implementation:**
+- `tests/smoke/` - Directory containing smoke test modules and test functions
+
+## Domain: tests.test_core.py
+
+**Purpose:**
+
+The `tests.test_core.py` domain provides comprehensive unit testing for the core application logic. This test module ensures the reliability and correctness of fundamental system components through automated validation.
+
+**Implemented Modules:**
+
+- `tests/test_core.py` - Primary test implementation file containing test cases and validation logic for core functionality
+
+**Responsibilities                   Technical Stack:**
+
+- Python
+- TypeScript
+
+This domain serves as a critical quality assurance component, validating that core system behaviors operate as expected under various conditions and edge cases.
+
+## Domain: tests.test_restart.py
+
+### Purpose
+The `tests.test_restart.py` domain serves as a comprehensive test suite designed to validate the restart functionality within the system. Its primary purpose is to ensure that restart operations—whether initiated manually or automatically—are executed reliably, maintaining system integrity and state consistency.
+
+### Implemented Modules
+- **tests/test_restart.py**: The primary test module containing all test cases and assertions. This module is responsible for:
+  - Verifying correct initialization of restart processes
+  - Testing error handling during failed restart attempts
+  - Validating state restoration post-restart
+  - Ensuring proper cleanup of temporary resources
+  - Confirming integration points with core system components
+
+### Technical Stack
+- Python: Used for test implementation and execution
+- TypeScript: Referenced in project context but not directly involved in this test domain
+
+### Scope Boundaries
+This domain is strictly limited to testing restart-related functionality. It does not cover:
+- Core restart implementation logic (handled by other domains)
+- User interface components
+- Database persistence layer (unless directly related to restart state)
+- Networking protocols unrelated to restart coordination
+
+### tests.test_work_ordering.py
+
+This domain validates the behavior of work ordering within a task scheduling system. The primary purpose is to ensure that tasks are processed in the correct sequence based on their dependencies and priority levels.
+
+#### Purpose
+The `tests.test_work_ordering.py` module contains unit tests that verify the correctness of work ordering logic. These tests simulate various scenarios where tasks have different dependencies and priorities, checking that the system's ordering mechanism produces the expected sequence.
+
+#### Implementation Modules
+| Module | Role | Symbols |
+|--------|------|---------|
+| `tests.test_work_ordering.py` | Contains test cases for work ordering functionality | 1 class, 8 methods |
+
+## Domain: tests.unit
+
+This domain encompasses the isolated unit testing infrastructure for the project, providing a framework to validate individual components independently. The `tests.unit` module serves as the central test suite, containing 1786 symbols across 267 classes/interfaces, 527 functions, and 992 methods, enabling comprehensive coverage of discrete functionalities.
+
+**Implemented Modules:**
+- `tests.unit`: Core testing module located at `tests/unit`, structured to support both Python and TypeScript implementations through its dual-language tech stack.
+
+## Domain: alembic.env.py
+
+The `alembic.env.py` domain encapsulates database migration configuration and execution logic using the Alembic framework. This domain is responsible for managing database schema changes through version-controlled migrations, providing both offline and online migration capabilities.
+
+### Purpose
+This domain serves as the central configuration point for database migrations, defining:
+- Migration script locations and naming conventions
+- Database connection configurations
+- Migration execution modes (offline vs)
+- Custom migration overrides and hooks
+
+### Implemented Modules
+| Module | Path | Role | Symbols |
+|--------|------|------|---------|
+| alembic.env.py | alembic/env.py | Primary migration environment configuration | 2 functions |
+
+## Domain: alembic.versions
+
+The **alembic.versions** domain provides version management capabilities for database schema migrations. It serves as a foundational layer for tracking and organizing migration script versions.
+
+### Purpose
+This domain exists to:
+- Manage version identifiers for database migration scripts
+- Provide programmaticence version-related utilities within the migration workflow
+- Support the broader alembic migration system
+
+### Implementing Modules
+The domain is implemented by:
+- **`alembic.`** (path: `alembic/versions`): Contains 2 function symbols that provide version-related functionality
+
+### Technology Stack
+This domain utilizes: Python, TypeScript
+
+## Domain: scratch.test_explore_flash.py
+
+### Purpose
+
+This domain provides a testing utility for exploring Flash-based functionality. It enables developers to investigate and validate Flash-related operations through a dedicated test script located at `scratch/test_explore_flash.py`.
+
+### Implementation Modules
+
+| Module | Path | Role Summary |
+|--------|------|---------------|
+| `scratch.test_explore_flash.py` | `scratch/test_explore_flash.py` | Contains 3 functions that support Flash exploration testing (0 classes/interfaces, 0 methods) |
+
+### Technology Stack
+
+- Python
+- TypeScript
+
+Note: Specific function implementations are not documented in this definition. See the source file for detailed behavior.

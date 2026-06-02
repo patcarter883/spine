@@ -2,19 +2,16 @@
 
 ## Assistance Overview
 
-This repository contains 225 files spanning 2989 symbols across 31 modules. The ten largest modules (`spine.agents`, `spine.cli`, `spine.config.py`, `spine.exceptions.py`, `spine.git`, `spine.mcp`, `spine.models`, `spine.persistence`, `spine.phases`, `spine.ui`) each contain only 8 symbols, indicating they are reasonably sized and can be safely read in full when needed.
+This repository is moderately 225 files spanning 31 modules with 3,011 total symbols across Python and TypeScript. The codebase is moderate in size, but passes the vector index is unavailable; queries are AST-only and lack summaries—making strategic file selection essential.
 
-Key constraints:
-- Vector index unavailable: querying falls back to AST-only search
-- Context budget should prioritize modules directly related to the task;
-- For unrelated areas, rely on indexed references rather than full file reads.
+The largest modules are evenly balanced at 8 symbols each: `spine.agents`, `spine.cli`, `spine.config.py`, `spine.exceptions.py`, `spine.git`, `spine.mcp`, `spine.models`, `spine.persistence`, `spine.phases`, and `spine.ui`. These constitute 80% of the total module count despite containing minimal symbol density individually. Context budget should prioritize these core modules over less-traveled paths.
 
-Tech stack: Python and TypeScript.
+With only 6 patterns indexed, few abstractions exist to guide navigation. Rely instead on targeting specific modules aligned with task domains—particularly
+"}          "agent behaviors" (spine.agents), "configuration" (spine.config.py), "data flow" (spine.models), or "UI interactions" (spine.ui). Avoid scanning unrelated modules to conserve token allocation.
 
 ## Hot Spots & Budget Guidance
-
-**Module Size Limits:** All modules are at 8 symbols (~20–30 lines). The 10 largest (`spine.agents`, `spine.cli`, `spine.config.py`, `spine.exceptions.py`, `spine.git`, `spine.mcp`, `spine.models`, `spine.persistence`, `spine.phases`, `spine.ui`) follow this ceiling. **Guidance
-
-**Context Budget Rule:**   When an assistant needs information from a module, prefer using the codebase index rather than reading the file directly. Due to the vector index being unavailable (AST-only, no summaries), Avoid loading full context for these modules unless absolutely necessary.
-
-**Analysis Notes:** Use the index to locate exported symbols and call sites; only open files for detailed line-level inspection.
+|
+*Avoid loading the following high-symbol modules in full: spine.agents (8), spine.cli (8), spine.config.py (8), spine.exceptions.py (8), spine.git (8), spine.mcp (8), spine.models (8), spine.persistence (8), spine.phases (8), spine.ui (8).*)
+*
+*Use the codebase index for navigation; vector index unavailable — AST-only, no summaries available
+*
