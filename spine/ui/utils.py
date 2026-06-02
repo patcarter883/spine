@@ -69,6 +69,29 @@ def truncate(text: str, max_len: int = 100) -> str:
     return text[: max_len - 3] + "..."
 
 
+def normalize_artifacts(artifacts: object) -> list[tuple[str, str]]:
+    """Normalize a persisted ``result["artifacts"]`` value into display rows.
+
+    Two shapes are persisted in the wild: the workflow dispatcher stores a
+    ``{phase: [names]}`` mapping (see ``dispatcher.py``), while onboarding
+    stores a flat ``[names]`` list (see ``onboarding/engine.py``). Returns a
+    list of ``(label, text)`` rows that render identically for either shape —
+    ``label`` is the phase name for the mapping shape and empty for the
+    flat-list shape, so callers can render ``"{label}: {text}"`` or just
+    ``"{text}"`` when the label is empty.
+    """
+    if isinstance(artifacts, dict):
+        rows: list[tuple[str, str]] = []
+        for phase, names in artifacts.items():
+            text = ", ".join(str(n) for n in names) if isinstance(names, list) else str(names)
+            rows.append((str(phase), text))
+        return rows
+    if isinstance(artifacts, list):
+        return [("", ", ".join(str(n) for n in artifacts))]
+    # Unexpected scalar — render it rather than crash.
+    return [("", str(artifacts))]
+
+
 # ── Duration formatting ──
 
 

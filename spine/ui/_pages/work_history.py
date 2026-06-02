@@ -5,7 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from spine.ui_api import UIApi
-from spine.ui.utils import format_timestamp, status_icon, truncate
+from spine.ui.utils import format_timestamp, normalize_artifacts, status_icon, truncate
 
 
 def render(api: UIApi) -> None:
@@ -56,5 +56,5 @@ def render(api: UIApi) -> None:
             result = item.get("result", {})
             if isinstance(result, dict) and result.get("artifacts"):
                 st.write("**Artifacts:**")
-                for phase, names in result["artifacts"].items():
-                    st.write(f"- {phase}: {', '.join(names) if isinstance(names, list) else names}")
+                for label, text in normalize_artifacts(result["artifacts"]):
+                    st.write(f"- {label}: {text}" if label else f"- {text}")

@@ -201,9 +201,11 @@ def status_cmd(work_id: str, config_path: str) -> None:
 
     result = entry.get("result", {})
     if isinstance(result, dict) and result.get("artifacts"):
+        from spine.ui.utils import normalize_artifacts
+
         console.print("\n[bold]Artifacts:[/bold]")
-        for phase, names in result["artifacts"].items():
-            console.print(f"  {phase}: {', '.join(names)}")
+        for label, text in normalize_artifacts(result["artifacts"]):
+            console.print(f"  {label}: {text}" if label else f"  {text}")
 
 
 @main.command(name="list")

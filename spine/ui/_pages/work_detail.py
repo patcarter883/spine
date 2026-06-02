@@ -14,7 +14,13 @@ import streamlit as st
 
 from spine.ui.pages import get as get_page
 from spine.ui_api import UIApi
-from spine.ui.utils import format_duration, format_timestamp, status_icon, truncate
+from spine.ui.utils import (
+    format_duration,
+    format_timestamp,
+    normalize_artifacts,
+    status_icon,
+    truncate,
+)
 
 # ── Fragment refresh interval (seconds) ──
 _POLL_INTERVAL = 10
@@ -290,8 +296,8 @@ def render(api: UIApi) -> None:
     if isinstance(result, dict):
         if result.get("artifacts"):
             st.subheader("Artifacts Summary")
-            for phase, names in result["artifacts"].items():
-                st.write(f"**{phase}**: {', '.join(names) if isinstance(names, list) else names}")
+            for label, text in normalize_artifacts(result["artifacts"]):
+                st.write(f"**{label}**: {text}" if label else text)
 
         if result.get("error"):
             st.error(f"Error: {result['error']}")
