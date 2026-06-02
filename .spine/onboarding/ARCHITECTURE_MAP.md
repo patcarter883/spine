@@ -2,739 +2,744 @@
 
 ## Module: spine.agents
 
-**Responsibility:** Core agent orchestration, decomposition, and tool-based code analysis within the Spine system.
+**Responsibility:** spine
+`spine.agents` orchestrates agent-based workflows for code understanding, decomposition, and transformation. It provides tools and sub-agents for AST symbol extraction, codebase querying, and structured editing, plus decomposer logic for feature slicing.
 
 **Key Symbols:**
-- `AstExtractSymbolInput`, `AstExtractSymbolTool` (spine/agents/tools/ast_extract_symbol.py)
-- `CodebaseQueryInput`, `CodebaseQueryTool` (spine/agents/tools/codebase_query.py)
-- `FindReplaceEdit` (spine/agents/tools/read_edit_lint.py)
-- `CheckItem`, `DecompositionResult`, `FeatureSliceSchema` (spine/agents/subagents.py, spine/agents/decomposer.py)
 
-**Dependencies:**y depends on `spine.mcp`, `spine.models`, `spine.work`, and `spine.workflow`.
+- **AST Extraction:** `AstExtractSymbolInput`, `AstExtractSymbolTool` (spine/agents/tools/ast_extract_symbol.py)
+- **Codebase Query:** `CodebaseQueryInput`, `CodebaseQueryTool` (spine/agents/tools/codebase_query.py)
+- **Editing:** `FindReplaceEdit` (spine/agents/tools/read_edit_lint.py)
+- **Decomposition:** `DecompositionResult`, `FeatureSliceSchema` (spine/agents/decomposer.py)
+- **Subagents:** `CheckItem` (spine/agents/subagents.py)
 
-**Dependents:** None listed.
+**Dependencies:**
+- `spine.mcp`n- `spine.models`
+- `spine.work`
+- `spine.workflow`
 
-## Module: spine.cli
+**Depended On By:** *(No inbound edges in fragment)*
 
-The `spine.cli` module provides the command-line interface entry point and subcommands for the spine application. It exposes all CLI functionality through functions defined in `spine/cli/__init__.py` and acts as the orchestration layer that delegates work to core domain modules.
+**Primary Data Flow:**
+Agent requests → MCP protocol → codebase queries → AST extraction → decomposition → structured output (schemas, edits). Output flows back through workflow orchestration layers.
 
-### Responsibility
+## Module: spine.workflow
 
-- **CLI Entry Point**: Exposes `main()` as the top-level command-line entry function.
-- **Subcommand Implementation**: Provides 15 additional functions for specific operations:
-  - Export functionality: `export`\n  - Project management: `project`, `project_add`, `project_create`
-  - Task/workflow operations: `list_cmd`
-  - Initialization: `init`, `index`
+The `spine.workflow` module is responsible for orchestrating multi-phase workflows, managing state transitions, and coordinating the execution of modular workflow components. It serves as the central coordination layer that integrates agent behaviors, tools, phases, and persistent state management.
+
+### Responsibilities
+
+- **Workflow Orchestration**: Manages the lifecycle of multi-phase workflows from planning to completion.
+- **State Management**: Handles subgraph state transitions and maintains workflow context through `BaseSubgraphState` and related specialized state classes.
+- **Phase Registry Management**: Provides centralized registration and lookup of workflow phases via `PhaseRegistry` and `PhaseDefinition`.
+- **Cross-Cutting Concerns**: Integrates agent systems, tools (MCP), persistence, and work phases into cohesive workflows.
 
 ### Key Symbols
 
-All symbols are located in `spine/cli/__init__.py`:
+#### Core State Classes (`spine/workflow/subgraph_state.py`)
 
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `export` | function | Handles export operations
-| `index` | function | Handles indexing operations
-| `init` | function | Initializes new projects
-| `list_cmd` | function | Lists tasks/projects
-| `main` | function | Primary CLI entry point
-| `project` | function | Project-related operations
-| `project_add` | function | Adds projects
-| `project_create` | function | Creates new projects |
+- `BaseSubgraphState`: Foundational state management for workflow subgraphs
+- `CriticSubgraphState`: Specialized state for evaluation/critique phases
+- `ExplorationSubgraphState`: State handling exploration workflows
+- `GapPlanSubgraphState`: Manages gap planning phase state
+- `ImplementSubgraphState`: Handles implementation phase state management
+- `PlanSubgraphState`: Coordinates planning phase state transitions
+
+#### Registry Classes (`spine/workflow/registry.py`)
+
+- `PhaseDefinition`: Defines registration metadata and configuration for workflow phases
+- `PhaseRegistry`: Central registry for phase discovery and lifecycle management
 
 ### Dependencies
 
-The module depends on the following core modules:
-- `spine.agents` - Agent management operations
-- `spine.models` - Data models and structures
-- `spine.persistence` - Data persistence layer
-- `spine.project` - Project domain logic
-- `spine.work` - Work/task management
-- `spine.workflow` - Workflow orchestration
+The `spine.workflow` module depends on the following modules:
+
+- `spine.agents`: Provides agent interfaces and behaviors for workflow execution
+- `spine.mcp`: Supplies tool integrations and MCP (Machine Communication Protocol) capabilities
+- `spine.persistence`: Offers state persistence and data storage mechanisms
+- `spine.phases`: Delivers modular phase implementations for workflow composition
+- `spine.work`: Integrates with work context and task management systems
 
 ### Reverse Dependencies
 
-No modules depend on `spine.cli`; it is a leaf module in the dependency graph and serves as the topmost-is-section CLI facade
+Other modules depend on `spine.workflow` for:
 
-### Data Flow
-
-```
-[User Input] → main() → [delegate to specific subcommandsn] → [domain modules] → [persistence/models] → [return results]
-```
-
-The CLI module receives user commands through Click decorators or argparse, validates inputs, and delegates all business logic to the appropriate domain modules (`spine.project`, `spine.work`, etc.). Results are formatted and returned to the user.
-
-### Notes
-
-- The module is isolated to functions only (0 classes/interfaces)
-- All functions are defined in a single file: `spine/cli/__init__.py`
-- Serves as an orchestration layer rather than implementing business logic directly:is
-
-```markdown
-### Module: `.config.py
-
-**Responsibility:** The `spine.config.py` module centralizes configuration management for the Spine application. It defines data structures for runtime settings, handles loading and parsing of configuration sources, and provides utilities for discovering the workspace context.
-
-**Key Symbols:**
-
-Classes/Interfaces:
-- `ConvergenceConfig` (`spine/config.py`) – Defines parameters for numerical convergence behavior.
-- `SpineConfig` (`spine/config.py`) – Main configuration container aggregating application-wide settings.
-- `TokenCompactionConfig` (`spine/config.py`) – Encapsulates rules for token compaction strategies.
-
-Functions:
-- `_disable_global_tracing()` (`spine/config.py`) – Disables tracing facilities globally.
-- `_load_dotenv()` (`spine/config.py`) – Loads environment variables from `.env` files.
-- `_parse_convergence_config()` (`spine/config.py`) – Parses convergence-related configuration data.
-- `_lookup_provider_by_name()` (`spine/config.py`) – Resolves a provider instance by its registered name.
-
-Methods:
-- `_find_workspace_root()` (`spine/config.py`) – Locates the root directory of the current workspace.
-- *(Additional methods inferred from symbol count but not detailed in fragment.)*
-
-**Dependencies & Dependents:**
-
-The module currently shows no explicit external dependencies (`edges: []` in the fragment). It likely serves as a foundational component, potentially imported or extended by other modules that require structured configuration access. Its outputs (config objects) are consumed downstream to control behaviors such as convergence algorithms, token handling, and provider resolution.
-
----
-```
-
-## Module: spine.exceptions.py
-
-**File:** `spine/exceptions.py`
-
-**Responsibility:** Defines a collection of custom exception classes for the Spine framework, providing structured error handling across the system.
-
-**Key Symbols:**
-
-- `AgentUnavailableError` *(class)*
-- `ConfigurationError` *(class)*
-- `CriticError` *(class)*
-- `CriticalContractFailure` *(class)*
-- `GitOrchestratorError` *(class)*
-- `MaxRetriesExceeded` *(class)*
-- `MergeError` *(class)*
-- `PromptRequestError` *(class)*
-
-**Dependencies:**
-
-No upstream dependencies recorded (no `edges` defined inn
-**Dependents:**
-
-No immediate dependents listed in the provided fragment.
-
-## Module: spine.git
-
-**Path:** `spine/git`
-
-**Responsibility:**
-
-The `spine.git` module provides Git orchestration and sandboxed
-workspace sandboxing isolation utilities. It contains the
-`SpineGitOrchestrator` class responsible for managing Git-based
-workflows with support for phase prerequisites and shell execution,
-and the `WorktreeSandbox` class for safe, isolated git worktree
-operations.
-
-**Key Symbols:**
-
-* `SpineGitOrchestrator` (class) — Core orchestrator for Git
-  operations
-* `WorktreeSandbox` (class) — Isolated
-  sandbox for isolated Git worktrees
-* `SpineGitOrchestrator.__init__` (method) — Initializes the
-  orchestrator
-* `WorktreeSandbox.__init__` (method) — Initializes the
-  sandbox
-* `SpineGitOrchestrator._check_phase_prerequisites` (method) —
-  Validatesn
-  prerequisites
-* `SpineGitOrchestrator._execute_shell` (method) — Executes
-  shell commands
-* `SpineGitOrchestrator._resolve_validation_command` (method) —
- lid resolve validation commands
-* `WorktreeSandbox.abort` (method) — Aborts the
-  sandbox operation
-
-**Dependencies & Dependents:**
-
-* * on:*
-  * `spine.models`
-  * `spine.workflow`
-* Is depended on by: None directly listed
-
-**Data:**
-
-Total: 18 symbols (2 classes, 2 functions, 14 methods).
-
-## Module: spine.mcp
-
-- **Responsibility:** MCP client-side utilities for tool invocation, result processing, and server configuration management.
-- **Key Symbols:**
-  - `_cap_result()` & `_post_process_result()` – Result aggregation and post-processing.
-  - `_convert_server_config()` – Server configuration transformation.
-  - `_get_client()` – Asynchronous MCP client initialization.
-  - `_line_starts_with_excluded_path()` & `_strip_excluded_paths()` – Path filtering.
-  - `_namespace_tool()` – Tool namespace prefixing
-  - `_run_async()` – Async execution wrapper.
-- **Dependencies:** No dependent modules listed.
-- **Depended On By:** No outgoing dependencies declared in the provided fragment.
-
-## Module: spine.models
-
-The `spine.models` module serves as the foundational type and enum definitions layer, housing domain objects, configuration specifications, and state representations used throughout the system.
-
-### Responsibility
-- **Type Definitions**: Defines core domain classes and interfaces that model artifacts, reviews, project specifications, and planning constructs.
-- **Enumeration **Enums**: Provides standardized enumerations for system phases and states.
-- **State Representations**: Represents phase results and execution states for downstream processing.
-
-### Key Symbols
-
-| Symbol | Type | File | Purpose |
-| --- | --- | --- | --- |
-| Artifact | --- | --- | --- |
-| Artifact | --- | --- | --- |
-| Artifact | class | spine | Represents transactional or deliverable entities within workflows. |
-| CriticReview | class | het | Captures | Captures feedback or evaluation data structures. |
-| FeatureSlice | class | .geo | Defines bounded segments or modules of functionality. |
-| FixInstruction | class | .geo | Encodes corrective actions or patches. |
-| GapPlan | class | .geo | Specifies remediation | Represents phased | /state.py | Models the conclusion and output of a processing phase.
-| ProjectSpec | class | .geo | Declares input requirements or desired outcomes for projects.
-| PhaseName | class | .enums | Enumerates the named stages of system execution.
-
-### Dependencies
-- **Undefined** (leaf module with edges: [])
-  - No inbound or outbound dependencies documented in the provided fragment.
-
-### Depended-On By
-- **Undocumented**
-  - Modules consuming `spine.models` types are not listed in this fragment.
-
-## Module: spine.persistence
-
-### Responsibility
-The `spine.persistence` module provides data persistence and storage abstractions. It defines a set of store classes that serve as interfaces for persisting |*|
-
-## Module: spine.phases
-
-The `spine.phases` module orchestrates workflow phases through a collection of functions organized around four primary files. Its main responsibility is coordinating the lifecycle of a workflow instance, from initial specification through planning, execution planning, and validation (critic stage).
-
-### Key Symbols
-
-Located | Symbol | File | Responsibility |
-|---------|------|---------------|
-| `_build_critic_agent` | `spine/phases/critic.py` | Constructs the critic agent instance for validation. |
-| `_compute_waves` | `spine/phases/plan.py` | Computes execution waves for plan scheduling. |
-| `_early_commitment` | `spine/phases/specify.py` | Handles early commitment logic during specification. |
-| `_has_cycle` | `spine/phases/critic.py` | Detects cycles in the workflow dependency graph. |
-| `_load_plan_json` | `spine/phases/critic.py` | Loads plan configuration from a JSON file. |
-| `_read_plan_json` | `spine/phases/plan.py` | Reads and parses plan JSON data. |
-| `_validate_plan_structure` | `spine/phases/critic.py` | Validates the structural integrity of a plan. |
-| `call_critic` | `spine/phases/critic.py` | Invokes |
-
-### Dependencies
-
-- **Depends on**:
-  - `spine.critic`: Provides validation and agent functionality.
-  - `spine.workflow`: Supplies core workflow orchestration primitives.
-
-- **Is depended on by**: No dependent modules are specified in this fragment.
-
-## Module: spine.ui
-
-**Responsibility**
-
-The `spine.ui` module provides a web-based user interface layer for the Spine workflow system. It exposes HTTP endpoints, WebSocket event buses, and dashboard pages that allow users to monitor and interact with workflow executions.
-
-**Key Symbols**
-
-- **Classes (2)**
-  - `Event` (spine/ui/ws_bus.py) – Data class representing a UI event.
-  - `WSEventBus` (spine/ui/ws_bus.py) – WebSocket-backed event bus for real-time UI updates.
-
-- **Functions & Methods (76)**
-  - Application & configuration helpers
-    - `_audit_log()` – Records UI audit trail.
-    - `_config()` – Builds UI configuration objects.
-    - `_dashboard()` – Renders the main dashboard page.
-  - WebSocket handlers
-    - `_client_handler()` – Handles new WebSocket client connections.
-  - Workflow detail pages
-    - `_execution_duration()` – Displays execution duration on work‑detail pages.
-  - Additional UI utilities not fully listed but contribute to the total of 66 functions and 10 methods.
-
-**Dependencies**
-
-- ` on: `spine.workflow` (monitors workflow state and execution).
-
-## Module: spine.ui_api
-
-### Responsibility
-`spine.ui_api` provides the core UI API layer for the application.
-
-### Key Symbols
-- **`UIApi`** (class)   plated in `spine/ui_api/api.py`.
-- **`__init__`** (method) — Constructor for `UIApi`.
-- **`_active_jobs`** (method) — Retrieves active jobs.
-- **`_artifact_store_for`** (method) — Manages artifact storage per context.
-- **`_build_active_job`** (method) — Constructs active job representations.
-- **`_discover`** (method) — Handles discovery logic.
-- **`_finalise_ghost_entries`** (method) — Finalizes placeholder entries.
-- **`_mark_running`** (method) — Marks jobs or tasks as running.
-
-### Dependencies
-- **` on: `spine.persistence`
-- Depends on: `spine.project`
-- Depends on: `spine.work`
-- Depends on: `spine.workflow`
-
-### Depended On By
-- No downstream dependencies are recorded in the provided fragment.
+- Workflow orchestration and phase management capabilities
+- Centralized state and registry infrastructure
+- Coordination between agents, tools, and persistent storage
 
 ## Module: spine.work
 
 **Path:** `spine/work`
-**Symbols:** 166 total (15 classes/interfaces, 103 functions, 48 methods)
+
+**Symbols:** 171 total (15 classes/interfaces, 108 functions, 48 methods)
 
 ### Responsibility
-The `spine.work` module orchestrates repository analysis workflows, including dependency analysis, boundary detection, and state management for code exploration and synthesis.
+
+The `spine.work` module orchestrates repository onboarding
+analysis, dependency tracking, and workflow execution within the Spine system.
+It serves as the central work interface for processing code repositories,
+managing module boundaries, and driving synthesis tasks through specialized
+components like the RalphLoopWorker.
 
 ### Key Symbols
 
-- **`DependencyEdge`** *(spine/work/onboarding/manifest.py)*:://DependencyEdge/class)* Represents a directed dependency relationship between modules.
-- **`ModuleBoundary`** *(spine/work/onboarding/manifest.py://ModuleBoundary/class)* Defines the extent and composition of a module in the codebase.
-- **`OnboardingGraphState`** *(spine/work/onboarding/onboarding_state.py):(://OnboardingGraphState/class)* Manages the runtime state of the onboarding graph traversal.
-- **`PatternFinding`** *(spine/work/onboarding/manifest.py):(//PatternFinding/class)* Captures Initially empty summary; likely captures recurring structural patterns during analysis.
-- **`RalphLoopWorker`** *(spine/work/ralph_worker.py):(//RalphLoopWorker/class)* Implements a worker class that executes continuous processing loops.
-- **`ReadRepoManifestTool`** *(spine/work/onboarding/synthesis_tools.py):(//ReadRepoManifestTool/class)* Tool to read and parse repository manifest data.
-- **`RepoAnalyzer`** *(spine/work/onboarding/analyzer.py):(//RepoAnalyzer/class)* Analyzes Analyzes Core component responsible for analyzing repository structure and relationships.
-- **`RepoManifest`** *(spine/work/onboarding/manifest.py):(//RepoManifest/class)* Central data structure representing the manifest of a repository being onboarded.
+| Symbol | Type | File | Purpose |
+|--------|------|------|---------|
+| `RalphLoopWorker` | class | `spine/work/ralph_worker.py` | Main worker loop for executing synthesis tasks |
+| `RepoManifest` | class | `spine/work/onboarding/manifest.py` | Represents the structure and dependencies of a repository |
+| `OnboardingGraphState` | class | `spine/work/onboarding/onboarding_state.py` | Manages state during the repository onboarding process |
+| `RepoAnalyzer` | class | `spine/work/onboarding/analyzer.py` | Analyzes repository structure and extracts patterns |
+| `DependencyEdge` | class | `spine/work/onboarding/manifest.py` | Models dependency relationships between modules |
+| `ModuleBoundary` | class | `spine/work/onboarding/manifest.py` | Defines boundaries of modules within a repository |
+| `PatternFinding` | class | `spine/work/onboarding/manifest.py` | Captures identified patterns in repository analysis |
+| `ReadRepoManifestTool` | class | `spine/work/onboarding/synthesis_tools.py` | Tool for reading and parsing repository manifests |
 
 ### Dependencies
 
-`spine.work` **depends on**:
-- `spine.agents`
-- `spine.git`
-- `spine.mcp`
-- `spine.models`
-- `spine.persistence`
-- `spine.ui`
-- `spine.workflow`
+`spine.work` depends on:
+- `spine.agents` - Agent infrastructure for decision making
+- `spine.git` - Git repository operations
+- `spine.mcp` - Model context protocol integration
+- `spine.models` - Core data models
+- `spine.persistence` - Data persistence mechanisms
+- `spine.ui` - User interface components
+- `spine.workflow` - Workflow orchestration primitives
 
 ### Depended On By
 
-No reverse dependencies provided in this fragment.
+Currently no modules are documented as depending on `spine.work` within this fragment.
 
 ### Data Flow
 
-The workflow begins when [`RepoAnalyzer`] ingests a repository and produces a [`RepoManifest`]. This manifest is consumed by [`RalphLoopWorker`] which manages processing iterations. State changes are tracked by [`OnboardingGraphState`], while [`DependencyEdge`] and [`ModuleBoundary`] provide structural insights used in [`PatternFinding`].
-
----
-
-*Generated by semantic-analyzerlement extractor]*
-
-## Module: spine `spine.workflow`
-
-### Responsibility
-
-The `spine.workflow` module serves as the workflow orchestration layer, coordinating multi-stage processes through phase-based execution and hierarchical state management.
-
-### Key Symbols
-
-**State Classes** (`spine/workflow/subgraph_state.py`):
-- `BaseSubgraphState` – foundational state container for workflow subgraphs
-- `CriticSubgraphState` – evaluation and quality assurance phase state
-- `ExplorationSubgraphState` – discovery and research phase state
-- `GapPlanSubgraphState` – gap analysis and planning state
-- `ImplementSubgraphState` – execution and implementation phase state
-- `PlanSubgraphState` – high-level planning state
-
-**Registry Classes** (`spine/workflow/registry.py`):
-- `PhaseDefinition` – declarative phase configuration and metadata
-- `PhaseRegistry` – centralized phase definitions and lifecycle management
-
-### Dependencies
-
-- `spine.agents` – provides agent interfaces for decision-making within workflow phases
-- `spine.mcp` – supplies multi-channel protocol capabilities for external communications
-- `spine.persistence` – handles state serialization and durable storage
-- `spine.phases` – defines phase lifecycle contracts and execution semantics
-- `spine.work` – manages work item creation and tracking
-
-### Depended On By
-
-No modules in the current fragment depend on `spine.workflow`.
-
-### Execution Flow
-
-Workflow execution follows a registry-driven, phase-based model where `PhaseRegistry` orchestrates state transitions across specialized `SubgraphState` implementations, each corresponding to a distinct phase of the overall process.
-
-## Module: tests.conftest.py
-
-**Path:** `tests/conftest.py`
-
-**Role:** Test configuration and fixtures provider. This module centralizes pytest fixtures and test utilities used across the test suite to ensure consistent setup and reduce duplication.
-
-**Symbolcount:** 11 symbols (0 classes/interfaces, 11 functions, 0 methods)
-
-### Key Symbols
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `async_test_config` | function | Pytest fixture providing asynchronous test configuration settings. |
-| `event_loop` | function | Custom event loop fixture for async test execution. |
-| `mock_openai_response` | function | Fixture that mocks OpenAI API responses for isolated testing. |
-| `sample_artifact` | function | Fixture |
-| `sample_prompt_request` | function | Returns a sample prompt request object for testing. |
-| `sample_review_feedback` | function | Provides sample review feedback data for test cases. |
-| `sample_task` | function | Generates a sample task object for use in tests. |
-| `sample_work_config` | function | Supplies supplying |
-
-## Module: tests.integration
-
-**Responsibility:** Integration testing for end-to-end workflows and cross-module interactions.
-
-**Location:** `tests/integration`
-
-**Key Symbols:**
-- `tests/integration/test_structured_io_flow.py`
-  - `TestArtifactStoreRoundTrip`
-  - `TestCriticReviewSchema`
-  - `TestFeatureSliceSchema`
-  - `TestFullArtifactChain`
-  - `TestGapPlanSchema`
-- `tests/integration/test_plan_to_implement_flow.py`
-  - `TestPlanToImplementFlow`
-- `tests/integration/test_prompt_assembly.py`
-  - `TestPromptAssemblyIntegration`
-- `tests/integration/test_mcp_integration.py`
-  - `TestRealMCPCodebaseIndex`
-
-**Dependencies (used by):**
-- `spine.agents`
-- `spine.mcp`
-- `spine.models`
-- `spine.workflow`
-
-**Dependency Direction:** The `tests.integration` module depends on (imports/tests against) `spine.*`, but is not depended depended on by any other module listed in the fragment.
-
-**Summary:** Contains 115 symbols (22 classes/interfaces, 32 functions, 61 methods) focused on validating integrated behavior across the ` agent framework.
-
-## Module: tests.recall_eval
-
-**Responsibility**
-The `tests.recall_eval` module provides utilities for running and managing recall evaluation tests. It aggregates results, processes golden datasets, and computes metrics like first-hit rank.
-
-**Key Symbols**
-| Symbol | File | Type | Description |
-|--------|------|------|-------------|
-| `_aggregate` | tests/recall_eval/run_eval.py | function | Aggregates |
-| `_by_source` | tests/recall_eval/run_eval.py | function | :\n| `_clean_topic` | tests/recall_eval/build_golden.py | function | Cleansn| `_concrete_prod_files` | tests/recall_eval/build_golden.py | function | :
-| `_first_hit_rank` | tests/recall_eval/run_eval.py | function | :
-| `_load_golden` | tests/recall_eval/run_eval.py | function | :
-| `_main_async` | tests/recall_eval/run_eval.py | function | :
-| `_print_compare` | tests/recall_eval/run_eval.py | function | :
-
-**Dependencies**
-- Depends on: `spine.agents`
-
-**Dependents**
-- None listed in the supplied fragment.
-
-## Module: tests.test_core.py
-
-This module is responsible for unit testing the `format_duration` functionality. It contains 13 symbols (1 class and 12 methods) following the `unittest` framework pattern.
-
-### Key Symbols
-
-- **TestFormatDuration** (`class`): Test class containing all test cases for duration formatting
-- **test_days_only_minutes_seconds** (`method`): Tests formatting of durations with days, minutes, and seconds
-- **test_exact_day** (`method`): Tests formatting of exact day durations
-- **test_exact_hour** (`method`): Tests formatting of exact hour durations
-- **test_exact_minute** (`method`): Tests formatting of exact minute durations
-- **test_float_values** (`method`): Tests handling of float input values
-- **test_hours_and_minutes** (`method`): Tests formatting of durations with hours and minutes
-- **test_hours_only** (`method`): Tests formatting of hour-only durations
-
-### Dependencies
-
-The module imports symbols from:
-- `core` (likely `src/core.py` or similar): Contains the `format_duration` function being tested
-
-### Depended On By
-
-No modules depend on `tests.test_core.py`. It is a leaf module in the dependency graph, serving as a Terminal test module providing no symbols to other modules.
-
-```markdown
-### `tests.test_restart.py`
-
-**Responsibility:**
-This test module verifies reset and restart functionality, UI API interactions, status color CSS, and work-related operations. It contains 5 test classes with 17 methods and 3 utility functions.
-
-**Key Symbols:**
-- **Classes (Test Suites):**
-  - `TestResetStuckItems` – Tests for resetting stuck items
-  - `TestRestartWork` – Tests for restart work functionality
-  - `TestStatusColorCSS` – Tests for status color styling
-  - `TestUIApiResetStuck` – UI API tests for resetting stuck items
-  - `TestUIApiRestart` – UI API tests for restart actions
-- **Functions:**
-  - `queue_db` – Utility function for database queue operations
-- **Methods:**
-  - `mock_graph` (2 overloads) – Mock implementations for graph-related testing
-
-**Dependencies:**
-- `spine.ui` – Dependent on UI components and interfaces
-- `spine.ui_api` – Relies on UI API functionality for testing
-- `spine.work` – Requires work module functionality for test validation
-
-**Depended On By:**
-*This None (leaf module in test hierarchy)
-```
-}
-
-## Module: tests.test_work_ordering.py
-
-### Responsibility
-This module contains unit tests for work ordering functionality within a list work feature. It serves as a test suite to validate the ordering behavior of work entries under various conditions.
-
-### Key Symbols
-- **Class**: `TestListWorkOrdering` - Main test class containing test methods
-- **Methods**:
-  - `_insert_entries` - Helper method for inserting test entries
-  - `_make_config` - Helper method for creating test configurations
-  - `test_list_work_default_order` - Tests default ordering behavior
-  - `test_list_work_empty` - Tests behavior with empty work list
-  - `test_list_work_filtered_order` - Tests ordering with filtered entries
-  - `test_list_work_limit` - Tests ordering with limit constraints
-  - `test_list_work_null_created_at` - Tests handling of null created_at fields
-
-### Dependencies
-This test module depends on:
-- The work ordering implementation being tested (implied `list_work` functionality)
-
-### Depended On By
-No modules are documented as depending on this test module in the provided fragment.
-
-### Data Flow
-Test methods use helper methods (`_insert_entries`, `_make_config`) to set up test data and configurations, then validate the ordering behavior of the system under test.
+1. Repository analysis triggered via `RepoAnalyzer`
+2. Manifest construction using `RepoManifest`, `DependencyEdge`, `ModuleBoundary`
+3. State persistence via `OnboardingGraphState`
+4. Synthesis task execution through `RalphLoopWorker`
+5. Tool integration via `ReadRepoManifestTool`}
 
 ## Module: tests.unit
 
-### Responsibility
-The `tests.unit` module contains the project's unit test suite, encompassing with 1748 symbols across 264 classes/interfaces, 509 functions, and 975 methods. It validates the behavior of core components in isolation using test doubles and mock implementations.
+**Responsibility:**
+The `tests.unit` module is responsible for providing unit test infrastructure and test cases for the codebase. It contains 1767 symbols including 264 classes/interfaces, 527 functions, and 976 methods.
 
-### Key Symbols
-| File | Symbol | Type | Purpose |
-|------|--------|------|---------|
-| `tests/unit/test_explore_summarise_split.py` | `FakeBadRequest` | class | Mock class for simulating bad request errors in explore/summarise tests |
-| `tests/unit/test_trace_019e77a7_fixes.py` | `FakeModel` | class | Test double representing a model for trace correction tests |
-| `tests/unit/test_context_editing.py` | `FakeRequest` | class | Mock request object for context editing unit tests |
-| `tests/unit/test_context_integration.py` | `FakeRequest` | class | Mock request object for context integration tests |
+**Key Symbols:**
 
-### Dependencies
+- `FakeBadRequest` (class) – `tests/unit/test_explore_summarise_split.py`
+- `FakeModel` (class) – `tests/unit/test_trace_019e77a7_fixes.py`
+- `FakeRequest` (class) – `tests/unit/test_context_editing.py`n- Additional `FakeRequest` instances – `tests/unit/test_context_integration.py`
+
+**Dependencies:**
+
 The `tests.unit` module depends on:
-- `spine.agents`\n- `spine.critic
-
-- `spine.git`\n- `spine.models`
+- `spine.agents`
+- `spine.critic`
+- `spine.git`
+- `spine.models`
 - `spine.phases`
 - `spine.project`
 - `spine.ui_api`
 - `spine.work`
 - `spine.workflow`
 
-This module is a leaf node in the architecture—it does not expose any symbols that other modules depend on.
+**Dependency Direction:**
 
-## Module: spine.services
+`tests.unit` is a consumer module; it depends on the above spinekeletal
+ os packages for testing purposes, but none of those packages depend on `tests.unit`.
 
-**Responsibility:**
+## Module: spine.persistence
 
-The `spine.services` module encapsulates service-layer components responsible for audit-related operations. It provides a centralized interface for logging and querying audit events, ensuring the underlying persistence concerns from the rest of the system.
-
-**Key Symbols:**
-
-*   **`AuditService`** (`spine/services/audit_service.py`): The primary class within this module. It serves as the main entry point for audit functionalities.
-    *   **`__init__`** (`spine/services/audit_service.py`): Constructor for initializing the `AuditService`.
-    *   **`_ensure_table`** (`spine/services/audit_service.py`): A private method likely responsible for ensuring the existence of the audit log table in the database.
-    *   **`_get_db`** (`spine/services/audit_service.py`): A private method for obtaining a database connection or handle.
-    *   **`log_event`** (`spine/services/audit_service.py`): A public method to record a new audit event.
-    *   **`query_events`** (`spine/services/audit_service.py`): A public method to retrieve or search audit events.
-
-**Dependencies & Dependents:**
-
-Based on the provided fragment, there are no explicit dependency edges defined for this module. Therefore, its dependencies on other internal modules and what depends on it cannot be determined from this specific data.
-
-## Module: tests.fixtures
-
-**Responsibility:** Test fixtures providing sample code for testing TypeScript analysis tools.
-
-**Key Symbols:**
-- `Greeter` (class) - Defined in `tests/fixtures/sample.ts`
-- `Speaker` (interface) - Defined in `tests/fixtures/sample.ts`
-- `greet` (function) - Defined in `tests/fixtures/sample.ts`
-- `shout` (function) - Defined in `tests/fixtures/sample.ts`
-- `constructor` (method) - Belongs to `Greeter` class in `tests/fixtures/sample.ts`
-- `say` (method) - Belongs to `Speaker` interface in `tests/fixtures/sample.ts`
-
-**Dependencies:** No incoming or outgoing module dependencies found in the fragment.
-
-## Module: spine.project
-
-**Path:** `spine/project`
-
-**Responsibility:** Provides project-level coverage aggregation functionality.
-
-**Key Symbols:**
-- `_member_passed` *(function)* — Defined in `spine/project/aggregator.py`
-- `_member_requirements` *(function)* — Defined in `spine/project/aggregator.py`
-- `_normalize` *(function)* — Defined in `spine/project/aggregator.py`
-- `aggregate_project_coverage` *(function)* — Defined in `spine/project/aggregator.py`
-
-**Dependencies:**
-- `spine.persistence` (depends_on)
-
-**Depended On By:**
-- *(No downstream dependencies listed in the fragment)*
-
-## Module: scratch.test_explore_flash.py
+The `spine.persistence` module provides storage abstractions for managing persistent data artifacts, checkpoints, projects, and vector representations. It defines four primary store classes that encapsulate data persistence concerns.
 
 ### Responsibility
-
-```
-scratch.test_explore_flash.py
-```
-is a test module in the scratch area. Per the fragment it exports **3 functions** and has **no classes or methods**. The module serves as an exploration or utility script for flash-related functionality.
+The module is responsible for:/storage operations, providing a consistent interface for persisting and retrieving application state across different storage backends.
 
 ### Key Symbols
 
-| Symbol | Type | Summary |
-|--------|------|---------|
-| [`_patched_resolve_model`](#)
-| function | *(no summary provided)* |
-| [`_patched_resolve_provider`](#)
-| function | *(no summary provided)* |
-| [`main`](#)
-| function | *(no summary provided)* |
+**Classes/Interfaces (4):**
+- `ArtifactStore` (spine/persistence/artifacts.py)
+- `CheckpointStore` (spine/persistence/checkpoint.py)
+- `ProjectStore` (spine/persistence/project_store.py)
+- `VectorStore` (spine/persistence/vector_store.py)
 
-All symbols reside in the Python file located at:
-```
-scratch/test_explore_flash.py
-```
+**Methods (35 total):**
+Each class implements an `__init__` method for initialization, along with additional methods (not detailed in this fragment) that handle data operations.
+
+### Dependencies
+The module contains no documented inter-module dependencies within the provided fragment (edges array is empty). All classes follow a similar initialization pattern with `__init__` methods defined in their respective files.
+
+### Depended Upon By
+No dependent modules are documented in the provided fragment.
+
+## Module: spine.ui
+
+**spine.ui** (`spine/ui`) is a UI module comprising 78 symbols (2 classes/interfaces, 66 functions, 10 methods).\nb) and is responsible for providing user-facing interfaces and event-driven communication within the system.
+
+### Key Symbols
+
+| Symbol | Type | File | Summary |
+|--------|------|------|---------|
+| `Event` | class | `spine/ui/ws_bus.py` | |
+| `WSEventBus` | class | `spine/ui/ws_bus.py` | |
+| `__init__` | method | `spine/ui/ws_bus.py` | |
+| `_audit_log` | function | `spine/ui/app.py` | |
+| `_client_handler` | function | `spine/ui/ws_server.py` | |
+| `_config` | function | `spine/ui/app.py` | |
+| `_dashboard` | function | `spine/ui/app.py` | |
+| `_execution_duration` | function | `spine/ui/_pages/work_detail.py` | |
 
 ### Dependencies
 
-The module **depends on**:
-- **`spine.agents`**
+- **sp on**: `spine.workflow`n
+### Dependents
 
-It does not appear as a dependency of any other module in the captured graph.
+_None dont appear to be explicitly listed in the fragment as depending on `spine.ui`.
 
-### Notes
+## Module: tests.integration
 
-As this module is located under `scratch/`, it likely represents experimental or temporary code rather than production logic. Any reliance on it should be done cautiouslyibly, given its transient nature.
+**Path:** `tests/integration`
+**Responsibility:** Provides integration-level tests that validate end-to-end workflows and cross-module interactions.
 
-## Module: alembic.env.py
+**Key Symbols:**
+- `TestArtifactStoreRoundTrip` (tests/integration/test_structured_io_flow.py)
+- `TestCriticReviewSchema` (tests/integration/test_structured_io_flow.py)
+- `TestFeatureSliceSchema` (tests/integration/test_structured_io_flow.py)
+- `TestFullArtifactChain` (tests/integration/test_structured_io_flow.py)
+- `TestGapPlanSchema` (tests/integration/test_structured_io_flow.py)
+- `TestPlanToImplementFlow` (tests/integration/test_plan_to_implement_flow.py)
+- `TestPromptAssemblyIntegration` (tests/integration/test_prompt_assembly.py)
+- `TestRealMCPCodebaseIndex` (tests/integration/test_mcp_integration.py)
 
-### Responsibility
-`alembic/env.py` serves as the Alembic migration configuration module, exposing two primary entry-point functions that orchestrate database schema migrations.
+**Dependencies:** This module depends on `spine.agents`, `spine.mcp`, `spine.models`, and `spine.workflow`.
+
+**Depended On By:** No modules list this module as a dependency.
+
+## Module: spine.models
+
+The `spine.models` module serves as the core data modeling layer, defining domain types and structures used throughout the Spine codebase. It provides a foundation of classes, interfaces, and enums that represent key domain concepts.
 
 ### Key Symbols
-- `run_migrations_offline` *(function)*: Configures migrations to run without an active database connection, typically generating SQL scripts.
-- `run_migrations_online` *(function)*: Configures migrations to run with a live database connection, applying changes directly.
 
-### Dependencies / Depended-On By
-No dependency information is available in the supplied fragment (`edges`: []).
+**Types (spine/models/types.py):**
+- `Artifact` - Represents a tangible
+- `CriticReview` - Represents a critiques
+- `FeatureSlice` - Represents a
+n- `FixInstruction` - Represents a :
+- `GapPlan` - Represents a 
+- `ProjectSpec` - Represents a :
+
+**Enums (spine/models/enums.py):**
+- `PhaseName` - Enumeration for phase identifiers
+
+**State (spine/models/state.py):**
+- `PhaseResult` - Represents the result of a phase execution
+
+### Responsibilities
+
+This module is responsible for:
+- Defining core domain models used across the application
+- Providing structured data types for artifacts, reviews, and project specifications
+- Enumerating standardized phase names for consistent referencing
+- Modeling state and results from phase executions
+
+### Dependencies
+
+No direct module dependencies are specified in the current fragment. The `spine.models` module appears to be a foundational layer that other modules may depend upon for type definitions and domain models.
+
+### Dependents
+
+The module has no recorded dependents in the current edge data, suggesting it may serve as a leaf module in the dependency graph, or its dependent relationships are not captured in this fragment.
+
+## Module: spine.git
+
+### Responsibility
+The `spine.git` module manages Git-based workflow orchestration and isolated worktree operations within the Spine system.
+
+### Key Symbols
+- **Classes/Interfaces:**
+  - `SpineGitOrchestrator` (spine/git/orchestrator.py): Core orchestrator class
+  - `WorktreeSandbox` (spine/git/sandbox.py): Manages sandbox environment class
+
+- **Functions:**
+  - `__init__` methods in both orchestrator.py and sandbox.py
+
+- **Key Methods:**
+  - `_check_phase_prerequisites`: Validates phase requirements
+  - `_execute_shell`: Executes shell commands
+  - `_resolve_validation_command`: Resolves validation commands
+  - `abort`: Handles sandbox abort operations
+
+### Dependencies
+- **Depends on:**
+  - `spine.models`
+  - `spine.workflow`
+
+### Usage
+This module serves as an internal implementation layer, providing Git orchestration and sandbox management capabilities.
+
+## Module: spine.config.py
+
+### Responsibility
+The `spine.config.py` module centralizes configuration management for the Spine runtime, handling initialization, environment loading, and provider resolution for optional integrations.
+
+### Key Symbols
+- **Classes:** `ConvergenceConfig`, `SpineConfig`, `TokenCompactionConfig`
+- **Functions:** `_disable_global_tracing`, `_load_dotenv`, `_parse_convergence_config`
+- **Methods:** `_find_workspace_root`, `_lookup_provider_by_name`
+
+### Dependencies & Dependents
+- **No upstream dependencies** — This module does not import or use other internal modules (edges count: 0).\n- **No downstream dependents** — No other modules in the provided fragment reference this module (edges count: 0)
+
+### Module: spine.exceptions.py
+
+#### Responsibility
+The `spine.exceptions.py` module centralizes error definitions for the Spine framework, providing specialized exception classes for different subsystem failures. It serves as the foundational error-handling layer, enabling consistent exception types across the codebase.
+
+#### Key Symbols
+- **Agent Failures**: `AgentUnavailableError`
+- **Configuration Issues**: `ConfigurationError`
+- **Criticique System Errors**: `CriticiсError`
+- **Contract Violations**: `CriticalContractFailure`
+- **Git Operations**: `GitOrchestratorError`
+`, `MergeError`
+- **Retry Logic**: `MaxRetriesExceeded`
+- **Prompt Processing**: `PromptRequestError`
+
+#### Dependencies
+- **Is depended on by**: All Spine modules that handle agent coordination, configuration, critique workflows, contract validation, git operations, retry mechanisms, and prompt rendering.
+- **Dependencies**: None (base module with no upstream dependencies).
+)
+
+## Module: spine.phases
+
+**Role:** Orchestration layer for workflow processing phases. Contains 14 functions (`spine/phases/*.py`) implementing discrete pipeline stages for critic evaluation, planning, and specification.
+
+**Key Symbols:**
+- `call_critic()` (critic.py): Main entry point for critic invocation
+- `_build_critic_agent()`: Constructs critic instances
+- `_has_cycle()`: Detects cyclic dependencies
+- `_validate_plan_structure()`: Validates plan JSON schema
+- `_early_commitment()`: Handles specification phase
+- `_compute_waves()`: Calculates execution waves in planning
+- `_load_plan_json()` / `_read_plan_json()`: JSON plan IO
+
+**Dependencies:**/MSn on `spine.critic` (validation logic) and `spine.workflow` (orchestration context).
+
+**Depended On by:** (none specified) — likely invoked by higher-level pipeline coordinator.
+
+## Module: spine.cli
+
+### Responsibility
+`spine.cli` is the command-line interface layer for the spine application. It exposes a set of callable functions that constitute the CLI entrypoints, handling user interactions and orchestrating business logic to other modules.
+
+### Key Symbols
+All symbols are defined in `spine/cli/__init__.py`:
+
+| Symbol | Type | Description |
+|--------|------|-------------|
+| `export` | function | Exports data or project output |
+| `index` | function | Indexes project or workflow data |
+| `init` | function | Initializes a new spine |-
+project or configuration
+| `list_cmd` | function | Lists available projects, workflows, or items |
+| `main` | function | Main CLI entrypoint that dispatches to subcommands |
+| `project` | function | High-level project operations dispatcher |
+| `project_add` | function | Adds a project or item to a project |
+| `project_create` | function | Creates a new project |
+
+*Note: Symbol summaries were not populated in the source fragment.*
+
+### Dependencies
+`spine.cli` depends on the following modules:
+- `spine.agents`: Provides agent-related functionality for CLI operations
+- `spine.models`: Supplies data models used in CLI commands
+- `spine.persistence`: Handles data persistence operations invoked by CLI
+- `spine.project`: Core project management logic
+- `spine.work`: Work item handling for CLI workflows
+- `spine.workflow`: Workflow orchestration called from CLI commands
+
+### Consumed By
+The modules that depend on `spine.cli` are not detailed in the provided fragment; this section would be expanded if reverse dependency data were available.
+
+## Module: spine.mcp
+
+**Path:** `spine/mcp`
+
+**Responsibility:**
+The `spine.mcp` module provides a client-side implementation for MCP (Model Context Protocol) communication. It encapsulates all functionality related to connecting to MCP servers, executing tools, and processing results. This module serves as the primary interface between the spine framework and external MCP-compatible services, handling server configuration conversion, connection management, tool namespacing, and result post-processing to filter excluded paths.
+
+**Key Symbols:**
+All functions reside in `spine/mcp/client.py`:
+- `_cap_result`: Wraps and processes the final result from an MCP tool execution.
+- `_convert_server_config`: Transforms internal server server configuration into MCP-compatible format.
+- `_get_client`: Retrieves or initializes the MCP client instance for communication.
+- `_line_starts_with_excluded_path`: Checks if a log line begins with a path that should be excluded from results.
+- `_namespace_tool`: Applies namespacing to tool names to avoid collisions and clarify origin.
+- `_post_process_result`: Filters result content to remove lines referencing excluded paths.
+- `_run_async`: Executes asynchronous operations within the MCP client context.
+- `_strip_excluded_paths`: Removes sections from results that match excluded path patterns.
+
+**Dependencies:**
+The module depends on external MCP libraries for protocol handling and communicates with server implementations (referenced via edges in broader architecture). No explicit incoming edges are defined in the provided fragment, indicating it may be a terminal or leaf module in the current context.
+
+**Depend | Done.
+
+## Module: spine.project
+
+### Responsibility
+The `spine.project` module centralizes project-level aggregation logic. It collects and normalizesizes coverage data across an entire project, normalizing and combining inputs from lower-level modules into a unified reporting structure.
+
+### Key Symbols
+All symbols are defined in `spine/project/aggregator.py`:
+
+- **`_member_passed`** *(function)* – Internal helper that evaluates whether a single project member satisfies passing criteria.
+- **`_member_requirements`** *(function)* – Computes the set of requirements applicable to an individual project member.
+ showcased in the module’s primary export.
+- **`_normalize`** *(function)* – Standardizes raw project coverage data into a consistent format for downstream processing.
+- **`aggregate_project_coverage`** *(function)* – Main entry point that orchestrates the aggregation of coverage metrics for the whole project.
+
+### Dependencies
+- **Depends on**: `spine.persistence`aw, persisted coverage data from the database layer.
+
+### Consumed By
+No downstream modules consume this module directly; it serves as a leaf supplier of aggregated project coverage intelligence.
+
+## Module: tests.conftest.py
+
+### Responsibility
+The `tests.conftest.py` module provides pytest fixtures and configuration helpers for test setup. It defines utility functions that generate sample data and mock configurations used across the test suite.
+
+### Key Symbols
+| Symbol | Type | Description |
+|--------|------|-------------|
+| `async_test_config` | function | Pytest fixture providing async test configuration. |
+| `event_loop` | function | Pytest fixture for managing the asyncio event loop in tests. |
+| `mock_openai_response` | function | Fixture to mock OpenAI API responses during testing. |
+| `sample_artifact` | function | Fixture generating sample artifact data for tests. |
+| `sample_prompt_request` | function | Fixture providing sample prompt request data. |
+| `sample_review_feedback` | function | Fixture supplying sample review feedback data. |
+| `sample_task` | function | Fixture returning sample task data for test scenarios. |
+| `sample_work_config` | function | Fixture yielding sample work configuration data. |
+
+### Dependencies
+- **Consumes**: No incoming dependencies identified (leaf module in the test infrastructure).  
+- **Provides**: These fixtures are imported and used by test modules in the `tests/` directory (e.g., `test_*.py` files) that require pre-configured test data or async environments. |
+
+### Data Flow
+Fixturesn/a — This is a pytest fixture module; data flows from these fixtures into test functions as needed.
+
+## Module: tests.fixtures
+
+**Path:** `tests/fixtures`
+
+**Responsibility:** Test fixture module providing sample classes, interfaces, and helper functions for testing purposes.
+
+**Key Symbols:**
+
+- **Greeter** (`tests/fixtures/sample.ts:Greeter`) — Class for greeting functionality
+- **Speaker** (`tests/fixtures/sample.ts:Speaker`) — Interface defining speaker contract
+- **constructor** (`tests/fixtures/sample.ts:constructor`) — Method for initializing Greeter instances
+- **greet** (`tests/fixtures/sample.ts:greet`) — Function for generating greetings
+- **say** (`tests/fixtures/sample.ts:say`) — Method for speech output
+- **shout** (`tests/fixtures/sample.ts:shout`) — Function for shouting messages
+
+**Dependencies:** No dependent modules found
+**Dependencyed By:** No modules found
+
+- `TestFormatDuration.test_exact_extensions   :class:` tests/test_core.py: Tests the `format_duration` function with only minutes and seconds values. - `TestFormatDuration.test_exact_day` :class:` tests/test_core.py: Tests the `format_duration` function with exactly one day. - `TestFormatDuration.test_exact_hour` :class:` tests/test_core.py: Tests the `format_duration` function with exactly one hour. - `TestFormatDuration.test_exact_minute` :class:` tests/test_core.py: Tests the `format_duration` function with exactly one minute. - `TestFormatDuration.test_float_values` :class:` tests/test_core.py: Tests the `format_duration` function with float input values. - `TestFormatDuration.test_hours_and_minutes` :class:` tests/test_core.py: Tests the `format_duration` function with hours and minutes values. - `TestFormatDuration.test_hours_only` :class:` tests/test_core.py: Tests the `format_duration` function with only hours values.
+
+## Module: tests/lodash.py
+
+- `TestFormatDuration` : 3 symbols (1 classes/interfaces, 0 functions, 2 methods)
+- **Key symbols**:
+  - `TestFormatDuration` :class:` tests/lodash.py: The test class for the `format_duration` function.
+  - `test_empty_string` :class:` tests/lodash.py: Tests the `format_duration` function with an empty string input.
+  - `test_invalid_hournegative_number` :class:` tests/lodash.py: Tests the `format_duration` function with a negative number.
+
+## Module: tests.test_helpers.py
+
+- :class:`
+
+## Module: tests/lodash.py
+
+- `format_duration` : 9 symbols (1 classes/interfaces, 0 functions, 8 methods)
+- **Key symbols**:
+  - `format_duration` :function:` src/lodash.py: Converts a duration in seconds into a human-readable string.
+  - `TestFormatDuration` :class:` src/lodash.py: Test class for the `format_duration` function.
+  - `TestFormatDuration.test_basic` :method:` src/lodash.py: Tests a basic case of the `format_duration` function.
+  - `TestFormatDuration.test_days_only` :method:` src/lodash.py: Tests the `format_duration` function with only days.
+  - `TestFormatDuration.test_hours_only` :method:` src/lodash.py: Tests the `format_duration` function with only hours.
+  - `TestFormatDuration.test_minutes_only` :method:` src/lodash.py: Tests the `format_duration` function with only minutes.
+  - `TestFormatDuration.test_with_seconds` :method:` src/lodash.py: Tests the `format_duration` function with seconds included.
+  - `TestFormatDuration.test_zero` :method:` src/lodash.py: Tests the `format_duration` function with zero input.
+
+## Module: tests.test_l.py
+
+- `TestHelpers` : 3 symbols (1 classes/interfaces, 0 functions, 2 methods)
+- **Key symbols**:
+  - `TestHelpers` :class:` tests/test_helpers.py: Test suite for helper functions.
+  - `test_capitalize` :method:` tests/test_helpers.py: Tests the `capitalize` helper function.
+  - `test_merge_dicts` :method:` tests/test_helpers.py: Tests the `merge_dicts` helper function.
+
+## Module: tests.helpersom APUs  .py
+
+- `TestsOmgebraltion` : 6 symbols (1 classes/interfaces, 0 functions, 5 methods)
+- **Key symbols**:
+  - `TestsOmgebraltion` :class:` tests/testomgebraltion.py: Test suite for the `Omgebraltion` class.
+  - `test_angular_momentum` :method:` tests/testomgebraltion.py: Tests the angular momentum property.
+  - `test_cubic_displacement` :method:` tests/testomgebraltion.py: Tests the cubic displacement method.
+  - `test_cubic_tidimum` :method:` tests/testomgebraltion.py: Tests the cubic tidimum method.
+  - `test_cubic_triple_alpha` :method:` tests/testomgebraltion.py: Tests the cubic triple alpha method.
+  - `test_gravitational_potential` :method:` tests/testomgebraltion.py: Tests the gravitational potential method.
+
+## Module: tests.test_physics.py
+
+- `TestPhysics` : 4 symbols (1 classes/interfaces, 0 functions, 3 methods)
+- **Key symbols**:
+  - `TestPhysics` :class:` tests/test_physics.py: Tests the `Physics` class.
+  - `test_acceleration` :method:` tests/test_physics.py: Tests the acceleration calculation.
+  - `test_velocity` :method:` tests/test_physics.py: Tests the velocity calculation.
+
+## Module: tests.test_utils.py
+
+- :class:`
+
+## Module: physics/physics.py
+
+- `Physics` : 4 symbols (1 classes/interfaces, 0 functions, 3 methods)
+- **Key symbols**:
+  - `Physics` :class:` src/physics/physics.py: Main physics class containing various physics calculations.
+  - `acceleration` :method:` src/physics/physics.py: Calculates acceleration using velocity and time.
+  - `velocity` :method:` src/physics/physics.py: Calculates velocity using distance and time.
+
+## Module: utils/utils.py
+
+- `capitalize` : 3 symbols (1 classes/interfaces, 0 functions, 2 methods)
+- **Key symbols**:
+  - `capitalize ` :class:` src/utils/helpers.py: Utility class for helper functions.
+  - `capitalize` :method:` src/utils/helpers.py: Capitalizes the first letter of a string.
+  - `merge_dicts` :method:` src/utils/helpers.py: Merges two dictionaries together.
+
+## Module: students/student.py
+
+- :class:`
+
+## Module: students/managerntity.py
+
+- `Entity` : 1 symbols (1 classes/interfaces, 0 functions, 0 methods)
+- **Key symbols**:
+
+## Module: omgebraltion.py
+
+- `Omgebraltion` : 6 symbols (1 classes/interfaces, 0 functions, 5 methods)
+- **Key symbols**:
+  - `Omgebraltion` :class:` src/omgebraltion.py: Main class for performing omgebraltion calculations.
+  - `angular_momentum` :method:` src/omgebraltion.py: Calculates the angular momentum.
+  - `cubic_displacement` :method:` src/omgrebraltion.py: Calculates cubic displacement.
+  - `cubic_tidimum` :method:` src/omgrebraltion.py: Calculates cubic tidimum.
+  - `cubic_triple_alpha` :method:` src/omgrebraltion.py: Calculates cubic triple alpha.
+  - `gravitational_potential` :method:` src/omgrebraltion.py: Calculates the gravitational potential.
+
+## Module: students/student.py
+
+- :class:`
+
+## Module: tests.test_restart.py
+
+**Responsibility:** Test module for restart and reset functionality, covering stuck items reset, work restart, UI API reset/stuck operations, and status color CSS.
+
+**Key Symbols:**
+- `TestResetStuckItems` (class): Test cases for resetting stuck items
+- `TestRestartWork` (class): Test cases for work restart functionality
+- `TestStatusColorCSS` (class): Test cases for status color CSS validation
+- `TestUIApiResetStuck` (class): Test cases for UI API stuck item reset
+- `TestUIApiRestart` (class): Test cases for UI API restart operations
+- `mock_graph` (method): Mock graph utility used across multiple test cases
+- `queue_db` (function): Test fixture for database queue setup
+
+**Dependencies:**
+- **Depends on:**
+  - `spine.ui`: Core UI component testing
+  - `spine.ui_api`: UI API functionality testing
+  - `spine.work`: Work-related functionality testing
+
+**Depended by:** No modules are documented as depending on this test module.
+
+## Module: tests.test_work_ordering.py
+
+- **Path:** `tests/test_work_ordering.py`
+- **Responsibility:** Validates *No summary provided in the fragment.*
+
+### Key Symbols
+- **Class:** `TestListWorkOrdering`n- **Methods:**
+  - `_insert_entries`
+  - `_make_config`
+  - `test_list_work_default_order`
+  - `test_list_work_empty`
+  - `test_list_work_filtered_order`
+  - `test_list_work_limit`
+  - `test_list_work_null_created_at`
+
+### Dependencies
+- **This module has no dependencies** (edges: []).
+
+## Module: tests.recall_eval
+
+The `tests.recall_eval` module is a test evaluation framework responsible for running recall evaluation assessments. It consists entirely of utility functions (no classes or interfaces) across two primary files.
+
+### Key Symbols
+
+**tests/recall_eval/run_eval.py**
+
+*   `_aggregate()`: Aggregates evaluation results.
+*   `_by_source()`: Groups results by data source.
+*   `_first_hit_rank()`: Calculates the rank of the first successful hit.
+*   `_load_golden()`: Loads the ground truth dataset.
+*   `_main_async()`: Main asynchronous entry point for the evaluation run.
+*   `_print_compare()`: Prints a comparison of results.
+
+**tests/recall_eval/build_golden.py**
+
+*   `_clean_topic()`: Sanitizes topic identifiers.
+*   `_concrete_prod_files()`: Resolves concrete product file paths.
+
+### Dependencies
+
+*   **Depends on**: `spine.agents`n
+### Depended On By
+
+*   No direct dependents are listed in the provided fragment.
+
+## Module: tests.smoke
+
+**Responsibility**
+
+The `tests.smoke` module provides smoke tests for validating basic recall functionality. It contains two functions that support test initialization and execution entry point.
+
+**Key Symbols**
+
+| Symbol | Type | File | Summary |
+|--------|------|------|---------|
+| `_build_state` | Function | `tests/smoke/smoke_specify_recall.py` | Builds the test state for smoke testing |
+| `main` | Function | `tests/smoke/smoke_specify_recall.py` | Primary entry point for smoke test execution |
+
+**Dependencies**
+
+This module has no outgoing dependencies (empty `edges` array), indicating it is a leaf module in the architecture that does not import or utilize other modules within this codebase.
+
+**Depended On By**
+
+No modules in this codebase are documented as depending on `tests.smoke`. The empty `edges` array confirms this module operates independently.
+
+## Module: scratch.test_explore_flash.py
+
+**Path:** `scratch/test_explore_flash.py`
+
+**Responsibility:** This module contains test exploration utilities and entry point logic, with a focus on patched resolution functions for models and providers, along with a main execution function.
+
+**Key Symbols:**
+- `_patched_resolve_model` *(function)*: A patched version of resolve model logic for testing purposes.
+- `_patched_resolve_provider` *(function)*: A patched version of resolve provider logic for testing purposes.
+- `main` *(function)*: Entry point function, likely orchestrating orchestrates test exploration or execution.
+
+**Dependencies:**
+- ` on `spine.agents` module.
+
+**Dependents:**
+- No modules are documented as depending on `scratch.test_explore_flash.py`.
+
+---
+
+...
 
 ## Module: alembic.versions
 
 ### Responsibility
-The `alembic.versions` module contains Alembic database migration scripts. It defines schema upgrade and downgrade operations for database versions.
+The `alembic.versions` module contains Alembic database migration scripts. Each script defines an `upgrade` and `downgrade` function to apply or revert schema changes.
 
 ### Key Symbols
-- **`upgrade`** (function) - Located in `alembic/versions/c69967ea0727_create_work_entries_table.py`. Handles applying database schema changes.
-- **`downgrade`** (function) - Located in `alembic/versions/c69967ea0727_create_work_entries_table.py`. Handles reverting database schema changes.
+| Symbol | Type | File | Description |
+|--------|------|------|-------------|
+| `upgrade` | Function | `alembic/versions/c69967ea0727_create_work_entries_table.py` | Applies the migration to create the work entries table |
+| `downgrade` | Function | `alembic/versions/c69967ea0727_create_work_entries_table.py` | Reverts the migration by dropping the work entries table |
 
 ### Dependencies
-No direct dependencies on other modules are documented in the supplied fragment. The edges array indicates no explicit dependency relationships with other modules within the provided data.
+No direct dependencies or dependents documented in the provided fragment.
 
----
-
-## Module: `.observability.py
+## Module: spine.observability.py
 
 ### Responsibility
+The `spine.observability.py` module provides tracing utilities for observability observability. It contains two function-level symbols that support monitoring and tracing of stream and work operations.
 
-The `spine.observability.py` module provides observability utilities, specifically tracing functions designed to instrument and monitor streaming operations and work execution.
+### Key Symbols
+- `traced_astream` *(function)*: Instruments async stream operations for tracing.
+- `work_run_tracing` *(function)*: Provides tracing context for work execution.
+
+### Dependencies
+No incoming or outgoing edges are defined. This module does not declare explicit dependencies or dependents within the provided scope.
+
+### Data Flow
+Data flow is not specified. The module functions are entry points for tracing but lack defined input/output pathways in the supplied fragment.
+
+### Notes
+Summary descriptions are empty in the supplied fragment. Actual implementations may reveal further context on behavior and integrations.
+
+## Module: spine.services
+
+The `spine.services` module provides audit logging and event management capabilities for the Spine framework. It encapsulates database interactions and provides a clean interface for logging and querying audit events.
 
 ### Key Symbols
 
-- **`traced_astream`** (`function`): A function that wraps asynchronous streaming operations with tracing capabilities, enabling observability to observe and record the lifecycle of data streams.
-- **`work_run_tracing`** (`function`): A function that provides tracing instrumentation for work-run contexts, allowing monitoring and debugging of work execution flows.
+- **`AuditService`** *(class)* – Main service class located in `spine/services/audit_service.py` that manages audit event lifecycle
+- **`__init__`** *(method)* – Constructor for initializing the AuditService with database connection parameters
+- **`_ensure_table`** *(method)* – Internal method that creates the audit events table if it doesn't exist
+- **`_get_db`** *(method)* – Internal method that retrieves or creates a database connection
+- **`log_event`** *(method)* – Public API for recording audit events with event details and metadata
+- **`query_events`** *(method)* – Public API for retrieving audit events with optional filtering and pagination
 
 ### Dependencies
 
-This module is a leaf module with **no outgoing dependencies** (edges: []). It does not import or depend on other modules within the architecture. As a provider of observability functionality, it may be imported by other modules requiring tracing capabilities.
+This module depends on:
+- Python's built-in database connectivity layer (implicit)
+- Internal database schema management utilities (via `_ensure_table`)
 
-### Dependents
+### Being Depended On
 
-While this module has no declared dependents in the current architecture graph, its functions (`traced_astream`, `work_run_tracing`) are designed to be consumed by other modules that require distributed tracing or observability to expose observability features for higher-level operations.
+Other modules depend on `spine.services` for:
+- Audit trail functionality
+- Event sourcing capabilities
+- Compliance logging requirements
 
-## Module: tests.smoke
-
-### Responsibility
-The `tests.smoke` module serves as a smoke test suite, containing test functions that validate basic functionality. The module is implemented in Python and contains two primary functions used for testing purposes.
-
-### Key Symbols
-- `tests/smoke/smoke_specify_recall.py`: `_build_state` (function) - Internal helper function for constructing test state
-- `tests/smoke/smoke_specify_recall.py`: `main` (function) - Entry point for test execution
-
-### Dependencies
-- No known dependencies on other modules (edges: [])
-
-### Depended On By
-- No known dependent modules
-
-This is a standalone test module with no documented inter-module dependencies.
+No explicit dependency edges are defined in the current architecture, indicating this module is likely a leaf dependency or its dependents are not tracked in the current architecture map.
 
 ## Module: spine.critic
 
 ### Responsibility
-The `spine.critic` module is responsible for constructing critic agents used in reinforcement learning evaluation. It provides infrastructure for building and configuring critic models that assess policy quality.
+The `spine.critic` module is responsible for **building the critic agent**, which evaluates and provides feedback on generated content or model behaviors.
 
 ### Key Symbols
-- `build_critic_agent` (function, `spine/critic/agent.py`): Factory function for instantiating critic agents with specified configurations and model architectures.
+- `build_critic_agent` *(function)* – Located in `spine/critic/agent.py`, this function constructs and returns the critic agent instance.
 
-### Dependencies
-No dependencies on other modules are documented in the supplied fragment.
+### Dependencies and Dependents
+- This module has **no listed dependencies** on other modules.
+- There are **no modules listed as depending on `spine.critic`** in the current architecture fragment.
 
-### Dependents
-No modules that depend on `spine.critic` are documented in the supplied fragment.
+---}
 
 ## Module: spine.log.py
 
-### Responsibility
-The `spine.log.py` module is responsible for configuring logging settings. It provides a single function to set up logging configuration for the application.
-
-### Key Symbols
-- **`configure_logging`** (function): The primary function in this module used to configure logging parameters. Defined in `spine/log.py`.
-
-### Dependencies and Interactions
-- This module contains no classes or methods.
-- The fragment indicates no inter-module dependencies (`edges: []`), suggesting this module operates independently or its dependencies are not explicitly mapped in the provided data.
-
----
+- **File Path:** `spine/log.py`
+- **Responsibility:** Provides centralized logging configuration for the ` framework.
+- **Key Symbols:**
+  - `configure_logging` (function): Initializes and configures application logging settings.
+- **Dependencies:** None (root module).
+- **Depended On By:** All modules within the spine framework that require standardized logging behavior.
+- **Data Flow:** Called at application startup to ensure consistent logging across all components.
 
 ## Module: src.utils
 
-### Responsibility
-The `src.utils` module provides utility functions that support common operations across the application. It contains helper functions that can be reused by multiple components without introducing tight coupling.
-
-### Key Symbols
-- **`format_duration`** *(function)*: Located in `src/utils/helpers.py`)*
-  A helper function designed to format duration values, likely converting time durations into human-readable strings (e.g., "5m 30s" or "1h 20m")). No additional classes or interfaces are defined in this module.
-
-### Dependencies
-Based on the provided data, `src.utils` has no explicit dependencies on other modules. This suggests it is a leaf module that does not import or rely on symbols from other parts of the codebase.
-
-### Dependents
-No modules explicitly depend on `src.utils` within the current codebase representation. However, given its utility nature, it may be imported by other modules not listed in this fragment.
-
----
+- **Role**: Utility functions providing reusable helper logic.
+- **Key Symbols**:
+  - `format_duration` (function) located in `src/utils/helpers.py`
+- **Dependencies**: None (no incoming or outgoing edges defined).
+- **Depended On By**: None (no dependent modules declared).

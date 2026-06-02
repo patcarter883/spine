@@ -2,112 +2,108 @@
 
 ## Logging Conventions
 
-### Use module-level loggers.getLogger(__name__)
+All modules MUST obtain a logger instance using `logging.getLogger(__name__)` to ensure proper hierarchical logging and log correlation with module names.
 
-All Python modules MUST obtain a logger using `logging.getLogger(__name__)` at the module level. This pattern ensures log records are organized organized under the module's fully-qualified name in the logger tree.
-
-**Evidence:**
-- `spine/config.py`: The `SpineConfig` class and `load` method both operate within a module that follows this convention
-- `spine/log.py`: The `configure_logging` function establishes this as the project-wide standard
-
-**Example:**
 ```python
 import logging
 
 logger = logging.getLogger(__name__)
-
-class MyClass:
-    def my_method(self):
-        logger.info("Processing started")
 ```
 
-**Rationale:**
-This convention enables granular control over logging levels per module and integrates seamlessly with the project's centralized `configure_logging` setup in `spine/log.py`.
+This pattern is established in:
+- `spine/config.py` - Used by both `SpineConfig` class and `load` method
+- `spine/log.py` - Used by `configure_logging` function
+
+This convention ensures loggersn logs are properly namespaced under their originating module.
 
 ## Data Model Conventions
 
-### Use frozen dataclasses for internal data models
+All internal data models must be implemented as **frozen `dataclass` decorators**. This ensures immutability, clear structure, and automatic method generation (__init__, __repr__, etc.) for data-holding classes.
 
-**Rule**: Define all internal data models as Python `dataclass`es decorated with `@dataclass(frozen=True)`.
+### Rule
+Use Python's `@dataclass(frozen=True)` when defining classes solely for holding data within the codebase.
 
-**Evidence**: The `RepoAnalyzer` class in `spine/work/onboarding/analyzer.py` demonstrates this convention.
-
-**Rationale**: Frozen dataclasses provide immutability, automatic `__eq__`, `__repr__`, and type-safe attribute definitions while being lightweight and Python.
-
-**Example**:
+### Example
 ```python
-def __post_init__(self):\n):
-    # Validation logic if needed
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class RepoAnalyzer:
+    name: str
+    path: str
 ```
 
-**Note**: This convention applies to internal data structures only. API contracts and external interfaces may follow different serialization patterns.
+This pattern enforces type safety, prevents accidental mutation, and clearly separates data models from behavioral classes.
 
 ## Naming Conventions
 
-All functions and methods MUST have fully typed signatures. Use Python type hints for all parameters and return values.
+### Functions and Methods
+All function and method signatures **must** include complete type hints for parameters and return values. Examples from the codebase:
 
-```python
-# Example from alembic/env.py
-from typing import Any
+- `run_migrations_offline()` — `alembic/env.py`
+- `run_migrations_online()` — `alembic/env.py`
+- `upgrade()` — `alembic/versions/c69967ea0727_create_work_entries_table.py`
 
-def run_migrations_offline() -> None:
-    """Run migrations offline."""
-    ...
+These functions demonstrate the requirement for explicit typing in signatures.
 
-def run_migrations_online() -> None:
-    """Run migrations online."""
-    ...
+### Module-Level Symbols
+Public and private symbols named at module level (e.g., functions, classes) follow standard Python naming: lowercase with underscores for functions and methods, CapWords for classes.
 
-def upgrade() -> None:
-    """Upgrade schema."""
-    ...
-```
+*(No evidence was found for constants, variables, or other naming patterns beyond the function type hint convention stated above.)*
 
-Key rules:
-- Use snake_case for function and method names
-- Include complete type annotations for all parameters
-- Use `-> None` for functions that don't return a value
-- Follow PEP 8 naming conventions
-
-Evidence: Functions `run_migrations_offline`, `run_migrations_online`, and `upgrade` in `alembic/env.py` and migration files all follow this pattern with full type hints.
+---
 
 ## Error Handling Conventions
 
-### Rule: Use try/except guards for fallible operations
+### Rule: Guard Fallible Operations with try/except
 
-Wrap all fallible operations in `try/except` blocks to gracefully handle exceptions and prevent unhandled crashes. This pattern is consistently applied across the codebase in functions that interact with external systems or perform potentially unsafe operations. Examples can be found in:
+Wrap all operations that can raise exceptions in a `try/except` block. This pattern is demonstrated in:
 
-- `spine/agents/_tokens.py` - function `count_tokens`
-- `spine/agents/artifacts.py` - function `scan_artifact_dir`
-- `spine/agents/artifacts.py` - function `list_slice_files`
+- `spine/agents/_tokens.py` - [`count_tokens`](()(function)`](code-spine/agents/_tokens.py)
+- `spine/agents/artifacts.py` - [`scan_artifact_dir()(function)`](code-spine/agents/artifacts.py)
+- `spine/agents/artifacts.py` - [`list_slice_files()(function)`](code-spine/agents/artifacts.py)
 
-When implementing new functions that perform file I/O, network operations, or other potentially exception-raising activities, ensure you follow this same pattern by wrapping the fallible code in appropriate error handling blocks.
+Apply this guard pattern to any I/O, parsing, or external-call operations where failure is possible.
+
+**Example Template:**
+```python
+def example_function():
+    try:
+        # fallible operation here
+        pass
+    except Exception as e:
+        # handle error appropriately
+        pass
+```
+
+*Do Policy:* All contributions MUST adopt this defensive structure when invoking potentially failing operations.
+
+---
+
+Type hints MUST be explicit
+
+*Formal utilizes PEP 484 type annotations.
 
 ## Testing Conventions
 
-All tests **must** follow the established pytest patterns:
+All tests MUST follow these naming and placement conventions:
 
-1. **Function naming**: Test functions **must** be prefixed with `test_`. Example: `test_exploration_subgraph_builds`\n2. **Class naming**: Test classes **must** use `Test*` PascalCase naming (e.g., `TestExplorer`).
-3. **Location**: Place tests in the `tests/` directory, using subdirectories like `tests/integration/` to organize by scope.
-4. **Structure**: Place `conftest.py` files in relevant test directories to scope fixtures appropriately.
-
-Adhere strictly to these conventions to maintain consistency with existing tests like `test_expl` and `test_exploration_subgraph_supports_plan`.
+1. **Function Names**: Test functions MUST be prefixed with `test_` and placed in the `tests/` directory.
+2. **Class Names**: Test classes MUST follow the `Test*` naming pattern (e.g., `TestExplorer`) and also reside in `tests/`.
+3. **Example Evidence**:
+   - `tests/conftest.py` contains `test_config`n   - `tests/integration/test_exploration_subgraph.py` contains `test_exploration_subgraph_builds`
 
 ## Config Conventions
 
-All configuration access must be performed through the centralized `SpineConfig.load()` method. Never instantiate or access configuration values directly.
+All configuration access must be performed through the centralized `SpineConfig.load()` method. Contributors must not instantiate or import configuration objects directly. The `SpineConfig.load()` method provides the single, authoritative source for accessing configuration throughout the codebase.
 
-**Rule:**
+**Evidence
+This convention is evidenced
+verified by examining the following functions in `spine/agents/exploration_agents.py`:
+- `run_research_manager`
+- `run_explore_do_node`
+- `_findings_structured_model`
 
-The use of `SpineConfig.load()` is consistently applied across the codebase, including:
+All configuration access within these functions consistently uses `SpineConfig.load()` rather than direct instantiation or alternative configuration patterns.
 
-* `run_research_manager` function in spine(':spine/agents/exploration_agents.py
-* `run_explore_do_node()` function in ':spine/agents/exploration_agents.py
-* `_findings_structured_model()` function in ':spine/agents/exploration_agents.py
-
-This centralized approach ensures uniform configuration management and prevents ad-hoc instantiation or scattering of configuration logic throughout the codebase.
-
-**Rule:**
-
-Distribute
-Contributors must route all configuration retrieval through `SpineConfig.load()`, treating it as the sole entry point for configuration access.
+**Enforcement:**nModule/common.rst: Failure to use `SpineConfig.load()` will result in inconsistent configuration states and potential runtime errors.
