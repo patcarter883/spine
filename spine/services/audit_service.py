@@ -9,6 +9,8 @@ from typing import Any
 
 import sqlite_utils
 
+from spine.persistence.sqlite_tuning import tune_connection
+
 
 class AuditService:
     """Records workflow events to a SQLite database for auditing.
@@ -29,7 +31,7 @@ class AuditService:
 
     def _get_db(self) -> sqlite_utils.Database:
         """Return a fresh connection (safe across threads)."""
-        return sqlite_utils.Database(str(self._db_path))
+        return tune_connection(sqlite_utils.Database(str(self._db_path)))
 
     def _ensure_table(self) -> None:
         """Create the audit_events table if it doesn't exist."""

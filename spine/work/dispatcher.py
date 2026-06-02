@@ -27,6 +27,7 @@ from spine.config import SpineConfig
 from spine.models.enums import PhaseName, TaskStatus, WorkType
 from spine.observability import traced_astream
 from spine.persistence.artifacts import ArtifactStore
+from spine.persistence.sqlite_tuning import tune_connection
 from spine.services.audit_service import AuditService
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ def _get_work_db(config: SpineConfig) -> sqlite_utils.Database:
     """Get or create the work entries database."""
     db_path = Path(config.queue_path).parent / "work_entries.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite_utils.Database(str(db_path))
+    db = tune_connection(sqlite_utils.Database(str(db_path)))
 
     if "work_entries" not in db.table_names():
         db["work_entries"].create(

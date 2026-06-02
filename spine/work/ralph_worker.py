@@ -23,6 +23,7 @@ import sqlite_utils
 
 from spine.config import SpineConfig
 from spine.models.enums import TaskStatus
+from spine.persistence.sqlite_tuning import tune_connection
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
     s.value for s in TaskStatus
@@ -90,7 +91,7 @@ class RalphLoopWorker:
         """Return a fresh connection — safe across threads."""
         db_path = Path(self.config.queue_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite_utils.Database(str(db_path))
+        db = tune_connection(sqlite_utils.Database(str(db_path)))
 
         if "queue" not in db.table_names():
             db["queue"].create(
