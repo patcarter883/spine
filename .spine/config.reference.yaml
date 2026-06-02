@@ -1,0 +1,422 @@
+# ============================================================================
+# SPINE configuration reference — every available setting
+# ============================================================================
+#
+# This file is DOCUMENTATION ONLY. SPINE does not load it; it loads
+# `.spine/config.yaml`. Every setting SPINE understands is listed here with:
+#
+#   • a short description of what it does
+#   • Default: the built-in value used when the key is absent (from the
+#     SpineConfig / ConvergenceConfig / TokenCompactionConfig dataclasses in
+#     spine/config.py — the canonical source of truth)
+#   • Env: the environment variable that overrides it, or "(no env override)"
+#   • valid values / ranges where they matter
+#
+# Each setting below is shown at its DEFAULT value, so this file is also a
+# behaviour-neutral starting template: copy the entries you want to change
+# into `.spine/config.yaml`. The `providers:`, `embedding:`, `reranker:`, and
+# `mcp_servers:` blocks show PLACEHOLDER endpoints/models — replace them with
+# real values before use.
+#
+# Booleans accept 1/true/yes (on) and 0/false/no (off), case-insensitive,
+# whether set in YAML or via an env var. Env vars always win over the file.
+# ============================================================================
+
+spine:
+
+  # ── Storage paths ─────────────────────────────────────────────────────
+  # All relative paths are resolved against the workspace root.
+
+  # LangGraph checkpoint store (workflow state persistence).
+  # Default: .spine/spine.db  | Env: SPINE_CHECKPOINT_PATH
+  checkpoint_path: .spine/spine.db
+
+  # Directory for work artifacts — plans, specifications, reports.
+  # Default: .spine/artifacts  | Env: SPINE_ARTIFACT_PATH
+  artifact_path: .spine/artifacts
+
+  # Directory for project metadata.
+  # Default: .spine/project  | Env: SPINE_PROJECT_PATH
+  project_path: .spine/project
+
+  # Work-queue backend database.
+  # Default: .spine/queue.db  | Env: SPINE_QUEUE_PATH
+  queue_path: .spine/queue.db
+
+  # Project root the agent reads/writes. Leave blank to auto-detect by
+  # searching upward from the CWD (then the package dir) for a `.spine/`
+  # directory. Set explicitly if auto-detection lands on the wrong path
+  # (a warning is logged when the resolved root has no `.spine/` or isn't
+  # writable).
+  # Default: "" (auto-detect)  | Env: SPINE_WORKSPACE_ROOT
+  workspace_root: ""
+
+  # ── Work & queue ──────────────────────────────────────────────────────
+
+  # Execution mode for queued work (e.g. "task", "critical_task").
+  # Default: task  | Env: SPINE_WORK_TYPE
+  work_type: task
+
+  # Queue engine. Only "sqlite" is supported today.
+  # Default: sqlite  | Env: SPINE_QUEUE_BACKEND
+  queue_backend: sqlite
+
+  # Enable the code interpreter during task execution.
+  # Default: false  | Env: SPINE_INTERPRETER
+  interpreter_enabled: false
+
+  # Max retry attempts the critic phase grants before giving up.
+  # Default: 2  | Env: SPINE_MAX_CRITIC_RETRIES
+  max_critic_retries: 2
+
+  # ── Tooling ───────────────────────────────────────────────────────────
+
+  # Validate MCP / tool call arguments against their JSON schema before
+  # dispatch. Set false only to debug a stubborn schema mismatch.
+  # Default: true  | Env: SPINE_TOOL_SCHEMA_VALIDATION (0/false/no disables)
+  tool_schema_validation: true
+
+  # Global default for guided (schema-constrained) decoding. Per-provider
+  # `guided_decoding:` on each entry in providers.llm[] overrides this.
+  # Default: false  | Env: SPINE_GUIDED_DECODING
+  guided_decoding: false
+
+  # ── Phase timeouts ────────────────────────────────────────────────────
+  # Per-phase wall-clock limit in seconds. 0 = no timeout. Phases not listed
+  # fall back to `default_timeout`.
+  # Default: all phases 0  | (no env override)
+  phase_timeouts:
+    specify: 0
+    plan: 0
+    tasks: 0
+    implement: 0
+    verify: 0
+    critic: 0
+
+  # Fallback timeout (seconds) for any phase absent from phase_timeouts.
+  # Default: 0 (no timeout)  | (no env override)
+  default_timeout: 0
+
+  # ── RAG / retrieval ───────────────────────────────────────────────────
+
+  # Name of the embedding provider to use, matched against
+  # providers.embedding[].name.
+  # Default: openai-embeddings  | (no env override)
+  embedding_provider: openai-embeddings
+
+  # Number of chunks returned per recall query.
+  # Default: 10  | (no env override)
+  recall_k: 10
+
+  # Index test files into the vector store. Off by default — test chunks
+  # score high on NL similarity but tell a researcher nothing about
+  # production code, and they swamp the index (~66% of symbols).
+  # Default: false  | (no env override)
+  index_tests: false
+
+  # Reciprocal-rank-fusion channel weights for hybrid (BM25 + vector)
+  # recall. Lexical BM25 is the workhorse for code-symbol search; the dense
+  # vector channel is kept at a small hedge weight. Measure on
+  # tests/recall_eval before changing.
+  # Defaults: vector 0.2, bm25 1.0  | Env: SPINE_RRF_VECTOR_WEIGHT,
+  #           SPINE_RRF_BM25_WEIGHT
+  rrf_vector_weight: 0.2
+  rrf_bm25_weight: 1.0
+
+  # Cross-encoder reranker name, matched against providers.reranker[].name.
+  # Empty = reranking disabled (the fused RRF order is returned as-is).
+  # When set, hybrid retrieves `rerank_pool` candidates and the
+  # cross-encoder re-orders them down to `recall_k`.
+  # Default: "" (disabled)  | (no env override)
+  reranker_provider: ""
+
+  # Candidate pool size fetched before reranking down to recall_k.
+  # Only used when reranker_provider is set.
+  # Default: 50  | (no env override)
+  rerank_pool: 50
+
+  # Embedding-index build tuning.
+  #   max_concurrent_chunks — parallel embedding workers
+  #   batch_size            — chunks per embedding request
+  # Defaults: max_concurrent_chunks 5, batch_size 100  | (no env override)
+  vector_indexing:
+    max_concurrent_chunks: 5
+    batch_size: 100
+
+  # Per-topic recall lookup (runs between research_manager and the router).
+  # For each topic the manager emits, recall the top-K symbols whose cosine
+  # similarity is at least `topic_lookup_min_similarity`.
+  # Defaults: top_k 5, min_similarity 0.5  | (no env override)
+  topic_lookup_top_k: 5
+  topic_lookup_min_similarity: 0.5
+
+  # ── SPECIFY recall gate (exploration short-circuit) ───────────────────
+  # When classification confidence is high enough AND enough chunks were
+  # retrieved, skip the multi-round research_manager loop and synthesize
+  # directly from the recalled chunks.
+
+  # Minimum classification confidence to take the short-circuit.
+  # Default: 0.75  | (no env override)
+  recall_gate_confidence: 0.75
+
+  # Minimum number of retrieved chunks required to activate the gate.
+  # Default: 5  | (no env override)
+  recall_gate_min_hits: 5
+
+  # Trivial-task fast path: a short, high-confidence description with no
+  # architectural verbs short-circuits SPECIFY exploration even when recall
+  # returns zero hits (cold/empty index). This is the char-length ceiling
+  # for "short".
+  # Default: 150  | (no env override)
+  recall_gate_trivial_max_chars: 150
+
+  # ── Token budgets ─────────────────────────────────────────────────────
+
+  # Completion-token cap for the researcher's ResearchFindings structured
+  # summarisation calls (summarise / finalize / salvage). A findings JSON is
+  # small; a tight cap fails fast instead of letting a local model ramble to
+  # the global window.
+  # Default: 4096  | (no env override)
+  summarise_max_completion_tokens: 4096
+
+  # Total token budget for the SPECIFY explorer context.
+  # Default: 30000  | (no env override)
+  specify_context_token_budget: 30000
+
+  # Cap on the findings block injected into plan/specify synthesize prompts,
+  # so accumulated research summaries can't dominate the prompt. 0 or
+  # negative = unbounded.
+  # Default: 20000  | Env: SPINE_SYNTHESIZE_FINDINGS_TOKEN_BUDGET
+  synthesize_findings_token_budget: 20000
+
+  # Cap on prior-phase findings (SPECIFY's research_log carried into PLAN)
+  # injected into PLAN researcher/manager prompts. Tighter than the synthesis
+  # budget because the PLAN prompt already carries the spec. 0 or negative =
+  # unbounded.
+  # Default: 6000  | Env: SPINE_PRIOR_PHASE_FINDINGS_TOKEN_BUDGET
+  prior_phase_findings_token_budget: 6000
+
+  # Global default for the model's `max_completion_tokens` request field.
+  # Per-provider `max_completion_tokens:` still wins; this is the fallback.
+  # Prevents finite-window local providers (vLLM/SGLang) from claiming the
+  # entire remaining context as output budget. 0 = disabled (use the
+  # provider/library default).
+  # Default: 0  | Env: SPINE_MAX_COMPLETION_TOKENS
+  max_completion_tokens: 0
+
+  # ── Onboarding (repo analysis & documentation synthesis) ──────────────
+
+  # Hard per-fragment token ceiling the section-worker enforces (it degrades
+  # key_symbols → names → truncate so a fragment never exceeds this).
+  # Default: 6000  | Env: SPINE_ONBOARDING_SECTION_TOKEN_CAP
+  onboarding_section_token_cap: 6000
+
+  # Cap on the number of documentation fragments (limits API call volume by
+  # ranking + grouping the module tail).
+  # Default: 32  | Env: SPINE_ONBOARDING_MAX_SECTIONS
+  onboarding_max_sections: 32
+
+  # Completion-token cap for the section-worker's structured-output call.
+  # Sections are 100–700 tokens; a tight cap avoids long failed generations.
+  # Default: 2048  | Env: SPINE_ONBOARDING_SECTION_MAX_COMPLETION_TOKENS
+  onboarding_section_max_completion_tokens: 2048
+
+  # Route analysis through the distributed map-reduce graph (one explorer
+  # Send per module unit). When false, the manager calls RepoAnalyzer.analyze
+  # inline with no explorer Sends — the monolithic fallback for tiny repos.
+  # Default: true  | Env: SPINE_ONBOARDING_DISTRIBUTED_ANALYSIS
+  #          (0/false/no selects the monolithic fallback)
+  onboarding_distributed_analysis: true
+
+  # Opt-in LLM-enriched explorer mode. NOT IMPLEMENTED YET — flag only; the
+  # deterministic branch is the only path today.
+  # Default: false  | Env: SPINE_ONBOARDING_EXPLORER_LLM
+  onboarding_explorer_llm: false
+
+  # Max cycles for the explorer phase.
+  # Default: 3  | Env: SPINE_ONBOARDING_EXPLORER_MAX_CYCLES
+  onboarding_explorer_max_cycles: 3
+
+  # When true, phase agents receive the relevant onboarding document injected
+  # into their system prompt (most-relevant doc in full, the rest referenced
+  # by path).
+  # Default: true
+  # NOTE: not currently wired into the YAML loader — the built-in default
+  # (true) always applies regardless of what is set here. Listed for
+  # completeness; see spine.agents.skills_resolver.
+  onboarding_context_injection: true
+
+  # ── Researcher convergence steering ───────────────────────────────────
+  convergence:
+    # researcher_soft / researcher_hard / researcher_recursion_limit are
+    # retained for YAML back-compat but are NO-OPS for the researcher
+    # subagent since the supervisor/worker split replaced the free-form tool
+    # loop. Kept for any future tool-call convergence steering.
+
+    # Tool calls before a SystemMessage nudge (legacy/no-op).
+    # Default: 10  | Env: SPINE_RESEARCHER_SOFT
+    researcher_soft: 10
+
+    # Tool calls before tools are dropped (legacy/no-op). Raised to match
+    # researcher_soft if set lower.
+    # Default: 14  | Env: SPINE_RESEARCHER_HARD
+    researcher_hard: 14
+
+    # LangGraph recursion-limit safety cap (matches exploration_agents.py).
+    # Default: 50  | Env: SPINE_RESEARCHER_RECURSION_LIMIT
+    researcher_recursion_limit: 50
+
+    # Supervisor↔worker loop iteration cap for SPECIFY (broad architectural
+    # mapping gets a larger budget). Floored at 1.
+    # Default: 12  | Env: SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_SPECIFY
+    researcher_supervisor_max_cycles_specify: 12
+
+    # Supervisor↔worker loop iteration cap for PLAN (focused change-surface
+    # scan). Floored at 1.
+    # Default: 6  | Env: SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_PLAN
+    researcher_supervisor_max_cycles_plan: 6
+
+  # ── Token-based phase compaction (TokenBudgetCompactor) ───────────────
+  token_compaction:
+    # Master switch.
+    # Default: false  | Env: SPINE_TOKEN_COMPACTION
+    enabled: false
+
+    # Token threshold applied to phases absent from `thresholds`. 0 disables
+    # compaction by default.
+    # Default: 0  | (no env override)
+    default_threshold: 0
+
+    # Per-phase token thresholds. A value of 0 disables compaction for that
+    # phase even when `enabled` is true. Phases without an entry use
+    # `default_threshold`.
+    # Default: {} (empty)  | (no env override)
+    thresholds:
+      specify: 30000
+      plan: 40000
+      implement: 60000
+      verify: 40000
+
+    # Minimum number of recent messages always preserved during compaction.
+    # Default: 6  | (no env override)
+    keep_recent: 6
+
+    # Tool calls whose output is exempt from compaction. When omitted (or set
+    # to an empty list) the seven defaults below are used.
+    # Default: the list below  | (no env override)
+    preserved_tools:
+      - write_file
+      - edit_file
+      - read_edit_lint
+      - write_specification
+      - write_plan
+      - write_tasks
+      - write_verification_report
+
+# ============================================================================
+# MCP servers
+# ============================================================================
+# Map of server name → launch config. Only the `stdio` transport is
+# supported. PROJECT_ROOT is auto-injected into the environment by
+# spine.mcp.client.get_mcp_tools from the active workspace_root — do NOT set
+# it here.
+#
+# Env override: SPINE_MCP_SERVERS may hold a JSON object; its entries are
+# merged on top of (and override) the YAML map.
+mcp_servers:
+  codebase-index:
+    transport: stdio            # only "stdio" is supported
+    command: mcp-codebase-index # executable to launch
+    args: []                    # list of CLI args
+    env: {}                     # extra environment variables (map)
+
+# ============================================================================
+# Providers — LLM, embedding, reranker, and per-phase routing
+# ============================================================================
+providers:
+
+  # ── LLM providers ─────────────────────────────────────────────────────
+  # The first entry with enabled: true and a model is the default model.
+  # Reference an entry from a phase via `providers.phases.<phase>.provider`.
+  llm:
+    - name: example-local              # unique name (referenced by phases)
+      type: deepagents-model           # provider type
+      model: openai:Your-Model-GGUF    # model id (e.g. openrouter:vendor/model)
+      enabled: true                    # default: true when omitted
+      # ── optional, per-provider overrides ──
+      base_url: http://localhost:8000/v1  # API endpoint
+      api_key: vllm                       # API key (or env-var name)
+      temperature: 0.7                    # sampling temperature
+      max_tokens: 0                       # legacy completion cap
+      max_completion_tokens: 0            # completion cap (wins over spine.max_completion_tokens)
+      request_timeout: 0                  # per-request timeout (seconds)
+      max_retries: 2                      # request retry count
+      guided_decoding: true               # schema-constrained decoding for this provider
+      max_concurrent_calls: 1             # concurrency limit for this provider
+      stream_usage: true                  # stream token-usage events
+
+  # ── Embedding providers ───────────────────────────────────────────────
+  # Selected by the top-level `spine.embedding_provider` name. The embedding
+  # dimension is auto-probed from the live model at index time — no `dim`
+  # setting needed (run `spine index --wipe` after swapping models).
+  embedding:
+    - name: example-embeddings         # unique name (referenced by embedding_provider)
+      type: openai-embedding
+      model: nomic-embed-text-v2       # model id as served
+      base_url: http://localhost:8000/v1
+      api_key: vllm
+      stream_usage: true               # optional
+      # Asymmetric-model prefixes (optional; REQUIRED for nomic-embed-text-v2):
+      query_prefix: "search_query: "
+      document_prefix: "search_document: "
+
+  # ── Reranker providers (optional, OFF by default) ─────────────────────
+  # Selected by the top-level `spine.reranker_provider` name. Serve a
+  # cross-encoder behind a Cohere/Jina/vLLM-compatible /rerank endpoint.
+  reranker:
+    - name: example-reranker           # unique name (referenced by reranker_provider)
+      model: bge-reranker-v2-m3
+      base_url: http://localhost:8000/v1
+      api_key: vllm
+      rerank_path: "/reranking"        # optional; omit to auto-probe /rerank then /reranking
+
+  # ── Per-phase model routing ───────────────────────────────────────────
+  # Map of phase (or phase/subagent path) → routing. Each entry either
+  # references a named LLM provider via `provider:` and/or sets `model:`
+  # directly, plus any of these inline overrides (most specific wins):
+  #   base_url, api_key, temperature, max_tokens, max_completion_tokens,
+  #   request_timeout, max_retries, guided_decoding, max_concurrent_calls,
+  #   stream_usage
+  #
+  # Known phase keys: specify, plan, critic, exploration, implement, verify,
+  #   gap_plan, classification, summarization, onboarding.
+  # Subagent/path keys override their parent phase, e.g.:
+  #   specify/subagents/researcher, implement/subagents/slice-implementer,
+  #   onboarding/doc-manager, onboarding/section-worker.
+  #
+  # When a phase has no entry, the first enabled provider in providers.llm[]
+  # is used. The SPINE_MODEL env var is the last-resort default model.
+  phases:
+    specify:
+      provider: example-local
+    plan:
+      provider: example-local
+    implement:
+      provider: example-local
+      # temperature: 0.3            # example inline override on top of the provider
+    implement/subagents/slice-implementer:
+      provider: example-local
+    verify:
+      provider: example-local
+    critic:
+      provider: example-local
+    exploration:
+      provider: example-local
+    gap_plan:
+      provider: example-local
+    classification:
+      provider: example-local
+    summarization:
+      provider: example-local
+    onboarding:
+      provider: example-local

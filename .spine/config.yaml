@@ -1,3 +1,7 @@
+# SPINE live configuration. This file lists only the settings overridden
+# from their built-in defaults. For the full catalogue of every available
+# setting — with its default, valid values, and environment-variable
+# override — see .spine/config.reference.yaml.
 spine:
   checkpoint_path: .spine/spine.db
   guided_decoding: true
