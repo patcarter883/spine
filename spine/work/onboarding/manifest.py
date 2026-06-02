@@ -77,6 +77,8 @@ class RepoManifest:
     file_count: int
     generated_at: str  # ISO timestamp
     notes: str = ""  # analysis caveats (e.g. "index unavailable, AST-only")
+    is_monorepo: bool = False
+    workspace_packages: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-round-trippable dict.
@@ -127,6 +129,8 @@ class RepoManifest:
             file_count=int(data.get("file_count", 0)),
             generated_at=data.get("generated_at", ""),
             notes=data.get("notes", ""),
+            is_monorepo=bool(data.get("is_monorepo", False)),
+            workspace_packages=list(data.get("workspace_packages", []) or []),
         )
 
 

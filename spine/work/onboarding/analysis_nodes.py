@@ -206,7 +206,10 @@ async def _analysis_manager_node(
         notes_parts.append("vector index unavailable — AST-only, no summaries")
 
     tech = analyzer._infer_tech_stack(files, seed_stack)  # noqa: SLF001
-    grouped = group_symbols_by_module(symbols)
+    from spine.work.onboarding.analyzer import detect_workspace_packages  # noqa: PLC0415
+    workspace_packages = detect_workspace_packages(workspace_root)
+    is_monorepo = len(workspace_packages) >= 2
+    grouped = group_symbols_by_module(symbols, workspace_packages)
 
     units: list[dict[str, Any]] = []
     for name in sorted(grouped):
@@ -230,6 +233,7 @@ async def _analysis_manager_node(
                 "path": path,
                 "symbols": [_symbol_to_dict(s) for s in unit_symbols],
                 "summaries": unit_summaries,
+                "workspace_packages": workspace_packages,
             }
         )
 
@@ -256,6 +260,8 @@ async def _analysis_manager_node(
         "symbol_count": len(symbols),
         "analysis_notes": notes_parts,
         "generated_at": generated_at,
+        "workspace_packages": workspace_packages,
+        "is_monorepo": is_monorepo,
     }
 
 
@@ -318,9 +324,15 @@ def _analysis_explorer_node(
     )
     patterns = analyzer._extract_patterns_for_unit(unit_symbols, summaries)  # noqa: SLF001
 
+    from spine.work.onboarding.analyzer import _build_pkg_index, _module_of_with_packages  # noqa: PLC0415
+    unit_wp = active.get("workspace_packages") or []
+    pkg_index = _build_pkg_index(unit_wp) if unit_wp else []
     raw_imports: list[dict[str, Any]] = []
     for sym in unit_symbols:
-        src_module = RepoAnalyzer._module_of(sym.file_path)  # noqa: SLF001
+        if pkg_index:
+            src_module = _module_of_with_packages(sym.file_path, pkg_index)
+        else:
+            src_module = RepoAnalyzer._module_of(sym.file_path)  # noqa: SLF001
         imports = RepoAnalyzer._iter_imports(sym.raw_code)  # noqa: SLF001
         if imports:
             raw_imports.append({"src": src_module, "imports": imports})
@@ -409,6 +421,8 @@ def _aggregate_analysis_node(
         generated_at=state.get("generated_at", "")
         or datetime.now(timezone.utc).isoformat(),
         notes="; ".join(notes_parts),
+        is_monorepo=bool(state.get("is_monorepo", False)),
+        workspace_packages=list(state.get("workspace_packages", []) or []),
     )
     manifest_path = _persist(manifest, workspace_root, work_id, config)
     logger.info(

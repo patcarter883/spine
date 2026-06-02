@@ -77,6 +77,13 @@ def _module_symbol_count(boundary: dict[str, Any]) -> int:
     return len(boundary.get("key_symbols", []) or [])
 
 
+def _monorepo_summary(packages: list[dict]) -> dict:
+    """Compact monorepo summary for the synthesis LLM's framing context."""
+    apps = [p["dotted_name"] for p in packages if p.get("kind") == "app"]
+    libs = [p["dotted_name"] for p in packages if p.get("kind") == "lib"]
+    return {"total_packages": len(packages), "apps": apps, "libs": libs}
+
+
 def _out_degree_by_module(
     boundaries: list[dict[str, Any]],
     edges: list[dict[str, Any]],
@@ -179,7 +186,10 @@ def manifest_index(
             seen.add(cat)
             pattern_categories.append(cat)
 
-    return {
+    is_monorepo = bool(data.get("is_monorepo", False))
+    workspace_packages = list(data.get("workspace_packages", []) or [])
+
+    result: dict[str, Any] = {
         "mode": data.get("mode", ""),
         "tech_stack": list(data.get("tech_stack", []) or []),
         "core_domains": [
@@ -197,7 +207,11 @@ def manifest_index(
             "edge_count": len(edges),
         },
         "notes": data.get("notes", ""),
+        "is_monorepo": is_monorepo,
+        "workspace_packages": workspace_packages if is_monorepo else [],
+        "monorepo_summary": _monorepo_summary(workspace_packages) if is_monorepo else None,
     }
+    return result
 
 
 # ── resolve_fragment ────────────────────────────────────────────────────────

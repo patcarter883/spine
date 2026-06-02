@@ -69,6 +69,8 @@ class OnboardingGraphState(TypedDict, total=False):
     symbol_count: int  # total extracted symbols
     file_count: int  # files that yielded symbols
     prebuilt_manifest: dict  # greenfield / monolithic-fallback manifest passthrough
+    workspace_packages: list[dict]  # set ONCE by analysis_manager; single writer
+    is_monorepo: bool  # set ONCE by analysis_manager; single writer
     manifest: dict  # RepoManifest.to_dict(); set ONCE by aggregator
     manifest_path: str  # set ONCE by aggregator
 

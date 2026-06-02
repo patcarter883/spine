@@ -129,10 +129,15 @@ class RepoAnalyzer:
             )
 
         files = await self._discover_files(workspace_root)
+        workspace_packages = detect_workspace_packages(workspace_root)
+        is_monorepo = len(workspace_packages) >= 2
         symbols, parsed_files = self._extract_symbols(workspace_root, files)
         notes_parts: list[str] = []
         if not files:
             notes_parts.append("file discovery returned nothing (index + walk both empty)")
+        if is_monorepo:
+            pkg_names = ", ".join(p["dotted_name"] for p in workspace_packages)
+            notes_parts.append(f"monorepo detected ({len(workspace_packages)} packages: {pkg_names})")
 
         summaries = self._load_summaries()
         if summaries:
@@ -140,8 +145,8 @@ class RepoAnalyzer:
         else:
             notes_parts.append("vector index unavailable — AST-only, no summaries")
 
-        boundaries = self._build_boundaries(symbols, summaries)
-        dependency_chains = self._build_dependency_edges(symbols)
+        boundaries = self._build_boundaries(symbols, summaries, workspace_packages)
+        dependency_chains = self._build_dependency_edges(symbols, workspace_packages)
         patterns = self._extract_patterns(symbols, summaries)
         tech = self._infer_tech_stack(files, seed_stack)
         core_domains = [b.name for b in boundaries]
@@ -158,6 +163,8 @@ class RepoAnalyzer:
             file_count=parsed_files,
             generated_at=generated_at,
             notes="; ".join(notes_parts),
+            is_monorepo=is_monorepo,
+            workspace_packages=workspace_packages,
         )
 
     # ── File discovery (index first, walk fallback) ─────────────────────
@@ -324,20 +331,20 @@ class RepoAnalyzer:
     # ── Module boundaries ───────────────────────────────────────────────
 
     def _build_boundaries(
-        self, symbols: list[Symbol], summaries: dict[tuple[str, str], str]
+        self,
+        symbols: list[Symbol],
+        summaries: dict[tuple[str, str], str],
+        workspace_packages: list[dict] | None = None,
     ) -> list[ModuleBoundary]:
         """Group symbols into logical module boundaries by package directory.
 
-        A boundary is the two-segment package prefix of a file path (e.g.
-        ``spine/work/dispatcher.py`` → module ``spine.work``, path
-        ``spine/work``). Top-level files collapse to their single segment.
-
-        This is the monolithic path: it groups all symbols (via
-        :func:`group_symbols_by_module`, also used by the distributed analysis
-        manager) and builds one boundary per group (via
-        :meth:`_build_boundary_for_unit`, also used by each analysis explorer).
+        When *workspace_packages* is provided, symbols are grouped by their
+        workspace package root; otherwise the two-segment prefix fallback is
+        used. This is the monolithic path — it groups all symbols via
+        :func:`group_symbols_by_module` and builds one boundary per group via
+        :meth:`_build_boundary_for_unit`.
         """
-        grouped = group_symbols_by_module(symbols)
+        grouped = group_symbols_by_module(symbols, workspace_packages)
         boundaries: list[ModuleBoundary] = []
         for name in sorted(grouped):
             module_symbols, path = grouped[name]
@@ -389,17 +396,22 @@ class RepoAnalyzer:
 
     # ── Dependency edges ────────────────────────────────────────────────
 
-    def _build_dependency_edges(self, symbols: list[Symbol]) -> list[DependencyEdge]:
+    def _build_dependency_edges(
+        self,
+        symbols: list[Symbol],
+        workspace_packages: list[dict] | None = None,
+    ) -> list[DependencyEdge]:
         """Derive inter-module ``depends_on`` edges from import statements.
 
         Imports are read from the byte-sliced symbol bodies already in memory
         (no extra file reads). We only record cross-module edges between
         package prefixes that actually appear as boundaries, deduplicated.
         """
-        modules = self._module_names(symbols)
+        pkg_index = _build_pkg_index(workspace_packages) if workspace_packages else []
+        modules = self._module_names(symbols, pkg_index)
         edges: set[tuple[str, str]] = set()
         for sym in symbols:
-            src_module = self._module_of(sym.file_path)
+            src_module = _module_of_with_packages(sym.file_path, pkg_index) if pkg_index else self._module_of(sym.file_path)
             for imported in self._iter_imports(sym.raw_code):
                 dst = self._match_module(imported, modules)
                 if dst and dst != src_module:
@@ -410,11 +422,14 @@ class RepoAnalyzer:
         ]
 
     @staticmethod
-    def _module_names(symbols: list[Symbol]) -> set[str]:
-        """Set of two-segment module names present across *symbols*."""
+    def _module_names(symbols: list[Symbol], pkg_index: list[tuple[str, str]] | None = None) -> set[str]:
+        """Set of module names present across *symbols*, package-aware when *pkg_index* is given."""
         names: set[str] = set()
         for sym in symbols:
-            names.add(RepoAnalyzer._module_of(sym.file_path))
+            if pkg_index:
+                names.add(_module_of_with_packages(sym.file_path, pkg_index))
+            else:
+                names.add(RepoAnalyzer._module_of(sym.file_path))
         return names
 
     @staticmethod
@@ -592,34 +607,154 @@ class RepoAnalyzer:
         return stack
 
 
+_PACKAGE_MARKERS: tuple[str, ...] = (
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "Cargo.toml",
+)
+
+_LIB_DIR_HINTS: frozenset[str] = frozenset({"libs", "lib", "packages", "shared", "common"})
+
+
+def _pkg_kind(name: str, parent: str | None) -> str:
+    """Heuristic: packages under a lib-hint dir, or named lib-like → 'lib'."""
+    if parent and parent.lower() in _LIB_DIR_HINTS:
+        return "lib"
+    if name.lower() in _LIB_DIR_HINTS or name.lower().startswith("lib"):
+        return "lib"
+    return "app"
+
+
+def detect_workspace_packages(workspace_root: str) -> list[dict]:
+    """Scan depth-1 and depth-2 for workspace package marker files.
+
+    Returns a list of package dicts with keys ``name``, ``dotted_name``,
+    ``path``, ``kind`` (``"app"`` or ``"lib"``), and ``marker`` (the
+    triggering file name). Returns an empty list for single-app repos or on
+    any filesystem error.
+
+    Depth-2 packages are only scanned under directories that are NOT
+    themselves packages at depth 1, preventing false sub-packages like
+    ``admin.src`` when ``admin/package.json`` already exists.
+    """
+    packages: list[dict] = []
+    found_at_depth1: set[str] = set()
+    try:
+        depth1 = sorted(os.listdir(workspace_root))
+    except OSError:
+        return []
+
+    for entry in depth1:
+        if entry.startswith(".") or entry in _SKIP_DIRS:
+            continue
+        entry_abs = os.path.join(workspace_root, entry)
+        if not os.path.isdir(entry_abs):
+            continue
+        for marker in _PACKAGE_MARKERS:
+            if os.path.isfile(os.path.join(entry_abs, marker)):
+                found_at_depth1.add(entry)
+                packages.append({
+                    "name": entry,
+                    "dotted_name": entry,
+                    "path": entry,
+                    "kind": _pkg_kind(entry, parent=None),
+                    "marker": marker,
+                })
+                break
+
+    for entry in depth1:
+        if entry.startswith(".") or entry in _SKIP_DIRS or entry in found_at_depth1:
+            continue
+        entry_abs = os.path.join(workspace_root, entry)
+        if not os.path.isdir(entry_abs):
+            continue
+        try:
+            subs = sorted(os.listdir(entry_abs))
+        except OSError:
+            continue
+        for sub in subs:
+            if sub.startswith(".") or sub in _SKIP_DIRS:
+                continue
+            sub_abs = os.path.join(entry_abs, sub)
+            if not os.path.isdir(sub_abs):
+                continue
+            for marker in _PACKAGE_MARKERS:
+                if os.path.isfile(os.path.join(sub_abs, marker)):
+                    packages.append({
+                        "name": sub,
+                        "dotted_name": f"{entry}.{sub}",
+                        "path": f"{entry}/{sub}",
+                        "kind": _pkg_kind(sub, parent=entry),
+                        "marker": marker,
+                    })
+                    break
+
+    return packages
+
+
+def _build_pkg_index(workspace_packages: list[dict]) -> list[tuple[str, str]]:
+    """Return ``(path_prefix, dotted_name)`` pairs sorted longest-prefix first."""
+    return sorted(
+        [(p["path"].rstrip("/"), p["dotted_name"]) for p in workspace_packages],
+        key=lambda x: -len(x[0]),
+    )
+
+
+def _module_of_with_packages(file_path: str, pkg_index: list[tuple[str, str]]) -> str:
+    """Resolve *file_path* to its module name using a pre-built *pkg_index*.
+
+    Tries each (prefix, dotted_name) pair longest-first. Falls back to the
+    two-segment logic when no package matches.
+    """
+    norm = file_path.replace("\\", "/")
+    for prefix, dotted_name in pkg_index:
+        if norm == prefix or norm.startswith(prefix + "/"):
+            return dotted_name
+    parts = norm.split("/")
+    return ".".join(parts[:2]) if len(parts) >= 2 else (parts[0] if parts else "")
+
+
 def group_symbols_by_module(
     symbols: list[Symbol],
+    workspace_packages: list[dict] | None = None,
 ) -> dict[str, tuple[list[Symbol], str]]:
-    """Group symbols by their two-segment package prefix.
+    """Group symbols by package root (monorepo) or two-segment prefix (single-app).
 
     Module-level so the distributed analysis manager can split symbols into
     per-unit work the same way the monolithic :meth:`RepoAnalyzer._build_boundaries`
-    does. A module key is the two-segment package prefix of a file path (e.g.
-    ``spine/work/dispatcher.py`` → ``spine.work``); top-level files collapse to
-    their single segment.
+    does.
+
+    When *workspace_packages* is provided and non-empty, each file is matched
+    against the longest package path prefix (greedy); files outside any detected
+    package fall back to the two-segment prefix logic. When *workspace_packages*
+    is empty or ``None``, the original two-segment behaviour is used unchanged.
 
     Args:
-        symbols: The flat symbol list from
-            :meth:`RepoAnalyzer._extract_symbols`.
+        symbols: The flat symbol list from :meth:`RepoAnalyzer._extract_symbols`.
+        workspace_packages: Optional list from :func:`detect_workspace_packages`.
 
     Returns:
-        ``{module_name: (symbols_in_module, module_path)}`` — the same grouping
-        the monolithic boundary builder uses, keyed by dotted module name with
-        its repo-relative directory path.
+        ``{module_name: (symbols_in_module, module_path)}`` keyed by dotted
+        module name with its repo-relative directory path.
     """
+    pkg_index = _build_pkg_index(workspace_packages) if workspace_packages else []
     by_module: dict[str, list[Symbol]] = defaultdict(list)
     module_path: dict[str, str] = {}
     for sym in symbols:
         norm = sym.file_path.replace("\\", "/")
-        parts = norm.split("/")
-        pkg_parts = parts[:2] if len(parts) >= 2 else parts[:1]
-        path = "/".join(pkg_parts)
-        name = ".".join(pkg_parts)
+        if pkg_index:
+            name = _module_of_with_packages(norm, pkg_index)
+            # Derive path from the matched package prefix or fallback segments
+            matched_prefix = next(
+                (prefix for prefix, dn in pkg_index if dn == name), None
+            )
+            path = matched_prefix if matched_prefix is not None else "/".join(norm.split("/")[:2])
+        else:
+            parts = norm.split("/")
+            pkg_parts = parts[:2] if len(parts) >= 2 else parts[:1]
+            path = "/".join(pkg_parts)
+            name = ".".join(pkg_parts)
         by_module[name].append(sym)
         module_path[name] = path
     return {name: (by_module[name], module_path[name]) for name in by_module}

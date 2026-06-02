@@ -320,9 +320,25 @@ async def _refine_plan_with_llm(
 
         index_json = json.dumps(index, ensure_ascii=False)
         draft_json = json.dumps(skeleton, ensure_ascii=False)
+
+        monorepo_addendum = ""
+        if index.get("is_monorepo"):
+            pkg_names = [
+                p.get("dotted_name", p.get("name", "?"))
+                for p in (index.get("workspace_packages") or [])
+            ]
+            monorepo_addendum = (
+                "\n\nThis is a MONOREPO containing multiple independent packages: "
+                f"{', '.join(pkg_names)}. "
+                "Treat each package as a standalone application or library — NOT as a "
+                "module of a single application. Use the package's dotted_name as its "
+                "canonical name in the documents you plan."
+            )
+        instructions = _MANAGER_INSTRUCTIONS + monorepo_addendum
+
         blocks = xml_blocks(
             (Tag.ROLE, _MANAGER_ROLE),
-            (Tag.WORKFLOW, _MANAGER_INSTRUCTIONS),
+            (Tag.WORKFLOW, instructions),
             (Tag.FINDINGS, f"Compact repository index:\n```json\n{index_json}\n```"),
             (Tag.SCRATCHPAD, f"Deterministic draft plan:\n```json\n{draft_json}\n```"),
         )

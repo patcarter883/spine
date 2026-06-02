@@ -295,6 +295,11 @@ def _coverage_manifest() -> RepoManifest:
         file_count=314,
         generated_at="2026-01-01T00:00:00",
         notes="analysis-caveat-sentinel",
+        is_monorepo=True,
+        workspace_packages=[
+            {"name": "admin", "dotted_name": "admin", "path": "admin", "kind": "app", "marker": "package.json"},
+            {"name": "api", "dotted_name": "api", "path": "api", "kind": "app", "marker": "package.json"},
+        ],
     )
 
 
@@ -335,6 +340,8 @@ def test_every_manifest_field_is_indexed_or_projected_or_excluded() -> None:
         "symbol_count": "4242",
         "file_count": "314",
         "notes": "analysis-caveat-sentinel",
+        "is_monorepo": "true",
+        "workspace_packages": "admin",
     }
 
     projected = set(signals)
