@@ -715,8 +715,12 @@ def _extract_anchors_from_tool_payload(body: str) -> tuple[str, list[str]]:
                         symbols.append(str(name))
                     if not target_path:
                         target_path = str(
-                            r.get("file_path") or r.get("path") or ""
+                            r.get("file_path") or r.get("path") or r.get("file") or ""
                         )
+        if not symbols:
+            for q in (data.get("queries_run") or [])[:5]:
+                if q:
+                    symbols.append(str(q))
     elif isinstance(data, list):
         for r in data[:10]:
             if isinstance(r, dict):
@@ -724,7 +728,7 @@ def _extract_anchors_from_tool_payload(body: str) -> tuple[str, list[str]]:
                 if name:
                     symbols.append(str(name))
                 if not target_path:
-                    target_path = str(r.get("file_path") or r.get("path") or "")
+                    target_path = str(r.get("file_path") or r.get("path") or r.get("file") or "")
 
     # De-dupe preserving order.
     seen: set[str] = set()

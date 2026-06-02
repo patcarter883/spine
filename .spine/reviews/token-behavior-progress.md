@@ -172,6 +172,17 @@ Total reduction: **prompt 21× smaller, P:C ratio from 226 → 15** across three
 
 ---
 
+## 11. Critic completion cap + configurable rework cap (2026-06-02, trace `019e87a2`)
+
+Trace `019e87a2` (work `a8511aac`, `critical_reviewed_task`, 1576s): critic_plan ran 3 cycles; the 3rd critic's first LLM call spent **592 seconds** generating before hitting the global 40K completion cap — cost ~600s of wall-clock for a ~2K-token verdict JSON. Separately, `max_critic_retries` was hardcoded to `3` in `critic_subgraph.py`, silently ignoring the `max_critic_retries` field in `SpineConfig` and `config.yaml`.
+
+Two fixes applied (not yet committed):
+
+- *(uncommitted 2026-06-02)* `critic_subgraph.py:242` — replace hardcoded `"max_retries": 3` with `SpineConfig.load().max_critic_retries`. `config.yaml` `max_critic_retries` dropped from 5 → 3 to preserve the previous effective cap while making it explicitly intentional.
+- *(uncommitted 2026-06-02)* `config.yaml phases.critic` — add `max_completion_tokens: 8192`. Critic verdict JSON never exceeds ~2K tokens; the 8K cap fails fast (expected <20s) vs. the prior 592s runaway. Applies via the `_PROVIDER_KEYS` override path in `resolve_provider_config`, no code change needed.
+
+P:C ratio for this trace: **2.4:1 on the plan phase** (from historical 226:1 baseline — sustained improvement). No context bloat; purpose-built tools working as expected.
+
 ## How to extend this document
 
 When trace audits land new fixes, append rows to the relevant section using the same `hash short-message — one-line impact` shape. Keep the TL;DR honest: if a section grows by more than two entries, bump a bullet up top so the reader sees it on first scroll.

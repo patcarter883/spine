@@ -19,6 +19,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
+from spine.config import SpineConfig
 from spine.models.enums import PhaseName, ReviewStatus
 from spine.workflow.subgraph_state import CriticSubgraphState
 from spine.workflow.critic_review import structural_critic_check, agent_critic_check
@@ -239,7 +240,7 @@ async def _agent_check_node(
         "work_type": state.get("work_type", ""),
         "feedback": state.get("feedback", []),
         "retry_count": {reviewed_phase: state.get("retry_count", 0)},
-        "max_retries": 3,
+        "max_retries": SpineConfig.load().max_critic_retries,
         "specification_json": state.get("specification_json"),
         "plan_json": state.get("plan_json"),
         # Forward the directive from the plan-before-do split so
