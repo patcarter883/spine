@@ -8,8 +8,11 @@ was returning paths under dot-folders like ``.git/``, ``.venv/``,
 
 from __future__ import annotations
 
+import json
+
 from spine.mcp.client import (
     EXCLUDED_INDEX_PATHS,
+    _is_excluded_path,
     _line_starts_with_excluded_path,
     _strip_excluded_paths,
 )
@@ -103,3 +106,77 @@ class TestStripExcludedPathsAggregate:
         out, dropped = _strip_excluded_paths(blob)
         assert out == blob
         assert dropped == 0
+
+
+class TestIsExcludedPath:
+    """Unit tests for the raw-path helper used by both branches."""
+
+    def test_dot_folder_at_root(self):
+        assert _is_excluded_path(".agent/skills/x.md")
+        assert _is_excluded_path(".deepagents/core/SKILL.md")
+        assert _is_excluded_path(".git/HEAD")
+        assert _is_excluded_path(".venv/lib/python3.13/site.py")
+
+    def test_dot_folder_nested(self):
+        assert _is_excluded_path("src/.cache/x.py")
+        assert _is_excluded_path("spine/.hidden/y")
+
+    def test_explicit_excluded_paths(self):
+        for prefix in EXCLUDED_INDEX_PATHS:
+            assert _is_excluded_path(prefix + "anything")
+
+    def test_normal_paths_kept(self):
+        assert not _is_excluded_path("spine/agents/factory.py")
+        assert not _is_excluded_path("README.md")
+        assert not _is_excluded_path("./spine/agents/factory.py")
+
+
+class TestStripExcludedPathsJsonFormat:
+    """_strip_excluded_paths must filter JSON-array results from codebase-index."""
+
+    def _make_result(self, file: str, content: str = "x") -> dict:
+        return {"file": file, "line_number": 1, "content": content}
+
+    def test_all_hidden_entries_dropped(self):
+        data = [
+            self._make_result(".agent/skills/langsmith-trace-analysis/SKILL.md"),
+            self._make_result(".deepagents/skills/deep-agents-core/SKILL.md"),
+        ]
+        out, dropped = _strip_excluded_paths(json.dumps(data))
+        assert dropped == 2
+        assert json.loads(out) == []
+
+    def test_mixed_entries_only_hidden_dropped(self):
+        data = [
+            self._make_result("spine/agents/factory.py", "clean"),
+            self._make_result(".agent/skills/x.md", "hidden"),
+            self._make_result("README.md", "also clean"),
+            self._make_result(".deepagents/core/SKILL.md", "hidden2"),
+        ]
+        out, dropped = _strip_excluded_paths(json.dumps(data))
+        assert dropped == 2
+        kept = json.loads(out)
+        assert len(kept) == 2
+        assert all(r["file"] in ("spine/agents/factory.py", "README.md") for r in kept)
+
+    def test_no_hidden_entries_returns_original(self):
+        data = [
+            self._make_result("spine/agents/factory.py"),
+            self._make_result("README.md"),
+        ]
+        blob = json.dumps(data)
+        out, dropped = _strip_excluded_paths(blob)
+        assert dropped == 0
+        assert out is blob  # identical object — no copy made
+
+    def test_empty_json_array_unchanged(self):
+        out, dropped = _strip_excluded_paths("[]")
+        assert dropped == 0
+
+    def test_non_json_starting_with_bracket_falls_back_to_text(self):
+        # Starts with '[' but isn't valid JSON → text-based filter fires.
+        blob = "[not json\n.git/HEAD: ref\nREADME.md: intro"
+        out, dropped = _strip_excluded_paths(blob)
+        assert dropped == 1
+        assert ".git/HEAD" not in out
+        assert "README.md" in out

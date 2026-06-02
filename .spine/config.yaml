@@ -156,7 +156,7 @@ providers:
     rerank_path: "/reranking"
   phases:
     specify:
-      provider: pat
+      provider: deepseek-v4-flash
     # Researcher subagent override. The local `pat` model struggles with
     # MCP tool-arg schemas (trace 019e6cc4: 23/23 research branches failed
     # with malformed args). Uncomment to escalate the researcher to a
@@ -164,19 +164,19 @@ providers:
     # specify/subagents/researcher:
     #   provider: deepseek-v4-pro
     plan:
-      provider: pat
+      provider: deepseek-v4-flash
     critic:
-      provider: pat
+      provider: deepseek-v4-flash
     exploration:
-      provider: pat
+      provider: deepseek-v4-flash
     implement:
-      provider: pat
+      provider: deepseek-v4-flash
     implement/subagents/slice-implementer:
-      provider: pat
+      provider: deepseek-v4-flash
     verify:
-      provider: pat
+      provider: deepseek-v4-flash
     gap_plan:
-      provider: pat
+      provider: deepseek-v4-flash
     # RAG phase providers
     classification:
       provider: pat

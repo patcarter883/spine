@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import re
 from pathlib import Path
@@ -68,58 +69,87 @@ _PATH_LINE_RE = re.compile(
 )
 
 
-def _line_starts_with_excluded_path(line: str) -> bool:
-    """Return True when *line* leads with a path inside EXCLUDED_INDEX_PATHS
-    or any dot-folder (``.git/``, ``.venv/``, ``.spine/``, ``.pytest_cache/``…).
+def _is_excluded_path(path: str) -> bool:
+    """Return True if *path* falls inside an excluded directory.
 
-    The dot-folder filter applies at any depth — ``spine/.cache/foo`` is
-    dropped just like ``.git/HEAD``. ``./`` (current-dir notation) and
-    ``../`` (parent-dir notation) are NOT treated as dot-folders.
+    Checks explicit ``EXCLUDED_INDEX_PATHS`` prefixes and the generic
+    dot-folder rule (any segment starting with ``.`` other than ``.`` or
+    ``..``). Works on raw path strings — no regex needed.
     """
-    m = _PATH_LINE_RE.match(line)
-    if not m:
-        return False
-    path = m.group("path")
     if path.startswith("./"):
         path = path[2:]
     if any(path.startswith(prefix) for prefix in EXCLUDED_INDEX_PATHS):
         return True
-    # Any segment beginning with '.' (other than '.' or '..') indicates a
-    # dot-folder. Splits handle both leading (.git/HEAD) and nested
-    # (src/.cache/foo) cases.
     for segment in path.split("/"):
         if segment.startswith(".") and segment not in (".", ".."):
             return True
     return False
 
 
+def _line_starts_with_excluded_path(line: str) -> bool:
+    """Return True when *line* leads with an excluded path.
+
+    Extracts the leading path token via ``_PATH_LINE_RE`` then delegates to
+    :func:`_is_excluded_path`.  Non-path lines (prose, JSON structure chars,
+    etc.) never match and pass through untouched.
+    """
+    m = _PATH_LINE_RE.match(line)
+    if not m:
+        return False
+    return _is_excluded_path(m.group("path"))
+
+
 def _strip_excluded_paths(text: str) -> tuple[str, int]:
-    """Drop lines whose leading path falls under an excluded directory.
+    """Drop result entries whose path falls under an excluded directory.
 
-    Returns (filtered_text, n_dropped). Forgiving — non-path lines pass
-    through untouched so prose/grouping headers are preserved.
+    Returns ``(filtered_text, n_dropped)``.
 
-    The per-line scan always runs (result blobs are byte-capped, so the
-    cost is negligible). We deliberately do NOT short-circuit on the
-    explicit ``EXCLUDED_INDEX_PATHS`` prefixes: the generic dot-folder rule
-    in :func:`_line_starts_with_excluded_path` must fire for hidden dirs
-    like ``.git/``, ``.venv/``, ``.pytest_cache/`` even when none of the
-    hard-coded ``.spine/`` prefixes happen to appear in the blob. When
-    nothing is dropped we return the original text unchanged so formatting
-    (trailing newlines, line endings) is preserved on the common path.
+    Handles two result formats emitted by the codebase-index MCP tools:
+
+    * **JSON array** — ``[{"file": "...", "line_number": N, "content": "..."}, …]``.
+      Filters at the object level; re-serialises the kept items as pretty JSON.
+    * **Plain text** — one match per line, path at line start (after optional
+      bullet/whitespace decoration).  Forgiving: non-path lines pass through.
+
+    When nothing is dropped the original *text* is returned unchanged so
+    formatting (trailing newlines, line endings) is preserved on the common path.
     """
     if not text:
         return text, 0
-    kept: list[str] = []
+
+    # JSON-array branch: codebase-index search returns [{file, line_number,
+    # content}, …] serialised as a JSON string. The line-by-line regex cannot
+    # match JSON key-value lines like `"file": ".agent/..."`.
+    stripped = text.strip()
+    if stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, list):
+                kept = [
+                    item for item in data
+                    if not (
+                        isinstance(item, dict)
+                        and _is_excluded_path(item.get("file") or "")
+                    )
+                ]
+                dropped = len(data) - len(kept)
+                if dropped == 0:
+                    return text, 0
+                return json.dumps(kept, indent=2), dropped
+        except (ValueError, TypeError):
+            pass  # not valid JSON — fall through to text-based filter
+
+    # Plain-text branch: one path-prefixed line per result.
+    kept_lines: list[str] = []
     dropped = 0
     for line in text.splitlines():
         if _line_starts_with_excluded_path(line):
             dropped += 1
             continue
-        kept.append(line)
+        kept_lines.append(line)
     if dropped == 0:
         return text, 0
-    return ("\n".join(kept), dropped)
+    return "\n".join(kept_lines), dropped
 
 
 def _cap_result(tool_name: str, result: str) -> str:
