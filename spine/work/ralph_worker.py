@@ -23,7 +23,7 @@ import sqlite_utils
 
 from spine.config import SpineConfig
 from spine.models.enums import TaskStatus
-from spine.persistence.sqlite_tuning import tune_connection
+from spine.persistence.sqlite_tuning import retry_on_locked, tune_connection
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
     s.value for s in TaskStatus
@@ -127,16 +127,18 @@ class RalphLoopWorker:
         Returns:
             The queue item ID.
         """
-        row = self._get_db()["queue"].insert(
-            {
-                "description": description,
-                "work_type": work_type,
-                "status": "pending",
-                "enqueued_at": datetime.now().isoformat(),
-                "started_at": "",
-                "completed_at": "",
-                "result": "",
-            }
+        row = retry_on_locked(
+            lambda: self._get_db()["queue"].insert(
+                {
+                    "description": description,
+                    "work_type": work_type,
+                    "status": "pending",
+                    "enqueued_at": datetime.now().isoformat(),
+                    "started_at": "",
+                    "completed_at": "",
+                    "result": "",
+                }
+            )
         )
         logger.info(f"Enqueued work item {row.last_pk}: {description[:80]}")
         return row.last_pk
@@ -157,28 +159,37 @@ class RalphLoopWorker:
         db = self._get_db()
         started_at = datetime.now().isoformat()
         work_id = str(uuid.uuid4())[:8]
-        cursor = db.execute(
-            """
-            UPDATE queue
-               SET status     = 'running',
-                   started_at = ?,
-                   work_id    = ?
-             WHERE id = (
-                   SELECT id FROM queue
-                    WHERE status = 'pending'
-                    ORDER BY enqueued_at
-                    LIMIT 1
-             )
-            RETURNING *
-            """,
-            [started_at, work_id],
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        cols = [d[0] for d in cursor.description]
-        db.conn.commit()
-        return dict(zip(cols, row))
+
+        # The whole claim is wrapped so a writer-vs-writer lock-upgrade BUSY
+        # (which bypasses busy_timeout) retries the atomic UPDATE rather than
+        # surfacing as ``database is locked``. The UPDATE … WHERE status =
+        # 'pending' is idempotent under retry: re-running only ever claims a
+        # still-pending row, never the one a prior attempt already claimed.
+        def _claim() -> dict[str, Any] | None:
+            cursor = db.execute(
+                """
+                UPDATE queue
+                   SET status     = 'running',
+                       started_at = ?,
+                       work_id    = ?
+                 WHERE id = (
+                       SELECT id FROM queue
+                        WHERE status = 'pending'
+                        ORDER BY enqueued_at
+                        LIMIT 1
+                 )
+                RETURNING *
+                """,
+                [started_at, work_id],
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cursor.description]
+            db.conn.commit()
+            return dict(zip(cols, row))
+
+        return retry_on_locked(_claim)
 
     def _dequeue_work_id(self, item: dict[str, Any]) -> str:
         """Return the work_id that was stamped by :meth:`dequeue`."""
@@ -267,9 +278,8 @@ class RalphLoopWorker:
                 if work_id:
                     update_payload["work_id"] = work_id
 
-                self._get_db()["queue"].update(
-                    item_id,
-                    update_payload,
+                retry_on_locked(
+                    lambda: self._get_db()["queue"].update(item_id, update_payload)
                 )
 
                 # ── Push completion event to WebSocket bus ──
@@ -285,13 +295,19 @@ class RalphLoopWorker:
 
             except Exception as e:
                 logger.error(f"Queue item {item_id} failed: {e}", exc_info=True)
-                self._get_db()["queue"].update(
-                    item_id,
-                    {
-                        "status": "failed",
-                        "completed_at": datetime.now().isoformat(),
-                        "result": json.dumps({"error": str(e)}),
-                    },
+                # Capture the message in a local: ``e`` is deleted when the
+                # except block exits, and closing the retry lambda over it would
+                # be both fragile and flagged as an undefined name.
+                error_text = str(e)
+                retry_on_locked(
+                    lambda: self._get_db()["queue"].update(
+                        item_id,
+                        {
+                            "status": "failed",
+                            "completed_at": datetime.now().isoformat(),
+                            "result": json.dumps({"error": error_text}),
+                        },
+                    )
                 )
 
                 # ── Push failure event to WebSocket bus ──
@@ -332,14 +348,16 @@ class RalphLoopWorker:
         for item in stuck:
             item_id = item["id"]
             # Reset queue row to pending
-            db["queue"].update(
-                item_id,
-                {
-                    "status": "pending",
-                    "started_at": "",
-                    "completed_at": "",
-                    "result": "",
-                },
+            retry_on_locked(
+                lambda item_id=item_id: db["queue"].update(
+                    item_id,
+                    {
+                        "status": "pending",
+                        "started_at": "",
+                        "completed_at": "",
+                        "result": "",
+                    },
+                )
             )
             # Purge any LangGraph checkpoint so the graph starts fresh.
             # Best-effort: a purge failure (no checkpoint, version skew)
@@ -462,13 +480,15 @@ class RalphLoopWorker:
         if item["status"] != "pending":
             return False
 
-        db["queue"].update(
-            item_id,
-            {
-                "status": "cancelled",
-                "completed_at": datetime.now().isoformat(),
-                "result": json.dumps({"cancelled": True}),
-            },
+        retry_on_locked(
+            lambda: db["queue"].update(
+                item_id,
+                {
+                    "status": "cancelled",
+                    "completed_at": datetime.now().isoformat(),
+                    "result": json.dumps({"cancelled": True}),
+                },
+            )
         )
         logger.info(f"Cancelled queue item {item_id}")
         return True
@@ -510,13 +530,15 @@ class RalphLoopWorker:
 
         item_id = item["id"]
         # Mark as cancelled
-        db["queue"].update(
-            item_id,
-            {
-                "status": "cancelled",
-                "completed_at": datetime.now().isoformat(),
-                "result": json.dumps({"cancelled": True, "work_id": work_id}),
-            },
+        retry_on_locked(
+            lambda: db["queue"].update(
+                item_id,
+                {
+                    "status": "cancelled",
+                    "completed_at": datetime.now().isoformat(),
+                    "result": json.dumps({"cancelled": True, "work_id": work_id}),
+                },
+            )
         )
 
         if purge_checkpoint:
