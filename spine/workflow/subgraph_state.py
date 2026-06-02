@@ -7,6 +7,7 @@ and phase-internal state don't leak into the parent graph's state.
 from __future__ import annotations
 
 from operator import add as _op_add
+from operator import or_ as _op_or
 from typing import Annotated, Any
 
 from typing_extensions import TypedDict
@@ -221,6 +222,15 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     research_round: int  # Current round number (0-based)
     max_rounds: int  # Safety valve — max exploration rounds (default 3)
     manager_decision: str  # "explore" | "done" — set by research_manager
+
+    # Set True (OR-merged across parallel branches) when any explore_do branch
+    # exhausted its supervisor cycle budget without completing. The sufficiency
+    # router treats this as a hard "proceed to synthesis" signal: a researcher
+    # that already blew its full per-topic budget will not converge by being
+    # handed the same budget on overlapping topics next round, so looping
+    # further only burns time/tokens (and risks tripping the dispatcher stall
+    # timeout). Write-once-true; no reset needed since it forces the loop to end.
+    recursion_capped_seen: Annotated[bool, _op_or]
 
     # Accumulated research (operator.add reducer merges per-round findings)
     topics: Annotated[list[str], _op_add]  # Areas being explored this round

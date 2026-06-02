@@ -604,6 +604,13 @@ async def _explore_do_node(
     if cache:
         update["read_cache"] = cache
 
+    # Surface a recursion-capped branch to the subgraph router so the loop
+    # short-circuits to synthesis instead of spawning more (equally doomed)
+    # rounds. Reduced via _op_or on the ``recursion_capped_seen`` channel so
+    # sibling Send() branches merge cleanly.
+    if evidence.get("recursion_capped"):
+        update["recursion_capped_seen"] = True
+
     # Carry the BaseSubgraphState fields the downstream node will need
     # to resolve the researcher model and log against the right work_id.
     send_payload: dict[str, Any] = {
@@ -668,6 +675,16 @@ def _sufficiency_router(
     max_rounds = state.get("max_rounds", _DEFAULT_MAX_ROUNDS)
     round_num = state.get("research_round", 0)
 
+    # A researcher that exhausted its full per-topic cycle budget will not
+    # converge by looping again on overlapping topics — proceed immediately to
+    # synthesis from the accumulated evidence rather than grinding more rounds
+    # (which is what makes the phase appear to "hang until a timeout").
+    if state.get("recursion_capped_seen"):
+        logger.info(
+            "Exploration recursion-capped — proceeding to synthesis from "
+            "accumulated evidence"
+        )
+        return "done"
     if decision == "done":
         return "done"
     if round_num >= max_rounds:

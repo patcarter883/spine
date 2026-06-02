@@ -143,10 +143,16 @@ async def test_loop_terminates_when_supervisor_marks_complete(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_loop_hits_cap_when_supervisor_never_completes(monkeypatch):
-    """If the supervisor never says is_complete=True, the loop must
-    terminate at the per-phase cap (PLAN: 6 by default) and mark
-    ``recursion_capped=True`` so the summarise sentinel path kicks in.
+    """If the supervisor never says is_complete=True (not even on the
+    post-loop final evaluation), the loop must terminate at the per-phase
+    cap and mark ``recursion_capped=True`` so the summarise sentinel path
+    kicks in. The cap is read from config so the test tracks
+    ``.spine/config.yaml`` rather than the hardcoded code default.
     """
+    from spine.config import SpineConfig
+
+    cap = SpineConfig.load().convergence.researcher_supervisor_max_cycles_plan
+
     _stub_subagent_spec(monkeypatch, bind_log=[])
     _stub_context(monkeypatch)
 
@@ -188,9 +194,79 @@ async def test_loop_hits_cap_when_supervisor_never_completes(monkeypatch):
 
     evidence = out["exploration_evidence"]
     assert evidence["recursion_capped"] is True
-    # PLAN default cap is 6 — the worker ran the cap number of times.
-    assert evidence["supervisor_cycles"] == 6
-    assert worker_calls == 6
+    # The worker ran the (config-resolved) cap number of times; the post-loop
+    # final-evaluation pass is a no-worker supervisor turn so it does not add
+    # to the cycle/worker counts.
+    assert evidence["supervisor_cycles"] == cap
+    assert worker_calls == cap
+
+
+@pytest.mark.asyncio
+async def test_final_evaluation_salvages_false_cap(monkeypatch):
+    """Off-by-one salvage: the supervisor never completes *inside* the loop
+    (its last verdict comes before the final worker turn), but the post-loop
+    final-evaluation pass — which sees the full history — judges the evidence
+    sufficient. The run is then NOT marked recursion_capped and the gathered
+    evidence is preserved.
+    """
+    from spine.config import SpineConfig
+
+    cap = SpineConfig.load().convergence.researcher_supervisor_max_cycles_plan
+
+    _stub_subagent_spec(monkeypatch, bind_log=[])
+    _stub_context(monkeypatch)
+
+    async def _fake_supervisor(**kw):
+        # In-loop turns see at most cap-1 prior findings and never complete;
+        # the final-evaluation pass sees the full `cap` findings and completes.
+        if len(kw.get("evaluation_history") or []) >= cap:
+            return SupervisorDirective(
+                analysis_and_reasoning="evidence sufficient on final review",
+                is_complete=True,
+            )
+        return SupervisorDirective(
+            analysis_and_reasoning="more please",
+            is_complete=False,
+            next_directive="get_source for something",
+            allowed_tool_class=ToolClass.READ_SOURCE,
+        )
+
+    worker_calls = 0
+
+    async def _fake_worker(**kw):
+        nonlocal worker_calls
+        worker_calls += 1
+        return StructuredFinding(
+            tool_name="codebase_query",
+            tool_class=ToolClass.READ_SOURCE,
+            status=FindingStatus.SUCCESS,
+            target_path="spine/x.py",
+            structured_code_block="content",
+        )
+
+    monkeypatch.setattr(researcher_supervisor, "run_supervisor_node", _fake_supervisor)
+    monkeypatch.setattr(researcher_supervisor, "run_worker_node", _fake_worker)
+
+    out = await exploration_agents.run_explore_do_node(
+        {
+            "work_id": "w1",
+            "phase": "plan",
+            "workspace_root": "/tmp",
+            "spec_path": "",
+        },
+        None,
+        topic="some plan topic",
+    )
+
+    evidence = out["exploration_evidence"]
+    # The false cap was cleared by the final-evaluation pass.
+    assert evidence["recursion_capped"] is False
+    # The loop still consumed the full worker budget (the cap WAS reached) ...
+    assert worker_calls == cap
+    assert evidence["supervisor_cycles"] == cap
+    # ... and the accumulated evidence + final narrative survived.
+    assert "content" in evidence["tool_results_text"]
+    assert "final review" in evidence["narrative"]
 
 
 @pytest.mark.asyncio

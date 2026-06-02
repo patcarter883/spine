@@ -247,12 +247,25 @@ def _build_supervisor_user_message(
     LATEST_FINDING → HISTORY. Final plain-text directive sits AFTER every
     closing tag per the project's hostage-prompt convention.
     """
+    cycle_line = f"Cycle {cycle_idx} of {max_cycles} (hard cap)."
+    # Soft landing: in the last couple of cycles, push the supervisor to
+    # converge on what it already has rather than spending the remaining
+    # budget chasing marginal detail. Without this nudge the loop tends to
+    # run to the cap and exit as recursion_capped even when the accumulated
+    # evidence is already enough to write a ResearchFindings.
+    if cycle_idx >= max_cycles - 1:
+        cycle_line += (
+            " You are near the hard cap — set is_complete=True now and "
+            "synthesise a ResearchFindings from the accumulated evidence "
+            "unless a single critical fact is still missing. Do NOT request "
+            "further tool calls just to be thorough."
+        )
     return hostage_layout(
         xml_blocks(
             (Tag.OBJECTIVE, global_goal),
             (
                 Tag.CONSTRAINTS,
-                f"Cycle {cycle_idx} of {max_cycles} (hard cap).",
+                cycle_line,
             ),
             (Tag.LATEST_FINDING, latest_finding_block),
             (

@@ -1077,14 +1077,49 @@ async def run_explore_do_node(
     cap_hit = cycle >= max_cycles and (
         last_directive is None or not last_directive.is_complete
     )
+
+    # Off-by-one salvage: the supervisor runs BEFORE the worker each cycle, so
+    # the final worker turn's finding never receives a completion verdict — the
+    # loop exits on the counter first. Give the supervisor one last no-worker
+    # evaluation against the full history; if it now judges the evidence
+    # sufficient, this was a false cap and we proceed as a normal completion.
+    if cap_hit and latest is not None:
+        final_directive = await run_supervisor_node(
+            state=state,
+            config=config,
+            phase_path=supervisor_phase_path,
+            global_goal=enriched_topic,
+            latest_finding=latest,
+            evaluation_history=history,
+            cycle_idx=max(cycle - 1, 0),
+            max_cycles=max_cycles,
+        )
+        last_directive = final_directive
+        if final_directive.is_complete:
+            cap_hit = False
+            logger.info(
+                "[%s] explore_do: supervisor completed on final evaluation "
+                "after %d cycle(s) for topic=%r",
+                work_id, cycle, topic_str,
+            )
+
+    evidence_text = render_history_as_evidence(history)
+
     if cap_hit:
-        logger.warning(
+        # A capped run that still gathered substantial evidence is an expected
+        # soft landing — summarise will emit a usable partial finding — not an
+        # error. Reserve WARNING for the thin-evidence case that degrades to the
+        # "(research did not converge)" sentinel.
+        log = (
+            logger.warning
+            if len(evidence_text) < _SUMMARISE_MIN_EVIDENCE_CHARS
+            else logger.info
+        )
+        log(
             "[%s] explore_do: cycle cap (%d) reached without supervisor "
             "completion for topic=%r — marking recursion_capped",
             work_id, max_cycles, topic_str,
         )
-
-    evidence_text = render_history_as_evidence(history)
     # Supervisor's last reasoning becomes the narrative — gives summarise
     # a non-tool gloss on what the loop concluded.
     narrative = ""

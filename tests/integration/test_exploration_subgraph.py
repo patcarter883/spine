@@ -298,6 +298,67 @@ def test_sufficiency_router_max_rounds():
     assert _sufficiency_router(state) == "done"
 
 
+def test_sufficiency_router_recursion_capped_forces_done():
+    """A recursion-capped branch forces 'done' even when the manager still
+    wants to explore and we are under max_rounds — looping again would only
+    re-burn the budget and stall the phase.
+    """
+    from spine.workflow.subgraphs.exploration_subgraph import _sufficiency_router
+    from spine.workflow.subgraph_state import ExplorationSubgraphState
+
+    state: ExplorationSubgraphState = {
+        "phase": "specify",
+        "work_id": "test-wk-1",
+        "work_type": "task",
+        "description": "test",
+        "workspace_root": "/tmp",
+        "retry_count": 0,
+        "feedback": [],
+        "messages": [],
+        "artifacts_output": {},
+        "phase_status": "",
+        "research_round": 1,  # well under max_rounds
+        "max_rounds": 3,
+        "manager_decision": "explore",  # manager wants more, but a topic capped
+        "recursion_capped_seen": True,
+        "topics": ["more"],
+        "findings": [],
+        "agent_response": "",
+    }
+
+    assert _sufficiency_router(state) == "done"
+
+
+@pytest.mark.asyncio
+async def test_explore_do_node_surfaces_recursion_capped(monkeypatch):
+    """A recursion-capped branch bubbles ``recursion_capped_seen=True`` into
+    the reduced subgraph update so the sufficiency router can see it. A
+    non-capped branch leaves the channel unset.
+    """
+    import spine.agents.exploration_agents as ea
+    from spine.workflow.subgraphs.exploration_subgraph import _explore_do_node
+
+    async def _fake_run(state, config, *, topic):
+        return {
+            "exploration_evidence": {
+                "topic": topic,
+                "recursion_capped": state["__capped"],
+            }
+        }
+
+    monkeypatch.setattr(ea, "run_explore_do_node", _fake_run)
+
+    capped = await _explore_do_node(
+        {"topic": "t", "phase": "specify", "work_id": "w1", "__capped": True}, None
+    )
+    assert capped.update.get("recursion_capped_seen") is True
+
+    not_capped = await _explore_do_node(
+        {"topic": "t", "phase": "specify", "work_id": "w1", "__capped": False}, None
+    )
+    assert "recursion_capped_seen" not in not_capped.update
+
+
 # ── Test: topic_lookup node ──────────────────────────────────────────────
 
 
