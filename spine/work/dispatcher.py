@@ -165,6 +165,41 @@ def update_work_phase_started(
         pass
 
 
+# Planning work types pause for human approval after critic_plan, before any
+# execution tasks are spawned.
+PLAN_TYPES = ("reviewed_task", "critical_reviewed_task")
+
+
+def _derive_final_status(
+    result: dict[str, Any],
+    *,
+    stalled: bool,
+    feedback: list[Any],
+    work_type: str,
+) -> str:
+    """Derive the terminal work status from a completed graph result.
+
+    Shared by ``submit_work``, ``resume_interrupted_work``, and
+    ``_run_workflow_graph_inner`` so reviewed-plan types consistently end at
+    ``awaiting_approval`` regardless of which entry point ran the graph.
+    """
+    if stalled:
+        return "stalled"
+    status = result.get("status", "completed")
+    # A graph that ends normally leaves status "running" — treat as completed.
+    if status == "running":
+        status = "completed"
+    # The critic router sends to END with a needs_review feedback entry when
+    # max retries are exceeded.
+    if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
+        status = "needs_review"
+    # Planning work types must end as "awaiting_approval" so users can review
+    # before execution tasks are spawned.
+    if work_type in PLAN_TYPES and status == "completed":
+        status = "awaiting_approval"
+    return status
+
+
 # ── Submit work ──
 
 
@@ -518,29 +553,12 @@ async def submit_work(
         #   - If the graph completed naturally (all phases ran), status
         #     should be "completed" or the verify phase's final status.
         #   - The top-level except (below) catches true failures.
-        if stalled:
-            final_status = "stalled"
-        else:
-            final_status = result.get("status", "completed")
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])
-
-        # If status is still "running" after graph completes, the graph
-        # ended normally — treat as completed.
-        if final_status == "running":
-            final_status = "completed"
-
-        # Check if any feedback entry indicates needs_review (the critic
-        # router sends to END when max retries are exceeded).
-        if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
-            final_status = "needs_review"
-
-        # Planning work types must end as "awaiting_approval" so users
-        # can review before execution tasks are spawned.
-        plan_types = ("reviewed_task", "critical_reviewed_task")
-        if work_type in plan_types and final_status == "completed":
-            final_status = "awaiting_approval"
+        final_status = _derive_final_status(
+            result, stalled=stalled, feedback=feedback, work_type=work_type
+        )
 
         # Save artifacts to disk
         for phase, phase_artifacts in result_artifacts.items():
@@ -894,17 +912,13 @@ async def resume_work(
                                     work_id, art_phase, art_name, str(art_content)
                                 )
 
-        # Derive final status (same logic as submit_work)
-        final_status = result.get("status", "completed")
+        # Derive final status (resume has no stall tracking).
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])
-
-        if final_status == "running":
-            final_status = "completed"
-
-        if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
-            final_status = "needs_review"
+        final_status = _derive_final_status(
+            result, stalled=False, feedback=feedback, work_type=work_type
+        )
 
         db["work_entries"].update(
             work_id,
@@ -1085,8 +1099,10 @@ async def resume_interrupted_work(
         _finalise_failed_work(db, work_id, audit, e)
         raise
 
-    final_status = result.get("status", "completed")
     final_phase = result.get("current_phase", "")
+    final_status = _derive_final_status(
+        result, stalled=False, feedback=result.get("feedback", []), work_type=work_type
+    )
 
     db["work_entries"].update(
         work_id,
@@ -1686,20 +1702,12 @@ async def _run_workflow_graph_inner(
                             )
 
     # ── Final status ──
-    if stalled:
-        final_status = "stalled"
-    else:
-        final_status = result.get("status", "completed")
-
     final_phase = result.get("current_phase", "")
     result_artifacts = result.get("artifacts", {})
     feedback = result.get("feedback", [])
-
-    if final_status == "running":
-        final_status = "completed"
-
-    if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
-        final_status = "needs_review"
+    final_status = _derive_final_status(
+        result, stalled=stalled, feedback=feedback, work_type=work_type
+    )
 
     result_payload = {
         "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
@@ -2266,17 +2274,12 @@ async def approve_and_spawn(
                     }
                 raise
 
-        final_status = result.get("status", "completed")
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])
-        if final_status == "running":
-            final_status = "completed"
-        if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
-            final_status = "needs_review"
-        plan_types_check = ("reviewed_task", "critical_reviewed_task")
-        if work_type in plan_types_check and final_status == "completed":
-            final_status = "awaiting_approval"
+        final_status = _derive_final_status(
+            result, stalled=False, feedback=feedback, work_type=work_type
+        )
 
         db["work_entries"].update(
             plan_id,
