@@ -136,6 +136,91 @@ class TestResolveModelSessionId:
         assert model.app_url == "https://spine.dev"
         assert model.app_title == "SPINE"
 
+    def test_completion_cap_sent_as_max_tokens_not_max_completion_tokens(self) -> None:
+        """Regression (trace 019e86ed): the resolved completion cap must be sent
+        as ``max_tokens``, not ``max_completion_tokens``.
+
+        OpenRouter routes across provider endpoints that advertise ``max_tokens``
+        but not ``max_completion_tokens`` (e.g. every deepseek-v4-flash endpoint).
+        With require_parameters=True, sending ``max_completion_tokens`` makes
+        OpenRouter reject the request with HTTP 404 "No endpoints found that can
+        handle the requested parameters" — silently killing every call.
+        """
+        from spine.agents.helpers import _build_openrouter_model
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key-12345"}):
+            with patch(
+                "spine.agents.helpers._active_provider_config",
+                return_value={"max_completion_tokens": 20000},
+            ):
+                model = _build_openrouter_model(
+                    "openrouter:deepseek/deepseek-v4-flash",
+                    "work-123",
+                )
+
+        assert model.max_tokens == 20000
+        assert getattr(model, "max_completion_tokens", None) is None
+
+    def test_bind_structured_output_routes_openrouter_through_json_schema(self) -> None:
+        """Regression: ChatOpenRouter is NOT a ChatOpenAI subclass, so the
+        json_schema routing in bind_structured_output must detect it explicitly.
+
+        Otherwise structured output falls back to method="function_calling",
+        which forces a ``tool_choice`` value some OpenRouter endpoints reject.
+        """
+        from pydantic import BaseModel
+
+        from spine.agents.helpers import (
+            _build_openrouter_model,
+            _is_openai_style_model,
+        )
+
+        class _Schema(BaseModel):
+            decision: str
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key-12345"}):
+            model = _build_openrouter_model(
+                "openrouter:deepseek/deepseek-v4-flash",
+                "work-123",
+            )
+
+        # The detection guard must recognise ChatOpenRouter despite it not
+        # subclassing ChatOpenAI.
+        assert _is_openai_style_model(model) is True
+
+        # The bound runnable must put response_format (json_schema) on the wire
+        # and NOT a forced tool_choice. Intercept the SDK call to capture the
+        # request params just before they would hit the network.
+        import asyncio
+
+        from langchain_core.messages import HumanMessage
+
+        from spine.agents.helpers import bind_structured_output
+
+        class _Stop(Exception):
+            pass
+
+        captured: dict[str, object] = {}
+
+        async def _spy(*_args: object, **kwargs: object) -> object:
+            captured.update(kwargs)
+            raise _Stop
+
+        model.client.chat.send_async = _spy
+        runnable = bind_structured_output(model, _Schema)
+
+        async def _go() -> None:
+            try:
+                await runnable.ainvoke([HumanMessage(content="hi")])
+            except _Stop:
+                pass
+
+        asyncio.run(_go())
+
+        assert "response_format" in captured
+        assert "tool_choice" not in captured
+        assert captured["response_format"]["type"] == "json_schema"  # type: ignore[index]
+
 
 class TestLocalProviderModel:
     """Verify that local providers with base_url get pre-built ChatOpenAI models."""

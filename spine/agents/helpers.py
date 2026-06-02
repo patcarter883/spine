@@ -177,17 +177,29 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
 
 
 def _is_openai_style_model(model: Any) -> bool:
-    """True when ``model`` is a ``ChatOpenAI`` subclass.
+    """True when ``model``'s ``with_structured_output`` supports json_schema.
 
-    Covers ``ChatOpenRouter`` (which inherits ``ChatOpenAI``) and local
-    OpenAI-compatible servers (vLLM via ``ChatOpenAI``).  Returns ``False``
-    for ``ChatAnthropic``, string specs, and test fakes.
+    Covers ``ChatOpenAI`` (and local OpenAI-compatible vLLM via ``ChatOpenAI``)
+    and ``langchain_openrouter.ChatOpenRouter``.  NB: ChatOpenRouter is *not* a
+    ChatOpenAI subclass — it extends ``BaseChatModel`` directly — but exposes
+    the same ``method="json_schema"`` structured-output path, so it must be
+    checked explicitly.  Returns ``False`` for ``ChatAnthropic``, string specs,
+    and test fakes.
     """
+    candidates: list[type] = []
     try:
         from langchain_openai import ChatOpenAI
+
+        candidates.append(ChatOpenAI)
     except ImportError:
-        return False
-    return isinstance(model, ChatOpenAI)
+        pass
+    try:
+        from langchain_openrouter import ChatOpenRouter
+
+        candidates.append(ChatOpenRouter)
+    except ImportError:
+        pass
+    return bool(candidates) and isinstance(model, tuple(candidates))
 
 
 def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
@@ -399,11 +411,18 @@ def _build_openrouter_model(
     api_key = provider_cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY", "")
     if api_key:
         model_kwargs["api_key"] = api_key
-    if max_completion_tokens is not None:
-        model_kwargs["max_completion_tokens"] = int(max_completion_tokens)
-    elif max_tokens is not None:
-        # Fall back to max_tokens if max_completion_tokens isn't set
-        model_kwargs["max_tokens"] = int(max_tokens)
+    # Send the resolved cap as `max_tokens`, NOT `max_completion_tokens`.
+    # OpenRouter routes across many provider endpoints, the majority of which
+    # advertise `max_tokens` but NOT `max_completion_tokens` in their
+    # supported_parameters (e.g. every deepseek-v4-flash endpoint).  With
+    # require_parameters=True (set above), sending `max_completion_tokens`
+    # makes OpenRouter reject the request up-front with HTTP 404 "No endpoints
+    # found that can handle the requested parameters" — even though the model
+    # itself is fine.  `max_tokens` is the portable field OpenRouter normalises
+    # for every provider, so collapse both config fields onto it.
+    cap = max_completion_tokens if max_completion_tokens is not None else max_tokens
+    if cap is not None:
+        model_kwargs["max_tokens"] = int(cap)
 
     # ── Enable streaming for stall detection ─────────────────────────
     # ChatOpenRouter defaults to streaming=False.  Without streaming,
