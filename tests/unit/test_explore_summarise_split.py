@@ -126,6 +126,105 @@ async def test_summarise_evidence_uses_only_evidence_in_prompt():
 
 
 @pytest.mark.asyncio
+async def test_summarise_prompt_includes_brevity_constraints():
+    """The constraints must steer the model away from over-generating — the
+    rambling that blew past the 4096 cap and discarded 2 topics on 019e8694.
+    """
+    from spine.agents.prompt_format import Tag, get_block
+    from spine.agents.subagents import ResearchFindings
+
+    captured: dict[str, Any] = {}
+    await summarise_evidence(
+        model=_FakeModel(
+            ResearchFindings(summary="x", patterns=[], file_map={}, dependencies=[]),
+            captured,
+        ),
+        topic="auth flow",
+        evidence_text="### Tool result: codebase_query\nfound login()",
+    )
+    constraints = get_block(captured["prompt"], Tag.CONSTRAINTS)
+    assert "AT MOST 3 short paragraphs" in constraints
+    assert "Do NOT reproduce code" in constraints
+
+
+# ── Length-cap salvage (trace 019e8694) ────────────────────────────────
+
+
+def test_salvage_truncated_findings_passes_through_valid_json():
+    out = exploration_agents._salvage_truncated_findings(
+        '{"summary": "ok", "patterns": [], "file_map": {}, "dependencies": []}'
+    )
+    assert out == {
+        "summary": "ok",
+        "patterns": [],
+        "file_map": {},
+        "dependencies": [],
+    }
+
+
+def test_salvage_truncated_findings_recovers_summary_from_truncation():
+    """JSON cut off mid-``patterns`` array still yields the complete summary."""
+    truncated = (
+        '{"summary": "Config loads via spine/config.py; model resolver in '
+        'helpers.py.", "patterns": ["uses dataclass'
+    )
+    out = exploration_agents._salvage_truncated_findings(truncated)
+    assert out is not None
+    assert out["summary"].startswith("Config loads via spine/config.py")
+    assert out["patterns"] == [] and out["file_map"] == {}
+
+
+def test_salvage_extract_handles_escaped_characters():
+    raw = '{"summary": "line one\\nline two with \\"quotes\\"", "patterns": ['
+    summary = exploration_agents._extract_json_string_field(raw, "summary")
+    assert summary == 'line one\nline two with "quotes"'
+
+
+def test_salvage_truncated_findings_returns_none_when_unrecoverable():
+    assert exploration_agents._salvage_truncated_findings("not json at all") is None
+    assert exploration_agents._salvage_truncated_findings("") is None
+
+
+@pytest.mark.asyncio
+async def test_summarise_evidence_salvages_partial_on_length_error():
+    """A LengthFinishReasonError must yield a salvaged partial finding (summary
+    recovered) instead of None → sentinel — the data loss seen on 019e8694."""
+    partial_json = (
+        '{"summary": "SPINE logs via logging.getLogger and a central log.py.", '
+        '"patterns": ["central log config'  # truncated mid-array
+    )
+
+    class _FakeMsg:
+        content = partial_json
+
+    class _FakeChoice:
+        message = _FakeMsg()
+
+    class _FakeCompletion:
+        usage = None
+        choices = [_FakeChoice()]
+
+    class _RaisingStructured:
+        async def ainvoke(self, _messages):
+            raise exploration_agents._LengthFinishReasonError(
+                completion=_FakeCompletion()
+            )
+
+    class _RaisingModel:
+        def with_structured_output(self, _schema):
+            return _RaisingStructured()
+
+    out = await summarise_evidence(
+        model=_RaisingModel(),
+        topic="logging conventions",
+        evidence_text="### Tool result: search\n" + "x" * 500,
+    )
+    assert out is not None
+    assert out["summary"].startswith("SPINE logs via logging.getLogger")
+    assert out["patterns"] == []
+
+
+@pytest.mark.asyncio
 async def test_summarise_evidence_returns_none_when_model_lacks_structured_output():
     class _NoStructured:
         def with_structured_output(self, _schema):

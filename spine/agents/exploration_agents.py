@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import warnings
 from pathlib import Path
 from typing import Any, Literal
@@ -24,6 +25,12 @@ from pydantic import BaseModel, Field
 
 from spine.agents._tokens import count_tokens as _count_tokens
 from spine.agents.helpers import cap_completion_tokens, resolve_chat_model
+
+try:  # openai is always present when the model is ChatOpenAI; guard for safety.
+    from openai import LengthFinishReasonError as _LengthFinishReasonError
+except Exception:  # pragma: no cover - openai missing → length salvage is a no-op
+    class _LengthFinishReasonError(Exception):  # type: ignore[no-redef]
+        """Fallback sentinel — never raised, so the except branch stays inert."""
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -1320,6 +1327,82 @@ def _findings_structured_model(model: Any) -> Any | None:
         return None
 
 
+def _partial_content_from_length_error(exc: Any) -> str:
+    """Pull the partial assistant text out of a ``LengthFinishReasonError``.
+
+    The exception carries a ``completion`` snapshot whose first choice holds
+    the JSON the model had emitted before it hit the token ceiling. When
+    streaming, ``usage`` is absent but ``message.content`` is still populated.
+    Fail-open to ``""`` so the caller falls back to the sentinel.
+    """
+    completion = getattr(exc, "completion", None)
+    if completion is None:
+        return ""
+    try:
+        choices = getattr(completion, "choices", None) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        return content if isinstance(content, str) else ""
+    except Exception:  # pragma: no cover - defensive against snapshot shape drift
+        return ""
+
+
+def _extract_json_string_field(raw: str, key: str) -> str:
+    """Best-effort extract of one string field from possibly-truncated JSON.
+
+    Scans for ``"<key>": "`` and reads to the next unescaped quote (or EOF if
+    the value itself was truncated mid-string), then JSON-unescapes the token.
+    Used to recover the ``summary`` from a findings JSON the model never closed.
+    """
+    m = re.search(r'"' + re.escape(key) + r'"\s*:\s*"', raw)
+    if not m:
+        return ""
+    buf: list[str] = []
+    i, n = m.end(), len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\" and i + 1 < n:
+            buf.append(raw[i : i + 2])
+            i += 2
+            continue
+        if c == '"':
+            break
+        buf.append(c)
+        i += 1
+    token = "".join(buf)
+    for candidate in (token, token.rstrip("\\")):
+        try:
+            return json.loads(f'"{candidate}"').strip()
+        except Exception:
+            continue
+    return token.strip()
+
+
+def _salvage_truncated_findings(raw: str) -> dict | None:
+    """Recover a partial ResearchFindings dict from a truncated JSON payload.
+
+    The model writes fields in schema order (``summary`` first under
+    json_schema guided decoding), so a length-capped run almost always has a
+    complete summary before it ran out filling ``patterns`` / ``file_map``.
+    Returns a findings dict with the recovered summary (and any list fields
+    that still parse), or ``None`` when nothing usable can be extracted.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    summary = _extract_json_string_field(raw, "summary")
+    if not summary:
+        return None
+    return {"summary": summary, "patterns": [], "file_map": {}, "dependencies": []}
+
+
 async def summarise_evidence(
     *,
     model: Any,
@@ -1355,7 +1438,13 @@ async def summarise_evidence(
         "- If a field has no support in the evidence, leave it empty "
         "(``[]`` for lists, ``{}`` for file_map).\n"
         "- summary should describe what was actually discovered in the "
-        "evidence, not what the agent was asked to investigate."
+        "evidence, not what the agent was asked to investigate.\n"
+        "- Keep summary to AT MOST 3 short paragraphs. Do NOT reproduce code, "
+        "file contents, or long verbatim quotations — describe them concisely. "
+        "This is a structured directive, not a report: brevity is required so "
+        "the JSON stays within the token budget.\n"
+        "- List at most 8 items each for patterns and dependencies; keep the "
+        "most important and drop the rest."
     )
     if recursion_capped:
         constraints_body += (
@@ -1373,7 +1462,8 @@ async def summarise_evidence(
         ),
         (
             "Convert the evidence above into the ResearchFindings JSON "
-            "schema following the constraints."
+            "schema following the constraints. Be concise — a short, accurate "
+            "summary beats an exhaustive one."
         ),
     )
 
@@ -1381,6 +1471,27 @@ async def summarise_evidence(
         parsed = await structured_model.ainvoke(
             [HumanMessage(content=summarise_prompt)]
         )
+    except _LengthFinishReasonError as e:
+        # The model ran past summarise_max_completion_tokens before closing the
+        # JSON. Rather than discard the topic to the sentinel, salvage the
+        # (usually complete) summary from the truncated payload — schema order
+        # puts summary first, so it has almost always landed. Trace 019e8694
+        # lost 2 SPECIFY topics this way before the salvage existed.
+        salvaged = _salvage_truncated_findings(_partial_content_from_length_error(e))
+        if salvaged is not None:
+            logger.warning(
+                "summarise_evidence: length cap hit for topic=%r — salvaged "
+                "partial findings (%d summary chars)",
+                topic,
+                len(salvaged.get("summary", "")),
+            )
+            return salvaged
+        logger.warning(
+            "summarise_evidence: length cap hit for topic=%r — nothing "
+            "salvageable, falling back to sentinel",
+            topic,
+        )
+        return None
     except Exception as e:
         logger.warning("summarise_evidence: invocation failed: %s", e)
         return None
