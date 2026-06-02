@@ -1,4 +1,4 @@
-"""Tests for RalphLoopWorker ordering behavior."""
+"""Tests for RalphLoopWorker ordering and concurrency behavior."""
 
 from __future__ import annotations
 
@@ -308,3 +308,115 @@ class TestRalphLoopWorkerListRecentCompletedOrdering:
             )
             recent = worker.list_recent_completed()
             assert len(recent) == 2
+
+
+class TestDequeueAtomic:
+    """dequeue() must atomically claim exactly one row under concurrent callers."""
+
+    def _insert_pending(self, db, item_id: int, enqueued_at: str = "2024-01-01T00:00:00") -> None:
+        db["queue"].insert(
+            {
+                "id": item_id,
+                "description": f"job {item_id}",
+                "work_type": "task",
+                "status": "pending",
+                "enqueued_at": enqueued_at,
+                "started_at": "",
+                "completed_at": "",
+                "result": "",
+                "work_id": "",
+            }
+        )
+
+    def test_dequeue_returns_item_and_marks_running(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            self._insert_pending(worker._get_db(), 1)
+
+            item = worker.dequeue()
+
+            assert item is not None
+            assert item["id"] == 1
+            assert item["status"] == "running"
+            assert item["work_id"] != ""
+            assert worker._get_db()["queue"].get(1)["status"] == "running"
+
+    def test_dequeue_returns_none_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            assert worker.dequeue() is None
+
+    def test_dequeue_skips_running_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            db = worker._get_db()
+            db["queue"].insert(
+                {
+                    "id": 1,
+                    "description": "already running",
+                    "work_type": "task",
+                    "status": "running",
+                    "enqueued_at": "2024-01-01T00:00:00",
+                    "started_at": "2024-01-01T00:00:01",
+                    "completed_at": "",
+                    "result": "",
+                    "work_id": "existing",
+                }
+            )
+            assert worker.dequeue() is None
+
+    def test_two_concurrent_callers_claim_different_rows(self):
+        """Two threads calling dequeue() simultaneously must not both get the same row."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            db = worker._get_db()
+            self._insert_pending(db, 1, "2024-01-01T00:00:00")
+            self._insert_pending(db, 2, "2024-01-01T00:00:01")
+
+            results: list = []
+            barrier = threading.Barrier(2)
+
+            def _call():
+                barrier.wait()
+                item = worker.dequeue()
+                if item is not None:
+                    results.append(item)
+
+            threads = [threading.Thread(target=_call) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            claimed_ids = [r["id"] for r in results]
+            assert len(claimed_ids) == len(set(claimed_ids)), (
+                f"Duplicate rows claimed: {claimed_ids}"
+            )
+            assert len(claimed_ids) == 2
+
+    def test_one_pending_row_claimed_by_exactly_one_of_two_callers(self):
+        """With one pending item, exactly one caller wins; the other gets None."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _fresh_worker(tmpdir)
+            self._insert_pending(worker._get_db(), 1)
+
+            results: list = []
+            barrier = threading.Barrier(2)
+
+            def _call():
+                barrier.wait()
+                results.append(worker.dequeue())
+
+            threads = [threading.Thread(target=_call) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            non_none = [r for r in results if r is not None]
+            assert len(non_none) == 1, f"Expected exactly 1 winner, got {results}"
+            assert non_none[0]["id"] == 1

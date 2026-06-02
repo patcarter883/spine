@@ -141,20 +141,47 @@ class RalphLoopWorker:
         return row.last_pk
 
     def dequeue(self) -> dict[str, Any] | None:
-        """Get the next pending work item from the queue.
+        """Atomically claim the next pending work item.
+
+        Uses a single UPDATE … WHERE status='pending' … RETURNING so that
+        concurrent callers (e.g. a stale daemon thread racing a freshly
+        restarted worker) can never both claim the same row.  SQLite
+        serialises writers, so whichever connection executes the UPDATE first
+        wins; the other sees zero rows returned and gets None.
 
         Returns:
-            The queue item dict, or None if queue is empty.
+            The claimed queue item dict (with status already set to
+            ``"running"``), or None if the queue is empty.
         """
-        rows = list(
-            self._get_db()["queue"].rows_where(
-                "status = ?",
-                ["pending"],
-                order_by="enqueued_at",
-                limit=1,
-            )
+        db = self._get_db()
+        started_at = datetime.now().isoformat()
+        work_id = str(uuid.uuid4())[:8]
+        cursor = db.execute(
+            """
+            UPDATE queue
+               SET status     = 'running',
+                   started_at = ?,
+                   work_id    = ?
+             WHERE id = (
+                   SELECT id FROM queue
+                    WHERE status = 'pending'
+                    ORDER BY enqueued_at
+                    LIMIT 1
+             )
+            RETURNING *
+            """,
+            [started_at, work_id],
         )
-        return rows[0] if rows else None
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        db.conn.commit()
+        return dict(zip(cols, row))
+
+    def _dequeue_work_id(self, item: dict[str, Any]) -> str:
+        """Return the work_id that was stamped by :meth:`dequeue`."""
+        return item.get("work_id") or str(uuid.uuid4())[:8]
 
     def start(self) -> None:
         """Start the worker loop in a background daemon thread.
@@ -193,21 +220,9 @@ class RalphLoopWorker:
                 continue
 
             item_id = item["id"]
+            # work_id was stamped atomically by dequeue(); no separate update needed.
+            work_id = self._dequeue_work_id(item)
             logger.info(f"Processing queue item {item_id}")
-
-            # Pre-generate a work_id so the queue row shows it while
-            # the job is running (rather than the queue sequence number).
-            work_id = str(uuid.uuid4())[:8]
-
-            # Mark as started in the queue
-            self._get_db()["queue"].update(
-                item_id,
-                {
-                    "status": "running",
-                    "started_at": datetime.now().isoformat(),
-                    "work_id": work_id,
-                },
-            )
 
             # ── Push event to WebSocket bus ──
             try:
