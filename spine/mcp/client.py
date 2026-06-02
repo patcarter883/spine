@@ -98,8 +98,17 @@ def _strip_excluded_paths(text: str) -> tuple[str, int]:
 
     Returns (filtered_text, n_dropped). Forgiving — non-path lines pass
     through untouched so prose/grouping headers are preserved.
+
+    The per-line scan always runs (result blobs are byte-capped, so the
+    cost is negligible). We deliberately do NOT short-circuit on the
+    explicit ``EXCLUDED_INDEX_PATHS`` prefixes: the generic dot-folder rule
+    in :func:`_line_starts_with_excluded_path` must fire for hidden dirs
+    like ``.git/``, ``.venv/``, ``.pytest_cache/`` even when none of the
+    hard-coded ``.spine/`` prefixes happen to appear in the blob. When
+    nothing is dropped we return the original text unchanged so formatting
+    (trailing newlines, line endings) is preserved on the common path.
     """
-    if not text or not any(prefix in text for prefix in EXCLUDED_INDEX_PATHS):
+    if not text:
         return text, 0
     kept: list[str] = []
     dropped = 0
@@ -108,6 +117,8 @@ def _strip_excluded_paths(text: str) -> tuple[str, int]:
             dropped += 1
             continue
         kept.append(line)
+    if dropped == 0:
+        return text, 0
     return ("\n".join(kept), dropped)
 
 

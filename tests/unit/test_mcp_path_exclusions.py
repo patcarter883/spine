@@ -74,3 +74,32 @@ class TestStripExcludedPathsAggregate:
                 f"line containing {noisy!r} should have been dropped"
             )
         assert dropped == 4
+
+    def test_drops_dot_folders_without_explicit_spine_prefix(self):
+        # Regression: the dot-folder rule must fire even when NONE of the
+        # hard-coded EXCLUDED_INDEX_PATHS (.spine/...) prefixes appear in the
+        # blob. Previously a guard short-circuited on those prefixes, leaking
+        # .git/.venv/.pytest_cache paths into research findings.
+        blob = "\n".join([
+            "spine/agents/factory.py: def build_phase_agent",
+            ".git/HEAD: ref refs/heads/main",
+            ".venv/lib/python3.13/site-packages/foo.py: def bar",
+            ".pytest_cache/CACHEDIR.TAG: noise",
+            "  - .hidden/config.toml: leading-bullet hidden dir",
+            "README.md: project intro",
+        ])
+        out, dropped = _strip_excluded_paths(blob)
+        kept_lines = out.splitlines()
+        assert kept_lines == [
+            "spine/agents/factory.py: def build_phase_agent",
+            "README.md: project intro",
+        ]
+        assert dropped == 4
+
+    def test_clean_blob_passes_through_unchanged(self):
+        # No dot-folders, no explicit prefixes → original text preserved
+        # verbatim (including trailing newline) and nothing dropped.
+        blob = "spine/agents/factory.py: def f\nREADME.md: intro\n"
+        out, dropped = _strip_excluded_paths(blob)
+        assert out == blob
+        assert dropped == 0
