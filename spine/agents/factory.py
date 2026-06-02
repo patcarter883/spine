@@ -405,9 +405,36 @@ def build_phase_agent(
     onboarding_inject: str | None = None
     onboarding_ref_block = ""
     if not is_subagent and _onboarding_injection_enabled():
-        onboarding_inject, onboarding_ref = resolve_onboarding_docs(
+        onboarding_inject, onboarding_ref, inject_excerpt = resolve_onboarding_docs(
             workspace_root, phase.value
         )
+        # When the primary doc exceeds the full-inject cap, resolve_onboarding_docs
+        # returns an excerpt string instead of a path.  Write it to a tempfile so
+        # the memory middleware can load it identically to a full doc.  The file
+        # must persist for the lifetime of this process (the middleware reads it
+        # per-request, not at construction time); atexit handles cleanup so we
+        # don't pollute the workspace .spine/onboarding/ directory.
+        if onboarding_inject is None and inject_excerpt:
+            import atexit
+            import os
+            import tempfile
+
+            fd, _excerpt_path = tempfile.mkstemp(
+                suffix=".md", prefix="spine_onboarding_excerpt_"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as _fh:
+                    _fh.write(inject_excerpt)
+                onboarding_inject = _excerpt_path
+                atexit.register(
+                    lambda p=_excerpt_path: os.unlink(p) if os.path.exists(p) else None
+                )
+            except OSError:
+                try:
+                    os.close(fd)
+                    os.unlink(_excerpt_path)
+                except OSError:
+                    pass
         onboarding_ref_block = build_onboarding_reference(onboarding_ref)
 
     # ── Assemble final system prompt ─────────────────────────────────

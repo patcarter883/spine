@@ -589,6 +589,32 @@ async def run_research_manager(
     else:
         manager_prompt = _RESEARCH_MANAGER_SPECIFY
 
+    # ── Prepend onboarding orientation ──────────────────────────────
+    # The research manager picks exploration topics that shape the entire
+    # phase.  Giving it a bounded excerpt of the phase-relevant onboarding
+    # doc grounds its topic selection in the project's actual architecture
+    # without going through the build_phase_agent middleware stack (this
+    # function uses a raw ainvoke path).
+    try:
+        from spine.agents.factory import _onboarding_injection_enabled
+        from spine.agents.skills_resolver import (
+            _PHASE_PRIMARY_DOC,
+            load_onboarding_excerpt,
+        )
+
+        if _onboarding_injection_enabled():
+            _primary_doc = _PHASE_PRIMARY_DOC.get(phase)
+            if _primary_doc:
+                _excerpt = load_onboarding_excerpt(
+                    workspace_root, _primary_doc, max_bytes=6_000
+                )
+                if _excerpt:
+                    manager_prompt = (
+                        xml_block(Tag.ONBOARDING_DOCS, _excerpt) + "\n\n" + manager_prompt
+                    )
+    except Exception:
+        pass  # fail-open — orientation is best-effort
+
     try:
         # Use model.with_structured_output() for proper Pydantic validation.
         # The local vLLM can produce syntactically-valid but semantically-

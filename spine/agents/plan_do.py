@@ -199,6 +199,7 @@ async def run_plan_node(
     phase_path: str,
     task_description: str,
     role_hint: str = "",
+    workspace_root: str | None = None,
 ) -> SubagentDirective:
     """Run the no-tool planner for a subagent step.
 
@@ -211,6 +212,11 @@ async def run_plan_node(
             The planner reads this and produces a directive.
         role_hint: Optional one-line description of which subagent the
             directive is for (rendered into the planner's user message).
+        workspace_root: Project workspace root.  When provided and onboarding
+            injection is enabled, a bounded excerpt of the phase-relevant
+            onboarding document is prepended to the system prompt so the
+            planner has project context even though it bypasses
+            ``build_phase_agent``.
 
     Returns:
         A :class:`SubagentDirective`. On any failure returns
@@ -241,6 +247,33 @@ async def run_plan_node(
         )
         return empty_directive("structured output unsupported")
 
+    # Build the effective system prompt, optionally prepending an onboarding
+    # excerpt.  This function uses a raw ainvoke path that bypasses
+    # build_phase_agent, so we handle the injection explicitly here.
+    effective_system_prompt = _PLAN_SYSTEM_PROMPT
+    if workspace_root:
+        try:
+            from spine.agents.factory import _onboarding_injection_enabled
+            from spine.agents.skills_resolver import (
+                _PHASE_PRIMARY_DOC,
+                load_onboarding_excerpt,
+            )
+
+            if _onboarding_injection_enabled():
+                _primary_doc = _PHASE_PRIMARY_DOC.get(phase_path)
+                if _primary_doc:
+                    _excerpt = load_onboarding_excerpt(
+                        workspace_root, _primary_doc, max_bytes=4_000
+                    )
+                    if _excerpt:
+                        effective_system_prompt = (
+                            xml_block(Tag.ONBOARDING_DOCS, _excerpt)  # Tag from module imports
+                            + "\n\n"
+                            + _PLAN_SYSTEM_PROMPT
+                        )
+        except Exception:
+            pass  # fail-open — orientation is best-effort
+
     human_content = hostage_layout(
         xml_blocks(
             (Tag.ROLE, role_hint.strip()),
@@ -252,7 +285,7 @@ async def run_plan_node(
     try:
         response: Any = await structured.ainvoke(
             [
-                SystemMessage(content=_PLAN_SYSTEM_PROMPT),
+                SystemMessage(content=effective_system_prompt),
                 HumanMessage(content=human_content),
             ]
         )

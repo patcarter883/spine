@@ -56,6 +56,7 @@ async def _critic_directive_node(
         phase_path=PhaseName.CRITIC.value,
         task_description=task,
         role_hint=f"critic for the {reviewed_phase!r} phase",
+        workspace_root=state.get("workspace_root", "."),
     )
     logger.info(
         "[%s] CRITIC plan-directive: approach=%r",

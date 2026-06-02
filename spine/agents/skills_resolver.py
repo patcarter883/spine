@@ -165,35 +165,91 @@ _DOC_PURPOSE: dict[str, str] = {
     "SPINE_ASSISTANCE_REQUIREMENTS.md": "where to assist + context/token guardrails",
 }
 
-# Size cap (bytes) for the injected primary document. Above this it is demoted to
-# reference-only so the always-on injection can never blow the bounded token
-# budget that project AGENTS.md is itself skipped to protect (see
+# Size cap (bytes) for the injected primary document. Above this the full doc
+# is demoted to reference-only and an excerpt is injected instead (see
+# :func:`resolve_onboarding_docs`). The cap protects the always-on token
+# budget that project AGENTS.md is itself skipped to preserve (see
 # ``_SKIP_AGENTS_MD``).
 _ONBOARDING_INJECT_BYTE_CAP = 12_000
+
+# Excerpt size cap used when the primary doc exceeds the full-inject cap.
+# A 10 KB excerpt is ~2 500 tokens — meaningful architectural context without
+# per-turn cost multiplication.
+_ONBOARDING_EXCERPT_BYTE_CAP = 10_000
+
+
+def load_onboarding_excerpt(
+    workspace_root: str | None,
+    doc_name: str,
+    max_bytes: int = 6_000,
+) -> str:
+    """Read up to ``max_bytes`` of an onboarding document.
+
+    Returns the full text when it fits, or a UTF-8-safe truncation with an
+    appended sentinel so the model knows the document continues on disk.
+    Returns ``""`` when ``workspace_root`` is falsy or the document is absent.
+
+    Args:
+        workspace_root: Project workspace root (holds ``.spine/onboarding/``).
+        doc_name: Filename of the document, e.g. ``"ARCHITECTURE_MAP.md"``.
+        max_bytes: Maximum byte length of the returned string (default 6 000).
+    """
+    if not workspace_root:
+        return ""
+    from spine.work.onboarding.synthesis_tools import onboarding_docs_dir
+
+    path = onboarding_docs_dir(workspace_root) / doc_name
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    encoded = text.encode()
+    if len(encoded) <= max_bytes:
+        return text
+    truncated = encoded[:max_bytes].decode(errors="replace")
+    return (
+        truncated
+        + f"\n[Document truncated — read the full file at {path} for complete coverage.]"
+    )
 
 
 def resolve_onboarding_docs(
     workspace_root: str | None,
     phase: str,
-) -> tuple[str | None, list[tuple[str, str]]]:
+) -> tuple[str | None, list[tuple[str, str]], str | None]:
     """Resolve onboarding context for a phase agent (hybrid injection).
 
     Onboarding writes four markdown documents to a single stable location,
     ``<workspace_root>/.spine/onboarding/`` (see
     :func:`spine.work.onboarding.synthesis_tools.onboarding_docs_dir`). This
-    selects the phase's PRIMARY document to inject in full and lists the rest as
+    selects the phase's PRIMARY document to inject and lists the rest as
     references the agent may read on demand.
+
+    When the primary document fits within :data:`_ONBOARDING_INJECT_BYTE_CAP`,
+    its path is returned as ``inject_path`` for full injection via the memory
+    middleware. When it exceeds the cap, ``inject_path`` is ``None`` and
+    ``inject_excerpt`` carries a :data:`_ONBOARDING_EXCERPT_BYTE_CAP`-bounded
+    excerpt (with a truncation sentinel). The caller is responsible for writing
+    the excerpt to a tempfile and passing that path to the memory middleware —
+    this avoids polluting the ``.spine/onboarding/`` directory.
 
     Args:
         workspace_root: Project workspace root (holds ``.spine/onboarding/``).
         phase: Phase name (e.g. ``"specify"``).
 
     Returns:
-        ``(inject_path, reference)`` where ``inject_path`` is the absolute path to
-        the primary document to inject in full — or ``None`` when it is absent or
-        exceeds :data:`_ONBOARDING_INJECT_BYTE_CAP` (demoted to reference-only) —
-        and ``reference`` is a list of ``(filename, abs_path)`` for the other
-        existing onboarding documents.
+        ``(inject_path, reference, inject_excerpt)`` where:
+
+        - ``inject_path`` is the absolute path to the primary document for full
+          injection, or ``None`` when absent or oversized.
+        - ``reference`` is a list of ``(filename, abs_path)`` for the other
+          existing onboarding documents (always includes the primary when it is
+          oversized, so the agent can still read it on demand).
+        - ``inject_excerpt`` is a bounded excerpt string to inject when
+          ``inject_path`` is ``None`` but the doc exists and is oversized, or
+          ``None`` when no excerpt is available.
     """
     from spine.work.onboarding.synthesis_tools import (
         ONBOARDING_DOC_NAMES,
@@ -201,14 +257,15 @@ def resolve_onboarding_docs(
     )
 
     if not workspace_root:
-        return None, []
+        return None, [], None
 
     docs_dir = onboarding_docs_dir(workspace_root)
     if not docs_dir.is_dir():
-        return None, []
+        return None, [], None
 
     # Choose the primary doc to inject, subject to the size guard.
     inject_path: str | None = None
+    inject_excerpt: str | None = None
     primary = _PHASE_PRIMARY_DOC.get(phase)
     if primary:
         ppath = docs_dir / primary
@@ -222,12 +279,18 @@ def resolve_onboarding_docs(
             else:
                 logger.debug(
                     "Phase %s: onboarding doc %s exceeds inject cap — "
-                    "demoting to reference-only",
+                    "injecting excerpt (%d B cap) + reference",
                     phase,
                     primary,
+                    _ONBOARDING_EXCERPT_BYTE_CAP,
                 )
+                inject_excerpt = load_onboarding_excerpt(
+                    workspace_root, primary, max_bytes=_ONBOARDING_EXCERPT_BYTE_CAP
+                ) or None
 
     # Everything else (existing docs not injected in full) becomes a reference.
+    # When the primary is oversized its path is still listed so the agent can
+    # read the complete document on demand.
     reference: list[tuple[str, str]] = []
     for name in ONBOARDING_DOC_NAMES:
         fname = f"{name}.md"
@@ -238,7 +301,7 @@ def resolve_onboarding_docs(
             continue
         reference.append((fname, str(fpath)))
 
-    return inject_path, reference
+    return inject_path, reference, inject_excerpt
 
 
 def build_onboarding_reference(reference: list[tuple[str, str]]) -> str:
