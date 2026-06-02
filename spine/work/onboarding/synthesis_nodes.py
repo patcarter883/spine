@@ -52,6 +52,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from spine.agents.helpers import (
+    bind_structured_output,
     cap_completion_tokens,
     coerce_structured_output,
     resolve_chat_model,
@@ -347,7 +348,7 @@ async def _refine_plan_with_llm(
             "Return the refined, ordered list of sections for all four documents.",
         )
 
-        structured = model.with_structured_output(SectionPlanSet)
+        structured = bind_structured_output(model, SectionPlanSet)
         with suppress_parsed_serializer_warning():
             response = await structured.ainvoke(
                 [SystemMessage(content=_MANAGER_ROLE), HumanMessage(content=prompt)]
@@ -503,7 +504,7 @@ async def _section_worker_node(
         model = cap_completion_tokens(model, comp_cap)
 
         prompt = _worker_prompt(active, voice)
-        structured = model.with_structured_output(SectionResult)
+        structured = bind_structured_output(model, SectionResult)
         messages = [SystemMessage(content=voice), HumanMessage(content=prompt)]
 
         # Bounded retry: a single transient LLM failure or one empty/unparseable

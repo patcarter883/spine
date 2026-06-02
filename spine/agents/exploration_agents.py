@@ -24,7 +24,11 @@ from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 from spine.agents._tokens import count_tokens as _count_tokens
-from spine.agents.helpers import cap_completion_tokens, resolve_chat_model
+from spine.agents.helpers import (
+    bind_structured_output,
+    cap_completion_tokens,
+    resolve_chat_model,
+)
 
 try:  # openai is always present when the model is ChatOpenAI; guard for safety.
     from openai import LengthFinishReasonError as _LengthFinishReasonError
@@ -629,7 +633,7 @@ async def run_research_manager(
         # only Pydantic validation catches this.  We extract plain values
         # into a dict so the Pydantic instance never leaks into LangGraph
         # state (avoids the checkpoint serializer warning on AIMessage.parsed).
-        structured_model = model.with_structured_output(ResearchManagerDecision)
+        structured_model = bind_structured_output(model, ResearchManagerDecision)
         # LangChain's tracer Pydantic-serializes the raw AIMessage with
         # `.parsed` populated to our custom model, which trips Pydantic's
         # "unexpected value" warning every call. The warning is cosmetic
@@ -1321,7 +1325,7 @@ def _findings_structured_model(model: Any) -> Any | None:
         capped = model
 
     try:
-        return capped.with_structured_output(ResearchFindings)
+        return bind_structured_output(capped, ResearchFindings)
     except Exception:
         logger.debug("findings cap: model lacks with_structured_output", exc_info=True)
         return None

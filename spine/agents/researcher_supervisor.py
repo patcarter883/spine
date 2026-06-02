@@ -39,7 +39,11 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import cap_completion_tokens, resolve_chat_model
+from spine.agents.helpers import (
+    bind_structured_output,
+    cap_completion_tokens,
+    resolve_chat_model,
+)
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -437,7 +441,7 @@ async def run_supervisor_node(
         )
 
     try:
-        structured = model.with_structured_output(SupervisorDirective)
+        structured = bind_structured_output(model, SupervisorDirective)
     except Exception:
         logger.debug(
             "[%s] researcher_supervisor: model %r lacks with_structured_output",

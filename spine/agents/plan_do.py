@@ -26,7 +26,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_chat_model
+from spine.agents.helpers import bind_structured_output, resolve_chat_model
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -237,7 +237,7 @@ async def run_plan_node(
         return empty_directive("resolve_chat_model failed")
 
     try:
-        structured = model.with_structured_output(SubagentDirective)
+        structured = bind_structured_output(model, SubagentDirective)
     except Exception:
         logger.debug(
             "[%s] plan_do: model %r lacks with_structured_output — skipping plan",

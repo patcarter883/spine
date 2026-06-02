@@ -27,7 +27,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_chat_model
+from spine.agents.helpers import bind_structured_output, resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
 logger = logging.getLogger(__name__)
@@ -132,7 +132,7 @@ async def run_decomposer(
 
     phase_path = f"implement/decomposer/{mode.lower()}"
     model = resolve_chat_model(config, session_id=session_id, phase=phase_path)
-    structured = model.with_structured_output(DecompositionResult)
+    structured = bind_structured_output(model, DecompositionResult)
 
     if mode == "PLAN":
         system_prompt = _PLAN_PROMPT

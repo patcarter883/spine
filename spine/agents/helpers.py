@@ -176,6 +176,51 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
     return model.model_copy(update={"max_completion_tokens": cap})
 
 
+def _is_openai_style_model(model: Any) -> bool:
+    """True when ``model`` is a ``ChatOpenAI`` subclass.
+
+    Covers ``ChatOpenRouter`` (which inherits ``ChatOpenAI``) and local
+    OpenAI-compatible servers (vLLM via ``ChatOpenAI``).  Returns ``False``
+    for ``ChatAnthropic``, string specs, and test fakes.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError:
+        return False
+    return isinstance(model, ChatOpenAI)
+
+
+def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
+    """Bind ``schema`` for structured output, avoiding forced ``tool_choice``.
+
+    ``model.with_structured_output(schema)`` defaults to
+    ``method="function_calling"`` on OpenAI-compatible models, which forces a
+    ``tool_choice`` value to make the model call the extraction function.
+    Combined with our ``require_parameters=True`` OpenRouter setting (see
+    :func:`_build_openrouter_model`), any model whose endpoints don't support
+    that value is rejected up-front with::
+
+        NotFoundResponseError: No endpoints found that support the
+        provided 'tool_choice' value.
+
+    Because every bare ``with_structured_output`` callsite wraps its invoke in
+    a ``try/except`` fallback, that 404 doesn't crash the run — it silently
+    degrades each planner/decomposer/supervisor call to its floor (empty
+    directive, terminating directive, skeleton plan).
+
+    For OpenAI-style models we therefore request ``method="json_schema"``,
+    which uses the native ``response_format`` path and sends no ``tool_choice``
+    at all.  Other providers (e.g. ``ChatAnthropic``, which has no
+    ``response_format`` and handles forced tool choice fine) keep their default
+    method.  ``method="json_schema"`` is selected only at bind time; if a model
+    later rejects ``response_format`` json_schema at invoke time, the callsite's
+    existing ``try/except`` still degrades gracefully.
+    """
+    if _is_openai_style_model(model):
+        return model.with_structured_output(schema, method="json_schema")
+    return model.with_structured_output(schema)
+
+
 def coerce_structured_output(
     response: Any,
     schema: type[_StructuredT],
