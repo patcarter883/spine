@@ -296,6 +296,119 @@ async def test_supervisor_terminates_when_structured_output_unsupported(monkeypa
     assert d.is_complete is True
 
 
+@pytest.mark.asyncio
+async def test_supervisor_caps_completion_tokens_before_structured_output(monkeypatch):
+    """The directive call must be token-capped before binding structured
+    output. Without the cap it inherits the global window (e.g. 40K) and a
+    local model that misreads the near-cap soft-landing nudge can ramble for
+    minutes into the analysis field before raising LengthFinishReasonError —
+    the stall on trace 019e8679 (run 019e867a). Pins that the configured cap
+    is applied.
+    """
+    from spine.config import SpineConfig
+
+    captured: dict[str, Any] = {}
+
+    class _Structured:
+        async def ainvoke(self, messages, **kw):
+            return {"analysis_and_reasoning": "done", "is_complete": True}
+
+    class _Model:
+        def with_structured_output(self, schema):
+            return _Structured()
+
+    def _capture_cap(model, cap):
+        captured["cap"] = cap
+        return model  # identity — no need to model_copy a stub
+
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", _capture_cap)
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True
+    assert captured["cap"] == SpineConfig.load().researcher_supervisor_max_completion_tokens
+
+
+@pytest.mark.asyncio
+async def test_supervisor_terminates_when_invocation_raises_length_error(monkeypatch):
+    """A truncated/over-length structured-output call raises during ainvoke;
+    the node must turn it into a terminating directive so the loop exits
+    cleanly instead of hanging (regression for the runaway on 019e867a)."""
+
+    class _Structured:
+        async def ainvoke(self, messages, **kw):
+            # Stand-in for openai.LengthFinishReasonError; the except clause
+            # is type-agnostic, so any invocation exception exercises the path.
+            raise RuntimeError("Could not parse response content as the length limit was reached")
+
+    class _Model:
+        def with_structured_output(self, schema):
+            return _Structured()
+
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", lambda model, cap: model)
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=11,
+        max_cycles=12,
+    )
+    assert d.is_complete is True
+
+
+# ── Soft-landing prompt (near the hard cap) ────────────────────────────
+
+
+def test_soft_landing_prompt_does_not_ask_supervisor_to_write_findings():
+    """Near the cap the nudge must steer toward is_complete=True WITHOUT
+    telling the supervisor to author the findings — the old "synthesise a
+    ResearchFindings" wording made local models dump the whole artifact into
+    the free-text analysis field and run to the token ceiling (019e867a).
+    """
+    msg = rs._build_supervisor_user_message(
+        global_goal="topic",
+        cycle_idx=12,  # display index; 12 >= max_cycles-1 → soft landing on
+        max_cycles=12,
+        latest_finding_block="(none)",
+        history_count=3,
+        history_summary="1. [search/success] ...",
+    )
+    assert "synthesise a ResearchFindings" not in msg
+    assert "Do NOT write the findings yourself" in msg
+    assert "is_complete=True" in msg
+
+
+def test_early_cycle_prompt_omits_soft_landing_nudge():
+    """Far from the cap there is no soft-landing nudge at all."""
+    msg = rs._build_supervisor_user_message(
+        global_goal="topic",
+        cycle_idx=2,
+        max_cycles=12,
+        latest_finding_block="(none)",
+        history_count=1,
+        history_summary="1. [search/success] ...",
+    )
+    assert "near the hard cap" not in msg
+
+
 # ── Worker: message → StructuredFinding extraction ─────────────────────
 
 

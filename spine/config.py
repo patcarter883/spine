@@ -269,6 +269,16 @@ class SpineConfig:
     # cap (16K) and 207s before raising LengthFinishReasonError, which is then
     # discarded anyway (trace 019e77fe). Capping fails fast to the sentinel.
     summarise_max_completion_tokens: int = 4096
+    # Completion-token cap for the per-topic researcher SUPERVISOR's
+    # SupervisorDirective calls (in-loop + off-by-one salvage). A directive is
+    # tiny (a 2-4 sentence verdict + a one-sentence next move); without a tight
+    # cap the call inherits the global window (e.g. 40K) and a local model that
+    # mistakes the near-cap soft-landing nudge for "write the findings now" can
+    # ramble for minutes into the free-text analysis field before raising
+    # LengthFinishReasonError — which stalled SPECIFY on trace 019e8679
+    # (run 019e867a, ~9.5min). A tight cap fails fast and the loop proceeds to
+    # synthesis from accumulated evidence. Mirrors summarise_max_completion_tokens.
+    researcher_supervisor_max_completion_tokens: int = 1024
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -538,6 +548,9 @@ class SpineConfig:
             ),
             summarise_max_completion_tokens=int(
                 spine.get("summarise_max_completion_tokens", 4096)
+            ),
+            researcher_supervisor_max_completion_tokens=int(
+                spine.get("researcher_supervisor_max_completion_tokens", 1024)
             ),
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)

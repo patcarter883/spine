@@ -39,7 +39,7 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_chat_model
+from spine.agents.helpers import cap_completion_tokens, resolve_chat_model
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -255,10 +255,12 @@ def _build_supervisor_user_message(
     # evidence is already enough to write a ResearchFindings.
     if cycle_idx >= max_cycles - 1:
         cycle_line += (
-            " You are near the hard cap — set is_complete=True now and "
-            "synthesise a ResearchFindings from the accumulated evidence "
-            "unless a single critical fact is still missing. Do NOT request "
-            "further tool calls just to be thorough."
+            " You are near the hard cap. Unless a single critical fact is still "
+            "missing, set is_complete=True now, leave next_directive empty and "
+            "allowed_tool_class null, and keep analysis_and_reasoning to your "
+            "usual 2-4 sentences. Do NOT write the findings yourself and do NOT "
+            "request further tool calls just to be thorough — a later step "
+            "synthesises the ResearchFindings from the accumulated evidence."
         )
     return hostage_layout(
         xml_blocks(
@@ -413,6 +415,26 @@ async def run_supervisor_node(
             exc_info=True,
         )
         return _terminating_directive("resolve_chat_model failed")
+
+    # Cap the directive call's completion budget before binding structured
+    # output. A SupervisorDirective is tiny, but the resolved model inherits the
+    # global max_completion_tokens (e.g. 40K); without a tight cap a local model
+    # that reads the near-cap soft-landing nudge as "write the findings now" can
+    # ramble into the free-text analysis field for minutes before raising
+    # LengthFinishReasonError (trace 019e8679, run 019e867a). The cap fails fast;
+    # the except below turns the truncation into a terminating directive so the
+    # loop exits cleanly. Mirrors exploration_agents._findings_structured_model.
+    try:
+        from spine.config import SpineConfig
+
+        cap = SpineConfig.load().researcher_supervisor_max_completion_tokens
+        model = cap_completion_tokens(model, cap)
+    except Exception:
+        logger.debug(
+            "[%s] researcher_supervisor: token-cap copy failed — using uncapped model",
+            work_id,
+            exc_info=True,
+        )
 
     try:
         structured = model.with_structured_output(SupervisorDirective)

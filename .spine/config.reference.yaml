@@ -179,6 +179,13 @@ spine:
   # Default: 4096  | (no env override)
   summarise_max_completion_tokens: 4096
 
+  # Completion-token cap for the per-topic researcher SUPERVISOR's
+  # SupervisorDirective calls (in-loop + off-by-one salvage). A directive is
+  # tiny; a tight cap stops a local model from rambling into the analysis field
+  # when it mistakes the near-cap soft-landing nudge for "write the findings now".
+  # Default: 1024  | (no env override)
+  researcher_supervisor_max_completion_tokens: 1024
+
   # Total token budget for the SPECIFY explorer context.
   # Default: 30000  | (no env override)
   specify_context_token_budget: 30000
