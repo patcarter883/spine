@@ -175,10 +175,22 @@ providers:
       provider: pat
     implement:
       provider: pat
+      # Slice-implementer agents build via build_phase_agent(phase=IMPLEMENT),
+      # so the model resolves on this bare "implement" key (the
+      # implement/subagents/slice-implementer entry below is only consulted on
+      # the phase_path path, e.g. the planning node). Slice completions are
+      # small (37-4,315 tokens observed in trace 019e87dd); capping at 8192
+      # prevents the 80K-window crash (prompt + global 40K cap > window) and
+      # any degenerate run-to-40K generation. Mirrors the critic cap above.
+      max_completion_tokens: 8192
     implement/subagents/slice-implementer:
       provider: pat
     verify:
       provider: pat
+      # Same rationale as implement: slice-verifier builds via
+      # build_phase_agent(phase=VERIFY) and inherits the global 40K cap on an
+      # 80K-window model. Verification reports are small; cap at 8192.
+      max_completion_tokens: 8192
     gap_plan:
       provider: pat
     # RAG phase providers

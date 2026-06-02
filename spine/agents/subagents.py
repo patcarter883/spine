@@ -811,6 +811,21 @@ def build_subagent_spec(
         from spine.agents.context_editing import ToolOutputTrimmer
 
         subagent_middleware.append(ToolOutputTrimmer(max_full_tool_results=8))
+    elif name in ("slice-implementer", "slice-verifier"):
+        # The leaf code agents run a genuine multi-step read→edit→execute loop
+        # (not the researcher's survey pattern), so they keep the agent.ainvoke
+        # tool loop. But with no trimming the message history grows
+        # monotonically: trace 019e87dd showed a single slice climbing
+        # 6K→34K prompt tokens over ~6-21 turns (whole-file reads + execute
+        # output never evicted), then crashing when prompt + the requested
+        # completion exceeded the model window. Trimming the OLD tail to a
+        # metadata placeholder while keeping the recent window flattens the
+        # climb without starving the agent of its working context — the larger
+        # window (12 vs the researcher's 8) preserves more recent file/test
+        # output that the code agents legitimately need.
+        from spine.agents.context_editing import ToolOutputTrimmer
+
+        subagent_middleware.append(ToolOutputTrimmer(max_full_tool_results=12))
 
     spec: dict[str, Any] = {
         "name": name,

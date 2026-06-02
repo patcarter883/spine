@@ -121,6 +121,51 @@ class TestSubagentAutonomy:
                 f"Subagent {name!r} prompt doesn't mention batch reads or MCP tool batching"
             )
 
+    def test_leaf_code_subagents_have_tool_output_trimmer(self):
+        """slice-implementer / slice-verifier must carry a ToolOutputTrimmer.
+
+        Without trimming, a slice agent's read→edit→execute loop accumulates
+        every tool result in message history and the prompt grows
+        monotonically (trace 019e87dd: a single slice climbed 6K→34K prompt
+        tokens before crashing when prompt + the requested completion exceeded
+        the model window). The trimmer evicts the stale tail to a metadata
+        placeholder while preserving the recent window.
+        """
+        from unittest.mock import patch, MagicMock
+        from spine.agents.subagents import build_subagent_spec
+        from spine.agents.context_editing import ToolOutputTrimmer
+
+        state: WorkflowState = {
+            "work_id": "test",
+            "work_type": "task",
+            "description": "test",
+            "workspace_root": "/tmp",
+            "artifacts": {},
+            "critic_reviewing": "",
+            "current_phase": "",
+            "feedback": [],
+            "max_retries": 3,
+            "phase_index": 0,
+            "prompt_request": None,
+            "retry_count": {},
+            "status": "running",
+        }
+
+        mock_model = MagicMock()
+        for name, phase in (
+            ("slice-implementer", PhaseName.IMPLEMENT),
+            ("slice-verifier", PhaseName.VERIFY),
+        ):
+            with patch("spine.agents.helpers.resolve_model", return_value=mock_model):
+                spec = build_subagent_spec(name=name, phase=phase, state=state)
+            trimmers = [
+                m for m in spec.get("middleware", []) if isinstance(m, ToolOutputTrimmer)
+            ]
+            assert trimmers, (
+                f"Subagent {name!r} must carry a ToolOutputTrimmer to bound "
+                f"per-slice context growth"
+            )
+
 
 class TestContextEditing:
     """Verify context editing middleware is configured."""
