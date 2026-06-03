@@ -116,6 +116,64 @@ keeping `implement`/`pat` at 4.
 
 ---
 
+## Index context-window sizing
+
+How small can `max-model-len` go for a dedicated **index / summarisation**
+instance? The constraint is **request admission**, not actual usage: vLLM 400s any
+request where `prompt + max_tokens > max-model-len` (see the comment at
+`spine/agents/helpers.py:576-585`). Index per-request data (713 reqs, 3 h):
+
+| Per request | p50 | p99 | max observed |
+|---|---|---|---|
+| Prompt tokens | 495 | 6,759 | ≤10,000 |
+| Generation tokens (actual) | 1,594 | 4,885 | one outlier in 5k–20k band |
+| `max_tokens` **requested** | — | — | **40,000 (flat)** |
+
+> The requested `max_tokens` is a flat **40,000**, set by the global
+> `spine.max_completion_tokens` (`.spine/config.yaml:14`) and applied to the `pat`
+> provider via the fallback in `_build_local_model` (`spine/agents/helpers.py:581-585`)
+> because the `summarization` phase route (`.spine/config.yaml:206-207`) has no
+> override. Index requests only ever *generate* ~1,600 (p99 4,885), so the 40k
+> budget is ~8× over-provisioned. (An earlier read of the coarse Prometheus
+> `request_params_max_tokens` histogram showed p50 33.6k / p99 49.7k — those were
+> bucket-interpolation artifacts; the true value is 40,000.)
+
+**Sizing, two cases:**
+
+1. **Change nothing else → floor ≈ 56k.** Worst-case admission = max prompt (~10k)
+   + requested `max_tokens` (40k) = ~50k. Below ~56k, vLLM starts rejecting the
+   largest index requests. Barely under today's 80k — not worth it alone.
+
+2. **Cap the summarisation `max_tokens` first → 32k is safe.** Add a per-phase
+   override mirroring the existing `verify` phase (`.spine/config.yaml:200`,
+   `max_completion_tokens: 8192`):
+
+   ```yaml
+   providers:
+     phases:
+       summarization:
+         provider: pat
+         max_completion_tokens: 16384   # 3× the 4,885 p99; covers the rare long summary
+   ```
+
+   Then `prompt (≤10k) + 16,384 = ~26k` fits comfortably in **`--max-model-len 32768`**.
+   (8,192 would match `verify` and cover the p99, but risks clipping the lone
+   >5k-token summary; 16,384 is the safe default.)
+
+**Absolute floor on observed real traffic ≈ 24k** (max prompt 10k + the ~20k gen
+outlier, if they coincided) — but 32k is the right round number with headroom.
+
+**Caveats:**
+- Shrinking `max-model-len` does **not** by itself grow the KV pool
+  (`num_gpu_blocks=302` is fixed by VRAM profiling at `gpu_memory_utilization=0.96`).
+  The win is a smaller per-sequence ceiling → safely raise `max-num-seqs` /
+  concurrency for the decode-bound index workload without KV over-commit, and it
+  stops the 40k `max_tokens` over-reservation.
+- **Index-only.** The `implement` workload has prompts to 48k (p99) and needs
+  ≥ ~56k context — never apply 32k to a shared instance.
+
+---
+
 ## Verification
 
 Re-run during a real `implement` burst against `http://10.50.1.51:9090`:
