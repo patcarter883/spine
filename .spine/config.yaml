@@ -12,6 +12,7 @@ spine:
   # threshold). Set to 0 or negative to disable the cap.
   synthesize_findings_token_budget: 20000
   max_completion_tokens: 40000
+  researcher_supervisor_max_completion_tokens: 4096
   max_critic_retries: 3
   # RAG configuration
   reranker_provider: bge-reranker
@@ -27,15 +28,21 @@ spine:
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
-    max_concurrent_chunks: 10
+    max_concurrent_chunks: 5
     batch_size: 100
   # Researcher convergence steering — nudge & force the explore subagent
   # to emit final ResearchFindings before LangGraph's recursion_limit (50)
   # is hit. Disable with SPINE_RESEARCHER_CONVERGENCE=false.
   convergence:
-    researcher_soft: 10            # tool calls before a SystemMessage nudge
-    researcher_hard: 14            # tool calls before tools are dropped
-    researcher_recursion_limit: 50 # matches exploration_agents.py safety cap
+    # Supervisor↔worker loop iteration cap for SPECIFY (broad architectural
+    # mapping gets a larger budget). Floored at 1.
+    # Default: 12  | Env: SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_SPECIFY
+    researcher_supervisor_max_cycles_specify: 12
+
+    # Supervisor↔worker loop iteration cap for PLAN (focused change-surface
+    # scan). Floored at 1.
+    # Default: 6  | Env: SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_PLAN
+    researcher_supervisor_max_cycles_plan: 6
   # Token-based phase compaction (TokenBudgetCompactor). Off by default;
   # enable with SPINE_TOKEN_COMPACTION=true. Per-phase threshold of 0
   # disables compaction for that phase even when the env flag is set.
@@ -116,10 +123,10 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 6
-  - name: tiny
+    max_concurrent_calls: 4
+  - name: LFM2.5-8B-A1B
     type: deepagents-model
-    model: openai:Bonsai-8B-gguf
+    model: openai:LFM2.5-8B-A1B
     base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
@@ -137,7 +144,7 @@ providers:
   - name: local-embeddings
     type: openai-embedding
     model: nomic-embed-text-v2-moe-GGUF
-    base_url: http://localhost:8010/v1
+    base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
     query_prefix: "search_query: "
@@ -150,7 +157,7 @@ providers:
   reranker:
   - name: bge-reranker
     model: bge-reranker-v2-m3-GGUF
-    base_url: http://localhost:8010/v1
+    base_url: http://localhost:8000/v1
     api_key: vllm
     # llama.cpp rerank route. Omit to auto-probe (/rerank then /reranking).
     rerank_path: "/reranking"
@@ -195,8 +202,9 @@ providers:
       provider: pat
     # RAG phase providers
     classification:
-      provider: pat
+      provider: LFM2.5-8B-A1B
     summarization:
-      provider: pat
+      provider: LFM2.5-8B-A1B
+      max_completion_tokens: 16384
     onboarding:
       provider: pat
