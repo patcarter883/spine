@@ -28,7 +28,7 @@ spine:
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
-    max_concurrent_chunks: 50
+    max_concurrent_chunks: 10
     batch_size: 100
   # Researcher convergence steering — nudge & force the explore subagent
   # to emit final ResearchFindings before LangGraph's recursion_limit (50)
