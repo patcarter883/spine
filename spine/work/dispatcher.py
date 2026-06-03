@@ -114,6 +114,23 @@ def _update_work_progress(
         pass
 
 
+def _work_is_cancelled(db: sqlite_utils.Database, work_id: str) -> bool:
+    """Return True if the work entry has been marked ``cancelled``.
+
+    ``UIApi.stop_work`` marks the ``work_entries`` row ``cancelled`` as a
+    cooperative-cancellation signal.  The dispatcher polls this at each stream
+    boundary so a Stop Work click halts the run — and closes the LangSmith
+    trace — promptly, instead of letting the graph stream (and its trace) run
+    on until the stall timeout fires.  Mirrors the onboarding engine's
+    ``_is_cancelled`` poll.
+    """
+    try:
+        row = db["work_entries"].get(work_id)
+    except Exception:
+        return False
+    return bool(row) and row.get("status") == TaskStatus.CANCELLED.value
+
+
 # ── Phase-start update (public) ──────────────────────────────────────────
 # Called at the START of each phase node so the UI shows the correct phase
 # while work is in progress.
@@ -430,7 +447,22 @@ async def submit_work(
             work_type,
         )
         stalled = False
+        cancelled = False
         while True:
+            # Cooperative cancellation: a Stop Work click marks the work entry
+            # ``cancelled``.  Poll at each stream boundary so we break promptly
+            # (within one node) and close the trace, instead of streaming on
+            # until the stall timeout.
+            if _work_is_cancelled(db, work_id):
+                cancelled = True
+                logger.info(f"[{work_id}] Work cancelled — halting stream")
+                audit.log_event(
+                    work_id,
+                    "work_cancelled",
+                    "dispatcher",
+                    {"last_phase": result.get("current_phase", "")},
+                )
+                break
             try:
                 chunk = await asyncio.wait_for(
                     stream_iter.__anext__(),
@@ -545,8 +577,20 @@ async def submit_work(
                                 )
                                 logger.debug(f"[{work_id}] Saved artifact {art_phase}/{art_name}")
 
+        # Close the stream generator so the LangSmith trace tears down now.
+        # On natural completion it's already exhausted (no-op); on a cancel or
+        # stall break it's left suspended at a ``yield`` — ``aclose()`` runs the
+        # ``traced_astream`` teardown immediately so the trace is closed at stop
+        # time instead of lingering until garbage collection.
+        try:
+            await stream_iter.aclose()
+        except Exception:
+            logger.debug(f"[{work_id}] stream aclose raised", exc_info=True)
+
         # Update work entry with final results.
         # Derive the terminal status from the graph state:
+        #   - If cancelled (Stop Work), the status stays "cancelled" — a
+        #     user-requested stop is terminal and must not be overwritten.
         #   - If stalled, the status was already set to "stalled" above.
         #   - If the critic routed to needs_review → END, the feedback
         #     contains a needs_review entry.
@@ -556,8 +600,12 @@ async def submit_work(
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])
-        final_status = _derive_final_status(
-            result, stalled=stalled, feedback=feedback, work_type=work_type
+        final_status = (
+            TaskStatus.CANCELLED.value
+            if cancelled
+            else _derive_final_status(
+                result, stalled=stalled, feedback=feedback, work_type=work_type
+            )
         )
 
         # Save artifacts to disk
@@ -1621,8 +1669,23 @@ async def _run_workflow_graph_inner(
         work_type,
     )
     stalled = False
+    cancelled = False
 
     while True:
+        # Cooperative cancellation: a Stop Work click marks the work entry
+        # ``cancelled``.  Poll at each stream boundary so we break promptly
+        # (within one node) and close the trace, instead of streaming on
+        # until the stall timeout.
+        if _work_is_cancelled(db, work_id):
+            cancelled = True
+            logger.info(f"[{work_id}] Work cancelled — halting stream")
+            audit.log_event(
+                work_id,
+                "work_cancelled",
+                "dispatcher",
+                {"last_phase": result.get("current_phase", "")},
+            )
+            break
         try:
             chunk = await asyncio.wait_for(
                 stream_iter.__anext__(),
@@ -1701,12 +1764,25 @@ async def _run_workflow_graph_inner(
                                 work_id, art_phase, art_name, str(art_content)
                             )
 
+    # Close the stream generator so the LangSmith trace tears down now (no-op
+    # on natural exhaustion; runs teardown promptly on a cancel/stall break).
+    try:
+        await stream_iter.aclose()
+    except Exception:
+        logger.debug(f"[{work_id}] stream aclose raised", exc_info=True)
+
     # ── Final status ──
+    # A user-requested cancel is terminal — it must not be overwritten by the
+    # graph-state derivation.
     final_phase = result.get("current_phase", "")
     result_artifacts = result.get("artifacts", {})
     feedback = result.get("feedback", [])
-    final_status = _derive_final_status(
-        result, stalled=stalled, feedback=feedback, work_type=work_type
+    final_status = (
+        TaskStatus.CANCELLED.value
+        if cancelled
+        else _derive_final_status(
+            result, stalled=stalled, feedback=feedback, work_type=work_type
+        )
     )
 
     result_payload = {
