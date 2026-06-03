@@ -8,14 +8,18 @@ to eliminate duplication and ensure consistent behavior.
 
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from contextlib import contextmanager
 from typing import Any, Iterator, TypeVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 _StructuredT = TypeVar("_StructuredT", bound=BaseModel)
 
@@ -231,6 +235,79 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
     if _is_openai_style_model(model):
         return model.with_structured_output(schema, method="json_schema")
     return model.with_structured_output(schema)
+
+
+# Substring of the ValueError LangChain's ``_oai_structured_outputs_parser``
+# raises when an OpenAI-style model returns finish_reason='stop' with empty
+# content and no parsed object — i.e. the json_schema response carried neither a
+# ``parsed`` field nor a ``refusal``. Matched on the message because LangChain
+# raises a bare ``ValueError`` for this case (no dedicated exception type).
+_EMPTY_STRUCTURED_PARSE_MARKER = "does not have a 'parsed' field"
+
+
+def is_empty_structured_parse(exc: BaseException) -> bool:
+    """True for the transient json_schema empty-parse ``ValueError``.
+
+    Distinct from ``openai.LengthFinishReasonError`` (the token-cap truncation
+    case, which is a separate exception type left for each caller's own salvage
+    path). This covers the failure where a vLLM-served local model emits an
+    empty completion under guided decoding and produces no structured object;
+    the run finishes with ``finish_reason='stop'`` so it is *not* a length
+    issue and is almost always recoverable on a re-invoke.
+    """
+    return isinstance(exc, ValueError) and _EMPTY_STRUCTURED_PARSE_MARKER in str(exc)
+
+
+async def ainvoke_structured_with_retry(
+    structured_model: Any,
+    messages: list[Any],
+    *,
+    retries: int = 1,
+    label: str = "structured-output",
+) -> Any:
+    """Invoke a structured-output model, retrying transient empty parses.
+
+    Some json_schema-mode models occasionally return an empty completion with no
+    parsed object, which LangChain surfaces as a ``ValueError`` (see
+    :func:`is_empty_structured_parse`). The failure is non-deterministic, so we
+    retry up to ``retries`` times, appending a short nudge so a deterministic
+    decoder doesn't simply reproduce the empty result.
+
+    Every other exception — including ``LengthFinishReasonError`` — propagates
+    immediately, and the empty-parse ``ValueError`` re-raises once ``retries``
+    are exhausted, so each caller's existing ``try/except`` fallback still runs
+    unchanged (empty/terminating directive, sentinel, salvage, …).
+
+    Args:
+        structured_model: A model already bound via ``with_structured_output``.
+        messages: Messages to invoke with; never mutated.
+        retries: Max extra attempts after the first (default 1 → up to 2 calls).
+        label: Identifier used in the retry log line.
+
+    Returns:
+        Whatever ``structured_model.ainvoke`` returns on the first success.
+    """
+    nudge = HumanMessage(
+        content=(
+            "Your previous response was empty. Respond with ONLY the JSON "
+            "object for the required schema — no prose, no preamble."
+        )
+    )
+    attempt = 0
+    while True:
+        invoke_messages = messages if attempt == 0 else [*messages, nudge]
+        try:
+            return await structured_model.ainvoke(invoke_messages)
+        except ValueError as exc:
+            if attempt >= retries or not is_empty_structured_parse(exc):
+                raise
+            attempt += 1
+            logger.warning(
+                "%s: empty structured parse — retrying (%d/%d)",
+                label,
+                attempt,
+                retries,
+            )
 
 
 def coerce_structured_output(

@@ -26,7 +26,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import bind_structured_output, resolve_chat_model
+from spine.agents.helpers import (
+    ainvoke_structured_with_retry,
+    bind_structured_output,
+    resolve_chat_model,
+)
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -283,11 +287,13 @@ async def run_plan_node(
     )
 
     try:
-        response: Any = await structured.ainvoke(
+        response: Any = await ainvoke_structured_with_retry(
+            structured,
             [
                 SystemMessage(content=effective_system_prompt),
                 HumanMessage(content=human_content),
-            ]
+            ],
+            label=f"plan_do[{phase_path}]",
         )
     except Exception:
         logger.warning(

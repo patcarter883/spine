@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from spine.agents._tokens import count_tokens as _count_tokens
 from spine.agents.helpers import (
+    ainvoke_structured_with_retry,
     bind_structured_output,
     cap_completion_tokens,
     resolve_chat_model,
@@ -647,8 +648,10 @@ async def run_research_manager(
                 "ignore",
                 message=r".*Expected `none`.*parsed.*",
             )
-            response = await structured_model.ainvoke(
+            response = await ainvoke_structured_with_retry(
+                structured_model,
                 [SystemMessage(content=manager_prompt), HumanMessage(content=context)],
+                label="research_manager",
             )
 
         # .with_structured_output() may return the Pydantic instance directly
@@ -1472,8 +1475,10 @@ async def summarise_evidence(
     )
 
     try:
-        parsed = await structured_model.ainvoke(
-            [HumanMessage(content=summarise_prompt)]
+        parsed = await ainvoke_structured_with_retry(
+            structured_model,
+            [HumanMessage(content=summarise_prompt)],
+            label="summarise_evidence",
         )
     except _LengthFinishReasonError as e:
         # The model ran past summarise_max_completion_tokens before closing the
@@ -1736,8 +1741,10 @@ async def _finalize_research_findings(result: dict, model: Any) -> None:
         "Convert the report above into the ResearchFindings JSON schema.",
     )
     try:
-        parsed = await structured_model.ainvoke(
-            [HumanMessage(content=finalize_prompt)]
+        parsed = await ainvoke_structured_with_retry(
+            structured_model,
+            [HumanMessage(content=finalize_prompt)],
+            label="finalize_findings",
         )
     except Exception as e:
         logger.warning("Structured finalization failed: %s", e)
@@ -1844,8 +1851,10 @@ async def _finalize_research_findings_from_evidence(
         ),
     )
     try:
-        parsed = await structured_model.ainvoke(
-            [HumanMessage(content=salvage_prompt)]
+        parsed = await ainvoke_structured_with_retry(
+            structured_model,
+            [HumanMessage(content=salvage_prompt)],
+            label="salvage_findings",
         )
     except Exception as e:
         logger.warning("Salvage finalization failed: %s", e)

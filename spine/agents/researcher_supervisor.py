@@ -40,6 +40,7 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from spine.agents.helpers import (
+    ainvoke_structured_with_retry,
     bind_structured_output,
     cap_completion_tokens,
     resolve_chat_model,
@@ -461,11 +462,13 @@ async def run_supervisor_node(
     )
 
     try:
-        response: Any = await structured.ainvoke(
+        response: Any = await ainvoke_structured_with_retry(
+            structured,
             [
                 SystemMessage(content=_SUPERVISOR_SYSTEM_PROMPT),
                 HumanMessage(content=user_msg),
-            ]
+            ],
+            label=f"researcher_supervisor[{phase_path}]",
         )
     except Exception:
         logger.warning(

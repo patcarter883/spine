@@ -34,7 +34,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import bind_structured_output, resolve_chat_model
+from spine.agents.helpers import (
+    ainvoke_structured_with_retry,
+    bind_structured_output,
+    resolve_chat_model,
+)
 from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
 logger = logging.getLogger(__name__)
@@ -227,8 +231,10 @@ async def run_decomposer(
             ),
         )
 
-    response: Any = await structured.ainvoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=human_content)]
+    response: Any = await ainvoke_structured_with_retry(
+        structured,
+        [SystemMessage(content=system_prompt), HumanMessage(content=human_content)],
+        label="decomposer",
     )
 
     if isinstance(response, DecompositionResult):
