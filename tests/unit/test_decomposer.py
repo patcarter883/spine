@@ -104,3 +104,83 @@ async def test_fallback_mode_requires_traceback():
 async def test_unknown_mode_raises():
     with pytest.raises(ValueError, match="Unknown decomposer mode"):
         await run_decomposer(mode="WAT")  # type: ignore[arg-type]
+
+
+# ── PER_FILE mode ────────────────────────────────────────────────────────
+
+
+def _per_file_result(*files: str) -> DecompositionResult:
+    """A decomposition with one slice per file, each targeting that file."""
+    return DecompositionResult(
+        slices=[
+            FeatureSliceSchema(
+                id=f"raw-{i}",
+                title=f"raw {i}",
+                description=f"work on {f}",
+                target_files=[f],
+                acceptance_criteria=["ignored — overwritten by parent"],
+            )
+            for i, f in enumerate(files, start=1)
+        ]
+    )
+
+
+_PARENT = {
+    "id": "add-auth",
+    "title": "Add auth",
+    "target_files": ["src/models.py", "src/login.py", "tests/test_auth.py"],
+    "acceptance_criteria": ["pytest passes", "imports clean"],
+}
+
+
+@pytest.mark.asyncio
+async def test_per_file_mode_one_subslice_per_file_ordered():
+    model = _make_structured_mock(
+        _per_file_result("src/models.py", "src/login.py", "tests/test_auth.py")
+    )
+    with patch("spine.agents.decomposer.resolve_chat_model", return_value=model):
+        slices = await run_decomposer(mode="PER_FILE", source_slice=_PARENT)
+
+    assert [s["id"] for s in slices] == [
+        "add-auth::1-models.py",
+        "add-auth::2-login.py",
+        "add-auth::3-test_auth.py",
+    ]
+    # Each sub-slice owns exactly one file...
+    assert [s["target_files"] for s in slices] == [
+        ["src/models.py"],
+        ["src/login.py"],
+        ["tests/test_auth.py"],
+    ]
+    # ...and carries the parent's full acceptance criteria verbatim.
+    assert all(s["acceptance_criteria"] == _PARENT["acceptance_criteria"] for s in slices)
+
+
+@pytest.mark.asyncio
+async def test_per_file_mode_appends_uncovered_files():
+    # Model only covered 2 of the 3 parent files; the missing one is appended
+    # at the end so coverage is never lost.
+    model = _make_structured_mock(
+        _per_file_result("src/models.py", "src/login.py")
+    )
+    with patch("spine.agents.decomposer.resolve_chat_model", return_value=model):
+        slices = await run_decomposer(mode="PER_FILE", source_slice=_PARENT)
+
+    files = [s["target_files"][0] for s in slices]
+    assert files == ["src/models.py", "src/login.py", "tests/test_auth.py"]
+    assert slices[-1]["id"] == "add-auth::3-test_auth.py"
+
+
+@pytest.mark.asyncio
+async def test_per_file_mode_requires_source_slice():
+    with pytest.raises(ValueError, match="source_slice"):
+        await run_decomposer(mode="PER_FILE", source_slice={})
+
+
+@pytest.mark.asyncio
+async def test_per_file_mode_requires_two_files():
+    with pytest.raises(ValueError, match="≥2 target_files"):
+        await run_decomposer(
+            mode="PER_FILE",
+            source_slice={"id": "solo", "target_files": ["only.py"]},
+        )

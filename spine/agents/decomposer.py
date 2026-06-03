@@ -1,7 +1,7 @@
 """Structural slice decomposer — splits a spec or failed slice into
 smaller FeatureSlice-shaped dicts via a single LLM call.
 
-Two modes:
+Three modes:
 
 - ``PLAN``     — input is the raw specification markdown; output is the
                  initial wave of parallelizable feature slices.
@@ -10,6 +10,12 @@ Two modes:
                  smaller micro-slices, each addressing one aspect of the
                  failure. Used by the IMPLEMENT subgraph's
                  decompose-on-failure loop.
+- ``PER_FILE`` — input is one multi-file slice; output is one single-file
+                 sub-slice per ``target_files`` entry, emitted in dependency
+                 order (a file appears only after the files it imports), with
+                 a tailored per-file ``description`` and the parent's full
+                 ``acceptance_criteria`` copied onto each. Used proactively by
+                 the IMPLEMENT subgraph so each implementer touches one file.
 
 The schema here is intentionally narrower than ``_FeatureSliceInput`` in
 ``plan_tools`` — we drop ``execution_requirements`` / ``dependencies`` /
@@ -21,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -91,13 +98,46 @@ _FALLBACK_PROMPT = (
     )
 )
 
+_PER_FILE_PROMPT = (
+    xml_block(
+        Tag.ROLE,
+        "You are a structural decomposer operating in PER_FILE mode. You are "
+        "given one feature slice that touches several files. Split it into "
+        "single-file sub-slices — exactly one sub-slice per file in the "
+        "slice's target_files — so each can be handed to an implementer that "
+        "creates or modifies only that one file.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Emit EXACTLY one sub-slice per file in the parent's target_files, "
+        "and each sub-slice's target_files MUST be a list of that single "
+        "file path (copied verbatim from the parent).\n"
+        "- ORDER MATTERS: emit files in dependency order — a file that "
+        "imports from or builds on another file MUST appear AFTER it. Source "
+        "modules before the tests that exercise them; base classes before "
+        "subclasses.\n"
+        "- Each sub-slice's description tailors the parent's intent to that "
+        "ONE file: what to create/modify in it, and which already-built "
+        "sibling files it may read for context.\n"
+        "- Copy the parent's full acceptance_criteria onto every sub-slice "
+        "verbatim — do NOT invent or drop criteria. Only the last file will "
+        "be expected to satisfy slice-level tests.\n"
+        "- Do NOT introduce files that are not in the parent's target_files, "
+        "and do NOT merge two files into one sub-slice.\n"
+        "- Sub-slice ids are placeholders; they will be reassigned by the "
+        "caller, so any unique slug is fine.",
+    )
+)
+
 
 async def run_decomposer(
     *,
-    mode: Literal["PLAN", "FALLBACK"],
+    mode: Literal["PLAN", "FALLBACK", "PER_FILE"],
     spec_markdown: str | None = None,
     failed_slice: dict | None = None,
     error_traceback: str | None = None,
+    source_slice: dict | None = None,
     config: RunnableConfig | None = None,
     session_id: str | None = None,
 ) -> list[dict]:
@@ -105,17 +145,22 @@ async def run_decomposer(
 
     Args:
         mode: ``"PLAN"`` for top-level spec breakdown,
-              ``"FALLBACK"`` for failure-driven micro-slicing.
+              ``"FALLBACK"`` for failure-driven micro-slicing,
+              ``"PER_FILE"`` for proactive single-file sub-slicing.
         spec_markdown: Specification text (required when mode is PLAN).
         failed_slice: The slice dict that failed (required when mode is
             FALLBACK). Must include ``id``.
         error_traceback: Captured failure detail from the implementer
             (required when mode is FALLBACK).
+        source_slice: The multi-file slice to split (required when mode is
+            PER_FILE). Must include ``id`` and ≥2 ``target_files``.
         config: LangGraph runtime config; carries per-phase model overrides.
         session_id: Work id for OpenRouter session grouping.
 
     Returns:
         A list of slice dicts ready to be appended to ``pending_slices``.
+        For PER_FILE the list is ordered (head file first) and every dict's
+        ``target_files`` holds exactly one path.
     """
     if mode == "PLAN":
         if not spec_markdown or not spec_markdown.strip():
@@ -127,6 +172,15 @@ async def run_decomposer(
             )
         if not error_traceback:
             raise ValueError("run_decomposer(mode='FALLBACK') requires error_traceback")
+    elif mode == "PER_FILE":
+        if not source_slice or not source_slice.get("id"):
+            raise ValueError(
+                "run_decomposer(mode='PER_FILE') requires source_slice with an 'id'"
+            )
+        if len([f for f in (source_slice.get("target_files") or []) if f]) < 2:
+            raise ValueError(
+                "run_decomposer(mode='PER_FILE') requires source_slice with ≥2 target_files"
+            )
     else:
         raise ValueError(f"Unknown decomposer mode: {mode!r}")
 
@@ -139,6 +193,22 @@ async def run_decomposer(
         human_content = hostage_layout(
             xml_blocks((Tag.SPECIFICATION, spec_markdown.strip())),
             "Return a DecompositionResult covering the specification above.",
+        )
+    elif mode == "PER_FILE":
+        parent_id = source_slice["id"]
+        parent_files = [f for f in (source_slice.get("target_files") or []) if f]
+        slice_json = json.dumps(source_slice, indent=2, ensure_ascii=False, default=str)
+        system_prompt = _PER_FILE_PROMPT
+        human_content = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, f"Parent slice id: {parent_id}"),
+                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+            ),
+            (
+                f"Return a DecompositionResult with EXACTLY {len(parent_files)} "
+                "single-file sub-slice(s) — one per parent target file — in "
+                "dependency order."
+            ),
         )
     else:
         parent_id = failed_slice["id"]
@@ -179,6 +249,8 @@ async def run_decomposer(
             expected = f"{parent_id}-micro-{i}"
             if sl.get("id") != expected:
                 sl["id"] = expected
+    elif mode == "PER_FILE":
+        slices = _normalize_per_file_slices(source_slice, slices)
 
     logger.info(
         "Decomposer(%s) produced %d slice(s): %s",
@@ -187,3 +259,59 @@ async def run_decomposer(
         [s.get("id", "?") for s in slices],
     )
     return slices
+
+
+def _normalize_per_file_slices(
+    source_slice: dict,
+    raw_slices: list[dict],
+) -> list[dict]:
+    """Coerce PER_FILE decomposer output into ordered single-file sub-slices.
+
+    Guarantees, regardless of what the model returned:
+      - exactly one sub-slice per parent ``target_files`` entry,
+      - each sub-slice's ``target_files`` is ``[that single path]``,
+      - the parent's full ``acceptance_criteria`` is copied onto each,
+      - deterministic ids ``"{parent_id}::{i}-{basename}"`` (1-based, index
+        prefix avoids basename collisions across directories).
+
+    The model's emitted order is honoured for files it covered; any parent
+    file the model missed is appended at the end so coverage is never lost.
+    """
+    parent_id = source_slice["id"]
+    parent_title = source_slice.get("title", parent_id)
+    parent_criteria = list(source_slice.get("acceptance_criteria") or [])
+    parent_files = [f for f in (source_slice.get("target_files") or []) if f]
+
+    # Map each model sub-slice to a parent file (first target_files entry that
+    # belongs to the parent and is not yet claimed), preserving model order.
+    remaining = list(parent_files)
+    ordered: list[tuple[str, dict]] = []
+    for sl in raw_slices:
+        match = next(
+            (f for f in (sl.get("target_files") or []) if f in remaining),
+            None,
+        )
+        if match is None:
+            continue
+        remaining.remove(match)
+        ordered.append((match, sl))
+    # Append any parent files the model failed to cover, in parent order.
+    for f in remaining:
+        ordered.append((f, {}))
+
+    normalized: list[dict] = []
+    for i, (path, sl) in enumerate(ordered, start=1):
+        description = (sl.get("description") or "").strip() or (
+            f"Implement the portion of slice {parent_id!r} that lives in "
+            f"{path}."
+        )
+        normalized.append(
+            {
+                "id": f"{parent_id}::{i}-{os.path.basename(path)}",
+                "title": f"{parent_title} — {path}",
+                "description": description,
+                "target_files": [path],
+                "acceptance_criteria": list(parent_criteria),
+            }
+        )
+    return normalized

@@ -122,6 +122,22 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     remove a slice (by id) and add new ones in a single update — this
     is what lets the dispatch loop terminate even though pending and
     failed slices are repeatedly re-routed via conditional edges.
+
+    Single-file decomposition (``split_slices`` node) replaces each multi-file
+    slice with the head of a single-file chain. The extra sequencing metadata
+    rides *inside* the slice dicts already flowing through the lists above — no
+    new channels — using these private (underscore-prefixed) keys:
+
+    - ``_parent_slice_id`` — id of the originating multi-file slice.
+    - ``_all_files`` — every target file of the parent (for sibling context).
+    - ``_sibling_queue`` — ordered remaining sub-slices; ``slice_implementer``
+      promotes ``[0]`` to ``pending_slices`` on success so a parent's files
+      land sequentially while other parents proceed in parallel.
+    - ``_file_index`` / ``_file_total`` — 1-based position within the chain.
+    - ``_validate_slice_criteria`` — True only on the last file; that
+      implementer runs the slice-level acceptance checks.
+    - ``_decompose_depth`` — inherited from the parent so a failed sub-slice is
+      still eligible for fallback micro-slicing.
     """
 
     plan_path: str

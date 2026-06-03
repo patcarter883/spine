@@ -20,6 +20,7 @@ single state update, so the loop actually terminates.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Literal
@@ -109,6 +110,142 @@ def _route_slices(
     return sends
 
 
+# ── split_slices node (per-file decomposition) ──────────────────────────
+
+
+def _build_subslice_chain(parent: dict, subs: list[dict]) -> dict:
+    """Turn an ordered list of single-file sub-slices into a dispatchable head.
+
+    Every sub-slice is tagged with sequencing metadata; the head carries the
+    remainder as a flat ``_sibling_queue`` (the slice_implementer promotes the
+    next entry on success). All chain members share ``_all_files`` so each
+    implementer can list its siblings for read-only context.
+    """
+    total = len(subs)
+    depth = parent.get("_decompose_depth", 0)
+    all_files = [f for f in (parent.get("target_files") or []) if f]
+    chain: list[dict] = []
+    for i, sub in enumerate(subs, start=1):
+        chain.append(
+            {
+                **sub,
+                "_parent_slice_id": parent.get("id"),
+                "_all_files": all_files,
+                "_file_index": i,
+                "_file_total": total,
+                "_validate_slice_criteria": i == total,
+                "_decompose_depth": depth,
+            }
+        )
+    head = chain[0]
+    head["_sibling_queue"] = chain[1:]
+    return head
+
+
+async def _split_slices_node(
+    state: ImplementSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Proactively split each multi-file slice into single-file sub-slices.
+
+    Runs once at START, before the dispatch loop. For every seeded slice with
+    ≥2 target files we call the PER_FILE decomposer (all concurrently) and
+    replace the slice with the **head** of its single-file chain; the rest of
+    the chain rides on the head's ``_sibling_queue`` and is promoted one file
+    at a time by ``_slice_implementer_node``. Single-file slices — and any
+    slice whose decomposition fails — pass through unchanged, so a decomposer
+    outage never strands work.
+    """
+    work_id = state.get("work_id", "unknown")
+    pending = state.get("pending_slices", []) or []
+    multi = [
+        sl
+        for sl in pending
+        if len([f for f in (sl.get("target_files") or []) if f]) >= 2
+    ]
+    if not multi:
+        return {}
+
+    from spine.agents.decomposer import run_decomposer
+
+    async def _decompose(parent: dict) -> list[dict] | None:
+        try:
+            subs = await run_decomposer(
+                mode="PER_FILE",
+                source_slice=parent,
+                config=config,
+                session_id=work_id,
+            )
+        except Exception as e:  # noqa: BLE001 — graceful degradation
+            logger.warning(
+                "[%s] split_slices: PER_FILE failed for %r: %s — keeping slice whole",
+                work_id,
+                parent.get("id"),
+                e,
+            )
+            return None
+        return subs or None
+
+    results = await asyncio.gather(*[_decompose(p) for p in multi])
+
+    remove_ids: list[str] = []
+    adds: list[dict] = []
+    for parent, subs in zip(multi, results):
+        if not subs:
+            continue
+        remove_ids.append(parent.get("id"))
+        adds.append(_build_subslice_chain(parent, subs))
+        logger.info(
+            "[%s] split_slices: slice=%r -> %d single-file sub-slice(s)",
+            work_id,
+            parent.get("id"),
+            len(subs),
+        )
+
+    if not remove_ids:
+        return {}
+    return {"pending_slices": {"remove": remove_ids, "add": adds}}
+
+
+def _subslice_context(active_slice: dict) -> str:
+    """Build a single-file directive block, or '' for an ordinary slice.
+
+    Lists the slice's other files as read-only context and states whether
+    this implementer is the one expected to satisfy slice-level criteria
+    (the last file) or should treat sibling-dependent tests as pending.
+    """
+    if not active_slice.get("_parent_slice_id"):
+        return ""
+    target_files = active_slice.get("target_files") or []
+    my_file = target_files[0] if target_files else "(unknown)"
+    siblings = [f for f in (active_slice.get("_all_files") or []) if f != my_file]
+    idx = active_slice.get("_file_index", 1)
+    total = active_slice.get("_file_total", 1)
+    sib_lines = (
+        "\n".join(f"- {p}" for p in siblings) if siblings else "(none)"
+    )
+    if active_slice.get("_validate_slice_criteria"):
+        validate = (
+            "This is the LAST file of the slice — every sibling file is now in "
+            "place, so run the slice's acceptance-criteria checks (tests/lint) "
+            "and make them pass."
+        )
+    else:
+        validate = (
+            "Sibling files are still being built in later steps — do NOT expect "
+            "slice-level/integration tests to pass yet. Make your one file "
+            "correct and self-consistent; note any sibling-dependent check as "
+            "pending rather than failing."
+        )
+    return (
+        f"\n\n## Single-file scope (file {idx}/{total} of slice "
+        f"{active_slice.get('_parent_slice_id')!r})\n"
+        f"CREATE or MODIFY only this one file: {my_file}\n"
+        f"You MAY READ these sibling files for context but MUST NOT edit them:\n"
+        f"{sib_lines}\n\n{validate}"
+    )
+
+
 # ── plan_slice_implementer node (no tools) ──────────────────────────────
 
 
@@ -143,6 +280,7 @@ async def _plan_slice_implementer_node(
         f"## Description\n{description or '(none)'}\n\n"
         f"## Target files\n{file_lines}\n\n"
         f"## Acceptance criteria\n{crit_lines}"
+        f"{_subslice_context(active_slice)}"
     )
     directive = await run_plan_node(
         state=dict(state),
@@ -224,7 +362,13 @@ async def _slice_implementer_node(
             # execute via subagents.py) — they live in ``extra_tools`` above.
         )
 
-        slice_json = json.dumps(active_slice, indent=2, ensure_ascii=False, default=str)
+        # Strip private sequencing keys (e.g. _sibling_queue, which nests the
+        # remaining sub-slices) from the JSON block so the prompt stays small;
+        # the single-file scope is rendered as plain text by _subslice_context.
+        public_slice = {
+            k: v for k, v in active_slice.items() if not k.startswith("_")
+        }
+        slice_json = json.dumps(public_slice, indent=2, ensure_ascii=False, default=str)
         directive_block = format_directive_for_prompt(
             directive_from_state(dict(state), "active_slice_directive")
         )
@@ -242,6 +386,7 @@ async def _slice_implementer_node(
                 "Read the slice JSON above carefully — it specifies "
                 "target_files, acceptance_criteria, and (optionally) a "
                 "description. Make only the changes described in the slice."
+                + _subslice_context(active_slice)
             ),
         )
 
@@ -270,15 +415,26 @@ async def _slice_implementer_node(
             "issues": [str(e)],
         }
 
+    # The remaining single-file sub-slices of this parent (empty for an
+    # ordinary slice). Promoted one at a time so a parent's files land
+    # sequentially while other parents proceed in parallel.
+    sibling_queue = active_slice.get("_sibling_queue") or []
+
     status = slice_result.get("status", "blocked")
     if status in ("implemented", "partial"):
         merged = {**active_slice, **slice_result}
-        return {
+        merged.pop("_sibling_queue", None)  # keep completed_slices tidy
+        update: dict[str, Any] = {
             "pending_slices": {"remove": [slice_id]},
             "completed_slices": {"add": [merged]},
             "slices_dispatched": True,
             "implementation_files_written": True,
         }
+        if sibling_queue:
+            # Promote the next file; thread the rest onto its own queue.
+            nxt = {**sibling_queue[0], "_sibling_queue": sibling_queue[1:]}
+            update["pending_slices"]["add"] = [nxt]
+        return update
 
     failure_traceback = "\n".join(
         part
@@ -288,12 +444,22 @@ async def _slice_implementer_node(
         )
         if part
     )
+    issues = list(slice_result.get("issues") or [])
+    if sibling_queue:
+        skipped = [q.get("id", "?") for q in sibling_queue]
+        issues.append(
+            "Remaining slice files skipped after failure: " + ", ".join(skipped)
+        )
     tagged = {
         **active_slice,
         **slice_result,
+        "issues": issues,
         "_failure_traceback": failure_traceback,
         "_decompose_depth": active_slice.get("_decompose_depth", 0),
     }
+    # Drop the queue: the fallback decomposer micro-slices the failed FILE,
+    # it does not resume the parent's later files.
+    tagged.pop("_sibling_queue", None)
     return {
         "pending_slices": {"remove": [slice_id]},
         "failed_slices": {"add": [tagged]},
@@ -577,23 +743,38 @@ def _collect_files_written(slice_results: list[dict]) -> list[str]:
 
 
 def _build_implementation_summary(slice_results: list[dict]) -> str:
-    """Build a human-readable implementation summary from slice results."""
+    """Build a human-readable implementation summary from slice results.
+
+    Results may be per-file sub-slices (from PER_FILE decomposition). They are
+    counted both per file and grouped back to their logical parent slice (via
+    ``_parent_slice_id``) so the report still reads at slice granularity.
+    """
     total = len(slice_results)
     statuses: dict[str, int] = {}
     for r in slice_results:
         s = r.get("status", "unknown")
         statuses[s] = statuses.get(s, 0) + 1
 
-    parts = [f"Implemented {total} feature slice(s)."]
+    # Distinct logical slices: the parent id when present, else the result's id.
+    logical = {r.get("_parent_slice_id") or r.get("slice_name") or r.get("id") for r in slice_results}
+    logical.discard(None)
+
+    if logical and len(logical) != total:
+        parts = [
+            f"Implemented {len(logical)} feature slice(s) across {total} "
+            "single-file step(s)."
+        ]
+    else:
+        parts = [f"Implemented {total} feature slice(s)."]
     for status, count in sorted(statuses.items()):
-        parts.append(f"- {status}: {count}")
+        parts.append(f"- {status}: {count} file-step(s)")
 
     implemented = statuses.get("implemented", 0)
     blocked = statuses.get("blocked", 0)
     if implemented == total:
         parts.append("All slices implemented successfully.")
     elif blocked > 0:
-        parts.append(f"{blocked} slice(s) blocked — see implementation.md for details.")
+        parts.append(f"{blocked} step(s) blocked — see implementation.md for details.")
 
     return "\n".join(parts)
 
@@ -653,25 +834,33 @@ def build_implement_subgraph() -> Any:
     """Build the IMPLEMENT phase subgraph (SmallCode dispatch loop).
 
     Nodes:
-    1. ``slice_implementer`` — per-slice subagent with restricted tools.
-    2. ``fallback_decomposer`` — micro-slices a failed slice.
-    3. ``synthesize_implementation`` — writes implementation artifacts.
-    4. ``save_artifacts`` — scans disk and materializes to state.
+    1. ``split_slices`` — runs once at START, replacing each multi-file slice
+       with the head of a single-file sub-slice chain (PER_FILE decomposition).
+    2. ``slice_implementer`` — per-slice subagent with restricted tools; on
+       success it promotes the parent's next file from ``_sibling_queue``.
+    3. ``fallback_decomposer`` — micro-slices a failed slice.
+    4. ``synthesize_implementation`` — writes implementation artifacts.
+    5. ``save_artifacts`` — scans disk and materializes to state.
 
     The conditional edge ``_route_slices`` is wired three times — from
-    ``START`` and from each fan-out node — so the loop re-evaluates after
-    every super-step until both ``pending_slices`` and ``failed_slices``
+    ``split_slices`` and from each fan-out node — so the loop re-evaluates
+    after every super-step until both ``pending_slices`` and ``failed_slices``
     are empty.
     """
     builder = StateGraph(ImplementSubgraphState)
 
+    builder.add_node("split_slices", _split_slices_node)
     builder.add_node("plan_slice_implementer", _plan_slice_implementer_node)
     builder.add_node("slice_implementer", _slice_implementer_node)
     builder.add_node("fallback_decomposer", _fallback_decomposer_node)
     builder.add_node("synthesize_implementation", _synthesize_implementation_node)
     builder.add_node("save_artifacts", _save_implement_artifacts)
 
-    builder.add_conditional_edges(START, _route_slices, _ROUTE_MAP)
+    # START → split_slices (per-file decomposition) → route. The split node
+    # runs once, replacing multi-file slices with single-file chains before
+    # any dispatch; the router then fans out as before.
+    builder.add_edge(START, "split_slices")
+    builder.add_conditional_edges("split_slices", _route_slices, _ROUTE_MAP)
     # plan_slice_implementer dispatches to slice_implementer dynamically
     # via Command(goto=Send) (see the node itself) so each parallel
     # branch carries its own directive without colliding on a shared
