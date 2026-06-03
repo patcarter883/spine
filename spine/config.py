@@ -694,6 +694,7 @@ class SpineConfig:
         "guided_decoding",
         "max_concurrent_calls",
         "stream_usage",
+        "reasoning",
     )
 
     def resolve_active_provider(self) -> dict | None:

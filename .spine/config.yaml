@@ -28,7 +28,7 @@ spine:
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
-    max_concurrent_chunks: 10
+    max_concurrent_chunks: 50
     batch_size: 100
   # Researcher convergence steering — nudge & force the explore subagent
   # to emit final ResearchFindings before LangGraph's recursion_limit (50)
@@ -124,9 +124,9 @@ providers:
     enabled: true
     stream_usage: true
     max_concurrent_calls: 4
-  - name: LFM2.5-8B-A1B
+  - name: local-tiny
     type: deepagents-model
-    model: openai:LFM2.5-8B-A1B
+    model: openai:Gemma-4-E4B-it-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
@@ -202,17 +202,11 @@ providers:
       provider: pat
     # RAG phase providers
     classification:
-      provider: LFM2.5-8B-A1B
+      provider: local-tiny
     summarization:
-      provider: LFM2.5-8B-A1B
-      # Output is a fixed 4-line extractive schema (~50-80 tokens). The cap
-      # was previously the full 16K window, so each summary ran for hundreds
-      # of tokens (slot n_decoded observed at 323+ and still climbing) —
-      # seconds per call, capping `spine index` at ~12 symbols/min even after
-      # moving off the remote model. 256 is generous headroom for 4 lines and
-      # cuts per-call generation ~5-20x. temperature 0 keeps the extraction
-      # deterministic and stops the model rambling past the schema.
-      max_completion_tokens: 256
+      provider: local-tiny
+      max_completion_tokens: 1024
       temperature: 0
+      reasoning: false
     onboarding:
       provider: pat

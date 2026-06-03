@@ -573,6 +573,19 @@ def _build_local_model(
         if key in provider_cfg:
             kwargs[key] = provider_cfg[key]
 
+    # ── Disable model reasoning when `reasoning: false` is configured ──
+    # Reasoning ("thinking") models spend their output budget on
+    # chain-of-thought before emitting the answer. For mechanical phases
+    # like extractive summarization that don't benefit from reasoning, this
+    # is pure waste: with a tight completion cap the model is truncated
+    # mid-thought and `content` comes back empty (reasoning lands in the
+    # separate reasoning_content channel). Setting `reasoning: false` sends
+    # llama.cpp's `reasoning_budget: 0` to suppress the thinking block so the
+    # full budget goes to the visible answer. Only injected when explicitly
+    # set to False; unset/True leaves the model's default behaviour intact.
+    if provider_cfg.get("reasoning") is False:
+        kwargs["extra_body"] = {"reasoning_budget": 0}
+
     # Fall back to global SpineConfig.max_completion_tokens when neither
     # max_completion_tokens nor max_tokens is set on the provider. Without
     # this, finite-window local backends (vLLM/SGLang) use the full
