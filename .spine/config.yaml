@@ -28,7 +28,7 @@ spine:
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
-    max_concurrent_chunks: 5
+    max_concurrent_chunks: 10
     batch_size: 100
   # Researcher convergence steering — nudge & force the explore subagent
   # to emit final ResearchFindings before LangGraph's recursion_limit (50)
@@ -205,6 +205,14 @@ providers:
       provider: LFM2.5-8B-A1B
     summarization:
       provider: LFM2.5-8B-A1B
-      max_completion_tokens: 16384
+      # Output is a fixed 4-line extractive schema (~50-80 tokens). The cap
+      # was previously the full 16K window, so each summary ran for hundreds
+      # of tokens (slot n_decoded observed at 323+ and still climbing) —
+      # seconds per call, capping `spine index` at ~12 symbols/min even after
+      # moving off the remote model. 256 is generous headroom for 4 lines and
+      # cuts per-call generation ~5-20x. temperature 0 keeps the extraction
+      # deterministic and stops the model rambling past the schema.
+      max_completion_tokens: 256
+      temperature: 0
     onboarding:
       provider: pat
