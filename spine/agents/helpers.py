@@ -579,12 +579,23 @@ def _build_local_model(
     # like extractive summarization that don't benefit from reasoning, this
     # is pure waste: with a tight completion cap the model is truncated
     # mid-thought and `content` comes back empty (reasoning lands in the
-    # separate reasoning_content channel). Setting `reasoning: false` sends
-    # llama.cpp's `reasoning_budget: 0` to suppress the thinking block so the
-    # full budget goes to the visible answer. Only injected when explicitly
-    # set to False; unset/True leaves the model's default behaviour intact.
+    # separate reasoning_content channel).
+    #
+    # Two suppression levers are sent because llama.cpp models split on which
+    # one they honour: `reasoning_budget: 0` works for hybrid models that read
+    # the server-side budget, while template-gated models (e.g. Gemma/Qwen
+    # instruct) only stop thinking when their chat template sees
+    # `enable_thinking: false`. Empirically the Gemma-4-26B-A4B QAT build
+    # *ignores* reasoning_budget entirely and reasons to the token cap (empty
+    # `content`); enable_thinking=false is the only switch it respects. Sending
+    # both is safe — each model picks up whichever it understands and ignores
+    # the unused jinja kwarg. Only injected when reasoning is explicitly False;
+    # unset/True leaves the model's default behaviour intact.
     if provider_cfg.get("reasoning") is False:
-        kwargs["extra_body"] = {"reasoning_budget": 0}
+        kwargs["extra_body"] = {
+            "reasoning_budget": 0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
 
     # Fall back to global SpineConfig.max_completion_tokens when neither
     # max_completion_tokens nor max_tokens is set on the provider. Without

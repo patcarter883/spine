@@ -160,38 +160,55 @@ class VectorIndexer:
             len(current), len(changed), skipped, len(removed),
         )
 
-        # Clear stale symbols for changed files, then extract their symbols.
-        symbols: list[dict[str, Any]] = []
-        for rel in changed:
-            self.store.delete_file_symbols(rel)
-            full_path = os.path.join(workspace_root, rel)
-            symbols.extend(self._extract_symbols_from_file(full_path, rel))
-
+        # Process changed files concurrently, but commit each file's ledger row
+        # the moment *its* symbols all finish — not after the whole run. The
+        # ledger is what makes an interrupted run resumable: a file recorded at
+        # its content hash is skipped next time. Writing it only at the very end
+        # meant any crash (or a fresh `--wipe` restart) re-did every file from
+        # scratch. Per-file commit turns the index into a checkpointed job.
+        #
+        # Global concurrency is unchanged: every file's symbols share one
+        # semaphore, so up to ``max_concurrent_chunks`` symbols are in flight at
+        # once across all files — slots fill from the whole corpus, not one file
+        # at a time.
         max_concurrent = self.config.vector_indexing.get("max_concurrent_chunks", 5)
         semaphore = asyncio.Semaphore(max_concurrent)
-        results = await asyncio.gather(
-            *[self._process_symbol(s, semaphore, workspace_root) for s in symbols],
+
+        async def _process_file(rel: str) -> tuple[int, int]:
+            """Index one file's symbols; commit its ledger row iff all stored.
+
+            Returns ``(success_count, error_count)`` for the file. A file is
+            "indexed at this hash" only when every symbol stored cleanly; files
+            with a failure are left out of the ledger and retried next run.
+            Files with zero symbols count as clean so they aren't re-extracted
+            every run.
+            """
+            self.store.delete_file_symbols(rel)
+            full_path = os.path.join(workspace_root, rel)
+            file_symbols = self._extract_symbols_from_file(full_path, rel)
+            results = await asyncio.gather(
+                *[self._process_symbol(s, semaphore, workspace_root) for s in file_symbols],
+                return_exceptions=True,
+            )
+            succeeded = sum(1 for r in results if r is True)
+            failed = len(results) - succeeded
+            if failed == 0:
+                mtime, content_hash = current[rel]
+                self.store.upsert_indexed_file(rel, mtime, content_hash)
+            return succeeded, failed
+
+        per_file = await asyncio.gather(
+            *[_process_file(rel) for rel in changed],
             return_exceptions=True,
         )
 
-        # A changed file is "indexed at this hash" only if every one of its
-        # symbols stored cleanly (files with zero symbols count as clean, so
-        # they aren't re-extracted every run). Files with a failure are left
-        # out of the ledger and retried next run.
-        file_ok: dict[str, bool] = {rel: True for rel in changed}
-        success_count = 0
-        error_count = 0
-        for sym, res in zip(symbols, results):
-            ok = res is True
-            success_count += 1 if ok else 0
-            if not ok:
-                error_count += 1
-                file_ok[sym["file_path"]] = False
-
-        for rel in changed:
-            if file_ok.get(rel):
-                mtime, content_hash = current[rel]
-                self.store.upsert_indexed_file(rel, mtime, content_hash)
+        # Aggregate stats; a file-level exception (rather than a per-symbol one)
+        # counts as a wholly-failed file that simply isn't in the ledger.
+        success_count = sum(r[0] for r in per_file if isinstance(r, tuple))
+        error_count = sum(r[1] for r in per_file if isinstance(r, tuple))
+        for r in per_file:
+            if not isinstance(r, tuple):
+                logger.error("File-level indexing failure: %r", r)
 
         return {
             "files_total": len(current),
