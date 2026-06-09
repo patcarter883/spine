@@ -157,6 +157,61 @@ def index(workspace_root: str | None, config_path: str, wipe: bool) -> None:
         )
     )
 
+    # Refresh the committed, compressed snapshot so it stays in lockstep with
+    # the freshly-built index. This is the artifact checked into git — the
+    # live .db stays gitignored.
+    from spine.persistence.vector_store import VectorStore, snapshot_path_for
+
+    snap = snapshot_path_for(config.checkpoint_path)
+    store = VectorStore(config.checkpoint_path)
+    store.ensure_schema()
+    store.export_snapshot(snap)
+    store.close()
+    console.print(
+        f"[green]Index snapshot written:[/green] {snap}\n"
+        f"[dim]Commit it:[/dim] git add {snap} && git commit"
+    )
+
+
+@main.command(name="index-restore")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Restore even if a live index db already exists (overwrites it).",
+)
+def index_restore(config_path: str, force: bool) -> None:
+    """Restore the vector index from the committed snapshot.
+
+    Decompresses ``.spine/spine.db.xz`` into ``.spine/spine.db`` so a fresh
+    clone can query without re-indexing. By default it leaves an existing
+    db untouched; use ``--force`` to overwrite (e.g. to discard a local
+    re-index and return to the committed index).
+    """
+    from pathlib import Path
+
+    from spine.persistence.vector_store import restore_snapshot, snapshot_path_for
+
+    config = SpineConfig.load(path=config_path)
+    db_path = config.checkpoint_path
+    snap = snapshot_path_for(db_path)
+
+    if not Path(snap).exists():
+        console.print(f"[bold red]No snapshot to restore at {snap}.[/bold red]")
+        sys.exit(1)
+
+    if force:
+        Path(db_path).unlink(missing_ok=True)
+
+    if restore_snapshot(db_path, snap):
+        console.print(f"[green]Restored index from snapshot:[/green] {snap} → {db_path}")
+    else:
+        console.print(
+            f"[yellow]Index db already present at {db_path}; left untouched. "
+            f"Use --force to overwrite.[/yellow]"
+        )
+
 
 @main.command(name="status")
 @click.argument("work_id")

@@ -193,6 +193,22 @@ class VectorIndexer:
                 mtime, content_hash = current[rel]
                 self.store.upsert_indexed_file(rel, mtime, content_hash)
 
+        # Stamp the embedding-model fingerprint so query time can verify the
+        # live model matches what built this index. Written every run so it
+        # always reflects the current model (cheap, and self-healing after a
+        # model swap + --wipe). base_url/api_key are intentionally excluded —
+        # the same model served from a different endpoint is still a match.
+        provider_cfg = self.config.resolve_embedding_provider() or {}
+        self.store.write_manifest({
+            "embedding_model": provider_cfg.get("model", ""),
+            "embedding_provider": provider_cfg.get("name", ""),
+            "embedding_provider_type": provider_cfg.get("type", ""),
+            "embedding_dim": self.store.embedding_dim,
+            "query_prefix": provider_cfg.get("query_prefix", ""),
+            "document_prefix": provider_cfg.get("document_prefix", ""),
+            "index_version": "1",
+        })
+
         return {
             "files_total": len(current),
             "files_changed": len(changed),

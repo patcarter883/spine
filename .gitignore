@@ -14,6 +14,10 @@ build/
 *.db-wal
 
 # SPINE runtime data
+# NB: the live vector index .spine/spine.db is ignored, but its committed,
+# compressed snapshot .spine/spine.db.xz is NOT — that artifact is checked
+# in so fresh clones restore the index instead of re-indexing. `*.db` / `*.xz`
+# do not collide (.db.xz ends in .xz), so no negation rule is needed.
 .spine/artifacts/
 .spine/spine.db
 .spine/queue.db

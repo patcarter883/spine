@@ -258,6 +258,19 @@ class VectorStore:
             )
         """)
 
+        # Index manifest: a key/value record of *which embedding model* built
+        # this index, written by the indexer and checked at query time. The
+        # vec0 table only pins the embedding *dimension*; two different models
+        # can share a dimension (many are 768), so a name/prefix fingerprint
+        # is what stops a mismatched model from silently returning garbage.
+        # Absent/empty for legacy databases built before fingerprinting.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_manifest (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
         conn.commit()
 
         # Backfill the FTS index for stores populated before the lexical
@@ -562,6 +575,133 @@ class VectorStore:
         )
         conn.commit()
 
+    # ── Embedding-model manifest ────────────────────────────────────────
+
+    def write_manifest(self, fields: dict[str, str]) -> None:
+        """Upsert the embedding-model fingerprint into ``index_manifest``.
+
+        Called by the indexer after a successful build so the database
+        records the model identity it was created with. Keys are free-form
+        strings; see :meth:`assert_embedding_compatible` for the ones that
+        are enforced at query time.
+        """
+        conn = self._get_connection()
+        conn.executemany(
+            """
+            INSERT INTO index_manifest (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            [(k, "" if v is None else str(v)) for k, v in fields.items()],
+        )
+        conn.commit()
+
+    def read_manifest(self) -> dict[str, str]:
+        """Return the stored manifest as a dict (empty for legacy databases)."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("SELECT key, value FROM index_manifest").fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {r["key"]: r["value"] for r in rows}
+
+    def assert_embedding_compatible(
+        self, provider_cfg: dict[str, Any], query_dim: int | None = None
+    ) -> None:
+        """Hard-fail if the live embedding model disagrees with the index.
+
+        Compares the configured embedding provider (model name + asymmetric
+        prefixes) and, when supplied, the live query-embedding width against
+        the fingerprint stamped at index time. A mismatch means queries would
+        be embedded in a different space than the stored vectors and return
+        garbage, so we refuse rather than silently degrade.
+
+        Legacy databases carry no manifest; there we can only warn and fall
+        back to the dimension check, so upgrading an existing checkout does
+        not start crashing on every recall.
+
+        Args:
+            provider_cfg: The resolved ``providers.embedding`` entry in use.
+            query_dim: Width of a freshly produced query embedding, if known.
+
+        Raises:
+            ValueError: if the configured model/prefixes/dimension do not
+                match what built the index.
+        """
+        manifest = self.read_manifest()
+        if not manifest:
+            logger.warning(
+                "Vector index at %s predates model fingerprinting — cannot "
+                "verify the embedding model matches. Run `spine index` to "
+                "stamp it. Falling back to dimension check only.",
+                self._db_path,
+            )
+            if query_dim is not None and query_dim != self.embedding_dim:
+                raise ValueError(
+                    f"Query embedding dim {query_dim} != index dim "
+                    f"{self.embedding_dim}. The configured embedding model does "
+                    f"not match this index — fix `embedding_provider` in "
+                    f".spine/config.yaml or run `spine index --wipe`."
+                )
+            return
+
+        idx_model = manifest.get("embedding_model", "")
+        cfg_model = provider_cfg.get("model", "")
+        idx_dim = manifest.get("embedding_dim", "")
+        mismatches: list[str] = []
+        if idx_model != cfg_model:
+            mismatches.append(f"model={idx_model!r} vs {cfg_model!r}")
+        if provider_cfg.get("query_prefix", "") != manifest.get("query_prefix", ""):
+            mismatches.append(
+                f"query_prefix={manifest.get('query_prefix', '')!r} vs "
+                f"{provider_cfg.get('query_prefix', '')!r}"
+            )
+        if provider_cfg.get("document_prefix", "") != manifest.get("document_prefix", ""):
+            mismatches.append(
+                f"document_prefix={manifest.get('document_prefix', '')!r} vs "
+                f"{provider_cfg.get('document_prefix', '')!r}"
+            )
+        if query_dim is not None and str(query_dim) != str(idx_dim):
+            mismatches.append(f"dim={idx_dim} vs {query_dim}")
+
+        if mismatches:
+            raise ValueError(
+                f"Embedding model does not match the committed index "
+                f"(index built with model={idx_model!r} dim={idx_dim}). "
+                f"Differences (index vs configured): {'; '.join(mismatches)}. "
+                f"Fix `embedding_provider` in .spine/config.yaml or run "
+                f"`spine index --wipe` to rebuild for the new model."
+            )
+
+    # ── Snapshot (git-committable export / restore) ─────────────────────
+
+    def export_snapshot(self, dest: str) -> str:
+        """Write a compact, self-contained, lzma-compressed copy of the db.
+
+        Checkpoints the WAL and VACUUMs so the single ``.db`` file holds the
+        whole index (no ``-wal``/``-shm`` sidecars), then lzma-compresses it
+        to ``dest``. The compressed artifact is what gets committed to git so
+        a fresh clone can restore the index instead of re-indexing.
+
+        Returns:
+            The path written (``dest``).
+        """
+        import lzma
+
+        conn = self._get_connection()
+        # Fold the WAL back into the main db and shrink free pages so the
+        # file we compress is the complete, minimal index.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+        conn.commit()
+
+        dest_path = Path(dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._db_path, "rb") as src, lzma.open(dest_path, "wb") as out:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                out.write(chunk)
+        logger.info("Wrote index snapshot %s", dest_path)
+        return str(dest_path)
+
     def delete_all(self) -> None:
         """Delete all vectors, metadata, and the incremental-index ledger."""
         conn = self._get_connection()
@@ -627,3 +767,41 @@ class VectorStore:
         conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (file_path,))
         conn.commit()
         return len(ids)
+
+
+def snapshot_path_for(db_path: str) -> str:
+    """Return the committed-snapshot path for a given live db path.
+
+    e.g. ``.spine/spine.db`` -> ``.spine/spine.db.xz``. Kept as one helper so
+    the indexer (writer) and the restore path (reader) never disagree.
+    """
+    return f"{db_path}.xz"
+
+
+def restore_snapshot(db_path: str, snapshot_path: str | None = None) -> bool:
+    """Decompress the committed snapshot into ``db_path`` if it is missing.
+
+    Used on a fresh clone so the first query restores the canonical index
+    instead of forcing a (slow, non-deterministic) re-index. A db that is
+    already present is left untouched — git's snapshot is the source of
+    truth, but a developer's local re-index/WIP is not clobbered.
+
+    Returns:
+        True if a restore happened, False if it was skipped (db already
+        present, or no snapshot to restore from).
+    """
+    import lzma
+
+    db = Path(db_path)
+    snap = Path(snapshot_path or snapshot_path_for(db_path))
+    if db.exists():
+        return False
+    if not snap.exists():
+        return False
+
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with lzma.open(snap, "rb") as src, open(db, "wb") as out:
+        for chunk in iter(lambda: src.read(1 << 20), b""):
+            out.write(chunk)
+    logger.info("Restored vector index from snapshot %s", snap)
+    return True

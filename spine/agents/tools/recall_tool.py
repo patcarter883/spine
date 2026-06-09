@@ -125,10 +125,24 @@ class RecallTool(BaseTool):
         if k == 0:
             k = cfg.recall_k
 
+        # On a fresh clone the live db is gitignored; restore it from the
+        # committed snapshot before opening so the first query works without
+        # a (slow, non-deterministic) re-index. No-op once the db exists.
+        from spine.persistence.vector_store import restore_snapshot
+
+        restore_snapshot(self.db_path)
+
         embedding = await self._embed_query(query)
 
         store = VectorStore(self.db_path)
         store.ensure_schema()
+
+        # Refuse to query if the configured embedding model is not the one
+        # that built this index — a mismatched model embeds the query into a
+        # different space and returns silent garbage. Raises ValueError with
+        # both sides named; legacy indexes (no manifest) only warn + dim-check.
+        provider_cfg = cfg.resolve_embedding_provider() or {}
+        store.assert_embedding_compatible(provider_cfg, query_dim=int(embedding.shape[0]))
 
         # Hybrid (BM25 + vector, RRF-fused) is the default: the local
         # embedding space is weak/anisotropic, so lexical match on
