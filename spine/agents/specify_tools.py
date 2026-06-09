@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -346,3 +347,123 @@ def build_specify_orchestrator_tools(
             work_description=description,
         ),
     ]
+
+
+# ── Salvage (recover a spec the model printed as text) ─────────────────────
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction of one JSON object from model text.
+
+    Handles a ```json fenced block, a bare ``` fence, or — as a last resort —
+    the first balanced top-level ``{...}`` object in the text. Returns the
+    first candidate that parses to a dict, or ``None``.
+    """
+    if not text:
+        return None
+
+    candidates: list[str] = [
+        m.group(1)
+        for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    ]
+    if not candidates:
+        # Brace-match the first top-level object (ignores braces inside, since
+        # we only need the outermost balanced span).
+        start = text.find("{")
+        if start != -1:
+            depth = 0
+            for i in range(start, len(text)):
+                ch = text[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(text[start : i + 1])
+                        break
+
+    for raw in candidates:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Coerce a spec field into a clean list of non-empty strings."""
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
+    return []
+
+
+def salvage_specification_from_text(
+    text: str, workspace_root: str, work_id: str
+) -> bool:
+    """Recover a specification from a model that printed JSON instead of calling.
+
+    When the synthesizer emits the spec as a fenced ```json block rather than
+    calling :class:`WriteSpecificationTool`, ``specification.json`` never lands
+    on disk and the SPECIFY contract hard-fails. This parses that text and, if
+    it carries the contract-required fields (``title``, ``summary``,
+    ``requirements``), writes ``specification.json`` + ``specification.md``
+    exactly as the tool would — turning an unrecoverable failure into a
+    salvage. The full spend on the synthesizer's generation is preserved.
+
+    Returns ``True`` when a valid specification was written, ``False`` when
+    nothing parseable/sufficient was found (the caller then fails closed).
+    """
+    data = _extract_json_object(text)
+    if not isinstance(data, dict):
+        return False
+
+    title = data.get("title")
+    summary = data.get("summary")
+    requirements = _coerce_str_list(data.get("requirements"))
+    if not (isinstance(title, str) and title.strip()):
+        return False
+    if not (isinstance(summary, str) and summary.strip()):
+        return False
+    if not requirements:
+        return False
+
+    try:
+        spec = Specification(
+            title=title.strip(),
+            summary=summary.strip(),
+            objectives=_coerce_str_list(data.get("objectives")),
+            requirements=requirements,
+            constraints=_coerce_str_list(data.get("constraints")),
+            scope_inclusions=_coerce_str_list(data.get("scope_inclusions")),
+            scope_exclusions=_coerce_str_list(data.get("scope_exclusions")),
+            hard_boundaries=_coerce_str_list(data.get("hard_boundaries")),
+            known_risks=_coerce_str_list(data.get("known_risks")),
+        )
+    except Exception:
+        logger.warning(
+            "Salvage: parsed JSON did not satisfy the Specification schema",
+            exc_info=True,
+        )
+        return False
+
+    spec_path = Path(workspace_root) / artifact_path(work_id, "specify")
+    try:
+        spec_path.mkdir(parents=True, exist_ok=True)
+        (spec_path / "specification.md").write_text(
+            _render_spec_markdown(spec), encoding="utf-8"
+        )
+        (spec_path / "specification.json").write_text(
+            spec.model_dump_json(indent=2), encoding="utf-8"
+        )
+    except OSError:
+        logger.warning("Salvage: failed to write recovered specification", exc_info=True)
+        return False
+
+    logger.info(
+        "Salvage: recovered specification.json from model text output for %s", work_id
+    )
+    return True

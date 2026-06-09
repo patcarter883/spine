@@ -16,10 +16,17 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from spine.agents.retry import MaxTokenBudgetExceeded
+from spine.exceptions import CriticalContractFailure
 from spine.models.state import WorkflowState
 from spine.workflow.phase_progress import mark_phase_started
 
 logger = logging.getLogger(__name__)
+
+# Structural contract failures (e.g. a synthesizer that emitted the spec as
+# text instead of calling its write tool) get this many fresh-thread re-runs
+# before escalating to human review. One retry covers the common case of a
+# weak model failing the structured-output contract on the first roll.
+_MAX_STRUCTURAL_RETRIES = 1
 
 # ── Per-phase checkpoint store ─────────────────────────────────────────
 # Cache to avoid opening the same phase DB multiple times per workflow.
@@ -279,15 +286,11 @@ def make_subgraph_node(
             subgraph_input = state_mapper(parent_state, config)
 
             # Build subgraph config with its own thread_id for independent checkpointing
-            subgraph_config = {
-                "configurable": {
-                    "thread_id": f"{work_id}_{phase_name}",
-                },
-            }
+            base_configurable: dict[str, Any] = {"thread_id": f"{work_id}_{phase_name}"}
             if config and isinstance(config, dict):
                 cfg = config.get("configurable", {})
                 if cfg:
-                    subgraph_config["configurable"].update(cfg)
+                    base_configurable.update(cfg)
 
             # When using per-phase checkpointers, recompile the subgraph with its own
             # phase-specific checkpointer before invoking.  This gives each phase
@@ -315,20 +318,48 @@ def make_subgraph_node(
                             exc_info=True,
                         )
 
-            # Invoke with or without timeout (0 = no timeout)
-            raw_coro = active_subgraph.ainvoke(subgraph_input, subgraph_config)
-            if timeout > 0:
-                result = await asyncio.wait_for(raw_coro, timeout=timeout)
-            else:
-                result = await raw_coro
+            # Invoke, retrying structural contract failures on a fresh thread.
+            # Each attempt uses a distinct thread_id so the subgraph re-runs from
+            # START — a same-thread re-invoke would resume at the failed save
+            # node (with the bad agent output checkpointed) and re-raise without
+            # re-running the agent.
+            max_attempts = 1 + _MAX_STRUCTURAL_RETRIES
+            for attempt in range(max_attempts):
+                attempt_configurable = dict(base_configurable)
+                if attempt > 0:
+                    attempt_configurable["thread_id"] = (
+                        f"{work_id}_{phase_name}_retry{attempt}"
+                    )
+                subgraph_config = {"configurable": attempt_configurable}
 
-            # Map subgraph result back to parent state
-            parent_update = result_mapper(result, parent_state)
-            logger.info(
-                f"[{work_id}] [{phase_name}] subgraph completed: "
-                f"phase_status={result.get('phase_status', 'unknown')}"
-            )
-            return parent_update
+                try:
+                    # Invoke with or without timeout (0 = no timeout)
+                    raw_coro = active_subgraph.ainvoke(subgraph_input, subgraph_config)
+                    if timeout > 0:
+                        result = await asyncio.wait_for(raw_coro, timeout=timeout)
+                    else:
+                        result = await raw_coro
+                except CriticalContractFailure as cf:
+                    if attempt + 1 < max_attempts:
+                        logger.warning(
+                            f"[{work_id}] [{phase_name}] structural contract failure "
+                            f"({cf.reason}) — auto-retrying on a clean thread "
+                            f"(attempt {attempt + 2}/{max_attempts})"
+                        )
+                        continue
+                    logger.error(
+                        f"[{work_id}] [{phase_name}] structural contract failure "
+                        f"persisted after {max_attempts} attempt(s): {cf.reason}"
+                    )
+                    return _error_update(parent_state, phase_name, str(cf))
+
+                # Map subgraph result back to parent state
+                parent_update = result_mapper(result, parent_state)
+                logger.info(
+                    f"[{work_id}] [{phase_name}] subgraph completed: "
+                    f"phase_status={result.get('phase_status', 'unknown')}"
+                )
+                return parent_update
 
         except asyncio.TimeoutError:
             logger.error(f"[{work_id}] [{phase_name}] subgraph timed out after {timeout}s")

@@ -1091,6 +1091,19 @@ async def _save_exploration_artifacts(
     # Fail-closed: SPECIFY requires specification.json (fail-closed like plan)
     if phase == PhaseName.SPECIFY.value:
         spec_json_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
+        # Salvage: if the synthesizer printed the spec as fenced JSON text
+        # instead of calling write_specification, recover it from the agent's
+        # final message before failing closed.
+        if not spec_json_path.exists():
+            from spine.agents.specify_tools import salvage_specification_from_text
+
+            if salvage_specification_from_text(agent_response, workspace_root, work_id):
+                logger.warning(
+                    "[%s] SPECIFY: salvaged specification.json from agent text "
+                    "output (model emitted JSON instead of calling "
+                    "write_specification)",
+                    work_id,
+                )
         if spec_json_path.exists():
             try:
                 raw = spec_json_path.read_text(encoding="utf-8")

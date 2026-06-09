@@ -31,7 +31,6 @@ from spine.agents.artifacts import (
     materialize_artifacts,
     materialize_phase_artifacts,
     scan_artifact_dir,
-    artifact_path,
 )
 from spine.config import SpineConfig
 from spine.exceptions import CriticalContractFailure
@@ -224,6 +223,17 @@ async def _save_specify_artifacts(
 
     # Fail-closed: validate specification.json exists and is well-formed
     spec_json_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
+    # Salvage: if the agent printed the spec as fenced JSON text instead of
+    # calling write_specification, recover it before failing closed.
+    if not spec_json_path.exists():
+        from spine.agents.specify_tools import salvage_specification_from_text
+
+        if salvage_specification_from_text(agent_response, workspace_root, work_id):
+            logger.warning(
+                "[%s] SPECIFY: salvaged specification.json from agent text output "
+                "(model emitted JSON instead of calling write_specification)",
+                work_id,
+            )
     if not spec_json_path.exists():
         raise CriticalContractFailure(
             phase="specify",

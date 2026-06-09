@@ -24,6 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.agents.artifacts import build_artifact_prompt
 from spine.agents.factory import build_phase_agent
 from spine.agents.specify_tools import build_specify_orchestrator_tools
+from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 
@@ -74,6 +75,11 @@ def build_specify_agent(
         system_prompt=system_prompt,
         extra_tools=all_tools,
         skip_filesystem_middleware=True,
+        # Force a tool call every turn until write_specification succeeds, so a
+        # weak/quantized model can't end the turn with the spec as fenced JSON
+        # text instead of calling the tool. No gate_tool here: the orchestrator
+        # legitimately calls `recall` between read_work_context and the write.
+        extra_middleware=[ForceToolUntilCalledMiddleware(final_tool="write_specification")],
     )
 
     return agent
@@ -117,6 +123,16 @@ def build_specify_synthesizer(
         system_prompt=system_prompt,
         extra_tools=list(orchestrator_tools),
         skip_filesystem_middleware=True,
+        # The synthesizer runs a strict 2-call flow (read_work_context →
+        # write_specification) with no `recall`, so once the gate tool fires we
+        # pin tool_choice to write_specification — the model cannot stall in
+        # prose. Forcing releases as soon as the write succeeds so the loop ends.
+        extra_middleware=[
+            ForceToolUntilCalledMiddleware(
+                final_tool="write_specification",
+                gate_tool="read_work_context",
+            )
+        ],
     )
 
 
