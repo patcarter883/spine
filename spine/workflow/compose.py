@@ -464,6 +464,20 @@ def _critic_result_mapper(reviewed_phase: str):
             "attempt": prior_attempts + 1,
         }
 
+        # Rework of a workspace-mutating phase invalidates the per-work_id
+        # symbol cache: the failed attempt (or the human, during a
+        # needs_review pause) may have edited files, and serving the
+        # pre-edit lookup results to the retry would mask those changes.
+        # Spec/plan rework leaves the workspace untouched — keep the cache.
+        _mutating_phases = (PhaseName.IMPLEMENT.value, PhaseName.VERIFY.value)
+        if (
+            phase_status in (ReviewStatus.NEEDS_REVIEW.value, ReviewStatus.NEEDS_REVISION.value)
+            and reviewed_phase in _mutating_phases
+        ):
+            from spine.agents import symbol_cache
+
+            symbol_cache.clear(parent_state.get("work_id", ""))
+
         if phase_status == ReviewStatus.NEEDS_REVIEW.value:
             base["status"] = "needs_review"
             base["needs_review_phase"] = reviewed_phase

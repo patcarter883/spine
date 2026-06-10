@@ -39,6 +39,7 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
+from spine.agents import symbol_cache
 from spine.agents.helpers import (
     ainvoke_structured_with_retry,
     bind_structured_output,
@@ -744,10 +745,63 @@ def _extract_anchors_from_tool_payload(body: str) -> tuple[str, list[str]]:
     return target_path, deduped
 
 
+# Deterministic read-only research tools that the one-shot worker path may
+# additionally dedupe through ``symbol_cache`` (beyond what
+# ``symbol_cache.is_cacheable`` already approves). The worker only runs in
+# exploration phases (SPECIFY / PLAN scouts), where the workspace is not
+# being mutated — so file-observing lookups are stable for the duration.
+# Do NOT widen ``symbol_cache``'s global allowlist with these: implement-
+# phase agents reach the same cache via ReadCacheMiddleware, and there the
+# underlying files DO change within a work_id.
+_WORKER_CACHEABLE_EXTRA: frozenset[str] = frozenset({
+    "ast_extract_symbol",
+    "search_codebase",
+})
+
+
+async def _invoke_tool_deduped(
+    tool: Any,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    work_id: str,
+) -> tuple[Any, int]:
+    """``tool.ainvoke`` with cross-scout single-flight dedupe.
+
+    The one-shot worker executes tool calls bare — no middleware stack —
+    so without this hop the ``ReadCacheMiddleware``/``symbol_cache``
+    layers never see them. Trace 019eaecf: sibling Architectural Scouts
+    issued ``codebase_query(get_source, SpineConfig)`` 19× because each
+    fan-out branch paid for its own MCP round-trip.
+
+    Returns ``(output, hit_count)`` — ``hit_count`` >= 1 means the result
+    was served from a sibling's earlier fetch. Exceptions from the
+    underlying tool propagate (and are never memoised).
+    """
+    cacheable = symbol_cache.is_cacheable(tool_name) or tool_name in _WORKER_CACHEABLE_EXTRA
+    if not work_id or work_id == "unknown" or not cacheable:
+        return await tool.ainvoke(tool_args), 0
+
+    captured: dict[str, Any] = {}
+
+    async def _fetch() -> str | None:
+        res = await tool.ainvoke(tool_args)
+        captured["result"] = res
+        # Only string payloads are memoised; anything else falls through.
+        return res if isinstance(res, str) else None
+
+    content, hit_count = await symbol_cache.get_or_fetch(
+        work_id, tool_name, tool_args, _fetch,
+    )
+    if content is not None:
+        return content, hit_count
+    return captured.get("result"), 0
+
+
 async def _execute_worker_first_tool(
     ai_msg: Any,
     tool_by_name: dict[str, Any],
     tool_class: ToolClass,
+    work_id: str = "",
 ) -> tuple[str, Any]:
     """Run the FIRST tool call on ``ai_msg`` and classify the outcome.
 
@@ -759,6 +813,10 @@ async def _execute_worker_first_tool(
       - ``("error", (tool_id, tool_name, error_text))`` — the tool was missing
         from the scoped surface or raised. ``error_text`` is the teaching
         message the caller may feed back to the model for ONE retry.
+
+    Deterministic codebase lookups are routed through ``symbol_cache``
+    keyed by *work_id* so sibling scout branches share results instead of
+    each re-issuing the same fetch (see :func:`_invoke_tool_deduped`).
     """
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
     if not tool_calls:
@@ -782,14 +840,24 @@ async def _execute_worker_first_tool(
         )
 
     try:
-        tool_output = await tool.ainvoke(tool_args)
+        tool_output, hit_count = await _invoke_tool_deduped(
+            tool, tool_name, tool_args, work_id,
+        )
     except Exception as exc:
         return "error", (tool_id, tool_name, f"{type(exc).__name__}: {exc}")
+
+    content = str(tool_output) if tool_output is not None else ""
+    if hit_count > 0:
+        content = (
+            f"[ALREADY FETCHED — an identical {tool_name} query was answered "
+            f"earlier in this run (served from cache, hit #{hit_count}). "
+            f"Result repeated below; do not re-issue this query.]\n{content}"
+        )
 
     # Wrap the tool output as a ToolMessage so the existing extractor
     # (which expects a message list) keeps working unchanged.
     tool_msg = ToolMessage(
-        content=str(tool_output) if tool_output is not None else "",
+        content=content,
         name=tool_name,
         tool_call_id=tool_id,
     )
@@ -838,11 +906,12 @@ async def run_worker_node(
             (``SUBAGENT_PROMPTS["researcher"]`` / ``-plan``). Sent as a
             SystemMessage to the bound model.
         context: Unused. Kept in the signature for caller compatibility
-            after the agent-loop removal — ReadCacheMiddleware no longer
-            wraps the worker's tool execution because there is no
-            middleware stack to wrap. MCP / search tools cache
-            internally; the worker only does ONE tool call per turn
-            anyway, so cross-turn dedupe wasn't doing useful work here.
+            after the agent-loop removal — there is no middleware stack
+            to wrap. Cross-scout dedupe of deterministic codebase
+            lookups happens inside :func:`_execute_worker_first_tool`
+            via ``symbol_cache`` keyed by work_id instead (trace
+            019eaecf showed sibling scouts re-fetching the same symbol
+            19× when this path ran bare).
     """
     work_id = state.get("work_id", "unknown")
     tool_class = directive.allowed_tool_class
@@ -911,7 +980,9 @@ async def run_worker_node(
     # the supervisor governs convergence and explicitly asked for a single
     # move this turn — extra tool calls would just inflate the next cycle's
     # history block.
-    kind, payload = await _execute_worker_first_tool(ai_msg, tool_by_name, tool_class)
+    kind, payload = await _execute_worker_first_tool(
+        ai_msg, tool_by_name, tool_class, work_id=work_id,
+    )
     if kind == "finding":
         return payload  # no tool call — narration-only finding
     if kind == "ok":
@@ -953,7 +1024,7 @@ async def run_worker_node(
         work_id, tool_name,
     )
     kind2, payload2 = await _execute_worker_first_tool(
-        retry_ai_msg, tool_by_name, tool_class
+        retry_ai_msg, tool_by_name, tool_class, work_id=work_id,
     )
     if kind2 == "finding":
         return payload2

@@ -54,6 +54,27 @@ _cacheable_servers: dict[str, tuple[str, ...]] = {
     "codebase-index": _DEFAULT_DETERMINISTIC_SUFFIXES,
 }
 
+# Exact tool names (non-``mcp_``-prefixed) opted into cross-branch result
+# sharing. The ``codebase_query`` facade (commit b2f60ac) replaced the raw
+# ``mcp_codebase-index_*`` surface for all subagents; without this entry
+# ``is_cacheable`` returned False for the facade and cross-branch dedupe
+# silently stopped applying — trace 019eaecf showed the same
+# ``get_source(SpineConfig)`` fetched 19× across sibling scouts.
+_cacheable_tools: set[str] = {
+    "codebase_query",
+}
+
+
+def register_cacheable_tool(tool_name: str) -> None:
+    """Opt an exact (non-MCP) tool name into cross-branch result sharing.
+
+    Only deterministic, read-only tools may be registered — the cache
+    lives for the whole work_id, so results from tools that observe
+    mutable state would go stale across phases.
+    """
+    if tool_name:
+        _cacheable_tools.add(tool_name)
+
 
 def register_cacheable_server(
     server_name: str,
@@ -71,12 +92,18 @@ def register_cacheable_server(
 
 
 def is_cacheable(tool_name: str) -> bool:
-    """Return True when *tool_name* is a deterministic MCP lookup.
+    """Return True when *tool_name* is a deterministic codebase lookup.
 
-    Matches the ``mcp_<server>_<suffix>...`` naming convention against
-    the server allowlist registered via ``register_cacheable_server``.
+    Exact names registered via ``register_cacheable_tool`` qualify (e.g.
+    the ``codebase_query`` facade); otherwise matches the
+    ``mcp_<server>_<suffix>...`` naming convention against the server
+    allowlist registered via ``register_cacheable_server``.
     """
-    if not tool_name or not tool_name.startswith("mcp_"):
+    if not tool_name:
+        return False
+    if tool_name in _cacheable_tools:
+        return True
+    if not tool_name.startswith("mcp_"):
         return False
     for server, suffixes in _cacheable_servers.items():
         prefix = f"mcp_{server}_"

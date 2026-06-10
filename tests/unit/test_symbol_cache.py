@@ -35,10 +35,22 @@ class TestIsCacheable:
         # regex against the index is safe to share across sibling branches.
         assert symbol_cache.is_cacheable("mcp_codebase-index_search_codebase")
 
+    def test_codebase_query_facade_is_cacheable(self):
+        # The facade replaced the raw mcp_codebase-index_* surface for
+        # subagents (commit b2f60ac); it must stay on the allowlist or
+        # cross-branch dedupe silently stops applying (trace 019eaecf:
+        # get_source(SpineConfig) fetched 19× by sibling scouts).
+        assert symbol_cache.is_cacheable("codebase_query")
+
     def test_non_mcp_and_mutating_tools_are_not_cacheable(self):
         assert not symbol_cache.is_cacheable("read_file")
         assert not symbol_cache.is_cacheable("write_file")
         assert not symbol_cache.is_cacheable("")
+        # File-observing research tools are NOT globally cacheable — files
+        # change during implement; only the exploration worker path opts
+        # them in (where the workspace is read-only).
+        assert not symbol_cache.is_cacheable("ast_extract_symbol")
+        assert not symbol_cache.is_cacheable("search_codebase")
         # No suffix match — create_/update_/delete_/run_ are excluded.
         assert not symbol_cache.is_cacheable("mcp_codebase-index_create_thing")
         assert not symbol_cache.is_cacheable("mcp_codebase-index_run_query")
@@ -68,6 +80,21 @@ class TestRegisterCacheableServer:
             assert not symbol_cache.is_cacheable("mcp_strict_search_thing")
         finally:
             symbol_cache._cacheable_servers.pop("strict", None)
+
+
+class TestRegisterCacheableTool:
+    def test_exact_name_registration(self):
+        assert not symbol_cache.is_cacheable("my_lookup_tool")
+        try:
+            symbol_cache.register_cacheable_tool("my_lookup_tool")
+            assert symbol_cache.is_cacheable("my_lookup_tool")
+        finally:
+            symbol_cache._cacheable_tools.discard("my_lookup_tool")
+
+    def test_empty_name_is_noop(self):
+        before = set(symbol_cache._cacheable_tools)
+        symbol_cache.register_cacheable_tool("")
+        assert symbol_cache._cacheable_tools == before
 
 
 class TestArgsFingerprint:
