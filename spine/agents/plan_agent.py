@@ -123,6 +123,8 @@ def build_plan_synthesizer(
         ),
     ]
 
+    from spine.agents.synthesis_budget import synthesis_completion_cap
+
     return build_phase_agent(
         state=state,
         config=config,
@@ -130,6 +132,10 @@ def build_plan_synthesizer(
         system_prompt=_build_plan_synthesizer_prompt(),
         extra_tools=synthesizer_tools,
         skip_filesystem_middleware=True,
+        # The plan JSON is 2-5K tokens; without a clamp the request inherits
+        # the global max_completion_tokens (30K) and a finite-window model
+        # 400s once prompt + completion budget exceed the window (019eb3dd).
+        completion_token_cap=synthesis_completion_cap(PhaseName.PLAN.value),
     )
 
 

@@ -176,6 +176,73 @@ class TestSpineConfig:
         assert config.artifact_path == ".spine/artifacts"
         assert config.max_critic_retries == 2
 
+    # ── Window-aware synthesis budgeting (trace 019eb3dd) ─────────────
+
+    def test_synthesis_budget_fields_defaults(self) -> None:
+        """New synthesis budget knobs have sane defaults."""
+        config = SpineConfig()
+        assert config.synthesize_max_completion_tokens == 8000
+        assert config.synthesize_overhead_tokens == 4000
+        assert config.evidence_compression_enabled is True
+
+    def test_synthesis_budget_fields_from_yaml(self, temp_dir: Path) -> None:
+        """Synthesis budget knobs parse from the spine: section."""
+        config_file = temp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(
+                {
+                    "spine": {
+                        "synthesize_max_completion_tokens": 6000,
+                        "synthesize_overhead_tokens": 2000,
+                        "evidence_compression_enabled": False,
+                    }
+                },
+                f,
+            )
+        config = SpineConfig.load(str(config_file))
+        assert config.synthesize_max_completion_tokens == 6000
+        assert config.synthesize_overhead_tokens == 2000
+        assert config.evidence_compression_enabled is False
+
+    def test_context_window_resolves_per_provider_and_phase(
+        self, temp_dir: Path
+    ) -> None:
+        """context_window flows through provider resolution + phase override."""
+        config_file = temp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(
+                {
+                    "providers": {
+                        "llm": [
+                            {
+                                "name": "local",
+                                "model": "openai:m",
+                                "enabled": True,
+                                "context_window": 60000,
+                            }
+                        ],
+                        "phases": {
+                            "specify": {"provider": "local"},
+                            "plan": {
+                                "provider": "local",
+                                "context_window": 32000,  # phase override
+                            },
+                        },
+                    }
+                },
+                f,
+            )
+        config = SpineConfig.load(str(config_file))
+        assert config.resolve_provider_config(phase="specify")["context_window"] == 60000
+        assert config.resolve_provider_config(phase="plan")["context_window"] == 32000
+
+    def test_context_window_absent_by_default(self) -> None:
+        """Providers without context_window stay legacy (no key)."""
+        config = SpineConfig(
+            providers={"llm": [{"name": "c", "model": "openrouter:x", "enabled": True}]}
+        )
+        assert config.resolve_provider_config(phase="specify").get("context_window") is None
+
     # ── MCP config parsing ────────────────────────────────────────────
 
     def test_mcp_servers_default_empty(self) -> None:

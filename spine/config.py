@@ -288,6 +288,23 @@ class SpineConfig:
     # vs 40K TokenBudgetCompactor threshold). 0 or negative = unbounded.
     synthesize_findings_token_budget: int = 20000
 
+    # Completion-token clamp for the SPECIFY/PLAN synthesizer calls. The
+    # structured spec/plan JSON is 2-4K tokens; without a clamp the synth
+    # request inherits the global max_completion_tokens (30K) and a
+    # finite-window model 400s once prompt + completion budget exceeds the
+    # window (trace 019eb3dd: ~33K prompt + 30K requested vs a 60K window).
+    # 8K (not 4K) leaves headroom for reasoning-channel tokens on thinking
+    # models. Per-phase ``max_completion_tokens`` overrides still win.
+    synthesize_max_completion_tokens: int = 8000
+    # Safety margin subtracted from the window when computing the synth
+    # input budget — covers tool schemas, chat-template framing, and
+    # tiktoken-vs-model-tokenizer drift (cl100k underestimates Qwen ~10%).
+    synthesize_overhead_tokens: int = 4000
+    # Kill switch for map-reduce evidence compression in the synth nodes.
+    # When False, oversized findings/recall blocks degrade by truncation
+    # only (pre-019eb3dd behaviour).
+    evidence_compression_enabled: bool = True
+
     # Token budget for the prior-phase findings injected into PLAN
     # researcher / manager prompts (SPECIFY's research_log.json findings
     # carried across into PLAN exploration). Tighter than the synthesis
@@ -561,6 +578,23 @@ class SpineConfig:
                     spine.get("synthesize_findings_token_budget", 20000),
                 )
             ),
+            synthesize_max_completion_tokens=int(
+                os.getenv(
+                    "SPINE_SYNTHESIZE_MAX_COMPLETION_TOKENS",
+                    spine.get("synthesize_max_completion_tokens", 8000),
+                )
+            ),
+            synthesize_overhead_tokens=int(
+                os.getenv(
+                    "SPINE_SYNTHESIZE_OVERHEAD_TOKENS",
+                    spine.get("synthesize_overhead_tokens", 4000),
+                )
+            ),
+            evidence_compression_enabled=os.getenv(
+                "SPINE_EVIDENCE_COMPRESSION",
+                str(spine.get("evidence_compression_enabled", True)).lower(),
+            )
+            not in ("0", "false", "no"),
             prior_phase_findings_token_budget=int(
                 os.getenv(
                     "SPINE_PRIOR_PHASE_FINDINGS_TOKEN_BUDGET",
@@ -695,6 +729,7 @@ class SpineConfig:
         "max_concurrent_calls",
         "stream_usage",
         "reasoning",
+        "context_window",
     )
 
     def resolve_active_provider(self) -> dict | None:

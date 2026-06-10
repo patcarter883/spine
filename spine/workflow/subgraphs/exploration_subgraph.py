@@ -29,8 +29,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send
 
 from spine.agents._tokens import count_tokens as _count_tokens
+from spine.agents.evidence_compression import (
+    compress_findings as _compress_findings,
+    compress_recall_chunks as _compress_recall_chunks,
+)
 from spine.agents.exploration_agents import format_findings as _format_findings
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+from spine.agents.synthesis_budget import (
+    allocate_evidence as _allocate_evidence,
+    estimate_tool_payload_reserve as _estimate_tool_payload_reserve,
+    resolve_synthesis_budget as _resolve_synthesis_budget,
+)
 
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ExplorationSubgraphState
@@ -57,6 +66,9 @@ _DEFAULT_MAX_ROUNDS = 3
 # the cap are deferred: the manager will re-propose them next round
 # (and _new_topics will skip ones already covered).
 _MAX_PARALLEL_EXPLORES = 4
+# Sentinel budget for measuring an evidence block's full rendered size
+# before allocation (effectively "no cap").
+_UNBOUNDED_BUDGET = 10**9
 
 
 # ── Node: pre_research_gate ─────────────────────────────────────────────
@@ -737,11 +749,6 @@ async def _synthesize_plan(
         agent = build_plan_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        from spine.config import SpineConfig as _SpineConfig
-        findings_text = _format_findings(
-            findings,
-            budget=_SpineConfig.load().synthesize_findings_token_budget,
-        )
         feedback_body = ""
         if retry_count > 0:
             feedback_body = _render_rework_feedback(last_critic_review, feedback) or ""
@@ -752,6 +759,64 @@ async def _synthesize_plan(
             if retry_count > 0
             else ""
         )
+        instruction = (
+            f"{rework_lead}Create a detailed technical plan with "
+            "structured feature slices, incorporating the research "
+            "findings above. Call `read_prior_artifacts` to load the "
+            "specification and prior context in one call. Then "
+            "synthesize the spec + findings into structured "
+            "feature_slices and call `write_structured_plan` exactly "
+            "once — the tool writes both plan.md and plan.json for you. "
+            "Do not call write_file."
+        )
+
+        # ── Window-aware evidence budgeting (trace 019eb3dd) ────────────
+        # Same ledger as _synthesize_specify, minus the recall block (PLAN
+        # has no recall-gate short-circuit). The tool-payload reserve covers
+        # read_prior_artifacts returning the full specification on turn 2.
+        from deepagents.graph import BASE_AGENT_PROMPT as _BASE_PROMPT
+        from spine.agents.artifacts import build_artifact_prompt as _artifact_prompt
+        from spine.agents.plan_agent import _build_plan_synthesizer_prompt
+
+        system_estimate = (
+            _build_plan_synthesizer_prompt()
+            + _artifact_prompt(
+                state.get("artifacts", {}), PhaseName.PLAN.value, work_id=work_id
+            )
+            + _BASE_PROMPT
+        )
+        reserve = _estimate_tool_payload_reserve(
+            workspace_root=workspace_root,
+            artifact_dirs=[f".spine/artifacts/{work_id}/specify"],
+            description=description,
+            feedback=[str(f) for f in feedback] if feedback else [],
+        )
+        synth_budget = _resolve_synthesis_budget(
+            PhaseName.PLAN.value,
+            fixed_texts=[
+                system_estimate, description, feedback_body, scratchpad, instruction,
+            ],
+            tool_payload_reserve=reserve,
+        )
+
+        findings_full = _format_findings(findings)
+        alloc = _allocate_evidence(
+            synth_budget,
+            findings_tokens=_count_tokens(findings_full),
+        )
+        if _count_tokens(findings_full) <= alloc.findings:
+            findings_text = findings_full
+        else:
+            if not synth_budget.legacy:
+                findings = await _compress_findings(
+                    findings,
+                    budget_tokens=alloc.findings,
+                    phase=PhaseName.PLAN.value,
+                    work_id=work_id,
+                    config=config,
+                )
+            findings_text = _format_findings(findings, budget=alloc.findings)
+
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
@@ -759,16 +824,7 @@ async def _synthesize_plan(
                 (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
             ),
-            (
-                f"{rework_lead}Create a detailed technical plan with "
-                "structured feature slices, incorporating the research "
-                "findings above. Call `read_prior_artifacts` to load the "
-                "specification and prior context in one call. Then "
-                "synthesize the spec + findings into structured "
-                "feature_slices and call `write_structured_plan` exactly "
-                "once — the tool writes both plan.md and plan.json for you. "
-                "Do not call write_file."
-            ),
+            instruction,
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)
@@ -858,19 +914,6 @@ async def _synthesize_specify(
         agent = build_specify_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        from spine.config import SpineConfig as _SpineConfig
-        findings_text = _format_findings(
-            findings,
-            budget=_SpineConfig.load().synthesize_findings_token_budget,
-        )
-        # When the pre_research_gate fired (high confidence + sufficient
-        # hits), it skips the exploration loop and we synthesize directly
-        # from the recalled chunks.  Inject the raw per-symbol bodies
-        # (tree-sitter-sliced — single function bodies, not whole files)
-        # up to the configured token budget.
-        recall_body = _format_retrieved_context(
-            state.get("retrieved_context") or []
-        )
         feedback_body = ""
         if retry_count > 0:
             feedback_body = _render_rework_feedback(last_critic_review, feedback) or ""
@@ -882,6 +925,83 @@ async def _synthesize_specify(
             if retry_count > 0
             else ""
         )
+        instruction = (
+            f"{rework_lead}Create a detailed specification for the work "
+            "above, incorporating the research findings. Call "
+            "`read_work_context` once to load description, feedback, "
+            "and any prior spec. Then synthesize the work description + "
+            "research findings into the structured fields and call "
+            "`write_specification` exactly once (fields: title, summary, "
+            "objectives, requirements, constraints, scope_inclusions, "
+            "scope_exclusions, known_risks). The tool renders markdown "
+            "and emits JSON for you — do not call write_file."
+        )
+
+        # ── Window-aware evidence budgeting (trace 019eb3dd) ────────────
+        # Measure the fixed prompt pieces and what read_work_context will
+        # return on turn 2, then size the findings/recall blocks so the
+        # whole request (plus the clamped completion) fits the provider's
+        # declared context_window. Legacy (no window declared) keeps the
+        # historical fixed budgets.
+        from deepagents.graph import BASE_AGENT_PROMPT as _BASE_PROMPT
+        from spine.agents.artifacts import build_artifact_prompt as _artifact_prompt
+        from spine.agents.specify_agent import _build_specify_synthesizer_prompt
+
+        system_estimate = (
+            _build_specify_synthesizer_prompt()
+            + _artifact_prompt(
+                state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
+            )
+            + _BASE_PROMPT
+        )
+        reserve = _estimate_tool_payload_reserve(
+            workspace_root=workspace_root,
+            artifact_dirs=[f".spine/artifacts/{work_id}/specify"],
+            description=description,
+            feedback=[str(f) for f in feedback] if feedback else [],
+        )
+        synth_budget = _resolve_synthesis_budget(
+            PhaseName.SPECIFY.value,
+            fixed_texts=[
+                system_estimate, description, feedback_body, scratchpad, instruction,
+            ],
+            tool_payload_reserve=reserve,
+        )
+
+        # When the pre_research_gate fired (high confidence + sufficient
+        # hits), it skips the exploration loop and we synthesize directly
+        # from the recalled chunks.  Inject the raw per-symbol bodies
+        # (tree-sitter-sliced — single function bodies, not whole files)
+        # up to the allocated token budget.
+        chunks = state.get("retrieved_context") or []
+        findings_full = _format_findings(findings)
+        recall_full = _format_retrieved_context(chunks, budget=_UNBOUNDED_BUDGET)
+        alloc = _allocate_evidence(
+            synth_budget,
+            findings_tokens=_count_tokens(findings_full),
+            recall_tokens=_count_tokens(recall_full),
+        )
+
+        if _count_tokens(findings_full) <= alloc.findings:
+            findings_text = findings_full
+        else:
+            if not synth_budget.legacy:
+                findings = await _compress_findings(
+                    findings,
+                    budget_tokens=alloc.findings,
+                    phase=PhaseName.SPECIFY.value,
+                    work_id=work_id,
+                    config=config,
+                )
+            findings_text = _format_findings(findings, budget=alloc.findings)
+
+        if _count_tokens(recall_full) <= alloc.recall:
+            recall_body = recall_full
+        else:
+            if not synth_budget.legacy:
+                chunks = _compress_recall_chunks(chunks, budget_tokens=alloc.recall)
+            recall_body = _format_retrieved_context(chunks, budget=alloc.recall)
+
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
@@ -890,17 +1010,7 @@ async def _synthesize_specify(
                 (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
             ),
-            (
-                f"{rework_lead}Create a detailed specification for the work "
-                "above, incorporating the research findings. Call "
-                "`read_work_context` once to load description, feedback, "
-                "and any prior spec. Then synthesize the work description + "
-                "research findings into the structured fields and call "
-                "`write_specification` exactly once (fields: title, summary, "
-                "objectives, requirements, constraints, scope_inclusions, "
-                "scope_exclusions, known_risks). The tool renders markdown "
-                "and emits JSON for you — do not call write_file."
-            ),
+            instruction,
         )
 
         ctx = build_context(dict(state), PhaseName.SPECIFY)
@@ -986,19 +1096,22 @@ def _compute_waves(
 # _count_tokens has moved to spine.agents._tokens (imported at module top).
 
 
-def _format_retrieved_context(chunks: list[dict]) -> str:
-    """Render recalled chunks as code blocks, capped by ``specify_context_token_budget``.
+def _format_retrieved_context(chunks: list[dict], budget: int | None = None) -> str:
+    """Render recalled chunks as code blocks, capped by a token budget.
 
     Each chunk is a tree-sitter-sliced symbol body (Phase 1), so there is
     no per-chunk truncation — we simply stop appending when adding the
-    next chunk would exceed the budget.
+    next chunk would exceed the budget. ``budget=None`` falls back to
+    ``specify_context_token_budget`` (the historical behaviour); the
+    synthesize nodes pass an explicit window-derived allocation.
     """
     if not chunks:
         return ""
 
-    from spine.config import SpineConfig
+    if budget is None:
+        from spine.config import SpineConfig
 
-    budget = SpineConfig.load().specify_context_token_budget
+        budget = SpineConfig.load().specify_context_token_budget
     # No outer markdown header — caller wraps the returned text in
     # ``xml_blocks((Tag.RETRIEVED_CODE, ...))`` per the project's tagging
     # convention (see ``spine.agents.prompt_format``).
