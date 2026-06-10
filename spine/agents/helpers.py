@@ -231,10 +231,87 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
     method.  ``method="json_schema"`` is selected only at bind time; if a model
     later rejects ``response_format`` json_schema at invoke time, the callsite's
     existing ``try/except`` still degrades gracefully.
+
+    The json_schema default has its own mirror-image failure (trace 019eaf1f):
+    OpenRouter gates ``response_format: json_schema`` behind the separate
+    ``structured_outputs`` endpoint capability, and some models (e.g.
+    minimax/minimax-m3) advertise ``tools``/``tool_choice`` but NOT
+    ``structured_outputs`` — so with ``require_parameters=True`` every call
+    404s before reaching the provider.  For ChatOpenRouter models we therefore
+    consult the model's endpoint capabilities (cached, fail-open) and pick the
+    method its endpoints can actually serve.
     """
-    if _is_openai_style_model(model):
-        return model.with_structured_output(schema, method="json_schema")
-    return model.with_structured_output(schema)
+    if not _is_openai_style_model(model):
+        return model.with_structured_output(schema)
+    method = "json_schema"
+    if type(model).__name__ == "ChatOpenRouter":
+        model_name = getattr(model, "model_name", None)
+        if model_name:
+            method = _openrouter_structured_method(model_name)
+    return model.with_structured_output(schema, method=method)
+
+
+_OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{model}/endpoints"
+
+# model name -> chosen with_structured_output method. Populated lazily; also
+# caches the fail-open default on lookup errors so a flaky network costs at
+# most one blocked bind per model per process.
+_structured_method_cache: dict[str, str] = {}
+
+
+def _openrouter_structured_method(model_name: str) -> str:
+    """Pick the ``with_structured_output`` method this model's endpoints serve.
+
+    OpenRouter's per-model endpoint listing advertises ``supported_parameters``
+    per endpoint.  With ``require_parameters=True`` a request succeeds if ANY
+    endpoint supports every parameter sent, so we check the union across
+    endpoints, preferring the most reliable method available:
+
+    1. ``json_schema`` — needs the ``structured_outputs`` capability.
+    2. ``function_calling`` — needs ``tool_choice`` (forced tool call).
+    3. ``json_mode`` — needs only plain ``response_format`` (json_object);
+       weakest guarantee, but better than a guaranteed 404.
+
+    Fails open to ``json_schema`` (the previous unconditional behavior) when
+    the lookup errors or returns no endpoints. The result — including the
+    fail-open default — is cached per model for the process lifetime.
+    """
+    cached = _structured_method_cache.get(model_name)
+    if cached is not None:
+        return cached
+    method = "json_schema"
+    try:
+        import httpx
+
+        resp = httpx.get(
+            _OPENROUTER_ENDPOINTS_URL.format(model=model_name), timeout=5.0
+        )
+        resp.raise_for_status()
+        endpoints = (resp.json().get("data") or {}).get("endpoints") or []
+        if endpoints:
+            supported: set[str] = set()
+            for ep in endpoints:
+                supported.update(ep.get("supported_parameters") or [])
+            if "structured_outputs" not in supported:
+                if "tool_choice" in supported:
+                    method = "function_calling"
+                elif "response_format" in supported:
+                    method = "json_mode"
+                logger.info(
+                    "%s: endpoints lack structured_outputs support; using "
+                    "structured-output method=%s",
+                    model_name,
+                    method,
+                )
+    except Exception as exc:  # noqa: BLE001 — fail open to the static default
+        logger.debug(
+            "OpenRouter endpoint lookup failed for %s (%s); defaulting to "
+            "json_schema",
+            model_name,
+            exc,
+        )
+    _structured_method_cache[model_name] = method
+    return method
 
 
 # Substring of the ValueError LangChain's ``_oai_structured_outputs_parser``
