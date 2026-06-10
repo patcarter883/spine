@@ -246,6 +246,27 @@ class VectorStore:
             END
         """)
 
+        # Dependency edges for languages mcp-codebase-index can't analyze
+        # (currently PHP). Populated by the vector indexer from
+        # ``ast_extract.extract_edges``; queried by codebase_query's local
+        # fallback for get_dependencies / get_dependents.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                src_file TEXT NOT NULL,
+                src_symbol TEXT NOT NULL,
+                edge_kind TEXT NOT NULL,
+                dst_name TEXT NOT NULL,
+                lang TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbol_edges_src ON symbol_edges(src_symbol)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbol_edges_dst ON symbol_edges(dst_name)"
+        )
+
         # Incremental-indexing ledger: one row per source file, holding the
         # content hash last indexed. The indexer skips files whose hash is
         # unchanged so a re-index only touches what actually changed.
@@ -568,12 +589,33 @@ class VectorStore:
         conn.execute("DELETE FROM symbol_vectors")
         conn.execute("DELETE FROM symbol_metadata")
         # Clear the ledger too so a wipe forces a genuine full re-index.
-        try:
-            conn.execute("DELETE FROM indexed_files")
-        except sqlite3.OperationalError:
-            pass
+        # Edges and ledger are guarded for databases pre-dating the tables.
+        for table in ("indexed_files", "symbol_edges"):
+            try:
+                conn.execute(f"DELETE FROM {table}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
         logger.info("Vector store cleared")
+
+    def replace_file_edges(self, file_path: str, edges: list[Any]) -> None:
+        """Replace all dependency edges recorded for one source file.
+
+        ``edges`` are :class:`spine.agents.tools.ast_extract.Edge` instances
+        (anything with src_file/src_symbol/edge_kind/dst_name/lang attrs).
+        """
+        conn = self._get_connection()
+        conn.execute("DELETE FROM symbol_edges WHERE src_file = ?", (file_path,))
+        if edges:
+            conn.executemany(
+                "INSERT INTO symbol_edges (src_file, src_symbol, edge_kind, dst_name, lang) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (e.src_file, e.src_symbol, e.edge_kind, e.dst_name, e.lang)
+                    for e in edges
+                ],
+            )
+        conn.commit()
 
     # ── Incremental indexing ────────────────────────────────────────────
 
@@ -624,6 +666,10 @@ class VectorStore:
             placeholders = ",".join("?" for _ in ids)
             conn.execute(f"DELETE FROM symbol_vectors WHERE rowid IN ({placeholders})", ids)
             conn.execute(f"DELETE FROM symbol_metadata WHERE id IN ({placeholders})", ids)
+        try:
+            conn.execute("DELETE FROM symbol_edges WHERE src_file = ?", (file_path,))
+        except sqlite3.OperationalError:
+            pass
         conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (file_path,))
         conn.commit()
         return len(ids)

@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+from spine.agents.tools.ast_extract import extract_edges as ast_extract_edges
 from spine.agents.tools.ast_extract import extract_symbols as ast_extract_symbols
 from spine.config import SpineConfig
 from spine.persistence.vector_store import VectorStore
@@ -187,6 +188,9 @@ class VectorIndexer:
             self.store.delete_file_symbols(rel)
             full_path = os.path.join(workspace_root, rel)
             file_symbols = self._extract_symbols_from_file(full_path, rel)
+            # Dependency edges (PHP only — other languages are covered by
+            # mcp-codebase-index). Pure AST work, no LLM/embedding cost.
+            self.store.replace_file_edges(rel, ast_extract_edges(full_path, rel))
             results = await asyncio.gather(
                 *[self._process_symbol(s, semaphore, workspace_root) for s in file_symbols],
                 return_exceptions=True,

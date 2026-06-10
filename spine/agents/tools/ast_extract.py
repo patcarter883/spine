@@ -33,6 +33,24 @@ _EXT_TO_LANG: dict[str, str] = {
 
 
 @dataclass(frozen=True)
+class Edge:
+    """A dependency edge extracted from a source file.
+
+    ``src_symbol`` is the qualified name (``Class.method``) of the
+    enclosing symbol, or ``""`` for file-level statements (e.g. top-level
+    ``use`` imports). ``dst_name`` is the alias-resolved target with
+    namespace prefix stripped to its last segment so it matches the
+    ``symbol_name`` values stored in ``symbol_metadata``.
+    """
+
+    src_file: str
+    src_symbol: str
+    edge_kind: str  # use_import|new|static_call|call|extends|implements|trait_use
+    dst_name: str
+    lang: str
+
+
+@dataclass(frozen=True)
 class Symbol:
     """A single extracted symbol with its source slice and location."""
 
@@ -260,3 +278,175 @@ def extract_symbols(full_path: str, rel_path: str) -> list[Symbol]:
         )
 
     return symbols
+
+
+# ── Dependency-edge extraction (PHP) ─────────────────────────────────────
+#
+# mcp-codebase-index has no PHP support, so spine builds its own PHP
+# dependency edges at index time. Other languages keep using the MCP
+# server's pre-built graph; extract_edges returns [] for them.
+
+_PHP_NAME_NODE_TYPES: frozenset[str] = frozenset({"name", "qualified_name"})
+
+_PHP_SYMBOL_DEF_NODE_TYPES: frozenset[str] = frozenset({
+    "function_definition",
+    "method_declaration",
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "trait_declaration",
+})
+
+
+def _php_node_name(node: Any, source_bytes: bytes) -> str | None:
+    """Text of the first ``name``/``qualified_name`` child, or None."""
+    for child in node.children:
+        if child.type in _PHP_NAME_NODE_TYPES:
+            return source_bytes[child.start_byte : child.end_byte].decode(
+                "utf-8", errors="replace"
+            )
+    return None
+
+
+def _php_enclosing_symbol(node: Any, source_bytes: bytes) -> str:
+    """Qualified name of the nearest enclosing PHP symbol, '' at file level."""
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if cur.type in _PHP_SYMBOL_DEF_NODE_TYPES:
+            name = _php_node_name(cur, source_bytes)
+            if name is None:
+                return ""
+            if cur.type == "method_declaration":
+                cls = _enclosing_class_name(cur, source_bytes)
+                return f"{cls}.{name}" if cls else name
+            return name
+        cur = getattr(cur, "parent", None)
+    return ""
+
+
+def extract_edges(full_path: str, rel_path: str) -> list[Edge]:
+    """Extract dependency edges from a PHP source file.
+
+    Captures top-level ``use`` imports, ``new ClassName`` instantiation,
+    ``Foo::bar()`` static calls, plain/member function calls,
+    ``extends`` / ``implements`` clauses, and in-class trait ``use``.
+    File-local ``use`` aliases are resolved so ``dst_name`` carries the
+    final class/function segment (lossy: dynamic dispatch and string
+    class names are invisible to the AST).
+
+    Returns an empty list for non-PHP files, missing files, or parse
+    failures (logged at DEBUG).
+    """
+    lang = _infer_lang(full_path)
+    if lang != "php":
+        return []
+
+    try:
+        with open(full_path, "rb") as f:
+            source_bytes = f.read()
+    except OSError as exc:
+        logger.debug("Could not read %s: %s", rel_path, exc)
+        return []
+
+    try:
+        parser = _get_parser(lang)
+        tree = parser.parse(source_bytes)
+    except Exception as exc:  # pragma: no cover — tree-sitter setup errors
+        logger.warning("Tree-sitter parse failed for %s: %s", rel_path, exc)
+        return []
+
+    def text(node: Any) -> str:
+        return source_bytes[node.start_byte : node.end_byte].decode(
+            "utf-8", errors="replace"
+        )
+
+    # use-statement alias map, filled in document order (PHP requires use
+    # statements before references in practice; lossy if violated).
+    aliases: dict[str, str] = {}
+
+    def resolve(raw: str) -> str:
+        """Alias-resolve a (possibly namespaced) name to its last segment."""
+        raw = raw.lstrip("\\")
+        first, _, rest = raw.partition("\\")
+        fqn = aliases.get(first)
+        full = f"{fqn}\\{rest}" if (fqn and rest) else (fqn or raw)
+        return full.rsplit("\\", 1)[-1]
+
+    edges: list[Edge] = []
+
+    def add(node: Any, kind: str, dst: str) -> None:
+        dst = dst.strip()
+        if dst:
+            edges.append(Edge(
+                src_file=rel_path,
+                src_symbol=_php_enclosing_symbol(node, source_bytes),
+                edge_kind=kind,
+                dst_name=dst,
+                lang=lang,
+            ))
+
+    # Iterative pre-order DFS keeps document order (alias map correctness).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        stack.extend(reversed(node.children))
+        ntype = node.type
+
+        if ntype == "namespace_use_clause":
+            # Children: (qualified_name|name) ['as' name] — the alias is a
+            # bare `name` following the `as` keyword, not a wrapper node.
+            target = _php_node_name(node, source_bytes)
+            if not target:
+                continue
+            fqn = target.lstrip("\\")
+            alias = None
+            saw_as = False
+            for child in node.children:
+                if child.type == "as":
+                    saw_as = True
+                elif saw_as and child.type == "name":
+                    alias = text(child)
+                    break
+            short = fqn.rsplit("\\", 1)[-1]
+            aliases[alias or short] = fqn
+            add(node, "use_import", short)
+
+        elif ntype == "object_creation_expression":
+            target = _php_node_name(node, source_bytes)
+            if target:  # skip dynamic `new $class`
+                add(node, "new", resolve(target))
+
+        elif ntype == "scoped_call_expression":
+            scope = node.child_by_field_name("scope")
+            method = node.child_by_field_name("name")
+            if scope is not None and scope.type in _PHP_NAME_NODE_TYPES:
+                cls = resolve(text(scope))
+                dst = f"{cls}.{text(method)}" if method is not None else cls
+                add(node, "static_call", dst)
+
+        elif ntype == "function_call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type in _PHP_NAME_NODE_TYPES:
+                add(node, "call", resolve(text(fn)))
+
+        elif ntype == "member_call_expression":
+            method = node.child_by_field_name("name")
+            if method is not None and method.type == "name":
+                add(node, "call", text(method))
+
+        elif ntype == "base_clause":
+            for child in node.children:
+                if child.type in _PHP_NAME_NODE_TYPES:
+                    add(node, "extends", resolve(text(child)))
+
+        elif ntype == "class_interface_clause":
+            for child in node.children:
+                if child.type in _PHP_NAME_NODE_TYPES:
+                    add(node, "implements", resolve(text(child)))
+
+        elif ntype == "use_declaration":  # trait use, inside a class body
+            for child in node.children:
+                if child.type in _PHP_NAME_NODE_TYPES:
+                    add(node, "trait_use", resolve(text(child)))
+
+    return edges

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from spine.agents.tools.ast_extract import Symbol, extract_symbols
+from spine.agents.tools.ast_extract import Symbol, extract_edges, extract_symbols
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -82,3 +82,69 @@ def test_unsupported_extension_returns_empty() -> None:
 
 def test_missing_file_returns_empty() -> None:
     assert extract_symbols("/tmp/this-file-does-not-exist-xyz123.py", "x.py") == []
+
+
+# ── PHP dependency-edge extraction ────────────────────────────────────────
+
+
+_EDGE_PHP = """<?php
+namespace App;
+
+use App\\Services\\Mailer;
+use App\\Services\\Long\\PathThing as PT;
+
+class OrderHandler extends BaseHandler implements HandlerInterface {
+    use LoggableTrait;
+
+    public function handle($order) {
+        $mailer = new Mailer();
+        $pt = new PT();
+        Validator::check($order);
+        $mailer->send($order);
+        format_total($order);
+    }
+}
+
+function top_level() {
+    helper_fn();
+}
+"""
+
+
+@pytest.fixture
+def php_edges(tmp_path: Path) -> list:
+    target = tmp_path / "handler.php"
+    target.write_text(_EDGE_PHP)
+    return extract_edges(str(target), "src/handler.php")
+
+
+def _edge_set(edges: list) -> set[tuple[str, str, str]]:
+    return {(e.src_symbol, e.edge_kind, e.dst_name) for e in edges}
+
+
+def test_php_edges_cover_all_kinds(php_edges: list) -> None:
+    got = _edge_set(php_edges)
+    assert ("", "use_import", "Mailer") in got
+    assert ("OrderHandler", "extends", "BaseHandler") in got
+    assert ("OrderHandler", "implements", "HandlerInterface") in got
+    assert ("OrderHandler", "trait_use", "LoggableTrait") in got
+    assert ("OrderHandler.handle", "new", "Mailer") in got
+    assert ("OrderHandler.handle", "static_call", "Validator.check") in got
+    assert ("OrderHandler.handle", "call", "send") in got
+    assert ("OrderHandler.handle", "call", "format_total") in got
+    assert ("top_level", "call", "helper_fn") in got
+    for e in php_edges:
+        assert e.lang == "php"
+        assert e.src_file == "src/handler.php"
+
+
+def test_php_use_alias_resolves_to_target_class(php_edges: list) -> None:
+    # `use ...\PathThing as PT; new PT()` must record PathThing, not PT.
+    got = _edge_set(php_edges)
+    assert ("OrderHandler.handle", "new", "PathThing") in got
+    assert ("", "use_import", "PathThing") in got
+
+
+def test_edges_empty_for_non_php() -> None:
+    assert extract_edges("/tmp/whatever.py", "x.py") == []
+    assert extract_edges("/tmp/missing-file-xyz.php", "x.php") == []

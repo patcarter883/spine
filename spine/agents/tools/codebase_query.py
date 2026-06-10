@@ -65,6 +65,32 @@ _ACTION_TO_MCP: dict[str, str] = {
 }
 
 
+# "No results" phrasings the MCP server uses; checked only on short
+# responses so a real result mentioning these words is never swallowed.
+_EMPTY_RESULT_MARKERS: tuple[str, ...] = (
+    "not found", "no results", "no matches", "no match", "no symbols",
+)
+
+
+def _looks_empty(result: Any) -> bool:
+    """True when an MCP response carries no usable content.
+
+    mcp-codebase-index has no PHP analyzer, so PHP queries come back
+    empty / "not found" rather than erroring — that is the signal to try
+    the local index instead.
+    """
+    if result is None:
+        return True
+    text = result if isinstance(result, str) else str(result)
+    stripped = text.strip()
+    if not stripped or stripped in ("[]", "{}", "null"):
+        return True
+    if len(stripped) < 200:
+        lowered = stripped.lower()
+        return any(marker in lowered for marker in _EMPTY_RESULT_MARKERS)
+    return False
+
+
 class CodebaseQueryInput(BaseModel):
     """Single schema covering every action of :class:`CodebaseQueryTool`.
 
@@ -176,18 +202,26 @@ class CodebaseQueryTool(BaseTool):
         "Pick the action FIRST, then fill the one argument it needs. Use "
         "'name' for the four symbol actions and 'pattern' for 'search' — "
         "they are mutually exclusive. Sub-millisecond latency; use this "
-        "before reading whole files."
+        "before reading whole files. Covers Python/TS/Go/Rust via the "
+        "structural index and PHP via the local symbol index."
     )
     args_schema: ArgsSchema | None = CodebaseQueryInput
 
     workspace_root: str = ""
+    db_path: str = ".spine/spine.db"
 
     # Lazily-loaded MCP tool map: { mcp_tool_name → BaseTool }.
     _tool_map: dict[str, BaseTool] | None = PrivateAttr(default=None)
     _server_configs: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
 
-    def __init__(self, *, workspace_root: str, mcp_servers: dict[str, dict[str, Any]]):
-        super().__init__(workspace_root=workspace_root)
+    def __init__(
+        self,
+        *,
+        workspace_root: str,
+        mcp_servers: dict[str, dict[str, Any]],
+        db_path: str = ".spine/spine.db",
+    ):
+        super().__init__(workspace_root=workspace_root, db_path=db_path)
         # Store the server config; the actual tool load happens on first use.
         self._server_configs = mcp_servers or {}
 
@@ -250,6 +284,70 @@ class CodebaseQueryTool(BaseTool):
     # ``.ainvoke`` API instead — it handles config plumbing and is the
     # documented surface for invoking a BaseTool by argument dict.
 
+    # ── Local-index fallback ────────────────────────────────────────────
+    #
+    # mcp-codebase-index cannot analyze PHP, but the Phase 1 vector index
+    # (symbol_metadata / symbol_fts / symbol_edges in .spine/spine.db)
+    # covers it. Three triggers, in order: a symbol the local index knows
+    # only as PHP skips MCP entirely; an unloaded MCP backend falls back
+    # instead of raising; an empty MCP result falls back before being
+    # returned. Fallback responses carry "source": "local_index".
+
+    def _local_fallback(self, action: str, args: dict[str, Any]) -> str | None:
+        from spine.agents.tools import codebase_query_local as local
+
+        try:
+            if action == "find_symbol":
+                return local.local_find_symbol(self.db_path, args["name"])
+            if action == "get_source":
+                return local.local_get_source(
+                    self.db_path, self.workspace_root, args["name"]
+                )
+            if action == "search":
+                return local.local_search(
+                    self.db_path, args["pattern"], args["max_results"]
+                )
+            if action == "get_dependencies":
+                return local.local_dependencies(self.db_path, args["name"], "dependencies")
+            if action == "get_dependents":
+                return local.local_dependencies(self.db_path, args["name"], "dependents")
+        except Exception:
+            logger.debug("codebase_query: local fallback failed", exc_info=True)
+        return None
+
+    def _php_short_circuit(self, action: str, args: dict[str, Any]) -> str | None:
+        """Serve PHP-only symbols locally without touching MCP."""
+        if action == "search":
+            return None
+        from spine.agents.tools.codebase_query_local import lookup_local_langs
+
+        if lookup_local_langs(self.db_path, args["name"]) == {"php"}:
+            return self._local_fallback(action, args)
+        return None
+
+    def _finish(self, action: str, args: dict[str, Any], result: Any) -> str:
+        """Apply the empty-result fallback to an MCP response."""
+        if _looks_empty(result):
+            local = self._local_fallback(action, args)
+            if local is not None:
+                return local
+        return result
+
+    def _backing_tool_or_fallback(
+        self, action: str, backing_name: str, args: dict[str, Any]
+    ) -> BaseTool | str:
+        tool = self._ensure_loaded().get(backing_name)
+        if tool is not None:
+            return tool
+        local = self._local_fallback(action, args)
+        if local is not None:
+            return local
+        raise ToolException(
+            f"codebase_query: backing tool {backing_name!r} is not loaded "
+            f"(MCP server unavailable?) and the local index has no match. "
+            f"Available actions: {sorted(_ACTION_TO_MCP)}."
+        )
+
     def _run(
         self,
         action: str,
@@ -260,15 +358,13 @@ class CodebaseQueryTool(BaseTool):
         backing_name, backing_args = self._resolve_args(
             action, name, pattern, max_results,
         )
-        tool_map = self._ensure_loaded()
-        tool = tool_map.get(backing_name)
-        if tool is None:
-            raise ToolException(
-                f"codebase_query: backing tool {backing_name!r} is not loaded "
-                f"(MCP server unavailable?). Available actions: "
-                f"{sorted(_ACTION_TO_MCP)}."
-            )
-        return tool.invoke(backing_args)
+        local = self._php_short_circuit(action, backing_args)
+        if local is not None:
+            return local
+        tool = self._backing_tool_or_fallback(action, backing_name, backing_args)
+        if isinstance(tool, str):
+            return tool
+        return self._finish(action, backing_args, tool.invoke(backing_args))
 
     async def _arun(
         self,
@@ -280,12 +376,10 @@ class CodebaseQueryTool(BaseTool):
         backing_name, backing_args = self._resolve_args(
             action, name, pattern, max_results,
         )
-        tool_map = self._ensure_loaded()
-        tool = tool_map.get(backing_name)
-        if tool is None:
-            raise ToolException(
-                f"codebase_query: backing tool {backing_name!r} is not loaded "
-                f"(MCP server unavailable?). Available actions: "
-                f"{sorted(_ACTION_TO_MCP)}."
-            )
-        return await tool.ainvoke(backing_args)
+        local = self._php_short_circuit(action, backing_args)
+        if local is not None:
+            return local
+        tool = self._backing_tool_or_fallback(action, backing_name, backing_args)
+        if isinstance(tool, str):
+            return tool
+        return self._finish(action, backing_args, await tool.ainvoke(backing_args))

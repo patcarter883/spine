@@ -532,6 +532,7 @@ def _inject_mcp_tools(
                 CodebaseQueryTool(
                     workspace_root=workspace_root,
                     mcp_servers=config.mcp_servers,
+                    db_path=config.checkpoint_path,
                 )
             ]
         tools.extend(mcp_tools)
