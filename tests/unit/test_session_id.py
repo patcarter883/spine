@@ -360,6 +360,141 @@ class TestOpenRouterStructuredMethod:
         )
 
 
+class _Routing404(Exception):
+    """Mimics langchain_openrouter's NotFoundResponseError shape."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.status_code = 404
+
+
+_TOOL_CHOICE_404 = (
+    "No endpoints found that support the provided 'tool_choice' value. "
+    "To learn more about provider routing, visit: "
+    "https://openrouter.ai/docs/guides/routing/provider-selection"
+)
+_PARAMS_404 = "No endpoints found that can handle the requested parameters."
+
+
+class _FakeStructuredModel:
+    """Stub model whose bound runnable fails routing for selected methods."""
+
+    def __init__(self, model_name: str, failing_methods: dict[str, Exception]) -> None:
+        self.model_name = model_name
+        self._failing = failing_methods
+        self.methods_invoked: list[str] = []
+
+    def with_structured_output(self, schema: object, method: str = "") -> object:
+        outer = self
+
+        class _Bound:
+            async def ainvoke(self, _input: object, _config: object = None, **_kw: object) -> str:
+                outer.methods_invoked.append(method)
+                exc = outer._failing.get(method)
+                if exc is not None:
+                    raise exc
+                return f"ok:{method}"
+
+        return _Bound()
+
+
+class TestSelfHealingStructured:
+    """Verify invoke-time method demotion on OpenRouter routing 404s.
+
+    Regression (trace 019eaf2a): endpoint capability listings can't reveal
+    value-level support — minimax-m3 advertises ``tool_choice`` but rejects
+    the forced named function that method="function_calling" sends, 404ing
+    at routing time. The binding must demote and retry rather than fail the
+    whole synthesis run.
+    """
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def test_demotes_function_calling_to_json_mode_and_caches(self) -> None:
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "minimax/minimax-m3",
+            {"function_calling": _Routing404(_TOOL_CHOICE_404)},
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "function_calling")
+            result = self._run(wrapper.ainvoke(["msg"]))
+            assert helpers._structured_method_cache["minimax/minimax-m3"] == "json_mode"
+        assert result == "ok:json_mode"
+        assert model.methods_invoked == ["function_calling", "json_mode"]
+
+    def test_walks_full_ladder_from_json_schema(self) -> None:
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model",
+            {
+                "json_schema": _Routing404(_PARAMS_404),
+                "function_calling": _Routing404(_TOOL_CHOICE_404),
+            },
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "json_schema")
+            result = self._run(wrapper.ainvoke(["msg"]))
+        assert result == "ok:json_mode"
+        assert model.methods_invoked == ["json_schema", "function_calling", "json_mode"]
+
+    def test_non_routing_errors_propagate_without_demotion(self) -> None:
+        import pytest
+
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model", {"json_schema": RuntimeError("provider exploded")}
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "json_schema")
+            with pytest.raises(RuntimeError, match="provider exploded"):
+                self._run(wrapper.ainvoke(["msg"]))
+            assert "test/model" not in helpers._structured_method_cache
+        assert model.methods_invoked == ["json_schema"]
+
+    def test_bottom_of_ladder_404_propagates(self) -> None:
+        import pytest
+
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model", {"json_mode": _Routing404(_PARAMS_404)}
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "json_mode")
+            with pytest.raises(_Routing404):
+                self._run(wrapper.ainvoke(["msg"]))
+        assert model.methods_invoked == ["json_mode"]
+
+    def test_adopts_demotion_discovered_by_another_worker(self) -> None:
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model", {"json_schema": _Routing404(_PARAMS_404)}
+        )
+        with patch.dict(
+            helpers._structured_method_cache,
+            {"test/model": "json_mode"},
+            clear=True,
+        ):
+            wrapper = _SelfHealingStructured(model, object, "json_schema")
+            result = self._run(wrapper.ainvoke(["msg"]))
+        # The cached demotion is adopted up-front: json_schema never tried.
+        assert result == "ok:json_mode"
+        assert model.methods_invoked == ["json_mode"]
+
+
 class TestLocalProviderModel:
     """Verify that local providers with base_url get pre-built ChatOpenAI models."""
 

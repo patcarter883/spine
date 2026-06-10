@@ -240,15 +240,111 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
     404s before reaching the provider.  For ChatOpenRouter models we therefore
     consult the model's endpoint capabilities (cached, fail-open) and pick the
     method its endpoints can actually serve.
+
+    The capability probe alone is not sufficient: ``supported_parameters``
+    only says an endpoint accepts a parameter, not which *values* it accepts.
+    minimax-m3 advertises ``tool_choice`` but rejects a forced named function
+    (trace 019eaf2a: 404 "No endpoints found that support the provided
+    'tool_choice' value"), which is exactly what ``method="function_calling"``
+    sends.  ChatOpenRouter bindings are therefore returned as a
+    :class:`_SelfHealingStructured` wrapper that catches routing 404s at
+    invoke time, demotes the method down the ladder (json_schema →
+    function_calling → json_mode), updates the per-model cache so concurrent
+    and future binds skip the dead method, and retries the same input.
     """
     if not _is_openai_style_model(model):
         return model.with_structured_output(schema)
-    method = "json_schema"
     if type(model).__name__ == "ChatOpenRouter":
         model_name = getattr(model, "model_name", None)
         if model_name:
             method = _openrouter_structured_method(model_name)
-    return model.with_structured_output(schema, method=method)
+            return _SelfHealingStructured(model, schema, method)
+    return model.with_structured_output(schema, method="json_schema")
+
+
+# Structured-output methods in order of preference. Demotion on a routing
+# 404 steps one place right; past the end there is nothing left to try and
+# the error propagates to the callsite's existing fallback.
+_STRUCTURED_METHOD_LADDER = ("json_schema", "function_calling", "json_mode")
+
+
+def _is_structured_routing_404(exc: BaseException) -> bool:
+    """True for OpenRouter's up-front "No endpoints found" routing rejection.
+
+    With ``require_parameters=True`` OpenRouter rejects a request before it
+    reaches any provider when no endpoint supports the parameters (or
+    parameter *values*) sent — always HTTP 404 with a message starting
+    "No endpoints found". Matched structurally (status_code attribute +
+    message text) rather than by exception class so we don't need a hard
+    dependency on ``langchain_openrouter``'s exception hierarchy.
+    """
+    return getattr(exc, "status_code", None) == 404 and "No endpoints found" in str(exc)
+
+
+def _demoted_method(method: str) -> str | None:
+    """Next structured-output method down the ladder, or None at the bottom."""
+    try:
+        idx = _STRUCTURED_METHOD_LADDER.index(method)
+    except ValueError:
+        return None
+    if idx + 1 >= len(_STRUCTURED_METHOD_LADDER):
+        return None
+    return _STRUCTURED_METHOD_LADDER[idx + 1]
+
+
+class _SelfHealingStructured:
+    """Structured-output binding that demotes its method on routing 404s.
+
+    Endpoint capability listings can't reveal value-level support (trace
+    019eaf2a: minimax-m3 advertises ``tool_choice`` but rejects a forced
+    named function), so the only reliable detection point is the 404 at
+    invoke time.  On each ``ainvoke`` this wrapper binds with its current
+    method, and when OpenRouter rejects routing it demotes one ladder step,
+    records the demotion in ``_structured_method_cache`` (so other in-flight
+    workers and future binds for the same model skip straight past the dead
+    method), and retries the same input.  At the bottom of the ladder the
+    error propagates unchanged, preserving every callsite's existing
+    ``try/except`` degradation path.
+
+    Only ``ainvoke`` is exposed: every structured callsite in SPINE invokes
+    through ``await structured.ainvoke(...)`` (directly or via
+    :func:`ainvoke_structured_with_retry`).
+    """
+
+    def __init__(self, model: Any, schema: type[BaseModel], method: str) -> None:
+        self._model = model
+        self._schema = schema
+        self._method = method
+        self._model_name: str = getattr(model, "model_name", "") or ""
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        # Adopt a demotion another worker already paid a 404 to discover.
+        if self._model_name:
+            cached = _structured_method_cache.get(self._model_name)
+            if cached:
+                self._method = cached
+        while True:
+            bound = self._model.with_structured_output(self._schema, method=self._method)
+            try:
+                return await bound.ainvoke(input, config, **kwargs)
+            except Exception as exc:
+                next_method = (
+                    _demoted_method(self._method)
+                    if _is_structured_routing_404(exc)
+                    else None
+                )
+                if next_method is None:
+                    raise
+                logger.warning(
+                    "%s: structured-output method=%s rejected by OpenRouter "
+                    "routing (404); demoting to method=%s and retrying",
+                    self._model_name or type(self._model).__name__,
+                    self._method,
+                    next_method,
+                )
+                self._method = next_method
+                if self._model_name:
+                    _structured_method_cache[self._model_name] = next_method
 
 
 _OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{model}/endpoints"
