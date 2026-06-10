@@ -1041,3 +1041,140 @@ async def test_worker_dedupe_does_not_memoise_tool_errors():
     assert kind2 == "ok"
     assert healthy.calls == [tc["args"]]
     assert msg2.content == "recovered"
+
+
+# ── Reasoning suppression + length-aware retry (trace 019eafac) ─────────
+
+
+@pytest.mark.asyncio
+async def test_supervisor_suppresses_reasoning_before_structured_output(monkeypatch):
+    """The directive call is mechanical — thinking must be disabled so a
+    local reasoning model doesn't burn the tight completion cap on
+    chain-of-thought before emitting JSON (trace 019eafac)."""
+    captured: dict[str, Any] = {}
+
+    class _Structured:
+        async def ainvoke(self, messages, **kw):
+            return {"analysis_and_reasoning": "done", "is_complete": True}
+
+    class _Model:
+        def with_structured_output(self, schema):
+            return _Structured()
+
+    def _capture_suppress(model):
+        captured["suppressed"] = True
+        return model
+
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", lambda model, cap: model)
+    monkeypatch.setattr(rs, "suppress_reasoning", _capture_suppress)
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True
+    assert captured.get("suppressed") is True
+
+
+class _FakeLengthError(Exception):
+    """Stands in for openai.LengthFinishReasonError in retry tests."""
+
+
+@pytest.mark.asyncio
+async def test_supervisor_retries_once_with_raised_cap_on_length_error(monkeypatch):
+    """A directive truncated at the completion cap retries ONCE with a much
+    larger budget instead of silently terminating exploration (trace
+    019eafac: cap=4096 truncations degraded to terminating directives)."""
+    from spine.config import SpineConfig
+
+    caps: list[int] = []
+
+    class _FailingStructured:
+        async def ainvoke(self, messages, **kw):
+            raise _FakeLengthError("length limit reached")
+
+    class _OkStructured:
+        async def ainvoke(self, messages, **kw):
+            return {"analysis_and_reasoning": "recovered", "is_complete": True}
+
+    binds = [_FailingStructured(), _OkStructured()]
+
+    class _Model:
+        def with_structured_output(self, schema):
+            raise AssertionError("bind_structured_output is monkeypatched")
+
+    def _capture_cap(model, cap):
+        caps.append(cap)
+        return model
+
+    monkeypatch.setattr(rs, "_LengthFinishReasonError", _FakeLengthError)
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", _capture_cap)
+    monkeypatch.setattr(rs, "suppress_reasoning", lambda model: model)
+    monkeypatch.setattr(rs, "bind_structured_output", lambda model, schema: binds.pop(0))
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True
+    # The recovered directive came from the retry, not the terminating fallback.
+    assert d.analysis_and_reasoning == "recovered"
+    cfg = SpineConfig.load()
+    base_cap = cfg.researcher_supervisor_max_completion_tokens
+    assert caps[0] == base_cap
+    assert caps[1] == max(base_cap * 4, cfg.max_completion_tokens or 0, 16384)
+    assert caps[1] > caps[0]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_terminates_when_length_retry_also_fails(monkeypatch):
+    """Two consecutive truncations exhaust the retry — the node degrades to a
+    terminating directive so the loop exits instead of spinning."""
+
+    class _FailingStructured:
+        async def ainvoke(self, messages, **kw):
+            raise _FakeLengthError("length limit reached")
+
+    class _Model:
+        def with_structured_output(self, schema):
+            raise AssertionError("bind_structured_output is monkeypatched")
+
+    monkeypatch.setattr(rs, "_LengthFinishReasonError", _FakeLengthError)
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", lambda model, cap: model)
+    monkeypatch.setattr(rs, "suppress_reasoning", lambda model: model)
+    monkeypatch.setattr(
+        rs, "bind_structured_output", lambda model, schema: _FailingStructured()
+    )
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True

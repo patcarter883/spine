@@ -431,3 +431,48 @@ def test_no_direct_mcp_codebase_index_invocations():
     )
     bad = [f for f in out if not f.endswith(allowed_suffixes)]
     assert not bad, f"direct mcp_codebase-index_ references: {bad}"
+
+
+# ── resolve_backing_call / canonical_backing_call ───────────────────────
+
+
+def test_resolve_backing_call_symbol_actions():
+    from spine.agents.tools.codebase_query import resolve_backing_call
+
+    name, args = resolve_backing_call("get_source", " render ", None)
+    assert name == "mcp_codebase-index_get_function_source"
+    assert args == {"name": "render"}
+
+
+def test_resolve_backing_call_search_clamps_max_results():
+    from spine.agents.tools.codebase_query import resolve_backing_call
+
+    name, args = resolve_backing_call("search", None, "def foo", max_results=0)
+    assert name == "mcp_codebase-index_search_codebase"
+    assert args == {"pattern": "def foo", "max_results": 1}
+
+
+def test_resolve_backing_call_unknown_action_raises():
+    from langchain_core.tools import ToolException
+
+    from spine.agents.tools.codebase_query import resolve_backing_call
+
+    with pytest.raises(ToolException, match="unknown action"):
+        resolve_backing_call("read_file", "x", None)
+
+
+def test_canonical_backing_call_drops_unknown_keys():
+    from spine.agents.tools.codebase_query import canonical_backing_call
+
+    assert canonical_backing_call(
+        {"action": "get_source", "name": "render", "file_hint": "a/b.py"}
+    ) == ("mcp_codebase-index_get_function_source", {"name": "render"})
+
+
+def test_canonical_backing_call_returns_none_on_invalid():
+    from spine.agents.tools.codebase_query import canonical_backing_call
+
+    assert canonical_backing_call({"action": "search"}) is None
+    assert canonical_backing_call({"action": "get_source"}) is None
+    assert canonical_backing_call({}) is None
+    assert canonical_backing_call({"action": "get_source", "name": "x", "pattern": "y"}) is None

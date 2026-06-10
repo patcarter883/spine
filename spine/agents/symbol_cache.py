@@ -27,7 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,68 @@ def is_cacheable(tool_name: str) -> bool:
     return False
 
 
+# ── Args canonicalization ────────────────────────────────────────────
+#
+# Fingerprinting raw facade args lets superficially different calls miss
+# each other: ``codebase_query {"action":"get_source","name":"render"}``
+# and the same call plus a hallucinated ``file_hint`` key (dropped by
+# Pydantic ``extra="ignore"``) resolve to the *identical* backing MCP
+# call but produced distinct cache keys — trace 019eafac fetched
+# ``get_function_source(render)`` 3× in one work_id. A canonicalizer
+# maps ``(tool_name, raw args)`` → the resolved backing call before
+# fingerprinting, so every variant (and any raw ``mcp_*`` caller)
+# coalesces onto one entry.
+
+def _codebase_query_canonicalizer(
+    args: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    # Lazy import: symbol_cache must stay importable independent of the
+    # tools package; codebase_query does not import symbol_cache (no cycle).
+    from spine.agents.tools.codebase_query import canonical_backing_call
+
+    return canonical_backing_call(args)
+
+
+_args_canonicalizers: dict[
+    str, Callable[[dict[str, Any]], tuple[str, dict[str, Any]] | None]
+] = {
+    "codebase_query": _codebase_query_canonicalizer,
+}
+
+
+def register_args_canonicalizer(
+    tool_name: str,
+    fn: Callable[[dict[str, Any]], tuple[str, dict[str, Any]] | None],
+) -> None:
+    """Register a canonical-call mapper for *tool_name*.
+
+    ``fn`` receives the raw tool args and returns ``(canonical_tool_name,
+    canonical_args)``, or ``None`` to keep the raw key (e.g. when the args
+    don't validate). The canonical name should itself be ``is_cacheable``
+    so direct callers of the backing tool share the same entries.
+    """
+    if tool_name and fn is not None:
+        _args_canonicalizers[tool_name] = fn
+
+
+def _canonical_call(
+    tool_name: str, args: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    fn = _args_canonicalizers.get(tool_name)
+    if fn is not None:
+        try:
+            mapped = fn(args)
+            if mapped is not None:
+                return mapped
+        except Exception:
+            logger.debug(
+                "symbol_cache: canonicalizer for %r failed — using raw key",
+                tool_name,
+                exc_info=True,
+            )
+    return tool_name, args
+
+
 def args_fingerprint(args: dict[str, Any]) -> str:
     """Stable short hash of a tool call's arguments for cache keying."""
     try:
@@ -152,6 +214,7 @@ _index_lock = asyncio.Lock()
 
 
 def _key(work_id: str, tool_name: str, args: dict[str, Any]) -> tuple[str, str, str]:
+    tool_name, args = _canonical_call(tool_name, args)
     return (work_id or "_unknown", tool_name, args_fingerprint(args))
 
 

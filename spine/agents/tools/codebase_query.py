@@ -212,7 +212,8 @@ class CodebaseQueryInput(BaseModel):
             "Symbol identifier (function, class, or method name). REQUIRED "
             "for find_symbol, get_source, get_dependencies, get_dependents. "
             "Must be a clean identifier — no whitespace, no module prefix, "
-            "no parentheses."
+            "no parentheses. Do not pass any other arguments (e.g. "
+            "file_hint) — they are ignored."
         ),
     )
     pattern: str | None = Field(
@@ -271,6 +272,68 @@ def _normalise_pattern(value: str | None) -> str:
         )
     _reject_markup(value, "pattern")
     return value
+
+
+def resolve_backing_call(
+    action: str,
+    name: str | None,
+    pattern: str | None,
+    max_results: int = 20,
+) -> tuple[str, dict[str, Any]]:
+    """Map facade args → ``(backing MCP tool name, backing args)``.
+
+    Single source of truth for both dispatch (``CodebaseQueryTool``) and
+    cache keying (:func:`canonical_backing_call`) so the two can never
+    diverge. Raises ``ToolException`` on invalid input.
+    """
+    if action == "search":
+        if name is not None:
+            raise ToolException(
+                "codebase_query: 'name' must not be supplied for action='search'; "
+                "use 'pattern' instead."
+            )
+        return _ACTION_TO_MCP[action], {
+            "pattern": _normalise_pattern(pattern),
+            "max_results": max(1, int(max_results)),
+        }
+    # All other actions take a symbol name.
+    if action not in _ACTION_TO_MCP:
+        raise ToolException(
+            f"codebase_query: unknown action {action!r}. "
+            f"Available actions: {sorted(_ACTION_TO_MCP)}."
+        )
+    if pattern is not None:
+        raise ToolException(
+            f"codebase_query: 'pattern' must not be supplied for action={action!r}; "
+            f"use 'name' instead."
+        )
+    return _ACTION_TO_MCP[action], {"name": _normalise_name(name, action)}
+
+
+def canonical_backing_call(args: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Resolve raw facade args to the backing MCP call for dedupe keying.
+
+    ``symbol_cache`` fingerprints raw tool args, so superficially different
+    facade calls — e.g. a hallucinated ``file_hint`` key (silently dropped
+    by Pydantic ``extra="ignore"``) or an explicit default ``max_results`` —
+    produced distinct cache keys for the *identical* backing MCP call
+    (trace 019eafac: ``get_source(render)`` fetched 3×). Keying on the
+    resolved backing call coalesces every variant, and also shares entries
+    with any path that still issues raw ``mcp_codebase-index_*`` calls.
+
+    Returns ``None`` when the args don't validate — the caller falls back
+    to raw-key behaviour (error responses are never worth memoising under
+    a canonical key anyway).
+    """
+    try:
+        return resolve_backing_call(
+            args["action"],
+            args.get("name"),
+            args.get("pattern"),
+            int(args.get("max_results", 20)),
+        )
+    except Exception:
+        return None
 
 
 class CodebaseQueryTool(BaseTool):
@@ -350,23 +413,7 @@ class CodebaseQueryTool(BaseTool):
     def _resolve_args(
         self, action: str, name: str | None, pattern: str | None, max_results: int,
     ) -> tuple[str, dict[str, Any]]:
-        if action == "search":
-            if name is not None:
-                raise ToolException(
-                    "codebase_query: 'name' must not be supplied for action='search'; "
-                    "use 'pattern' instead."
-                )
-            return _ACTION_TO_MCP[action], {
-                "pattern": _normalise_pattern(pattern),
-                "max_results": max(1, int(max_results)),
-            }
-        # All other actions take a symbol name.
-        if pattern is not None:
-            raise ToolException(
-                f"codebase_query: 'pattern' must not be supplied for action={action!r}; "
-                f"use 'name' instead."
-            )
-        return _ACTION_TO_MCP[action], {"name": _normalise_name(name, action)}
+        return resolve_backing_call(action, name, pattern, max_results)
 
     # NOTE: backing tools are wrapped as ``langchain_core.tools.StructuredTool``
     # by the MCP adapter. Their ``_run`` / ``_arun`` signatures require a

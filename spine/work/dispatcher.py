@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import uuid
+from contextlib import aclosing
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -887,78 +888,85 @@ async def resume_work(
         # (same pattern as submit_work — uses stream_mode=["updates", "messages"]
         # with subgraphs=True and version="v2" for consistent StreamPart format)
         result: dict[str, Any] = dict(resume_state)
-        async for chunk in traced_astream(
-            graph.astream(
-                resume_state,
-                thread_config,
-                stream_mode=["updates", "messages"],
-                subgraphs=True,
-                version="v2",
-            ),
-            work_id,
-            work_type,
-        ):
-            # V2 format: each chunk is a StreamPart dict:
-            #   {"type": "updates"|"messages", "ns": (...), "data": ...}
-            # Skip non-update chunks.  Only process root-level updates
-            # (ns == ()) — subgraph updates come from Deep Agent internals.
-            if not isinstance(chunk, dict) or chunk.get("type") != "updates":
-                continue
-            ns = chunk.get("ns", ())
-            if ns != ():
-                continue
+        # aclosing guarantees the generator (and the tracing context inside
+        # traced_astream) is finalised even on an exception/early exit, so
+        # the LangSmith root span is closed deterministically instead of
+        # waiting on GC.
+        async with aclosing(
+            traced_astream(
+                graph.astream(
+                    resume_state,
+                    thread_config,
+                    stream_mode=["updates", "messages"],
+                    subgraphs=True,
+                    version="v2",
+                ),
+                work_id,
+                work_type,
+            )
+        ) as stream:
+            async for chunk in stream:
+                # V2 format: each chunk is a StreamPart dict:
+                #   {"type": "updates"|"messages", "ns": (...), "data": ...}
+                # Skip non-update chunks.  Only process root-level updates
+                # (ns == ()) — subgraph updates come from Deep Agent internals.
+                if not isinstance(chunk, dict) or chunk.get("type") != "updates":
+                    continue
+                ns = chunk.get("ns", ())
+                if ns != ():
+                    continue
 
-            data = chunk.get("data", {})
-            for node_name, node_output in data.items():
-                # Deep-merge artifacts
-                node_artifacts = node_output.get("artifacts")
-                if node_artifacts and isinstance(node_artifacts, dict):
-                    existing = result.get("artifacts", {})
-                    if not isinstance(existing, dict):
-                        existing = {}
-                    merged = {**existing, **node_artifacts}
-                    for key in set(existing) & set(node_artifacts):
-                        if isinstance(existing[key], dict) and isinstance(
-                            node_artifacts[key], dict
-                        ):
-                            merged[key] = {**existing[key], **node_artifacts[key]}
-                    node_output = {**node_output, "artifacts": merged}
+                data = chunk.get("data", {})
+                for node_name, node_output in data.items():
+                    # Deep-merge artifacts
+                    node_artifacts = node_output.get("artifacts")
+                    if node_artifacts and isinstance(node_artifacts, dict):
+                        existing = result.get("artifacts", {})
+                        if not isinstance(existing, dict):
+                            existing = {}
+                        merged = {**existing, **node_artifacts}
+                        for key in set(existing) & set(node_artifacts):
+                            if isinstance(existing[key], dict) and isinstance(
+                                node_artifacts[key], dict
+                            ):
+                                merged[key] = {**existing[key], **node_artifacts[key]}
+                        node_output = {**node_output, "artifacts": merged}
 
-                # Accumulate feedback
-                node_feedback = node_output.get("feedback")
-                if node_feedback and isinstance(node_feedback, list):
-                    existing_fb = result.get("feedback", [])
-                    if not isinstance(existing_fb, list):
-                        existing_fb = []
-                    node_output = {
-                        **node_output,
-                        "feedback": existing_fb + node_feedback,
-                    }
+                    # Accumulate feedback
+                    node_feedback = node_output.get("feedback")
+                    if node_feedback and isinstance(node_feedback, list):
+                        existing_fb = result.get("feedback", [])
+                        if not isinstance(existing_fb, list):
+                            existing_fb = []
+                        node_output = {
+                            **node_output,
+                            "feedback": existing_fb + node_feedback,
+                        }
 
-                result.update(node_output)
-                phase = node_output.get("current_phase", "")
-                status = node_output.get("status", "")
-                if phase or status:
-                    _update_work_progress(db, work_id, phase, status)
-                    logger.info(f"[{work_id}] Resume: Phase {phase or node_name} → {status}")
-                    audit.log_event(
-                        work_id,
-                        "phase_completed",
-                        node_name,
-                        {"phase": phase, "status": status},
-                    )
+                    result.update(node_output)
+                    phase = node_output.get("current_phase", "")
+                    status = node_output.get("status", "")
+                    if phase or status:
+                        _update_work_progress(db, work_id, phase, status)
+                        logger.info(f"[{work_id}] Resume: Phase {phase or node_name} → {status}")
+                        audit.log_event(
+                            work_id,
+                            "phase_completed",
+                            node_name,
+                            {"phase": phase, "status": status},
+                        )
 
-                # Persist artifacts
-                node_artifacts = node_output.get("artifacts")
-                if node_artifacts and isinstance(node_artifacts, dict):
-                    for art_phase, phase_arts in node_artifacts.items():
-                        if not isinstance(phase_arts, dict):
-                            continue
-                        for art_name, art_content in phase_arts.items():
-                            if art_content is not None:
-                                artifacts.save_artifact(
-                                    work_id, art_phase, art_name, str(art_content)
-                                )
+                    # Persist artifacts
+                    node_artifacts = node_output.get("artifacts")
+                    if node_artifacts and isinstance(node_artifacts, dict):
+                        for art_phase, phase_arts in node_artifacts.items():
+                            if not isinstance(phase_arts, dict):
+                                continue
+                            for art_name, art_content in phase_arts.items():
+                                if art_content is not None:
+                                    artifacts.save_artifact(
+                                        work_id, art_phase, art_name, str(art_content)
+                                    )
 
         # Derive final status (resume has no stall tracking).
         final_phase = result.get("current_phase", "")
@@ -1119,18 +1127,19 @@ async def resume_interrupted_work(
     # leaving it stuck "running" as a ghost — this path runs on the detached
     # resume executor thread, where the exception is otherwise just dropped.
     result: dict[str, Any] = {}
+    stream = traced_astream(
+        graph.astream(
+            command,
+            thread_config,
+            stream_mode=["updates", "messages"],
+            subgraphs=True,
+            version="v2",
+        ),
+        work_id,
+        work_type,
+    )
     try:
-        async for chunk in traced_astream(
-            graph.astream(
-                command,
-                thread_config,
-                stream_mode=["updates", "messages"],
-                subgraphs=True,
-                version="v2",
-            ),
-            work_id,
-            work_type,
-        ):
+        async for chunk in stream:
             if not isinstance(chunk, dict) or chunk.get("type") != "updates":
                 continue
             if chunk.get("ns", ()) != ():
@@ -1146,6 +1155,11 @@ async def resume_interrupted_work(
     except Exception as e:
         _finalise_failed_work(db, work_id, audit, e)
         raise
+    finally:
+        # Deterministically finalise the generator (and the tracing context
+        # inside traced_astream) so the LangSmith root span closes even on
+        # an exception/early exit instead of waiting on GC.
+        await stream.aclose()
 
     final_phase = result.get("current_phase", "")
     final_status = _derive_final_status(
@@ -2230,8 +2244,13 @@ async def approve_and_spawn(
         stall_timeout_val = int(stall_timeout or "120")
 
         async def _stall_timer_fn(to: int) -> None:
+            # Marks the run stalled only when the timer expires; the
+            # per-chunk cancel in _stream_graph keeps it from firing while
+            # the stream is making progress.
+            nonlocal stalled
             try:
                 await asyncio.sleep(to)
+                stalled = True
             except asyncio.CancelledError:
                 pass
 
@@ -2242,16 +2261,17 @@ async def approve_and_spawn(
 
             if stall_timeout_val > 0:
                 stall_task = asyncio.ensure_future(_stall_timer_fn(stream_timeout))
-                stall_task.add_done_callback(
-                    lambda t: setattr(_globals := type("", (), {}), "stalled", True) or None
-                )
 
-            async for chunk in graph.astream(
-                resume_state,
-                thread_config,
-                stream_mode=["updates", "messages"],
-                subgraphs=True,
-                version="v2",
+            async for chunk in traced_astream(
+                graph.astream(
+                    resume_state,
+                    thread_config,
+                    stream_mode=["updates", "messages"],
+                    subgraphs=True,
+                    version="v2",
+                ),
+                plan_id,
+                work_type,
             ):
                 if stall_task and not stall_task.done():
                     stall_task.cancel()

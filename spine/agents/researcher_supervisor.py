@@ -45,7 +45,14 @@ from spine.agents.helpers import (
     bind_structured_output,
     cap_completion_tokens,
     resolve_chat_model,
+    suppress_reasoning,
 )
+
+try:  # openai is always present when the model is ChatOpenAI; guard for safety.
+    from openai import LengthFinishReasonError as _LengthFinishReasonError
+except Exception:  # pragma: no cover - openai missing → length retry is a no-op
+    class _LengthFinishReasonError(Exception):  # type: ignore[no-redef]
+        """Fallback sentinel — never raised, so the except branch stays inert."""
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -430,11 +437,13 @@ async def run_supervisor_node(
     # LengthFinishReasonError (trace 019e8679, run 019e867a). The cap fails fast;
     # the except below turns the truncation into a terminating directive so the
     # loop exits cleanly. Mirrors exploration_agents._findings_structured_model.
+    base_model = model
+    cap = 0
     try:
         from spine.config import SpineConfig
 
         cap = SpineConfig.load().researcher_supervisor_max_completion_tokens
-        model = cap_completion_tokens(model, cap)
+        model = suppress_reasoning(cap_completion_tokens(model, cap))
     except Exception:
         logger.debug(
             "[%s] researcher_supervisor: token-cap copy failed — using uncapped model",
@@ -462,18 +471,56 @@ async def run_supervisor_node(
         history_summary=_render_history_summary(evaluation_history),
     )
 
+    messages = [
+        SystemMessage(content=_SUPERVISOR_SYSTEM_PROMPT),
+        HumanMessage(content=user_msg),
+    ]
     try:
         response: Any = await ainvoke_structured_with_retry(
             structured,
-            [
-                SystemMessage(content=_SUPERVISOR_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ],
+            messages,
             label=f"researcher_supervisor[{phase_path}]",
         )
+    except _LengthFinishReasonError:
+        # The directive was truncated at the completion cap. Retry once with
+        # a much larger budget rebuilt from the pre-cap model — losing this
+        # call doesn't just drop one answer, it terminates exploration early
+        # (the generic except below degrades to a terminating directive).
+        try:
+            from spine.config import SpineConfig
+
+            global_cap = SpineConfig.load().max_completion_tokens or 0
+            raised_cap = max(cap * 4, global_cap, 16384)
+            logger.warning(
+                "[%s] researcher_supervisor: directive truncated at cap=%d for "
+                "phase_path=%r — retrying once with cap=%d",
+                work_id,
+                cap,
+                phase_path,
+                raised_cap,
+            )
+            retry_structured = bind_structured_output(
+                suppress_reasoning(cap_completion_tokens(base_model, raised_cap)),
+                SupervisorDirective,
+            )
+            response = await ainvoke_structured_with_retry(
+                retry_structured,
+                messages,
+                label=f"researcher_supervisor[{phase_path}]/length-retry",
+            )
+        except Exception:
+            logger.warning(
+                "[%s] researcher_supervisor: length retry failed for phase_path=%r — "
+                "terminating exploration early (directive degraded to terminate)",
+                work_id,
+                phase_path,
+                exc_info=True,
+            )
+            return _terminating_directive("supervisor invocation failed")
     except Exception:
         logger.warning(
-            "[%s] researcher_supervisor: invocation failed for phase_path=%r",
+            "[%s] researcher_supervisor: invocation failed for phase_path=%r — "
+            "terminating exploration early (directive degraded to terminate)",
             work_id,
             phase_path,
             exc_info=True,

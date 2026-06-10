@@ -180,6 +180,45 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
     return model.model_copy(update={"max_completion_tokens": cap})
 
 
+def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
+    """Return a model_copy with thinking disabled — no-op for non-local models.
+
+    Mechanical structured-output calls (supervisor directives, findings
+    extraction) gain nothing from chain-of-thought, but on local thinking
+    models (e.g. Qwen3.6) the reasoning channel consumes the tight
+    ``cap_completion_tokens`` budget before any JSON is emitted, raising
+    ``LengthFinishReasonError`` (trace 019eafac). We send the same two
+    suppression levers as :func:`_build_local_model` (see its
+    ``reasoning: false`` block for why both are needed): ``reasoning_budget:
+    0`` for budget-honouring models and ``enable_thinking: false`` for
+    template-gated ones.
+
+    Scoped to ``ChatOpenAI`` instances pointing at a non-OpenAI ``base_url``
+    (local/OpenAI-compatible servers). ChatOpenRouter is not a ChatOpenAI
+    subclass and real OpenAI endpoints reject unknown extra_body keys —
+    both pass through unchanged. Merges into any existing ``extra_body``
+    rather than replacing it, so a provider-level ``reasoning: false``
+    config stays intact (idempotent). Fails open on any error.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+
+        if not isinstance(model, ChatOpenAI):
+            return model
+        base_url = getattr(model, "openai_api_base", None)
+        if not base_url or "api.openai.com" in str(base_url):
+            return model
+        extra = dict(getattr(model, "extra_body", None) or {})
+        template_kwargs = dict(extra.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = False
+        extra["reasoning_budget"] = 0
+        extra["chat_template_kwargs"] = template_kwargs
+        return model.model_copy(update={"extra_body": extra})
+    except Exception:
+        logger.debug("suppress_reasoning: copy failed — using model as-is", exc_info=True)
+        return model
+
+
 def _is_openai_style_model(model: Any) -> bool:
     """True when ``model``'s ``with_structured_output`` supports json_schema.
 
