@@ -13,6 +13,23 @@ from spine.config import SpineConfig
 from spine.models.types import Task, Artifact, ReviewFeedback, PromptRequest
 
 
+@pytest.fixture(autouse=True)
+def _no_langsmith_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the test suite out of LangSmith.
+
+    Importing ``spine.config`` loads the repo's ``.env``, so the real
+    ``LANGSMITH_API_KEY`` sits in ``os.environ`` during tests. The ambient
+    tracing flag is already forced off, but ``work_run_tracing()`` opts the
+    work-run code path back in whenever a key is present — so dispatcher and
+    onboarding-engine tests emit real traces. Deleting the key makes
+    ``work_run_tracing`` a no-op; ``SPINE_TRACE_ALL`` is cleared so the
+    trace-everything escape hatch cannot re-enable tracing under pytest
+    either.
+    """
+    for var in ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY", "SPINE_TRACE_ALL"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture(scope="session")
 def temp_dir() -> Generator[Path, None, None]:
     """Create a temporary directory for test files."""
