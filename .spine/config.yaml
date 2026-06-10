@@ -202,9 +202,9 @@ providers:
       provider: pat
     # RAG phase providers
     classification:
-      provider: local-tiny
+      provider: pat
     summarization:
-      provider: local-tiny
+      provider: pat
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false
