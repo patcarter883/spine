@@ -156,6 +156,39 @@ async def _run_plan_agent(
         plan_json_path = (
             Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
         )
+
+        # One corrective retry before failing the contract. A local thinking
+        # model can burn its whole generation in the reasoning channel and
+        # stop with empty content and no tool call (trace 019eb00d: 26K
+        # completion tokens, finish_reason=stop, plan.json never written).
+        # Continue the same conversation with an explicit instruction so the
+        # model sees its own empty turn; the CriticalContractFailure below
+        # (and subgraph_wrapper's clean-thread retry) remains the backstop.
+        if not plan_json_path.exists():
+            logger.warning(
+                "[%s] PLAN agent finished without writing plan.json — "
+                "issuing one corrective retry",
+                work_id,
+            )
+            nudge = (
+                "Your previous turn produced no plan: plan.json was not "
+                "written. Do not deliberate further. Call "
+                "`write_structured_plan` exactly once, NOW, with the "
+                "structured fields (architecture_overview, "
+                "technology_choices, feature_slices, testing_strategy, "
+                "risks, codebase_map)."
+            )
+            retry_messages = list(result.get("messages") or []) + [
+                {"role": "user", "content": nudge}
+            ]
+            result = await ainvoke_with_retry(
+                agent,
+                {"messages": retry_messages},
+                phase_name=PhaseName.PLAN.value,
+                work_id=work_id,
+                work_type=work_type,
+                context=ctx,
+            )
         plan_json_str: str | None = None
         execution_waves: list[list[dict]] = []
 
@@ -196,6 +229,14 @@ async def _run_plan_agent(
             "read_cache": result.get("read_cache") or {},
         }
 
+    except CriticalContractFailure:
+        # Must propagate to subgraph_wrapper's structural-retry handler so a
+        # missing/malformed plan.json re-runs the phase on a clean thread.
+        # Trace 019eb00d: this blanket except used to swallow it into a soft
+        # phase_status="error", so the empty plan_json flowed to the critic
+        # gate, whose own contract failure triggered a full phase rework
+        # (research included) instead of one in-place agent retry.
+        raise
     except Exception as e:
         logger.error(f"[{work_id}] PLAN subgraph agent failed: {e}", exc_info=True)
         return {
