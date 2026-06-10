@@ -82,6 +82,7 @@ providers:
     enabled: true
     stream_usage: true
     max_concurrent_calls: 2
+    context_window: 60000
   - name: pat
     type: deepagents-model
     model: openai:model
@@ -91,6 +92,7 @@ providers:
     enabled: true
     stream_usage: true
     max_concurrent_calls: 8
+    context_window: 60000
   - name: local-tiny
     type: deepagents-model
     model: openai:Gemma-4-E4B-it-GGUF
@@ -114,21 +116,21 @@ providers:
     rerank_path: /reranking
   phases:
     specify:
-      provider: local
+      provider: pat
     specify/subagents/researcher:
       provider: pat
     plan:
-      provider: local
+      provider: pat
     plan/subagents/researcher:
       provider: pat
     implement:
       provider: pat
     verify:
-      provider: local
+      provider: pat
     critic:
-      provider: local
+      provider: pat
     gap_plan:
-      provider: local
+      provider: pat
     classification:
       provider: pat
       max_completion_tokens: 1024
@@ -140,4 +142,4 @@ providers:
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local
+      provider: pat
