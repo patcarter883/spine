@@ -76,6 +76,61 @@ def test_typescript_extracts_functions_arrow_classes_interfaces() -> None:
         assert s.lang == "typescript"
 
 
+def test_c_extracts_functions_structs_enums_unions() -> None:
+    sample = FIXTURES / "sample.c"
+    symbols = extract_symbols(str(sample), "tests/fixtures/sample.c")
+
+    names = _names(symbols)
+    # plain function, pointer-returning static function, struct, union, enum
+    assert {"add", "format_point", "Point", "Value", "Color"}.issubset(names)
+    by_name = {s.symbol_name: s for s in symbols}
+    assert by_name["add"].symbol_type == "function"
+    assert by_name["Point"].symbol_type == "struct"
+    assert by_name["Value"].symbol_type == "union"
+    assert by_name["Color"].symbol_type == "enum"
+    for s in symbols:
+        assert s.lang == "c"
+        assert s.raw_code
+
+
+def test_cpp_extracts_classes_methods_and_free_functions() -> None:
+    sample = FIXTURES / "sample.cpp"
+    symbols = extract_symbols(str(sample), "tests/fixtures/sample.cpp")
+
+    names = _names(symbols)
+    # class, struct, enum class, in-class method, out-of-line method,
+    # reference-returning and pointer-returning free functions
+    assert {
+        "Greeter", "Point", "Color", "greet",
+        "Greeter::shout", "dot", "pick", "make_counter",
+    }.issubset(names)
+
+    by_name_type = {(s.symbol_name, s.symbol_type): s for s in symbols}
+    assert ("Greeter", "class") in by_name_type
+    # The constructor is a method that shares the class's name.
+    assert ("Greeter", "method") in by_name_type
+    assert ("Point", "struct") in by_name_type
+    assert ("Color", "enum") in by_name_type
+    # In-class definition is a method qualified by its enclosing class.
+    greet = by_name_type[("greet", "method")]
+    assert greet.symbol_type == "method"
+    assert greet.parent_class == "Greeter"
+    assert greet.qualified_name == "Greeter.greet"
+    # Destructor is captured too.
+    assert "~Greeter" in names
+    for s in symbols:
+        assert s.lang == "cpp"
+        assert s.raw_code
+
+
+def test_header_extension_parses_as_cpp(tmp_path: Path) -> None:
+    header = tmp_path / "util.h"
+    header.write_text("int twice(int v);\nint twice(int v) { return v * 2; }\n")
+    symbols = extract_symbols(str(header), "src/util.h")
+    assert _names(symbols) == {"twice"}
+    assert symbols[0].lang == "cpp"
+
+
 def test_unsupported_extension_returns_empty() -> None:
     assert extract_symbols("/tmp/nonexistent.yaml", "x.yaml") == []
 

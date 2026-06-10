@@ -45,7 +45,10 @@ logger = logging.getLogger(__name__)
 
 # Extensions the AST extractor can parse. Mirrors VectorIndexer — only
 # extensions that yield symbols, not every text file in the tree.
-_INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({".py", ".php", ".ts", ".tsx"})
+_INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".php", ".ts", ".tsx",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+})
 
 # Directories never worth walking — vendored deps, VCS, build output, caches.
 _SKIP_DIRS: frozenset[str] = frozenset(
@@ -63,6 +66,9 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         "build",
         ".tox",
         "vendor",
+        "external",
+        "third_party",
+        "extern",
     }
 )
 
@@ -75,6 +81,14 @@ _EXT_TO_LANG: dict[str, str] = {
     ".php": "php",
     ".ts": "typescript",
     ".tsx": "typescript",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".h": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
 }
 
 

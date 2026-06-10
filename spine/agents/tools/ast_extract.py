@@ -10,6 +10,11 @@ Supported languages (inferred from file extension):
 - ``.py``        → python
 - ``.php``       → php
 - ``.ts``/``.tsx`` → typescript
+- ``.c``         → c
+- ``.cpp``/``.cc``/``.cxx``/``.h``/``.hpp``/``.hh``/``.hxx`` → cpp
+
+``.h`` is parsed with the C++ grammar: it is a superset that handles plain
+C headers as well as C++ ones, so ambiguous headers never lose symbols.
 
 Unknown extensions return an empty list (logged at DEBUG).
 """
@@ -29,6 +34,14 @@ _EXT_TO_LANG: dict[str, str] = {
     ".php": "php",
     ".ts": "typescript",
     ".tsx": "typescript",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".h": "cpp",  # C++ grammar is a superset; parses C headers too
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
 }
 
 
@@ -95,6 +108,31 @@ _QUERY_STRINGS: dict[str, str] = {
             name: (identifier) @name
             value: (arrow_function)) @def
     """,
+    # body fields are required on struct/enum/union/class patterns so that
+    # forward declarations and uses-as-a-type don't produce empty symbols.
+    "c": """
+        (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
+        (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @def
+        (struct_specifier name: (type_identifier) @name body: (field_declaration_list)) @def
+        (union_specifier name: (type_identifier) @name body: (field_declaration_list)) @def
+        (enum_specifier name: (type_identifier) @name body: (enumerator_list)) @def
+    """,
+    # Out-of-line definitions (``Foo::bar``) capture the whole
+    # qualified_identifier as @name; in-class definitions use
+    # field_identifier and pick up parent_class by tree-walk.
+    "cpp": """
+        (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
+        (function_definition declarator: (function_declarator declarator: (field_identifier) @name)) @def
+        (function_definition declarator: (function_declarator declarator: (qualified_identifier) @name)) @def
+        (function_definition declarator: (function_declarator declarator: (destructor_name) @name)) @def
+        (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @def
+        (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (qualified_identifier) @name))) @def
+        (function_definition declarator: (reference_declarator (function_declarator declarator: (identifier) @name))) @def
+        (function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier) @name))) @def
+        (class_specifier name: (type_identifier) @name body: (field_declaration_list)) @def
+        (struct_specifier name: (type_identifier) @name body: (field_declaration_list)) @def
+        (enum_specifier name: (type_identifier) @name body: (enumerator_list)) @def
+    """,
 }
 
 # Map node-type → symbol_type for tagging extracted symbols.
@@ -109,6 +147,10 @@ _NODE_TYPE_TO_SYMBOL_TYPE: dict[str, str] = {
     "enum_declaration": "enum",
     "trait_declaration": "trait",
     "variable_declarator": "function",  # arrow function assigned to const
+    "class_specifier": "class",  # cpp
+    "struct_specifier": "struct",  # c, cpp
+    "union_specifier": "union",  # c
+    "enum_specifier": "enum",  # c, cpp
 }
 
 
@@ -117,6 +159,8 @@ _CLASS_NODE_TYPES: frozenset[str] = frozenset({
     "class_declaration",  # php, typescript
     "enum_declaration",  # php
     "trait_declaration",  # php
+    "class_specifier",  # cpp
+    "struct_specifier",  # c, cpp
 })
 
 
@@ -172,6 +216,14 @@ def _get_parser(lang: str) -> Any:
         import tree_sitter_typescript as ts_lang_mod
 
         language = tree_sitter.Language(ts_lang_mod.language_typescript())
+    elif lang == "c":
+        import tree_sitter_c as ts_lang_mod
+
+        language = tree_sitter.Language(ts_lang_mod.language())
+    elif lang == "cpp":
+        import tree_sitter_cpp as ts_lang_mod
+
+        language = tree_sitter.Language(ts_lang_mod.language())
     else:
         raise ValueError(f"Unsupported language: {lang}")
 

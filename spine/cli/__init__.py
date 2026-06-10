@@ -119,7 +119,8 @@ def run(
 def index(workspace_root: str | None, config_path: str, wipe: bool) -> None:
     """Index the workspace into the vector store for RAG.
 
-    Discovers source files (.py, .php, .ts, .tsx), extracts per-symbol
+    Discovers source files (.py, .php, .ts, .tsx, and C/C++:
+    .c, .cpp, .cc, .cxx, .h, .hpp, .hh, .hxx), extracts per-symbol
     byte slices via tree-sitter, summarizes with LLM, and stores
     embeddings for hybrid search.
 

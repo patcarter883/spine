@@ -23,7 +23,10 @@ from spine.persistence.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
-_INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({".py", ".php", ".ts", ".tsx"})
+_INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".php", ".ts", ".tsx",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+})
 
 # Directories we never want to walk into — vendored deps, build output,
 # and Python/Node caches. Match by path prefix or by any path component
@@ -44,6 +47,9 @@ _EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     ".next",
     ".nuxt",
     "vendor",
+    "external",
+    "third_party",
+    "extern",
 })
 
 
@@ -60,7 +66,7 @@ def _is_test_file(file_path: str) -> bool:
         file_path.startswith("tests/")
         or "/tests/" in file_path
         or base.startswith("test_")
-        or base.endswith("_test.py")
+        or base.endswith(("_test.py", "_test.c", "_test.cpp", "_test.cc"))
         or base == "conftest.py"
     )
 
