@@ -4,8 +4,9 @@ This is slice 1 of the onboarding engine. It analyses a target repo using
 *semantic* signals only — never raw line-by-line file reads at runtime — to
 protect the context window:
 
-- File discovery via ``mcp_codebase-index_list_files`` (fast, cached) with a
-  filesystem ``os.walk`` fallback when the index is unavailable.
+- File discovery via :func:`spine.agents.tools.codebase_query.list_files`,
+  which merges the MCP index with a local walk per-extension (so PHP and
+  other index-unsupported languages are never dropped).
 - Symbol extraction via :func:`spine.agents.tools.ast_extract.extract_symbols`,
   which byte-slices each function/class/method/interface body rather than
   reading whole files.
@@ -167,57 +168,23 @@ class RepoAnalyzer:
             workspace_packages=workspace_packages,
         )
 
-    # ── File discovery (index first, walk fallback) ─────────────────────
+    # ── File discovery (codebase_query facade) ──────────────────────────
 
     async def _discover_files(self, workspace_root: str) -> list[str]:
-        """Return repo-relative source file paths, index-first with walk fallback."""
-        files = await self._discover_files_via_index(workspace_root)
-        if files:
-            return files
-        logger.info("Onboarding analyzer: index discovery empty, falling back to os.walk")
-        return self._discover_files_via_walk(workspace_root)
+        """Return repo-relative source file paths via the codebase_query facade.
 
-    async def _discover_files_via_index(self, workspace_root: str) -> list[str]:
-        """Discover files using ``mcp_codebase-index_list_files`` (cached, fast)."""
-        try:
-            from spine.mcp.client import get_mcp_tools
-
-            mcp_tools = get_mcp_tools(
-                self.config.mcp_servers,
-                cache_key="onboarding",
-                workspace_root=workspace_root,
-            )
-            tool_by_name = {t.name: t for t in mcp_tools}
-            list_files_tool = tool_by_name.get("mcp_codebase-index_list_files")
-            if not list_files_tool:
-                logger.info("mcp_codebase-index_list_files unavailable for onboarding")
-                return []
-
-            files_result = await list_files_tool.ainvoke({"root": workspace_root})
-            all_files = self._parse_tool_result(files_result)
-            return self._filter_source_files(all_files)
-        except Exception as exc:  # pragma: no cover — MCP env-dependent
-            logger.info("Onboarding analyzer: index discovery failed: %s", exc)
-            return []
-
-    def _discover_files_via_walk(self, workspace_root: str) -> list[str]:
-        """Fallback discovery: walk the tree for source files (no file *reads*).
-
-        ``os.walk`` only lists paths — it does not read source content. The
-        no-line-read constraint applies to source *content*, which is only ever
-        read by ``extract_symbols`` (byte slices). Listing filenames is allowed.
+        The facade merges the MCP index with a local walk per-extension, so
+        languages the index cannot analyze (PHP) are never silently dropped.
         """
-        results: list[str] = []
-        for dirpath, dirnames, filenames in os.walk(workspace_root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
-            for name in filenames:
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in _INDEXABLE_EXTENSIONS:
-                    continue
-                full = os.path.join(dirpath, name)
-                rel = os.path.relpath(full, workspace_root)
-                results.append(rel)
-        return self._filter_source_files(results)
+        from spine.agents.tools import codebase_query
+
+        files = await codebase_query.list_files(
+            workspace_root,
+            self.config.mcp_servers,
+            extensions=_INDEXABLE_EXTENSIONS,
+            skip_dirs=_SKIP_DIRS,
+        )
+        return self._filter_source_files(files)
 
     @staticmethod
     def _filter_source_files(all_files: list[Any]) -> list[str]:
@@ -232,38 +199,6 @@ class RepoAnalyzer:
                 for part in f.replace("\\", "/").split("/")
             )
         ]
-
-    @staticmethod
-    def _parse_tool_result(result: Any) -> list[Any]:
-        """Normalise an MCP tool result to a list of entries.
-
-        Mirrors ``VectorIndexer._parse_tool_result`` — handles the LangChain
-        ``[{"type": "text", "text": "[...json...]"}]`` envelope, plain JSON
-        strings, and ``{"items": [...]}``-style dicts.
-        """
-        import json
-
-        if isinstance(result, list):
-            if len(result) == 1 and isinstance(result[0], dict) and "text" in result[0]:
-                text = result[0]["text"]
-                try:
-                    parsed = json.loads(text)
-                    return parsed if isinstance(parsed, list) else [parsed]
-                except (json.JSONDecodeError, TypeError):
-                    return [text] if text else []
-            return result
-        if isinstance(result, str):
-            try:
-                parsed = json.loads(result)
-                return parsed if isinstance(parsed, list) else [parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [result] if result else []
-        if isinstance(result, dict):
-            for key in ("items", "results", "symbols", "functions", "classes", "files"):
-                if key in result:
-                    return result[key]
-            return [result]
-        return []
 
     # ── Symbol extraction (byte-sliced, no line reads) ──────────────────
 

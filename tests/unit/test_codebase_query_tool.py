@@ -20,9 +20,11 @@ import pytest
 from langchain_core.tools import ToolException
 
 from spine.agents.tools.ast_extract import Edge
+from spine.agents.tools import codebase_query as cq_module
 from spine.agents.tools.codebase_query import (
     _ACTION_TO_MCP,
     CodebaseQueryTool,
+    list_files,
 )
 from spine.persistence.vector_store import VectorStore
 
@@ -291,3 +293,141 @@ def test_php_dependencies_without_edge_rows_suggests_reindex(php_index):
     out = json.loads(cqt._run(action="get_dependencies", name="Invoice.total"))
     assert out["status"] == "unavailable"
     assert "Re-run indexing" in out["detail"]
+
+
+# ── list_files facade (single entry point for file discovery) ────────────
+
+
+def _fake_list_files_backend(paths: list[str]) -> MagicMock:
+    tool = MagicMock()
+    tool.name = "mcp_codebase-index_list_files"
+    tool.ainvoke = AsyncMock(return_value=json.dumps(paths))
+    return tool
+
+
+@pytest.fixture
+def mixed_repo(tmp_path):
+    """A repo with Python, PHP, a dot-folder, and a vendored dir."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n")
+    (tmp_path / "src" / "Invoice.php").write_text("<?php class Invoice {}\n")
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "hidden.php").write_text("<?php\n")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "dep.php").write_text("<?php\n")
+    return tmp_path
+
+
+_EXTS = frozenset({".py", ".php"})
+_SKIPS = frozenset({"vendor"})
+
+
+@pytest.mark.asyncio
+async def test_list_files_supplements_php_via_walk(mixed_repo, monkeypatch):
+    """Regression: MCP returns a non-empty py-only list; PHP must still appear."""
+    import spine.mcp.client as mcp_client
+
+    monkeypatch.setattr(
+        mcp_client, "get_mcp_tools",
+        lambda *a, **k: [_fake_list_files_backend(["src/app.py"])],
+    )
+    files = await list_files(
+        str(mixed_repo), {"codebase-index": {}}, extensions=_EXTS, skip_dirs=_SKIPS
+    )
+    assert "src/app.py" in files
+    assert "src/Invoice.php" in files
+
+
+@pytest.mark.asyncio
+async def test_list_files_walk_only_when_mcp_unconfigured(mixed_repo):
+    files = await list_files(str(mixed_repo), {}, extensions=_EXTS, skip_dirs=_SKIPS)
+    assert files == ["src/Invoice.php", "src/app.py"]
+
+
+@pytest.mark.asyncio
+async def test_list_files_walk_only_when_mcp_load_fails(mixed_repo, monkeypatch):
+    import spine.mcp.client as mcp_client
+
+    def _boom(*a, **k):
+        raise RuntimeError("server down")
+
+    monkeypatch.setattr(mcp_client, "get_mcp_tools", _boom)
+    files = await list_files(
+        str(mixed_repo), {"codebase-index": {}}, extensions=_EXTS, skip_dirs=_SKIPS
+    )
+    assert "src/app.py" in files and "src/Invoice.php" in files
+
+
+@pytest.mark.asyncio
+async def test_list_files_drops_dot_folder_and_skip_dir_paths(mixed_repo, monkeypatch):
+    """MCP results inside dot-folders or skip_dirs never reach the caller."""
+    import spine.mcp.client as mcp_client
+
+    monkeypatch.setattr(
+        mcp_client, "get_mcp_tools",
+        lambda *a, **k: [_fake_list_files_backend([
+            "src/app.py",
+            ".venv/lib/pkg.py",
+            ".spine/artifacts/old.py",
+            "vendor/dep.php",
+        ])],
+    )
+    files = await list_files(
+        str(mixed_repo), {"codebase-index": {}}, extensions=_EXTS, skip_dirs=_SKIPS
+    )
+    assert not any(".venv" in f or ".spine" in f or f.startswith("vendor/") for f in files)
+    assert not any(".cache" in f for f in files)  # walk side also prunes dot-dirs
+
+
+@pytest.mark.asyncio
+async def test_list_files_dedupes_mcp_walk_overlap(mixed_repo, monkeypatch):
+    import spine.mcp.client as mcp_client
+
+    monkeypatch.setattr(
+        mcp_client, "get_mcp_tools",
+        lambda *a, **k: [_fake_list_files_backend(["src/app.py", "src/Invoice.php"])],
+    )
+    files = await list_files(
+        str(mixed_repo), {"codebase-index": {}}, extensions=_EXTS, skip_dirs=_SKIPS
+    )
+    assert files == sorted(set(files))
+    assert files.count("src/app.py") == 1
+
+
+# ── Facade lockdown guard ────────────────────────────────────────────────
+
+def test_codebase_query_local_only_imported_by_facade():
+    """codebase_query_local must be reachable only via codebase_query."""
+    import subprocess
+
+    root = Path(cq_module.__file__).resolve().parents[3]
+    out = subprocess.run(
+        ["grep", "-rl", "codebase_query_local", str(root / "spine"), "--include=*.py"],
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    allowed = {
+        str(root / "spine" / "agents" / "tools" / "codebase_query.py"),
+        str(root / "spine" / "agents" / "tools" / "codebase_query_local.py"),
+    }
+    assert set(out) <= allowed, f"direct codebase_query_local usage: {set(out) - allowed}"
+
+
+def test_no_direct_mcp_codebase_index_invocations():
+    """Only the facade / mcp client / cache infra may reference mcp tool names."""
+    import subprocess
+
+    root = Path(cq_module.__file__).resolve().parents[3]
+    out = subprocess.run(
+        ["grep", "-rl", "mcp_codebase-index_", str(root / "spine"), "--include=*.py"],
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    allowed_suffixes = (
+        "spine/agents/tools/codebase_query.py",
+        "spine/mcp/client.py",
+        "spine/agents/symbol_cache.py",
+        "spine/agents/context_editing.py",  # name-pattern infra (comments)
+        "spine/agents/subagents.py",        # prompt text only
+        "spine/work/onboarding/templates.py",  # template comment only
+    )
+    bad = [f for f in out if not f.endswith(allowed_suffixes)]
+    assert not bad, f"direct mcp_codebase-index_ references: {bad}"

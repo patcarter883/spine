@@ -55,6 +55,28 @@ def _ok(payload: dict[str, Any]) -> str:
     return json.dumps({"status": "ok", "source": "local_index", **payload})
 
 
+def local_list_files(
+    workspace_root: str,
+    extensions: frozenset[str],
+    skip_dirs: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Walk *workspace_root* for source files matching *extensions*.
+
+    Lists paths only — never reads file contents. Prunes *skip_dirs* and
+    every dot-prefixed directory, returning repo-relative paths.
+    """
+    results: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(workspace_root):
+        dirnames[:] = [
+            d for d in dirnames if d not in skip_dirs and not d.startswith(".")
+        ]
+        for fname in filenames:
+            if os.path.splitext(fname)[1].lower() in extensions:
+                full = os.path.join(dirpath, fname)
+                results.append(os.path.relpath(full, workspace_root))
+    return results
+
+
 def lookup_local_langs(db_path: str, name: str) -> set[str]:
     """Languages of indexed symbols matching *name* (empty set if none)."""
     rows = _query(

@@ -20,11 +20,19 @@ Collapsing five tool schemas into one (with one ``action`` decision plus a
 small, named arg set) removes the wrong-key class of failures entirely,
 and the markup/whitespace guards short-circuit the obvious garbage at
 validator level before it reaches the MCP server.
+
+This module is the ONLY sanctioned entry point to codebase indexing:
+no other production code may invoke raw ``mcp_codebase-index_*`` tools
+or import :mod:`spine.agents.tools.codebase_query_local` directly. Agents
+get :class:`CodebaseQueryTool`; programmatic callers (e.g. the onboarding
+analyzer) use :func:`list_files`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Any, Literal
 
 from langchain_core.tools import BaseTool, ToolException
@@ -89,6 +97,91 @@ def _looks_empty(result: Any) -> bool:
         lowered = stripped.lower()
         return any(marker in lowered for marker in _EMPTY_RESULT_MARKERS)
     return False
+
+
+def _parse_tool_result(result: Any) -> list[Any]:
+    """Normalise an MCP tool result to a list of entries.
+
+    Mirrors ``VectorIndexer._parse_tool_result`` — handles the LangChain
+    ``[{"type": "text", "text": "[...json...]"}]`` envelope, plain JSON
+    strings, and ``{"items": [...]}``-style dicts.
+    """
+    if isinstance(result, list):
+        if len(result) == 1 and isinstance(result[0], dict) and "text" in result[0]:
+            text = result[0]["text"]
+            try:
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, list) else [parsed]
+            except (json.JSONDecodeError, TypeError):
+                return [text] if text else []
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except (json.JSONDecodeError, TypeError):
+            return [result] if result else []
+    if isinstance(result, dict):
+        for key in ("items", "results", "symbols", "functions", "classes", "files"):
+            if key in result:
+                return result[key]
+        return [result]
+    return []
+
+
+async def list_files(
+    workspace_root: str,
+    mcp_servers: dict[str, dict[str, Any]] | None,
+    *,
+    extensions: frozenset[str],
+    skip_dirs: frozenset[str] = frozenset(),
+) -> list[str]:
+    """List repo-relative source files matching *extensions*.
+
+    Index-first with a per-extension local supplement: the MCP server's
+    ``list_files`` only covers languages it can analyze (no PHP), so any
+    requested extension with zero MCP hits is filled in from a local walk
+    instead of being silently dropped. Dot-folder paths are excluded from
+    every return path.
+    """
+    from spine.agents.tools.codebase_query_local import local_list_files
+    from spine.mcp.client import _is_excluded_path, get_mcp_tools
+
+    mcp_files: list[str] = []
+    if mcp_servers:
+        try:
+            tools = get_mcp_tools(
+                mcp_servers,
+                cache_key=f"list-files-{workspace_root}",
+                workspace_root=workspace_root,
+            )
+            tool = next(
+                (t for t in tools if t.name == "mcp_codebase-index_list_files"), None
+            )
+            if tool is not None:
+                raw = await tool.ainvoke({"root": workspace_root})
+                mcp_files = [
+                    f
+                    for f in _parse_tool_result(raw)
+                    if isinstance(f, str)
+                    and os.path.splitext(f)[1].lower() in extensions
+                    and not _is_excluded_path(f.replace("\\", "/"))
+                    and not any(
+                        part in skip_dirs for part in f.replace("\\", "/").split("/")
+                    )
+                ]
+            else:
+                logger.info("codebase_query.list_files: MCP list_files unavailable")
+        except Exception as exc:
+            logger.info("codebase_query.list_files: index discovery failed: %s", exc)
+
+    covered = {os.path.splitext(f)[1].lower() for f in mcp_files}
+    uncovered = extensions - covered
+    local_files: list[str] = []
+    if uncovered:
+        local_files = local_list_files(workspace_root, frozenset(uncovered), skip_dirs)
+    return sorted({f.replace("\\", "/") for f in mcp_files}
+                  | {f.replace("\\", "/") for f in local_files})
 
 
 class CodebaseQueryInput(BaseModel):

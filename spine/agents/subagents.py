@@ -490,17 +490,13 @@ _RE_RESEARCH_PROMPT_SUFFIX = (
 def _inject_mcp_tools(
     tools: list, workspace_root: str, *, subagent_name: str = "researcher"
 ) -> None:
-    """Inject MCP codebase-index tools into a subagent's tool list.
+    """Inject the consolidated ``codebase_query`` tool into a subagent's tool list.
 
-    Loads MCP tools from the SpineConfig, wrapping each as a LangChain
-    ``BaseTool``.  Errors during MCP tool loading are logged and swallowed
-    — subagents fall back to filesystem tools if MCP is unavailable.
-
-    The cache_key includes the subagent name (researcher vs slice-implementer)
-    so the two subagents do not collide in the tool cache. Both receive a
-    single ``CodebaseQueryTool`` wrapper (tool name ``codebase_query``) that
-    collapses the raw MCP index surface — no raw ``mcp_``-prefixed tool is
-    ever appended to a subagent's tool list.
+    Every subagent receives a single ``CodebaseQueryTool`` wrapper (tool name
+    ``codebase_query``) that collapses the raw MCP index surface — no raw
+    ``mcp_``-prefixed tool is ever appended to a subagent's tool list. Errors
+    are logged and swallowed — subagents fall back to filesystem tools when
+    the index is unavailable.
 
     Args:
         tools: The subagent's tool list (mutated in place).
@@ -509,32 +505,23 @@ def _inject_mcp_tools(
     """
     try:
         from spine.config import SpineConfig
-        from spine.mcp.client import get_mcp_tools
 
         config = SpineConfig.load()
-        cache_key = f"subagent-{subagent_name}-{workspace_root}"
-        mcp_tools = get_mcp_tools(
-            config.mcp_servers,
-            cache_key=cache_key,
-            workspace_root=workspace_root,
-        )
-        if subagent_name in ("researcher", "slice-implementer"):
-            # Both subagents get ONE consolidated codebase_query tool instead
-            # of the individual raw MCP wrappers. Collapsing the surface area
-            # eliminates the wrong-key / invented-arg failure class observed
-            # in trace 019e6cc4 (23/23 research branches failed with
-            # malformed args) and ensures no raw mcp_-prefixed tool reaches
-            # any agent. The MCP tools stay loaded in the cache so the
-            # wrapper can dispatch against them.
-            from spine.agents.tools.codebase_query import CodebaseQueryTool
+        # Every subagent gets ONE consolidated codebase_query tool — never
+        # the individual raw MCP wrappers. Collapsing the surface area
+        # eliminates the wrong-key / invented-arg failure class observed
+        # in trace 019e6cc4 (23/23 research branches failed with malformed
+        # args) and ensures no raw mcp_-prefixed tool reaches any agent.
+        # The wrapper lazy-loads its MCP backend on first use.
+        from spine.agents.tools.codebase_query import CodebaseQueryTool
 
-            mcp_tools = [
-                CodebaseQueryTool(
-                    workspace_root=workspace_root,
-                    mcp_servers=config.mcp_servers,
-                    db_path=config.checkpoint_path,
-                )
-            ]
+        mcp_tools: list = [
+            CodebaseQueryTool(
+                workspace_root=workspace_root,
+                mcp_servers=config.mcp_servers,
+                db_path=config.checkpoint_path,
+            )
+        ]
         tools.extend(mcp_tools)
         logger.info(
             "Injected %d MCP-related tools into %s subagent: %s",
