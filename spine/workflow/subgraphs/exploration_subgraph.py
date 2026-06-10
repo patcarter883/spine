@@ -552,10 +552,19 @@ def _research_router(
             # Two-node researcher: explore_do (tools) → summarise (no tools).
             # The plain edge explore_do→summarise threads each parallel
             # branch's evidence dossier to its own summariser before fan-in.
+            #
+            # work_id MUST ride along: a Send payload is the target node's
+            # entire state, so omitting it ran every scout with
+            # work_id=None and _invoke_tool_deduped bypassed symbol_cache —
+            # sibling scouts each re-fetched the same hot symbols
+            # (trace 019eb00d: get_source(SpineConfig) 3× per round).
             "explore_do",
             {
                 "topic": _enrich_topic(t, hits_map.get(t, [])),
                 "phase": phase,
+                "work_id": state.get("work_id"),
+                "work_type": state.get("work_type", ""),
+                "workspace_root": state.get("workspace_root", "."),
             },
         )
         for t in capped_topics

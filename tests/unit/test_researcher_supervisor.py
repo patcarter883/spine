@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from spine.agents import symbol_cache
 from spine.agents import researcher_supervisor as rs
 from spine.agents.researcher_supervisor import (
     FindingStatus,
@@ -31,6 +32,16 @@ from spine.agents.researcher_supervisor import (
     run_supervisor_node,
     run_worker_node,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_symbol_cache():
+    """The worker path now dedupes codebase lookups through the
+    process-level symbol_cache; wipe it between tests so a cached result
+    from one test's work_id never satisfies another test's stub tool."""
+    symbol_cache._cache.clear()
+    yield
+    symbol_cache._cache.clear()
 
 
 # ── Tool-class filtering ───────────────────────────────────────────────
@@ -907,3 +918,263 @@ async def test_worker_retry_failure_returns_error_no_second_retry():
     assert len(bound.invocations) == 2  # initial + exactly one retry
     assert len(tool.calls) == 2
     assert f.status == FindingStatus.ERROR
+
+
+# ── Cross-scout dedupe via symbol_cache (trace 019eaecf) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_sibling_workers_share_codebase_query_results():
+    """Two scout branches in the same work_id issuing an identical
+    codebase_query must pay for ONE underlying tool execution; the second
+    is served from symbol_cache with an ALREADY FETCHED sentinel."""
+    tc = {
+        "name": "codebase_query",
+        "args": {"action": "get_source", "name": "SpineConfig"},
+        "id": "tc-1",
+        "type": "tool_call",
+    }
+    payload = "class SpineConfig:\n    ..."
+    tool_a = _StubTool("codebase_query", payload)
+    tool_b = _StubTool("codebase_query", "must never be fetched")
+
+    kind1, (_, msg1) = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"codebase_query": tool_a}, ToolClass.READ_SOURCE, work_id="w-shared",
+    )
+    kind2, (_, msg2) = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"codebase_query": tool_b}, ToolClass.READ_SOURCE, work_id="w-shared",
+    )
+
+    assert kind1 == kind2 == "ok"
+    assert tool_a.calls == [tc["args"]]
+    assert tool_b.calls == [], "second sibling must hit the cache, not the tool"
+    assert msg1.content == payload
+    assert "ALREADY FETCHED" in msg2.content
+    assert payload in msg2.content, "full result still served so the scout can use it"
+
+
+@pytest.mark.asyncio
+async def test_worker_dedupe_covers_exploration_extra_tools():
+    """ast_extract_symbol / search_codebase are deterministic during
+    exploration — the worker path dedupes them across siblings too."""
+    tc = {
+        "name": "ast_extract_symbol",
+        "args": {"file_hint": "spine/ui/x.py", "symbol_name": "render"},
+        "id": "tc-1",
+        "type": "tool_call",
+    }
+    tool_a = _StubTool("ast_extract_symbol", "def render(): ...")
+    tool_b = _StubTool("ast_extract_symbol", "unused")
+
+    await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"ast_extract_symbol": tool_a}, ToolClass.READ_SOURCE, work_id="w-ast",
+    )
+    _, (_, msg2) = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"ast_extract_symbol": tool_b}, ToolClass.READ_SOURCE, work_id="w-ast",
+    )
+
+    assert tool_b.calls == []
+    assert "ALREADY FETCHED" in msg2.content
+
+
+@pytest.mark.asyncio
+async def test_worker_dedupe_requires_work_id():
+    """Without a work_id there is no safe cache scope — every call runs."""
+    tc = {
+        "name": "codebase_query",
+        "args": {"action": "get_source", "name": "X"},
+        "id": "tc-1",
+        "type": "tool_call",
+    }
+    tool = _StubTool("codebase_query", "src")
+    for _ in range(2):
+        await rs._execute_worker_first_tool(
+            AIMessage(content="", tool_calls=[tc]),
+            {"codebase_query": tool}, ToolClass.READ_SOURCE, work_id="",
+        )
+    assert len(tool.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_dedupe_skips_non_deterministic_tools():
+    """Tools outside the deterministic allowlist always execute."""
+    tc = {
+        "name": "read_file",
+        "args": {"file_path": "a.py"},
+        "id": "tc-1",
+        "type": "tool_call",
+    }
+    tool = _StubTool("read_file", "contents")
+    for _ in range(2):
+        await rs._execute_worker_first_tool(
+            AIMessage(content="", tool_calls=[tc]),
+            {"read_file": tool}, ToolClass.READ_SOURCE, work_id="w-rf",
+        )
+    assert len(tool.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_dedupe_does_not_memoise_tool_errors():
+    """A raising tool must not poison the cache for its siblings."""
+    tc = {
+        "name": "codebase_query",
+        "args": {"action": "get_source", "name": "Boom"},
+        "id": "tc-1",
+        "type": "tool_call",
+    }
+    failing = _StubTool("codebase_query", RuntimeError("index down"))
+    kind1, _ = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"codebase_query": failing}, ToolClass.READ_SOURCE, work_id="w-err",
+    )
+    assert kind1 == "error"
+
+    healthy = _StubTool("codebase_query", "recovered")
+    kind2, (_, msg2) = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"codebase_query": healthy}, ToolClass.READ_SOURCE, work_id="w-err",
+    )
+    assert kind2 == "ok"
+    assert healthy.calls == [tc["args"]]
+    assert msg2.content == "recovered"
+
+
+# ── Reasoning suppression + length-aware retry (trace 019eafac) ─────────
+
+
+@pytest.mark.asyncio
+async def test_supervisor_suppresses_reasoning_before_structured_output(monkeypatch):
+    """The directive call is mechanical — thinking must be disabled so a
+    local reasoning model doesn't burn the tight completion cap on
+    chain-of-thought before emitting JSON (trace 019eafac)."""
+    captured: dict[str, Any] = {}
+
+    class _Structured:
+        async def ainvoke(self, messages, **kw):
+            return {"analysis_and_reasoning": "done", "is_complete": True}
+
+    class _Model:
+        def with_structured_output(self, schema):
+            return _Structured()
+
+    def _capture_suppress(model):
+        captured["suppressed"] = True
+        return model
+
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", lambda model, cap: model)
+    monkeypatch.setattr(rs, "suppress_reasoning", _capture_suppress)
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True
+    assert captured.get("suppressed") is True
+
+
+class _FakeLengthError(Exception):
+    """Stands in for openai.LengthFinishReasonError in retry tests."""
+
+
+@pytest.mark.asyncio
+async def test_supervisor_retries_once_with_raised_cap_on_length_error(monkeypatch):
+    """A directive truncated at the completion cap retries ONCE with a much
+    larger budget instead of silently terminating exploration (trace
+    019eafac: cap=4096 truncations degraded to terminating directives)."""
+    from spine.config import SpineConfig
+
+    caps: list[int] = []
+
+    class _FailingStructured:
+        async def ainvoke(self, messages, **kw):
+            raise _FakeLengthError("length limit reached")
+
+    class _OkStructured:
+        async def ainvoke(self, messages, **kw):
+            return {"analysis_and_reasoning": "recovered", "is_complete": True}
+
+    binds = [_FailingStructured(), _OkStructured()]
+
+    class _Model:
+        def with_structured_output(self, schema):
+            raise AssertionError("bind_structured_output is monkeypatched")
+
+    def _capture_cap(model, cap):
+        caps.append(cap)
+        return model
+
+    monkeypatch.setattr(rs, "_LengthFinishReasonError", _FakeLengthError)
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", _capture_cap)
+    monkeypatch.setattr(rs, "suppress_reasoning", lambda model: model)
+    monkeypatch.setattr(rs, "bind_structured_output", lambda model, schema: binds.pop(0))
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True
+    # The recovered directive came from the retry, not the terminating fallback.
+    assert d.analysis_and_reasoning == "recovered"
+    cfg = SpineConfig.load()
+    base_cap = cfg.researcher_supervisor_max_completion_tokens
+    assert caps[0] == base_cap
+    assert caps[1] == max(base_cap * 4, cfg.max_completion_tokens or 0, 16384)
+    assert caps[1] > caps[0]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_terminates_when_length_retry_also_fails(monkeypatch):
+    """Two consecutive truncations exhaust the retry — the node degrades to a
+    terminating directive so the loop exits instead of spinning."""
+
+    class _FailingStructured:
+        async def ainvoke(self, messages, **kw):
+            raise _FakeLengthError("length limit reached")
+
+    class _Model:
+        def with_structured_output(self, schema):
+            raise AssertionError("bind_structured_output is monkeypatched")
+
+    monkeypatch.setattr(rs, "_LengthFinishReasonError", _FakeLengthError)
+    monkeypatch.setattr(rs, "resolve_chat_model", lambda *a, **kw: _Model())
+    monkeypatch.setattr(rs, "cap_completion_tokens", lambda model, cap: model)
+    monkeypatch.setattr(rs, "suppress_reasoning", lambda model: model)
+    monkeypatch.setattr(
+        rs, "bind_structured_output", lambda model, schema: _FailingStructured()
+    )
+
+    d = await run_supervisor_node(
+        state={"work_id": "w"},
+        config=None,
+        phase_path="specify/subagents/researcher/supervisor",
+        global_goal="topic",
+        latest_finding=StructuredFinding(
+            tool_name="t", tool_class=ToolClass.SEARCH, status=FindingStatus.SUCCESS
+        ),
+        evaluation_history=[],
+        cycle_idx=1,
+        max_cycles=12,
+    )
+    assert d.is_complete is True

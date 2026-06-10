@@ -102,7 +102,17 @@ class _FakeRequest:
 def _openai_model():
     from langchain_openai import ChatOpenAI
 
-    # Construction makes no network call; isinstance is what the middleware checks.
+    # Construction makes no network call; isinstance is what the middleware
+    # checks. No base_url → treated as cloud OpenAI, where a named tool pin
+    # is supported on the wire.
+    return ChatOpenAI(model="gpt-4o-mini", api_key="x")
+
+
+def _local_model():
+    from langchain_openai import ChatOpenAI
+
+    # Custom base_url marks a local OpenAI-compatible server (e.g. llama.cpp),
+    # which rejects the object-form tool_choice a named pin serializes to.
     return ChatOpenAI(model="gemma", api_key="x", base_url="http://localhost:1/v1")
 
 
@@ -120,6 +130,13 @@ class TestForceToolMiddleware:
     def test_after_gate_pins_final_tool(self):
         mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
         assert mw._decide(_FakeRequest(_openai_model(), self.GATE)) == "write_specification"
+
+    def test_local_server_demotes_pin_to_any(self):
+        # llama.cpp only parses string tool_choice values; a named pin would be
+        # sent as the object form and silently dropped ("Wrong type supplied
+        # for parameter 'tool_choice'"). Local models keep forcing "any".
+        mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
+        assert mw._decide(_FakeRequest(_local_model(), self.GATE)) == "any"
 
     def test_no_gate_variant_never_pins(self):
         mw = ForceToolUntilCalledMiddleware("write_specification")

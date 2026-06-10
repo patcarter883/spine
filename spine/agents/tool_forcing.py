@@ -28,6 +28,21 @@ honors natively: OpenAI, vLLM's OpenAI server, OpenRouter, and llama.cpp's
 OpenAI-compatible server.  Anthropic uses a different ``tool_choice``
 grammar, so the middleware is a deliberate no-op for non-OpenAI-style
 models (Claude's tool-calling reliability does not need this anyway).
+
+One wire-format caveat: ``bind_tools`` maps ``"any"`` onto the *string*
+``tool_choice="required"``, but a tool *name* onto the OpenAI *object* form
+``{"type": "function", "function": {"name": ...}}``.  llama.cpp's server
+only parses string values ("none"/"auto"/"required") and discards the
+object form with::
+
+    Wrong type supplied for parameter 'tool_choice'. Expected 'string',
+    using default value
+
+i.e. the pin silently degrades to "auto" — exactly the prose-stall the
+middleware exists to prevent.  Local servers (detected via a custom
+``base_url`` on ChatOpenAI) therefore get ``"any"`` instead of a named
+pin; "required" still forbids a bare text turn, which is the property
+that matters.
 """
 
 from __future__ import annotations
@@ -50,6 +65,22 @@ _RELEASE = object()
 # ChatOpenRouter bind_tools() map this onto the OpenAI ``tool_choice="required"``
 # wire value; vLLM and llama.cpp honor it identically.
 _FORCE_ANY = "any"
+
+
+def _named_pin_supported(model: Any) -> bool:
+    """True when pinning ``tool_choice`` to a named tool is safe on the wire.
+
+    A named pin serializes as the OpenAI object form
+    ``{"type": "function", "function": {"name": ...}}``.  llama.cpp's server
+    only accepts string ``tool_choice`` values and silently falls back to the
+    default ("auto") on the object form, defeating the pin entirely.  Local
+    OpenAI-compatible servers are recognised by a custom ``base_url`` on
+    ChatOpenAI (cloud OpenAI leaves it unset); vLLM does support the object
+    form, but demoting it to "required" only loosens *which* tool is forced,
+    never whether one is — a safe trade for not having to fingerprint the
+    server behind the URL.
+    """
+    return not getattr(model, "openai_api_base", None)
 
 
 class ForceToolUntilCalledMiddleware(AgentMiddleware):
@@ -117,12 +148,13 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
 
     def _decide(self, request: Any) -> Any:
         """Return the tool_choice to force, or ``_RELEASE`` to leave as-is."""
-        if not _is_openai_style_model(getattr(request, "model", None)):
+        model = getattr(request, "model", None)
+        if not _is_openai_style_model(model):
             return _RELEASE
         messages = list(getattr(request, "messages", None) or [])
         if self._final_tool_succeeded(messages):
             return _RELEASE
-        if self._gate_tool_called(messages):
+        if self._gate_tool_called(messages) and _named_pin_supported(model):
             return self.final_tool  # pin the structured write specifically
         return _FORCE_ANY
 

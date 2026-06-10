@@ -180,6 +180,45 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
     return model.model_copy(update={"max_completion_tokens": cap})
 
 
+def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
+    """Return a model_copy with thinking disabled — no-op for non-local models.
+
+    Mechanical structured-output calls (supervisor directives, findings
+    extraction) gain nothing from chain-of-thought, but on local thinking
+    models (e.g. Qwen3.6) the reasoning channel consumes the tight
+    ``cap_completion_tokens`` budget before any JSON is emitted, raising
+    ``LengthFinishReasonError`` (trace 019eafac). We send the same two
+    suppression levers as :func:`_build_local_model` (see its
+    ``reasoning: false`` block for why both are needed): ``reasoning_budget:
+    0`` for budget-honouring models and ``enable_thinking: false`` for
+    template-gated ones.
+
+    Scoped to ``ChatOpenAI`` instances pointing at a non-OpenAI ``base_url``
+    (local/OpenAI-compatible servers). ChatOpenRouter is not a ChatOpenAI
+    subclass and real OpenAI endpoints reject unknown extra_body keys —
+    both pass through unchanged. Merges into any existing ``extra_body``
+    rather than replacing it, so a provider-level ``reasoning: false``
+    config stays intact (idempotent). Fails open on any error.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+
+        if not isinstance(model, ChatOpenAI):
+            return model
+        base_url = getattr(model, "openai_api_base", None)
+        if not base_url or "api.openai.com" in str(base_url):
+            return model
+        extra = dict(getattr(model, "extra_body", None) or {})
+        template_kwargs = dict(extra.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = False
+        extra["reasoning_budget"] = 0
+        extra["chat_template_kwargs"] = template_kwargs
+        return model.model_copy(update={"extra_body": extra})
+    except Exception:
+        logger.debug("suppress_reasoning: copy failed — using model as-is", exc_info=True)
+        return model
+
+
 def _is_openai_style_model(model: Any) -> bool:
     """True when ``model``'s ``with_structured_output`` supports json_schema.
 
@@ -231,10 +270,183 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
     method.  ``method="json_schema"`` is selected only at bind time; if a model
     later rejects ``response_format`` json_schema at invoke time, the callsite's
     existing ``try/except`` still degrades gracefully.
+
+    The json_schema default has its own mirror-image failure (trace 019eaf1f):
+    OpenRouter gates ``response_format: json_schema`` behind the separate
+    ``structured_outputs`` endpoint capability, and some models (e.g.
+    minimax/minimax-m3) advertise ``tools``/``tool_choice`` but NOT
+    ``structured_outputs`` — so with ``require_parameters=True`` every call
+    404s before reaching the provider.  For ChatOpenRouter models we therefore
+    consult the model's endpoint capabilities (cached, fail-open) and pick the
+    method its endpoints can actually serve.
+
+    The capability probe alone is not sufficient: ``supported_parameters``
+    only says an endpoint accepts a parameter, not which *values* it accepts.
+    minimax-m3 advertises ``tool_choice`` but rejects a forced named function
+    (trace 019eaf2a: 404 "No endpoints found that support the provided
+    'tool_choice' value"), which is exactly what ``method="function_calling"``
+    sends.  ChatOpenRouter bindings are therefore returned as a
+    :class:`_SelfHealingStructured` wrapper that catches routing 404s at
+    invoke time, demotes the method down the ladder (json_schema →
+    function_calling → json_mode), updates the per-model cache so concurrent
+    and future binds skip the dead method, and retries the same input.
     """
-    if _is_openai_style_model(model):
-        return model.with_structured_output(schema, method="json_schema")
-    return model.with_structured_output(schema)
+    if not _is_openai_style_model(model):
+        return model.with_structured_output(schema)
+    if type(model).__name__ == "ChatOpenRouter":
+        model_name = getattr(model, "model_name", None)
+        if model_name:
+            method = _openrouter_structured_method(model_name)
+            return _SelfHealingStructured(model, schema, method)
+    return model.with_structured_output(schema, method="json_schema")
+
+
+# Structured-output methods in order of preference. Demotion on a routing
+# 404 steps one place right; past the end there is nothing left to try and
+# the error propagates to the callsite's existing fallback.
+_STRUCTURED_METHOD_LADDER = ("json_schema", "function_calling", "json_mode")
+
+
+def _is_structured_routing_404(exc: BaseException) -> bool:
+    """True for OpenRouter's up-front "No endpoints found" routing rejection.
+
+    With ``require_parameters=True`` OpenRouter rejects a request before it
+    reaches any provider when no endpoint supports the parameters (or
+    parameter *values*) sent — always HTTP 404 with a message starting
+    "No endpoints found". Matched structurally (status_code attribute +
+    message text) rather than by exception class so we don't need a hard
+    dependency on ``langchain_openrouter``'s exception hierarchy.
+    """
+    return getattr(exc, "status_code", None) == 404 and "No endpoints found" in str(exc)
+
+
+def _demoted_method(method: str) -> str | None:
+    """Next structured-output method down the ladder, or None at the bottom."""
+    try:
+        idx = _STRUCTURED_METHOD_LADDER.index(method)
+    except ValueError:
+        return None
+    if idx + 1 >= len(_STRUCTURED_METHOD_LADDER):
+        return None
+    return _STRUCTURED_METHOD_LADDER[idx + 1]
+
+
+class _SelfHealingStructured:
+    """Structured-output binding that demotes its method on routing 404s.
+
+    Endpoint capability listings can't reveal value-level support (trace
+    019eaf2a: minimax-m3 advertises ``tool_choice`` but rejects a forced
+    named function), so the only reliable detection point is the 404 at
+    invoke time.  On each ``ainvoke`` this wrapper binds with its current
+    method, and when OpenRouter rejects routing it demotes one ladder step,
+    records the demotion in ``_structured_method_cache`` (so other in-flight
+    workers and future binds for the same model skip straight past the dead
+    method), and retries the same input.  At the bottom of the ladder the
+    error propagates unchanged, preserving every callsite's existing
+    ``try/except`` degradation path.
+
+    Only ``ainvoke`` is exposed: every structured callsite in SPINE invokes
+    through ``await structured.ainvoke(...)`` (directly or via
+    :func:`ainvoke_structured_with_retry`).
+    """
+
+    def __init__(self, model: Any, schema: type[BaseModel], method: str) -> None:
+        self._model = model
+        self._schema = schema
+        self._method = method
+        self._model_name: str = getattr(model, "model_name", "") or ""
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        # Adopt a demotion another worker already paid a 404 to discover.
+        if self._model_name:
+            cached = _structured_method_cache.get(self._model_name)
+            if cached:
+                self._method = cached
+        while True:
+            bound = self._model.with_structured_output(self._schema, method=self._method)
+            try:
+                return await bound.ainvoke(input, config, **kwargs)
+            except Exception as exc:
+                next_method = (
+                    _demoted_method(self._method)
+                    if _is_structured_routing_404(exc)
+                    else None
+                )
+                if next_method is None:
+                    raise
+                logger.warning(
+                    "%s: structured-output method=%s rejected by OpenRouter "
+                    "routing (404); demoting to method=%s and retrying",
+                    self._model_name or type(self._model).__name__,
+                    self._method,
+                    next_method,
+                )
+                self._method = next_method
+                if self._model_name:
+                    _structured_method_cache[self._model_name] = next_method
+
+
+_OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{model}/endpoints"
+
+# model name -> chosen with_structured_output method. Populated lazily; also
+# caches the fail-open default on lookup errors so a flaky network costs at
+# most one blocked bind per model per process.
+_structured_method_cache: dict[str, str] = {}
+
+
+def _openrouter_structured_method(model_name: str) -> str:
+    """Pick the ``with_structured_output`` method this model's endpoints serve.
+
+    OpenRouter's per-model endpoint listing advertises ``supported_parameters``
+    per endpoint.  With ``require_parameters=True`` a request succeeds if ANY
+    endpoint supports every parameter sent, so we check the union across
+    endpoints, preferring the most reliable method available:
+
+    1. ``json_schema`` — needs the ``structured_outputs`` capability.
+    2. ``function_calling`` — needs ``tool_choice`` (forced tool call).
+    3. ``json_mode`` — needs only plain ``response_format`` (json_object);
+       weakest guarantee, but better than a guaranteed 404.
+
+    Fails open to ``json_schema`` (the previous unconditional behavior) when
+    the lookup errors or returns no endpoints. The result — including the
+    fail-open default — is cached per model for the process lifetime.
+    """
+    cached = _structured_method_cache.get(model_name)
+    if cached is not None:
+        return cached
+    method = "json_schema"
+    try:
+        import httpx
+
+        resp = httpx.get(
+            _OPENROUTER_ENDPOINTS_URL.format(model=model_name), timeout=5.0
+        )
+        resp.raise_for_status()
+        endpoints = (resp.json().get("data") or {}).get("endpoints") or []
+        if endpoints:
+            supported: set[str] = set()
+            for ep in endpoints:
+                supported.update(ep.get("supported_parameters") or [])
+            if "structured_outputs" not in supported:
+                if "tool_choice" in supported:
+                    method = "function_calling"
+                elif "response_format" in supported:
+                    method = "json_mode"
+                logger.info(
+                    "%s: endpoints lack structured_outputs support; using "
+                    "structured-output method=%s",
+                    model_name,
+                    method,
+                )
+    except Exception as exc:  # noqa: BLE001 — fail open to the static default
+        logger.debug(
+            "OpenRouter endpoint lookup failed for %s (%s); defaulting to "
+            "json_schema",
+            model_name,
+            exc,
+        )
+    _structured_method_cache[model_name] = method
+    return method
 
 
 # Substring of the ValueError LangChain's ``_oai_structured_outputs_parser``

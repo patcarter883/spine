@@ -110,3 +110,72 @@ async def test_first_attempt_success_makes_one_call():
 
     assert result == "immediate"
     assert len(model.calls) == 1
+
+
+# ── suppress_reasoning ──────────────────────────────────────────────────
+
+
+def _local_chat_openai(**overrides):
+    from langchain_openai import ChatOpenAI
+
+    kwargs = {
+        "model": "Qwen3.6-35B-A3B-MTP-GGUF",
+        "base_url": "http://localhost:8000/v1",
+        "api_key": "vllm",
+    }
+    kwargs.update(overrides)
+    return ChatOpenAI(**kwargs)
+
+
+class TestSuppressReasoning:
+    def test_local_chat_openai_gets_suppression_levers(self):
+        from spine.agents.helpers import suppress_reasoning
+
+        model = suppress_reasoning(_local_chat_openai())
+        extra = model.extra_body
+        assert extra["reasoning_budget"] == 0
+        assert extra["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_existing_extra_body_keys_survive_merge(self):
+        from spine.agents.helpers import suppress_reasoning
+
+        model = suppress_reasoning(
+            _local_chat_openai(
+                extra_body={
+                    "top_k": 40,
+                    "chat_template_kwargs": {"custom_flag": True},
+                }
+            )
+        )
+        extra = model.extra_body
+        assert extra["top_k"] == 40
+        assert extra["chat_template_kwargs"]["custom_flag"] is True
+        assert extra["chat_template_kwargs"]["enable_thinking"] is False
+        assert extra["reasoning_budget"] == 0
+
+    def test_idempotent(self):
+        from spine.agents.helpers import suppress_reasoning
+
+        once = suppress_reasoning(_local_chat_openai())
+        twice = suppress_reasoning(once)
+        assert twice.extra_body == once.extra_body
+
+    def test_non_chat_openai_passthrough(self):
+        from spine.agents.helpers import suppress_reasoning
+
+        sentinel = object()
+        assert suppress_reasoning(sentinel) is sentinel
+
+    def test_real_openai_endpoint_passthrough(self):
+        from spine.agents.helpers import suppress_reasoning
+
+        model = _local_chat_openai(base_url="https://api.openai.com/v1")
+        assert suppress_reasoning(model) is model
+
+    def test_no_base_url_passthrough(self):
+        from langchain_openai import ChatOpenAI
+
+        from spine.agents.helpers import suppress_reasoning
+
+        model = ChatOpenAI(model="gpt-4o-mini", api_key="sk-test")
+        assert suppress_reasoning(model) is model

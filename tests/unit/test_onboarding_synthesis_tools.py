@@ -8,7 +8,7 @@ Exercises the tools directly without a live LLM:
 - ``synthesize_artifacts`` (now a thin shim over the synthesis hierarchy graph)
   writes all four documents and is idempotent across re-runs, with the bare
   manager/worker LLM calls replaced by stubs returning a ``SectionPlanSet`` /
-  ``SectionResult``.
+  ``SectionContent``.
 """
 
 from __future__ import annotations
@@ -208,7 +208,7 @@ class _StubModel:
     """A bare chat model whose structured calls return canned plan/results.
 
     The manager call binds ``SectionPlanSet`` and the worker call binds
-    ``SectionResult``; ``_factory`` inspects the schema to return the right
+    ``SectionContent``; ``_factory`` inspects the schema to return the right
     canned object. ``worker_status`` lets a test force a worker to report
     ``status="error"`` so the partial-generation RuntimeError path is exercised.
     """
@@ -224,8 +224,8 @@ class _StubModel:
 
     def _make(self, schema: Any) -> Any:
         from spine.work.onboarding.synthesis_plan import (
+            SectionContent,
             SectionPlanSet,
-            SectionResult,
         )
 
         if schema is SectionPlanSet:
@@ -243,16 +243,11 @@ class _StubModel:
                     for doc in ONBOARDING_DOC_NAMES
                 ]
             )
-        # SectionResult — one section's markdown. The error case returns empty
-        # markdown so the worker classifies it as a failed section.
+        # SectionContent — one section's content. The error case returns a
+        # whitespace-only overview so the worker classifies it as failed.
         if self._worker_status == "error":
-            return SectionResult(doc_id="", order=0, markdown="", status="error")
-        return SectionResult(
-            doc_id="",
-            order=0,
-            markdown="Generated for tests.",
-            status="ok",
-        )
+            return SectionContent(overview=" ")
+        return SectionContent(overview="Generated for tests.")
 
 
 def _patch_models(monkeypatch, worker_status: str = "ok") -> None:

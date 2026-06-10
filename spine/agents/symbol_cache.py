@@ -27,7 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,27 @@ _cacheable_servers: dict[str, tuple[str, ...]] = {
     "codebase-index": _DEFAULT_DETERMINISTIC_SUFFIXES,
 }
 
+# Exact tool names (non-``mcp_``-prefixed) opted into cross-branch result
+# sharing. The ``codebase_query`` facade (commit b2f60ac) replaced the raw
+# ``mcp_codebase-index_*`` surface for all subagents; without this entry
+# ``is_cacheable`` returned False for the facade and cross-branch dedupe
+# silently stopped applying — trace 019eaecf showed the same
+# ``get_source(SpineConfig)`` fetched 19× across sibling scouts.
+_cacheable_tools: set[str] = {
+    "codebase_query",
+}
+
+
+def register_cacheable_tool(tool_name: str) -> None:
+    """Opt an exact (non-MCP) tool name into cross-branch result sharing.
+
+    Only deterministic, read-only tools may be registered — the cache
+    lives for the whole work_id, so results from tools that observe
+    mutable state would go stale across phases.
+    """
+    if tool_name:
+        _cacheable_tools.add(tool_name)
+
 
 def register_cacheable_server(
     server_name: str,
@@ -71,12 +92,18 @@ def register_cacheable_server(
 
 
 def is_cacheable(tool_name: str) -> bool:
-    """Return True when *tool_name* is a deterministic MCP lookup.
+    """Return True when *tool_name* is a deterministic codebase lookup.
 
-    Matches the ``mcp_<server>_<suffix>...`` naming convention against
-    the server allowlist registered via ``register_cacheable_server``.
+    Exact names registered via ``register_cacheable_tool`` qualify (e.g.
+    the ``codebase_query`` facade); otherwise matches the
+    ``mcp_<server>_<suffix>...`` naming convention against the server
+    allowlist registered via ``register_cacheable_server``.
     """
-    if not tool_name or not tool_name.startswith("mcp_"):
+    if not tool_name:
+        return False
+    if tool_name in _cacheable_tools:
+        return True
+    if not tool_name.startswith("mcp_"):
         return False
     for server, suffixes in _cacheable_servers.items():
         prefix = f"mcp_{server}_"
@@ -85,6 +112,68 @@ def is_cacheable(tool_name: str) -> bool:
         rest = tool_name[len(prefix):]
         return any(rest.startswith(suf) for suf in suffixes)
     return False
+
+
+# ── Args canonicalization ────────────────────────────────────────────
+#
+# Fingerprinting raw facade args lets superficially different calls miss
+# each other: ``codebase_query {"action":"get_source","name":"render"}``
+# and the same call plus a hallucinated ``file_hint`` key (dropped by
+# Pydantic ``extra="ignore"``) resolve to the *identical* backing MCP
+# call but produced distinct cache keys — trace 019eafac fetched
+# ``get_function_source(render)`` 3× in one work_id. A canonicalizer
+# maps ``(tool_name, raw args)`` → the resolved backing call before
+# fingerprinting, so every variant (and any raw ``mcp_*`` caller)
+# coalesces onto one entry.
+
+def _codebase_query_canonicalizer(
+    args: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    # Lazy import: symbol_cache must stay importable independent of the
+    # tools package; codebase_query does not import symbol_cache (no cycle).
+    from spine.agents.tools.codebase_query import canonical_backing_call
+
+    return canonical_backing_call(args)
+
+
+_args_canonicalizers: dict[
+    str, Callable[[dict[str, Any]], tuple[str, dict[str, Any]] | None]
+] = {
+    "codebase_query": _codebase_query_canonicalizer,
+}
+
+
+def register_args_canonicalizer(
+    tool_name: str,
+    fn: Callable[[dict[str, Any]], tuple[str, dict[str, Any]] | None],
+) -> None:
+    """Register a canonical-call mapper for *tool_name*.
+
+    ``fn`` receives the raw tool args and returns ``(canonical_tool_name,
+    canonical_args)``, or ``None`` to keep the raw key (e.g. when the args
+    don't validate). The canonical name should itself be ``is_cacheable``
+    so direct callers of the backing tool share the same entries.
+    """
+    if tool_name and fn is not None:
+        _args_canonicalizers[tool_name] = fn
+
+
+def _canonical_call(
+    tool_name: str, args: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    fn = _args_canonicalizers.get(tool_name)
+    if fn is not None:
+        try:
+            mapped = fn(args)
+            if mapped is not None:
+                return mapped
+        except Exception:
+            logger.debug(
+                "symbol_cache: canonicalizer for %r failed — using raw key",
+                tool_name,
+                exc_info=True,
+            )
+    return tool_name, args
 
 
 def args_fingerprint(args: dict[str, Any]) -> str:
@@ -125,6 +214,7 @@ _index_lock = asyncio.Lock()
 
 
 def _key(work_id: str, tool_name: str, args: dict[str, Any]) -> tuple[str, str, str]:
+    tool_name, args = _canonical_call(tool_name, args)
     return (work_id or "_unknown", tool_name, args_fingerprint(args))
 
 

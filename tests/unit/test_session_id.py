@@ -170,6 +170,7 @@ class TestResolveModelSessionId:
         """
         from pydantic import BaseModel
 
+        import spine.agents.helpers as helpers
         from spine.agents.helpers import (
             _build_openrouter_model,
             _is_openai_style_model,
@@ -207,7 +208,13 @@ class TestResolveModelSessionId:
             raise _Stop
 
         model.client.chat.send_async = _spy
-        runnable = bind_structured_output(model, _Schema)
+        # Seed the capability cache so bind_structured_output doesn't hit
+        # the live OpenRouter endpoints API from a unit test.
+        with patch.dict(
+            helpers._structured_method_cache,
+            {"deepseek/deepseek-v4-flash": "json_schema"},
+        ):
+            runnable = bind_structured_output(model, _Schema)
 
         async def _go() -> None:
             try:
@@ -220,6 +227,272 @@ class TestResolveModelSessionId:
         assert "response_format" in captured
         assert "tool_choice" not in captured
         assert captured["response_format"]["type"] == "json_schema"  # type: ignore[index]
+
+
+class TestOpenRouterStructuredMethod:
+    """Verify endpoint-capability-driven structured-output method selection.
+
+    Regression (trace 019eaf1f): OpenRouter gates ``response_format:
+    json_schema`` behind the ``structured_outputs`` endpoint capability.
+    minimax/minimax-m3's only endpoint advertises ``tools``/``tool_choice``
+    but NOT ``structured_outputs``, so with ``require_parameters=True`` the
+    unconditional ``method="json_schema"`` bind made every call 404 with
+    "No endpoints found that can handle the requested parameters".
+    """
+
+    @staticmethod
+    def _endpoints_response(supported_parameters: list[str]):
+        class _Resp:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {
+                    "data": {
+                        "endpoints": [
+                            {"supported_parameters": supported_parameters}
+                        ]
+                    }
+                }
+
+        return _Resp()
+
+    def _method_for(self, supported_parameters: list[str]) -> str:
+        import spine.agents.helpers as helpers
+
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            with patch(
+                "httpx.get",
+                return_value=self._endpoints_response(supported_parameters),
+            ):
+                return helpers._openrouter_structured_method("test/model")
+
+    def test_no_structured_outputs_falls_back_to_function_calling(self) -> None:
+        """minimax-m3's actual capability set must select function_calling."""
+        supported = [
+            "include_reasoning",
+            "max_tokens",
+            "reasoning",
+            "response_format",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
+        ]
+        assert self._method_for(supported) == "function_calling"
+
+    def test_structured_outputs_supported_keeps_json_schema(self) -> None:
+        assert (
+            self._method_for(["structured_outputs", "tool_choice", "max_tokens"])
+            == "json_schema"
+        )
+
+    def test_response_format_only_falls_back_to_json_mode(self) -> None:
+        assert self._method_for(["response_format", "max_tokens"]) == "json_mode"
+
+    def test_lookup_failure_fails_open_to_json_schema_and_caches(self) -> None:
+        import spine.agents.helpers as helpers
+
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            with patch("httpx.get", side_effect=OSError("network down")):
+                assert (
+                    helpers._openrouter_structured_method("test/model")
+                    == "json_schema"
+                )
+            # The fail-open default is cached: no second HTTP attempt.
+            with patch("httpx.get", side_effect=AssertionError("should not be called")):
+                assert (
+                    helpers._openrouter_structured_method("test/model")
+                    == "json_schema"
+                )
+
+    def test_bind_structured_output_uses_function_calling_for_minimax(self) -> None:
+        """End-to-end bind: a ChatOpenRouter model whose endpoints lack
+        structured_outputs must put a forced tool_choice on the wire instead
+        of response_format json_schema."""
+        import asyncio
+
+        from langchain_core.messages import HumanMessage
+        from pydantic import BaseModel
+
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import (
+            _build_openrouter_model,
+            bind_structured_output,
+        )
+
+        class _Schema(BaseModel):
+            decision: str
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key-12345"}):
+            model = _build_openrouter_model(
+                "openrouter:minimax/minimax-m3",
+                "work-123",
+            )
+
+        class _Stop(Exception):
+            pass
+
+        captured: dict[str, object] = {}
+
+        async def _spy(*_args: object, **kwargs: object) -> object:
+            captured.update(kwargs)
+            raise _Stop
+
+        model.client.chat.send_async = _spy
+        with patch.dict(
+            helpers._structured_method_cache,
+            {"minimax/minimax-m3": "function_calling"},
+        ):
+            runnable = bind_structured_output(model, _Schema)
+
+        async def _go() -> None:
+            try:
+                await runnable.ainvoke([HumanMessage(content="hi")])
+            except _Stop:
+                pass
+
+        asyncio.run(_go())
+
+        assert "tool_choice" in captured
+        assert captured.get("response_format") is None or (
+            captured["response_format"].get("type") != "json_schema"  # type: ignore[union-attr]
+        )
+
+
+class _Routing404(Exception):
+    """Mimics langchain_openrouter's NotFoundResponseError shape."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.status_code = 404
+
+
+_TOOL_CHOICE_404 = (
+    "No endpoints found that support the provided 'tool_choice' value. "
+    "To learn more about provider routing, visit: "
+    "https://openrouter.ai/docs/guides/routing/provider-selection"
+)
+_PARAMS_404 = "No endpoints found that can handle the requested parameters."
+
+
+class _FakeStructuredModel:
+    """Stub model whose bound runnable fails routing for selected methods."""
+
+    def __init__(self, model_name: str, failing_methods: dict[str, Exception]) -> None:
+        self.model_name = model_name
+        self._failing = failing_methods
+        self.methods_invoked: list[str] = []
+
+    def with_structured_output(self, schema: object, method: str = "") -> object:
+        outer = self
+
+        class _Bound:
+            async def ainvoke(self, _input: object, _config: object = None, **_kw: object) -> str:
+                outer.methods_invoked.append(method)
+                exc = outer._failing.get(method)
+                if exc is not None:
+                    raise exc
+                return f"ok:{method}"
+
+        return _Bound()
+
+
+class TestSelfHealingStructured:
+    """Verify invoke-time method demotion on OpenRouter routing 404s.
+
+    Regression (trace 019eaf2a): endpoint capability listings can't reveal
+    value-level support — minimax-m3 advertises ``tool_choice`` but rejects
+    the forced named function that method="function_calling" sends, 404ing
+    at routing time. The binding must demote and retry rather than fail the
+    whole synthesis run.
+    """
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def test_demotes_function_calling_to_json_mode_and_caches(self) -> None:
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "minimax/minimax-m3",
+            {"function_calling": _Routing404(_TOOL_CHOICE_404)},
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "function_calling")
+            result = self._run(wrapper.ainvoke(["msg"]))
+            assert helpers._structured_method_cache["minimax/minimax-m3"] == "json_mode"
+        assert result == "ok:json_mode"
+        assert model.methods_invoked == ["function_calling", "json_mode"]
+
+    def test_walks_full_ladder_from_json_schema(self) -> None:
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model",
+            {
+                "json_schema": _Routing404(_PARAMS_404),
+                "function_calling": _Routing404(_TOOL_CHOICE_404),
+            },
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "json_schema")
+            result = self._run(wrapper.ainvoke(["msg"]))
+        assert result == "ok:json_mode"
+        assert model.methods_invoked == ["json_schema", "function_calling", "json_mode"]
+
+    def test_non_routing_errors_propagate_without_demotion(self) -> None:
+        import pytest
+
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model", {"json_schema": RuntimeError("provider exploded")}
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "json_schema")
+            with pytest.raises(RuntimeError, match="provider exploded"):
+                self._run(wrapper.ainvoke(["msg"]))
+            assert "test/model" not in helpers._structured_method_cache
+        assert model.methods_invoked == ["json_schema"]
+
+    def test_bottom_of_ladder_404_propagates(self) -> None:
+        import pytest
+
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model", {"json_mode": _Routing404(_PARAMS_404)}
+        )
+        with patch.dict(helpers._structured_method_cache, {}, clear=True):
+            wrapper = _SelfHealingStructured(model, object, "json_mode")
+            with pytest.raises(_Routing404):
+                self._run(wrapper.ainvoke(["msg"]))
+        assert model.methods_invoked == ["json_mode"]
+
+    def test_adopts_demotion_discovered_by_another_worker(self) -> None:
+        import spine.agents.helpers as helpers
+        from spine.agents.helpers import _SelfHealingStructured
+
+        model = _FakeStructuredModel(
+            "test/model", {"json_schema": _Routing404(_PARAMS_404)}
+        )
+        with patch.dict(
+            helpers._structured_method_cache,
+            {"test/model": "json_mode"},
+            clear=True,
+        ):
+            wrapper = _SelfHealingStructured(model, object, "json_schema")
+            result = self._run(wrapper.ainvoke(["msg"]))
+        # The cached demotion is adopted up-front: json_schema never tried.
+        assert result == "ok:json_mode"
+        assert model.methods_invoked == ["json_mode"]
 
 
 class TestLocalProviderModel:

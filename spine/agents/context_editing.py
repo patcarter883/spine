@@ -38,7 +38,11 @@ from spine.agents._tokens import count_tokens
 # never appear here. The MCP codebase-index tools are dispatched under the
 # ``mcp_codebase-index_*`` prefix; rather than enumerating each one, the
 # middleware also dedupes any tool whose name starts with ``mcp_``.
+# ``codebase_query`` is the facade that replaced the raw mcp_ surface for
+# subagents (commit b2f60ac) — it must be listed explicitly or the
+# middleware skips it entirely.
 _DEDUPED_TOOLS: frozenset[str] = frozenset({
+    "codebase_query",
     "search_codebase",
     "ast_extract_symbol",
     "glob",

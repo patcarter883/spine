@@ -13,8 +13,10 @@ an ordered list of sections — one per natural unit per document:
   grouped by the index); fragment = that module's boundary + its edges.
 - ``CODING_GUIDELINES`` — one section per pattern category; fragment = that
   category's findings (with evidence).
-- ``PROJECT_DEFINITION`` — one section per core domain; fragment = that domain's
-  module roles.
+- ``PROJECT_DEFINITION`` — one section per core domain (domains below
+  :data:`_MIN_DOMAIN_SYMBOLS` symbols are merged into a single "Supporting
+  Domains" section so no worker is asked to write prose about a near-empty
+  domain); fragment = that domain's module roles.
 - ``SPINE_ASSISTANCE_REQUIREMENTS`` — 1-2 sections; fragment = size/budget
   signals only.
 - greenfield — a fixed minimal plan (one section per doc, no manifest content).
@@ -65,14 +67,103 @@ class SectionPlan(BaseModel):
     )
 
 
+class SectionEntry(BaseModel):
+    """One concrete item within a section (a module, convention, domain, …)."""
+
+    name: str = Field(
+        min_length=1,
+        description="The item's name (module, convention, domain, or component).",
+    )
+    path: str = Field(
+        default="",
+        description="Repository path for the item, if it has one (else empty).",
+    )
+    description: str = Field(
+        min_length=1,
+        description=(
+            "What this item is/does, grounded in the supplied fragment. Inline "
+            "markdown (backticks, bold) is allowed."
+        ),
+    )
+
+
+class SectionContent(BaseModel):
+    """The section worker's structured output — content fields ONLY.
+
+    This is the schema bound via ``with_structured_output`` for each Tier-B
+    worker call. It deliberately carries NO ``doc_id``/``order``/``status`` —
+    the worker already knows those from its ``active_section`` input, and
+    asking the model to echo them only invites hallucination (trace
+    019eaf55: workers returned envelope-only JSON with invented orders).
+    ``overview`` is required and non-empty so json_schema enforcement makes a
+    metadata-only response an invalid generation. The markdown document shape
+    is rendered deterministically by :func:`render_section_markdown` — the
+    model never authors document structure.
+    """
+
+    overview: str = Field(
+        min_length=1,
+        description=(
+            "1-3 paragraphs of prose for this section, grounded ONLY in the "
+            "supplied fragment. Inline markdown (backticks, bold) is allowed; "
+            "no headings."
+        ),
+    )
+    entries: list[SectionEntry] = Field(
+        default_factory=list,
+        description=(
+            "One entry per concrete item the section covers (module, "
+            "convention, domain, component). Empty if the section is pure prose."
+        ),
+    )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="Optional caveats or pointers worth calling out (short strings).",
+    )
+
+
+def render_section_markdown(title: str, content: SectionContent) -> str:
+    """Render one section's markdown from its structured content.
+
+    Deterministic — the renderer owns the markdown shape (mirrors
+    ``_render_spec_markdown`` in :mod:`spine.agents.specify_tools`): ``##``
+    section heading from the PLAN title (never the model), overview prose,
+    one ``###`` subsection per entry, then a trailing notes list. Sections are
+    concatenated under the assembler's ``# <Document Title>``, so headings
+    start at ``##``.
+    """
+    parts: list[str] = []
+    if title.strip():
+        parts.append(f"## {title.strip()}")
+    if content.overview.strip():
+        parts.append(content.overview.strip())
+    for entry in content.entries:
+        name = entry.name.strip()
+        description = entry.description.strip()
+        if not (name and description):
+            continue
+        path = entry.path.strip()
+        heading = f"### {name}" + (f" (`{path}`)" if path else "")
+        parts.append(f"{heading}\n\n{description}")
+    cleaned_notes = [n.strip() for n in content.notes if n and n.strip()]
+    if cleaned_notes:
+        parts.append("**Notes:**\n" + "\n".join(f"- {n}" for n in cleaned_notes))
+    return "\n\n".join(parts)
+
+
 class SectionResult(BaseModel):
-    """One section worker's output — a single document section's markdown."""
+    """One section's RESULT carried on the graph state channel.
+
+    NOT an LLM output schema — the worker authors a :class:`SectionContent`,
+    renders it via :func:`render_section_markdown`, and emits this shape (as a
+    plain dict) with its own known ``doc_id``/``order``.
+    """
 
     doc_id: str = Field(description="Which onboarding document this section is for.")
     order: int = Field(description="Position within the document (for assembly).")
     markdown: str = Field(
         default="",
-        description="The authored markdown for this section.",
+        description="The rendered markdown for this section.",
     )
     status: str = Field(
         default="ok",
@@ -95,6 +186,12 @@ class SectionPlanSet(BaseModel):
 
 
 # ── Deterministic skeleton ──────────────────────────────────────────────────
+
+# A core domain whose backing module carries fewer symbols than this is merged
+# into one shared "Supporting Domains" section instead of getting a dedicated
+# section. A worker given a 1-4 symbol domain has nothing to write — trace
+# 019eaf55 showed such sections deterministically coming back content-free.
+_MIN_DOMAIN_SYMBOLS = 5
 
 
 def _greenfield_plan() -> list[dict[str, Any]]:
@@ -214,8 +311,18 @@ def _project_sections(index: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
             }
         ]
+    # Domains map to modules of the same name (see resolve_fragment). Domains
+    # whose module carries too few symbols (or fell into the index's collapsed
+    # tail, so we have no count) are merged into ONE shared section.
+    symbol_counts = {
+        m.get("name", ""): int(m.get("symbol_count", 0) or 0)
+        for m in (index.get("modules", []) or [])
+    }
+    primary = [d for d in domains if symbol_counts.get(d, 0) >= _MIN_DOMAIN_SYMBOLS]
+    minor = [d for d in domains if d not in primary]
+
     sections: list[dict[str, Any]] = []
-    for order, domain in enumerate(domains):
+    for order, domain in enumerate(primary):
         sections.append(
             {
                 "doc_id": "PROJECT_DEFINITION",
@@ -228,6 +335,24 @@ def _project_sections(index: dict[str, Any]) -> list[dict[str, Any]]:
                 "instruction": (
                     f"Define the '{domain}' domain: its purpose and the modules "
                     "that implement it, using only the supplied module roles."
+                ),
+            }
+        )
+    if minor:
+        sections.append(
+            {
+                "doc_id": "PROJECT_DEFINITION",
+                "order": len(primary),
+                "title": "Supporting Domains",
+                "fragment_keys": {
+                    "doc_id": "PROJECT_DEFINITION",
+                    "domains": list(minor),
+                },
+                "instruction": (
+                    "Briefly define each of these smaller supporting domains — "
+                    + ", ".join(f"'{d}'" for d in minor)
+                    + " — one short entry apiece, using only the supplied "
+                    "module roles."
                 ),
             }
         )

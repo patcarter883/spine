@@ -39,12 +39,20 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
+from spine.agents import symbol_cache
 from spine.agents.helpers import (
     ainvoke_structured_with_retry,
     bind_structured_output,
     cap_completion_tokens,
     resolve_chat_model,
+    suppress_reasoning,
 )
+
+try:  # openai is always present when the model is ChatOpenAI; guard for safety.
+    from openai import LengthFinishReasonError as _LengthFinishReasonError
+except Exception:  # pragma: no cover - openai missing → length retry is a no-op
+    class _LengthFinishReasonError(Exception):  # type: ignore[no-redef]
+        """Fallback sentinel — never raised, so the except branch stays inert."""
 from spine.agents.prompt_format import (
     Tag,
     hostage_layout,
@@ -429,11 +437,13 @@ async def run_supervisor_node(
     # LengthFinishReasonError (trace 019e8679, run 019e867a). The cap fails fast;
     # the except below turns the truncation into a terminating directive so the
     # loop exits cleanly. Mirrors exploration_agents._findings_structured_model.
+    base_model = model
+    cap = 0
     try:
         from spine.config import SpineConfig
 
         cap = SpineConfig.load().researcher_supervisor_max_completion_tokens
-        model = cap_completion_tokens(model, cap)
+        model = suppress_reasoning(cap_completion_tokens(model, cap))
     except Exception:
         logger.debug(
             "[%s] researcher_supervisor: token-cap copy failed — using uncapped model",
@@ -461,18 +471,56 @@ async def run_supervisor_node(
         history_summary=_render_history_summary(evaluation_history),
     )
 
+    messages = [
+        SystemMessage(content=_SUPERVISOR_SYSTEM_PROMPT),
+        HumanMessage(content=user_msg),
+    ]
     try:
         response: Any = await ainvoke_structured_with_retry(
             structured,
-            [
-                SystemMessage(content=_SUPERVISOR_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ],
+            messages,
             label=f"researcher_supervisor[{phase_path}]",
         )
+    except _LengthFinishReasonError:
+        # The directive was truncated at the completion cap. Retry once with
+        # a much larger budget rebuilt from the pre-cap model — losing this
+        # call doesn't just drop one answer, it terminates exploration early
+        # (the generic except below degrades to a terminating directive).
+        try:
+            from spine.config import SpineConfig
+
+            global_cap = SpineConfig.load().max_completion_tokens or 0
+            raised_cap = max(cap * 4, global_cap, 16384)
+            logger.warning(
+                "[%s] researcher_supervisor: directive truncated at cap=%d for "
+                "phase_path=%r — retrying once with cap=%d",
+                work_id,
+                cap,
+                phase_path,
+                raised_cap,
+            )
+            retry_structured = bind_structured_output(
+                suppress_reasoning(cap_completion_tokens(base_model, raised_cap)),
+                SupervisorDirective,
+            )
+            response = await ainvoke_structured_with_retry(
+                retry_structured,
+                messages,
+                label=f"researcher_supervisor[{phase_path}]/length-retry",
+            )
+        except Exception:
+            logger.warning(
+                "[%s] researcher_supervisor: length retry failed for phase_path=%r — "
+                "terminating exploration early (directive degraded to terminate)",
+                work_id,
+                phase_path,
+                exc_info=True,
+            )
+            return _terminating_directive("supervisor invocation failed")
     except Exception:
         logger.warning(
-            "[%s] researcher_supervisor: invocation failed for phase_path=%r",
+            "[%s] researcher_supervisor: invocation failed for phase_path=%r — "
+            "terminating exploration early (directive degraded to terminate)",
             work_id,
             phase_path,
             exc_info=True,
@@ -744,10 +792,63 @@ def _extract_anchors_from_tool_payload(body: str) -> tuple[str, list[str]]:
     return target_path, deduped
 
 
+# Deterministic read-only research tools that the one-shot worker path may
+# additionally dedupe through ``symbol_cache`` (beyond what
+# ``symbol_cache.is_cacheable`` already approves). The worker only runs in
+# exploration phases (SPECIFY / PLAN scouts), where the workspace is not
+# being mutated — so file-observing lookups are stable for the duration.
+# Do NOT widen ``symbol_cache``'s global allowlist with these: implement-
+# phase agents reach the same cache via ReadCacheMiddleware, and there the
+# underlying files DO change within a work_id.
+_WORKER_CACHEABLE_EXTRA: frozenset[str] = frozenset({
+    "ast_extract_symbol",
+    "search_codebase",
+})
+
+
+async def _invoke_tool_deduped(
+    tool: Any,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    work_id: str,
+) -> tuple[Any, int]:
+    """``tool.ainvoke`` with cross-scout single-flight dedupe.
+
+    The one-shot worker executes tool calls bare — no middleware stack —
+    so without this hop the ``ReadCacheMiddleware``/``symbol_cache``
+    layers never see them. Trace 019eaecf: sibling Architectural Scouts
+    issued ``codebase_query(get_source, SpineConfig)`` 19× because each
+    fan-out branch paid for its own MCP round-trip.
+
+    Returns ``(output, hit_count)`` — ``hit_count`` >= 1 means the result
+    was served from a sibling's earlier fetch. Exceptions from the
+    underlying tool propagate (and are never memoised).
+    """
+    cacheable = symbol_cache.is_cacheable(tool_name) or tool_name in _WORKER_CACHEABLE_EXTRA
+    if not work_id or work_id == "unknown" or not cacheable:
+        return await tool.ainvoke(tool_args), 0
+
+    captured: dict[str, Any] = {}
+
+    async def _fetch() -> str | None:
+        res = await tool.ainvoke(tool_args)
+        captured["result"] = res
+        # Only string payloads are memoised; anything else falls through.
+        return res if isinstance(res, str) else None
+
+    content, hit_count = await symbol_cache.get_or_fetch(
+        work_id, tool_name, tool_args, _fetch,
+    )
+    if content is not None:
+        return content, hit_count
+    return captured.get("result"), 0
+
+
 async def _execute_worker_first_tool(
     ai_msg: Any,
     tool_by_name: dict[str, Any],
     tool_class: ToolClass,
+    work_id: str = "",
 ) -> tuple[str, Any]:
     """Run the FIRST tool call on ``ai_msg`` and classify the outcome.
 
@@ -759,6 +860,10 @@ async def _execute_worker_first_tool(
       - ``("error", (tool_id, tool_name, error_text))`` — the tool was missing
         from the scoped surface or raised. ``error_text`` is the teaching
         message the caller may feed back to the model for ONE retry.
+
+    Deterministic codebase lookups are routed through ``symbol_cache``
+    keyed by *work_id* so sibling scout branches share results instead of
+    each re-issuing the same fetch (see :func:`_invoke_tool_deduped`).
     """
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
     if not tool_calls:
@@ -782,14 +887,24 @@ async def _execute_worker_first_tool(
         )
 
     try:
-        tool_output = await tool.ainvoke(tool_args)
+        tool_output, hit_count = await _invoke_tool_deduped(
+            tool, tool_name, tool_args, work_id,
+        )
     except Exception as exc:
         return "error", (tool_id, tool_name, f"{type(exc).__name__}: {exc}")
+
+    content = str(tool_output) if tool_output is not None else ""
+    if hit_count > 0:
+        content = (
+            f"[ALREADY FETCHED — an identical {tool_name} query was answered "
+            f"earlier in this run (served from cache, hit #{hit_count}). "
+            f"Result repeated below; do not re-issue this query.]\n{content}"
+        )
 
     # Wrap the tool output as a ToolMessage so the existing extractor
     # (which expects a message list) keeps working unchanged.
     tool_msg = ToolMessage(
-        content=str(tool_output) if tool_output is not None else "",
+        content=content,
         name=tool_name,
         tool_call_id=tool_id,
     )
@@ -838,11 +953,12 @@ async def run_worker_node(
             (``SUBAGENT_PROMPTS["researcher"]`` / ``-plan``). Sent as a
             SystemMessage to the bound model.
         context: Unused. Kept in the signature for caller compatibility
-            after the agent-loop removal — ReadCacheMiddleware no longer
-            wraps the worker's tool execution because there is no
-            middleware stack to wrap. MCP / search tools cache
-            internally; the worker only does ONE tool call per turn
-            anyway, so cross-turn dedupe wasn't doing useful work here.
+            after the agent-loop removal — there is no middleware stack
+            to wrap. Cross-scout dedupe of deterministic codebase
+            lookups happens inside :func:`_execute_worker_first_tool`
+            via ``symbol_cache`` keyed by work_id instead (trace
+            019eaecf showed sibling scouts re-fetching the same symbol
+            19× when this path ran bare).
     """
     work_id = state.get("work_id", "unknown")
     tool_class = directive.allowed_tool_class
@@ -911,7 +1027,9 @@ async def run_worker_node(
     # the supervisor governs convergence and explicitly asked for a single
     # move this turn — extra tool calls would just inflate the next cycle's
     # history block.
-    kind, payload = await _execute_worker_first_tool(ai_msg, tool_by_name, tool_class)
+    kind, payload = await _execute_worker_first_tool(
+        ai_msg, tool_by_name, tool_class, work_id=work_id,
+    )
     if kind == "finding":
         return payload  # no tool call — narration-only finding
     if kind == "ok":
@@ -953,7 +1071,7 @@ async def run_worker_node(
         work_id, tool_name,
     )
     kind2, payload2 = await _execute_worker_first_tool(
-        retry_ai_msg, tool_by_name, tool_class
+        retry_ai_msg, tool_by_name, tool_class, work_id=work_id,
     )
     if kind2 == "finding":
         return payload2

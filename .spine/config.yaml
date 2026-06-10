@@ -1,75 +1,46 @@
-# SPINE live configuration. This file lists only the settings overridden
-# from their built-in defaults. For the full catalogue of every available
-# setting — with its default, valid values, and environment-variable
-# override — see .spine/config.reference.yaml.
 spine:
   checkpoint_path: .spine/spine.db
   guided_decoding: true
   topic_lookup_min_similarity: 0.75
-  # Cap the findings block injected into plan/specify synthesize prompts.
-  # Prevents accumulated research summaries from dominating prompt size
-  # (trace 019e6d27: plan-synthesize hit 42K, above the 40K compactor
-  # threshold). Set to 0 or negative to disable the cap.
   synthesize_findings_token_budget: 20000
-  max_completion_tokens: 40000
+  max_completion_tokens: 30000
   researcher_supervisor_max_completion_tokens: 4096
   max_critic_retries: 3
-  # RAG configuration
   reranker_provider: bge-reranker
   embedding_provider: local-embeddings
   recall_k: 10
   topic_lookup_top_k: 5
-  # Hybrid recall (BM25 + vector, RRF-fused). Tests are excluded from the
-  # index by default (they swamped ~66% of symbols). Lexical BM25 dominates
-  # code-symbol search; the dense vector channel added nothing on
-  # tests/recall_eval (pure BM25 had the best MRR), so it is kept at a small
-  # hedge weight rather than removed. Env: SPINE_RRF_VECTOR_WEIGHT.
   index_tests: false
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
     max_concurrent_chunks: 10
     batch_size: 100
-  # Researcher convergence steering — nudge & force the explore subagent
-  # to emit final ResearchFindings before LangGraph's recursion_limit (50)
-  # is hit. Disable with SPINE_RESEARCHER_CONVERGENCE=false.
   convergence:
-    # Supervisor↔worker loop iteration cap for SPECIFY (broad architectural
-    # mapping gets a larger budget). Floored at 1.
-    # Default: 12  | Env: SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_SPECIFY
     researcher_supervisor_max_cycles_specify: 12
-
-    # Supervisor↔worker loop iteration cap for PLAN (focused change-surface
-    # scan). Floored at 1.
-    # Default: 6  | Env: SPINE_RESEARCHER_SUPERVISOR_MAX_CYCLES_PLAN
     researcher_supervisor_max_cycles_plan: 6
-  # Token-based phase compaction (TokenBudgetCompactor). Off by default;
-  # enable with SPINE_TOKEN_COMPACTION=true. Per-phase threshold of 0
-  # disables compaction for that phase even when the env flag is set.
   token_compaction:
     enabled: true
     default_threshold: 0
     thresholds:
-      specify:   30000
-      plan:      40000
-      implement: 60000
-      verify:    40000
+      specify: 30000
+      plan: 30000
+      implement: 30000
+      verify: 30000
     keep_recent: 6
     preserved_tools:
-      - write_file
-      - edit_file
-      - read_edit_lint
-      - write_specification
-      - write_plan
-      - write_tasks
-      - write_verification_report
+    - write_file
+    - edit_file
+    - read_edit_lint
+    - write_specification
+    - write_plan
+    - write_tasks
+    - write_verification_report
 mcp_servers:
   codebase-index:
     transport: stdio
     command: mcp-codebase-index
     args: []
-    # PROJECT_ROOT is auto-injected by spine.mcp.client.get_mcp_tools from
-    # the active workspace_root — do not set it here.
 providers:
   llm:
   - name: glm
@@ -87,25 +58,21 @@ providers:
     model: openrouter:deepseek/deepseek-v4-pro
     enabled: true
     guided_decoding: false
-
   - name: laguna-m1
     type: deepagents-model
     model: openrouter:poolside/laguna-m.1:free
     enabled: true
     guided_decoding: true
-
   - name: laguna-xs2
     type: deepagents-model
     model: openrouter:poolside/laguna-xs.2:free
     enabled: true
     guided_decoding: true
-
   - name: gemini-3.5-flash
     type: deepagents-model
     model: openrouter:google/gemini-3.5-flash
     enabled: true
     guided_decoding: true
-
   - name: local
     type: deepagents-model
     model: openai:Qwen3.6-35B-A3B-MTP-GGUF
@@ -114,7 +81,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 1
+    max_concurrent_calls: 2
   - name: pat
     type: deepagents-model
     model: openai:model
@@ -123,23 +90,13 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 4
+    max_concurrent_calls: 8
   - name: local-tiny
     type: deepagents-model
     model: openai:Gemma-4-E4B-it-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
-  # Embedding providers.
-  #
-  # query_prefix / document_prefix support asymmetric models. The embedding
-  # dimension is auto-probed from the live model at index time, so no `dim`
-  # setting is needed — just `spine index --wipe` after swapping models.
-  #
-  # For nomic-embed-text-v2 (768-dim) the prefixes below are REQUIRED:
-  #     model: nomic-embed-text-v2        # whatever name vLLM serves it as
-  #     query_prefix: "search_query: "
-  #     document_prefix: "search_document: "
   embedding:
   - name: local-embeddings
     type: openai-embedding
@@ -147,66 +104,40 @@ providers:
     base_url: http://localhost:8000/v1
     api_key: vllm
     stream_usage: true
-    query_prefix: "search_query: "
-    document_prefix: "search_document: "
-  # Cross-encoder rerankers (optional, OFF by default). To enable, serve a
-  # reranker (e.g. bge-reranker-v2-m3) behind a Cohere/Jina/vLLM-compatible
-  # /rerank endpoint, add it here, and set `reranker_provider: bge-reranker`
-  # plus `rerank_pool` under the top-level `spine:` block. Then measure with
-  # tests/recall_eval before trusting it.
+    query_prefix: 'search_query: '
+    document_prefix: 'search_document: '
   reranker:
   - name: bge-reranker
     model: bge-reranker-v2-m3-GGUF
     base_url: http://localhost:8000/v1
     api_key: vllm
-    # llama.cpp rerank route. Omit to auto-probe (/rerank then /reranking).
-    rerank_path: "/reranking"
+    rerank_path: /reranking
   phases:
     specify:
+      provider: local
+    specify/subagents/researcher:
       provider: pat
-    # Researcher subagent override. The local `pat` model struggles with
-    # MCP tool-arg schemas (trace 019e6cc4: 23/23 research branches failed
-    # with malformed args). Uncomment to escalate the researcher to a
-    # stronger model — must already be defined and enabled in providers.llm[].
-    # specify/subagents/researcher:
-    #   provider: deepseek-v4-pro
     plan:
-      provider: pat
-    critic:
-      provider: pat
-      # Critic verdict JSON is small (~2K tokens max). Cap prevents the 592s
-      # runaway seen in trace 019e87a2 where the local model hit the global
-      # 40K cap and generated for 10 minutes before raising LengthFinishReasonError.
-      max_completion_tokens: 8192
-    exploration:
+      provider: local
+    plan/subagents/researcher:
       provider: pat
     implement:
       provider: pat
-      # Slice-implementer agents build via build_phase_agent(phase=IMPLEMENT),
-      # so the model resolves on this bare "implement" key (the
-      # implement/subagents/slice-implementer entry below is only consulted on
-      # the phase_path path, e.g. the planning node). Slice completions are
-      # small (37-4,315 tokens observed in trace 019e87dd); capping at 8192
-      # prevents the 80K-window crash (prompt + global 40K cap > window) and
-      # any degenerate run-to-40K generation. Mirrors the critic cap above.
-      max_completion_tokens: 8192
-    implement/subagents/slice-implementer:
-      provider: pat
     verify:
-      provider: pat
-      # Same rationale as implement: slice-verifier builds via
-      # build_phase_agent(phase=VERIFY) and inherits the global 40K cap on an
-      # 80K-window model. Verification reports are small; cap at 8192.
-      max_completion_tokens: 8192
+      provider: local
+    critic:
+      provider: local
     gap_plan:
-      provider: pat
-    # RAG phase providers
+      provider: local
     classification:
       provider: pat
+      max_completion_tokens: 1024
+      temperature: 0
+      reasoning: false
     summarization:
       provider: pat
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false
     onboarding:
-      provider: pat
+      provider: local

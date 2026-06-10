@@ -35,10 +35,22 @@ class TestIsCacheable:
         # regex against the index is safe to share across sibling branches.
         assert symbol_cache.is_cacheable("mcp_codebase-index_search_codebase")
 
+    def test_codebase_query_facade_is_cacheable(self):
+        # The facade replaced the raw mcp_codebase-index_* surface for
+        # subagents (commit b2f60ac); it must stay on the allowlist or
+        # cross-branch dedupe silently stops applying (trace 019eaecf:
+        # get_source(SpineConfig) fetched 19× by sibling scouts).
+        assert symbol_cache.is_cacheable("codebase_query")
+
     def test_non_mcp_and_mutating_tools_are_not_cacheable(self):
         assert not symbol_cache.is_cacheable("read_file")
         assert not symbol_cache.is_cacheable("write_file")
         assert not symbol_cache.is_cacheable("")
+        # File-observing research tools are NOT globally cacheable — files
+        # change during implement; only the exploration worker path opts
+        # them in (where the workspace is read-only).
+        assert not symbol_cache.is_cacheable("ast_extract_symbol")
+        assert not symbol_cache.is_cacheable("search_codebase")
         # No suffix match — create_/update_/delete_/run_ are excluded.
         assert not symbol_cache.is_cacheable("mcp_codebase-index_create_thing")
         assert not symbol_cache.is_cacheable("mcp_codebase-index_run_query")
@@ -68,6 +80,21 @@ class TestRegisterCacheableServer:
             assert not symbol_cache.is_cacheable("mcp_strict_search_thing")
         finally:
             symbol_cache._cacheable_servers.pop("strict", None)
+
+
+class TestRegisterCacheableTool:
+    def test_exact_name_registration(self):
+        assert not symbol_cache.is_cacheable("my_lookup_tool")
+        try:
+            symbol_cache.register_cacheable_tool("my_lookup_tool")
+            assert symbol_cache.is_cacheable("my_lookup_tool")
+        finally:
+            symbol_cache._cacheable_tools.discard("my_lookup_tool")
+
+    def test_empty_name_is_noop(self):
+        before = set(symbol_cache._cacheable_tools)
+        symbol_cache.register_cacheable_tool("")
+        assert symbol_cache._cacheable_tools == before
 
 
 class TestArgsFingerprint:
@@ -212,3 +239,89 @@ class TestClear:
 
     def test_clear_empty_work_id_is_noop(self):
         assert symbol_cache.clear("") == 0
+
+
+class TestArgsCanonicalization:
+    """codebase_query args are keyed on the resolved backing MCP call so
+    superficially different facade calls coalesce (trace 019eafac:
+    get_source(render) fetched 3× because a hallucinated file_hint key and
+    explicit-default max_results produced distinct fingerprints)."""
+
+    def test_get_source_variants_share_a_key(self):
+        base = symbol_cache._key(
+            "w1", "codebase_query", {"action": "get_source", "name": "render"}
+        )
+        with_hint = symbol_cache._key(
+            "w1",
+            "codebase_query",
+            {"action": "get_source", "name": "render", "file_hint": "a/b.py"},
+        )
+        with_whitespace = symbol_cache._key(
+            "w1", "codebase_query", {"action": "get_source", "name": " render "}
+        )
+        assert base == with_hint == with_whitespace
+
+    def test_facade_and_raw_mcp_calls_share_a_key(self):
+        facade = symbol_cache._key(
+            "w1", "codebase_query", {"action": "get_source", "name": "render"}
+        )
+        raw = symbol_cache._key(
+            "w1", "mcp_codebase-index_get_function_source", {"name": "render"}
+        )
+        assert facade == raw
+
+    def test_search_default_max_results_coalesces(self):
+        implicit = symbol_cache._key(
+            "w1", "codebase_query", {"action": "search", "pattern": "def foo"}
+        )
+        explicit = symbol_cache._key(
+            "w1",
+            "codebase_query",
+            {"action": "search", "pattern": "def foo", "max_results": 20},
+        )
+        assert implicit == explicit
+
+    def test_invalid_args_fall_back_to_raw_key(self):
+        # search without pattern doesn't validate — canonicalizer returns
+        # None and the raw key is used without raising.
+        key = symbol_cache._key("w1", "codebase_query", {"action": "search"})
+        assert key[1] == "codebase_query"
+
+    def test_unregistered_tools_unaffected(self):
+        key = symbol_cache._key("w1", "some_other_tool", {"name": "render"})
+        assert key[1] == "some_other_tool"
+
+    @pytest.mark.asyncio
+    async def test_get_or_fetch_fetches_once_across_variants(self):
+        calls = []
+
+        async def fetch():
+            calls.append(1)
+            return "SOURCE"
+
+        r1, h1 = await symbol_cache.get_or_fetch(
+            "w-canon", "codebase_query", {"action": "get_source", "name": "render"}, fetch
+        )
+        r2, h2 = await symbol_cache.get_or_fetch(
+            "w-canon",
+            "codebase_query",
+            {"action": "get_source", "name": "render", "file_hint": "x.py"},
+            fetch,
+        )
+        r3, h3 = await symbol_cache.get_or_fetch(
+            "w-canon", "mcp_codebase-index_get_function_source", {"name": "render"}, fetch
+        )
+        assert (r1, r2, r3) == ("SOURCE", "SOURCE", "SOURCE")
+        assert len(calls) == 1
+        assert h1 == 0 and h2 == 1 and h3 == 2
+        symbol_cache.clear("w-canon")
+
+    def test_register_args_canonicalizer(self):
+        symbol_cache.register_args_canonicalizer(
+            "my_tool", lambda args: ("canonical_tool", {"x": 1})
+        )
+        try:
+            key = symbol_cache._key("w1", "my_tool", {"anything": "goes"})
+            assert key[1] == "canonical_tool"
+        finally:
+            symbol_cache._args_canonicalizers.pop("my_tool", None)

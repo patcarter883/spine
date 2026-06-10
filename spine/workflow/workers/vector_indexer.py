@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+from spine.agents.tools.ast_extract import extract_edges as ast_extract_edges
 from spine.agents.tools.ast_extract import extract_symbols as ast_extract_symbols
 from spine.config import SpineConfig
 from spine.persistence.vector_store import VectorStore
@@ -42,6 +43,7 @@ _EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     ".tox",
     ".next",
     ".nuxt",
+    "vendor",
 })
 
 
@@ -186,6 +188,9 @@ class VectorIndexer:
             self.store.delete_file_symbols(rel)
             full_path = os.path.join(workspace_root, rel)
             file_symbols = self._extract_symbols_from_file(full_path, rel)
+            # Dependency edges (PHP only — other languages are covered by
+            # mcp-codebase-index). Pure AST work, no LLM/embedding cost.
+            self.store.replace_file_edges(rel, ast_extract_edges(full_path, rel))
             results = await asyncio.gather(
                 *[self._process_symbol(s, semaphore, workspace_root) for s in file_symbols],
                 return_exceptions=True,
@@ -232,47 +237,58 @@ class VectorIndexer:
             return None
 
     async def _discover_target_files(self, workspace_root: str) -> list[str]:
-        """List indexable source files via mcp-codebase-index, filtered.
+        """List indexable source files by walking the workspace directly.
 
-        Applies the extension allow-list, the excluded-dirs blacklist, and
-        the test-file exclusion (unless ``index_tests``). Returns
-        workspace-relative paths.
+        Prefers ``git ls-files`` (tracked + untracked-but-not-ignored, so
+        .gitignore is respected); falls back to an ``os.walk`` with
+        directory pruning outside a git repo. Applies the extension
+        allow-list, the excluded-dirs blacklist, and the test-file
+        exclusion (unless ``index_tests``). Returns workspace-relative
+        paths.
         """
-        from spine.mcp.client import get_mcp_tools
+        all_files = await asyncio.to_thread(self._list_workspace_files, workspace_root)
+
+        index_tests = getattr(self.config, "index_tests", False)
+        target = [
+            f for f in all_files
+            if os.path.splitext(f)[1].lower() in _INDEXABLE_EXTENSIONS
+            and not _is_excluded(f)
+            and (index_tests or not _is_test_file(f))
+        ]
+        logger.info(
+            "Found %d indexable files (post-blacklist, index_tests=%s)",
+            len(target), index_tests,
+        )
+        return target
+
+    @staticmethod
+    def _list_workspace_files(workspace_root: str) -> list[str]:
+        """Workspace-relative file paths via git ls-files, else os.walk."""
+        import subprocess
 
         try:
-            mcp_tools = get_mcp_tools(
-                self.config.mcp_servers,
-                cache_key="indexing",
-                workspace_root=workspace_root,
+            result = subprocess.run(
+                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+                cwd=workspace_root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=True,
             )
-            tool_by_name = {t.name: t for t in mcp_tools}
+            return [line for line in result.stdout.splitlines() if line]
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.info("git ls-files unavailable (%s); falling back to os.walk", exc)
 
-            list_files_tool = tool_by_name.get("mcp_codebase-index_list_files")
-            if not list_files_tool:
-                logger.warning("mcp_codebase-index_list_files tool not available")
-                return []
-
-            files_result = await list_files_tool.ainvoke({"root": workspace_root})
-            all_files = self._parse_tool_result(files_result)
-
-            index_tests = getattr(self.config, "index_tests", False)
-            target = [
-                f for f in all_files
-                if isinstance(f, str)
-                and os.path.splitext(f)[1].lower() in _INDEXABLE_EXTENSIONS
-                and not _is_excluded(f)
-                and (index_tests or not _is_test_file(f))
+        files: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(workspace_root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _EXCLUDED_DIR_NAMES and not d.startswith(".")
             ]
-            logger.info(
-                "Found %d indexable files (post-blacklist, index_tests=%s)",
-                len(target), index_tests,
-            )
-            return target
-
-        except Exception as e:
-            logger.error("MCP discovery failed: %s", e, exc_info=True)
-            return []
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                files.append(os.path.relpath(full, workspace_root))
+        return files
 
     @staticmethod
     def _extract_symbols_from_file(
@@ -293,41 +309,6 @@ class VectorIndexer:
             }
             for s in extracted
         ]
-
-    @staticmethod
-    def _parse_tool_result(result: Any) -> list[Any]:
-        """Normalize MCP tool results to a list of entries.
-
-        Handles LangChain tool response format:
-        [{"type": "text", "text": "[...json...]"}] -> parsed list
-        """
-        import json
-
-        if isinstance(result, list):
-            if len(result) == 1 and isinstance(result[0], dict) and "text" in result[0]:
-                text = result[0]["text"]
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, list):
-                        return parsed
-                    return [parsed]
-                except (json.JSONDecodeError, TypeError):
-                    return [text] if text else []
-            return result
-        if isinstance(result, str):
-            try:
-                parsed = json.loads(result)
-                if isinstance(parsed, list):
-                    return parsed
-                return [parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [result] if result else []
-        if isinstance(result, dict):
-            for key in ("items", "results", "symbols", "functions", "classes"):
-                if key in result:
-                    return result[key]
-            return [result]
-        return []
 
     async def _process_symbol(
         self,

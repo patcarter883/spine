@@ -464,6 +464,20 @@ def _critic_result_mapper(reviewed_phase: str):
             "attempt": prior_attempts + 1,
         }
 
+        # Rework of a workspace-mutating phase invalidates the per-work_id
+        # symbol cache: the failed attempt (or the human, during a
+        # needs_review pause) may have edited files, and serving the
+        # pre-edit lookup results to the retry would mask those changes.
+        # Spec/plan rework leaves the workspace untouched — keep the cache.
+        _mutating_phases = (PhaseName.IMPLEMENT.value, PhaseName.VERIFY.value)
+        if (
+            phase_status in (ReviewStatus.NEEDS_REVIEW.value, ReviewStatus.NEEDS_REVISION.value)
+            and reviewed_phase in _mutating_phases
+        ):
+            from spine.agents import symbol_cache
+
+            symbol_cache.clear(parent_state.get("work_id", ""))
+
         if phase_status == ReviewStatus.NEEDS_REVIEW.value:
             base["status"] = "needs_review"
             base["needs_review_phase"] = reviewed_phase
@@ -570,7 +584,9 @@ def _human_review_interrupt(state: WorkflowState) -> dict:
     feedback = state.get("feedback", [])
     phase_results = state.get("phase_results", {})
 
-    last_fb = feedback[-1] if feedback else {}
+    # Feedback lists can contain non-dict entries (e.g. tuples from state
+    # merges) — use the last dict entry, matching how the dispatcher filters.
+    last_fb = next((f for f in reversed(feedback) if isinstance(f, dict)), {})
     review_info = {
         "phase": needs_review_phase or state.get("current_phase", ""),
         "reason": last_fb.get("reason", "No reason provided"),

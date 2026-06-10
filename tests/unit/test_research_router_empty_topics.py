@@ -84,3 +84,28 @@ def test_router_done_still_routes_to_synthesize():
 
     result = _research_router(_state(manager_decision="done", topics=[]))
     assert result == "synthesize"
+
+
+def test_router_sends_carry_work_id():
+    """Send payloads are the target node's ENTIRE state — omitting work_id
+    ran every explore_do scout with work_id=None, which bypassed the
+    cross-scout symbol_cache dedupe (trace 019eb00d: get_source(SpineConfig)
+    fetched 3× per research round)."""
+    from langgraph.types import Send
+
+    result = _research_router(
+        _state(
+            manager_decision="explore",
+            topics=["topic a", "topic b"],
+            workspace_root="/tmp/ws",
+        )
+    )
+
+    assert isinstance(result, list) and result
+    for send in result:
+        assert isinstance(send, Send)
+        assert send.arg["work_id"] == "wk-router"
+        assert send.arg["work_type"] == "task"
+        assert send.arg["workspace_root"] == "/tmp/ws"
+        assert send.arg["topic"]
+        assert send.arg["phase"] == "specify"

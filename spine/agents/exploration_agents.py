@@ -29,6 +29,7 @@ from spine.agents.helpers import (
     bind_structured_output,
     cap_completion_tokens,
     resolve_chat_model,
+    suppress_reasoning,
 )
 
 try:  # openai is always present when the model is ChatOpenAI; guard for safety.
@@ -1322,7 +1323,10 @@ def _findings_structured_model(model: Any) -> Any | None:
         cap = SpineConfig.load().summarise_max_completion_tokens
         # ChatOpenAI exposes both fields; override whichever the builder set,
         # defaulting to max_completion_tokens. model_copy keeps with_structured_output.
-        capped = cap_completion_tokens(model, cap)
+        # Findings extraction is mechanical — disable thinking so a local
+        # reasoning model doesn't burn the tight cap on chain-of-thought
+        # before emitting JSON (trace 019eafac).
+        capped = suppress_reasoning(cap_completion_tokens(model, cap))
     except Exception:
         logger.debug("findings cap: model_copy failed — using uncapped model", exc_info=True)
         capped = model
