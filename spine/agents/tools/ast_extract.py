@@ -65,6 +65,8 @@ _QUERY_STRINGS: dict[str, str] = {
         (method_declaration name: (name) @name) @def
         (class_declaration name: (name) @name) @def
         (interface_declaration name: (name) @name) @def
+        (enum_declaration name: (name) @name) @def
+        (trait_declaration name: (name) @name) @def
     """,
     "typescript": """
         (function_declaration name: (identifier) @name) @def
@@ -86,6 +88,8 @@ _NODE_TYPE_TO_SYMBOL_TYPE: dict[str, str] = {
     "method_declaration": "method",
     "method_definition": "method",
     "interface_declaration": "interface",
+    "enum_declaration": "enum",
+    "trait_declaration": "trait",
     "variable_declarator": "function",  # arrow function assigned to const
 }
 
@@ -93,6 +97,8 @@ _NODE_TYPE_TO_SYMBOL_TYPE: dict[str, str] = {
 _CLASS_NODE_TYPES: frozenset[str] = frozenset({
     "class_definition",  # python
     "class_declaration",  # php, typescript
+    "enum_declaration",  # php
+    "trait_declaration",  # php
 })
 
 
