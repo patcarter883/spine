@@ -24,9 +24,9 @@ spine:
     default_threshold: 0
     thresholds:
       specify: 30000
-      plan: 40000
-      implement: 60000
-      verify: 40000
+      plan: 30000
+      implement: 30000
+      verify: 30000
     keep_recent: 6
     preserved_tools:
     - write_file
