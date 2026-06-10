@@ -570,7 +570,9 @@ def _human_review_interrupt(state: WorkflowState) -> dict:
     feedback = state.get("feedback", [])
     phase_results = state.get("phase_results", {})
 
-    last_fb = feedback[-1] if feedback else {}
+    # Feedback lists can contain non-dict entries (e.g. tuples from state
+    # merges) — use the last dict entry, matching how the dispatcher filters.
+    last_fb = next((f for f in reversed(feedback) if isinstance(f, dict)), {})
     review_info = {
         "phase": needs_review_phase or state.get("current_phase", ""),
         "reason": last_fb.get("reason", "No reason provided"),
