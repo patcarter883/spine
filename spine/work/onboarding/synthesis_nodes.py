@@ -18,9 +18,16 @@ size**, because **no LLM ever receives the whole manifest**:
   input is ONLY the bounded fragment
   (:func:`spine.work.onboarding.manifest_index.resolve_fragment`, hard-capped
   to ``onboarding_section_token_cap``) + the section instruction + a short
-  doc-level voice string. On failure it returns a ``SectionResult`` with
-  ``status="error"`` carrying a GENERIC reason — never raw exception text
-  (MEMORY rule: never leak tool-error text into generated docs).
+  doc-level voice string. The model fills the content-only
+  :class:`spine.work.onboarding.synthesis_plan.SectionContent` schema (required
+  ``overview``; no ``doc_id``/``order``/``status`` echo) and the worker renders
+  the section markdown deterministically via
+  :func:`spine.work.onboarding.synthesis_plan.render_section_markdown` — the
+  model never authors document structure (same contract as
+  ``specify_tools._WriteSpecificationInput``). On failure it returns a
+  ``SectionResult``-shaped dict with ``status="error"`` carrying a GENERIC
+  reason — never raw exception text (MEMORY rule: never leak tool-error text
+  into generated docs).
 - **Tier C — :func:`_assemble_docs_node`**: deterministic. Groups
   ``section_results`` by ``doc_id``, sorts by ``order``, concatenates markdown,
   and writes each ``<NAME>.md`` via :class:`WriteOnboardingDocTool`.
@@ -67,10 +74,11 @@ from spine.work.onboarding.manifest_index import (
 )
 from spine.work.onboarding.onboarding_state import OnboardingGraphState
 from spine.work.onboarding.synthesis_plan import (
+    SectionContent,
     SectionPlan,
     SectionPlanSet,
-    SectionResult,
     deterministic_section_plan,
+    render_section_markdown,
 )
 from spine.work.onboarding.synthesis_tools import (
     ONBOARDING_DOC_NAMES,
@@ -116,8 +124,8 @@ _DOC_VOICE: dict[str, str] = {
 }
 
 _DEFAULT_VOICE = (
-    "You author one section of a Spine onboarding document. Write self-contained, "
-    "well-structured markdown grounded ONLY in the supplied fragment."
+    "You author one section of a Spine onboarding document, grounded ONLY in "
+    "the supplied fragment."
 )
 
 _GENERIC_SECTION_ERROR = "section generation failed; section omitted"
@@ -436,7 +444,15 @@ def _section_router(state: OnboardingGraphState) -> list[Send] | str:
 
 
 def _worker_prompt(active: dict[str, Any], voice: str) -> str:
-    """Build the bounded per-section worker prompt (hostage layout)."""
+    """Build the bounded per-section worker prompt (hostage layout).
+
+    The contract matches the structured-output binding: the model returns a
+    JSON object (``SectionContent``), NEVER raw markdown — document structure
+    is rendered deterministically from its fields. The previous wording
+    ("write the markdown now") contradicted the JSON output mode and let weak
+    models resolve the tension by emitting a content-free envelope (trace
+    019eaf55).
+    """
     fragment_json = json.dumps(active.get("fragment", {}), ensure_ascii=False)
     blocks = xml_blocks(
         (Tag.ROLE, voice),
@@ -447,25 +463,41 @@ def _worker_prompt(active: dict[str, Any], voice: str) -> str:
         (
             Tag.CONSTRAINTS,
             "Use ONLY the supplied fragment as your source of truth. Do not "
-            "invent modules, symbols, or facts not present in it. Output "
-            "self-contained markdown for THIS section only (no document-level "
-            "title) — it will be concatenated with sibling sections.",
+            "invent modules, symbols, or facts not present in it. Return a "
+            "JSON object matching the schema: put 1-3 paragraphs of prose in "
+            "'overview', one 'entries' item (name, path, description) per "
+            "concrete module/convention/component you cover, and any caveats "
+            "in 'notes'. Inline markdown (backticks, bold) is allowed inside "
+            "strings; do NOT include headings — document structure is "
+            "rendered from your fields and concatenated with sibling sections.",
         ),
         (Tag.FINDINGS, f"Section fragment:\n```json\n{fragment_json}\n```"),
     )
     return hostage_layout(
         blocks,
-        "Write the markdown for this one section now.",
+        "Fill the section-content JSON for this one section now.",
     )
 
 
-def _coerce_section_result(response: Any) -> SectionResult | None:
-    """Coerce a worker ``with_structured_output`` response to a SectionResult.
+# Corrective nudge appended on retry attempts. Re-sending the identical
+# messages just replays a deterministic failure (trace 019eaf55: all three
+# attempts returned the same content-free envelope); naming the defect gives
+# the retry a reason to land differently.
+_RETRY_NUDGE = (
+    "Your previous response did not contain usable section content. Return a "
+    "JSON object matching the schema exactly: 'overview' MUST hold 1-3 "
+    "non-empty paragraphs of prose for this section. Do not return an empty "
+    "or metadata-only object."
+)
+
+
+def _coerce_section_content(response: Any) -> SectionContent | None:
+    """Coerce a worker ``with_structured_output`` response to SectionContent.
 
     Delegates to :func:`spine.agents.helpers.coerce_structured_output` (the
     same instance / ``.parsed`` / dict-validate handling the doc manager uses).
     """
-    return coerce_structured_output(response, SectionResult)
+    return coerce_structured_output(response, SectionContent)
 
 
 async def _section_worker_node(
@@ -475,12 +507,16 @@ async def _section_worker_node(
     """Tier B: author ONE section from its bounded fragment (bare LLM call).
 
     Input is ONLY ``state["active_section"]`` (fragment + instruction + title).
-    Returns ``{"section_results": [one SectionResult dict]}`` for the
-    ``operator.add`` channel. The bare structured call is retried up to
-    :data:`_SECTION_MAX_RETRIES` extra times on exception or empty/unparseable
-    output so a single transient failure does not nuke the run (finding #6).
-    After the budget is exhausted it returns a result with ``status="error"``
-    and a GENERIC reason (never raw exception text).
+    The model fills the content-only :class:`SectionContent` schema; the
+    worker renders the markdown via :func:`render_section_markdown` using its
+    own known ``doc_id``/``order``/``title`` (never the model's). Returns
+    ``{"section_results": [one SectionResult dict]}`` for the ``operator.add``
+    channel. The bare structured call is retried up to
+    :data:`_SECTION_MAX_RETRIES` extra times — with :data:`_RETRY_NUDGE`
+    appended so a retry isn't a verbatim replay — on exception or
+    empty/unparseable output, so a single transient failure does not nuke the
+    run (finding #6). After the budget is exhausted it returns a result with
+    ``status="error"`` and a GENERIC reason (never raw exception text).
     """
     active = state.get("active_section", {}) or {}
     doc_id = active.get("doc_id", "")
@@ -504,20 +540,26 @@ async def _section_worker_node(
         model = cap_completion_tokens(model, comp_cap)
 
         prompt = _worker_prompt(active, voice)
-        structured = bind_structured_output(model, SectionResult)
-        messages = [SystemMessage(content=voice), HumanMessage(content=prompt)]
+        structured = bind_structured_output(model, SectionContent)
+        base_messages = [SystemMessage(content=voice), HumanMessage(content=prompt)]
 
         # Bounded retry: a single transient LLM failure or one empty/unparseable
         # response should not nuke the whole run (finding #6). Retry the bare
-        # structured call up to _SECTION_MAX_RETRIES extra times, then fall back
+        # structured call up to _SECTION_MAX_RETRIES extra times — appending the
+        # corrective nudge so the retry isn't a verbatim replay — then fall back
         # to a generic status="error" (never leaking exception text).
         for attempt in range(_SECTION_MAX_RETRIES + 1):
+            messages = (
+                base_messages
+                if attempt == 0
+                else [*base_messages, HumanMessage(content=_RETRY_NUDGE)]
+            )
             try:
                 with suppress_parsed_serializer_warning():
                     response = await structured.ainvoke(messages)
-                result = _coerce_section_result(response)
+                content = _coerce_section_content(response)
             except Exception as exc:  # noqa: BLE001 - never leak exception text into docs
-                result = None
+                content = None
                 if attempt >= _SECTION_MAX_RETRIES:
                     logger.warning(
                         "[%s] section_worker: section %s#%d failed after %d "
@@ -531,13 +573,14 @@ async def _section_worker_node(
                     return {"section_results": [_error_result()]}
                 continue
 
-            if result is not None and (result.markdown or "").strip():
+            if content is not None and content.overview.strip():
+                markdown = render_section_markdown(active.get("title", ""), content)
                 return {
                     "section_results": [
                         {
                             "doc_id": doc_id,
                             "order": order,
-                            "markdown": result.markdown,
+                            "markdown": markdown,
                             "status": "ok",
                         }
                     ]

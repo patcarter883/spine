@@ -44,8 +44,8 @@ from spine.work.onboarding.synthesis_nodes import (
     build_synthesis_graph,
 )
 from spine.work.onboarding.synthesis_plan import (
+    SectionContent,
     SectionPlanSet,
-    SectionResult,
     deterministic_section_plan,
 )
 from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES
@@ -159,9 +159,7 @@ class _StubModel:
                     for doc in ONBOARDING_DOC_NAMES
                 ]
             )
-        return SectionResult(
-            doc_id="", order=0, markdown="Section body.", status="ok"
-        )
+        return SectionContent(overview="Section body.")
 
 
 class _RaisingModel:
@@ -226,9 +224,7 @@ class _FailOnceWorkerModel(_StubModel):
             self._parent._worker_calls += 1
             if self._parent._worker_calls == 1:
                 raise RuntimeError("transient local-model hiccup")
-            return SectionResult(
-                doc_id="", order=0, markdown="Recovered body.", status="ok"
-            )
+            return SectionContent(overview="Recovered body.")
 
 
 def _patch_resolve(monkeypatch, model: Any) -> None:
@@ -417,6 +413,43 @@ class TestSynthesisGraph:
         # No section ended up status="error" despite the one transient failure.
         assert all(r.get("status") == "ok" for r in final["section_results"])
 
+    def test_section_retry_appends_corrective_nudge(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A retry must not be a verbatim replay: the corrective nudge is
+        appended so a deterministic content-free response (trace 019eaf55)
+        gets steered instead of repeated."""
+        manifest = _brownfield_manifest(str(tmp_path))
+        seen_message_counts: list[int] = []
+
+        class _EmptyOnceWorkerModel(_StubModel):
+            def __init__(self) -> None:
+                self._worker_calls = 0
+
+            def with_structured_output(self, schema: Any) -> Any:
+                if schema is SectionPlanSet:
+                    return _StubStructured(schema, self._make)
+                return self._Structured(self)
+
+            class _Structured:
+                def __init__(self, parent: "_EmptyOnceWorkerModel") -> None:
+                    self._parent = parent
+
+                async def ainvoke(self, messages: list[Any], **_: Any) -> Any:
+                    self._parent._worker_calls += 1
+                    seen_message_counts.append(len(messages))
+                    if self._parent._worker_calls == 1:
+                        return SectionContent(overview=" ")  # content-free
+                    return SectionContent(overview="Steered body.")
+
+        _patch_resolve(monkeypatch, _EmptyOnceWorkerModel())
+        final = self._run(manifest, tmp_path, "wk-nudge")
+
+        assert all(r.get("status") == "ok" for r in final["section_results"])
+        # First attempt: system + human. Retry: system + human + nudge.
+        assert seen_message_counts[0] == 2
+        assert seen_message_counts[1] == 3
+
     def test_greenfield_minimal_plan(self, tmp_path: Path, monkeypatch) -> None:
         manifest = _greenfield_manifest(str(tmp_path))
         # Greenfield skips the LLM refine, but resolve_chat_model is still patched
@@ -467,8 +500,9 @@ class TestSynthesisGraph:
             def _make(self, schema: Any) -> Any:
                 if schema is SectionPlanSet:
                     return super()._make(schema)
-                # Worker returns empty markdown → classified as an error.
-                return SectionResult(doc_id="", order=0, markdown="", status="error")
+                # Worker returns whitespace-only overview → classified as an
+                # error (min_length=1 admits " ", the worker's strip() rejects).
+                return SectionContent(overview=" ")
 
         _patch_resolve(monkeypatch, _ErrorWorkerModel())
 

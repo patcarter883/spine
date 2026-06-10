@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from spine.config import SpineConfig
 from spine.models.enums import TaskStatus
 from spine.work.onboarding.engine import run_onboarding
-from spine.work.onboarding.synthesis_plan import SectionPlanSet, SectionResult
+from spine.work.onboarding.synthesis_plan import SectionContent, SectionPlanSet
 from spine.work.onboarding.synthesis_tools import ONBOARDING_DOC_NAMES
 
 
@@ -68,7 +68,7 @@ class _StubModel:
                     for doc in ONBOARDING_DOC_NAMES
                 ]
             )
-        return SectionResult(doc_id="", order=0, markdown="Section body.", status="ok")
+        return SectionContent(overview="Section body.")
 
 
 # ── Fixtures / helpers ───────────────────────────────────────────────────────
@@ -270,7 +270,8 @@ class TestRunOnboardingFailure:
             def _make(self, schema: Any) -> Any:
                 if schema is SectionPlanSet:
                     return super()._make(schema)
-                return SectionResult(doc_id="", order=0, markdown="", status="error")
+                # Whitespace-only overview → the worker classifies it as error.
+                return SectionContent(overview=" ")
 
         def fake_resolve_model(config: Any, session_id: Any = None, phase: Any = None) -> Any:
             return _ErrorWorkerModel()
