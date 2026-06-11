@@ -828,19 +828,65 @@ async def _synthesize_plan(
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)
-        result = await ainvoke_with_retry(
-            agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            phase_name=PhaseName.PLAN.value,
-            work_id=work_id,
-            work_type=work_type,
-            context=ctx,
-        )
+        # The first invocation may raise instead of returning (trace
+        # 019eb412: LengthFinishReasonError after the model burned all
+        # 8K completion tokens in the reasoning channel with no tool
+        # call). Don't fail yet — fall through to the corrective retry.
+        try:
+            result = await ainvoke_with_retry(
+                agent,
+                {"messages": [{"role": "user", "content": prompt}]},
+                phase_name=PhaseName.PLAN.value,
+                work_id=work_id,
+                work_type=work_type,
+                context=ctx,
+            )
+        except Exception as invoke_exc:
+            logger.warning(
+                "[%s] Synthesize (plan) invocation failed (%s) — "
+                "proceeding to corrective retry",
+                work_id, invoke_exc,
+            )
+            result = {"messages": []}
 
         # ── Read plan.json from disk (written by write_structured_plan) ──
         plan_json_path = (
             Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
         )
+
+        # One corrective retry before failing the contract — mirrors
+        # plan_subgraph.run_agent (commit a431597). That protection lived
+        # only on the non-exploration path, so trace 019eb412 sailed past a
+        # failed synthesis to human_review reporting plan "success" with
+        # zero artifacts.
+        if not plan_json_path.exists():
+            logger.warning(
+                "[%s] PLAN synthesizer finished without writing plan.json — "
+                "issuing one corrective retry",
+                work_id,
+            )
+            nudge = (
+                "Your previous turn produced no plan: plan.json was not "
+                "written. Do not deliberate further. Call "
+                "`write_structured_plan` exactly once, NOW, with the "
+                "structured fields (architecture_overview, "
+                "technology_choices, feature_slices, testing_strategy, "
+                "risks, codebase_map)."
+            )
+            prior_messages = list(result.get("messages") or [])
+            if not prior_messages:
+                # First invocation raised before producing a conversation —
+                # restart from the original prompt so the retry has context.
+                prior_messages = [{"role": "user", "content": prompt}]
+            result = await ainvoke_with_retry(
+                agent,
+                {"messages": prior_messages + [{"role": "user", "content": nudge}]},
+                phase_name=PhaseName.PLAN.value,
+                work_id=work_id,
+                work_type=work_type,
+                context=ctx,
+            )
+
         plan_json_str: str | None = None
         execution_waves: list[list[dict]] = []
 
@@ -861,7 +907,19 @@ async def _synthesize_plan(
                         wave_error,
                     )
             except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("[%s] Failed to read plan.json: %s", work_id, exc)
+                raise CriticalContractFailure(
+                    phase="plan",
+                    reason=f"plan.json exists but is malformed or unreadable: {exc}",
+                )
+        else:
+            raise CriticalContractFailure(
+                phase="plan",
+                reason=(
+                    "plan.json does not exist after corrective retry — the "
+                    "synthesizer did not produce structured output via "
+                    "write_structured_plan."
+                ),
+            )
 
         return {
             "messages": result.get("messages", []),
@@ -871,6 +929,13 @@ async def _synthesize_plan(
             "read_cache": result.get("read_cache") or {},
         }
 
+    except CriticalContractFailure:
+        # Must propagate to subgraph_wrapper's structural-retry handler so a
+        # missing plan.json re-runs the phase on a clean thread instead of
+        # flowing downstream as a soft phase_status="error" (trace 019eb412:
+        # the workflow reached human_review reporting plan success with
+        # artifact_count=0).
+        raise
     except Exception as e:
         logger.error("[%s] Synthesize (plan) failed: %s", work_id, e, exc_info=True)
         return {
@@ -1260,6 +1325,23 @@ async def _save_exploration_artifacts(
                 reason="specification.json does not exist — "
                        "the specify agent did not produce structured output via write_specification. "
                        "This indicates a model invocation failure.",
+            )
+
+    # Fail-closed: PLAN requires plan.json. _synthesize_plan enforces this
+    # itself (corrective retry + CriticalContractFailure), but this backstop
+    # catches any path that reaches save_artifacts without one — trace
+    # 019eb412 reached human_review reporting plan "success" with
+    # artifact_count=0 after a swallowed synthesis failure.
+    if phase == PhaseName.PLAN.value:
+        plan_json_check = (
+            Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+        )
+        if not plan_json_check.exists():
+            raise CriticalContractFailure(
+                phase="plan",
+                reason="plan.json does not exist at save_artifacts — "
+                       "the plan synthesizer did not produce structured output "
+                       "via write_structured_plan.",
             )
 
     disk_artifacts = scan_artifact_dir(

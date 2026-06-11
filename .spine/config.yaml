@@ -43,46 +43,6 @@ mcp_servers:
     args: []
 providers:
   llm:
-  - name: glm
-    type: deepagents-model
-    model: openrouter:z-ai/glm-5.1
-    enabled: true
-    guided_decoding: true
-  - name: deepseek-v4-flash
-    type: deepagents-model
-    model: openrouter:deepseek/deepseek-v4-flash
-    enabled: true
-    guided_decoding: true
-  - name: deepseek-v4-pro
-    type: deepagents-model
-    model: openrouter:deepseek/deepseek-v4-pro
-    enabled: true
-    guided_decoding: false
-  - name: laguna-m1
-    type: deepagents-model
-    model: openrouter:poolside/laguna-m.1:free
-    enabled: true
-    guided_decoding: true
-  - name: laguna-xs2
-    type: deepagents-model
-    model: openrouter:poolside/laguna-xs.2:free
-    enabled: true
-    guided_decoding: true
-  - name: gemini-3.5-flash
-    type: deepagents-model
-    model: openrouter:google/gemini-3.5-flash
-    enabled: true
-    guided_decoding: true
-  - name: local
-    type: deepagents-model
-    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
-    base_url: http://localhost:8000/v1
-    api_key: vllm
-    guided_decoding: true
-    enabled: true
-    stream_usage: true
-    max_concurrent_calls: 2
-    context_window: 60000
   - name: pat
     type: deepagents-model
     model: openai:model
@@ -92,6 +52,16 @@ providers:
     enabled: true
     stream_usage: true
     max_concurrent_calls: 8
+    context_window: 60000
+  - name: local
+    type: deepagents-model
+    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
+    base_url: http://localhost:8000/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2
     context_window: 60000
   - name: local-tiny
     type: deepagents-model

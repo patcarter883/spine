@@ -124,6 +124,7 @@ def build_plan_synthesizer(
     ]
 
     from spine.agents.synthesis_budget import synthesis_completion_cap
+    from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
 
     return build_phase_agent(
         state=state,
@@ -136,6 +137,18 @@ def build_plan_synthesizer(
         # the global max_completion_tokens (30K) and a finite-window model
         # 400s once prompt + completion budget exceed the window (019eb3dd).
         completion_token_cap=synthesis_completion_cap(PhaseName.PLAN.value),
+        # Same forcing as the specify synthesizer: a strict 2-call flow
+        # (read_prior_artifacts → write_structured_plan). Without it a
+        # thinking model hallucinated read_file ×3 and then burned its whole
+        # 8K completion budget in the reasoning channel with no tool call
+        # (trace 019eb412). Once the gate tool fires, tool_choice is pinned
+        # to write_structured_plan; forcing releases when the write succeeds.
+        extra_middleware=[
+            ForceToolUntilCalledMiddleware(
+                final_tool="write_structured_plan",
+                gate_tool="read_prior_artifacts",
+            )
+        ],
     )
 
 
