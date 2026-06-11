@@ -332,6 +332,7 @@ def build_phase_agent(
     allowed_tools: list[str] | None = None,
     extra_tools: list[Any] | None = None,
     skip_filesystem_middleware: bool = False,
+    completion_token_cap: int | None = None,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -362,6 +363,11 @@ def build_phase_agent(
             entirely. Pair with extra_tools to replace all filesystem access
             with purpose-built tools, removing any generic read/write fallback
             from the model's tool surface.
+        completion_token_cap: When > 0, clamp the model's completion-token
+            request to this value (via ``cap_completion_tokens``). Used by
+            the SPECIFY/PLAN synthesizers so a structured 2-4K JSON output
+            doesn't request the global 30K budget and push the prompt over
+            a finite context window (trace 019eb3dd).
 
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
@@ -377,6 +383,23 @@ def build_phase_agent(
 
     # ── Resolve model and backend ────────────────────────────────────
     model = resolve_model(config, session_id=state.get("work_id"), phase=phase.value)
+    if completion_token_cap and completion_token_cap > 0:
+        if isinstance(model, str):
+            # String specs are resolved by create_agent without provider
+            # kwargs; they only occur for cloud providers that declare no
+            # finite context_window, so the cap is a no-op there.
+            logger.debug(
+                "Phase %s: completion_token_cap=%d skipped (string model spec)",
+                phase.value, completion_token_cap,
+            )
+        else:
+            from spine.agents.helpers import cap_completion_tokens
+
+            model = cap_completion_tokens(model, completion_token_cap)
+            logger.info(
+                "Phase %s: completion tokens clamped to %d for synthesis",
+                phase.value, completion_token_cap,
+            )
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
     work_id = state.get("work_id", "")

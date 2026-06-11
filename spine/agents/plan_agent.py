@@ -32,7 +32,6 @@ from langchain_core.runnables import RunnableConfig
 from spine.agents.artifacts import artifact_path
 from spine.agents.factory import build_phase_agent
 from spine.agents.plan_tools import (
-    ReadPriorArtifactsTool,
     StructuredWritePlanTool,
     build_plan_agent_tools,
 )
@@ -92,36 +91,32 @@ def build_plan_synthesizer(
 ) -> Any:
     """Build the synthesize-only Deep Agent for the PLAN phase.
 
-    Tool surface is intentionally minimal: ``read_prior_artifacts`` and
-    ``write_structured_plan`` only. No ``search_codebase``, no researcher
-    subagents — exploration was done upstream and the findings are
-    already in the prompt. This stops the synthesizer from re-exploring.
-    """
-    work_id = state.get("work_id", "")
-    workspace_root = state.get("workspace_root", ".")
-    work_type = state.get("work_type", "")
-    description = state.get("description", "")
-    feedback_raw = state.get("feedback", [])
-    feedback = [str(f) for f in feedback_raw] if feedback_raw else []
+    Tool surface is exactly ONE tool: ``write_structured_plan``. The
+    specification and research findings are inlined into the prompt by
+    ``_synthesize_plan``, so there is nothing to read first.
 
-    prior_phase_dirs = _resolve_prior_phase_dirs(state, work_id)
+    ``read_prior_artifacts`` was removed after trace 019eb52c: on the
+    exploration path ``state["artifacts"]`` is never populated, so the
+    tool always answered "No prior artifacts found" while the system
+    prompt promised it would load the specification — the forced-tool
+    loop then re-called it 23× chasing a spec that never came (the named
+    tool_choice pin that would have broken the loop is unsupported on
+    local providers). With a single tool, ``tool_choice="any"`` IS a pin:
+    the loop is structurally impossible on every provider.
+    """
+    workspace_root = state.get("workspace_root", ".")
+    work_id = state.get("work_id", "")
     plan_dir = artifact_path(work_id, PhaseName.PLAN.value)
 
     synthesizer_tools = [
-        ReadPriorArtifactsTool(
-            workspace_root=workspace_root,
-            work_id=work_id,
-            work_type=work_type,
-            description=description,
-            feedback=feedback,
-            plan_dir=plan_dir,
-            prior_phase_dirs=prior_phase_dirs,
-        ),
         StructuredWritePlanTool(
             workspace_root=workspace_root,
             plan_dir=plan_dir,
         ),
     ]
+
+    from spine.agents.synthesis_budget import synthesis_completion_cap
+    from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
 
     return build_phase_agent(
         state=state,
@@ -130,6 +125,17 @@ def build_plan_synthesizer(
         system_prompt=_build_plan_synthesizer_prompt(),
         extra_tools=synthesizer_tools,
         skip_filesystem_middleware=True,
+        # The plan JSON is 2-5K tokens; without a clamp the request inherits
+        # the global max_completion_tokens (30K) and a finite-window model
+        # 400s once prompt + completion budget exceed the window (019eb3dd).
+        completion_token_cap=synthesis_completion_cap(PhaseName.PLAN.value),
+        # Forcing with a single-tool surface: the model cannot end a turn
+        # in prose/reasoning (trace 019eb412) and cannot stall on a read
+        # tool (trace 019eb52c) — the only legal move is the write, and
+        # forcing releases when it succeeds.
+        extra_middleware=[
+            ForceToolUntilCalledMiddleware(final_tool="write_structured_plan")
+        ],
     )
 
 
@@ -228,14 +234,13 @@ def _build_plan_synthesizer_prompt() -> str:
         "Before you call the tool, self-check: (1) is the slice COUNT as small "
         "as the objective allows, and (2) does the union of all slices cover "
         "EVERY spec acceptance criterion, including tests? Both must be yes.\n\n"
-        "## Available tools (the ONLY tools you have)\n"
-        "- `read_prior_artifacts` — loads the specification and prior artifacts in one call. Call FIRST.\n"
-        "- `write_structured_plan` — writes both plan.md and plan.json. Call LAST.\n\n"
-        "## Workflow (exactly 2 calls)\n\n"
-        "### Step 1 — Call read_prior_artifacts\n"
-        "Call with no arguments to load the specification and any prior plan artifacts.\n\n"
-        "### Step 2 — Call write_structured_plan\n"
-        "Synthesize spec + findings (already in your prompt) into structured fields and call "
+        "## Available tools (the ONLY tool you have)\n"
+        "- `write_structured_plan` — writes both plan.md and plan.json.\n\n"
+        "## Workflow (exactly 1 call)\n\n"
+        "Everything you need is ALREADY in your prompt: the specification "
+        "(<specification> block), the research findings (<findings> block), "
+        "and the objective. There is nothing to read or load first. "
+        "Synthesize spec + findings into structured fields and call "
         "`write_structured_plan` ONCE. The tool renders markdown and emits JSON for you — "
         "DO NOT author markdown, DO NOT hand-serialize JSON, DO NOT call write_file.\n\n"
         "Top-level fields:\n"

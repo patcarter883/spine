@@ -263,7 +263,7 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         xml_block(
             Tag.ROLE,
             "YOU MUST USE TOOLS. Do not describe changes — make them with "
-            "read_edit_lint, then verify with execute.\n"
+            "read_edit_lint.\n"
             "You are a code implementer for a single feature slice. Your "
             "task description contains the full slice definition, codebase "
             "context, modification targets with exact line ranges, and "
@@ -289,8 +289,6 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "`codebase_query` ONLY when a specific unknown symbol blocks an "
             "edit.\n\n"
             "Your tools:\n"
-            "- `read_file` — read files (use offset/limit for pagination). "
-            "Read the files named in your task FIRST.\n"
             "- `codebase_query` — targeted symbol lookup (use ONLY when a "
             "specific symbol you must call/extend isn't in your task context). "
             "Pick `action`, fill the one argument it needs:\n"
@@ -301,29 +299,38 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "50 hits.\n"
             "  - `name` and `pattern` are mutually exclusive. Do NOT pass "
             "both.\n"
-            "- `read_edit_lint` — the ONLY write tool. Pass exactly ONE edit "
-            "mode: `old_str`+`new_str` (exact, single-occurrence "
-            "find-and-replace); `full_replace` (whole-file content); `edits` "
-            "(a batch of find-and-replace ops applied ATOMICALLY — all-or-"
-            "nothing, prefer this to make several changes to one file in a "
-            "single call); or `start_line`+`end_line`+`replacement` (replace a "
-            "line range — token-efficient and disambiguates repeated snippets; "
-            "pass `expected` with the current range text to guard against stale "
-            "line numbers). The tool runs a syntax check before writing — on a "
-            "syntax error or failed match it returns "
-            "`{\"status\":\"syntax_error\",...}` (or `no_match`/`ambiguous_match`"
-            "/`stale`) and the file is left untouched. Fix and call again.\n"
-            "- `execute` — run shell commands (tests, linters, builds).",
+            "- `read_edit_lint` — your ONLY filesystem tool: read AND write.\n"
+            "  READ: pass just `file_path` for line-numbered content, or add "
+            "`start_line`+`end_line` (no `replacement`) for a range. Prefer "
+            "ranged reads — whole-file reads of large files waste your "
+            "context. NEVER re-read a file you just edited: a status=\"ok\" "
+            "result means the edit is in the file exactly as you sent it.\n"
+            "  EDIT: pass exactly ONE edit mode: `old_str`+`new_str` (exact, "
+            "single-occurrence find-and-replace); `full_replace` (whole-file "
+            "content); `edits` (a batch of find-and-replace ops applied "
+            "ATOMICALLY — all-or-nothing, prefer this to make several changes "
+            "to one file in a single call); or `start_line`+`end_line`+"
+            "`replacement` (replace a line range — token-efficient and "
+            "disambiguates repeated snippets; pass `expected` with the current "
+            "range text to guard against stale line numbers). The tool runs a "
+            "syntax check before writing — on a syntax error or failed match "
+            "it returns `{\"status\":\"syntax_error\",...}` (or `no_match`/"
+            "`ambiguous_match`/`stale`) and the file is left untouched. Fix "
+            "and call again. `already_applied` means the change is ALREADY in "
+            "the file — move on, do not retry.\n"
+            "  LINT: successful Python writes include a `ruff` field with "
+            "bounded diagnostics. There is no shell — do not try to run "
+            "tests or linters; the verify phase does that.",
         )
         + "\n\n"
         + xml_block(
             Tag.WORKFLOW,
-            "Implementation workflow (4-6 turns):\n"
-            "1. Read existing code (1 turn, batch): Read ≥3 files in a "
-            "single turn — the files listed in your task description, plus "
-            "any imports or dependencies they reference. Check the "
-            "modification targets in your task description for exact change "
-            "sites.\n"
+            "Implementation workflow (3-5 turns):\n"
+            "1. Read existing code (1 turn, batch): issue parallel "
+            "`read_edit_lint` READ calls for the files listed in your task "
+            "description — ranged reads around the modification targets, "
+            "not whole files. Check the targets in your task description "
+            "for exact change sites.\n"
             "2. Navigate if needed (0-1 turns): ONLY if a specific symbol you "
             "must call/extend isn't in your task context, use `codebase_query` "
             "to locate it. Do NOT explore broadly — the slice is pre-specified.\n"
@@ -332,13 +339,12 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "single turn where possible. Focus only on files listed in the "
             "slice — do NOT modify or create files outside its scope. If "
             "`read_edit_lint` returns `status=\"syntax_error\"`, the file "
-            "was NOT written — correct the snippet and call again.\n"
-            "4. Test (1 turn): Run the tests listed in your task "
-            "description's acceptance criteria. Run linters (ruff) on the "
-            "files you changed.\n"
-            "5. Fix if needed (0-1 turns): If tests fail, fix and re-test.\n"
-            "6. Report (final turn): Return the SliceResult with exactly "
-            "what you changed and any remaining issues.",
+            "was NOT written — correct the snippet and call again. Address "
+            "any `ruff` diagnostics reported on your own edits.\n"
+            "4. Report (final turn): Return the SliceResult with exactly "
+            "what you changed and any remaining issues. Do NOT attempt to "
+            "run tests — the verify phase executes them after all slices "
+            "land.",
         )
         + "\n\n"
         + xml_block(
@@ -355,8 +361,10 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "- Use `codebase_query` to verify a symbol exists before calling "
             "it. Do not invent paths.\n\n"
             "Hard limits:\n"
-            "- Batch reads: read the files named in your task in a single "
-            "turn (≥3 at once where applicable). Never read one file at a time.\n"
+            "- Batch reads: issue the READ calls for the files named in your "
+            "task in a single turn (parallel tool calls). Never read one "
+            "file per turn, and never re-read a file after a status=\"ok\" "
+            "edit — the result already tells you the edit landed.\n"
             "- Exploration budget: maximum 2 turns of read/lookup before "
             "your first write/edit. If you haven't changed code by turn 3, "
             "you're over-exploring — make changes with what you know.\n"
@@ -449,11 +457,18 @@ _READ_ONLY_TOOLS: list[str] = [
 # implementer "research half the codebase" (trace 019e784c: 83 LLM calls /
 # 1.39M prompt tokens on a one-line flag). Targeted symbol lookups still go
 # through the injected ``codebase_query`` wrapper when a specific unknown
-# symbol blocks an edit. Read the named files, edit, run tests.
+# symbol blocks an edit.
+#
+# ``read_file`` and ``execute`` were removed after trace 019eb502 (1.76M
+# prompt tokens): implementers read the same two files 35× via read_file
+# (~50K tokens of raw output riding every later turn) and used execute for
+# ad-hoc ast.parse/ruff/pytest runs plus interpreter spelunking — linting
+# that read_edit_lint performs itself. read_edit_lint now carries a
+# line-numbered READ mode (ranged, output-capped) and reports bounded ruff
+# diagnostics on successful Python writes; test execution belongs to the
+# slice-verifier, not the implementer.
 _IMPLEMENT_TOOLS: list[str] = [
-    "read_file",
     "read_edit_lint",
-    "execute",
 ]
 
 _READ_AND_EXECUTE_TOOLS: list[str] = [

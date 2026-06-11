@@ -96,21 +96,26 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
             reliability. Leave ``None`` to only ever force "any" tool — the
             right choice when the agent legitimately uses several tools
             (e.g. ``recall``) between the gate and the final write.
-        success_marker: Substring that marks a *successful* ``final_tool``
-            result. The write tools return a validation/error string (which
-            lacks this marker) when args are bad, so a failed write keeps the
-            constraint on and lets the model self-correct in the same loop.
+        failure_prefixes: Prefixes that mark a *failed* ``final_tool`` result.
+            The write tools return ``"VALIDATION_ERROR: …"`` / ``"ERROR: …"``
+            strings when args are bad or the write fails; those keep the
+            constraint on so the model can self-correct in the same loop.
+            Any other non-error result releases the forcing — matching
+            failure is far less fragile than matching a success phrase
+            (trace 019eb43f: the plan tool's success message lacked the old
+            ``"written to"`` marker, so forcing never released and the
+            synthesizer rewrote the plan every turn until context overflow).
     """
 
     def __init__(
         self,
         final_tool: str,
         gate_tool: str | None = None,
-        success_marker: str = "written to",
+        failure_prefixes: tuple[str, ...] = ("VALIDATION_ERROR", "ERROR"),
     ) -> None:
         self.final_tool = final_tool
         self.gate_tool = gate_tool
-        self.success_marker = success_marker
+        self.failure_prefixes = failure_prefixes
 
     # ── decision helpers ────────────────────────────────────────────────
 
@@ -129,9 +134,9 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
                 if getattr(msg, "status", None) == "error":
                     continue
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                # A validation rejection (e.g. "VALIDATION_ERROR: …") lacks the
-                # success marker — treat it as not-yet-done so forcing persists.
-                if self.success_marker and self.success_marker not in content:
+                # A rejection ("VALIDATION_ERROR: …" / "ERROR: …") means the
+                # write didn't land — keep forcing so the model self-corrects.
+                if content.lstrip().startswith(self.failure_prefixes):
                     continue
                 return True
         return False

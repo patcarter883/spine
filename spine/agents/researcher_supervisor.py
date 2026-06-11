@@ -806,6 +806,31 @@ _WORKER_CACHEABLE_EXTRA: frozenset[str] = frozenset({
 })
 
 
+def _coerce_payload_text(res: Any) -> str | None:
+    """Flatten a tool result to memoisable text, or ``None`` when unsafe.
+
+    MCP-backed tools (and the ``codebase_query`` facade over them) return
+    LangChain content-block lists — ``[{"id": ..., "text": "def render..."}]``
+    — not plain strings. The memoise hook used to accept only ``str``, so
+    every such result skipped the cache and each sibling/round re-paid the
+    full MCP round-trip: trace 019eb4c7 fetched ``get_source(render)`` 9×
+    in one work_id. Text-only block lists flatten losslessly (the worker
+    stringifies the payload for its ToolMessage anyway); anything carrying
+    a non-text block stays un-memoised.
+    """
+    if isinstance(res, str):
+        return res
+    if isinstance(res, list) and res:
+        texts: list[str] = []
+        for block in res:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            else:
+                return None  # non-text block — don't memoise
+        return "\n".join(texts)
+    return None
+
+
 async def _invoke_tool_deduped(
     tool: Any,
     tool_name: str,
@@ -833,8 +858,7 @@ async def _invoke_tool_deduped(
     async def _fetch() -> str | None:
         res = await tool.ainvoke(tool_args)
         captured["result"] = res
-        # Only string payloads are memoised; anything else falls through.
-        return res if isinstance(res, str) else None
+        return _coerce_payload_text(res)
 
     content, hit_count = await symbol_cache.get_or_fetch(
         work_id, tool_name, tool_args, _fetch,

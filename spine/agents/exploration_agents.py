@@ -161,19 +161,27 @@ def _topics_near_duplicate(a: str, b: str) -> bool:
     return (overlap / min(len(fa), len(fb))) >= _TOPIC_DUPE_OVERLAP_THRESHOLD
 
 
-_CRITIC_RESEARCH_KEYWORDS: tuple[str, ...] = (
-    "research",
-    "explore",
-    "investigate",
-    "missing knowledge",
-    "missing context",
-    "unclear scope",
-    "more information",
-    "more info",
-    "need to understand",
-    "needs investigation",
-    "find out",
-    "discover",
+# Word-boundary pattern, NOT bare substrings: plain `"explore" in blob`
+# matched identifier fragments like "onboarding/explorer" and
+# "slice-explorer" in critic feedback that was purely about artifact
+# fix-ups (trace 019eb4c7), defeating the synth-only rework guard below
+# and re-running the entire exploration loop for nothing. Verb
+# inflections are spelled out so e.g. "should be explored further"
+# still counts while "explorer" (a noun naming a component) does not.
+_CRITIC_RESEARCH_PATTERN = re.compile(
+    r"\b(?:"
+    r"research(?:ing|ed)?"
+    r"|explor(?:e|ed|ing|ation)"
+    r"|investigat(?:e|ed|ing|ion)"
+    r"|missing knowledge"
+    r"|missing context"
+    r"|unclear scope"
+    r"|more information"
+    r"|more info"
+    r"|need to understand"
+    r"|find out"
+    r"|discover(?:y|ed|ing)?"
+    r")\b"
 )
 
 
@@ -192,7 +200,7 @@ def _critic_wants_more_research(last_critic_review: dict[str, Any]) -> bool:
     sugs = last_critic_review.get("suggestions") or []
     blob_parts.extend(str(s) for s in sugs)
     blob = " ".join(blob_parts).lower()
-    return any(kw in blob for kw in _CRITIC_RESEARCH_KEYWORDS)
+    return _CRITIC_RESEARCH_PATTERN.search(blob) is not None
 
 
 def _approx_findings_tokens(findings: list[Any]) -> int:
@@ -468,6 +476,23 @@ async def run_research_manager(
         return {"manager_decision": "done", "topics": []}
 
     model = resolve_chat_model(config, session_id=work_id, phase="exploration/manager")
+
+    # Cap the completion + suppress the reasoning channel, mirroring
+    # run_supervisor_node / run_plan_node: a ResearchManagerDecision is a
+    # handful of topic strings, but uncapped this call inherits the
+    # provider's full completion budget — and the empty-parse retry nudge
+    # sent a thinking model into a 300s+ reasoning burn (trace 019eb541).
+    try:
+        from spine.config import SpineConfig as _Cfg
+
+        _cap = _Cfg.load().research_manager_max_completion_tokens
+        model = suppress_reasoning(cap_completion_tokens(model, _cap))
+    except Exception:
+        logger.debug(
+            "[%s] research_manager: token-cap copy failed — using uncapped model",
+            work_id,
+            exc_info=True,
+        )
 
     # ── Recall context from state ────────────────────────────────────
     # The pre_research_gate (exploration_subgraph._pre_research_gate)
@@ -764,6 +789,61 @@ def _summarize_findings(findings: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# Char cap for the covered-ground digest injected into each explore branch.
+# It rides every supervisor + worker call for that branch, so it must stay
+# compact: file lists and one-line summaries, not full findings.
+_COVERED_GROUND_BUDGET_CHARS = 2_000
+
+
+def render_covered_ground(findings: list[dict]) -> str:
+    """Render a compact coverage digest for dispatch to explore branches.
+
+    Round-2+ researchers used to start completely cold — the Send payload
+    carried only the topic, so each new branch re-established ground its
+    siblings had already mapped (trace 019eb4c7: rounds 2-3 re-fetched the
+    same hot symbols and re-derived the same architecture facts round 1
+    found). This digest gives the branch's supervisor the files already
+    examined plus a one-line summary per prior finding, so it can direct
+    workers at what is NOT covered.
+
+    Self-describing: the preamble carries the behavioural instruction, so
+    the consuming prompt doesn't need a matching rule. Error-sentinel
+    findings are skipped — "attempted, nothing learned" doesn't help a
+    researcher avoid duplicate fetches. Returns ``""`` when there is
+    nothing worth shipping.
+    """
+    if not findings:
+        return ""
+    lines: list[str] = []
+    total = 0
+    skipped = 0
+    for f in findings:
+        if not isinstance(f, dict) or f.get("error"):
+            continue
+        topic = _normalise_topic(f.get("topic", ""))
+        summary = (f.get("summary", "") or "").strip().replace("\n", " ")
+        file_map = f.get("file_map", {}) or {}
+        files = list(file_map.keys()) if isinstance(file_map, dict) else []
+        entry = f"- {topic[:100]}: {summary[:200]}"
+        if files:
+            entry += f" [files: {', '.join(files[:8])}]"
+        if total + len(entry) > _COVERED_GROUND_BUDGET_CHARS:
+            skipped += 1
+            continue
+        lines.append(entry)
+        total += len(entry)
+    if not lines:
+        return ""
+    preamble = (
+        "Ground already mapped by earlier researchers in this run — do NOT "
+        "re-fetch these files/symbols or re-derive these facts; build on "
+        "them and target what is NOT covered:"
+    )
+    if skipped:
+        lines.append(f"(... {skipped} additional finding(s) elided for size)")
+    return preamble + "\n" + "\n".join(lines)
+
+
 def _render_explored_topic_roll_up(
     existing_topics: list[str],
     findings: list[dict],
@@ -967,20 +1047,27 @@ async def run_explore_do_node(
     # bounded as XML blocks so the supervisor sees the same hostage-laid
     # payload the worker does. ``topic_str`` alone is the bare research
     # question; the enriched form prepends it as the OBJECTIVE block and
-    # then layers SPECIFICATION / PRIOR_RESEARCH / SCRATCHPAD when present.
+    # then layers SPECIFICATION / PRIOR_RESEARCH / COVERED_GROUND /
+    # SCRATCHPAD when present.
     enriched_topic = topic_str
     scratchpad = state.get("scratchpad", "")
+    # Digest of sibling/prior-round findings, rendered by the dispatching
+    # router (render_covered_ground) and shipped in the Send payload — the
+    # supervisor uses it to steer workers away from already-mapped ground.
+    covered_ground = state.get("covered_ground", "") or ""
     enriched_blocks = xml_blocks(
         (Tag.OBJECTIVE, topic_str),
         (Tag.SPECIFICATION, spec_content[:_MAX_SPEC_CHARS] if spec_content else ""),
         (Tag.PRIOR_RESEARCH, prior_findings_body),
+        (Tag.COVERED_GROUND, covered_ground),
         (Tag.SCRATCHPAD, scratchpad),
     )
     # When only OBJECTIVE is present (no spec, no prior research, no
-    # scratchpad), keep the bare topic string so the supervisor's existing
-    # short-circuit / re-rendering logic stays compact. When ANY auxiliary
-    # block is present, ship the full XML payload.
-    if spec_content or prior_findings_body or scratchpad:
+    # covered ground, no scratchpad), keep the bare topic string so the
+    # supervisor's existing short-circuit / re-rendering logic stays
+    # compact. When ANY auxiliary block is present, ship the full XML
+    # payload.
+    if spec_content or prior_findings_body or covered_ground or scratchpad:
         enriched_topic = enriched_blocks
 
     # ── Build worker agents lazily, one per ToolClass ────────────────

@@ -676,10 +676,12 @@ class StructuredWritePlanTool(BaseTool):
             return f"ERROR: Could not write plan.json: {exc}"
 
         slice_count = len(validated_slices)
+        # ForceToolUntilCalledMiddleware treats any result not starting with
+        # VALIDATION_ERROR/ERROR as a successful write — keep failure strings
+        # on those prefixes (trace 019eb43f).
         return (
-            f"Plan artifacts written: {self.plan_dir}/plan.md "
-            f"({len(md_content)} chars), {self.plan_dir}/plan.json "
-            f"({len(json_content)} chars). "
+            f"plan.md ({len(md_content)} chars) and plan.json "
+            f"({len(json_content)} chars) written to {self.plan_dir}/. "
             f"{slice_count} feature slice(s) included."
         )
 

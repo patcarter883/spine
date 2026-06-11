@@ -265,6 +265,13 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # writer per branch so no reducer is needed.
     exploration_evidence: dict
 
+    # Per-Send transient: compact digest of prior-round findings rendered
+    # by the dispatching router (render_covered_ground) and consumed by
+    # explore_do, so round-2+ researchers build on already-mapped ground
+    # instead of re-fetching it. Rides the Send payload only — never
+    # written back as a channel update.
+    covered_ground: str
+
     # Recall hits per topic from the topic_lookup node. Populated for the
     # latest round's NEW topics only — older rounds' entries are not
     # carried forward (already-explored topics won't be re-sent by the

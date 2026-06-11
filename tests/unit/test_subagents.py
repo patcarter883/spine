@@ -330,19 +330,23 @@ class TestSubagentFactory:
         assert "execute" not in researcher_tools
         assert "ast_extract_symbol" in researcher_tools
 
-        # Implementer writes via the linted compound tool, NOT raw write/edit.
+        # Implementer reads AND writes via the linted compound tool only.
         impl_tools = SUBAGENT_TOOLS["slice-implementer"]
         assert "write_file" not in impl_tools
         assert "edit_file" not in impl_tools
         assert "read_edit_lint" in impl_tools
-        assert "execute" in impl_tools
+        # No shell: ad-hoc ast.parse/ruff/pytest runs are read_edit_lint's
+        # (and the verify phase's) job — trace 019eb502.
+        assert "execute" not in impl_tools
         # The implementer's surface is intentionally narrow: the broad keyword
         # search and redundant symbol-extractor are NOT bound, so it can't
         # "research half the codebase" (trace 019e784c). Targeted lookups go
         # through the injected codebase_query wrapper, not these.
         assert "search_codebase" not in impl_tools
         assert "ast_extract_symbol" not in impl_tools
-        assert "read_file" in impl_tools
+        # Reads go through read_edit_lint's READ mode (ranged, line-numbered,
+        # output-capped) — raw read_file dumped whole files 35× on 019eb502.
+        assert "read_file" not in impl_tools
 
         # Verifier can execute (tests/lint) but not write
         verifier_tools = SUBAGENT_TOOLS["slice-verifier"]

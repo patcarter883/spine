@@ -279,6 +279,29 @@ class SpineConfig:
     # (run 019e867a, ~9.5min). A tight cap fails fast and the loop proceeds to
     # synthesis from accumulated evidence. Mirrors summarise_max_completion_tokens.
     researcher_supervisor_max_completion_tokens: int = 1024
+    # Completion-token cap for the research manager's ResearchManagerDecision
+    # structured call. The decision is tiny (explore/done + 2-4 topic
+    # strings); uncapped, the empty-parse retry ("Your previous response was
+    # empty. Respond with ONLY the JSON…") sent a thinking model into a
+    # multi-minute reasoning burn toward the provider's full completion
+    # budget (trace 019eb541, observed live at 300s+ solo on the engine).
+    research_manager_max_completion_tokens: int = 2048
+    # Completion-token cap for the no-tool plan_do (run_plan_node)
+    # SubagentDirective calls (e.g. plan_slice_implementer). A directive is
+    # a few hundred tokens; without a cap the call inherits the provider's
+    # max_completion_tokens and a thinking model can burn for minutes in
+    # the reasoning channel before LengthFinishReasonError — trace
+    # 019eb502: 450s solo on the engine, serializing the whole implement
+    # fan-out behind it. Mirrors researcher_supervisor_max_completion_tokens
+    # (larger because a SubagentDirective carries approach + steps + risks).
+    plan_do_max_completion_tokens: int = 2048
+    # Completion-token cap for the slice-implementer agent loop. Implement
+    # turns are tool calls (edit payloads), not essays; without a cap the
+    # request inherits the global max_completion_tokens (30K) and a
+    # finite-window model 400s once the conversation grows past
+    # window - 30K (trace 019eb502: 30,001-token prompt + 30K requested vs
+    # a 60K window). 12K still covers a full_replace of a ~45KB file.
+    implement_max_completion_tokens: int = 12000
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -287,6 +310,23 @@ class SpineConfig:
     # synthesize prompt (trace 019e6d27: 42K plan-synthesize prompt
     # vs 40K TokenBudgetCompactor threshold). 0 or negative = unbounded.
     synthesize_findings_token_budget: int = 20000
+
+    # Completion-token clamp for the SPECIFY/PLAN synthesizer calls. The
+    # structured spec/plan JSON is 2-4K tokens; without a clamp the synth
+    # request inherits the global max_completion_tokens (30K) and a
+    # finite-window model 400s once prompt + completion budget exceeds the
+    # window (trace 019eb3dd: ~33K prompt + 30K requested vs a 60K window).
+    # 8K (not 4K) leaves headroom for reasoning-channel tokens on thinking
+    # models. Per-phase ``max_completion_tokens`` overrides still win.
+    synthesize_max_completion_tokens: int = 8000
+    # Safety margin subtracted from the window when computing the synth
+    # input budget — covers tool schemas, chat-template framing, and
+    # tiktoken-vs-model-tokenizer drift (cl100k underestimates Qwen ~10%).
+    synthesize_overhead_tokens: int = 4000
+    # Kill switch for map-reduce evidence compression in the synth nodes.
+    # When False, oversized findings/recall blocks degrade by truncation
+    # only (pre-019eb3dd behaviour).
+    evidence_compression_enabled: bool = True
 
     # Token budget for the prior-phase findings injected into PLAN
     # researcher / manager prompts (SPECIFY's research_log.json findings
@@ -561,6 +601,23 @@ class SpineConfig:
                     spine.get("synthesize_findings_token_budget", 20000),
                 )
             ),
+            synthesize_max_completion_tokens=int(
+                os.getenv(
+                    "SPINE_SYNTHESIZE_MAX_COMPLETION_TOKENS",
+                    spine.get("synthesize_max_completion_tokens", 8000),
+                )
+            ),
+            synthesize_overhead_tokens=int(
+                os.getenv(
+                    "SPINE_SYNTHESIZE_OVERHEAD_TOKENS",
+                    spine.get("synthesize_overhead_tokens", 4000),
+                )
+            ),
+            evidence_compression_enabled=os.getenv(
+                "SPINE_EVIDENCE_COMPRESSION",
+                str(spine.get("evidence_compression_enabled", True)).lower(),
+            )
+            not in ("0", "false", "no"),
             prior_phase_findings_token_budget=int(
                 os.getenv(
                     "SPINE_PRIOR_PHASE_FINDINGS_TOKEN_BUDGET",
@@ -695,6 +752,7 @@ class SpineConfig:
         "max_concurrent_calls",
         "stream_usage",
         "reasoning",
+        "context_window",
     )
 
     def resolve_active_provider(self) -> dict | None:

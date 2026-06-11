@@ -29,8 +29,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send
 
 from spine.agents._tokens import count_tokens as _count_tokens
+from spine.agents.evidence_compression import (
+    compress_findings as _compress_findings,
+    compress_recall_chunks as _compress_recall_chunks,
+)
 from spine.agents.exploration_agents import format_findings as _format_findings
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+from spine.agents.synthesis_budget import (
+    allocate_evidence as _allocate_evidence,
+    estimate_tool_payload_reserve as _estimate_tool_payload_reserve,
+    resolve_synthesis_budget as _resolve_synthesis_budget,
+)
 
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ExplorationSubgraphState
@@ -57,6 +66,14 @@ _DEFAULT_MAX_ROUNDS = 3
 # the cap are deferred: the manager will re-propose them next round
 # (and _new_topics will skip ones already covered).
 _MAX_PARALLEL_EXPLORES = 4
+# Sentinel budget for measuring an evidence block's full rendered size
+# before allocation (effectively "no cap").
+_UNBOUNDED_BUDGET = 10**9
+# Cap on the specification.md content inlined into the PLAN synthesizer
+# prompt (trace 019eb52c). Generous — the spec is the planning contract
+# and a truncated spec produces plans the critic rejects for missed
+# requirements — but bounded so a runaway spec can't eat the window.
+_MAX_SPEC_CHARS = 24_000
 
 
 # ── Node: pre_research_gate ─────────────────────────────────────────────
@@ -547,6 +564,14 @@ def _research_router(
     phase = state.get("phase", "")
     capped_topics = new_topics[:_MAX_PARALLEL_EXPLORES]
     deferred = new_topics[_MAX_PARALLEL_EXPLORES:]
+    # Compact digest of what prior rounds (and seeded rework findings)
+    # already established. Round-2+ researchers used to start cold and
+    # re-map ground their predecessors covered (trace 019eb4c7) — the
+    # digest lets each branch's supervisor steer at the uncovered part.
+    # Empty on round 1, so first-round branches pay nothing.
+    from spine.agents.exploration_agents import render_covered_ground
+
+    covered_ground = render_covered_ground(state.get("findings", []) or [])
     sends = [
         Send(
             # Two-node researcher: explore_do (tools) → summarise (no tools).
@@ -565,6 +590,7 @@ def _research_router(
                 "work_id": state.get("work_id"),
                 "work_type": state.get("work_type", ""),
                 "workspace_root": state.get("workspace_root", "."),
+                "covered_ground": covered_ground,
             },
         )
         for t in capped_topics
@@ -737,11 +763,6 @@ async def _synthesize_plan(
         agent = build_plan_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        from spine.config import SpineConfig as _SpineConfig
-        findings_text = _format_findings(
-            findings,
-            budget=_SpineConfig.load().synthesize_findings_token_budget,
-        )
         feedback_body = ""
         if retry_count > 0:
             feedback_body = _render_rework_feedback(last_critic_review, feedback) or ""
@@ -752,39 +773,152 @@ async def _synthesize_plan(
             if retry_count > 0
             else ""
         )
+        instruction = (
+            f"{rework_lead}Create a detailed technical plan with "
+            "structured feature slices. The specification and research "
+            "findings are in the blocks above — everything you need is "
+            "already in this prompt; there is nothing to read or load "
+            "first. Synthesize the spec + findings into structured "
+            "feature_slices and call `write_structured_plan` exactly "
+            "once — the tool writes both plan.md and plan.json for you. "
+            "Do not call write_file."
+        )
+
+        # ── Inline the specification (trace 019eb52c) ────────────────────
+        # The synthesizer used to be told to fetch the spec via
+        # read_prior_artifacts, but on this path state["artifacts"] is never
+        # populated, so the tool always answered "No prior artifacts found"
+        # — and the forced-tool loop re-called it 23× chasing the spec the
+        # prompt promised. Read specification.md from disk and put it IN the
+        # prompt instead; the synthesizer now has zero read tools.
+        spec_body = ""
+        spec_dir = state.get("spec_path") or f".spine/artifacts/{work_id}/specify"
+        spec_file = Path(workspace_root) / spec_dir / "specification.md"
+        if spec_file.exists():
+            try:
+                spec_body = spec_file.read_text(encoding="utf-8")[:_MAX_SPEC_CHARS]
+            except OSError as exc:
+                logger.warning("[%s] Could not read spec for plan synth: %s", work_id, exc)
+        if not spec_body:
+            logger.warning(
+                "[%s] PLAN synthesize: no specification.md found at %s — "
+                "synthesizing from description + findings only",
+                work_id, spec_file,
+            )
+
+        # ── Window-aware evidence budgeting (trace 019eb3dd) ────────────
+        # Same ledger as _synthesize_specify, minus the recall block (PLAN
+        # has no recall-gate short-circuit). No tool-payload reserve: the
+        # synthesizer has no read tools, so turn 1 is the whole request —
+        # the spec is measured as fixed prompt content instead.
+        from deepagents.graph import BASE_AGENT_PROMPT as _BASE_PROMPT
+        from spine.agents.artifacts import build_artifact_prompt as _artifact_prompt
+        from spine.agents.plan_agent import _build_plan_synthesizer_prompt
+
+        system_estimate = (
+            _build_plan_synthesizer_prompt()
+            + _artifact_prompt(
+                state.get("artifacts", {}), PhaseName.PLAN.value, work_id=work_id
+            )
+            + _BASE_PROMPT
+        )
+        synth_budget = _resolve_synthesis_budget(
+            PhaseName.PLAN.value,
+            fixed_texts=[
+                system_estimate, description, spec_body, feedback_body,
+                scratchpad, instruction,
+            ],
+        )
+
+        findings_full = _format_findings(findings)
+        alloc = _allocate_evidence(
+            synth_budget,
+            findings_tokens=_count_tokens(findings_full),
+        )
+        if _count_tokens(findings_full) <= alloc.findings:
+            findings_text = findings_full
+        else:
+            if not synth_budget.legacy:
+                findings = await _compress_findings(
+                    findings,
+                    budget_tokens=alloc.findings,
+                    phase=PhaseName.PLAN.value,
+                    work_id=work_id,
+                    config=config,
+                )
+            findings_text = _format_findings(findings, budget=alloc.findings)
+
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
+                (Tag.SPECIFICATION, spec_body),
                 (Tag.FINDINGS, findings_text),
                 (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
             ),
-            (
-                f"{rework_lead}Create a detailed technical plan with "
-                "structured feature slices, incorporating the research "
-                "findings above. Call `read_prior_artifacts` to load the "
-                "specification and prior context in one call. Then "
-                "synthesize the spec + findings into structured "
-                "feature_slices and call `write_structured_plan` exactly "
-                "once — the tool writes both plan.md and plan.json for you. "
-                "Do not call write_file."
-            ),
+            instruction,
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)
-        result = await ainvoke_with_retry(
-            agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            phase_name=PhaseName.PLAN.value,
-            work_id=work_id,
-            work_type=work_type,
-            context=ctx,
-        )
+        # The first invocation may raise instead of returning (trace
+        # 019eb412: LengthFinishReasonError after the model burned all
+        # 8K completion tokens in the reasoning channel with no tool
+        # call). Don't fail yet — fall through to the corrective retry.
+        try:
+            result = await ainvoke_with_retry(
+                agent,
+                {"messages": [{"role": "user", "content": prompt}]},
+                phase_name=PhaseName.PLAN.value,
+                work_id=work_id,
+                work_type=work_type,
+                context=ctx,
+            )
+        except Exception as invoke_exc:
+            logger.warning(
+                "[%s] Synthesize (plan) invocation failed (%s) — "
+                "proceeding to corrective retry",
+                work_id, invoke_exc,
+            )
+            result = {"messages": []}
 
         # ── Read plan.json from disk (written by write_structured_plan) ──
         plan_json_path = (
             Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
         )
+
+        # One corrective retry before failing the contract — mirrors
+        # plan_subgraph.run_agent (commit a431597). That protection lived
+        # only on the non-exploration path, so trace 019eb412 sailed past a
+        # failed synthesis to human_review reporting plan "success" with
+        # zero artifacts.
+        if not plan_json_path.exists():
+            logger.warning(
+                "[%s] PLAN synthesizer finished without writing plan.json — "
+                "issuing one corrective retry",
+                work_id,
+            )
+            nudge = (
+                "Your previous turn produced no plan: plan.json was not "
+                "written. Do not deliberate further. Call "
+                "`write_structured_plan` exactly once, NOW, with the "
+                "structured fields (architecture_overview, "
+                "technology_choices, feature_slices, testing_strategy, "
+                "risks, codebase_map)."
+            )
+            prior_messages = list(result.get("messages") or [])
+            if not prior_messages:
+                # First invocation raised before producing a conversation —
+                # restart from the original prompt so the retry has context.
+                prior_messages = [{"role": "user", "content": prompt}]
+            result = await ainvoke_with_retry(
+                agent,
+                {"messages": prior_messages + [{"role": "user", "content": nudge}]},
+                phase_name=PhaseName.PLAN.value,
+                work_id=work_id,
+                work_type=work_type,
+                context=ctx,
+            )
+
         plan_json_str: str | None = None
         execution_waves: list[list[dict]] = []
 
@@ -805,7 +939,19 @@ async def _synthesize_plan(
                         wave_error,
                     )
             except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("[%s] Failed to read plan.json: %s", work_id, exc)
+                raise CriticalContractFailure(
+                    phase="plan",
+                    reason=f"plan.json exists but is malformed or unreadable: {exc}",
+                )
+        else:
+            raise CriticalContractFailure(
+                phase="plan",
+                reason=(
+                    "plan.json does not exist after corrective retry — the "
+                    "synthesizer did not produce structured output via "
+                    "write_structured_plan."
+                ),
+            )
 
         return {
             "messages": result.get("messages", []),
@@ -815,6 +961,13 @@ async def _synthesize_plan(
             "read_cache": result.get("read_cache") or {},
         }
 
+    except CriticalContractFailure:
+        # Must propagate to subgraph_wrapper's structural-retry handler so a
+        # missing plan.json re-runs the phase on a clean thread instead of
+        # flowing downstream as a soft phase_status="error" (trace 019eb412:
+        # the workflow reached human_review reporting plan success with
+        # artifact_count=0).
+        raise
     except Exception as e:
         logger.error("[%s] Synthesize (plan) failed: %s", work_id, e, exc_info=True)
         return {
@@ -858,19 +1011,6 @@ async def _synthesize_specify(
         agent = build_specify_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
 
-        from spine.config import SpineConfig as _SpineConfig
-        findings_text = _format_findings(
-            findings,
-            budget=_SpineConfig.load().synthesize_findings_token_budget,
-        )
-        # When the pre_research_gate fired (high confidence + sufficient
-        # hits), it skips the exploration loop and we synthesize directly
-        # from the recalled chunks.  Inject the raw per-symbol bodies
-        # (tree-sitter-sliced — single function bodies, not whole files)
-        # up to the configured token budget.
-        recall_body = _format_retrieved_context(
-            state.get("retrieved_context") or []
-        )
         feedback_body = ""
         if retry_count > 0:
             feedback_body = _render_rework_feedback(last_critic_review, feedback) or ""
@@ -882,6 +1022,83 @@ async def _synthesize_specify(
             if retry_count > 0
             else ""
         )
+        instruction = (
+            f"{rework_lead}Create a detailed specification for the work "
+            "above, incorporating the research findings. Call "
+            "`read_work_context` once to load description, feedback, "
+            "and any prior spec. Then synthesize the work description + "
+            "research findings into the structured fields and call "
+            "`write_specification` exactly once (fields: title, summary, "
+            "objectives, requirements, constraints, scope_inclusions, "
+            "scope_exclusions, known_risks). The tool renders markdown "
+            "and emits JSON for you — do not call write_file."
+        )
+
+        # ── Window-aware evidence budgeting (trace 019eb3dd) ────────────
+        # Measure the fixed prompt pieces and what read_work_context will
+        # return on turn 2, then size the findings/recall blocks so the
+        # whole request (plus the clamped completion) fits the provider's
+        # declared context_window. Legacy (no window declared) keeps the
+        # historical fixed budgets.
+        from deepagents.graph import BASE_AGENT_PROMPT as _BASE_PROMPT
+        from spine.agents.artifacts import build_artifact_prompt as _artifact_prompt
+        from spine.agents.specify_agent import _build_specify_synthesizer_prompt
+
+        system_estimate = (
+            _build_specify_synthesizer_prompt()
+            + _artifact_prompt(
+                state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
+            )
+            + _BASE_PROMPT
+        )
+        reserve = _estimate_tool_payload_reserve(
+            workspace_root=workspace_root,
+            artifact_dirs=[f".spine/artifacts/{work_id}/specify"],
+            description=description,
+            feedback=[str(f) for f in feedback] if feedback else [],
+        )
+        synth_budget = _resolve_synthesis_budget(
+            PhaseName.SPECIFY.value,
+            fixed_texts=[
+                system_estimate, description, feedback_body, scratchpad, instruction,
+            ],
+            tool_payload_reserve=reserve,
+        )
+
+        # When the pre_research_gate fired (high confidence + sufficient
+        # hits), it skips the exploration loop and we synthesize directly
+        # from the recalled chunks.  Inject the raw per-symbol bodies
+        # (tree-sitter-sliced — single function bodies, not whole files)
+        # up to the allocated token budget.
+        chunks = state.get("retrieved_context") or []
+        findings_full = _format_findings(findings)
+        recall_full = _format_retrieved_context(chunks, budget=_UNBOUNDED_BUDGET)
+        alloc = _allocate_evidence(
+            synth_budget,
+            findings_tokens=_count_tokens(findings_full),
+            recall_tokens=_count_tokens(recall_full),
+        )
+
+        if _count_tokens(findings_full) <= alloc.findings:
+            findings_text = findings_full
+        else:
+            if not synth_budget.legacy:
+                findings = await _compress_findings(
+                    findings,
+                    budget_tokens=alloc.findings,
+                    phase=PhaseName.SPECIFY.value,
+                    work_id=work_id,
+                    config=config,
+                )
+            findings_text = _format_findings(findings, budget=alloc.findings)
+
+        if _count_tokens(recall_full) <= alloc.recall:
+            recall_body = recall_full
+        else:
+            if not synth_budget.legacy:
+                chunks = _compress_recall_chunks(chunks, budget_tokens=alloc.recall)
+            recall_body = _format_retrieved_context(chunks, budget=alloc.recall)
+
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
@@ -890,17 +1107,7 @@ async def _synthesize_specify(
                 (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
             ),
-            (
-                f"{rework_lead}Create a detailed specification for the work "
-                "above, incorporating the research findings. Call "
-                "`read_work_context` once to load description, feedback, "
-                "and any prior spec. Then synthesize the work description + "
-                "research findings into the structured fields and call "
-                "`write_specification` exactly once (fields: title, summary, "
-                "objectives, requirements, constraints, scope_inclusions, "
-                "scope_exclusions, known_risks). The tool renders markdown "
-                "and emits JSON for you — do not call write_file."
-            ),
+            instruction,
         )
 
         ctx = build_context(dict(state), PhaseName.SPECIFY)
@@ -986,19 +1193,22 @@ def _compute_waves(
 # _count_tokens has moved to spine.agents._tokens (imported at module top).
 
 
-def _format_retrieved_context(chunks: list[dict]) -> str:
-    """Render recalled chunks as code blocks, capped by ``specify_context_token_budget``.
+def _format_retrieved_context(chunks: list[dict], budget: int | None = None) -> str:
+    """Render recalled chunks as code blocks, capped by a token budget.
 
     Each chunk is a tree-sitter-sliced symbol body (Phase 1), so there is
     no per-chunk truncation — we simply stop appending when adding the
-    next chunk would exceed the budget.
+    next chunk would exceed the budget. ``budget=None`` falls back to
+    ``specify_context_token_budget`` (the historical behaviour); the
+    synthesize nodes pass an explicit window-derived allocation.
     """
     if not chunks:
         return ""
 
-    from spine.config import SpineConfig
+    if budget is None:
+        from spine.config import SpineConfig
 
-    budget = SpineConfig.load().specify_context_token_budget
+        budget = SpineConfig.load().specify_context_token_budget
     # No outer markdown header — caller wraps the returned text in
     # ``xml_blocks((Tag.RETRIEVED_CODE, ...))`` per the project's tagging
     # convention (see ``spine.agents.prompt_format``).
@@ -1147,6 +1357,23 @@ async def _save_exploration_artifacts(
                 reason="specification.json does not exist — "
                        "the specify agent did not produce structured output via write_specification. "
                        "This indicates a model invocation failure.",
+            )
+
+    # Fail-closed: PLAN requires plan.json. _synthesize_plan enforces this
+    # itself (corrective retry + CriticalContractFailure), but this backstop
+    # catches any path that reaches save_artifacts without one — trace
+    # 019eb412 reached human_review reporting plan "success" with
+    # artifact_count=0 after a swallowed synthesis failure.
+    if phase == PhaseName.PLAN.value:
+        plan_json_check = (
+            Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+        )
+        if not plan_json_check.exists():
+            raise CriticalContractFailure(
+                phase="plan",
+                reason="plan.json does not exist at save_artifacts — "
+                       "the plan synthesizer did not produce structured output "
+                       "via write_structured_plan.",
             )
 
     disk_artifacts = scan_artifact_dir(

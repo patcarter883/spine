@@ -116,6 +116,8 @@ def build_specify_synthesizer(
         state.get("artifacts", {}), PhaseName.SPECIFY.value, work_id=work_id
     )
 
+    from spine.agents.synthesis_budget import synthesis_completion_cap
+
     return build_phase_agent(
         state=state,
         config=config,
@@ -123,6 +125,10 @@ def build_specify_synthesizer(
         system_prompt=system_prompt,
         extra_tools=list(orchestrator_tools),
         skip_filesystem_middleware=True,
+        # The spec JSON is 2-4K tokens; without a clamp the request inherits
+        # the global max_completion_tokens (30K) and a finite-window model
+        # 400s once prompt + completion budget exceed the window (019eb3dd).
+        completion_token_cap=synthesis_completion_cap(PhaseName.SPECIFY.value),
         # The synthesizer runs a strict 2-call flow (read_work_context →
         # write_specification) with no `recall`, so once the gate tool fires we
         # pin tool_choice to write_specification — the model cannot stall in
