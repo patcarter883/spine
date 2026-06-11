@@ -202,3 +202,53 @@ def test_plan_synthesizer_forces_write_structured_plan(tmp_path, monkeypatch):
         if isinstance(m, ForceToolUntilCalledMiddleware)
     ]
     assert forcing, "plan synthesizer is missing ForceToolUntilCalledMiddleware"
+
+
+def test_forcing_releases_on_real_write_structured_plan_output(tmp_path):
+    """The middleware must release after a real successful write (trace 019eb43f).
+
+    The release check matches success_marker ("written to") against the tool's
+    return string. The plan tool's old message ("Plan artifacts written: …")
+    lacked the marker, so forcing never released: the synthesizer was compelled
+    to call write_structured_plan every turn (24×) until the context window
+    overflowed. Run the REAL tool and feed its REAL output through the
+    middleware so message drift can't silently re-open the loop.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from spine.agents.plan_tools import StructuredWritePlanTool
+    from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
+
+    tool = StructuredWritePlanTool(
+        workspace_root=str(tmp_path),
+        plan_dir=".spine/artifacts/wk-explan/plan",
+    )
+    output = tool._run(
+        architecture_overview="x",
+        feature_slices=[
+            {
+                "id": "s1",
+                "title": "slice one",
+                "execution_requirements": "do it",
+                "acceptance_criteria": ["works"],
+            }
+        ],
+        testing_strategy="pytest",
+    )
+    assert "VALIDATION_ERROR" not in output and "ERROR" not in output
+
+    mw = ForceToolUntilCalledMiddleware(
+        final_tool="write_structured_plan",
+        gate_tool="read_prior_artifacts",
+    )
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "write_structured_plan", "args": {}, "id": "tc1"}],
+        ),
+        ToolMessage(content=output, tool_call_id="tc1"),
+    ]
+    assert mw._final_tool_succeeded(messages), (
+        "middleware did not release on the plan tool's success message — "
+        f"success_marker {mw.success_marker!r} missing from: {output!r}"
+    )

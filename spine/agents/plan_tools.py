@@ -676,10 +676,13 @@ class StructuredWritePlanTool(BaseTool):
             return f"ERROR: Could not write plan.json: {exc}"
 
         slice_count = len(validated_slices)
+        # "written to" is ForceToolUntilCalledMiddleware's success_marker —
+        # forcing only releases when it appears in this message (trace
+        # 019eb43f: "Plan artifacts written:" lacked it, so the synthesizer
+        # was forced to rewrite the plan every turn until context overflow).
         return (
-            f"Plan artifacts written: {self.plan_dir}/plan.md "
-            f"({len(md_content)} chars), {self.plan_dir}/plan.json "
-            f"({len(json_content)} chars). "
+            f"plan.md ({len(md_content)} chars) and plan.json "
+            f"({len(json_content)} chars) written to {self.plan_dir}/. "
             f"{slice_count} feature slice(s) included."
         )
 
