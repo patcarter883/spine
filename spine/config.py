@@ -279,6 +279,22 @@ class SpineConfig:
     # (run 019e867a, ~9.5min). A tight cap fails fast and the loop proceeds to
     # synthesis from accumulated evidence. Mirrors summarise_max_completion_tokens.
     researcher_supervisor_max_completion_tokens: int = 1024
+    # Completion-token cap for the no-tool plan_do (run_plan_node)
+    # SubagentDirective calls (e.g. plan_slice_implementer). A directive is
+    # a few hundred tokens; without a cap the call inherits the provider's
+    # max_completion_tokens and a thinking model can burn for minutes in
+    # the reasoning channel before LengthFinishReasonError — trace
+    # 019eb502: 450s solo on the engine, serializing the whole implement
+    # fan-out behind it. Mirrors researcher_supervisor_max_completion_tokens
+    # (larger because a SubagentDirective carries approach + steps + risks).
+    plan_do_max_completion_tokens: int = 2048
+    # Completion-token cap for the slice-implementer agent loop. Implement
+    # turns are tool calls (edit payloads), not essays; without a cap the
+    # request inherits the global max_completion_tokens (30K) and a
+    # finite-window model 400s once the conversation grows past
+    # window - 30K (trace 019eb502: 30,001-token prompt + 30K requested vs
+    # a 60K window). 12K still covers a full_replace of a ~45KB file.
+    implement_max_completion_tokens: int = 12000
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify

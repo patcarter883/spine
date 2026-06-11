@@ -348,6 +348,9 @@ async def _slice_implementer_node(
             [getattr(t, "name", repr(t)) for t in extra_tools],
         )
 
+        from spine.agents.synthesis_budget import synthesis_completion_cap
+        from spine.config import SpineConfig
+
         agent = build_phase_agent(
             state=state,
             config=config,
@@ -358,8 +361,18 @@ async def _slice_implementer_node(
             response_format=subagent_spec.get("response_format"),
             skip_filesystem_middleware=True,
             # The subagent_spec already curated the implementer's tool
-            # surface (read_edit_lint + codebase_query wrapper + read/search/
-            # execute via subagents.py) — they live in ``extra_tools`` above.
+            # surface (read_edit_lint + codebase_query wrapper via
+            # subagents.py) — they live in ``extra_tools`` above.
+            #
+            # Implement turns are tool calls (edit payloads), not essays.
+            # Without a clamp the request inherits the global
+            # max_completion_tokens (30K) and a finite-window model 400s
+            # once the conversation grows past window - 30K (trace
+            # 019eb502: 30,001-token prompt + 30K requested vs 60K window).
+            completion_token_cap=synthesis_completion_cap(
+                PhaseName.IMPLEMENT.value,
+                phase_cap=SpineConfig.load().implement_max_completion_tokens,
+            ),
         )
 
         # Strip private sequencing keys (e.g. _sibling_queue, which nests the

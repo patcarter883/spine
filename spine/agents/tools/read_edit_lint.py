@@ -1,13 +1,19 @@
 """Read-edit-lint compound tool for the slice-implementer subagent.
 
-Replaces ``write_file`` + ``edit_file`` with a single tool that resolves an
+The implementer's ONLY filesystem tool: read, edit, and lint in one
+surface. Replaces ``write_file`` + ``edit_file`` (and, since trace
+019eb502, ``read_file`` + ``execute``) with a single tool that resolves an
 edit in memory, runs a language-specific syntax check on the proposed new
 content, and only writes (atomically) when the check passes. On failure it
 returns a structured status WITHOUT touching disk so the model can correct
-and retry in-loop.
+and retry in-loop. After a successful Python write it also runs ``ruff``
+(when available) and reports a bounded diagnostic summary, so implementers
+never need a shell to lint.
 
-Four mutually-exclusive edit modes:
+Read mode plus four mutually-exclusive edit modes:
 
+0. *(read)* — ``file_path`` alone returns the file with line numbers;
+   add ``start_line``/``end_line`` (no ``replacement``) for a range.
 1. ``old_str`` → ``new_str`` — exact, single-occurrence find-and-replace.
 2. ``full_replace`` — whole-file rewrite (also creates new files).
 3. ``edits`` — a batch of find-and-replace ops applied in order to one file,
@@ -21,7 +27,11 @@ Four mutually-exclusive edit modes:
 
 The exact-match contract on ``old_str`` mirrors Anthropic's ``str_replace``:
 no regex, no fuzzy matching, fail loudly if the snippet is missing or appears
-more than once.
+more than once. One deliberate softening: when ``old_str`` is missing but
+``new_str`` is already present in the file, the status is
+``already_applied`` rather than ``no_match`` — trace 019eb502 showed models
+re-sending an edit that had just succeeded, reading the ``no_match`` as a
+failure, and spiralling into re-reads of a file that was already correct.
 """
 
 from __future__ import annotations
@@ -66,7 +76,11 @@ class ReadEditLintInput(BaseModel):
     """Input schema for :class:`ReadEditLintTool`."""
 
     file_path: str = Field(
-        description="Workspace-relative path to the file to edit (or create with full_replace)."
+        description=(
+            "Workspace-relative path to the file to read, edit, or create "
+            "(with full_replace). Passing ONLY file_path (optionally with "
+            "start_line/end_line) READS the file with line numbers."
+        )
     )
     old_str: Optional[str] = Field(
         default=None,
@@ -98,11 +112,18 @@ class ReadEditLintInput(BaseModel):
     )
     start_line: Optional[int] = Field(
         default=None,
-        description="1-indexed first line of the range to replace (line-range mode).",
+        description=(
+            "1-indexed first line of the range to replace (line-range mode) "
+            "or to read (read mode, when replacement is omitted)."
+        ),
     )
     end_line: Optional[int] = Field(
         default=None,
-        description="1-indexed last line of the range to replace, inclusive (line-range mode).",
+        description=(
+            "1-indexed last line, inclusive — of the range to replace "
+            "(line-range mode) or to read (read mode, when replacement is "
+            "omitted)."
+        ),
     )
     replacement: Optional[str] = Field(
         default=None,
@@ -192,6 +213,82 @@ def _find_error_node(node: Any) -> Any | None:
     return None
 
 
+# Bounded ruff diagnostics appended to a successful .py write. Informational
+# only — the write gate stays the syntax check. This exists so implementers
+# get lint feedback from their ONE tool instead of shelling out (trace
+# 019eb502: `execute("ruff check ...")`, `execute("python -c 'import ast...")`
+# after every edit, plus environment spelunking to find the interpreter).
+_RUFF_MAX_ISSUES = 10
+_RUFF_TIMEOUT_S = 10
+
+
+def _ruff_report(path: Path, workspace_root: str) -> Optional[str]:
+    """Run ``ruff check`` on the written file; return a bounded summary.
+
+    Returns ``"clean"`` when ruff passes, a newline-joined issue list
+    (capped at ``_RUFF_MAX_ISSUES``) when it doesn't, and ``None`` when
+    ruff is unavailable or errors — fail-open, never blocks the write.
+    """
+    if path.suffix.lower() != ".py":
+        return None
+    try:
+        proc = subprocess.run(
+            ["ruff", "check", "--output-format=concise", str(path)],
+            capture_output=True,
+            timeout=_RUFF_TIMEOUT_S,
+            cwd=workspace_root or None,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode == 0:
+        return "clean"
+    lines = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()
+    issues = [ln for ln in lines if ln.strip()]
+    if not issues:
+        return None  # non-zero with no parseable output — config error etc.
+    shown = issues[:_RUFF_MAX_ISSUES]
+    if len(issues) > len(shown):
+        shown.append(f"(... {len(issues) - len(shown)} more issue(s))")
+    return "\n".join(shown)
+
+
+# Cap on whole-file read output. Reads beyond this are truncated with a
+# notice steering the model to ranged reads — an uncapped read of a 50KB
+# file costs ~13K tokens and then rides every subsequent turn's prompt.
+_READ_MAX_LINES = 1200
+
+
+def _render_read(
+    file_path: str,
+    content: str,
+    start_line: Optional[int],
+    end_line: Optional[int],
+) -> str:
+    """Render a line-numbered read of the file (or a 1-indexed range)."""
+    lines = content.splitlines()
+    n_total = len(lines)
+    lo = max(1, start_line or 1)
+    hi = min(n_total, end_line or n_total)
+    if n_total and (lo > n_total or hi < lo):
+        return _result(
+            "range_error",
+            detail=f"Invalid read range {start_line}..{end_line} for {file_path} ({n_total} lines).",
+        )
+    window = lines[lo - 1 : hi]
+    truncated = len(window) > _READ_MAX_LINES
+    if truncated:
+        window = window[:_READ_MAX_LINES]
+        hi = lo + _READ_MAX_LINES - 1
+    body = "\n".join(f"{lo + i}| {line}" for i, line in enumerate(window))
+    header = f"[read: {file_path} lines {lo}-{hi} of {n_total}]"
+    if truncated:
+        header += (
+            f" (truncated at {_READ_MAX_LINES} lines — re-call with "
+            "start_line/end_line for the rest)"
+        )
+    return f"{header}\n{body}"
+
+
 def _dispatch_lint(file_path: str, source: str) -> Optional[str]:
     """Pick the right syntax check for the file extension."""
     ext = os.path.splitext(file_path)[1].lower()
@@ -211,12 +308,32 @@ def _dispatch_lint(file_path: str, source: str) -> Optional[str]:
 # on failure, where error_payload is a kwargs dict for :func:`_result`.
 
 
+def _already_applied_payload(file_path: str) -> dict[str, Any]:
+    """Status payload for an edit whose replacement text is already present.
+
+    Distinct from ``no_match`` so the model treats the edit as DONE instead
+    of as a failure: trace 019eb502 showed implementers re-sending an edit
+    that had just succeeded, reading the resulting ``no_match`` as "the edit
+    failed", and spiralling into re-reads of an already-correct file.
+    """
+    return {
+        "status": "already_applied",
+        "detail": (
+            f"old_str was not found in {file_path}, but new_str is already "
+            "present — this edit appears to have been applied previously. "
+            "Treat it as done; do NOT retry or re-read."
+        ),
+    }
+
+
 def _apply_find_replace(
     current: str, old_str: str, new_str: str, file_path: str
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Resolve a single exact find-and-replace against ``current``."""
     occurrences = current.count(old_str)
     if occurrences == 0:
+        if new_str and new_str in current:
+            return None, _already_applied_payload(file_path)
         return None, {
             "status": "no_match",
             "detail": (
@@ -268,6 +385,16 @@ def _apply_batch(
             }
         occurrences = buffer.count(old_str)
         if occurrences == 0:
+            if new_str and new_str in buffer:
+                payload = _already_applied_payload(file_path)
+                payload["edit_index"] = index
+                payload["detail"] = (
+                    f"edits[{index}] old_str was not found, but its new_str "
+                    f"is already present in {file_path} — that edit was "
+                    "applied previously. Nothing was written this call; "
+                    f"re-submit the batch WITHOUT edits[{index}]."
+                )
+                return None, payload
             return None, {
                 "status": "no_match",
                 "detail": (
@@ -346,14 +473,19 @@ class ReadEditLintTool(BaseTool):
 
     name: str = "read_edit_lint"
     description: str = (
-        "Edit or create a file with a built-in syntax check. Pass exactly ONE "
-        "edit mode: old_str+new_str (single-occurrence find-and-replace); "
-        "full_replace (whole-file content); edits (a batch of find-and-replace "
-        "ops applied atomically — all-or-nothing); or start_line+end_line+"
-        "replacement (line-range edit, with optional `expected` staleness "
-        "guard). On a syntax error or failed match the write is rejected "
-        "without modifying the file — fix and call again. Use this in place of "
-        "write_file/edit_file."
+        "Read, edit, or create a file — your single filesystem tool. "
+        "READ: pass only file_path (plus optional start_line/end_line) to "
+        "get line-numbered content; prefer ranged reads on large files. "
+        "EDIT: pass exactly ONE edit mode: old_str+new_str "
+        "(single-occurrence find-and-replace); full_replace (whole-file "
+        "content); edits (a batch of find-and-replace ops applied "
+        "atomically — all-or-nothing); or start_line+end_line+replacement "
+        "(line-range edit, with optional `expected` staleness guard). On a "
+        "syntax error or failed match the write is rejected without "
+        "modifying the file — fix and call again. status='already_applied' "
+        "means the change is ALREADY in the file: move on, do not retry. "
+        "Successful Python writes include a `ruff` field with lint "
+        "diagnostics — no shell needed to lint."
     )
     args_schema: Optional[ArgsSchema] = ReadEditLintInput
 
@@ -385,16 +517,13 @@ class ReadEditLintTool(BaseTool):
             active.append("find_replace")
         if edits is not None:
             active.append("edits")
-        if start_line is not None or end_line is not None or replacement is not None or expected is not None:
+        if replacement is not None or expected is not None:
             active.append("line_range")
+        elif start_line is not None or end_line is not None:
+            # Bare line bounds with no replacement/expected = ranged READ.
+            active.append("read")
         if not active:
-            return _result(
-                "input_error",
-                detail=(
-                    "Pass exactly one edit mode: full_replace; old_str+new_str; "
-                    "edits; or start_line+end_line+replacement."
-                ),
-            )
+            active.append("read")  # file_path alone = whole-file read
         if len(active) > 1:
             return _result(
                 "input_error",
@@ -404,6 +533,19 @@ class ReadEditLintTool(BaseTool):
 
         path = self._resolve_path(file_path)
         existed = path.exists()
+
+        # ── Read mode ───────────────────────────────────────────────
+        if mode == "read":
+            if not existed:
+                return _result(
+                    "not_found",
+                    detail=f"Cannot read {file_path}: file does not exist.",
+                )
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return _result("io_error", detail=f"Could not read {file_path}: {exc}")
+            return _render_read(file_path, content, start_line, end_line)
 
         # ── Build the new content in memory per mode ────────────────
         if mode == "full_replace":
@@ -454,12 +596,15 @@ class ReadEditLintTool(BaseTool):
         except OSError as exc:
             return _result("io_error", detail=f"Could not write {file_path}: {exc}")
 
-        return _result(
-            "ok",
-            file_path=file_path,
-            bytes_written=len(new_content.encode("utf-8")),
-            created=not existed,
-        )
+        ok_fields: dict[str, Any] = {
+            "file_path": file_path,
+            "bytes_written": len(new_content.encode("utf-8")),
+            "created": not existed,
+        }
+        ruff = _ruff_report(path, self.workspace_root)
+        if ruff is not None:
+            ok_fields["ruff"] = ruff
+        return _result("ok", **ok_fields)
 
     async def _arun(
         self,

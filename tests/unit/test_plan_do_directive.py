@@ -197,3 +197,34 @@ async def test_run_plan_node_accepts_dict_response(monkeypatch):
     assert isinstance(out, SubagentDirective)
     assert out.approach == "ok"
     assert out.target_files == ["a.py"]
+
+
+@pytest.mark.asyncio
+async def test_run_plan_node_caps_completion_tokens(monkeypatch):
+    """run_plan_node must clamp the model's completion budget — uncapped, a
+    thinking model burned 450s in the reasoning channel on trace 019eb502
+    (plan_slice_implementer), serializing the whole implement fan-out."""
+    from spine.config import SpineConfig
+
+    expected = SubagentDirective(approach="capped", steps=["s"])
+    seen: dict = {}
+
+    def _fake_cap(model, cap):
+        seen["cap"] = cap
+        return model
+
+    monkeypatch.setattr(
+        plan_do, "resolve_chat_model", lambda *a, **kw: _FakeChatModel(expected)
+    )
+    monkeypatch.setattr(plan_do, "cap_completion_tokens", _fake_cap)
+    monkeypatch.setattr(plan_do, "suppress_reasoning", lambda m: m)
+
+    out = await plan_do.run_plan_node(
+        state={"work_id": "w-cap"},
+        config=None,
+        phase_path="implement/subagents/slice-implementer",
+        task_description="do the thing",
+    )
+    assert out.approach == "capped"
+    assert seen["cap"] == SpineConfig.load().plan_do_max_completion_tokens
+    assert seen["cap"] > 0

@@ -65,13 +65,20 @@ class EvidenceAllocation:
     recall: int
 
 
-def synthesis_completion_cap(phase: str) -> int:
+def synthesis_completion_cap(phase: str, phase_cap: int | None = None) -> int:
     """Completion-token clamp for a synth call, or 0 when legacy.
 
     Takes the tightest of the provider/global ``max_completion_tokens``
     and ``synthesize_max_completion_tokens`` — but only when the provider
     declares a ``context_window`` (finite-window local models). Cloud
     providers without a declared window keep their configured behaviour.
+
+    Args:
+        phase: Phase name for provider resolution.
+        phase_cap: Optional phase-specific clamp used INSTEAD of the
+            config's ``synthesize_max_completion_tokens`` — e.g. the
+            implement phase passes ``implement_max_completion_tokens``
+            so edit payloads get more headroom than spec/plan JSON.
     """
     cfg = SpineConfig.load()
     provider_cfg = cfg.resolve_provider_config(phase=phase)
@@ -82,7 +89,7 @@ def synthesis_completion_cap(phase: str) -> int:
         int(provider_cfg.get("max_completion_tokens") or 0),
         int(provider_cfg.get("max_tokens") or 0),
         cfg.max_completion_tokens,
-        cfg.synthesize_max_completion_tokens,
+        phase_cap if phase_cap and phase_cap > 0 else cfg.synthesize_max_completion_tokens,
     ]
     positive = [c for c in candidates if c > 0]
     return min(positive) if positive else 0

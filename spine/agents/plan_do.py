@@ -29,7 +29,9 @@ from pydantic import BaseModel, Field
 from spine.agents.helpers import (
     ainvoke_structured_with_retry,
     bind_structured_output,
+    cap_completion_tokens,
     resolve_chat_model,
+    suppress_reasoning,
 )
 from spine.agents.prompt_format import (
     Tag,
@@ -239,6 +241,24 @@ async def run_plan_node(
             exc_info=True,
         )
         return empty_directive("resolve_chat_model failed")
+
+    # Cap the completion + suppress the reasoning channel, mirroring
+    # run_supervisor_node: a SubagentDirective is a few hundred tokens, but
+    # uncapped this call inherits the provider max_completion_tokens and a
+    # thinking model can burn for minutes in reasoning before
+    # LengthFinishReasonError (trace 019eb502: plan_slice_implementer ran
+    # 450s solo, serializing the whole implement fan-out behind it).
+    try:
+        from spine.config import SpineConfig
+
+        cap = SpineConfig.load().plan_do_max_completion_tokens
+        model = suppress_reasoning(cap_completion_tokens(model, cap))
+    except Exception:
+        logger.debug(
+            "[%s] plan_do: token-cap copy failed — using uncapped model",
+            work_id,
+            exc_info=True,
+        )
 
     try:
         structured = bind_structured_output(model, SubagentDirective)
