@@ -559,6 +559,14 @@ def _research_router(
     phase = state.get("phase", "")
     capped_topics = new_topics[:_MAX_PARALLEL_EXPLORES]
     deferred = new_topics[_MAX_PARALLEL_EXPLORES:]
+    # Compact digest of what prior rounds (and seeded rework findings)
+    # already established. Round-2+ researchers used to start cold and
+    # re-map ground their predecessors covered (trace 019eb4c7) — the
+    # digest lets each branch's supervisor steer at the uncovered part.
+    # Empty on round 1, so first-round branches pay nothing.
+    from spine.agents.exploration_agents import render_covered_ground
+
+    covered_ground = render_covered_ground(state.get("findings", []) or [])
     sends = [
         Send(
             # Two-node researcher: explore_do (tools) → summarise (no tools).
@@ -577,6 +585,7 @@ def _research_router(
                 "work_id": state.get("work_id"),
                 "work_type": state.get("work_type", ""),
                 "workspace_root": state.get("workspace_root", "."),
+                "covered_ground": covered_ground,
             },
         )
         for t in capped_topics

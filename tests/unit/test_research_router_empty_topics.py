@@ -109,3 +109,70 @@ def test_router_sends_carry_work_id():
         assert send.arg["workspace_root"] == "/tmp/ws"
         assert send.arg["topic"]
         assert send.arg["phase"] == "specify"
+
+
+def test_router_sends_carry_covered_ground_digest():
+    """Round-2+ dispatches must ship a digest of prior findings so new
+    researchers don't re-establish ground siblings already mapped
+    (trace 019eb4c7: rounds 2-3 re-fetched the same hot symbols and
+    re-derived round 1's architecture facts)."""
+    from langgraph.types import Send
+
+    result = _research_router(
+        _state(
+            manager_decision="explore",
+            topics=["a fresh round-two topic"],
+            findings=[
+                {
+                    "topic": "how is provider config persisted",
+                    "summary": "UIApi mutates .spine/config.yaml via yaml.dump",
+                    "file_map": {"spine/ui_api/api.py": "UIApi"},
+                },
+            ],
+        )
+    )
+
+    assert isinstance(result, list) and result
+    digest = result[0].arg["covered_ground"]
+    assert "do NOT" in digest
+    assert "spine/ui_api/api.py" in digest
+    assert "UIApi mutates" in digest
+
+
+def test_router_round_one_sends_have_empty_covered_ground():
+    """No findings yet → no digest → round-1 branches pay zero extra tokens."""
+    result = _research_router(
+        _state(manager_decision="explore", topics=["topic a"], findings=[])
+    )
+    assert isinstance(result, list) and result
+    assert result[0].arg["covered_ground"] == ""
+
+
+class TestRenderCoveredGround:
+    def test_error_sentinels_are_skipped(self):
+        from spine.agents.exploration_agents import render_covered_ground
+
+        digest = render_covered_ground(
+            [{"topic": "t1", "summary": "failed", "error": True}]
+        )
+        assert digest == ""
+
+    def test_budget_cap_elides_overflow(self):
+        from spine.agents.exploration_agents import (
+            _COVERED_GROUND_BUDGET_CHARS,
+            render_covered_ground,
+        )
+
+        findings = [
+            {
+                "topic": f"topic number {i}",
+                "summary": "s" * 200,
+                "file_map": {f"spine/mod_{i}.py": "x"},
+            }
+            for i in range(30)
+        ]
+        digest = render_covered_ground(findings)
+        # Preamble + elision note sit outside the per-entry budget; the
+        # entries themselves must respect it.
+        assert len(digest) < _COVERED_GROUND_BUDGET_CHARS + 400
+        assert "elided for size" in digest

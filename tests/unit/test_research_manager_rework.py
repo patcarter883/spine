@@ -53,6 +53,40 @@ class TestCriticWantsMoreResearch:
         }
         assert _critic_wants_more_research(review) is True
 
+    def test_identifier_fragments_do_not_trigger_demand(self):
+        """Trace 019eb4c7: 'onboarding/explorer' and 'slice-explorer' in a
+        pure artifact fix-up verdict substring-matched 'explore' and re-ran
+        the entire exploration loop. Identifiers must not count as a
+        research demand."""
+        review = {
+            "status": "needs_revision",
+            "reason": (
+                "The plan has multiple significant omissions against the "
+                "specification requirements."
+            ),
+            "suggestions": [
+                "CRITICAL: spec requires classify, summarize, "
+                "onboarding/doc-manager, onboarding/section-worker, "
+                "onboarding/explorer. Plan lists classification, "
+                "summarisation, onboarding, slice-implementer, "
+                "slice-explorer which does not match.",
+                "CRITICAL: Missing phase_timeouts entirely — create a new "
+                "slice to cover all six phase timeout keys.",
+            ],
+        }
+        assert _critic_wants_more_research(review) is False
+
+    def test_inflected_research_verbs_still_trigger_demand(self):
+        review = {
+            "status": "needs_revision",
+            "reason": (
+                "The resolver behaviour should be explored further before "
+                "the slice can be written."
+            ),
+            "suggestions": [],
+        }
+        assert _critic_wants_more_research(review) is True
+
 
 def test_rework_with_findings_skips_exploration_on_format_critic(monkeypatch):
     """Trace 019e6974's PLAN attempt-2 scenario: prior research_log was

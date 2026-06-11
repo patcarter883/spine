@@ -422,3 +422,73 @@ async def test_loop_terminates_immediately_when_supervisor_seeds_complete(
     assert ev["supervisor_cycles"] == 0
     assert ev["tool_results_text"] == ""
     assert ev["recursion_capped"] is False
+
+
+@pytest.mark.asyncio
+async def test_covered_ground_digest_reaches_supervisor_goal(monkeypatch):
+    """A covered_ground digest in the Send payload must surface in the
+    supervisor's global_goal so it can steer workers away from ground
+    earlier researchers already mapped (trace 019eb4c7: round-2+ branches
+    started cold and re-fetched the same hot symbols)."""
+    _stub_subagent_spec(monkeypatch, bind_log=[])
+    _stub_context(monkeypatch)
+
+    seen_goals: list[str] = []
+
+    async def _fake_supervisor(**kw):
+        seen_goals.append(kw["global_goal"])
+        return SupervisorDirective(
+            analysis_and_reasoning="already covered",
+            is_complete=True,
+        )
+
+    monkeypatch.setattr(researcher_supervisor, "run_supervisor_node", _fake_supervisor)
+
+    await exploration_agents.run_explore_do_node(
+        {
+            "work_id": "w-cg",
+            "phase": "specify",
+            "workspace_root": "/tmp",
+            "covered_ground": (
+                "Ground already mapped by earlier researchers in this run:\n"
+                "- provider config persistence [files: spine/ui_api/api.py]"
+            ),
+        },
+        None,
+        topic="how are reranker providers configured?",
+    )
+
+    goal = seen_goals[0]
+    assert "<covered_ground>" in goal
+    assert "spine/ui_api/api.py" in goal
+    assert "how are reranker providers configured?" in goal
+
+
+@pytest.mark.asyncio
+async def test_no_covered_ground_keeps_bare_topic(monkeypatch):
+    """Without auxiliary blocks the supervisor still gets the compact bare
+    topic string — round-1 branches pay nothing for the digest plumbing."""
+    _stub_subagent_spec(monkeypatch, bind_log=[])
+    _stub_context(monkeypatch)
+
+    seen_goals: list[str] = []
+
+    async def _fake_supervisor(**kw):
+        seen_goals.append(kw["global_goal"])
+        return SupervisorDirective(
+            analysis_and_reasoning="fine",
+            is_complete=True,
+        )
+
+    monkeypatch.setattr(researcher_supervisor, "run_supervisor_node", _fake_supervisor)
+
+    await exploration_agents.run_explore_do_node(
+        {
+            "work_id": "w-bare",
+            "phase": "specify",
+            "workspace_root": "/tmp",
+        },
+        None,
+        topic="a bare round-one topic",
+    )
+    assert seen_goals[0] == "a bare round-one topic"

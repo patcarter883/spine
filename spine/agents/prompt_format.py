@@ -48,6 +48,9 @@ class Tag(str, Enum):
         LATEST_FINDING: most recent ``StructuredFinding`` (supervisor turn).
         HISTORY: running list of prior cycles / findings.
         TOPICS_ALREADY_EXPLORED: manager's prior-round roll-up.
+        COVERED_GROUND: compact digest of sibling/prior-round findings
+            handed to each explore branch so researchers build on already-
+            mapped ground instead of re-fetching it.
         CRITIC_FEEDBACK: last critic verdict + suggestions (rework path).
         SCRATCHPAD: working-memory accumulator.
         ERRORS: tool / system error dossier.
@@ -75,6 +78,7 @@ class Tag(str, Enum):
     LATEST_FINDING = "latest_finding"
     HISTORY = "history"
     TOPICS_ALREADY_EXPLORED = "topics_already_explored"
+    COVERED_GROUND = "covered_ground"
     CRITIC_FEEDBACK = "critic_feedback"
     SCRATCHPAD = "scratchpad"
     ERRORS = "errors"

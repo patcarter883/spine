@@ -956,6 +956,54 @@ async def test_sibling_workers_share_codebase_query_results():
 
 
 @pytest.mark.asyncio
+async def test_sibling_workers_share_content_block_results():
+    """MCP-backed tools return content-block LISTS, not strings — trace
+    019eb4c7: get_source(render) was fetched 9× because the memoise hook
+    only accepted str payloads, so the cache never populated. Block lists
+    must flatten to text and dedupe exactly like string results."""
+    tc = {
+        "name": "codebase_query",
+        "args": {"action": "get_source", "name": "render"},
+        "id": "tc-1",
+        "type": "tool_call",
+    }
+    blocks = [
+        {"id": "lc_abc123", "text": "def render(api: UIApi) -> None:"},
+        {"id": "lc_def456", "text": "    ..."},
+    ]
+    tool_a = _StubTool("codebase_query", blocks)
+    tool_b = _StubTool("codebase_query", "must never be fetched")
+
+    kind1, (_, msg1) = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"codebase_query": tool_a}, ToolClass.READ_SOURCE, work_id="w-blocks",
+    )
+    kind2, (_, msg2) = await rs._execute_worker_first_tool(
+        AIMessage(content="", tool_calls=[tc]),
+        {"codebase_query": tool_b}, ToolClass.READ_SOURCE, work_id="w-blocks",
+    )
+
+    assert kind1 == kind2 == "ok"
+    assert tool_a.calls == [tc["args"]]
+    assert tool_b.calls == [], "second sibling must hit the cache, not the tool"
+    assert "def render(api: UIApi) -> None:" in msg1.content
+    assert "ALREADY FETCHED" in msg2.content
+    assert "def render(api: UIApi) -> None:" in msg2.content
+
+
+def test_coerce_payload_text_shapes():
+    assert rs._coerce_payload_text("plain") == "plain"
+    assert rs._coerce_payload_text(
+        [{"id": "1", "text": "a"}, {"id": "2", "text": "b"}]
+    ) == "a\nb"
+    # Non-text block anywhere → unsafe to flatten → not memoised.
+    assert rs._coerce_payload_text([{"id": "1", "text": "a"}, {"data": b"x"}]) is None
+    assert rs._coerce_payload_text([]) is None
+    assert rs._coerce_payload_text({"text": "a"}) is None
+    assert rs._coerce_payload_text(None) is None
+
+
+@pytest.mark.asyncio
 async def test_worker_dedupe_covers_exploration_extra_tools():
     """ast_extract_symbol / search_codebase are deterministic during
     exploration — the worker path dedupes them across siblings too."""
