@@ -226,3 +226,45 @@ def test_rework_skipped_when_critic_demands_more_research(monkeypatch):
     except RuntimeError:
         pass
     assert sentinel["called"] is True
+
+
+def test_research_manager_caps_completion_tokens(monkeypatch):
+    """The manager's structured call must clamp the completion budget —
+    uncapped, the empty-parse retry nudge sent a thinking model into a
+    300s+ reasoning burn solo on the engine (trace 019eb541)."""
+    import spine.agents.exploration_agents as ea
+    from spine.agents.exploration_agents import ResearchManagerDecision
+    from spine.config import SpineConfig
+
+    seen: dict = {}
+
+    def _fake_cap(model, cap):
+        seen["cap"] = cap
+        return model
+
+    monkeypatch.setattr(ea, "resolve_chat_model", lambda *a, **kw: object())
+    monkeypatch.setattr(ea, "cap_completion_tokens", _fake_cap)
+    monkeypatch.setattr(ea, "suppress_reasoning", lambda m: m)
+    monkeypatch.setattr(ea, "bind_structured_output", lambda m, s: m)
+
+    async def _fake_structured_invoke(model, messages, **kw):
+        return ResearchManagerDecision(decision="done", topics=[])
+
+    monkeypatch.setattr(ea, "ainvoke_structured_with_retry", _fake_structured_invoke)
+
+    state = {
+        "phase": "plan",
+        "work_id": "wk-cap",
+        "description": "Add a flag",
+        "topics": [],
+        "findings": [],
+        "research_round": 0,
+        "max_rounds": 3,
+        "retry_count": 0,
+        "workspace_root": "/tmp",
+    }
+    result = asyncio.run(run_research_manager(state, None))
+
+    assert result["manager_decision"] == "done"
+    assert seen["cap"] == SpineConfig.load().research_manager_max_completion_tokens
+    assert seen["cap"] > 0

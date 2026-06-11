@@ -279,6 +279,13 @@ class SpineConfig:
     # (run 019e867a, ~9.5min). A tight cap fails fast and the loop proceeds to
     # synthesis from accumulated evidence. Mirrors summarise_max_completion_tokens.
     researcher_supervisor_max_completion_tokens: int = 1024
+    # Completion-token cap for the research manager's ResearchManagerDecision
+    # structured call. The decision is tiny (explore/done + 2-4 topic
+    # strings); uncapped, the empty-parse retry ("Your previous response was
+    # empty. Respond with ONLY the JSON…") sent a thinking model into a
+    # multi-minute reasoning burn toward the provider's full completion
+    # budget (trace 019eb541, observed live at 300s+ solo on the engine).
+    research_manager_max_completion_tokens: int = 2048
     # Completion-token cap for the no-tool plan_do (run_plan_node)
     # SubagentDirective calls (e.g. plan_slice_implementer). A directive is
     # a few hundred tokens; without a cap the call inherits the provider's

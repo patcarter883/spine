@@ -477,6 +477,23 @@ async def run_research_manager(
 
     model = resolve_chat_model(config, session_id=work_id, phase="exploration/manager")
 
+    # Cap the completion + suppress the reasoning channel, mirroring
+    # run_supervisor_node / run_plan_node: a ResearchManagerDecision is a
+    # handful of topic strings, but uncapped this call inherits the
+    # provider's full completion budget — and the empty-parse retry nudge
+    # sent a thinking model into a 300s+ reasoning burn (trace 019eb541).
+    try:
+        from spine.config import SpineConfig as _Cfg
+
+        _cap = _Cfg.load().research_manager_max_completion_tokens
+        model = suppress_reasoning(cap_completion_tokens(model, _cap))
+    except Exception:
+        logger.debug(
+            "[%s] research_manager: token-cap copy failed — using uncapped model",
+            work_id,
+            exc_info=True,
+        )
+
     # ── Recall context from state ────────────────────────────────────
     # The pre_research_gate (exploration_subgraph._pre_research_gate)
     # already classified the task and pulled recall hits before the loop
