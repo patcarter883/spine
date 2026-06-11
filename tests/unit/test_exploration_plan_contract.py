@@ -207,12 +207,13 @@ def test_plan_synthesizer_forces_write_structured_plan(tmp_path, monkeypatch):
 def test_forcing_releases_on_real_write_structured_plan_output(tmp_path):
     """The middleware must release after a real successful write (trace 019eb43f).
 
-    The release check matches success_marker ("written to") against the tool's
-    return string. The plan tool's old message ("Plan artifacts written: …")
-    lacked the marker, so forcing never released: the synthesizer was compelled
-    to call write_structured_plan every turn (24×) until the context window
-    overflowed. Run the REAL tool and feed its REAL output through the
-    middleware so message drift can't silently re-open the loop.
+    The old release check matched a success substring ("written to") against
+    the tool's return string; the plan tool's message lacked it, so forcing
+    never released and the synthesizer was compelled to call
+    write_structured_plan every turn (24×) until the context window
+    overflowed. The check now matches failure prefixes instead, but keep
+    running the REAL tool and feeding its REAL output through the middleware
+    so message drift can't silently re-open the loop.
     """
     from langchain_core.messages import AIMessage, ToolMessage
 
@@ -250,5 +251,21 @@ def test_forcing_releases_on_real_write_structured_plan_output(tmp_path):
     ]
     assert mw._final_tool_succeeded(messages), (
         "middleware did not release on the plan tool's success message — "
-        f"success_marker {mw.success_marker!r} missing from: {output!r}"
+        f"output looked like a failure to it: {output!r}"
     )
+
+    # A rejected write must KEEP forcing so the model self-corrects in-loop.
+    for failure in (
+        "VALIDATION_ERROR: plan rejected before writing.\nduplicate slice id",
+        "ERROR: Could not write plan.json: disk full",
+    ):
+        failed = [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "write_structured_plan", "args": {}, "id": "tc2"}],
+            ),
+            ToolMessage(content=failure, tool_call_id="tc2"),
+        ]
+        assert not mw._final_tool_succeeded(failed), (
+            f"middleware released on a failed write: {failure!r}"
+        )
