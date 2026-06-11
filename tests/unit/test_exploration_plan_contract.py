@@ -202,6 +202,43 @@ def test_plan_synthesizer_forces_write_structured_plan(tmp_path, monkeypatch):
         if isinstance(m, ForceToolUntilCalledMiddleware)
     ]
     assert forcing, "plan synthesizer is missing ForceToolUntilCalledMiddleware"
+    # Single-tool surface (trace 019eb52c): read_prior_artifacts always
+    # returned empty on this path while the prompt promised it loaded the
+    # spec — the forced-tool loop re-called it 23×. With only the write
+    # tool bound, tool_choice="any" IS a pin on every provider.
+    assert forcing[0].gate_tool is None
+    tool_names = [getattr(t, "name", "?") for t in (captured.get("extra_tools") or [])]
+    assert tool_names == ["write_structured_plan"], (
+        f"plan synthesizer surface must be exactly the write tool, got {tool_names}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthesize_plan_inlines_spec_into_prompt(
+    tmp_path, _stub_synth, monkeypatch
+):
+    """The spec is prompt content now, not a tool fetch (trace 019eb52c)."""
+    spec_dir = tmp_path / ".spine" / "artifacts" / "wk-explan" / "specify"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "specification.md").write_text(
+        "# Spec\nREQUIREMENT-MARKER-42: the flag must default to false.\n",
+        encoding="utf-8",
+    )
+    captured: list[dict[str, Any]] = []
+
+    async def _fake_invoke(agent, payload, **kw):
+        captured.append(payload)
+        _write_valid_plan(tmp_path)
+        return {"messages": payload["messages"] + [{"role": "assistant", "content": ""}]}
+
+    monkeypatch.setattr(es, "ainvoke_with_retry", _fake_invoke)
+
+    await es._synthesize_plan(_state(tmp_path), None)
+
+    prompt = captured[0]["messages"][0]["content"]
+    assert "<specification>" in prompt
+    assert "REQUIREMENT-MARKER-42" in prompt
+    assert "read_prior_artifacts" not in prompt
 
 
 def test_forcing_releases_on_real_write_structured_plan_output(tmp_path):
@@ -238,10 +275,7 @@ def test_forcing_releases_on_real_write_structured_plan_output(tmp_path):
     )
     assert "VALIDATION_ERROR" not in output and "ERROR" not in output
 
-    mw = ForceToolUntilCalledMiddleware(
-        final_tool="write_structured_plan",
-        gate_tool="read_prior_artifacts",
-    )
+    mw = ForceToolUntilCalledMiddleware(final_tool="write_structured_plan")
     messages = [
         AIMessage(
             content="",

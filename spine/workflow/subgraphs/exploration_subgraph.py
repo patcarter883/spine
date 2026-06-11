@@ -69,6 +69,11 @@ _MAX_PARALLEL_EXPLORES = 4
 # Sentinel budget for measuring an evidence block's full rendered size
 # before allocation (effectively "no cap").
 _UNBOUNDED_BUDGET = 10**9
+# Cap on the specification.md content inlined into the PLAN synthesizer
+# prompt (trace 019eb52c). Generous — the spec is the planning contract
+# and a truncated spec produces plans the critic rejects for missed
+# requirements — but bounded so a runaway spec can't eat the window.
+_MAX_SPEC_CHARS = 24_000
 
 
 # ── Node: pre_research_gate ─────────────────────────────────────────────
@@ -770,19 +775,42 @@ async def _synthesize_plan(
         )
         instruction = (
             f"{rework_lead}Create a detailed technical plan with "
-            "structured feature slices, incorporating the research "
-            "findings above. Call `read_prior_artifacts` to load the "
-            "specification and prior context in one call. Then "
-            "synthesize the spec + findings into structured "
+            "structured feature slices. The specification and research "
+            "findings are in the blocks above — everything you need is "
+            "already in this prompt; there is nothing to read or load "
+            "first. Synthesize the spec + findings into structured "
             "feature_slices and call `write_structured_plan` exactly "
             "once — the tool writes both plan.md and plan.json for you. "
             "Do not call write_file."
         )
 
+        # ── Inline the specification (trace 019eb52c) ────────────────────
+        # The synthesizer used to be told to fetch the spec via
+        # read_prior_artifacts, but on this path state["artifacts"] is never
+        # populated, so the tool always answered "No prior artifacts found"
+        # — and the forced-tool loop re-called it 23× chasing the spec the
+        # prompt promised. Read specification.md from disk and put it IN the
+        # prompt instead; the synthesizer now has zero read tools.
+        spec_body = ""
+        spec_dir = state.get("spec_path") or f".spine/artifacts/{work_id}/specify"
+        spec_file = Path(workspace_root) / spec_dir / "specification.md"
+        if spec_file.exists():
+            try:
+                spec_body = spec_file.read_text(encoding="utf-8")[:_MAX_SPEC_CHARS]
+            except OSError as exc:
+                logger.warning("[%s] Could not read spec for plan synth: %s", work_id, exc)
+        if not spec_body:
+            logger.warning(
+                "[%s] PLAN synthesize: no specification.md found at %s — "
+                "synthesizing from description + findings only",
+                work_id, spec_file,
+            )
+
         # ── Window-aware evidence budgeting (trace 019eb3dd) ────────────
         # Same ledger as _synthesize_specify, minus the recall block (PLAN
-        # has no recall-gate short-circuit). The tool-payload reserve covers
-        # read_prior_artifacts returning the full specification on turn 2.
+        # has no recall-gate short-circuit). No tool-payload reserve: the
+        # synthesizer has no read tools, so turn 1 is the whole request —
+        # the spec is measured as fixed prompt content instead.
         from deepagents.graph import BASE_AGENT_PROMPT as _BASE_PROMPT
         from spine.agents.artifacts import build_artifact_prompt as _artifact_prompt
         from spine.agents.plan_agent import _build_plan_synthesizer_prompt
@@ -794,18 +822,12 @@ async def _synthesize_plan(
             )
             + _BASE_PROMPT
         )
-        reserve = _estimate_tool_payload_reserve(
-            workspace_root=workspace_root,
-            artifact_dirs=[f".spine/artifacts/{work_id}/specify"],
-            description=description,
-            feedback=[str(f) for f in feedback] if feedback else [],
-        )
         synth_budget = _resolve_synthesis_budget(
             PhaseName.PLAN.value,
             fixed_texts=[
-                system_estimate, description, feedback_body, scratchpad, instruction,
+                system_estimate, description, spec_body, feedback_body,
+                scratchpad, instruction,
             ],
-            tool_payload_reserve=reserve,
         )
 
         findings_full = _format_findings(findings)
@@ -829,6 +851,7 @@ async def _synthesize_plan(
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
+                (Tag.SPECIFICATION, spec_body),
                 (Tag.FINDINGS, findings_text),
                 (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
