@@ -341,6 +341,19 @@ def make_subgraph_node(
                         result = await raw_coro
                 except CriticalContractFailure as cf:
                     if attempt + 1 < max_attempts:
+                        # Seed whatever the failed attempt salvaged (e.g.
+                        # exploration findings that preceded a failed
+                        # synthesis) so the fresh thread retries only the
+                        # broken step instead of redoing completed work
+                        # (trace 019eb940).
+                        carry = getattr(cf, "carryover", None) or {}
+                        if carry:
+                            subgraph_input = {**subgraph_input, **carry}
+                            logger.info(
+                                f"[{work_id}] [{phase_name}] carrying "
+                                f"{len(carry.get('findings') or [])} findings "
+                                f"into the structural retry"
+                            )
                         logger.warning(
                             f"[{work_id}] [{phase_name}] structural contract failure "
                             f"({cf.reason}) — auto-retrying on a clean thread "

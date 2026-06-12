@@ -55,11 +55,24 @@ class CriticalContractFailure(SpineError):
     Raised when a required artifact is missing, a phase flag is incorrect,
     or any other critical workflow contract is broken. This signals that
     the workflow cannot progress safely without human intervention.
+
+    ``carryover`` optionally holds subgraph state worth seeding into the
+    wrapper's fresh-thread structural retry — e.g. exploration findings
+    that preceded a failed synthesis, so the retry re-runs only the
+    synthesis instead of repeating the whole research loop (trace
+    019eb940: a plan-synthesis contract failure re-ran ~15 minutes of
+    exploration whose findings were intact).
     """
 
-    def __init__(self, phase: str, reason: str) -> None:
+    def __init__(
+        self,
+        phase: str,
+        reason: str,
+        carryover: dict | None = None,
+    ) -> None:
         self.phase = phase
         self.reason = reason
+        self.carryover = carryover or {}
         super().__init__(f"Critical contract failure in '{phase}': {reason}")
 
 

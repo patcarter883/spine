@@ -247,3 +247,73 @@ class TestErrorUpdate:
         assert result["needs_review_phase"] == "tasks"
         assert result["phase_results"]["tasks"]["status"] == "needs_review"
         assert "check logs" in result["feedback"][0]["suggestions"]
+
+
+class TestStructuralRetryCarryover:
+    """Contract-failure retries must reuse what the failed attempt salvaged
+    (trace 019eb940: the plan retry re-ran ~15 min of exploration whose
+    findings were intact)."""
+
+    @pytest.mark.asyncio
+    async def test_carryover_seeds_retry_input(self):
+        from spine.exceptions import CriticalContractFailure
+        from spine.workflow.subgraph_wrapper import make_subgraph_node
+
+        findings = [{"topic": "t", "summary": "s"}]
+        inputs: list[dict] = []
+
+        class _Subgraph:
+            calls = 0
+
+            async def ainvoke(self, subgraph_input, config):
+                inputs.append(dict(subgraph_input))
+                _Subgraph.calls += 1
+                if _Subgraph.calls == 1:
+                    raise CriticalContractFailure(
+                        phase="plan",
+                        reason="plan.json missing",
+                        carryover={
+                            "findings": findings,
+                            "findings_carried_over": True,
+                            "synthesis_cap_escalated": True,
+                        },
+                    )
+                return {"phase_status": "success", "artifacts_output": {}}
+
+        node_fn = make_subgraph_node(
+            _Subgraph(), "plan", lambda p, c: {"phase": "plan"}, lambda r, p: {"ok": True}
+        )
+
+        result = await node_fn({"work_id": "wk1", "status": "running"}, None)
+
+        assert result == {"ok": True}
+        assert len(inputs) == 2
+        assert "findings" not in inputs[0]
+        assert inputs[1]["findings"] == findings
+        assert inputs[1]["findings_carried_over"] is True
+        assert inputs[1]["synthesis_cap_escalated"] is True
+
+    @pytest.mark.asyncio
+    async def test_no_carryover_keeps_original_input(self):
+        from spine.exceptions import CriticalContractFailure
+        from spine.workflow.subgraph_wrapper import make_subgraph_node
+
+        inputs: list[dict] = []
+
+        class _Subgraph:
+            calls = 0
+
+            async def ainvoke(self, subgraph_input, config):
+                inputs.append(dict(subgraph_input))
+                _Subgraph.calls += 1
+                if _Subgraph.calls == 1:
+                    raise CriticalContractFailure(phase="plan", reason="nope")
+                return {"phase_status": "success", "artifacts_output": {}}
+
+        node_fn = make_subgraph_node(
+            _Subgraph(), "plan", lambda p, c: {"phase": "plan"}, lambda r, p: {"ok": True}
+        )
+
+        await node_fn({"work_id": "wk1", "status": "running"}, None)
+
+        assert inputs[0] == inputs[1]

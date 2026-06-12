@@ -68,7 +68,9 @@ def _write_valid_plan(tmp_path) -> None:
 def _stub_synth(monkeypatch):
     import spine.agents.plan_agent as plan_agent
 
-    monkeypatch.setattr(plan_agent, "build_plan_synthesizer", lambda state, config: object())
+    monkeypatch.setattr(
+        plan_agent, "build_plan_synthesizer", lambda state, config, **kw: object()
+    )
     monkeypatch.setattr(es, "materialize_artifacts", lambda *a, **kw: None)
     monkeypatch.setattr(es, "build_context", lambda *a, **kw: None)
 
@@ -303,3 +305,156 @@ def test_forcing_releases_on_real_write_structured_plan_output(tmp_path):
         assert not mw._final_tool_succeeded(failed), (
             f"middleware released on a failed write: {failure!r}"
         )
+
+
+# ── Length-aware corrective retry + structural-retry carryover (019eb940) ──
+
+
+def _fixed_budget(monkeypatch, completion_cap: int = 8000):
+    """Pin the synthesis budget so tests don't depend on the repo config."""
+    from spine.agents.synthesis_budget import SynthesisBudget
+
+    budget = SynthesisBudget(
+        window=60000, completion_cap=completion_cap,
+        input_budget=20000, legacy=False,
+    )
+    monkeypatch.setattr(es, "_resolve_synthesis_budget", lambda *a, **kw: budget)
+    return budget
+
+
+def _truncated_ai_message():
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(content="", response_metadata={"finish_reason": "length"})
+
+
+@pytest.mark.asyncio
+async def test_truncated_attempt_escalates_cap_and_restarts_prompt(
+    tmp_path, monkeypatch
+):
+    """A completion-cap truncation must not be retried verbatim (trace
+    019eb940: three identical calls each burned exactly the 8K cap). The
+    corrective retry rebuilds the synthesizer at the escalated cap and
+    restarts from the original prompt with a compactness nudge."""
+    import spine.agents.plan_agent as plan_agent
+
+    build_overrides: list[Any] = []
+
+    def _fake_build(state, config, **kw):
+        build_overrides.append(kw.get("completion_cap_override"))
+        return object()
+
+    monkeypatch.setattr(plan_agent, "build_plan_synthesizer", _fake_build)
+    monkeypatch.setattr(es, "materialize_artifacts", lambda *a, **kw: None)
+    monkeypatch.setattr(es, "build_context", lambda *a, **kw: None)
+    _fixed_budget(monkeypatch)
+    monkeypatch.setattr(
+        es, "_escalated_completion_cap", lambda budget, *, prompt_tokens: 16000
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_invoke(agent, payload, **kw):
+        calls.append(payload)
+        if len(calls) == 1:
+            return {"messages": payload["messages"] + [_truncated_ai_message()]}
+        _write_valid_plan(tmp_path)
+        return {"messages": payload["messages"] + [{"role": "assistant", "content": ""}]}
+
+    monkeypatch.setattr(es, "ainvoke_with_retry", _fake_invoke)
+
+    result = await es._synthesize_plan(_state(tmp_path), None)
+
+    assert result.get("plan_json")
+    assert len(calls) == 2
+    # The retry rebuilt the synthesizer at the escalated cap.
+    assert 16000 in build_overrides
+    # The truncated turn is dropped: retry restarts from prompt + nudge.
+    assert len(calls[1]["messages"]) == 2
+    nudge = calls[1]["messages"][-1]["content"]
+    assert "write_structured_plan" in nudge
+    assert "COMPACT" in nudge
+
+
+@pytest.mark.asyncio
+async def test_contract_failure_carries_findings_and_escalation_flag(
+    tmp_path, _stub_synth, monkeypatch
+):
+    """When synthesis fails for good, the contract failure must carry the
+    intact exploration findings (plus the cap-escalation flag on a
+    truncation) so the wrapper's fresh-thread retry skips the research
+    loop instead of redoing it (trace 019eb940)."""
+    _fixed_budget(monkeypatch)
+    monkeypatch.setattr(
+        es, "_escalated_completion_cap", lambda budget, *, prompt_tokens: 16000
+    )
+
+    async def _fake_invoke(agent, payload, **kw):
+        return {"messages": payload["messages"] + [_truncated_ai_message()]}
+
+    monkeypatch.setattr(es, "ainvoke_with_retry", _fake_invoke)
+
+    state = _state(tmp_path)
+    with pytest.raises(CriticalContractFailure) as exc_info:
+        await es._synthesize_plan(state, None)
+
+    carry = exc_info.value.carryover
+    assert carry["findings"] == state["findings"]
+    assert carry["findings_carried_over"] is True
+    assert carry["synthesis_cap_escalated"] is True
+
+
+@pytest.mark.asyncio
+async def test_carried_findings_route_straight_to_synthesize():
+    """The gate router must skip the research loop when a structural retry
+    seeded findings from the failed attempt — for PLAN too, which never
+    takes the recall-gate short-circuit."""
+    carried = {
+        "phase": "plan",
+        "findings_carried_over": True,
+        "findings": [{"topic": "t", "summary": "s"}],
+    }
+    assert es._gate_router(carried) == "skip_to_synth"
+    # Without the flag, PLAN always explores.
+    assert es._gate_router({"phase": "plan", "findings": []}) == "explore"
+
+    # And the gate node itself skips classify/recall entirely.
+    result = await es._pre_research_gate(carried, None)
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_carried_escalation_flag_starts_synthesizer_at_raised_cap(
+    tmp_path, monkeypatch
+):
+    """On the structural retry, synthesis_cap_escalated (carried from the
+    truncated attempt) must rebuild the synthesizer at the raised cap
+    BEFORE the first invocation — re-rolling at the base cap would
+    truncate identically."""
+    import spine.agents.plan_agent as plan_agent
+
+    build_overrides: list[Any] = []
+
+    def _fake_build(state, config, **kw):
+        build_overrides.append(kw.get("completion_cap_override"))
+        return object()
+
+    monkeypatch.setattr(plan_agent, "build_plan_synthesizer", _fake_build)
+    monkeypatch.setattr(es, "materialize_artifacts", lambda *a, **kw: None)
+    monkeypatch.setattr(es, "build_context", lambda *a, **kw: None)
+    _fixed_budget(monkeypatch)
+    monkeypatch.setattr(
+        es, "_escalated_completion_cap", lambda budget, *, prompt_tokens: 16000
+    )
+
+    async def _fake_invoke(agent, payload, **kw):
+        _write_valid_plan(tmp_path)
+        return {"messages": payload["messages"] + [{"role": "assistant", "content": ""}]}
+
+    monkeypatch.setattr(es, "ainvoke_with_retry", _fake_invoke)
+
+    state = {**_state(tmp_path), "synthesis_cap_escalated": True}
+    result = await es._synthesize_plan(state, None)
+
+    assert result.get("plan_json")
+    assert build_overrides[-1] == 16000

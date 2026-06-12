@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 
 from spine.agents._tokens import count_tokens
 from spine.agents.evidence_compression import (
@@ -21,6 +20,7 @@ from spine.agents.synthesis_budget import (
     MIN_INPUT_BUDGET,
     SynthesisBudget,
     allocate_evidence,
+    escalated_completion_cap,
     estimate_tool_payload_reserve,
     resolve_synthesis_budget,
     synthesis_completion_cap,
@@ -275,3 +275,42 @@ def test_findings_kill_switch(monkeypatch):
     )
     assert out == findings
     assert model.calls == 0
+
+
+# ── escalated_completion_cap (length-truncated synth retry, 019eb940) ────
+
+
+def test_escalation_doubles_within_window_room(monkeypatch):
+    _config_with_provider(monkeypatch, WINDOWED)
+    budget = SynthesisBudget(
+        window=60000, completion_cap=8000, input_budget=20000, legacy=False
+    )
+    # room = 60000 - 5000 - overhead(4000) = 51000 → min(16000, 51000)
+    assert escalated_completion_cap(budget, prompt_tokens=5000) == 16000
+
+
+def test_escalation_bounded_by_window_room(monkeypatch):
+    _config_with_provider(monkeypatch, WINDOWED)
+    budget = SynthesisBudget(
+        window=60000, completion_cap=8000, input_budget=20000, legacy=False
+    )
+    # room = 60000 - 46000 - 4000 = 10000 < 16000 → clamp to room
+    assert escalated_completion_cap(budget, prompt_tokens=46000) == 10000
+
+
+def test_escalation_zero_when_no_headroom(monkeypatch):
+    _config_with_provider(monkeypatch, WINDOWED)
+    budget = SynthesisBudget(
+        window=60000, completion_cap=8000, input_budget=20000, legacy=False
+    )
+    # room = 60000 - 50000 - 4000 = 6000 <= cap → escalation impossible
+    assert escalated_completion_cap(budget, prompt_tokens=50000) == 0
+
+
+def test_escalation_zero_for_legacy_and_uncapped():
+    legacy = SynthesisBudget(window=0, completion_cap=0, input_budget=50000, legacy=True)
+    assert escalated_completion_cap(legacy, prompt_tokens=1000) == 0
+    uncapped = SynthesisBudget(
+        window=60000, completion_cap=0, input_budget=20000, legacy=False
+    )
+    assert escalated_completion_cap(uncapped, prompt_tokens=1000) == 0

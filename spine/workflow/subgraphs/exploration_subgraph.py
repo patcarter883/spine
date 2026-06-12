@@ -37,6 +37,7 @@ from spine.agents.exploration_agents import format_findings as _format_findings
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.synthesis_budget import (
     allocate_evidence as _allocate_evidence,
+    escalated_completion_cap as _escalated_completion_cap,
     estimate_tool_payload_reserve as _estimate_tool_payload_reserve,
     resolve_synthesis_budget as _resolve_synthesis_budget,
 )
@@ -100,6 +101,17 @@ async def _pre_research_gate(
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
     phase = state.get("phase", "")
+
+    # Structural-retry fast path: a failed synthesis attempt carried its
+    # findings into this fresh thread (trace 019eb940) — the router will
+    # skip straight to synthesize, so classify/recall would be wasted calls.
+    if state.get("findings_carried_over") and state.get("findings"):
+        logger.info(
+            "[%s] pre_research_gate: %d findings carried over from a failed "
+            "synthesis attempt — skipping classify/recall",
+            work_id, len(state.get("findings") or []),
+        )
+        return {}
 
     if not description:
         logger.info("[%s] pre_research_gate: no description — fall through", work_id)
@@ -179,6 +191,18 @@ def _gate_router(
     + critic feedback) would just repeat the work.
     """
     from spine.config import SpineConfig
+
+    # Structural-retry fast path (both phases, unlike the recall gate
+    # below): a failed synthesis attempt carried its findings into this
+    # fresh thread — exploration already succeeded once, so re-running it
+    # would just repeat the research (trace 019eb940: the plan retry
+    # redid ~15 minutes of exploration whose findings were intact).
+    if state.get("findings_carried_over") and state.get("findings"):
+        logger.info(
+            "Carried findings present (%d) — routing straight to synthesize",
+            len(state.get("findings") or []),
+        )
+        return "skip_to_synth"
 
     phase = state.get("phase", "")
     if phase != PhaseName.SPECIFY.value:
@@ -728,6 +752,36 @@ def _sufficiency_router(
     return "loop"
 
 
+def _hit_length_cap(
+    messages: list[Any],
+    invoke_exc: Exception | None,
+    completion_cap: int,
+) -> bool:
+    """True when the synthesis turn was cut off at the completion-token cap.
+
+    Two surfaces (trace 019eb940): structured-output parsing raises
+    ``LengthFinishReasonError``, while a forced tool call truncates
+    silently — the final AIMessage carries ``finish_reason="length"`` (or
+    an output spend at/above the cap) and no parseable tool call.
+    """
+    if invoke_exc is not None:
+        if type(invoke_exc).__name__ == "LengthFinishReasonError":
+            return True
+        if "length limit" in str(invoke_exc):
+            return True
+    for msg in reversed(messages or []):
+        if not isinstance(msg, AIMessage):
+            continue
+        meta = getattr(msg, "response_metadata", None) or {}
+        if meta.get("finish_reason") == "length" or meta.get("stop_reason") == "max_tokens":
+            return True
+        usage = getattr(msg, "usage_metadata", None) or {}
+        out = int(usage.get("output_tokens") or 0)
+        # Only the last AI turn matters — earlier turns completed.
+        return bool(completion_cap > 0 and out >= completion_cap)
+    return False
+
+
 # ── Node: synthesize (PLAN) ─────────────────────────────────────────────
 
 
@@ -860,10 +914,30 @@ async def _synthesize_plan(
         )
 
         ctx = build_context(dict(state), PhaseName.PLAN)
+
+        prompt_tokens = _count_tokens(prompt) + _count_tokens(system_estimate)
+        # A prior structural attempt already truncated at the base completion
+        # cap (flag carried over by subgraph_wrapper) — start escalated
+        # instead of burning a call to rediscover the truncation.
+        if state.get("synthesis_cap_escalated"):
+            carried_cap = _escalated_completion_cap(
+                synth_budget, prompt_tokens=prompt_tokens
+            )
+            if carried_cap:
+                logger.info(
+                    "[%s] PLAN synthesizer starting at escalated completion "
+                    "cap %d (prior attempt truncated at %d)",
+                    work_id, carried_cap, synth_budget.completion_cap,
+                )
+                agent = build_plan_synthesizer(
+                    dict(state), config, completion_cap_override=carried_cap
+                )
+
         # The first invocation may raise instead of returning (trace
         # 019eb412: LengthFinishReasonError after the model burned all
         # 8K completion tokens in the reasoning channel with no tool
         # call). Don't fail yet — fall through to the corrective retry.
+        invoke_error: Exception | None = None
         try:
             result = await ainvoke_with_retry(
                 agent,
@@ -879,6 +953,7 @@ async def _synthesize_plan(
                 "proceeding to corrective retry",
                 work_id, invoke_exc,
             )
+            invoke_error = invoke_exc
             result = {"messages": []}
 
         # ── Read plan.json from disk (written by write_structured_plan) ──
@@ -891,36 +966,105 @@ async def _synthesize_plan(
         # only on the non-exploration path, so trace 019eb412 sailed past a
         # failed synthesis to human_review reporting plan "success" with
         # zero artifacts.
+        truncated = False
         if not plan_json_path.exists():
-            logger.warning(
-                "[%s] PLAN synthesizer finished without writing plan.json — "
-                "issuing one corrective retry",
-                work_id,
+            truncated = _hit_length_cap(
+                result.get("messages") or [],
+                invoke_error,
+                synth_budget.completion_cap,
             )
-            nudge = (
-                "Your previous turn produced no plan: plan.json was not "
-                "written. Do not deliberate further. Call "
-                "`write_structured_plan` exactly once, NOW, with the "
-                "structured fields (architecture_overview, "
-                "technology_choices, feature_slices, testing_strategy, "
-                "risks, codebase_map)."
-            )
-            prior_messages = list(result.get("messages") or [])
-            if not prior_messages:
-                # First invocation raised before producing a conversation —
-                # restart from the original prompt so the retry has context.
+            if truncated:
+                # An identical retry would truncate identically (trace
+                # 019eb940: three calls each burned exactly the 8K cap and
+                # produced no parseable tool call). Raise the cap when the
+                # window allows, and restart from the original prompt — the
+                # truncated turn is unparseable garbage not worth carrying.
+                raised_cap = _escalated_completion_cap(
+                    synth_budget, prompt_tokens=prompt_tokens
+                )
+                logger.warning(
+                    "[%s] PLAN synthesizer truncated at the %d-token "
+                    "completion cap — corrective retry %s",
+                    work_id,
+                    synth_budget.completion_cap,
+                    f"with cap raised to {raised_cap}" if raised_cap
+                    else "(no window headroom to raise the cap)",
+                )
+                if raised_cap:
+                    agent = build_plan_synthesizer(
+                        dict(state), config, completion_cap_override=raised_cap
+                    )
+                nudge = (
+                    "Your previous attempt was cut off at the "
+                    "completion-token limit before the plan could be "
+                    "parsed. Call `write_structured_plan` exactly once, "
+                    "NOW, and keep it COMPACT: fewer, coarser "
+                    "feature_slices with terse descriptions — do not "
+                    "restate the spec or findings."
+                )
                 prior_messages = [{"role": "user", "content": prompt}]
-            result = await ainvoke_with_retry(
-                agent,
-                {"messages": prior_messages + [{"role": "user", "content": nudge}]},
-                phase_name=PhaseName.PLAN.value,
-                work_id=work_id,
-                work_type=work_type,
-                context=ctx,
-            )
+            else:
+                logger.warning(
+                    "[%s] PLAN synthesizer finished without writing plan.json — "
+                    "issuing one corrective retry",
+                    work_id,
+                )
+                nudge = (
+                    "Your previous turn produced no plan: plan.json was not "
+                    "written. Do not deliberate further. Call "
+                    "`write_structured_plan` exactly once, NOW, with the "
+                    "structured fields (architecture_overview, "
+                    "technology_choices, feature_slices, testing_strategy, "
+                    "risks, codebase_map)."
+                )
+                prior_messages = list(result.get("messages") or [])
+                if not prior_messages:
+                    # First invocation raised before producing a conversation —
+                    # restart from the original prompt so the retry has context.
+                    prior_messages = [{"role": "user", "content": prompt}]
+            try:
+                result = await ainvoke_with_retry(
+                    agent,
+                    {"messages": prior_messages + [{"role": "user", "content": nudge}]},
+                    phase_name=PhaseName.PLAN.value,
+                    work_id=work_id,
+                    work_type=work_type,
+                    context=ctx,
+                )
+            except Exception as retry_exc:
+                logger.warning(
+                    "[%s] Corrective retry invocation failed (%s) — "
+                    "checking disk for plan.json before failing the contract",
+                    work_id, retry_exc,
+                )
+                truncated = truncated or _hit_length_cap([], retry_exc, 0)
+                result = {"messages": []}
+            else:
+                truncated = truncated or _hit_length_cap(
+                    result.get("messages") or [],
+                    None,
+                    synth_budget.completion_cap,
+                )
 
         plan_json_str: str | None = None
         execution_waves: list[list[dict]] = []
+
+        # Exploration succeeded even though synthesis failed — carry the
+        # findings into the wrapper's fresh-thread structural retry so it
+        # re-runs ONLY the synthesis (trace 019eb940: the retry repeated
+        # ~15 minutes of research whose findings were intact). When the
+        # failure was a completion-cap truncation, also flag the retry to
+        # start at the escalated cap — re-rolling at the base cap would
+        # truncate identically.
+        retry_carryover: dict[str, Any] | None = None
+        if findings:
+            retry_carryover = {
+                "findings": findings,
+                "scratchpad": scratchpad,
+                "findings_carried_over": True,
+            }
+            if truncated:
+                retry_carryover["synthesis_cap_escalated"] = True
 
         if plan_json_path.exists():
             try:
@@ -942,6 +1086,7 @@ async def _synthesize_plan(
                 raise CriticalContractFailure(
                     phase="plan",
                     reason=f"plan.json exists but is malformed or unreadable: {exc}",
+                    carryover=retry_carryover,
                 )
         else:
             raise CriticalContractFailure(
@@ -951,6 +1096,7 @@ async def _synthesize_plan(
                     "synthesizer did not produce structured output via "
                     "write_structured_plan."
                 ),
+                carryover=retry_carryover,
             )
 
         return {
@@ -1307,6 +1453,16 @@ async def _save_exploration_artifacts(
             "phase_status": existing_phase_status,
         }
 
+    # Findings survive a synthesis contract failure — seed them into the
+    # wrapper's structural retry so it skips the research loop (019eb940).
+    retry_carryover: dict[str, Any] | None = None
+    if state.get("findings"):
+        retry_carryover = {
+            "findings": state.get("findings"),
+            "scratchpad": state.get("scratchpad") or "",
+            "findings_carried_over": True,
+        }
+
     # Fail-closed: SPECIFY requires specification.json (fail-closed like plan)
     if phase == PhaseName.SPECIFY.value:
         spec_json_path = Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
@@ -1331,6 +1487,7 @@ async def _save_exploration_artifacts(
                     raise CriticalContractFailure(
                         phase="specify",
                         reason="specification.json is not a JSON object",
+                        carryover=retry_carryover,
                     )
                 for key in ("title", "summary", "requirements"):
                     if key not in spec_data:
@@ -1338,11 +1495,13 @@ async def _save_exploration_artifacts(
                             phase="specify",
                             reason=f"specification.json missing required key '{key}' — "
                                    f"keys found: {list(spec_data.keys())}",
+                            carryover=retry_carryover,
                         )
             except (json.JSONDecodeError, OSError) as exc:
                 raise CriticalContractFailure(
                     phase="specify",
                     reason=f"specification.json is malformed or unreadable: {exc}",
+                    carryover=retry_carryover,
                 )
             except CriticalContractFailure:
                 raise
@@ -1350,6 +1509,7 @@ async def _save_exploration_artifacts(
                 raise CriticalContractFailure(
                     phase="specify",
                     reason=f"specification.json validation error: {exc}",
+                    carryover=retry_carryover,
                 )
         else:
             raise CriticalContractFailure(
@@ -1357,6 +1517,7 @@ async def _save_exploration_artifacts(
                 reason="specification.json does not exist — "
                        "the specify agent did not produce structured output via write_specification. "
                        "This indicates a model invocation failure.",
+                carryover=retry_carryover,
             )
 
     # Fail-closed: PLAN requires plan.json. _synthesize_plan enforces this
@@ -1374,6 +1535,7 @@ async def _save_exploration_artifacts(
                 reason="plan.json does not exist at save_artifacts — "
                        "the plan synthesizer did not produce structured output "
                        "via write_structured_plan.",
+                carryover=retry_carryover,
             )
 
     disk_artifacts = scan_artifact_dir(

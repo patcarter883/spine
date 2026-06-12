@@ -88,12 +88,19 @@ def build_plan_agent(
 def build_plan_synthesizer(
     state: WorkflowState,
     config: RunnableConfig | None = None,
+    *,
+    completion_cap_override: int | None = None,
 ) -> Any:
     """Build the synthesize-only Deep Agent for the PLAN phase.
 
     Tool surface is exactly ONE tool: ``write_structured_plan``. The
     specification and research findings are inlined into the prompt by
     ``_synthesize_plan``, so there is nothing to read first.
+
+    ``completion_cap_override`` replaces the default synthesis completion
+    clamp — used by the length-aware corrective retry to rebuild the agent
+    with a raised cap after the plan truncated at the base clamp (trace
+    019eb940: identical retries truncated identically at 8K).
 
     ``read_prior_artifacts`` was removed after trace 019eb52c: on the
     exploration path ``state["artifacts"]`` is never populated, so the
@@ -128,7 +135,11 @@ def build_plan_synthesizer(
         # The plan JSON is 2-5K tokens; without a clamp the request inherits
         # the global max_completion_tokens (30K) and a finite-window model
         # 400s once prompt + completion budget exceed the window (019eb3dd).
-        completion_token_cap=synthesis_completion_cap(PhaseName.PLAN.value),
+        completion_token_cap=(
+            completion_cap_override
+            if completion_cap_override and completion_cap_override > 0
+            else synthesis_completion_cap(PhaseName.PLAN.value)
+        ),
         # Forcing with a single-tool surface: the model cannot end a turn
         # in prose/reasoning (trace 019eb412) and cannot stall on a read
         # tool (trace 019eb52c) — the only legal move is the write, and

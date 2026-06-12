@@ -260,6 +260,17 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # or persisted-research-log paths for the current phase.
     prior_phase_findings: list[dict]
 
+    # ── Structural-retry carryover (trace 019eb940) ──
+    # Seeded into the fresh-thread retry input by subgraph_wrapper from
+    # CriticalContractFailure.carryover when synthesis failed AFTER
+    # exploration succeeded. ``findings_carried_over`` routes the retry
+    # straight to synthesize (skipping classify/recall and the research
+    # loop); ``synthesis_cap_escalated`` starts the synthesizer at the
+    # raised completion cap — the prior attempt truncated at the base cap,
+    # so re-rolling at it would truncate identically.
+    findings_carried_over: bool
+    synthesis_cap_escalated: bool
+
     # Per-Send transient: the evidence dossier produced by the explore_do
     # node and consumed by the summarise node in the same branch. One
     # writer per branch so no reducer is needed.

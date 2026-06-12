@@ -95,6 +95,40 @@ def synthesis_completion_cap(phase: str, phase_cap: int | None = None) -> int:
     return min(positive) if positive else 0
 
 
+def escalated_completion_cap(
+    budget: SynthesisBudget,
+    *,
+    prompt_tokens: int,
+) -> int:
+    """Raised completion clamp for a length-truncated synthesis retry.
+
+    The synth clamp exists to keep prompt + completion inside a finite
+    window — but when the structured artifact legitimately needs more than
+    the clamp, the forced tool call truncates mid-arguments and an identical
+    retry truncates identically (trace 019eb940: three plan-synthesize calls
+    each burned exactly 8K completion tokens and produced no parseable
+    ``write_structured_plan``). Doubling the clamp, bounded by the window
+    room left above the MEASURED prompt, gives the retry a real chance
+    without re-risking the overflow the clamp was added for.
+
+    Args:
+        budget: The ledger the truncated call ran under.
+        prompt_tokens: Measured size of the actual synthesis prompt
+            (system + user), not the worst-case reservation.
+
+    Returns:
+        The raised clamp, or 0 when escalation is impossible (legacy
+        provider, no clamp, or no window headroom above the current clamp).
+    """
+    if budget.legacy or budget.window <= 0 or budget.completion_cap <= 0:
+        return 0
+    cfg = SpineConfig.load()
+    room = budget.window - prompt_tokens - cfg.synthesize_overhead_tokens
+    if room <= budget.completion_cap:
+        return 0
+    return min(budget.completion_cap * 2, room)
+
+
 def resolve_synthesis_budget(
     phase: str,
     *,
