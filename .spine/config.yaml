@@ -14,7 +14,7 @@ spine:
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
-    max_concurrent_chunks: 10
+    max_concurrent_chunks: 2
     batch_size: 100
   convergence:
     researcher_supervisor_max_cycles_specify: 12
@@ -43,25 +43,25 @@ mcp_servers:
     args: []
 providers:
   llm:
-  - name: openrouter
-    type: deepagents-model
-    model: openrouter:poolside/laguna-xs.2:free
-    enabled: true
-    guided_decoding: true
-  - name: pat
-    type: deepagents-model
-    model: openai:model
-    base_url: http://10.50.1.51:8000/v1
-    api_key: vllm
-    guided_decoding: true
-    enabled: true
-    stream_usage: true
-    max_concurrent_calls: 8
-    context_window: 60000
+  # - name: openrouter
+  #   type: deepagents-model
+  #   model: openrouter:poolside/laguna-xs.2:free
+  #   enabled: true
+  #   guided_decoding: true
+  # - name: pat
+  #   type: deepagents-model
+  #   model: openai:model
+  #   base_url: http://10.50.1.51:8000/v1
+  #   api_key: vllm
+  #   guided_decoding: true
+  #   enabled: true
+  #   stream_usage: true
+  #   max_concurrent_calls: 8
+  #   context_window: 60000
   - name: local
     type: deepagents-model
-    model: openai:model
-    base_url: http://localhost:8000/v1
+    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
+    base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
     enabled: true
@@ -71,7 +71,7 @@ providers:
   embedding:
   - name: local-embeddings
     type: openai-embedding
-    model: nomic-embed-text-v2-moe-GGUF
+    model: Qwen3-Embedding-0.6B-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
     stream_usage: true
@@ -85,7 +85,7 @@ providers:
     rerank_path: /reranking
   phases:
     specify:
-      provider: openrouter
+      provider: local
       # Declare the model's real context window so the synthesizer runs under
       # the window-aware budget ledger (synthesis_budget): it clamps the synth
       # completion to synthesize_max_completion_tokens and compresses evidence
@@ -93,29 +93,29 @@ providers:
       # (no clamp, fixed evidence budgets). poolside/laguna-xs.2 = 262144.
       context_window: 262144
     specify/subagents/researcher:
-      provider: openrouter
+      provider: local
     plan:
-      provider: openrouter
+      provider: local
       context_window: 262144
     plan/subagents/researcher:
-      provider: openrouter
+      provider: local
     implement:
-      provider: openrouter
+      provider: local
     verify:
-      provider: openrouter
+      provider: local
     critic:
-      provider: openrouter
+      provider: local
     gap_plan:
-      provider: openrouter
+      provider: local
     classification:
-      provider: openrouter
+      provider: local
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false
     summarization:
-      provider: openrouter
+      provider: local
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false
     onboarding:
-      provider: openrouter
+      provider: local

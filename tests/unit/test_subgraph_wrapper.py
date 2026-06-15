@@ -221,6 +221,43 @@ class TestMakeSuccessResultMapper:
 
         assert result["phase_results"]["tasks"]["artifact_count"] == 0
 
+    def test_error_phase_status_not_labeled_success(self):
+        """A swallowed phase error must not be recorded as a successful phase.
+
+        Regression for trace 019ec90d: synthesis failed (phase_status=error,
+        0 artifacts) but phase_results said status=success / error=None while
+        the run as a whole failed.
+        """
+        from spine.workflow.subgraph_wrapper import make_success_result_mapper
+
+        mapper = make_success_result_mapper("specify")
+        subgraph_result = {
+            "artifacts_output": {},
+            "phase_status": "error",
+            "agent_response": "Synthesis error: No endpoints found",
+        }
+        result = mapper(subgraph_result, {})
+
+        entry = result["phase_results"]["specify"]
+        assert entry["status"] == "error"
+        assert entry["artifact_count"] == 0
+        assert entry["error"] == "Synthesis error: No endpoints found"
+
+    def test_needs_review_phase_status_propagated(self):
+        from spine.workflow.subgraph_wrapper import make_success_result_mapper
+
+        mapper = make_success_result_mapper("specify")
+        subgraph_result = {
+            "artifacts_output": {},
+            "phase_status": "needs_review",
+        }
+        result = mapper(subgraph_result, {})
+
+        entry = result["phase_results"]["specify"]
+        assert entry["status"] == "needs_review"
+        # Falls back to a descriptive error when no agent_response is present.
+        assert entry["error"] and "needs_review" in entry["error"]
+
 
 class TestErrorUpdate:
     """Tests for _error_update and _needs_review_update helpers."""
