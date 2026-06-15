@@ -28,7 +28,7 @@ from spine.agents.specify_tools import (
     _extract_json_object,
     salvage_specification_from_text,
 )
-from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware, _RELEASE
+from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware, _RELEASE, _tool_name
 from spine.exceptions import CriticalContractFailure
 
 
@@ -180,6 +180,63 @@ class TestForceToolMiddleware:
         mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
         out = mw._apply(_FakeRequest(_openai_model(), self.GATE))
         assert out.tool_choice == "write_specification"
+
+    # ── gate-drop backstop (trace 019ec913) ────────────────────────────────
+    # A weak model can ignore the tool_choice pin and re-call the gate tool
+    # forever, re-sending the heavy evidence prompt each turn. Once the gate
+    # has fired we remove it from the tool surface so it physically can't.
+
+    TOOLS = [
+        {"type": "function", "function": {"name": "read_work_context"}},
+        {"type": "function", "function": {"name": "write_specification"}},
+    ]
+
+    def _req_with_tools(self, model, messages, tools):
+        req = _FakeRequest(model, messages)
+        req.tools = list(tools)
+        return req
+
+    def test_gate_dropped_after_called(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
+        kept = mw._gate_dropped_tools(self._req_with_tools(_openai_model(), self.GATE, self.TOOLS))
+        assert [_tool_name(t) for t in kept] == ["write_specification"]
+
+    def test_gate_not_dropped_before_called(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
+        req = self._req_with_tools(_openai_model(), [HumanMessage("x")], self.TOOLS)
+        assert mw._gate_dropped_tools(req) is None
+
+    def test_apply_drops_gate_and_pins(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
+        out = mw._apply(self._req_with_tools(_openai_model(), self.GATE, self.TOOLS))
+        assert [_tool_name(t) for t in out.tools] == ["write_specification"]
+        assert out.tool_choice == "write_specification"
+
+    def test_local_server_drops_gate_so_any_forces_write(self):
+        # The named pin degrades to "any" on a local server, but with the gate
+        # removed "any" can only resolve to the single remaining write tool.
+        mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
+        out = mw._apply(self._req_with_tools(_local_model(), self.GATE, self.TOOLS))
+        assert [_tool_name(t) for t in out.tools] == ["write_specification"]
+        assert out.tool_choice == "any"
+
+    def test_no_gate_variant_keeps_all_tools(self):
+        # The orchestrator (no gate_tool) legitimately re-uses `recall`, so its
+        # tool surface must never be trimmed.
+        mw = ForceToolUntilCalledMiddleware("write_specification")
+        assert mw._gate_dropped_tools(self._req_with_tools(_openai_model(), self.GATE, self.TOOLS)) is None
+
+    def test_gate_not_dropped_after_successful_write(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification", gate_tool="read_work_context")
+        msgs = self.GATE + [
+            AIMessage("", tool_calls=[{"name": "write_specification", "args": {}, "id": "w"}]),
+            ToolMessage(
+                "specification.md (10 chars) written to .spine/artifacts/w/specify/.",
+                tool_call_id="w",
+                name="write_specification",
+            ),
+        ]
+        assert mw._gate_dropped_tools(self._req_with_tools(_openai_model(), msgs, self.TOOLS)) is None
 
 
 # ── Layer 3: structural retry in the subgraph wrapper ───────────────────────

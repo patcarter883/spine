@@ -43,6 +43,22 @@ middleware exists to prevent.  Local servers (detected via a custom
 ``base_url`` on ChatOpenAI) therefore get ``"any"`` instead of a named
 pin; "required" still forbids a bare text turn, which is the property
 that matters.
+
+A named ``tool_choice`` pin is only as good as the model's willingness to
+honor it.  Weak / quantized free models routinely *ignore* the pin and
+re-call whatever tool they like — most damagingly the ``gate_tool``, which
+they call over and over while the heavy evidence prompt rides along in
+every request (trace ``019ec913``: ``poolside/laguna-xs.2:free`` ignored
+the ``write_specification`` pin and re-called ``read_work_context`` 17
+times per attempt, re-sending a ~32K-token findings blob each turn — 95%
+of the trace's 814K input tokens).  Pinning ``tool_choice`` cannot stop a
+model that disregards it.  So once the gate tool has fired, this middleware
+*removes it from the request's tool surface*: a tool the model can no
+longer see is a tool it cannot re-call, no matter how it treats
+``tool_choice``.  With the gate gone the only remaining tool is the final
+write, so even a plain ``tool_choice="any"`` (the local-server fallback)
+resolves to it.  This is the structural backstop the ``tool_choice`` pin
+alone is not.
 """
 
 from __future__ import annotations
@@ -65,6 +81,22 @@ _RELEASE = object()
 # ChatOpenRouter bind_tools() map this onto the OpenAI ``tool_choice="required"``
 # wire value; vLLM and llama.cpp honor it identically.
 _FORCE_ANY = "any"
+
+
+def _tool_name(tool: Any) -> str:
+    """Extract a tool's name from a BaseTool or an OpenAI tool dict.
+
+    ``request.tools`` is ``list[BaseTool | dict]``; dicts arrive either as the
+    OpenAI function envelope ``{"type": "function", "function": {"name": …}}``
+    or a flat ``{"name": …}``. Returns ``""`` for unrecognised shapes so the
+    caller simply keeps the tool (never drops one it can't identify).
+    """
+    if isinstance(tool, dict):
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            return fn.get("name", "") or ""
+        return tool.get("name", "") or ""
+    return getattr(tool, "name", "") or ""
 
 
 def _named_pin_supported(model: Any) -> bool:
@@ -163,11 +195,45 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
             return self.final_tool  # pin the structured write specifically
         return _FORCE_ANY
 
+    def _gate_dropped_tools(self, request: Any) -> list[Any] | None:
+        """Tool list with ``gate_tool`` removed, or ``None`` to leave as-is.
+
+        Returns the filtered list only when the gate genuinely needs dropping:
+        an OpenAI-style model, a configured ``gate_tool`` that has already been
+        called, the final write not yet successful, and the gate still present
+        in the surfaced tools. ``None`` everywhere else — so the no-gate
+        orchestrator variant (which legitimately re-uses ``recall``) and
+        non-OpenAI models are untouched, exactly like ``_decide``.
+        """
+        if not self.gate_tool:
+            return None
+        if not _is_openai_style_model(getattr(request, "model", None)):
+            return None
+        messages = list(getattr(request, "messages", None) or [])
+        if self._final_tool_succeeded(messages):
+            return None
+        if not self._gate_tool_called(messages):
+            return None
+        tools = list(getattr(request, "tools", None) or [])
+        kept = [t for t in tools if _tool_name(t) != self.gate_tool]
+        if len(kept) == len(tools):
+            return None
+        return kept
+
     def _apply(self, request: Any) -> Any:
+        # A single override carries both changes: the structural gate-drop and
+        # the tool_choice pin. (Chaining two .override() calls is correct on the
+        # real ModelRequest but needlessly fragile against partial test fakes.)
+        overrides: dict[str, Any] = {}
+        kept_tools = self._gate_dropped_tools(request)
+        if kept_tools is not None:
+            overrides["tools"] = kept_tools
         choice = self._decide(request)
-        if choice is _RELEASE:
+        if choice is not _RELEASE:
+            overrides["tool_choice"] = choice
+        if not overrides:
             return request
-        return request.override(tool_choice=choice)
+        return request.override(**overrides)
 
     # ── middleware hooks (sync + async) ─────────────────────────────────
 
