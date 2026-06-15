@@ -24,6 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.specify_agent import build_specify_agent
+from spine.agents.specify_tools import build_work_context_block, load_prior_spec
 from spine.agents.helpers import extract_response
 from spine.agents.retry import ainvoke_with_retry
 from spine.agents.context import build_context
@@ -164,6 +165,16 @@ async def call_specify(
                 if isinstance(f, dict)
             )
             prompt += f"\n\nPrevious review feedback (please address):\n{feedback_text}"
+
+        # Inline the prior specification on rework so the agent can revise it
+        # without a read_work_context round-trip (trace 019ec965). On the first
+        # pass this is empty and elides.
+        if retry_count > 0:
+            prior_spec_block = build_work_context_block(
+                load_prior_spec(workspace_root, work_id)
+            )
+            if prior_spec_block:
+                prompt += f"\n\n{prior_spec_block}"
 
         # Build runtime context for the agent
         ctx = build_context(state, PhaseName.SPECIFY)

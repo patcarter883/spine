@@ -6,9 +6,12 @@ runs.  This agent's job is to synthesise the exploration results and write
 the final specification.md via the ``write_specification`` tool.
 
 Tool surface (complete list):
-- ``read_work_context`` — loads description, feedback, prior spec (rework)
 - ``write_specification`` — structured write to specification.md (only)
 - ``recall`` — retrieves relevant code chunks from vector store
+
+The work description, feedback and any prior spec (rework) are inlined into
+the prompt rather than fetched via a tool, so there is no ``read_work_context``
+round-trip (trace 019ec965).
 
 No generic filesystem tools (ls, read_file, glob, grep, write_file,
 edit_file, execute). The agent cannot read arbitrary files or write
@@ -51,12 +54,17 @@ def build_specify_agent(
     feedback_raw = state.get("feedback", [])
     feedback = [str(f) for f in feedback_raw] if feedback_raw else []
 
+    # read_work_context is omitted: the work description, classification,
+    # retrieved code and feedback are inlined into the user prompt by the
+    # caller (and any prior spec on rework), so the tool round-trip is dead
+    # weight (trace 019ec965: ~19K prompt tokens for a 29-token no-op call).
     orchestrator_tools = build_specify_orchestrator_tools(
         workspace_root=workspace_root,
         work_id=work_id,
         description=description,
         work_type=work_type,
         feedback=feedback,
+        include_read_work_context=False,
     )
 
     # Merge orchestrator tools with any extra tools (like RecallTool)
@@ -78,7 +86,7 @@ def build_specify_agent(
         # Force a tool call every turn until write_specification succeeds, so a
         # weak/quantized model can't end the turn with the spec as fenced JSON
         # text instead of calling the tool. No gate_tool here: the orchestrator
-        # legitimately calls `recall` between read_work_context and the write.
+        # may legitimately call `recall` before the write.
         extra_middleware=[ForceToolUntilCalledMiddleware(final_tool="write_specification")],
     )
 
@@ -104,12 +112,17 @@ def build_specify_synthesizer(
     feedback_raw = state.get("feedback", [])
     feedback = [str(f) for f in feedback_raw] if feedback_raw else []
 
+    # read_work_context is omitted: description, feedback and (on rework) the
+    # prior spec are inlined into the synthesizer prompt by _synthesize_specify,
+    # so the synthesizer needs only write_specification. This drops the 2-call
+    # flow to a single call (trace 019ec965).
     orchestrator_tools = build_specify_orchestrator_tools(
         workspace_root=workspace_root,
         work_id=work_id,
         description=description,
         work_type=work_type,
         feedback=feedback,
+        include_read_work_context=False,
     )
 
     system_prompt = _build_specify_synthesizer_prompt() + build_artifact_prompt(
@@ -129,15 +142,12 @@ def build_specify_synthesizer(
         # the global max_completion_tokens (30K) and a finite-window model
         # 400s once prompt + completion budget exceed the window (019eb3dd).
         completion_token_cap=synthesis_completion_cap(PhaseName.SPECIFY.value),
-        # The synthesizer runs a strict 2-call flow (read_work_context →
-        # write_specification) with no `recall`, so once the gate tool fires we
-        # pin tool_choice to write_specification — the model cannot stall in
-        # prose. Forcing releases as soon as the write succeeds so the loop ends.
+        # write_specification is now the synthesizer's only tool, so force it
+        # from turn 1 — the model cannot stall in prose. No gate_tool: there is
+        # no longer a read_work_context call to wait on. Forcing releases as
+        # soon as the write succeeds so the loop ends.
         extra_middleware=[
-            ForceToolUntilCalledMiddleware(
-                final_tool="write_specification",
-                gate_tool="read_work_context",
-            )
+            ForceToolUntilCalledMiddleware(final_tool="write_specification")
         ],
     )
 
@@ -147,23 +157,23 @@ def _build_specify_prompt() -> str:
         "You are the SPECIFY phase orchestrator. Synthesise the exploration results "
         "already in your context and write the formal specification.\\n\\n"
         "## Available tools (use only these)\\n"
-        "- `read_work_context` — loads work description, feedback, prior spec. Call FIRST.\\n"
         "- `recall` — retrieves relevant code chunks from the vector knowledge base. "
         "Use this to understand existing patterns before writing the spec.\\n"
         "- `write_specification` — writes specification.md. Call LAST.\\n\\n"
-        "Researcher subagents that explored the codebase were dispatched by "
-        "the upstream exploration subgraph; their findings are already in your "
-        "context. Do not try to dispatch more.\\n\\n"
+        "The work description, task classification, pre-retrieved code, and any "
+        "prior critic feedback (plus the prior specification on a rework pass) are "
+        "provided inline in the user message below — you do NOT need to call any "
+        "tool to load them. Researcher subagents that explored the codebase were "
+        "dispatched by the upstream exploration subgraph; their findings are "
+        "already in your context. Do not try to dispatch more.\\n\\n"
         "## SPECIFY PHASE — STEP-BY-STEP WORKFLOW\\n\\n"
         "Execute these steps in order. Complete each fully before proceeding.\\n\\n"
-        "### Step 1 — Call read_work_context (Turn 1)\\n"
-        "1. Call `read_work_context` with no arguments.\\n"
-        "2. Extract: ctx.description, ctx.feedback, ctx.prior_spec, ctx.spec_dir\\n\\n"
-        "### Step 2 — Review retrieved context\\n"
-        "Relevant code chunks have been pre-retrieved and are in your context. "
-        "Analyze them to understand existing patterns, conventions, and architectural decisions. "
-        "Do NOT dispatch additional researcher subagents unless the pre-retrieved context is insufficient.\\n\\n"
-        "### Step 3 — Call write_specification (Turn 2)\\n"
+        "### Step 1 — Review the provided context\\n"
+        "Read the work description, classification, and pre-retrieved code chunks "
+        "in the user message. Analyze them to understand existing patterns, "
+        "conventions, and architectural decisions. Do NOT dispatch additional "
+        "researcher subagents unless the pre-retrieved context is insufficient.\\n\\n"
+        "### Step 2 — Call write_specification\\n"
         "Synthesize the retrieved context and/or research findings into the structured "
         "fields below and call `write_specification` ONCE. The tool renders markdown and "
         "emits JSON for you — DO NOT author markdown, DO NOT hand-serialize JSON.\\n\\n"
@@ -177,8 +187,9 @@ def _build_specify_prompt() -> str:
         "- scope_exclusions: list of areas explicitly out of scope\\n"
         "- known_risks: list of open questions or risks\\n\\n"
         "### Turn Budget\\n"
-        "Expected: 2 turns. If exceeding 4 turns without calling `write_specification`, "
-        "check that context is available and proceed to write.\\n"
+        "Expected: 1 turn (optionally 1 `recall` first). If exceeding 3 turns "
+        "without calling `write_specification`, proceed to write with the context "
+        "already provided.\\n"
     )
 
 
@@ -188,13 +199,13 @@ def _build_specify_synthesizer_prompt() -> str:
         "BEFORE you started — the findings are injected into your prompt below. "
         "Your job is to synthesize those findings into a structured specification "
         "and call `write_specification` ONCE. Do NOT re-explore the codebase.\\n\\n"
-        "## Available tools (the ONLY tools you have)\\n"
-        "- `read_work_context` — loads work description, feedback, prior spec (rework). Call FIRST.\\n"
-        "- `write_specification` — writes both specification.md and specification.json. Call LAST.\\n\\n"
-        "## Workflow (exactly 2 calls)\\n\\n"
-        "### Step 1 — Call read_work_context\\n"
-        "Call with no arguments. Extract description, feedback, and any prior_spec.\\n\\n"
-        "### Step 2 — Call write_specification\\n"
+        "## Available tools (the ONLY tool you have)\\n"
+        "- `write_specification` — writes both specification.md and specification.json.\\n\\n"
+        "The work description, critic feedback, and (on a rework pass) the prior "
+        "specification are all provided inline in the user message — you do NOT "
+        "need to call any tool to load them.\\n\\n"
+        "## Workflow (exactly 1 call)\\n\\n"
+        "### Call write_specification\\n"
         "Synthesize the findings (already in your prompt) plus the work context into "
         "the structured fields below and call `write_specification` ONCE. The tool "
         "renders markdown and emits JSON for you — DO NOT author markdown, DO NOT "

@@ -38,7 +38,6 @@ from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.synthesis_budget import (
     allocate_evidence as _allocate_evidence,
     escalated_completion_cap as _escalated_completion_cap,
-    estimate_tool_payload_reserve as _estimate_tool_payload_reserve,
     resolve_synthesis_budget as _resolve_synthesis_budget,
 )
 
@@ -60,16 +59,41 @@ from langchain_core.messages import AIMessage
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 _DEFAULT_MAX_ROUNDS = 3
-# Cap on concurrent Send("explore", …) dispatches per research round.
-# Without this, _research_router fans out one branch per topic — observed
-# runs spawned ~9 simultaneous researchers, each re-fetching the same
-# hot symbols and crossing the per-branch token budget. Topics beyond
-# the cap are deferred: the manager will re-propose them next round
-# (and _new_topics will skip ones already covered).
-_MAX_PARALLEL_EXPLORES = 4
+# The per-round cap on concurrent Send("explore", …) dispatches now lives in
+# config (``research_max_parallel_explores`` / ``research_lean_*``) and is
+# resolved task-aware via _effective_research_limits. Without a cap,
+# _research_router fans out one branch per topic — observed runs spawned ~9
+# simultaneous researchers, each re-fetching the same hot symbols and crossing
+# the per-branch token budget. Topics beyond the cap are deferred: the manager
+# re-proposes them next round (and _new_topics skips ones already covered).
 # Sentinel budget for measuring an evidence block's full rendered size
 # before allocation (effectively "no cap").
 _UNBOUNDED_BUDGET = 10**9
+
+
+def _effective_research_limits(
+    task_category: str | None,
+    confidence: float,
+) -> tuple[int, int]:
+    """Resolve ``(max_rounds, max_parallel_explores)`` for this task.
+
+    High-confidence classifications in well-understood categories (config
+    ``research_lean_categories``, default ``["Frontend/UI"]``) get the leaner
+    ceilings — a config-UI field addition does not need 3 rounds × 4 branches
+    of codebase research (trace 019ec965: 52 explore_do calls, ~60% of input
+    tokens). Everything else keeps the full default breadth.
+    """
+    from spine.config import SpineConfig
+
+    cfg = SpineConfig.load()
+    lean = (
+        task_category is not None
+        and task_category in cfg.research_lean_categories
+        and confidence >= cfg.research_lean_confidence
+    )
+    if lean:
+        return cfg.research_lean_max_rounds, cfg.research_lean_max_parallel_explores
+    return cfg.research_max_rounds, cfg.research_max_parallel_explores
 # Cap on the specification.md content inlined into the PLAN synthesizer
 # prompt (trace 019eb52c). Generous — the spec is the planning contract
 # and a truncated spec produces plans the critic rejects for missed
@@ -151,10 +175,17 @@ async def _pre_research_gate(
     except Exception as exc:
         logger.warning("[%s] pre_research_gate: recall failed — %s", work_id, exc)
 
+    # Tighten the exploration loop for high-confidence, well-understood
+    # categories (trace 019ec965). max_rounds is read from state by the round
+    # checks (run_research_manager + _research_router_decision); the parallel
+    # cap is applied per-round in _research_router via the same helper.
+    max_rounds, _ = _effective_research_limits(task_category, confidence)
+
     return {
         "task_category": task_category,
         "classification_confidence": confidence,
         "retrieved_context": retrieved,
+        "max_rounds": max_rounds,
     }
 
 
@@ -586,8 +617,14 @@ def _research_router(
 
     hits_map: dict[str, list[dict]] = state.get("topic_recall_hits") or {}
     phase = state.get("phase", "")
-    capped_topics = new_topics[:_MAX_PARALLEL_EXPLORES]
-    deferred = new_topics[_MAX_PARALLEL_EXPLORES:]
+    # Task-aware per-round fan-out cap (trace 019ec965). High-confidence
+    # Frontend/UI work explores 2 branches/round instead of 4.
+    _, max_parallel = _effective_research_limits(
+        state.get("task_category"),
+        float(state.get("classification_confidence", 0.0) or 0.0),
+    )
+    capped_topics = new_topics[:max_parallel]
+    deferred = new_topics[max_parallel:]
     # Compact digest of what prior rounds (and seeded rework findings)
     # already established. Round-2+ researchers used to start cold and
     # re-map ground their predecessors covered (trace 019eb4c7) — the
@@ -1136,6 +1173,7 @@ async def _synthesize_specify(
     with the ``write_specification`` tool and research findings as context.
     """
     from spine.agents.specify_agent import build_specify_synthesizer
+    from spine.agents.specify_tools import load_prior_spec
 
     description = state.get("description", "")
     work_id = state.get("work_id", "unknown")
@@ -1170,15 +1208,21 @@ async def _synthesize_specify(
         )
         instruction = (
             f"{rework_lead}Create a detailed specification for the work "
-            "above, incorporating the research findings. Call "
-            "`read_work_context` once to load description, feedback, "
-            "and any prior spec. Then synthesize the work description + "
-            "research findings into the structured fields and call "
-            "`write_specification` exactly once (fields: title, summary, "
-            "objectives, requirements, constraints, scope_inclusions, "
+            "above, incorporating the research findings. The work description, "
+            "feedback, and any prior spec are already provided above — "
+            "synthesize them plus the research findings into the structured "
+            "fields and call `write_specification` exactly once (fields: title, "
+            "summary, objectives, requirements, constraints, scope_inclusions, "
             "scope_exclusions, known_risks). The tool renders markdown "
             "and emits JSON for you — do not call write_file."
         )
+
+        # Inline the prior spec on rework so the synthesizer can revise it
+        # without a read_work_context round-trip (trace 019ec965). Empty on
+        # first pass — the xml block elides.
+        prior_spec_body = ""
+        if retry_count > 0:
+            prior_spec_body = load_prior_spec(workspace_root, work_id)
 
         # ── Window-aware evidence budgeting (trace 019eb3dd) ────────────
         # Measure the fixed prompt pieces and what read_work_context will
@@ -1197,18 +1241,17 @@ async def _synthesize_specify(
             )
             + _BASE_PROMPT
         )
-        reserve = _estimate_tool_payload_reserve(
-            workspace_root=workspace_root,
-            artifact_dirs=[f".spine/artifacts/{work_id}/specify"],
-            description=description,
-            feedback=[str(f) for f in feedback] if feedback else [],
-        )
+        # No read_work_context round-trip anymore (trace 019ec965): the work
+        # context that tool used to return on turn 2 is now inlined into the
+        # prompt below (description/feedback already in fixed_texts; prior spec
+        # added here), so there is no separate tool payload to reserve.
         synth_budget = _resolve_synthesis_budget(
             PhaseName.SPECIFY.value,
             fixed_texts=[
-                system_estimate, description, feedback_body, scratchpad, instruction,
+                system_estimate, description, feedback_body, scratchpad,
+                instruction, prior_spec_body,
             ],
-            tool_payload_reserve=reserve,
+            tool_payload_reserve=0,
         )
 
         # When the pre_research_gate fired (high confidence + sufficient
@@ -1248,6 +1291,7 @@ async def _synthesize_specify(
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
+                (Tag.SPECIFICATION, prior_spec_body),
                 (Tag.FINDINGS, findings_text),
                 (Tag.RETRIEVED_CODE, recall_body),
                 (Tag.CRITIC_FEEDBACK, feedback_body),

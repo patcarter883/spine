@@ -400,14 +400,12 @@ class VectorIndexer:
         summaries paraphrase the identifiers away, which is exactly
         what hurts recall on identifier-mentioning queries.
         """
-        from spine.agents.helpers import resolve_model
+        from spine.agents.helpers import resolve_chat_model
 
-        model = resolve_model(None, phase="summarization")
-
-        if isinstance(model, str):
-            from langchain.chat_models import init_chat_model
-
-            model = init_chat_model(model)
+        # resolve_chat_model centralizes the resolve_model + init_chat_model
+        # coercion AND applies stream_usage/streaming so summary generation
+        # reports token usage (trace 019ec965).
+        model = resolve_chat_model(None, phase="summarization")
 
         system = xml_blocks(
             (

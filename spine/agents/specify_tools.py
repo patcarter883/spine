@@ -31,7 +31,30 @@ from spine.models.types import Specification
 logger = logging.getLogger(__name__)
 
 
-# ── read_work_context ─────────────────────────────────────────────────────
+# ── work context (eager-injected, no tool round-trip) ─────────────────────
+
+
+def load_prior_spec(workspace_root: str, work_id: str) -> str:
+    """Read a prior ``specification.md`` (rework pass) for eager injection.
+
+    The work description, classification, retrieved code and critic feedback
+    are already inlined into the SPECIFY agent's prompt, so the only context
+    a rework pass needs that is not already present is the prior specification.
+    This loads it directly so the agent never has to spend a turn calling
+    ``read_work_context`` (trace 019ec965: that round-trip cost ~19K prompt
+    tokens for a 29-token no-op tool call). Returns ``""`` when no prior spec
+    exists (first pass).
+    """
+    spec_path = Path(workspace_root) / artifact_path(work_id, "specify") / "specification.md"
+    if spec_path.exists():
+        try:
+            return spec_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not read prior spec at %s: %s", spec_path, exc)
+    return ""
+
+
+# ── read_work_context (legacy tool, retained for salvage/compat) ───────────
 
 
 class _ReadWorkContextInput(BaseModel):
@@ -90,6 +113,21 @@ class ReadWorkContextTool(BaseTool):
                 logger.warning("Could not read prior spec at %s: %s", spec_path, exc)
 
         return json.dumps(result, ensure_ascii=False)
+
+
+def build_work_context_block(prior_spec: str) -> str:
+    """Render a prior specification as a labeled prompt block for rework.
+
+    Empty (no prior spec) returns ``""`` so the section elides on first pass.
+    """
+    if not prior_spec.strip():
+        return ""
+    return (
+        "## Prior Specification (revise this)\n\n"
+        "A specification already exists from a previous pass. Revise it to "
+        "address the feedback above — do not start from scratch.\n\n"
+        f"```markdown\n{prior_spec.strip()}\n```"
+    )
 
     async def _arun(self, **kwargs: Any) -> str:
         return self._run(**kwargs)
@@ -309,12 +347,14 @@ def build_specify_orchestrator_tools(
     description: str,
     work_type: str,
     feedback: list[str] | None = None,
+    include_read_work_context: bool = True,
 ) -> list[BaseTool]:
     """Build the custom tool set for the specify agent.
 
-    Returns two tools:
-    - ``read_work_context``: loads description, feedback, and prior spec
-    - ``write_specification``: structured write to specification.md
+    Returns:
+    - ``write_specification``: structured write to specification.md (always)
+    - ``read_work_context``: loads description, feedback, and prior spec —
+      only when ``include_read_work_context`` is True
 
     These are the complete tool surface for the SPECIFY agent. No generic
     filesystem tools are exposed. Researcher subagents (when needed) are
@@ -326,27 +366,36 @@ def build_specify_orchestrator_tools(
         description: The work description from WorkflowState.
         work_type: The work type (quick, spec, etc.).
         feedback: List of prior feedback strings (for rework passes).
+        include_read_work_context: When False, omit ``read_work_context``.
+            The specify builders eagerly inline the work context into the
+            prompt (see :func:`load_prior_spec`), so the tool — and its
+            ~19K-token round-trip — is no longer needed (trace 019ec965).
 
     Returns:
-        List of two BaseTool instances.
+        List of BaseTool instances (one or two depending on the flag).
     """
     spec_dir = artifact_path(work_id, "specify")
 
-    return [
-        ReadWorkContextTool(
-            workspace_root=workspace_root,
-            work_id=work_id,
-            work_type=work_type,
-            description=description,
-            feedback=feedback or [],
-            spec_dir=spec_dir,
-        ),
+    tools: list[BaseTool] = [
         WriteSpecificationTool(
             workspace_root=workspace_root,
             spec_dir=spec_dir,
             work_description=description,
         ),
     ]
+    if include_read_work_context:
+        tools.insert(
+            0,
+            ReadWorkContextTool(
+                workspace_root=workspace_root,
+                work_id=work_id,
+                work_type=work_type,
+                description=description,
+                feedback=feedback or [],
+                spec_dir=spec_dir,
+            ),
+        )
+    return tools
 
 
 # ── Salvage (recover a spec the model printed as text) ─────────────────────

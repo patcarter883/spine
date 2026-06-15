@@ -297,6 +297,51 @@ class TestBuildSpecifyOrchestratorTools:
         assert isinstance(read_tool, ReadWorkContextTool)
         assert read_tool.feedback == ["fix this"]
 
+    def test_excludes_read_work_context_when_flag_false(self, tmp_path):
+        # Eager-injection mode (trace 019ec965): the work context is inlined
+        # into the prompt, so read_work_context is dropped from the surface.
+        tools = build_specify_orchestrator_tools(
+            workspace_root=str(tmp_path),
+            work_id="x",
+            description="d",
+            work_type="task",
+            include_read_work_context=False,
+        )
+        names = {t.name for t in tools}
+        assert names == {"write_specification"}
+
+
+# ── Eager work-context injection (load_prior_spec / build_work_context_block) ─
+
+
+class TestEagerWorkContext:
+    def test_load_prior_spec_absent(self, tmp_path):
+        from spine.agents.specify_tools import load_prior_spec
+
+        assert load_prior_spec(str(tmp_path), "no-such-work") == ""
+
+    def test_load_prior_spec_present(self, tmp_path):
+        from spine.agents.specify_tools import load_prior_spec
+
+        work_id = "wk-rework"
+        spec_dir = tmp_path / ".spine" / "artifacts" / work_id / "specify"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "specification.md").write_text("# Prior\nbody")
+        assert "Prior" in load_prior_spec(str(tmp_path), work_id)
+
+    def test_block_empty_elides(self):
+        from spine.agents.specify_tools import build_work_context_block
+
+        assert build_work_context_block("") == ""
+        assert build_work_context_block("   \n  ") == ""
+
+    def test_block_wraps_prior_spec(self):
+        from spine.agents.specify_tools import build_work_context_block
+
+        block = build_work_context_block("# Prior Spec\nstuff")
+        assert "Prior Specification" in block
+        assert "# Prior Spec" in block
+
 
 # ── ReadPriorArtifactsTool ────────────────────────────────────────────────
 

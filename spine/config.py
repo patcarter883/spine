@@ -286,6 +286,23 @@ class SpineConfig:
     # multi-minute reasoning burn toward the provider's full completion
     # budget (trace 019eb541, observed live at 300s+ solo on the engine).
     research_manager_max_completion_tokens: int = 2048
+    # ── Research breadth (task-aware exploration fan-out) ───────────────
+    # Default ceilings on the exploration loop: how many research_manager
+    # rounds run, and how many explore branches fan out per round. A high-
+    # confidence classification in a well-understood category (e.g. a
+    # Frontend/UI field addition) does not need the full breadth — trace
+    # 019ec965 spent 52 explore_do calls / ~60% of input tokens researching
+    # a config-UI form. When confidence >= ``research_lean_confidence`` AND
+    # the category is in ``research_lean_categories``, the leaner
+    # ``research_lean_*`` ceilings apply instead.
+    research_max_rounds: int = 3
+    research_max_parallel_explores: int = 4
+    research_lean_confidence: float = 0.85
+    research_lean_max_rounds: int = 2
+    research_lean_max_parallel_explores: int = 2
+    research_lean_categories: list[str] = field(
+        default_factory=lambda: ["Frontend/UI"]
+    )
     # Completion-token cap for the no-tool plan_do (run_plan_node)
     # SubagentDirective calls (e.g. plan_slice_implementer). A directive is
     # a few hundred tokens; without a cap the call inherits the provider's
@@ -591,6 +608,20 @@ class SpineConfig:
             ),
             researcher_supervisor_max_completion_tokens=int(
                 spine.get("researcher_supervisor_max_completion_tokens", 1024)
+            ),
+            research_max_rounds=int(spine.get("research_max_rounds", 3)),
+            research_max_parallel_explores=int(
+                spine.get("research_max_parallel_explores", 4)
+            ),
+            research_lean_confidence=float(
+                spine.get("research_lean_confidence", 0.85)
+            ),
+            research_lean_max_rounds=int(spine.get("research_lean_max_rounds", 2)),
+            research_lean_max_parallel_explores=int(
+                spine.get("research_lean_max_parallel_explores", 2)
+            ),
+            research_lean_categories=list(
+                spine.get("research_lean_categories", ["Frontend/UI"])
             ),
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)

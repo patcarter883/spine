@@ -161,6 +161,18 @@ def resolve_chat_model(
         cap_kwargs: dict[str, Any] = {}
         if provider_cfg:
             _apply_concurrency_cap(cap_kwargs, provider_cfg)
+            # ── Enable streaming + usage reporting (parity with the local /
+            # OpenRouter builders) ───────────────────────────────────────
+            # The string path routes through init_chat_model, which would
+            # otherwise drop these. Without stream_usage the streamed final
+            # chunk carries no token counts, producing 0-token spans in
+            # LangSmith and starving the per-work_id budget tracker (trace
+            # 019ec965: 6/52 explore_do spans reported no usage). streaming
+            # keeps the stall timer alive on slow local models. Both are
+            # default-on; opt out with providers.llm[].stream_usage: false.
+            cap_kwargs.setdefault("streaming", True)
+            if provider_cfg.get("stream_usage") is not False:
+                cap_kwargs.setdefault("stream_usage", True)
         return init_chat_model(model, **cap_kwargs) if cap_kwargs else init_chat_model(model)
     return model
 

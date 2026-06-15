@@ -186,6 +186,28 @@ spine:
   # Default: 1024  | (no env override)
   researcher_supervisor_max_completion_tokens: 1024
 
+  # ── Research breadth (task-aware exploration fan-out) ─────────────────
+  # Ceilings on the exploration loop: research_manager rounds and explore
+  # branches dispatched per round. A high-confidence classification in a
+  # well-understood category does not need full breadth — trace 019ec965
+  # spent 52 explore_do calls / ~60% of input tokens researching a config-UI
+  # form. When the classifier's confidence is >= research_lean_confidence AND
+  # the category is in research_lean_categories, the leaner research_lean_*
+  # ceilings apply; otherwise the defaults below do.
+  # Default: 3  | (no env override)
+  research_max_rounds: 3
+  # Default: 4  | (no env override)
+  research_max_parallel_explores: 4
+  # Default: 0.85  | (no env override)
+  research_lean_confidence: 0.85
+  # Default: 2  | (no env override)
+  research_lean_max_rounds: 2
+  # Default: 2  | (no env override)
+  research_lean_max_parallel_explores: 2
+  # Default: ["Frontend/UI"]  | (no env override)
+  research_lean_categories:
+    - Frontend/UI
+
   # Total token budget for the SPECIFY explorer context.
   # Default: 30000  | (no env override)
   specify_context_token_budget: 30000
