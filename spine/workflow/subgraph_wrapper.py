@@ -439,6 +439,25 @@ def make_success_result_mapper(phase: str) -> Callable:
                 if isinstance(content, str):
                     artifact_previews[name] = content[:_MAX_ARTIFACT_STATE_CHARS]
 
+        # Mirror the subgraph's reported phase_status into the per-phase
+        # record. Hardcoding "success" here mislabels phases that completed
+        # without raising but reported phase_status="error"/"needs_review"
+        # (e.g. a swallowed synthesis failure): callers patch the top-level
+        # ``status`` to failed/needs_review while phase_results still claimed
+        # success/error=None, so the summary contradicted the run outcome
+        # (trace 019ec90d). PhaseResult.status is "success" | "needs_review"
+        # | "error" — keep it honest.
+        phase_status = subgraph_result.get("phase_status", "")
+        if phase_status in ("error", "needs_review"):
+            phase_result_status = phase_status
+            phase_result_error = (
+                subgraph_result.get("agent_response")
+                or f"phase ended with status {phase_status!r}"
+            )[:_MAX_ARTIFACT_STATE_CHARS]
+        else:
+            phase_result_status = "success"
+            phase_result_error = None
+
         result: dict[str, Any] = {
             "current_phase": phase,
             "status": "running",
@@ -446,10 +465,10 @@ def make_success_result_mapper(phase: str) -> Callable:
             "phase_results": {
                 phase: {
                     "phase": phase,
-                    "status": "success",
+                    "status": phase_result_status,
                     "artifact_count": len(artifact_names),
                     "artifact_names": artifact_names,
-                    "error": None,
+                    "error": phase_result_error,
                 }
             },
             "artifacts": {phase: artifact_previews},
