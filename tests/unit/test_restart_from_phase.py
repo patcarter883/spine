@@ -8,6 +8,7 @@ This module covers:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,12 +23,21 @@ from spine.config import SpineConfig
 
 @pytest.fixture
 def tmp_config(tmp_path):
-    """Create a minimal SpineConfig for testing."""
+    """Create a minimal SpineConfig for testing.
+
+    ``workspace_root`` is a freshly-initialised (clean) git repo so the
+    code-producing restart path's worktree preflight passes. The stores live
+    outside that repo so they don't dirty it.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
     config = SpineConfig(
         checkpoint_path=str(tmp_path / "spine.db"),
         artifact_path=str(tmp_path / "artifacts"),
         queue_path=str(tmp_path / "queue.db"),
-        workspace_root=str(tmp_path),
+        workspace_root=str(repo),
         max_critic_retries=3,
     )
     config.ensure_dirs()
@@ -139,3 +149,31 @@ class TestRestartFromPhaseActiveTaskCheck:
             result = asyncio.run(restart_from_phase("test-work-1", "implement", tmp_config))
 
             assert result["status"] == "skipped"
+
+    def test_dirty_tree_raises_without_mutating_status(self, tmp_config, work_db):
+        """A dirty workspace makes the code-producing restart raise *before*
+        clearing artifacts / purging the checkpoint / marking running, leaving
+        the entry's status untouched so it stays retryable once cleaned."""
+        from spine.exceptions import SandboxPreparationError
+
+        self._setup_work_entry(work_db, "test-work-1")  # status=running, type=task
+        # Dirty the workspace git tree.
+        (Path(tmp_config.workspace_root) / "scratch.txt").write_text("wip", encoding="utf-8")
+
+        with patch("spine.work.ralph_worker.get_worker") as mock_get_worker:
+            mock_worker = MagicMock()
+            mock_worker.get_active.return_value = None
+            mock_get_worker.return_value = mock_worker
+
+            from spine.work.dispatcher import restart_from_phase
+
+            import asyncio
+
+            with patch("spine.work.dispatcher._run_workflow_graph") as run_graph:
+                with pytest.raises(SandboxPreparationError, match="not clean"):
+                    asyncio.run(restart_from_phase("test-work-1", "implement", tmp_config))
+                run_graph.assert_not_called()
+
+        # Status preserved → the restart can be retried after cleaning the tree.
+        entry = work_db["work_entries"].get("test-work-1")
+        assert entry["status"] == "running"

@@ -87,6 +87,30 @@ class WorktreeSandbox:
         self.active = work_type_writes_code(work_type)
         self._orch: object | None = None
 
+    def preflight(self) -> None:
+        """Verify a sandbox *can* be prepared, without creating one.
+
+        For a code-producing work type this checks the same precondition
+        :meth:`enter` enforces — a clean working tree — but creates no
+        worktree and mutates no state. Run it *before* any status
+        transition so a dirty tree fails fast and leaves the work entry
+        untouched (and therefore retryable) instead of progressing it to
+        running/failed and stranding the plan. No-op for non-code work
+        types.
+
+        Raises:
+            SandboxPreparationError: If the working tree is dirty.
+        """
+        if not self.active:
+            return
+
+        from spine.git.orchestrator import SpineGitOrchestrator
+
+        orch = SpineGitOrchestrator(base_config=self.config)
+        if self.config.workspace_root:
+            orch.master_dir = self.config.workspace_root
+        orch.ensure_tree_clean()
+
     def enter(self) -> SpineConfig:
         """Prepare the worktree and return the config to run the graph with.
 

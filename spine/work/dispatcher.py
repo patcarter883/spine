@@ -716,6 +716,32 @@ async def submit_work(
 # ── Resume work ──
 
 
+def _preflight_worktree_clean(config: SpineConfig, work_type: str) -> None:
+    """Fail fast (and retryably) if a code-producing run can't be isolated.
+
+    Code-producing work types run against an isolated git worktree, which
+    requires a clean main tree. Re-run entry points (resume / restart /
+    restart-from-phase / approved-plan continuation) mutate the work entry's
+    status to ``running`` — and perform other destructive setup like wiping
+    artifacts and purging the checkpoint — *before* the worktree is created
+    deep inside the graph runner. If the tree is dirty, that creation fails
+    and the entry is finalised to ``failed``, which is no longer in the
+    status set its own retry path accepts: the work is stranded and the user
+    cannot retry even after cleaning the tree.
+
+    Calling this *before* any such side effect makes a dirty tree raise while
+    the entry is still in its original, retryable status — so the user can
+    stash/commit and re-issue the same command. No-op for non-code work
+    types.
+
+    Raises:
+        SandboxPreparationError: If the working tree is dirty.
+    """
+    from spine.git import WorktreeSandbox
+
+    WorktreeSandbox(config, work_type).preflight()
+
+
 async def resume_work(
     work_id: str,
     human_feedback: str,
@@ -764,6 +790,11 @@ async def resume_work(
 
     work_type = entry.get("work_type", "spec")
     description = entry.get("description", "")
+
+    # A dirty tree here would fail worktree creation and finalise the entry to
+    # 'failed' — out of the 'needs_review' status resume requires. Check first
+    # so the entry stays resumable and the user can retry after cleaning up.
+    _preflight_worktree_clean(config, work_type)
 
     audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
     artifacts = ArtifactStore(base_path=config.artifact_path)
@@ -1250,6 +1281,13 @@ async def restart_work(
     work_type = entry.get("work_type", "spec")
     description = entry.get("description", "")
 
+    # Bail before any destructive setup (artifact wipe, checkpoint purge,
+    # status→running) if the tree is dirty: otherwise worktree creation fails
+    # mid-restart and finalises the entry to 'failed', which is not in this
+    # path's restartable set — stranding the work. Failing here leaves the
+    # original restartable status intact so the user can retry once clean.
+    _preflight_worktree_clean(config, work_type)
+
     audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
     artifact_store = ArtifactStore(base_path=config.artifact_path)
 
@@ -1403,6 +1441,12 @@ async def restart_from_phase(
             f"Phase '{phase_name}' is not valid for work type '{work_type}'. "
             f"Valid phases: {valid_phases}"
         )
+
+    # Check the tree is clean before clearing artifacts / purging the
+    # checkpoint / marking running — a dirty tree fails worktree creation
+    # later, and doing the destructive setup first would discard recoverable
+    # state for a run that can't start. Raising here keeps the entry retryable.
+    _preflight_worktree_clean(config, work_type)
 
     audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
     artifact_store = ArtifactStore(base_path=config.artifact_path)
@@ -2456,6 +2500,15 @@ async def approve_and_spawn(
             f"execution_waves in its checkpoint state and none could be rebuilt "
             f"from plan.json feature_slices."
         )
+
+    # Preflight the worktree precondition BEFORE touching status. The
+    # IMPLEMENT-onward run is code-producing, so it needs a clean tree to
+    # create its sandbox worktree. Checking here means a dirty tree raises
+    # while the entry is still awaiting_approval — so the user can stash /
+    # commit and re-approve. Done after the status mutation below, the same
+    # failure would have left the entry stuck running→failed, stranding the
+    # plan (re-approval is rejected once status leaves awaiting_approval).
+    _preflight_worktree_clean(config, exec_work_type)
 
     # Re-key the work item to its execution type so status/restart logic uses the
     # IMPLEMENT/VERIFY sequence and it will NOT relabel back to awaiting_approval.

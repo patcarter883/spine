@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -145,14 +146,31 @@ class TestApproveAndSpawn:
     SPAWNED_IDS = ["spawned-1", "spawned-2"]
 
     def _make_config(self, tmpdir: str) -> SpineConfig:
-        """Create a SpineConfig with isolated work_entries.db."""
+        """Create a SpineConfig with isolated work_entries.db.
+
+        ``workspace_root`` points at a freshly-initialised (clean) git repo
+        so the worktree preflight in the approval path passes. The queue /
+        artifact / checkpoint stores live outside that repo so they don't
+        dirty it.
+        """
         config = SpineConfig()
         config.queue_path = str(Path(tmpdir) / "queue.db")
         config.artifact_path = str(Path(tmpdir) / "artifacts")
         config.checkpoint_path = str(Path(tmpdir) / "checkpoint.db")
-        config.workspace_root = str(Path(tmpdir))
+        config.workspace_root = self._init_clean_repo(tmpdir)
         config.ensure_dirs()
         return config
+
+    def _init_clean_repo(self, tmpdir: str) -> str:
+        """Create a clean git repo under *tmpdir* and return its path."""
+        repo = Path(tmpdir) / "repo"
+        repo.mkdir(exist_ok=True)
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        return str(repo)
+
+    def _dirty_repo(self, config: SpineConfig) -> None:
+        """Leave an uncommitted change in the workspace git tree."""
+        (Path(config.workspace_root) / "scratch.txt").write_text("wip", encoding="utf-8")
 
     def _insert_plan_entry(
         self,
@@ -249,6 +267,87 @@ class TestApproveAndSpawn:
             assert kwargs["start_from_phase"] == "implement"
             assert kwargs["is_restart"] is True
             assert kwargs["initial_state"]["execution_waves"] == saved_state["execution_waves"]
+
+    # ── Dirty tree stays retryable ────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_approve_on_dirty_tree_raises_and_stays_retryable(self):
+        """Approving while the git tree is dirty raises *before* any status
+        mutation, so the entry is left awaiting_approval — retryable once the
+        tree is cleaned — rather than progressed to running/failed."""
+        from spine.exceptions import SandboxPreparationError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._make_config(tmpdir)
+            self._insert_plan_entry(config)
+            self._dirty_repo(config)
+
+            saved_state = {
+                "execution_waves": [[{"id": "slice-1", "title": "Do it"}]],
+                "plan_json": {"feature_slices": [{"id": "slice-1"}]},
+            }
+            mock_ckpt = MagicMock()
+            mock_ckpt.get_state = AsyncMock(return_value=saved_state)
+            mock_ckpt.delete_state = AsyncMock(return_value=True)
+            run_graph = AsyncMock()
+
+            with (
+                patch("spine.work.dispatcher.AuditService", MagicMock()),
+                patch("spine.persistence.checkpoint.CheckpointStore", return_value=mock_ckpt),
+                patch("spine.work.dispatcher._run_workflow_graph", run_graph),
+            ):
+                from spine.work.dispatcher import approve_and_spawn
+
+                with pytest.raises(SandboxPreparationError, match="not clean"):
+                    await approve_and_spawn(config=config, plan_id=self.PLAN_ID)
+
+            # Untouched: still awaiting_approval + reviewed_task, graph never ran.
+            db = _get_work_db(config)
+            entry = db["work_entries"].get(self.PLAN_ID)
+            assert entry["status"] == "awaiting_approval"
+            assert entry["work_type"] == "reviewed_task"
+            run_graph.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_approve_retry_succeeds_after_cleaning_tree(self):
+        """After a dirty-tree failure, cleaning the tree and re-approving the
+        same (still awaiting_approval) plan succeeds."""
+        from spine.exceptions import SandboxPreparationError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._make_config(tmpdir)
+            self._insert_plan_entry(config)
+            self._dirty_repo(config)
+
+            saved_state = {
+                "execution_waves": [[{"id": "slice-1", "title": "Do it"}]],
+                "plan_json": {"feature_slices": [{"id": "slice-1"}]},
+            }
+            mock_ckpt = MagicMock()
+            mock_ckpt.get_state = AsyncMock(return_value=saved_state)
+            mock_ckpt.delete_state = AsyncMock(return_value=True)
+            run_graph = AsyncMock(
+                return_value={"work_id": self.PLAN_ID, "status": "completed", "work_type": "task"}
+            )
+
+            with (
+                patch("spine.work.dispatcher.AuditService", MagicMock()),
+                patch("spine.persistence.checkpoint.CheckpointStore", return_value=mock_ckpt),
+                patch("spine.work.dispatcher._run_workflow_graph", run_graph),
+            ):
+                from spine.work.dispatcher import approve_and_spawn
+
+                # First attempt fails on the dirty tree.
+                with pytest.raises(SandboxPreparationError):
+                    await approve_and_spawn(config=config, plan_id=self.PLAN_ID)
+
+                # Clean the tree, then retry — the status guard still allows it.
+                (Path(config.workspace_root) / "scratch.txt").unlink()
+                result = await approve_and_spawn(config=config, plan_id=self.PLAN_ID)
+
+            assert result["status"] == "completed"
+            assert result["continued_from"] == "implement"
+            run_graph.assert_awaited_once()
 
     # ── No recoverable plan state ─────────────────────────────────────────
 
@@ -449,6 +548,80 @@ class TestApproveAndSpawn:
 
                 with pytest.raises(ValueError, match="not found"):
                     await approve_and_spawn(config=config, plan_id="nonexistent-plan")
+
+
+class TestDirtyTreeRetryable:
+    """A dirty git tree must fail a code-producing re-run *before* it moves the
+    work entry out of the status its own retry path accepts — otherwise the
+    entry lands in 'failed' and can never be retried, even after cleaning up."""
+
+    def _make_config(self, tmpdir: str) -> SpineConfig:
+        repo = Path(tmpdir) / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        config = SpineConfig()
+        config.queue_path = str(Path(tmpdir) / "queue.db")
+        config.artifact_path = str(Path(tmpdir) / "artifacts")
+        config.checkpoint_path = str(Path(tmpdir) / "checkpoint.db")
+        config.workspace_root = str(repo)
+        config.ensure_dirs()
+        return config
+
+    def _insert(self, config: SpineConfig, work_id: str, status: str) -> None:
+        db = _get_work_db(config)
+        db["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": "a job",
+                "work_type": "task",  # code-producing → worktree required
+                "status": status,
+                "current_phase": "implement",
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:00:00",
+                "result": "{}",
+            }
+        )
+
+    def _dirty(self, config: SpineConfig) -> None:
+        (Path(config.workspace_root) / "scratch.txt").write_text("wip", encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_resume_on_dirty_tree_stays_needs_review(self):
+        """resume_work only accepts 'needs_review'; a dirty tree must not flip
+        the entry to 'failed' and lock it out of being resumed again."""
+        from spine.exceptions import SandboxPreparationError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._make_config(tmpdir)
+            self._insert(config, "w1", status="needs_review")
+            self._dirty(config)
+
+            with patch("spine.work.dispatcher.AuditService", MagicMock()):
+                from spine.work.dispatcher import resume_work
+
+                with pytest.raises(SandboxPreparationError, match="not clean"):
+                    await resume_work("w1", "fix it", config=config)
+
+            assert _get_work_db(config)["work_entries"].get("w1")["status"] == "needs_review"
+
+    @pytest.mark.asyncio
+    async def test_restart_on_dirty_tree_keeps_restartable_status(self):
+        """restart_work's restartable set excludes 'failed'; a dirty tree must
+        leave the original (running) status intact so it stays restartable."""
+        from spine.exceptions import SandboxPreparationError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._make_config(tmpdir)
+            self._insert(config, "w1", status="running")
+            self._dirty(config)
+
+            with patch("spine.work.dispatcher.AuditService", MagicMock()):
+                from spine.work.dispatcher import restart_work
+
+                with pytest.raises(SandboxPreparationError, match="not clean"):
+                    await restart_work("w1", config=config)
+
+            assert _get_work_db(config)["work_entries"].get("w1")["status"] == "running"
 
 
 class TestGhostPrevention:

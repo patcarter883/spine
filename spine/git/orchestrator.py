@@ -164,15 +164,18 @@ class SpineGitOrchestrator:
 
     # ── lifecycle ──
 
-    def prepare_sandbox(self) -> str:
-        """Create the isolated sandbox worktree or branch.
+    def ensure_tree_clean(self) -> None:
+        """Raise if the master working tree has uncommitted changes.
 
-        Returns:
-            The absolute sandbox directory path.
+        This is the precondition :meth:`prepare_sandbox` enforces, factored
+        out so callers can check it *without* the side effect of creating a
+        worktree. A dirty tree leaves no state behind, so a caller can run
+        this before mutating any status and remain retryable once the tree
+        is cleaned.
 
         Raises:
-            SandboxPreparationError: If the working tree is dirty or the
-                git command to create the sandbox fails.
+            SandboxPreparationError: If git status reports a dirty tree or
+                the status command itself fails.
         """
         ok, stdout, stderr = self._execute_shell(
             "git status --porcelain", cwd=self.master_dir
@@ -186,6 +189,18 @@ class SpineGitOrchestrator:
                 "Working tree is not clean; commit or stash changes before "
                 "preparing a sandbox."
             )
+
+    def prepare_sandbox(self) -> str:
+        """Create the isolated sandbox worktree or branch.
+
+        Returns:
+            The absolute sandbox directory path.
+
+        Raises:
+            SandboxPreparationError: If the working tree is dirty or the
+                git command to create the sandbox fails.
+        """
+        self.ensure_tree_clean()
 
         token = uuid.uuid4().hex[:8]
         branch = f"{self.branch_prefix}{token}"
