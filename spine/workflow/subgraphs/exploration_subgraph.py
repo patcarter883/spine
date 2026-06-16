@@ -22,6 +22,7 @@ import logging
 from typing import Any, Literal
 
 import json
+import re
 from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
@@ -872,7 +873,9 @@ async def _synthesize_plan(
             "first. Synthesize the spec + findings into structured "
             "feature_slices and call `write_structured_plan` exactly "
             "once — the tool writes both plan.md and plan.json for you. "
-            "Do not call write_file."
+            "Do not call write_file. Every slice MUST list its "
+            "`target_files` (the concrete file paths it creates or "
+            "modifies) — never leave that array empty."
         )
 
         # ── Inline the specification (trace 019eb52c) ────────────────────
@@ -939,13 +942,23 @@ async def _synthesize_plan(
                 )
             findings_text = _format_findings(findings, budget=alloc.findings)
 
+        # ── Cache-stable block order (trace 019ec997) ───────────────────
+        # The large evidence blocks (objective + spec + findings) and the
+        # scratchpad are byte-identical across a structural retry, so keeping
+        # them as a contiguous prefix lets the retry's first turn reuse the
+        # prior attempt's prompt-cache prefix. CRITIC_FEEDBACK is the only
+        # block that appears/changes on a rework pass — placing it LAST (right
+        # before the instruction) keeps the cacheable prefix stable AND lands
+        # the feedback in the model's high-attention tail. Injecting it mid-
+        # prompt (the old order) shifted every following byte and forced a
+        # full cache miss on the retry call (trace 019ec997 call 5: cache=0).
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
                 (Tag.SPECIFICATION, spec_body),
                 (Tag.FINDINGS, findings_text),
-                (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
+                (Tag.CRITIC_FEEDBACK, feedback_body),
             ),
             instruction,
         )
@@ -1109,6 +1122,35 @@ async def _synthesize_plan(
                 plan_data = json.loads(raw)
                 plan_json_str = raw
                 logger.info("[%s] Read plan.json (%d chars)", work_id, len(raw))
+
+                # ── Deterministic target_files recovery (trace 019ec997) ──
+                # The synthesizer routinely leaves slice ``target_files`` empty
+                # while naming those same files in its prose, so the PLAN critic
+                # rejects the plan and spins it through rework until a human
+                # cancels (trace 019ec997: 3 rework cycles, all flagging empty
+                # target_files, then a manual stop with zero artifacts). Recover
+                # the paths it already wrote before the critic ever sees them,
+                # then re-persist so the on-disk plan.json the critic loads is
+                # already fixed.
+                known_paths = sorted(
+                    {
+                        p
+                        for f in findings
+                        if isinstance(f, dict)
+                        for p in (f.get("file_map") or {})
+                    }
+                )
+                if _backfill_target_files(plan_data, known_paths, work_id):
+                    raw = json.dumps(plan_data, indent=2, ensure_ascii=False)
+                    try:
+                        plan_json_path.write_text(raw, encoding="utf-8")
+                        plan_json_str = raw
+                    except OSError as exc:
+                        logger.warning(
+                            "[%s] PLAN backfill: could not re-persist plan.json "
+                            "(%s) — proceeding with in-memory plan",
+                            work_id, exc,
+                        )
 
                 wave_error: str | None = None
                 execution_waves, wave_error = _compute_waves(plan_data, work_id)
@@ -1288,14 +1330,16 @@ async def _synthesize_specify(
                 chunks = _compress_recall_chunks(chunks, budget_tokens=alloc.recall)
             recall_body = _format_retrieved_context(chunks, budget=alloc.recall)
 
+        # CRITIC_FEEDBACK placed last for cache-stable prefixes across rework
+        # passes (mirrors _synthesize_plan; trace 019ec997).
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
                 (Tag.SPECIFICATION, prior_spec_body),
                 (Tag.FINDINGS, findings_text),
                 (Tag.RETRIEVED_CODE, recall_body),
-                (Tag.CRITIC_FEEDBACK, feedback_body),
                 (Tag.SCRATCHPAD, scratchpad),
+                (Tag.CRITIC_FEEDBACK, feedback_body),
             ),
             instruction,
         )
@@ -1337,6 +1381,87 @@ async def _synthesize_specify(
             "agent_response": f"Synthesis error: {e}",
             "phase_status": "error",
         }
+
+
+# Path-like token: at least one ``dir/`` segment followed by a ``name.ext``.
+# Matches real source paths the synthesizer names inline in its slice prose
+# (e.g. ``spine/ui_api/api.py``) without grabbing bare words or sentence-final
+# punctuation. Trailing dots/commas are excluded by requiring the extension to
+# end on a word char.
+_PATHISH_RE = re.compile(r"(?:[\w.-]+/)+[\w-]+\.[A-Za-z0-9]+")
+
+
+def _slice_prose(slice_dict: dict[str, Any]) -> str:
+    """Concatenate the free-text fields of a slice that may name file paths."""
+    parts: list[str] = [
+        str(slice_dict.get("title", "")),
+        str(slice_dict.get("execution_requirements", "")),
+    ]
+    ac = slice_dict.get("acceptance_criteria")
+    if isinstance(ac, list):
+        parts.extend(str(item) for item in ac)
+    return "\n".join(p for p in parts if p)
+
+
+def _derive_target_files(slice_dict: dict[str, Any], known_paths: list[str]) -> list[str]:
+    """Best-effort recovery of a slice's target files from its own prose.
+
+    The synthesizer reliably *names* the files it will touch inside
+    ``execution_requirements`` (trace 019ec997: "Add four methods to the UIApi
+    class in spine/ui_api/api.py …") yet leaves the structured ``target_files``
+    array empty — which the PLAN critic rejects, spinning the phase through
+    rework until a human cancels. Rather than round-trip the model again, we
+    mine the paths it already wrote: first the research ``file_map`` paths it
+    mentions (known-real), then any remaining path-shaped tokens (covers
+    not-yet-existing files the slice will create). Order-preserving, de-duped.
+    """
+    text = _slice_prose(slice_dict)
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    # 1. Known real paths from research findings, mentioned in the slice.
+    for path in known_paths:
+        if path and path in text and path not in seen:
+            found.append(path)
+            seen.add(path)
+    # 2. Path-shaped tokens (e.g. new files the slice creates) not already seen.
+    for match in _PATHISH_RE.findall(text):
+        if match not in seen:
+            found.append(match)
+            seen.add(match)
+    return found
+
+
+def _backfill_target_files(
+    plan_data: dict[str, Any],
+    known_paths: list[str],
+    work_id: str,
+) -> int:
+    """Populate empty ``target_files`` on each slice from the slice's prose.
+
+    Mutates ``plan_data`` in place. Returns the number of slices backfilled so
+    the caller can decide whether to re-persist plan.json. A slice whose prose
+    names no path is left empty (the critic will still flag it — backfill is a
+    best-effort recovery, not a guarantee).
+    """
+    slices = plan_data.get("feature_slices")
+    if not isinstance(slices, list):
+        return 0
+    backfilled = 0
+    for s in slices:
+        if not isinstance(s, dict) or s.get("target_files"):
+            continue
+        derived = _derive_target_files(s, known_paths)
+        if derived:
+            s["target_files"] = derived
+            backfilled += 1
+            logger.info(
+                "[%s] PLAN backfill: slice %r had empty target_files — "
+                "derived %d from slice prose: %s",
+                work_id, s.get("id", "?"), len(derived), ", ".join(derived),
+            )
+    return backfilled
 
 
 def _compute_waves(
