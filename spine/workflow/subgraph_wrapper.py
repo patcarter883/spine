@@ -9,12 +9,14 @@ Each wrapper:
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from spine.agents.artifacts import scan_artifact_dir
 from spine.agents.retry import MaxTokenBudgetExceeded
 from spine.exceptions import CriticalContractFailure
 from spine.models.state import WorkflowState
@@ -27,6 +29,13 @@ logger = logging.getLogger(__name__)
 # before escalating to human review. One retry covers the common case of a
 # weak model failing the structured-output contract on the first roll.
 _MAX_STRUCTURAL_RETRIES = 1
+
+# Floor on the wall-clock that must remain (when a phase timeout is set) before
+# a structural retry is allowed to start. A retry launched with less budget than
+# the prior attempt consumed would be cancelled mid-synthesis and discard all of
+# its work (trace 019ec997), so we salvage the prior phases instead. Only
+# consulted when a non-zero phase timeout is configured.
+_MIN_RETRY_BUDGET_SECS = 30.0
 
 # ── Per-phase checkpoint store ─────────────────────────────────────────
 # Cache to avoid opening the same phase DB multiple times per workflow.
@@ -206,13 +215,44 @@ def _error_update(
     }
 
 
+def _salvaged_artifact_names(state: WorkflowState, phase: str) -> list[str]:
+    """Names of any artifacts the phase already wrote to disk before aborting.
+
+    The structured-write tools (``write_specification`` /
+    ``write_structured_plan``) persist their output to
+    ``.spine/artifacts/{work_id}/{phase}/`` *themselves*, before the subgraph's
+    save node runs. So a cancellation, timeout, or budget abort that lands after
+    the write but before the phase completes leaves valid artifacts stranded on
+    disk. Reporting ``artifact_count=0`` in that case is misleading (trace
+    019ec997: plan.json was on disk yet the phase claimed zero artifacts) and
+    hides reusable work. This best-effort scan lets the abort handlers tell the
+    truth so a human/retry can reuse what's already there.
+    """
+    work_id = state.get("work_id", "unknown")
+    workspace_root = state.get("workspace_root", ".")
+    try:
+        disk = scan_artifact_dir(workspace_root, work_id, phase)
+    except Exception:  # never let salvage reporting mask the original abort
+        logger.debug("[%s] [%s] artifact salvage scan failed", work_id, phase, exc_info=True)
+        return []
+    return sorted(disk.keys())
+
+
 def _needs_review_update(
     state: WorkflowState,
     phase: str,
     reason: str,
     suggestions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a parent state update for needs_review."""
+    """Build a parent state update for needs_review.
+
+    If the phase already persisted artifacts to disk before aborting, surface
+    them honestly (``artifact_count``/``artifact_names``) and note that they
+    were preserved, rather than reporting zero artifacts.
+    """
+    salvaged = _salvaged_artifact_names(state, phase)
+    if salvaged:
+        reason = f"{reason} (Artifacts preserved on disk: {', '.join(salvaged)}.)"
     return {
         "current_phase": phase,
         "status": "needs_review",
@@ -229,8 +269,8 @@ def _needs_review_update(
             phase: {
                 "phase": phase,
                 "status": "needs_review",
-                "artifact_count": 0,
-                "artifact_names": [],
+                "artifact_count": len(salvaged),
+                "artifact_names": salvaged,
                 "error": reason,
             }
         },
@@ -324,6 +364,14 @@ def make_subgraph_node(
             # node (with the bad agent output checkpointed) and re-raise without
             # re-running the agent.
             max_attempts = 1 + _MAX_STRUCTURAL_RETRIES
+            # When a timeout is configured it is a budget for the WHOLE phase,
+            # not a fresh allowance per attempt — otherwise a 2-attempt phase
+            # could run for 2× the timeout. Track elapsed wall-clock so each
+            # attempt sees only the remaining budget and a doomed retry is
+            # skipped before it starts (trace 019ec997). When timeout == 0
+            # (the default) all of this is inert and behaviour is unchanged.
+            phase_start = time.monotonic()
+            last_attempt_secs = 0.0
             for attempt in range(max_attempts):
                 attempt_configurable = dict(base_configurable)
                 if attempt > 0:
@@ -332,14 +380,45 @@ def make_subgraph_node(
                     )
                 subgraph_config = {"configurable": attempt_configurable}
 
+                attempt_timeout = 0.0
+                if timeout > 0:
+                    remaining = timeout - (time.monotonic() - phase_start)
+                    # A retry that can't plausibly finish in the time left would
+                    # be cancelled mid-synthesis, discarding its work and the
+                    # prior attempt's. Salvage instead of burning the budget.
+                    if attempt > 0:
+                        needed = max(last_attempt_secs, _MIN_RETRY_BUDGET_SECS)
+                        if remaining < needed:
+                            logger.warning(
+                                f"[{work_id}] [{phase_name}] skipping structural "
+                                f"retry: {remaining:.0f}s of the {timeout}s budget "
+                                f"left, prior attempt needed {last_attempt_secs:.0f}s"
+                            )
+                            return _needs_review_update(
+                                parent_state,
+                                phase_name,
+                                (
+                                    f"Structural retry skipped — only {remaining:.0f}s "
+                                    f"of the {timeout}s phase budget remained after the "
+                                    "first attempt. Prior phases preserved."
+                                ),
+                                suggestions=[
+                                    "Raise the phase timeout if the scope warrants it",
+                                    "Reduce scope or split into smaller work items",
+                                ],
+                            )
+                    attempt_timeout = max(remaining, 0.0)
+
+                attempt_start = time.monotonic()
                 try:
                     # Invoke with or without timeout (0 = no timeout)
                     raw_coro = active_subgraph.ainvoke(subgraph_input, subgraph_config)
                     if timeout > 0:
-                        result = await asyncio.wait_for(raw_coro, timeout=timeout)
+                        result = await asyncio.wait_for(raw_coro, timeout=attempt_timeout)
                     else:
                         result = await raw_coro
                 except CriticalContractFailure as cf:
+                    last_attempt_secs = time.monotonic() - attempt_start
                     if attempt + 1 < max_attempts:
                         # Seed whatever the failed attempt salvaged (e.g.
                         # exploration findings that preceded a failed

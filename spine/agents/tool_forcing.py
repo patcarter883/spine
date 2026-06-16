@@ -21,6 +21,17 @@ cannot answer in prose while the required tool is still outstanding:
   ``tool_choice`` untouched) so the agent loop can emit a normal terminal
   message and finish.  Without this release the forced-call loop would never
   terminate — the model would be compelled to keep calling tools forever.
+- Once ``final_tool`` has reported success, also *end the agent immediately*
+  (``before_model`` jumps to ``"end"``) instead of letting it make one more
+  model call to emit a goodbye message.  The structured artifact is already
+  on disk — the write tools persist it themselves — so that trailing call is
+  pure waste, and worse, it is a cancellation/timeout window in which already
+  completed work can be discarded: in trace ``019ec997`` the plan was written
+  to ``plan.json`` and then a ``CancelledError`` landed in the trailing model
+  call, so the subgraph result (and the recognized artifact) was thrown away
+  even though the file was on disk.  Skipping the trailing call closes that
+  window and is provider-agnostic (unlike the ``tool_choice`` forcing above,
+  which only applies to OpenAI-style models).
 
 ``tool_choice`` flows straight into ``model.bind_tools(tool_choice=...)``
 (see ``langchain/agents/factory.py``), which every OpenAI-style provider
@@ -66,7 +77,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, ToolMessage
 
 from spine.agents.helpers import _is_openai_style_model
@@ -235,7 +246,30 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
             return request
         return request.override(**overrides)
 
+    def _should_end(self, state: Any) -> dict[str, Any] | None:
+        """Jump to ``end`` once ``final_tool`` has already succeeded.
+
+        Runs before each model call. The first time it fires the final tool
+        has not been called yet, so it is a no-op; once the structured write
+        has landed (and its ToolMessage is in history) there is nothing left
+        for the agent to do, so we skip the otherwise-wasted trailing model
+        call. Unlike the ``tool_choice`` forcing, this is provider-agnostic:
+        the trailing call is wasteful and cancellation-prone for every model.
+        """
+        messages = list((state or {}).get("messages") or [])
+        if self._final_tool_succeeded(messages):
+            return {"jump_to": "end"}
+        return None
+
     # ── middleware hooks (sync + async) ─────────────────────────────────
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state, runtime=None):
+        return self._should_end(state)
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime=None):
+        return self._should_end(state)
 
     def wrap_model_call(self, request, handler):
         return handler(self._apply(request))

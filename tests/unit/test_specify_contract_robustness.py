@@ -238,6 +238,64 @@ class TestForceToolMiddleware:
         ]
         assert mw._gate_dropped_tools(self._req_with_tools(_openai_model(), msgs, self.TOOLS)) is None
 
+    # ── end-after-final-write short-circuit (trace 019ec997) ────────────────
+    # Once the structured write lands the artifact is already on disk, so the
+    # trailing model call is pure waste — and a cancellation window in which
+    # completed work can be discarded. ``before_model`` jumps straight to end.
+
+    _DONE = [
+        HumanMessage("do it"),
+        AIMessage("", tool_calls=[{"name": "write_specification", "args": {}, "id": "w"}]),
+        ToolMessage(
+            "specification.md (10 chars) and specification.json (20 chars) "
+            "written to .spine/artifacts/w/specify/.",
+            tool_call_id="w",
+            name="write_specification",
+        ),
+    ]
+
+    def test_before_model_no_jump_before_write(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification")
+        assert mw._should_end({"messages": [HumanMessage("x")]}) is None
+
+    def test_before_model_ends_after_successful_write(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification")
+        assert mw._should_end({"messages": self._DONE}) == {"jump_to": "end"}
+
+    def test_before_model_does_not_end_on_failed_write(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification")
+        msgs = [
+            HumanMessage("do it"),
+            AIMessage("", tool_calls=[{"name": "write_specification", "args": {}, "id": "w"}]),
+            ToolMessage(
+                "VALIDATION_ERROR: rejected.", tool_call_id="w", name="write_specification"
+            ),
+        ]
+        assert mw._should_end({"messages": msgs}) is None
+
+    def test_before_model_short_circuit_is_provider_agnostic(self):
+        # Unlike tool_choice forcing (OpenAI-only), ending after the write is
+        # correct for every provider — the wasted/cancellation-prone trailing
+        # call happens regardless of model.
+        mw = ForceToolUntilCalledMiddleware("write_specification")
+        # _should_end never inspects the model, so no model is needed at all.
+        assert mw._should_end({"messages": self._DONE}) == {"jump_to": "end"}
+
+    def test_before_model_hooks_declare_end_jump(self):
+        # The factory wires the conditional "→ end" edge only if the hook
+        # advertises can_jump_to=["end"] via __can_jump_to__.
+        assert getattr(ForceToolUntilCalledMiddleware.before_model, "__can_jump_to__", None) == [
+            "end"
+        ]
+        assert getattr(ForceToolUntilCalledMiddleware.abefore_model, "__can_jump_to__", None) == [
+            "end"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_abefore_model_ends_after_successful_write(self):
+        mw = ForceToolUntilCalledMiddleware("write_specification")
+        assert await mw.abefore_model({"messages": self._DONE}, None) == {"jump_to": "end"}
+
 
 # ── Layer 3: structural retry in the subgraph wrapper ───────────────────────
 
