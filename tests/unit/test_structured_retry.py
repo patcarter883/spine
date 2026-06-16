@@ -112,6 +112,127 @@ async def test_first_attempt_success_makes_one_call():
     assert len(model.calls) == 1
 
 
+# ── transient API/transport retry (mid-stream SSE break, 5xx, dropped socket) ──
+
+
+def _bare_api_error(msg: str = "An error occurred during streaming"):
+    """The exact shape llama.cpp/vLLM raise on a mid-stream SSE break."""
+    import httpx
+    from openai import APIError
+
+    return APIError(msg, request=httpx.Request("POST", "http://local/v1"), body=None)
+
+
+def _status_error(status: int):
+    import httpx
+    from openai import APIStatusError
+
+    req = httpx.Request("POST", "http://local/v1")
+    return APIStatusError("x", response=httpx.Response(status, request=req), body=None)
+
+
+def test_retryable_api_error_classification():
+    from openai import APIConnectionError, APITimeoutError
+
+    from spine.agents.helpers import _retryable_api_error
+
+    import httpx
+
+    req = httpx.Request("POST", "http://local/v1")
+    # Transient transport failures → retry.
+    assert _retryable_api_error(_bare_api_error()) is True
+    assert _retryable_api_error(APIConnectionError(request=req)) is True
+    assert _retryable_api_error(APITimeoutError(request=req)) is True
+    assert _retryable_api_error(_status_error(503)) is True
+    assert _retryable_api_error(_status_error(429)) is True
+    # Deterministic client errors → do not retry.
+    assert _retryable_api_error(_status_error(400)) is False
+    assert _retryable_api_error(_status_error(404)) is False
+    # Unrelated exceptions → not our concern.
+    assert _retryable_api_error(ValueError("x")) is False
+    assert _retryable_api_error(RuntimeError("x")) is False
+
+
+@pytest.mark.asyncio
+async def test_retries_transient_api_error_then_succeeds():
+    sentinel = object()
+    model = _FakeStructuredModel([_bare_api_error(), sentinel])
+
+    result = await ainvoke_structured_with_retry(
+        model, [("human", "go")], api_backoff=0, label="t"
+    )
+
+    assert result is sentinel
+    assert len(model.calls) == 2
+    # Transport retries resend the request verbatim — no nudge appended.
+    assert model.calls[1] == [("human", "go")]
+
+
+@pytest.mark.asyncio
+async def test_transient_api_error_reraises_after_api_retries_exhausted():
+    model = _FakeStructuredModel([_bare_api_error(), _bare_api_error(), _bare_api_error()])
+
+    from openai import APIError
+
+    with pytest.raises(APIError):
+        await ainvoke_structured_with_retry(
+            model, [], api_retries=2, api_backoff=0, label="t"
+        )
+
+    assert len(model.calls) == 3  # initial + 2 retries, then re-raise
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_status_error_propagates_immediately():
+    model = _FakeStructuredModel([_status_error(400), "unreached"])
+
+    from openai import APIStatusError
+
+    with pytest.raises(APIStatusError):
+        await ainvoke_structured_with_retry(model, [], api_backoff=0, label="t")
+
+    assert len(model.calls) == 1  # 4xx is not retried
+
+
+@pytest.mark.asyncio
+async def test_api_retries_zero_disables_transport_retry():
+    model = _FakeStructuredModel([_bare_api_error(), "unreached"])
+
+    from openai import APIError
+
+    with pytest.raises(APIError):
+        await ainvoke_structured_with_retry(
+            model, [], api_retries=0, api_backoff=0, label="t"
+        )
+
+    assert len(model.calls) == 1
+
+
+# ── disable_streaming ───────────────────────────────────────────────────
+
+
+class TestDisableStreaming:
+    def test_turns_streaming_off(self):
+        from spine.agents.helpers import disable_streaming
+
+        model = _local_chat_openai(streaming=True)
+        assert disable_streaming(model).streaming is False
+
+    def test_returns_a_copy_leaving_original_untouched(self):
+        from spine.agents.helpers import disable_streaming
+
+        model = _local_chat_openai(streaming=True)
+        copy = disable_streaming(model)
+        assert copy is not model
+        assert model.streaming is True
+
+    def test_fails_open_on_non_model(self):
+        from spine.agents.helpers import disable_streaming
+
+        sentinel = object()
+        assert disable_streaming(sentinel) is sentinel
+
+
 # ── suppress_reasoning ──────────────────────────────────────────────────
 
 

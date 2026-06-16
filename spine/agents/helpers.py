@@ -8,6 +8,7 @@ to eliminate duplication and ensure consistent behavior.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import warnings
@@ -228,6 +229,28 @@ def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
         return model.model_copy(update={"extra_body": extra})
     except Exception:
         logger.debug("suppress_reasoning: copy failed — using model as-is", exc_info=True)
+        return model
+
+
+def disable_streaming(model: BaseChatModel) -> BaseChatModel:
+    """Return a model_copy with streaming off — for single-shot structured calls.
+
+    The model builders force ``streaming=True`` so LangGraph's
+    ``stream_mode=["messages"]`` keeps the stall timer alive during long agent
+    loops (see ``_build_local_model`` / ``_build_openrouter_model``). But a
+    one-shot ``ainvoke()`` of a tiny structured decision (e.g. the
+    ``research_manager``'s ``explore``/``done`` choice) is not an agent loop: it
+    gains nothing from token streaming, and on local llama.cpp/vLLM backends a
+    mid-stream SSE break surfaces as ``openai.APIError('An error occurred during
+    streaming')`` that aborts the whole call at zero tokens (trace 019ecdea).
+    Routing it through the non-streaming completions endpoint removes that
+    failure mode — and the final response still carries usage, so token
+    accounting is unaffected. Fails open on any error.
+    """
+    try:
+        return model.model_copy(update={"streaming": False})
+    except Exception:
+        logger.debug("disable_streaming: copy failed — using model as-is", exc_info=True)
         return model
 
 
@@ -482,11 +505,42 @@ def is_empty_structured_parse(exc: BaseException) -> bool:
     return isinstance(exc, ValueError) and _EMPTY_STRUCTURED_PARSE_MARKER in str(exc)
 
 
+def _retryable_api_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a transient OpenAI-compatible transport failure.
+
+    Targets the failure modes that resolve on a retry of the *same* request:
+
+    - bare ``openai.APIError`` — what local llama.cpp/vLLM backends raise on a
+      mid-stream SSE break (``"An error occurred during streaming"``, trace
+      019ecdea); it has no ``status_code`` so it's not an ``APIStatusError``;
+    - ``APIConnectionError`` / ``APITimeoutError`` — dropped or stalled sockets;
+    - 5xx and 429 ``APIStatusError`` — server-side / rate-limit hiccups.
+
+    Deterministic client errors (400/401/404/422 ``BadRequestError`` etc.) are
+    *not* retryable — re-sending the identical request just fails again — so
+    they return ``False`` and propagate to the caller's fallback unchanged.
+    Returns ``False`` for any non-OpenAI exception (and if ``openai`` can't be
+    imported), so the caller's existing handling is never widened.
+    """
+    try:
+        from openai import APIError, APIStatusError
+    except Exception:
+        return False
+    if not isinstance(exc, APIError):
+        return False
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        return status is None or status >= 500 or status == 429
+    return True
+
+
 async def ainvoke_structured_with_retry(
     structured_model: Any,
     messages: list[Any],
     *,
     retries: int = 1,
+    api_retries: int = 2,
+    api_backoff: float = 0.5,
     label: str = "structured-output",
 ) -> Any:
     """Invoke a structured-output model, retrying transient empty parses.
@@ -497,6 +551,13 @@ async def ainvoke_structured_with_retry(
     retry up to ``retries`` times, appending a short nudge so a deterministic
     decoder doesn't simply reproduce the empty result.
 
+    Transient transport failures — a mid-stream SSE break on a local backend
+    (``openai.APIError``), dropped sockets, 5xx/429 — are retried separately up
+    to ``api_retries`` times with exponential backoff and *no* nudge (the
+    request was well-formed; only the connection broke). See
+    :func:`_retryable_api_error` for exactly which errors qualify; deterministic
+    4xx client errors are never retried.
+
     Every other exception — including ``LengthFinishReasonError`` — propagates
     immediately, and the empty-parse ``ValueError`` re-raises once ``retries``
     are exhausted, so each caller's existing ``try/except`` fallback still runs
@@ -505,7 +566,12 @@ async def ainvoke_structured_with_retry(
     Args:
         structured_model: A model already bound via ``with_structured_output``.
         messages: Messages to invoke with; never mutated.
-        retries: Max extra attempts after the first (default 1 → up to 2 calls).
+        retries: Max extra attempts after the first on empty parse (default 1 →
+            up to 2 calls).
+        api_retries: Max extra attempts on a transient API/transport error
+            (default 2). Set to 0 to disable transport retries.
+        api_backoff: Base seconds for exponential backoff between transport
+            retries (delay = ``api_backoff * 2**(n-1)``).
         label: Identifier used in the retry log line.
 
     Returns:
@@ -518,6 +584,7 @@ async def ainvoke_structured_with_retry(
         )
     )
     attempt = 0
+    api_attempt = 0
     while True:
         invoke_messages = messages if attempt == 0 else [*messages, nudge]
         try:
@@ -532,6 +599,20 @@ async def ainvoke_structured_with_retry(
                 attempt,
                 retries,
             )
+        except Exception as exc:
+            if api_attempt >= api_retries or not _retryable_api_error(exc):
+                raise
+            api_attempt += 1
+            delay = api_backoff * (2 ** (api_attempt - 1))
+            logger.warning(
+                "%s: transient API error %s — retrying (%d/%d) after %.1fs",
+                label,
+                type(exc).__name__,
+                api_attempt,
+                api_retries,
+                delay,
+            )
+            await asyncio.sleep(delay)
 
 
 def coerce_structured_output(

@@ -28,6 +28,7 @@ from spine.agents.helpers import (
     ainvoke_structured_with_retry,
     bind_structured_output,
     cap_completion_tokens,
+    disable_streaming,
     resolve_chat_model,
     suppress_reasoning,
 )
@@ -493,6 +494,12 @@ async def run_research_manager(
             work_id,
             exc_info=True,
         )
+
+    # This is a single-shot structured decision (explore/done + a few topic
+    # strings), not a streaming agent loop — route it through the non-streaming
+    # endpoint so a mid-stream SSE break on a local backend can't abort it at
+    # zero tokens (trace 019ecdea). disable_streaming fails open on any error.
+    model = disable_streaming(model)
 
     # ── Recall context from state ────────────────────────────────────
     # The pre_research_gate (exploration_subgraph._pre_research_gate)
