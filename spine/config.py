@@ -317,8 +317,12 @@ class SpineConfig:
     # request inherits the global max_completion_tokens (30K) and a
     # finite-window model 400s once the conversation grows past
     # window - 30K (trace 019eb502: 30,001-token prompt + 30K requested vs
-    # a 60K window). 12K still covers a full_replace of a ~45KB file.
-    implement_max_completion_tokens: int = 12000
+    # a 60K window). Lowered 12K→8K (trace 019ece87): the static reservation
+    # is the room subtracted from every turn's prompt budget, so a smaller cap
+    # buys ~4K more prompt headroom before overflow; DynamicCompletionCap then
+    # lowers it further per-turn as the prompt grows. 8K still covers a
+    # full_replace of a ~30KB file, which is larger than any single slice's file.
+    implement_max_completion_tokens: int = 8000
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify

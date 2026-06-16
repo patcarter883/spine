@@ -135,6 +135,19 @@ _PER_FILE_PROMPT = (
 )
 
 
+_OVERFLOW_HINT = (
+    "IMPORTANT — the parent failed because the implementer's context window "
+    "OVERFLOWED, not because of a logic error. Re-attempting the same whole-file "
+    "work will overflow again. Each micro-slice MUST therefore narrow the amount "
+    "of code that has to be in context at once:\n"
+    "- Scope each micro-slice to a SMALL region of the file (a single function, "
+    "class, or contiguous block), and say so in its description.\n"
+    "- Instruct the implementer (in the description) to read ONLY the relevant "
+    "line range with offset/limit, NOT the whole file.\n"
+    "- Prefer MORE, SMALLER micro-slices over fewer large ones."
+)
+
+
 async def run_decomposer(
     *,
     mode: Literal["PLAN", "FALLBACK", "PER_FILE"],
@@ -142,6 +155,7 @@ async def run_decomposer(
     failed_slice: dict | None = None,
     error_traceback: str | None = None,
     source_slice: dict | None = None,
+    overflow_hint: bool = False,
     config: RunnableConfig | None = None,
     session_id: str | None = None,
 ) -> list[dict]:
@@ -158,6 +172,10 @@ async def run_decomposer(
             (required when mode is FALLBACK).
         source_slice: The multi-file slice to split (required when mode is
             PER_FILE). Must include ``id`` and ≥2 ``target_files``.
+        overflow_hint: When True (FALLBACK mode), tells the decomposer the
+            parent failed on a context-window overflow rather than a logic
+            error, so micro-slices are scoped to narrow file regions read with
+            offset/limit instead of repeating the whole-file work that 400'd.
         config: LangGraph runtime config; carries per-phase model overrides.
         session_id: Work id for OpenRouter session grouping.
 
@@ -217,18 +235,28 @@ async def run_decomposer(
     else:
         parent_id = failed_slice["id"]
         slice_json = json.dumps(failed_slice, indent=2, ensure_ascii=False, default=str)
-        system_prompt = _FALLBACK_PROMPT
+        system_prompt = (
+            _FALLBACK_PROMPT + "\n\n" + xml_block(Tag.CONSTRAINTS, _OVERFLOW_HINT)
+            if overflow_hint
+            else _FALLBACK_PROMPT
+        )
+        tail = (
+            f"Return a DecompositionResult with 2-3 micro-slices whose ids "
+            f"are '{parent_id}-micro-1', '{parent_id}-micro-2', and "
+            f"optionally '{parent_id}-micro-3'."
+        )
+        if overflow_hint:
+            tail += (
+                " The parent OVERFLOWED the context window — make each "
+                "micro-slice region-scoped and read-narrow per the constraints."
+            )
         human_content = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, f"Parent slice id: {parent_id}"),
                 (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
                 (Tag.ERRORS, f"```\n{error_traceback.strip()}\n```"),
             ),
-            (
-                f"Return a DecompositionResult with 2-3 micro-slices whose ids "
-                f"are '{parent_id}-micro-1', '{parent_id}-micro-2', and "
-                f"optionally '{parent_id}-micro-3'."
-            ),
+            tail,
         )
 
     response: Any = await ainvoke_structured_with_retry(

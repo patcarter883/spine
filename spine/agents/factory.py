@@ -699,17 +699,39 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     # implementation/verification phases. ReadCacheMiddleware now handles
     # the re-read problem at source, while ToolOutputTrimmer is retired.
 
+    # Resolve the model's declared context window once — both the eviction
+    # threshold and the per-turn completion clamp are window-relative.
+    from spine.config import SpineConfig
+
+    _spine_cfg = SpineConfig.load()
+    try:
+        _provider_cfg = _spine_cfg.resolve_provider_config(phase=phase.value)
+        _window = int(_provider_cfg.get("context_window") or 0)
+    except Exception:  # noqa: BLE001 — config resolution is best-effort here
+        _window = 0
+    # Room to keep free below the eviction trigger (and above the prompt) for
+    # the completion request + tokenizer/template overhead.
+    _gen_reserve = _spine_cfg.implement_max_completion_tokens + _spine_cfg.synthesize_overhead_tokens
+
     # TokenBudgetCompactor — token-threshold eviction with hardened
     # preservation rules (always keeps the last N tool results and any
-    # write/edit/artifact-writer outputs). Default off; opt in per-agent
-    # via .spine/config.yaml `token_compaction.thresholds` and the
-    # SPINE_TOKEN_COMPACTION env var.
-    if _os.getenv("SPINE_TOKEN_COMPACTION", "false").lower() in ("1", "true", "yes"):
+    # write/edit/artifact-writer outputs). Enabled via
+    # .spine/config.yaml `token_compaction.enabled` (the SPINE_TOKEN_COMPACTION
+    # env var still overrides it — see _parse_token_compaction_config).
+    cfg = _spine_cfg.token_compaction
+    if cfg.enabled:
         from spine.agents.context_editing import TokenBudgetCompactor
-        from spine.config import SpineConfig
+        from spine.agents.synthesis_budget import window_aware_compaction_threshold
 
-        cfg = SpineConfig.load().token_compaction
-        threshold = cfg.thresholds.get(phase.value, cfg.default_threshold)
+        configured = cfg.thresholds.get(phase.value, cfg.default_threshold)
+        # A fixed threshold is meaningless when it exceeds the window — clamp
+        # it below the window ceiling so eviction fires before the provider
+        # 400s on a finite-window model (trace 019ece87).
+        threshold = window_aware_compaction_threshold(
+            window=_window,
+            configured_threshold=configured,
+            reserve=_gen_reserve,
+        )
         if threshold > 0:
             middleware.append(
                 TokenBudgetCompactor(
@@ -719,8 +741,9 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
                 )
             )
             logger.info(
-                "TokenBudgetCompactor: phase=%s threshold=%d keep_recent=%d",
-                phase.value, threshold, cfg.keep_recent,
+                "TokenBudgetCompactor: phase=%s threshold=%d (configured=%d "
+                "window=%d) keep_recent=%d",
+                phase.value, threshold, configured, _window, cfg.keep_recent,
             )
         else:
             logger.info(
@@ -729,8 +752,27 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
             )
     else:
         logger.info(
-            "TokenBudgetCompactor: phase=%s DISABLED (SPINE_TOKEN_COMPACTION env)",
+            "TokenBudgetCompactor: phase=%s DISABLED (token_compaction.enabled=false)",
             phase.value,
+        )
+
+    # DynamicCompletionCapMiddleware — defence in depth against the same
+    # overflow: even with eviction, a single large tool result or a burst of
+    # growth between trims can push prompt + reserved_cap past the window. This
+    # recomputes max_tokens against the measured prompt every turn so the
+    # request always fits. No-op for providers without a declared window.
+    if _window > 0:
+        from spine.agents.context_editing import DynamicCompletionCapMiddleware
+
+        middleware.append(
+            DynamicCompletionCapMiddleware(
+                window=_window,
+                overhead=_spine_cfg.synthesize_overhead_tokens,
+            )
+        )
+        logger.info(
+            "DynamicCompletionCap: phase=%s window=%d overhead=%d",
+            phase.value, _window, _spine_cfg.synthesize_overhead_tokens,
         )
 
 

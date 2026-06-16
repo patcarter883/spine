@@ -667,6 +667,100 @@ class TokenBudgetCompactor(AgentMiddleware):
 
 
 # ---------------------------------------------------------------------------
+# DynamicCompletionCapMiddleware (per-turn completion clamp for finite windows)
+# ---------------------------------------------------------------------------
+
+
+class DynamicCompletionCapMiddleware(AgentMiddleware):
+    """Lower ``max_tokens`` each turn so prompt + completion stays in-window.
+
+    The slice-implementer reserves a *static* completion cap when the agent is
+    built, but its prompt grows turn by turn as it reads files. Once
+    ``prompt + cap`` exceeds the model's context window the provider rejects
+    the request outright — trace 019ece87 spun the fallback decomposer 75 times
+    because every slice touching ``spine/ui_api/api.py`` (a 1200-line file) sent
+    a ~27K prompt + 12K reserved cap against a 32K window and 400'd with
+    "Context size has been exceeded".
+
+    This middleware measures the prompt before each model call and clamps the
+    model's ``max_tokens`` down to whatever room is left under the window. It
+    only ever *lowers* the bound cap (eviction, not this, is what reclaims
+    prompt room) and is a no-op for providers without a declared
+    ``context_window``. It is added INNER of :class:`TokenBudgetCompactor` so it
+    measures the already-trimmed message list.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int,
+        overhead: int = 2000,
+        floor: int = 512,
+    ) -> None:
+        self.window = window
+        self.overhead = overhead
+        self.floor = floor
+
+    @staticmethod
+    def _bound_cap(model: Any) -> int | None:
+        """Current completion ceiling bound on the model, if any."""
+        for attr in ("max_tokens", "max_completion_tokens"):
+            val = getattr(model, attr, None)
+            if val:
+                return int(val)
+        return None
+
+    @staticmethod
+    def _apply_cap(model: Any, cap: int) -> Any:
+        """Return a copy of ``model`` with ``cap`` as its completion ceiling.
+
+        Mirrors :func:`spine.agents.helpers.cap_completion_tokens` without the
+        import (ChatOpenAI stores the value as ``max_tokens``; updating the
+        alias alone leaves the wire field untouched).
+        """
+        if getattr(model, "max_tokens", None) is not None:
+            return model.model_copy(update={"max_tokens": cap})
+        return model.model_copy(update={"max_completion_tokens": cap})
+
+    async def awrap_model_call(self, request, handler):
+        if self.window <= 0:
+            return await handler(request)
+
+        from spine.agents.synthesis_budget import window_aware_completion_cap
+
+        messages = list(request.messages)
+        sys_msg = getattr(request, "system_message", None)
+        if sys_msg is not None:
+            messages = [sys_msg, *messages]
+        prompt_tokens = _estimate_message_tokens(messages)
+
+        current = self._bound_cap(request.model)
+        # When the model is uncapped, the window itself is the ceiling.
+        base_cap = current if current else self.window
+        cap = window_aware_completion_cap(
+            window=self.window,
+            prompt_tokens=prompt_tokens,
+            base_cap=base_cap,
+            overhead=self.overhead,
+            floor=self.floor,
+        )
+        if current is None or cap < current:
+            logger.info(
+                "DynamicCompletionCap: prompt=%d window=%d cap %s→%d",
+                prompt_tokens, self.window,
+                current if current is not None else "uncapped", cap,
+            )
+            request = request.override(model=self._apply_cap(request.model, cap))
+        return await handler(request)
+
+    def wrap_tool_call(self, request, handler):
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        return await handler(request)
+
+
+# ---------------------------------------------------------------------------
 # ResearcherConvergenceMiddleware (push researcher to finalise findings)
 # ---------------------------------------------------------------------------
 

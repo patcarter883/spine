@@ -129,6 +129,83 @@ def escalated_completion_cap(
     return min(budget.completion_cap * 2, room)
 
 
+def window_aware_completion_cap(
+    *,
+    window: int,
+    prompt_tokens: int,
+    base_cap: int,
+    overhead: int,
+    floor: int = 512,
+) -> int:
+    """Per-turn completion clamp that keeps prompt+completion inside ``window``.
+
+    ``synthesis_completion_cap`` reserves a *fixed* slice of the window for
+    generation, computed once when the agent is built. But an agentic loop
+    (the slice-implementer) grows its prompt turn by turn as it reads files,
+    so a static reservation eventually leaves the request as
+    ``prompt + base_cap > window`` and the provider 400s with "Context size
+    has been exceeded" (trace 019ece87: a 27K prompt + 12K cap against a 32K
+    window). Recomputing the clamp against the *measured* prompt each turn
+    makes the overflow structurally impossible.
+
+    Args:
+        window: Model context window. ``<= 0`` (legacy/cloud) → no-op,
+            returns ``base_cap`` unchanged.
+        prompt_tokens: Measured size of the current request (system + history).
+        base_cap: The completion ceiling to never exceed (the statically
+            bound ``max_tokens``). The result is never larger than this.
+        overhead: Safety margin for tool schemas, chat-template framing and
+            tokenizer drift.
+        floor: Smallest generation the call will still request. When the
+            prompt has already eaten the window the provider may still reject,
+            but we never request a zero/negative completion — eviction
+            (TokenBudgetCompactor) is what reclaims the room.
+
+    Returns:
+        ``min(base_cap, window - prompt_tokens - overhead)``, floored at
+        ``floor``; or ``base_cap`` when no finite window is declared.
+    """
+    if window <= 0 or base_cap <= 0:
+        return base_cap
+    room = window - prompt_tokens - overhead
+    if room >= base_cap:
+        return base_cap
+    return max(floor, room)
+
+
+def window_aware_compaction_threshold(
+    *,
+    window: int,
+    configured_threshold: int,
+    reserve: int,
+) -> int:
+    """Clamp a configured compaction trigger below the finite-window ceiling.
+
+    A fixed threshold (e.g. 30000) is meaningless if the window is smaller
+    than it: at a 32K window with a 12K generation reserve the usable prompt
+    ceiling is ~20K, so a 30K trigger never fires before the provider 400s.
+    This caps the trigger at ``window - reserve`` so eviction always engages
+    with working room to spare.
+
+    Args:
+        window: Model context window. ``<= 0`` → return ``configured_threshold``
+            unchanged (legacy/cloud providers keep their behaviour).
+        configured_threshold: The threshold from config (0 disables).
+        reserve: Room to keep free below the trigger for generation + overhead.
+
+    Returns:
+        The window-aware threshold, never below a small positive floor when a
+        finite window is declared and the configured threshold is enabled.
+    """
+    if window <= 0 or configured_threshold <= 0:
+        return configured_threshold
+    ceiling = window - reserve
+    if ceiling <= 0:
+        # Pathologically small window — trim aggressively but never to 0.
+        return max(1, window // 2)
+    return min(configured_threshold, ceiling)
+
+
 def resolve_synthesis_budget(
     phase: str,
     *,

@@ -48,6 +48,29 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 _MAX_DECOMPOSE_DEPTH = 2
 
+# Substrings that mark a slice failure as a context-window overflow rather than
+# a logic error. A finite-window local model (llama.cpp/vLLM GGUF) rejects the
+# request when prompt + requested completion exceeds n_ctx; re-running the same
+# whole-file work overflows identically, so the fallback decomposer must react
+# by producing narrower, region-scoped micro-slices (trace 019ece87).
+_OVERFLOW_MARKERS = (
+    "context size has been exceeded",
+    "context length",
+    "context window",
+    "maximum context",
+    "exceeds the maximum",
+    "too many tokens",
+    "reduce the length",
+)
+
+
+def _is_context_overflow(text: str) -> bool:
+    """True when ``text`` looks like a context-window overflow error."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _OVERFLOW_MARKERS)
+
 
 # ── Router ──────────────────────────────────────────────────────────────
 
@@ -205,6 +228,51 @@ async def _split_slices_node(
     if not remove_ids:
         return {}
     return {"pending_slices": {"remove": remove_ids, "add": adds}}
+
+
+# A target file estimated above this many tokens is "large": reading it whole
+# into the slice-implementer loop dominates a finite window, so we proactively
+# steer the implementer to read narrow ranges. DynamicCompletionCap + eviction
+# still enforce the hard window limit; this just avoids the costly first read.
+_LARGE_FILE_TOKEN_BUDGET = 6000
+
+
+def _large_file_directive(active_slice: dict, workspace_root: str) -> str:
+    """Read-narrow directive when a slice's target file is large, else ''.
+
+    Best-effort: measures each target file's token size on disk and, if any is
+    large, returns a directive telling the implementer to navigate with
+    ``codebase_query`` and read only the relevant line ranges (offset/limit)
+    rather than the whole file. Any measurement failure returns '' silently —
+    the window safety nets (DynamicCompletionCap, TokenBudgetCompactor) still
+    apply regardless.
+    """
+    from pathlib import Path
+
+    from spine.agents._tokens import count_tokens
+
+    targets = [f for f in (active_slice.get("target_files") or []) if f]
+    big: list[tuple[str, int]] = []
+    for rel in targets:
+        try:
+            text = (Path(workspace_root) / rel).read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001 — file may be new/binary/unreadable
+            continue
+        toks = count_tokens(text)
+        if toks > _LARGE_FILE_TOKEN_BUDGET:
+            big.append((rel, toks))
+    if not big:
+        return ""
+    listed = "\n".join(f"- {p} (~{t:,} tokens)" for p, t in big)
+    return (
+        "\n\n## Large file(s) — read in RANGES, not whole\n"
+        "These target files are large; reading them whole will crowd the "
+        "context window and can stall the run:\n"
+        f"{listed}\n"
+        "Use `codebase_query` (find_symbol / get_source) to locate the exact "
+        "symbol you need, then read ONLY that line range with start_line/"
+        "end_line. Do NOT read these files from line 1 in full."
+    )
 
 
 def _subslice_context(active_slice: dict) -> str:
@@ -400,6 +468,7 @@ async def _slice_implementer_node(
                 "target_files, acceptance_criteria, and (optionally) a "
                 "description. Make only the changes described in the slice."
                 + _subslice_context(active_slice)
+                + _large_file_directive(active_slice, workspace_root)
             ),
         )
 
@@ -469,6 +538,11 @@ async def _slice_implementer_node(
         "issues": issues,
         "_failure_traceback": failure_traceback,
         "_decompose_depth": active_slice.get("_decompose_depth", 0),
+        # Distinguish a context-overflow from a logic failure so the fallback
+        # decomposer narrows scope (region-scoped reads) instead of re-running
+        # the same whole-file work that overflowed (trace 019ece87).
+        "_overflow": _is_context_overflow(failure_traceback)
+        or _is_context_overflow(" ".join(issues)),
     }
     # Drop the queue: the fallback decomposer micro-slices the failed FILE,
     # it does not resume the parent's later files.
@@ -576,10 +650,12 @@ async def _fallback_decomposer_node(
         return {}
 
     try:
+        overflow = bool(active_slice.get("_overflow"))
         micro_slices = await run_decomposer(
             mode="FALLBACK",
             failed_slice=active_slice,
             error_traceback=active_slice.get("_failure_traceback", ""),
+            overflow_hint=overflow,
             config=config,
             session_id=work_id,
         )
