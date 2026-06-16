@@ -169,6 +169,16 @@ class SectionResult(BaseModel):
         default="ok",
         description='"ok" or "error" (generic reason; never raw exception text).',
     )
+    reason_kind: str = Field(
+        default="",
+        description=(
+            'For ``status="error"`` only: ``"transient"`` (an infrastructure '
+            "failure — connection/timeout — that a re-run can recover) or "
+            '``"content"`` (the model could not produce usable section content). '
+            "Empty for OK sections. Drives the aggregator's retryable-vs-tolerate "
+            "decision; never carries raw exception text."
+        ),
+    )
 
 
 class SectionPlanSet(BaseModel):

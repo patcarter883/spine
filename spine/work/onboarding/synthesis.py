@@ -74,9 +74,16 @@ async def synthesize_artifacts(
         documents (e.g. ``"PROJECT_DEFINITION"`` → its ``.md`` path).
 
     Raises:
-        RuntimeError: if any section fails or any of the four ``<NAME>.md`` is
-            missing afterward — the engine treats this as a failed run rather
-            than reporting ``completed`` with a partial document set.
+        RetryableSynthesisError: (a ``RuntimeError`` subclass) if one or more
+            sections failed *transiently* — the model endpoint was unreachable.
+            The sections that completed are already written to disk; a re-run
+            fills only the gaps. Callers that cannot distinguish it still see a
+            ``RuntimeError`` and treat the run as failed.
+        RuntimeError: if any of the four ``<NAME>.md`` is missing afterward, or a
+            document carries no synthesised content (placeholder-only). A section
+            that failed because the model could not produce usable *content* is
+            tolerated (the section is omitted) as long as its document still
+            carries real content from other sections.
     """
     _coerce_state(state, workspace_root, work_id)
 

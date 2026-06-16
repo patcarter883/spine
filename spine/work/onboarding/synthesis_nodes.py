@@ -48,6 +48,7 @@ uncompiled ``StateGraph`` for the back-compat shim and the unit tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -136,6 +137,76 @@ _GENERIC_SECTION_ERROR = "section generation failed; section omitted"
 # flaky call no longer nukes the whole run, while we stay fail-loud after the
 # budget is exhausted.
 _SECTION_MAX_RETRIES = 2
+
+# Base seconds for exponential backoff between a section worker's retries. The
+# pre-fix loop fired all three attempts in ~30ms (trace 019ece15: 01:57:10.721
+# → .753), giving a momentarily-unreachable model endpoint zero time to recover
+# before the section was abandoned. Backoff is applied only after a *transient*
+# (transport) failure — a content failure is deterministic and the corrective
+# nudge, not a sleep, is what changes the outcome. attempt N waits
+# ``base * 2**N`` seconds, capped at :data:`_SECTION_RETRY_BACKOFF_CAP_SECONDS`.
+_SECTION_RETRY_BACKOFF_SECONDS = 1.5
+_SECTION_RETRY_BACKOFF_CAP_SECONDS = 8.0
+
+# Substrings / exception class-name markers identifying a TRANSIENT transport
+# failure (endpoint unreachable, reset, or timed out) as opposed to a content
+# failure. Provider-agnostic on purpose: the local GGUF endpoint surfaces these
+# as ``APIError('CURL error: Could not connect to server')`` (trace 019ece15),
+# while hosted providers raise ``APIConnectionError`` / ``APITimeoutError``.
+_TRANSIENT_ERROR_MARKERS = (
+    "could not connect",
+    "connection error",
+    "connection reset",
+    "connection refused",
+    "curl error",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "apiconnectionerror",
+    "apitimeouterror",
+)
+
+
+class RetryableSynthesisError(RuntimeError):
+    """Synthesis failed on TRANSIENT (infrastructure) section errors only.
+
+    Subclasses :class:`RuntimeError` so existing ``except RuntimeError`` callers
+    still treat the run as failed (the all-or-nothing contract is preserved for
+    them), while newer callers can ``isinstance``-check to distinguish a
+    recoverable infra blip — where the already-written sections should be kept
+    and only the failed ones re-run once the endpoint is back — from a permanent
+    failure. The completed sections are already persisted to disk by
+    :func:`_assemble_docs_node` before this is raised.
+    """
+
+    def __init__(self, work_id: str, transient_sections: list[str]) -> None:
+        self.work_id = work_id
+        self.transient_sections = list(transient_sections)
+        super().__init__(
+            f"onboarding synthesis hit a transient failure for work {work_id}: "
+            f"{len(transient_sections)} section(s) failed to reach the model "
+            f"endpoint (retryable): {transient_sections}. Completed sections are "
+            "already written; re-run to fill only the gaps."
+        )
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Classify an exception as a transient transport failure vs a real error.
+
+    Inspects the exception class name and message for connection/timeout markers
+    (:data:`_TRANSIENT_ERROR_MARKERS`). Deliberately string-based so it survives
+    across provider SDKs without importing every provider's exception hierarchy.
+    """
+    haystack = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in haystack for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff (seconds) before the next transient retry."""
+    delay = _SECTION_RETRY_BACKOFF_SECONDS * (2**attempt)
+    return min(delay, _SECTION_RETRY_BACKOFF_CAP_SECONDS)
 
 
 # ── Manager (Tier A) prompts ─────────────────────────────────────────────────
@@ -524,12 +595,13 @@ async def _section_worker_node(
     work_id = state.get("work_id", "unknown")
     voice = _DOC_VOICE.get(doc_id, _DEFAULT_VOICE)
 
-    def _error_result() -> dict[str, Any]:
+    def _error_result(reason_kind: str = "content") -> dict[str, Any]:
         return {
             "doc_id": doc_id,
             "order": order,
             "markdown": "",
             "status": "error",
+            "reason_kind": reason_kind,
         }
 
     try:
@@ -547,7 +619,11 @@ async def _section_worker_node(
         # response should not nuke the whole run (finding #6). Retry the bare
         # structured call up to _SECTION_MAX_RETRIES extra times — appending the
         # corrective nudge so the retry isn't a verbatim replay — then fall back
-        # to a generic status="error" (never leaking exception text).
+        # to a status="error" tagged transient vs content (never leaking
+        # exception text). A transient (transport) failure additionally backs off
+        # before retrying so a momentary endpoint outage has time to recover, and
+        # propagates its kind so the aggregator can mark the run RETRYABLE rather
+        # than discarding the sections that did complete (trace 019ece15).
         for attempt in range(_SECTION_MAX_RETRIES + 1):
             messages = (
                 base_messages
@@ -560,17 +636,25 @@ async def _section_worker_node(
                 content = _coerce_section_content(response)
             except Exception as exc:  # noqa: BLE001 - never leak exception text into docs
                 content = None
+                transient = _is_transient_error(exc)
                 if attempt >= _SECTION_MAX_RETRIES:
                     logger.warning(
                         "[%s] section_worker: section %s#%d failed after %d "
-                        "attempt(s) (%s)",
+                        "attempt(s) (%s, %s)",
                         work_id,
                         doc_id,
                         order,
                         attempt + 1,
                         type(exc).__name__,
+                        "transient" if transient else "content",
                     )
-                    return {"section_results": [_error_result()]}
+                    return {
+                        "section_results": [
+                            _error_result("transient" if transient else "content")
+                        ]
+                    }
+                if transient:
+                    await asyncio.sleep(_retry_backoff_seconds(attempt))
                 continue
 
             if content is not None and content.overview.strip():
@@ -600,14 +684,20 @@ async def _section_worker_node(
         # Unreachable: the loop always returns. Defensive floor.
         return {"section_results": [_error_result()]}
     except Exception as exc:  # noqa: BLE001 - never leak exception text into docs
+        transient = _is_transient_error(exc)
         logger.warning(
-            "[%s] section_worker: section %s#%d failed (%s)",
+            "[%s] section_worker: section %s#%d failed (%s, %s)",
             work_id,
             doc_id,
             order,
             type(exc).__name__,
+            "transient" if transient else "content",
         )
-        return {"section_results": [_error_result()]}
+        return {
+            "section_results": [
+                _error_result("transient" if transient else "content")
+            ]
+        }
 
 
 # ── Document assembler (Tier C) ──────────────────────────────────────────────
@@ -675,26 +765,47 @@ def _assemble_docs_node(state: OnboardingGraphState) -> dict[str, Any]:
 
 
 def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
-    """Verify all four docs exist + no section errored, else ``RuntimeError``.
+    """Verify all four docs exist with real content, else raise.
 
-    Preserves the all-or-nothing contract of the legacy single-agent driver
-    (``synthesis.py`` lines 205-223): a missing document is a hard failure. We
-    additionally fail loudly when any section's status is ``"error"`` so a
-    single bad section never produces a silently-truncated document.
+    Section failures are split by ``reason_kind`` (set by the section worker):
+
+    - **transient** — the model endpoint was unreachable (connection/timeout).
+      The completed sections are already written to disk by
+      :func:`_assemble_docs_node`, so we raise :class:`RetryableSynthesisError`
+      (a ``RuntimeError`` subclass) rather than discarding them: a re-run, once
+      the endpoint is back, fills only the gaps. This is the trace-019ece15 fix
+      for "9 transient section failures nuked ~25 good sections".
+    - **content** — the model could not produce usable content for that section.
+      These are *tolerated* as long as every document still carries real content:
+      a content gap omits one section, it does not fail the run. The hard floors
+      below still apply — a missing document (legacy all-or-nothing contract) or
+      a placeholder-only document (finding #4) fails loudly, so a content failure
+      that empties a whole document is still caught.
     """
     workspace_root = state.get("workspace_root", "")
     work_id = state.get("work_id", "unknown")
     results = list(state.get("section_results", []) or [])
 
-    errored = [
-        f"{r.get('doc_id', '?')}#{r.get('order', '?')}"
-        for r in results
-        if r.get("status") == "error"
-    ]
-    if errored:
-        raise RuntimeError(
-            f"onboarding synthesis incomplete for work {work_id}: "
-            f"{len(errored)} section(s) failed: {errored}."
+    errored = [r for r in results if r.get("status") == "error"]
+
+    def _label(r: dict[str, Any]) -> str:
+        return f"{r.get('doc_id', '?')}#{r.get('order', '?')}"
+
+    transient = [_label(r) for r in errored if r.get("reason_kind") == "transient"]
+    if transient:
+        # Infra blip, not a content defect — keep what completed; re-run the gaps.
+        raise RetryableSynthesisError(work_id, transient)
+
+    content_failed = [_label(r) for r in errored if r.get("reason_kind") != "transient"]
+    if content_failed:
+        # Tolerated: the section is omitted. The missing-doc and placeholder-only
+        # floors below still fail the run if a gap left any document empty.
+        logger.warning(
+            "[%s] aggregate_synthesis: %d section(s) omitted (no usable content): "
+            "%s",
+            work_id,
+            len(content_failed),
+            content_failed,
         )
 
     doc_dir = _doc_dir(workspace_root)
@@ -729,11 +840,13 @@ def _aggregate_synthesis_node(state: OnboardingGraphState) -> dict[str, Any]:
         )
 
     logger.info(
-        "[%s] aggregate_synthesis: verified all %d onboarding documents",
+        "[%s] aggregate_synthesis: verified all %d onboarding documents "
+        "(%d section(s) omitted as degraded)",
         work_id,
         len(ONBOARDING_DOC_NAMES),
+        len(content_failed),
     )
-    return {"written": written}
+    return {"written": written, "degraded_sections": content_failed}
 
 
 # ── Graph builder ────────────────────────────────────────────────────────────

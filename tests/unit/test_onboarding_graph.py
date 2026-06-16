@@ -7,7 +7,11 @@ Revision 2, §2.2-§2.3) with the bare manager/worker LLM calls mocked:
   returns a coherent plan, and falls back to the skeleton when the LLM raises;
 - the per-section fan-out (one ``Send`` per section) writes all four documents;
 - a missing document raises ``RuntimeError`` (all-or-nothing preserved);
-- a section reporting ``status="error"`` raises ``RuntimeError``;
+- a *transient* (transport) section failure raises ``RetryableSynthesisError``
+  while the sections that completed stay on disk;
+- a *content* section failure is tolerated (the section is omitted) as long as
+  its document still carries real content, but a placeholder-only document
+  still fails loudly (finding #4);
 - the greenfield path produces the fixed minimal plan and all four docs.
 
 No live model and no whole-manifest prompt are involved — the test asserts the
@@ -39,7 +43,11 @@ from spine.work.onboarding.manifest_index import (
 )
 from spine.work.onboarding.synthesis_nodes import (
     SECTION_ROUTE_MAP,
+    RetryableSynthesisError,
+    _aggregate_synthesis_node,
+    _assemble_docs_node,
     _doc_manager_node,
+    _is_transient_error,
     _section_router,
     build_synthesis_graph,
 )
@@ -493,7 +501,12 @@ class TestSynthesisGraph:
             )
 
     def test_section_error_raises(self, tmp_path: Path, monkeypatch) -> None:
-        """A section reporting status=error must fail the run loudly."""
+        """Content failures that empty every document still fail the run loudly.
+
+        When *all* sections content-fail, every document is placeholder-only, so
+        the placeholder floor (finding #4) raises even though content failures
+        are otherwise tolerated.
+        """
         manifest = _brownfield_manifest(str(tmp_path))
 
         class _ErrorWorkerModel(_StubModel):
@@ -507,10 +520,130 @@ class TestSynthesisGraph:
         _patch_resolve(monkeypatch, _ErrorWorkerModel())
 
         graph = build_synthesis_graph().compile()
-        with pytest.raises(RuntimeError, match="synthesis incomplete"):
+        with pytest.raises(RuntimeError, match="placeholder-only"):
             asyncio.run(
                 graph.ainvoke(_initial_state(manifest, str(tmp_path), "wk-err"))
             )
+
+    def test_transient_section_error_raises_retryable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A transient (transport) section failure → ``RetryableSynthesisError``.
+
+        The endpoint-unreachable failure is classified ``transient``; the
+        aggregator surfaces it as retryable rather than discarding the run, and
+        the sections that DID complete are already written to disk (trace
+        019ece15: 9 transient failures must not nuke ~25 good sections).
+        """
+        manifest = _brownfield_manifest(str(tmp_path))
+        # Neutralise the backoff so the exhausted-retry path is instant.
+        import spine.work.onboarding.synthesis_nodes as nodes
+
+        monkeypatch.setattr(nodes, "_SECTION_RETRY_BACKOFF_SECONDS", 0.0)
+
+        class _UnreachableWorkerModel(_StubModel):
+            """All worker calls fail with a connection-style transport error."""
+
+            def with_structured_output(self, schema: Any) -> Any:
+                if schema is SectionPlanSet:
+                    return _StubStructured(schema, self._make)
+                return self
+
+            async def ainvoke(self, messages: list[Any], **_: Any) -> Any:
+                raise RuntimeError("APIError: CURL error: Could not connect to server")
+
+        _patch_resolve(monkeypatch, _UnreachableWorkerModel())
+
+        graph = build_synthesis_graph().compile()
+        with pytest.raises(RetryableSynthesisError) as excinfo:
+            asyncio.run(
+                graph.ainvoke(_initial_state(manifest, str(tmp_path), "wk-trans"))
+            )
+        # Every failed section is reported as a retryable gap.
+        assert excinfo.value.transient_sections
+        assert "retryable" in str(excinfo.value)
+
+    def test_aggregator_tolerates_content_failure_with_real_doc(
+        self, tmp_path: Path
+    ) -> None:
+        """A content failure is omitted when its document still has real content.
+
+        Drives the assembler + aggregator directly: ARCHITECTURE_MAP has one OK
+        section and one content-failed section; the run SUCCEEDS with the failed
+        section recorded in ``degraded_sections`` (no transient → not retryable;
+        the doc is not placeholder-only → no hard failure).
+        """
+        ok_md = "## Body\n\nReal section content.\n"
+        section_results: list[dict[str, Any]] = [
+            {"doc_id": doc, "order": 0, "markdown": ok_md, "status": "ok"}
+            for doc in ONBOARDING_DOC_NAMES
+        ]
+        section_results.append(
+            {
+                "doc_id": "ARCHITECTURE_MAP",
+                "order": 1,
+                "markdown": "",
+                "status": "error",
+                "reason_kind": "content",
+            }
+        )
+        state: dict[str, Any] = {
+            "workspace_root": str(tmp_path),
+            "work_id": "wk-degraded",
+            "section_results": section_results,
+        }
+        state.update(_assemble_docs_node(state))  # written + placeholder_docs
+        out = _aggregate_synthesis_node(state)
+
+        assert set(out["written"]) == set(ONBOARDING_DOC_NAMES)
+        assert out["degraded_sections"] == ["ARCHITECTURE_MAP#1"]
+
+    def test_transient_takes_precedence_over_placeholder(self, tmp_path: Path) -> None:
+        """A transient failure is retryable even if it left a document empty.
+
+        A transient gap should be re-run (the content is recoverable), so it must
+        win over the placeholder-only floor that would otherwise report a
+        permanent failure for the same empty document.
+        """
+        section_results: list[dict[str, Any]] = [
+            {"doc_id": doc, "order": 0, "markdown": "## B\n\nbody\n", "status": "ok"}
+            for doc in ONBOARDING_DOC_NAMES
+            if doc != "ARCHITECTURE_MAP"
+        ]
+        section_results.append(
+            {
+                "doc_id": "ARCHITECTURE_MAP",
+                "order": 0,
+                "markdown": "",
+                "status": "error",
+                "reason_kind": "transient",
+            }
+        )
+        state: dict[str, Any] = {
+            "workspace_root": str(tmp_path),
+            "work_id": "wk-trans-empty",
+            "section_results": section_results,
+        }
+        state.update(_assemble_docs_node(state))
+        with pytest.raises(RetryableSynthesisError):
+            _aggregate_synthesis_node(state)
+
+    def test_is_transient_error_classification(self) -> None:
+        """The transport-vs-content classifier keys off message/type markers."""
+        transient = [
+            RuntimeError("APIError: CURL error: Could not connect to server"),
+            TimeoutError("request timed out"),
+            ConnectionResetError("connection reset by peer"),
+            Exception("APIConnectionError: connection error"),
+            Exception("503 Service Unavailable"),
+        ]
+        content = [
+            ValueError("overview must be 1-3 non-empty paragraphs"),
+            RuntimeError("schema validation failed: missing 'overview'"),
+            Exception("model returned an empty object"),
+        ]
+        assert all(_is_transient_error(e) for e in transient)
+        assert not any(_is_transient_error(e) for e in content)
 
 
 # ── Composed graph: analysis (Phase A) + synthesis (Phase B) ─────────────────
