@@ -45,7 +45,44 @@ _BUSY_TIMEOUT_MS = 30_000
 _RETRY_ATTEMPTS = 7
 _RETRY_BASE_DELAY_S = 0.05
 
+# The rollback-journal → WAL transition needs a momentary exclusive lock, so it
+# fails (silently returning the old mode, or raising SQLITE_BUSY) whenever
+# *another* connection holds the database at that instant — e.g. the Ralph
+# worker's 5s dequeue poll racing the UI thread's first connection on a freshly
+# created ``queue.db``. The failure is transient: retrying lets the transition
+# land as soon as the contending connection releases. Same backoff envelope as
+# ``_RETRY_ATTEMPTS`` (≈3.2s cumulative).
+_WAL_RETRY_ATTEMPTS = 7
+_WAL_RETRY_BASE_DELAY_S = 0.05
+
 T = TypeVar("T")
+
+
+def _enable_wal(db: sqlite_utils.Database) -> bool:
+    """Switch ``db`` to WAL, retrying the transient contention failures.
+
+    Returns ``True`` once the connection is in WAL mode. ``PRAGMA
+    journal_mode=WAL`` is unreliable under concurrent access: it can *silently*
+    return the unchanged mode, or raise ``database is locked``, when another
+    connection holds the database while the transition tries to take its brief
+    exclusive lock. Both are transient — once WAL is recorded in the file header
+    it sticks for every connection — so we retry rather than degrade to
+    rollback-journal mode (which reintroduces the lock-upgrade deadlock this
+    module exists to avoid).
+    """
+    delay = _WAL_RETRY_BASE_DELAY_S
+    for attempt in range(_WAL_RETRY_ATTEMPTS):
+        try:
+            mode = db.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if str(mode).lower() == "wal":
+                return True
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+        if attempt < _WAL_RETRY_ATTEMPTS - 1:
+            time.sleep(delay)
+            delay *= 2
+    return False
 
 
 def tune_connection(db: sqlite_utils.Database) -> sqlite_utils.Database:
@@ -55,16 +92,17 @@ def tune_connection(db: sqlite_utils.Database) -> sqlite_utils.Database:
     ``db`` handle for convenient chaining.
     """
     # WAL is recorded in the file header; enabling it once makes it stick for
-    # all connections, but the call is cheap and idempotent. ``PRAGMA
-    # journal_mode`` *silently* fails to switch (returning the unchanged mode)
-    # if another connection holds the database at this instant, so verify the
-    # result rather than trusting it — a silent regression to rollback-journal
-    # mode reintroduces the lock-upgrade deadlock this module exists to avoid.
-    mode = db.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-    if str(mode).lower() != "wal":
+    # all connections, but the call is cheap and idempotent. The transition can
+    # fail transiently under concurrent access, so ``_enable_wal`` retries it —
+    # a silent regression to rollback-journal mode reintroduces the lock-upgrade
+    # deadlock this module exists to avoid.
+    if not _enable_wal(db):
+        mode = db.conn.execute("PRAGMA journal_mode").fetchone()[0]
         logger.warning(
-            "PRAGMA journal_mode=WAL did not take (got %r); connection is in "
-            "rollback-journal mode and may hit 'database is locked'.",
+            "PRAGMA journal_mode=WAL did not take after %d attempts (got %r); "
+            "connection is in rollback-journal mode and may hit 'database is "
+            "locked'.",
+            _WAL_RETRY_ATTEMPTS,
             mode,
         )
     # Per-connection; must be set on every fresh connection.

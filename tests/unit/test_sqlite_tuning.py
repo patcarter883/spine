@@ -22,7 +22,39 @@ import sqlite3
 
 import sqlite_utils
 
+from spine.persistence import sqlite_tuning
 from spine.persistence.sqlite_tuning import retry_on_locked, tune_connection
+
+
+def _LockedError() -> sqlite3.OperationalError:
+    return sqlite3.OperationalError("database is locked")
+
+
+class _FakeDb:
+    """Minimal stand-in whose ``conn.execute`` replays a scripted sequence.
+
+    Each ``PRAGMA journal_mode=WAL`` consumes the next item: a string is the
+    journal mode returned (silent success/failure), an ``Exception`` is raised.
+    Lets ``_enable_wal`` be tested deterministically — the real C-level
+    ``sqlite3.Connection.execute`` is read-only and cannot be monkeypatched.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = 0
+        self.conn = self
+
+    def execute(self, sql, *args, **kwargs):
+        self.calls += 1
+        outcome = self._script.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+
+        class _Cur:
+            def fetchone(self_inner):
+                return (outcome,)
+
+        return _Cur()
 
 
 class TestTuneConnection:
@@ -39,6 +71,51 @@ class TestTuneConnection:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = sqlite_utils.Database(str(Path(tmpdir) / "t.db"))
             assert tune_connection(db) is db
+
+    def test_enable_wal_retries_transient_failure(self, monkeypatch):
+        """A transient WAL-transition failure must be retried, not surrendered.
+
+        On a freshly created ``queue.db`` the rollback-journal → WAL switch can
+        silently return the old mode (or raise ``database is locked``) while
+        another connection holds the database — e.g. the worker's dequeue poll
+        racing the UI thread. Degrading to rollback-journal mode there is what
+        surfaces 'database is locked' on the first onboarding insert, so the
+        transition is retried until it lands.
+        """
+        monkeypatch.setattr(sqlite_tuning, "_WAL_RETRY_BASE_DELAY_S", 0.0)
+        db = _FakeDb(["delete", _LockedError(), "wal"])
+        assert sqlite_tuning._enable_wal(db) is True
+        assert db.calls == 3, "expected two failed WAL attempts then a success"
+
+    def test_enable_wal_gives_up_after_attempts(self, monkeypatch):
+        """If WAL never takes, report failure rather than spinning forever."""
+        monkeypatch.setattr(sqlite_tuning, "_WAL_RETRY_BASE_DELAY_S", 0.0)
+        db = _FakeDb(["delete"] * 20)
+        assert sqlite_tuning._enable_wal(db) is False
+        assert db.calls == sqlite_tuning._WAL_RETRY_ATTEMPTS
+
+    def test_enable_wal_propagates_non_lock_errors(self, monkeypatch):
+        """A genuine SQL error during the pragma must not be swallowed."""
+        monkeypatch.setattr(sqlite_tuning, "_WAL_RETRY_BASE_DELAY_S", 0.0)
+        db = _FakeDb([sqlite3.OperationalError("disk I/O error")])
+        try:
+            sqlite_tuning._enable_wal(db)
+        except sqlite3.OperationalError as exc:
+            assert "disk I/O error" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected the non-lock error to propagate")
+
+    def test_tune_connection_degrades_gracefully_with_warning(self, monkeypatch, caplog):
+        """If WAL can never take, warn but still return a usable connection."""
+        import logging
+
+        monkeypatch.setattr(sqlite_tuning, "_WAL_RETRY_BASE_DELAY_S", 0.0)
+        monkeypatch.setattr(sqlite_tuning, "_enable_wal", lambda db: False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = sqlite_utils.Database(str(Path(tmpdir) / "t.db"))
+            with caplog.at_level(logging.WARNING):
+                assert tune_connection(db) is db
+            assert any("did not take" in r.message for r in caplog.records)
 
     def test_held_read_does_not_block_writer(self):
         """A reader holding a transaction must not lock out a concurrent writer.
