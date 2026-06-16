@@ -48,16 +48,16 @@ providers:
   #   model: openrouter:poolside/laguna-xs.2:free
   #   enabled: true
   #   guided_decoding: true
-  # - name: pat
-  #   type: deepagents-model
-  #   model: openai:model
-  #   base_url: http://10.50.1.51:8000/v1
-  #   api_key: vllm
-  #   guided_decoding: true
-  #   enabled: true
-  #   stream_usage: true
-  #   max_concurrent_calls: 8
-  #   context_window: 60000
+  - name: pat
+    type: deepagents-model
+    model: openai:model
+    base_url: http://10.50.1.51:8100/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2
+    context_window: 32000
   - name: local
     type: deepagents-model
     model: openai:Qwen3.6-35B-A3B-MTP-GGUF
@@ -91,12 +91,12 @@ providers:
       # completion to synthesize_max_completion_tokens and compresses evidence
       # if it ever exceeds the window. Without this the synth runs "legacy"
       # (no clamp, fixed evidence budgets). poolside/laguna-xs.2 = 262144.
-      context_window: 262144
+      context_window: 60000
     specify/subagents/researcher:
       provider: local
     plan:
       provider: local
-      context_window: 262144
+      context_window: 60000
     plan/subagents/researcher:
       provider: local
     implement:
