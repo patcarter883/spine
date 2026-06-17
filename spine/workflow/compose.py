@@ -40,6 +40,7 @@ from spine.models.enums import PhaseName, ReviewStatus, WorkType
 from spine.models.state import WorkflowState
 from spine.workflow.phase_progress import mark_phase_started
 from spine.workflow.registry import get_registry
+from spine.workflow import critic_convergence
 from spine.workflow.critic_review import critic_router
 from spine.workflow.artifact_gate import (
     make_artifact_gate_node,
@@ -450,6 +451,55 @@ def _critic_result_mapper(reviewed_phase: str):
 
         phase_status = subgraph_result.get("phase_status", "")
         prior_attempts = parent_state.get("retry_count", {}).get(reviewed_phase, 0)
+        new_attempt = prior_attempts + 1
+        max_retries = parent_state.get("max_retries", 3)
+
+        # The prior verdict for THIS phase (last-write-wins). Only meaningful
+        # when it belongs to the same phase — critic_specify and critic_plan
+        # don't interleave, but guard anyway so a cross-phase record can't be
+        # mistaken for a prior round.
+        prior_lcr = parent_state.get("last_critic_review") or {}
+        prior_for_phase = (
+            prior_lcr if prior_lcr.get("phase") == reviewed_phase else {}
+        )
+
+        # Convergence detection (rec 1 + rec 3): is this rework round repeating
+        # the previous verdict, and which specific asks are still unaddressed?
+        unaddressed: list[str] = []
+        stagnation_streak = 0
+        if phase_status == ReviewStatus.NEEDS_REVISION.value and prior_for_phase:
+            unaddressed = critic_convergence.unaddressed_points(
+                prior_for_phase, effective_result
+            )
+            stagnation_streak = critic_convergence.next_stagnation_streak(
+                prior_for_phase, effective_result
+            )
+
+        # Escalation decision — collapse every "stop reworking" condition into a
+        # single flag so the mapper (state) and critic_router (edge) agree.
+        blocker_category = effective_result.get("blocker_category")
+        spec_contradiction = blocker_category == "spec_contradiction"
+        stagnated = stagnation_streak >= critic_convergence.STAGNATION_LIMIT
+        retries_exhausted = (
+            phase_status == ReviewStatus.NEEDS_REVISION.value
+            and new_attempt >= max_retries
+        )
+        escalate = (
+            phase_status == ReviewStatus.NEEDS_REVIEW.value
+            or spec_contradiction
+            or stagnated
+            or retries_exhausted
+        )
+        if spec_contradiction:
+            escalation_kind = "spec_amendment"
+        elif stagnated:
+            escalation_kind = "stagnation"
+        elif retries_exhausted:
+            escalation_kind = "retries_exhausted"
+        elif phase_status == ReviewStatus.NEEDS_REVIEW.value:
+            escalation_kind = "critic_flagged"
+        else:
+            escalation_kind = None
 
         # Single source of truth for the next routing decision. Derived from
         # the subgraph's phase_status (canonical) plus the effective review
@@ -461,7 +511,12 @@ def _critic_result_mapper(reviewed_phase: str):
             "tier": effective_result.get("tier", "unknown"),
             "reason": effective_result.get("reason", ""),
             "suggestions": effective_result.get("suggestions", []),
-            "attempt": prior_attempts + 1,
+            "attempt": new_attempt,
+            "stagnation_streak": stagnation_streak,
+            "unaddressed_points": unaddressed,
+            "blocker_category": blocker_category,
+            "escalate": escalate,
+            "escalation_kind": escalation_kind,
         }
 
         # Rework of a workspace-mutating phase invalidates the per-work_id
@@ -478,17 +533,27 @@ def _critic_result_mapper(reviewed_phase: str):
 
             symbol_cache.clear(parent_state.get("work_id", ""))
 
-        if phase_status == ReviewStatus.NEEDS_REVIEW.value:
-            base["status"] = "needs_review"
-            base["needs_review_phase"] = reviewed_phase
-            base["retry_count"] = {reviewed_phase: prior_attempts + 1}
-        elif phase_status == ReviewStatus.NEEDS_REVISION.value:
-            base["retry_count"] = {reviewed_phase: prior_attempts + 1}
-            base["status"] = "running"
-        elif phase_status == ReviewStatus.PASSED.value:
-            base["status"] = "running"
-        elif phase_status == "error":
+        if phase_status in (
+            ReviewStatus.NEEDS_REVIEW.value,
+            ReviewStatus.NEEDS_REVISION.value,
+        ):
+            base["retry_count"] = {reviewed_phase: new_attempt}
+
+        if phase_status == "error":
             base["status"] = "failed"
+        elif escalate:
+            # Pause for human review. A spec contradiction targets SPECIFY so a
+            # "rework" action amends the spec rather than retrying a plan that
+            # can't satisfy it; every other escalation reworks the phase the
+            # critic just reviewed.
+            base["status"] = "needs_review"
+            base["needs_review_phase"] = (
+                PhaseName.SPECIFY.value if spec_contradiction else reviewed_phase
+            )
+            base["needs_review_kind"] = escalation_kind
+        else:
+            # PASSED or a NEEDS_REVISION round that still has budget to converge.
+            base["status"] = "running"
 
         if reviewed_phase == PhaseName.SPECIFY.value:
             base["critic_specify_completed"] = True
@@ -587,11 +652,17 @@ def _human_review_interrupt(state: WorkflowState) -> dict:
     # Feedback lists can contain non-dict entries (e.g. tuples from state
     # merges) — use the last dict entry, matching how the dispatcher filters.
     last_fb = next((f for f in reversed(feedback) if isinstance(f, dict)), {})
+    lcr = state.get("last_critic_review") or {}
     review_info = {
         "phase": needs_review_phase or state.get("current_phase", ""),
         "reason": last_fb.get("reason", "No reason provided"),
         "suggestions": last_fb.get("suggestions", []),
         "phase_results": phase_results,
+        # Why the workflow paused — lets the reviewer (UI/CLI) distinguish a
+        # spec amendment from a non-converging rework loop or an exhausted
+        # budget, and shows which asks remained unaddressed.
+        "kind": state.get("needs_review_kind"),
+        "unaddressed_points": lcr.get("unaddressed_points", []),
     }
 
     # interrupt() pauses the graph. Human response comes back via Command(resume=...)
@@ -600,6 +671,7 @@ def _human_review_interrupt(state: WorkflowState) -> dict:
     return {
         "human_feedback": human_decision,
         "needs_review_phase": None,
+        "needs_review_kind": None,
     }
 
 

@@ -1570,6 +1570,12 @@ def _render_rework_feedback(
     recent critic) so the rework prompt always surfaces the exact verdict
     that caused the loopback. Falls back to the full ``feedback`` list when
     the field is absent (older state checkpoints).
+
+    When the convergence detector found asks that recurred from the previous
+    round (``unaddressed_points``), they are hoisted into an explicit "STILL
+    NOT ADDRESSED" block at the top — the author kept failing to act on these,
+    so they get the model's high-attention position and a sharper instruction
+    than the general feedback list (rec 3, trace 019ed383).
     """
     if last_critic_review:
         status = last_critic_review.get("status", "needs_revision")
@@ -1577,7 +1583,17 @@ def _render_rework_feedback(
         reason = last_critic_review.get("reason", "")
         suggestions = last_critic_review.get("suggestions") or []
         attempt = last_critic_review.get("attempt", 1)
-        lines = [f"- [{tier}] (attempt {attempt}, status={status}) {reason}"]
+        unaddressed = last_critic_review.get("unaddressed_points") or []
+        lines: list[str] = []
+        if unaddressed:
+            lines.append(
+                "⚠ STILL NOT ADDRESSED from the previous round — you MUST "
+                "resolve each of these before anything else; repeating the "
+                "same output again will fail the review:"
+            )
+            lines.extend(f"  - {p}" for p in unaddressed)
+            lines.append("")
+        lines.append(f"- [{tier}] (attempt {attempt}, status={status}) {reason}")
         for s in suggestions:
             lines.append(f"  - {s}")
         return "\n".join(lines)

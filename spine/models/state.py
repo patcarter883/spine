@@ -98,11 +98,21 @@ class WorkflowState(TypedDict, total=False):
     prompt_request: dict | None
     critic_reviewing: str  # Phase the current critic node is reviewing
     last_critic_review: dict | None  # {"phase": str, "status": str, "tier": str,
-    # "reason": str, "suggestions": list[str], "attempt": int}
+    # "reason": str, "suggestions": list[str], "attempt": int,
+    # "stagnation_streak": int, "unaddressed_points": list[str],
+    # "blocker_category": str | None, "escalate": bool, "escalation_kind": str | None}
     # Written by _critic_result_mapper; consumed by critic_router and by the
     # specify/plan synthesizers when retry_count > 0. Last-write-wins — this
     # is the single source of truth for routing, decoupled from the
-    # operator.add `feedback` list.
+    # operator.add `feedback` list. The convergence fields (stagnation_streak,
+    # unaddressed_points) are computed by spine.workflow.critic_convergence and
+    # drive early escalation + the "still unaddressed" rework delta.
+    needs_review_kind: str | None  # Why the workflow paused for human review:
+    # "spec_amendment" (spec contradiction the plan can't resolve),
+    # "stagnation" (rework rounds stopped converging), "retries_exhausted"
+    # (max_retries hit), or "critic_flagged" (critic returned NEEDS_REVIEW).
+    # Surfaced in the human_review interrupt payload so the reviewer knows
+    # whether to amend upstream artifacts vs. nudge a rework.
     workspace_root: str  # Project root directory for deep agent backends
     phase_results: Annotated[dict, _merge_dicts]  # phase → PhaseResult
     needs_review_phase: str | None  # Which phase triggered human review

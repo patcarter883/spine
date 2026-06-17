@@ -88,6 +88,24 @@ def _build_review_prompt(
     )
     prior_block = _format_prior_review(prior_review)
 
+    # When a specification is in scope (PLAN reviews), the critic may discover
+    # that the requirement needs something the spec excludes/omits — a gap the
+    # author cannot close by reworking this phase. Routing such a verdict
+    # through NEEDS_REVISION burns the whole retry budget on plans that can
+    # never pass (trace 019ed383: phase_max_retries demanded by the plan but
+    # excluded by the spec's "no backend config changes"). Tell the critic to
+    # escalate it as a spec contradiction instead.
+    spec_contradiction_note = ""
+    if spec_payload:
+        spec_contradiction_note = (
+            " IMPORTANT: if the ONLY thing blocking approval is that the "
+            "<specification> excludes or omits something the requirement "
+            "genuinely needs (so the author cannot fix it within this phase's "
+            "scope), respond NEEDS_REVIEW and set blocker_category to "
+            "'spec_contradiction' — do NOT respond NEEDS_REVISION, because "
+            "reworking the plan cannot resolve a spec gap."
+        )
+
     if prior_block:
         directive = (
             f"This is a REWORK review of the {reviewed_phase}-phase output. "
@@ -99,6 +117,7 @@ def _build_review_prompt(
             "BLOCKING semantic defect (not a schema/field-name nitpick). Keep "
             "your asks stable across rounds so the author can converge. "
             "Everything you need is in the tagged blocks — do not read files."
+            + spec_contradiction_note
         )
     else:
         directive = (
@@ -107,6 +126,7 @@ def _build_review_prompt(
             "need is in the tagged blocks. Respond with PASSED, "
             "NEEDS_REVISION, or NEEDS_REVIEW and include concrete reasons "
             "and suggestions."
+            + spec_contradiction_note
         )
 
     return hostage_layout(
@@ -345,17 +365,17 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
     if structured is not None:
         # Handle CriticReview Pydantic model
         if isinstance(structured, dict):
-            status_raw = structured.get("status", "NEEDS_REVISION")
-            reason = structured.get("reason", "Structured review completed")
-            suggestions = structured.get("suggestions", [])
+            data = structured
         elif hasattr(structured, "model_dump"):
             data = structured.model_dump()
-            status_raw = data.get("status", "NEEDS_REVISION")
-            reason = data.get("reason", "Structured review completed")
-            suggestions = data.get("suggestions", [])
         else:
             # Fallback for unexpected structured format
             return _parse_agent_review_fallback(result, reviewed_phase)
+
+        status_raw = data.get("status", "NEEDS_REVISION")
+        reason = data.get("reason", "Structured review completed")
+        suggestions = data.get("suggestions", [])
+        blocker_category = data.get("blocker_category")
 
         # Normalize status to lowercase (CriticReview uses uppercase)
         status = status_raw.lower() if isinstance(status_raw, str) else status_raw
@@ -365,6 +385,7 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
             "tier": "agent",
             "reason": reason,
             "suggestions": suggestions,
+            "blocker_category": blocker_category,
         }
 
     # Fallback to keyword parsing for backwards compatibility
@@ -444,16 +465,24 @@ def critic_router(state: WorkflowState) -> str:
         "tier": lcr.get("tier", "unknown"),
         "reason": lcr.get("reason", ""),
         "suggestions": lcr.get("suggestions", []),
+        # Early-escalation signals computed by _critic_result_mapper. When set,
+        # the loop stops short of the full retry budget (stagnation, or a spec
+        # contradiction the author cannot resolve by reworking this phase).
+        "escalate": lcr.get("escalate", False),
+        "escalation_kind": lcr.get("escalation_kind"),
+        "stagnation_streak": lcr.get("stagnation_streak", 0),
     }
     decision = _handle_review_outcome(state, reviewed_phase, review)
     retry_count = state.get("retry_count", {})
     logger.info(
-        "[%s] critic_router: phase=%s status=%s retries=%d/%d → %s",
+        "[%s] critic_router: phase=%s status=%s retries=%d/%d streak=%d kind=%s → %s",
         state.get("work_id", "?"),
         reviewed_phase,
         review_status,
         retry_count.get(reviewed_phase, 0),
         state.get("max_retries", 3),
+        review.get("stagnation_streak", 0),
+        review.get("escalation_kind"),
         decision,
     )
     return decision
@@ -477,6 +506,18 @@ def _handle_review_outcome(
         return "passed"
 
     if status == ReviewStatus.NEEDS_REVIEW.value:
+        return "needs_review"
+
+    # Early escalation: the mapper flagged this verdict as unresolvable by
+    # another rework round (stagnation — the same asks recurring — or a spec
+    # contradiction). Stop here instead of spending the rest of the budget on
+    # plans that cannot converge.
+    if review.get("escalate"):
+        logger.warning(
+            f"Phase '{reviewed_phase}' escalated early "
+            f"(kind={review.get('escalation_kind')}, "
+            f"streak={review.get('stagnation_streak', 0)}) → human review"
+        )
         return "needs_review"
 
     # NEEDS_REVISION — check retry count

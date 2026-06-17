@@ -250,3 +250,14 @@ class CriticReview(BaseModel):
     score: int | None = Field(
         default=None, description="Optional 1-10 quality score"
     )
+    blocker_category: Literal["spec_contradiction"] | None = Field(
+        default=None,
+        description=(
+            "Set to 'spec_contradiction' ONLY when the sole blocking issue is "
+            "that the specification excludes or omits something the requirement "
+            "needs, so the author cannot fix it by reworking this phase — it "
+            "requires amending the spec. Reworking the plan cannot resolve a "
+            "spec gap, so this is escalated to a spec-amendment review instead "
+            "of consuming retry attempts. Leave null for ordinary defects."
+        ),
+    )
