@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from spine.models.types import ProjectSpec, RequirementRef
+from spine.models.types import ProjectSpec, RequirementRef, Roadmap, RoadmapPhase
 from spine.persistence.project_store import ProjectStore
 
 
@@ -85,3 +85,44 @@ def test_list_projects_sorted(tmp_path):
     store.save_project(_spec("beta"))
     store.save_project(_spec("alpha"))
     assert store.list_projects() == ["alpha", "beta"]
+
+
+def test_remove_members_set_difference(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(_spec(member_work_ids=["w1", "w2", "w3"]))
+
+    spec = store.remove_members("demo", ["w2", "missing"])
+    assert spec.member_work_ids == ["w1", "w3"]
+
+
+def test_remove_members_strips_phase_membership(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(
+        _spec(
+            member_work_ids=["w1", "w2"],
+            roadmap=Roadmap(
+                phases=[RoadmapPhase(id="M-001", title="P1", member_work_ids=["w1", "w2"])]
+            ),
+        )
+    )
+
+    spec = store.remove_members("demo", ["w1"])
+    assert spec.member_work_ids == ["w2"]
+    assert spec.roadmap.phases[0].member_work_ids == ["w2"]
+
+
+def test_remove_members_unknown_project_raises(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    try:
+        store.remove_members("ghost", ["w1"])
+    except KeyError:
+        return
+    raise AssertionError("expected KeyError for unknown project")
+
+
+def test_delete_project(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(_spec())
+    assert store.delete_project("demo") is True
+    assert store.load_project("demo") is None
+    assert store.delete_project("demo") is False

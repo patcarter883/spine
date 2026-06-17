@@ -763,3 +763,122 @@ class TestUIApiGetCriticReview:
             )
 
             assert api.get_critic_review("no-review-1") is None
+
+
+class TestUIApiProjects:
+    """Project management: create, edit, members, delete, and grouping."""
+
+    def _api(self, tmpdir: str) -> tuple[UIApi, SpineConfig]:
+        config = SpineConfig()
+        config.queue_path = str(Path(tmpdir) / "queue.db")
+        config.project_path = str(Path(tmpdir) / ".spine" / "project")
+        config.ensure_dirs()
+        return UIApi(config), config
+
+    def _insert_work(self, config: SpineConfig, work_id: str, **kw) -> None:
+        from spine.work.dispatcher import get_work_db
+
+        get_work_db(config)["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": kw.get("description", "a job"),
+                "work_type": kw.get("work_type", "task"),
+                "status": kw.get("status", "completed"),
+                "current_phase": kw.get("current_phase", "verify"),
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:00:00",
+                "result": "{}",
+            }
+        )
+
+    def test_create_then_get(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            result = api.create_project(
+                "proj1",
+                title="Project One",
+                objectives=["Ship it"],
+                requirements=[{"id": "R-001", "text": "Do X"}],
+                roadmap={"phases": [{"id": "M-001", "title": "Phase 1"}]},
+            )
+            assert result == {"id": "proj1", "status": "created"}
+
+            spec = api.get_project("proj1")
+            assert spec["title"] == "Project One"
+            assert spec["objectives"] == ["Ship it"]
+            assert spec["requirements"][0]["id"] == "R-001"
+            assert spec["roadmap"]["phases"][0]["id"] == "M-001"
+
+    def test_create_duplicate_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            api.create_project("dup")
+            result = api.create_project("dup")
+            assert "error" in result
+
+    def test_create_requires_id(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            assert "error" in api.create_project("  ")
+
+    def test_update_preserves_requirement_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            api.create_project(
+                "proj2", requirements=[{"id": "R-001", "text": "Original"}]
+            )
+            result = api.update_project(
+                "proj2",
+                title="Renamed",
+                requirements=[{"id": "R-001", "text": "Updated"}],
+            )
+            assert result["status"] == "updated"
+            spec = api.get_project("proj2")
+            assert spec["title"] == "Renamed"
+            assert spec["requirements"][0]["id"] == "R-001"
+            assert spec["requirements"][0]["text"] == "Updated"
+
+    def test_update_missing_project(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            assert "error" in api.update_project("ghost", title="x")
+
+    def test_add_and_remove_members(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            api.create_project("proj3")
+
+            added = api.add_project_members("proj3", ["w1", "w2"])
+            assert added["members"] == 2
+
+            removed = api.remove_project_members("proj3", ["w1"])
+            assert removed["members"] == 1
+            assert api.get_project("proj3")["member_work_ids"] == ["w2"]
+
+    def test_member_ops_unknown_project(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            assert "error" in api.add_project_members("ghost", ["w1"])
+            assert "error" in api.remove_project_members("ghost", ["w1"])
+
+    def test_get_project_members_resolves_work_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, config = self._api(tmpdir)
+            self._insert_work(config, "w1", description="First", status="running")
+            api.create_project("proj4")
+            api.add_project_members("proj4", ["w1", "missing"])
+
+            members = api.get_project_members("proj4")
+            # 'missing' has no work entry, so it is skipped.
+            assert len(members) == 1
+            assert members[0]["work_id"] == "w1"
+            assert members[0]["status"] == "running"
+            assert members[0]["description"] == "First"
+
+    def test_delete_project(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api, _config = self._api(tmpdir)
+            api.create_project("proj5")
+            assert api.delete_project("proj5")["status"] == "deleted"
+            assert api.get_project("proj5") is None
+            assert "error" in api.delete_project("proj5")

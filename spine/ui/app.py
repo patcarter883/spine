@@ -117,6 +117,12 @@ def _onboarding() -> None:
     render(api)
 
 
+def _projects() -> None:
+    from spine.ui._pages.projects import render
+
+    render(api)
+
+
 pages = {
     "": [
         st.Page(_dashboard, title="Dashboard", icon="🏠", url_path="dashboard"),
@@ -136,6 +142,9 @@ pages = {
             icon="🚀",
             url_path="onboarding",
         ),
+    ],
+    "Projects": [
+        st.Page(_projects, title="Projects", icon="📁", url_path="projects"),
     ],
     "Work": [
         st.Page(_work_detail, title="Work Details", icon="🔍", url_path="work-detail"),

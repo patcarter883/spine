@@ -87,6 +87,151 @@ class UIApi:
 
         return asyncio.run(aggregate_project_coverage(spec, self._config))
 
+    # ── Project operations (write) ──
+
+    def create_project(
+        self,
+        project_id: str,
+        title: str | None = None,
+        summary: str = "",
+        objectives: list[str] | None = None,
+        requirements: list[dict[str, Any]] | None = None,
+        constraints: list[str] | None = None,
+        hard_boundaries: list[str] | None = None,
+        roadmap: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new project from a full spec.
+
+        Returns ``{"id", "status": "created"}`` on success, or
+        ``{"error": ...}`` if the id is taken or validation fails.
+        """
+        from datetime import datetime
+
+        from spine.models.types import ProjectSpec
+
+        project_id = (project_id or "").strip()
+        if not project_id:
+            return {"error": "Project id is required."}
+        if self._projects.load_project(project_id) is not None:
+            return {"error": f"Project '{project_id}' already exists."}
+
+        now = datetime.now().isoformat()
+        try:
+            spec = ProjectSpec.model_validate(
+                {
+                    "id": project_id,
+                    "title": title or project_id,
+                    "summary": summary,
+                    "objectives": objectives or [],
+                    "requirements": requirements or [],
+                    "constraints": constraints or [],
+                    "hard_boundaries": hard_boundaries or [],
+                    "roadmap": roadmap or {"phases": []},
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        except ValueError as exc:
+            return {"error": f"Invalid project spec: {exc}"}
+
+        self._projects.save_project(spec)
+        logger.info(f"Created project: {project_id}")
+        return {"id": project_id, "status": "created"}
+
+    def update_project(self, project_id: str, **fields: Any) -> dict[str, Any]:
+        """Update an existing project's editable fields.
+
+        Accepts any of: ``title``, ``summary``, ``objectives``,
+        ``requirements``, ``constraints``, ``hard_boundaries``, ``roadmap``.
+        Requirement and roadmap-phase IDs are immutable (the aggregator keys
+        coverage off them); callers must preserve existing IDs. ``id``,
+        ``member_work_ids``, and ``created_at`` cannot be changed here.
+        """
+        from datetime import datetime
+
+        from spine.models.types import ProjectSpec
+
+        spec = self._projects.load_project(project_id)
+        if spec is None:
+            return {"error": f"Project '{project_id}' not found."}
+
+        editable = {
+            "title",
+            "summary",
+            "objectives",
+            "requirements",
+            "constraints",
+            "hard_boundaries",
+            "roadmap",
+        }
+        data = spec.model_dump()
+        for key, value in fields.items():
+            if key in editable and value is not None:
+                data[key] = value
+        data["updated_at"] = datetime.now().isoformat()
+
+        try:
+            new_spec = ProjectSpec.model_validate(data)
+        except ValueError as exc:
+            return {"error": f"Invalid project spec: {exc}"}
+
+        self._projects.save_project(new_spec)
+        logger.info(f"Updated project: {project_id}")
+        return {"id": project_id, "status": "updated"}
+
+    def add_project_members(
+        self, project_id: str, work_ids: list[str]
+    ) -> dict[str, Any]:
+        """Add work items to a project's membership."""
+        try:
+            spec = self._projects.add_members(project_id, work_ids)
+        except KeyError:
+            return {"error": f"Project '{project_id}' not found."}
+        return {"id": project_id, "members": len(spec.member_work_ids)}
+
+    def remove_project_members(
+        self, project_id: str, work_ids: list[str]
+    ) -> dict[str, Any]:
+        """Remove work items from a project's membership."""
+        try:
+            spec = self._projects.remove_members(project_id, work_ids)
+        except KeyError:
+            return {"error": f"Project '{project_id}' not found."}
+        return {"id": project_id, "members": len(spec.member_work_ids)}
+
+    def delete_project(self, project_id: str) -> dict[str, Any]:
+        """Delete a project. Returns ``{"error": ...}`` if it does not exist."""
+        if self._projects.delete_project(project_id):
+            logger.info(f"Deleted project: {project_id}")
+            return {"id": project_id, "status": "deleted"}
+        return {"error": f"Project '{project_id}' not found."}
+
+    def get_project_members(self, project_id: str) -> list[dict[str, Any]]:
+        """Return work entries for a project's members (the source of truth).
+
+        Membership lives project-side (``member_work_ids``); each id is resolved
+        to its current work entry via ``get_work``. Ids with no matching entry
+        are skipped.
+        """
+        spec = self._projects.load_project(project_id)
+        if spec is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for wid in spec.member_work_ids:
+            entry = self.get_work(wid)
+            if entry is None:
+                continue
+            out.append(
+                {
+                    "work_id": wid,
+                    "description": entry.get("description", ""),
+                    "status": entry.get("status", "unknown"),
+                    "current_phase": entry.get("current_phase", ""),
+                    "work_type": entry.get("work_type", ""),
+                }
+            )
+        return out
+
     # ── Work operations ──
 
     def get_work(self, work_id: str) -> dict[str, Any] | None:

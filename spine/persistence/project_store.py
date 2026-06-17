@@ -96,3 +96,46 @@ class ProjectStore:
             spec.updated_at = datetime.now().isoformat()
             self.save_project(spec)
         return spec
+
+    def remove_members(self, project_id: str, work_ids: list[str]) -> ProjectSpec:
+        """Remove work_ids from a project's membership (set difference).
+
+        Also strips the removed ids from each roadmap phase's
+        ``member_work_ids`` so coverage stays consistent. Bumps ``updated_at``
+        only when something actually changed.
+
+        Raises:
+            KeyError: if the project does not exist.
+        """
+        spec = self.load_project(project_id)
+        if spec is None:
+            raise KeyError(f"Project '{project_id}' not found")
+
+        to_remove = {w for w in work_ids if w}
+        new_members = [w for w in spec.member_work_ids if w not in to_remove]
+        changed = len(new_members) != len(spec.member_work_ids)
+
+        for phase in spec.roadmap.phases:
+            new_phase_members = [w for w in phase.member_work_ids if w not in to_remove]
+            if len(new_phase_members) != len(phase.member_work_ids):
+                phase.member_work_ids = new_phase_members
+                changed = True
+
+        if changed:
+            spec.member_work_ids = new_members
+            spec.updated_at = datetime.now().isoformat()
+            self.save_project(spec)
+        return spec
+
+    def delete_project(self, project_id: str) -> bool:
+        """Delete a project's on-disk directory.
+
+        Returns True if the project existed and was removed, False otherwise.
+        """
+        import shutil
+
+        project_dir = self._project_dir(project_id)
+        if not project_dir.exists():
+            return False
+        shutil.rmtree(project_dir)
+        return True
