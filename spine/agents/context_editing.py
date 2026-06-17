@@ -117,6 +117,62 @@ def _count_lines(content: str) -> int:
     return content.count("\n") + (0 if content.endswith("\n") else 1)
 
 
+def _stringify_content(content: Any) -> str:
+    """Coerce LangChain message content into a plain string.
+
+    Tool results do not always arrive as a bare ``str``. The
+    ``codebase_query`` facade and the ``mcp_codebase-index_*`` tools return
+    *multimodal* content — a list of blocks like
+    ``[{"type": "text", "text": "..."}]``. Eviction and caching previously
+    discarded any non-``str`` content (``... if isinstance(c, str) else ""``),
+    which produced empty placeholders such as ``[evicted(codebase_query): ]``
+    and forced agents to re-issue structural lookups they had already paid
+    for (trace 019ed3b8: a single subagent re-read the same 3 files 48×).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _summarize_code_locations(content: str, max_locs: int = 4) -> str:
+    """Summarize a ``codebase_query`` result as ``file:line`` references.
+
+    The structural lookup tools return JSON — either a single object
+    (``find_symbol`` / ``get_source``) or a list (``search``). We surface the
+    file/line of each hit so the evicted placeholder still tells the agent
+    *where* the symbol lives, instead of an opaque stub it has to re-query.
+    """
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        hint = content.strip().split("\n", 1)[0][:80]
+        return hint or "no results"
+    items = data if isinstance(data, list) else [data]
+    if not items:
+        return "no results"
+    locs: list[str] = []
+    for item in items[:max_locs]:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("file") or item.get("file_path") or "?"
+        line = item.get("line") or item.get("start_line")
+        locs.append(f"{path}:{line}" if line else str(path))
+    if not locs:
+        return "no results"
+    extra = f" (+{len(items) - max_locs} more)" if len(items) > max_locs else ""
+    return f"{len(items)} hit(s): " + ", ".join(locs) + extra
+
+
 # ---------------------------------------------------------------------------
 # ReadCacheMiddleware
 # ---------------------------------------------------------------------------
@@ -176,10 +232,10 @@ class ReadCacheMiddleware(AgentMiddleware):
             result = await handler(request)
 
             content: str = ""
-            if isinstance(result, ToolMessage) and isinstance(result.content, str):
-                content = result.content
-            elif hasattr(result, "content") and isinstance(result.content, str):
-                content = result.content
+            if isinstance(result, ToolMessage):
+                content = _stringify_content(result.content)
+            elif hasattr(result, "content"):
+                content = _stringify_content(result.content)
 
             if content:
                 n_lines = _count_lines(content)
@@ -275,10 +331,10 @@ class ReadCacheMiddleware(AgentMiddleware):
             result = await handler(request)
 
             content = ""
-            if isinstance(result, ToolMessage) and isinstance(result.content, str):
-                content = result.content
-            elif hasattr(result, "content") and isinstance(result.content, str):
-                content = result.content
+            if isinstance(result, ToolMessage):
+                content = _stringify_content(result.content)
+            elif hasattr(result, "content"):
+                content = _stringify_content(result.content)
 
             if content:
                 summary = f"{_count_lines(content)} lines"
@@ -371,10 +427,52 @@ def extract_metadata(content: str, tool_name: str, tool_args: dict[str, Any]) ->
         entries = [line for line in content.splitlines() if line.strip()]
         return f"[ls: {path} — {len(entries)} entries]"
 
+    if tool_name == "codebase_query" or tool_name.startswith("mcp_codebase-index"):
+        action = tool_args.get("action") or tool_name.rsplit("_", 1)[-1]
+        target = tool_args.get("name") or tool_args.get("pattern") or "?"
+        locs = _summarize_code_locations(content)
+        return f"[codebase_query {action} '{target}' → {locs}]"
+
     hint = content[:80].split("\n")[0]
     if len(hint) == 80 and len(content) > 80:
         hint += "..."
     return f"[evicted({tool_name}): {hint}]"
+
+
+# ---------------------------------------------------------------------------
+# Search-loop detection (SearchLoopGuard)
+# ---------------------------------------------------------------------------
+
+# Tools whose results represent a *search*. A run of empty results from these
+# means the agent is hunting for something that does not exist and keeps
+# rewording the query — the spin observed in trace 019ed3b8 where ~7
+# near-duplicate reranker/recall searches each returned ``[]``.
+_SEARCH_TOOLS: frozenset[str] = frozenset({
+    "codebase_query",
+    "search_codebase",
+    "grep",
+    "glob",
+})
+
+
+def _is_search_tool(name: str) -> bool:
+    """Return True if *name* is a code/text search tool (incl. MCP index)."""
+    return name in _SEARCH_TOOLS or name.startswith("mcp_codebase-index")
+
+
+def _is_empty_search_result(content: str) -> bool:
+    """Return True if a search/lookup result found nothing.
+
+    Handles both fresh results (``[]`` / ``{}`` / empty) and the eviction
+    placeholders produced by :func:`extract_metadata` (``→ no results``,
+    ``0 files`` for grep, ``0 hit`` for codebase_query).
+    """
+    s = content.strip()
+    if not s:
+        return True
+    if s in ("[]", "{}", "null", "no results"):
+        return True
+    return "→ no results" in s or "0 files" in s or "0 hit" in s
 
 
 def trim_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -540,7 +638,7 @@ class ToolOutputTrimmer(AgentMiddleware):
             if tc_id and tc_id in call_map:
                 name, args = call_map[tc_id]
 
-            content = msg.content if isinstance(msg.content, str) else ""
+            content = _stringify_content(msg.content)
             metadata = extract_metadata(content, name, args)
 
             evicted_ids.add(tc_id or "")
@@ -636,7 +734,7 @@ class TokenBudgetCompactor(AgentMiddleware):
             if name in self.preserved_tools:
                 continue
 
-            content = msg.content if isinstance(msg.content, str) else ""
+            content = _stringify_content(msg.content)
             metadata = extract_metadata(content, name, args)
             evicted_ids.add(tc_id)
             try:
@@ -841,6 +939,73 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
         )
         return await handler(
             request.override(messages=[*messages, SystemMessage(content=nudge)])
+        )
+
+    def wrap_tool_call(self, request, handler):
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        return await handler(request)
+
+
+# ---------------------------------------------------------------------------
+# SearchLoopGuard (zero-result search spin breaker)
+# ---------------------------------------------------------------------------
+
+
+class SearchLoopGuard(AgentMiddleware):
+    """Break consecutive zero-result search loops.
+
+    A subagent that keeps rewording a search for a symbol/section that does
+    not exist will burn turns — and, because the whole history is re-sent each
+    turn, tokens — chasing it. In trace 019ed3b8 a single ``implement``
+    subagent issued ~7 near-duplicate reranker/recall searches that each
+    returned ``[]`` before accepting the section didn't exist and creating it.
+
+    After ``threshold`` consecutive empty search results this middleware
+    appends a ``SystemMessage`` telling the model to stop re-searching and act
+    on what it already knows (create the thing, or proceed) — without dropping
+    tools, so legitimate non-search work still runs. The streak resets the
+    moment any search returns a hit.
+    """
+
+    def __init__(self, threshold: int = 3) -> None:
+        if threshold < 1:
+            raise ValueError("threshold must be >= 1")
+        self.threshold = threshold
+
+    @staticmethod
+    def _trailing_empty_streak(messages: list) -> int:
+        """Count the trailing run of consecutive empty search results."""
+        call_map = build_tool_call_map(messages)
+        streak = 0
+        for msg in messages:
+            if not isinstance(msg, ToolMessage):
+                continue
+            name = msg.name or ""
+            if not name and msg.tool_call_id in call_map:
+                name = call_map[msg.tool_call_id][0]
+            if not _is_search_tool(name):
+                continue
+            content = _stringify_content(msg.content)
+            streak = streak + 1 if _is_empty_search_result(content) else 0
+        return streak
+
+    async def awrap_model_call(self, request, handler):
+        messages = request.messages
+        streak = self._trailing_empty_streak(messages)
+        if streak < self.threshold:
+            return await handler(request)
+        reminder = (
+            f"[SEARCH LOOP GUARD] Your last {streak} searches returned no "
+            f"results. Stop re-searching with reworded queries — what you are "
+            f"looking for most likely does not exist yet. Either create it, or "
+            f"proceed using what you already have. Do NOT issue another "
+            f"search/codebase_query for the same thing."
+        )
+        logger.info("SearchLoopGuard: intervening (empty streak=%d)", streak)
+        return await handler(
+            request.override(messages=[*messages, SystemMessage(content=reminder)])
         )
 
     def wrap_tool_call(self, request, handler):

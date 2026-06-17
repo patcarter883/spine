@@ -120,6 +120,81 @@ class TestDefaultMetadata:
         assert "some long output from an unknown tool" in meta
 
 
+# ── 5b. _extract_metadata: codebase_query (structural lookups) ───────────
+
+
+class TestCodebaseQueryMetadata:
+    def test_find_symbol_records_location(self, trimmer: ToolOutputTrimmer):
+        content = '{"file": "spine/ui_api/api.py", "line": 34, "end_line": 120}'
+        meta = trimmer._extract_metadata(
+            content, "codebase_query", {"action": "find_symbol", "name": "UIApi"}
+        )
+        assert "codebase_query find_symbol 'UIApi'" in meta
+        assert "spine/ui_api/api.py:34" in meta
+
+    def test_search_lists_hits(self, trimmer: ToolOutputTrimmer):
+        content = (
+            '[{"file": "a.py", "line": 10}, {"file": "b.py", "line": 20}, '
+            '{"file": "c.py", "line": 30}]'
+        )
+        meta = trimmer._extract_metadata(
+            content, "codebase_query", {"action": "search", "pattern": "foo|bar"}
+        )
+        assert "codebase_query search 'foo|bar'" in meta
+        assert "3 hit(s)" in meta
+        assert "a.py:10" in meta
+
+    def test_empty_search_result(self, trimmer: ToolOutputTrimmer):
+        meta = trimmer._extract_metadata(
+            content="[]", tool_name="codebase_query",
+            tool_args={"action": "search", "pattern": "nope"},
+        )
+        assert "no results" in meta
+
+    def test_mcp_codebase_index_tool_handled(self, trimmer: ToolOutputTrimmer):
+        content = '{"file": "x.py", "line": 5}'
+        meta = trimmer._extract_metadata(
+            content, "mcp_codebase-index_find_symbol", {"name": "Foo"}
+        )
+        assert "codebase_query" in meta
+        assert "x.py:5" in meta
+
+
+# ── 5c. Structured (multimodal) content is not dropped on eviction ───────
+
+
+class TestStructuredContentEviction:
+    """Regression: codebase_query/MCP tools return list-of-blocks content;
+    eviction used to coerce it to "" → empty ``[evicted(codebase_query): ]``
+    stubs that erased the agent's lookup memory (trace 019ed3b8)."""
+
+    def test_list_content_evicted_with_location(self, trimmer: ToolOutputTrimmer):
+        structured = [
+            {"type": "text", "text": '{"file": "spine/config.py", "line": 42}'}
+        ]
+        msg = ToolMessage(
+            content=structured,
+            tool_call_id="tc_q",
+            name="codebase_query",
+        )
+        from spine.agents.context_editing import _stringify_content, extract_metadata
+
+        coerced = _stringify_content(msg.content)
+        assert "spine/config.py" in coerced  # not dropped to ""
+        meta = extract_metadata(
+            coerced, "codebase_query", {"action": "find_symbol", "name": "C"}
+        )
+        assert "spine/config.py:42" in meta
+        assert meta != "[evicted(codebase_query): ]"
+
+    def test_stringify_plain_str_passthrough(self):
+        from spine.agents.context_editing import _stringify_content
+
+        assert _stringify_content("hello") == "hello"
+        assert _stringify_content(None) == ""
+        assert _stringify_content([{"type": "text", "text": "a"}, "b"]) == "a\nb"
+
+
 # ── 6. _trim_ai_args: write_file content trimming ────────────────────────
 
 
