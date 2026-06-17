@@ -258,15 +258,29 @@ def _render_members(api: UIApi, project_id: str) -> None:
     if not members:
         st.info("No work items belong to this project yet.")
         return
+    pending = [m for m in members if m.get("status") == "pending"]
+    if pending:
+        if st.button(f"▶ Start all ({len(pending)})", key="start_all_pending"):
+            for m in pending:
+                api.start_work(m["work_id"])
+            st.success(f"Started {len(pending)} work item(s).")
+            st.rerun()
+
     for m in members:
-        col1, col2, col3 = st.columns([2, 5, 1])
+        col1, col2, col3, col4 = st.columns([2, 5, 1, 1])
         col1.markdown(f"`{m['work_id']}`")
         phase = f" · {m['current_phase']}" if m.get("current_phase") else ""
         col2.write(
             f"{status_icon(m['status'])} {m['status']}{phase} — "
             f"{truncate(m['description'], 60)}"
         )
-        if col3.button("Open", key=f"open_{m['work_id']}"):
+        # Created-but-not-started items can be launched from here.
+        if m.get("status") == "pending":
+            if col3.button("Start", key=f"start_{m['work_id']}"):
+                api.start_work(m["work_id"])
+                st.success(f"Started {m['work_id']}.")
+                st.rerun()
+        if col4.button("Open", key=f"open_{m['work_id']}"):
             st.switch_page(
                 get_page("work-detail"), query_params={"work_id": m["work_id"]}
             )

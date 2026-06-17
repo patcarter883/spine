@@ -126,3 +126,49 @@ def test_delete_project(tmp_path):
     assert store.delete_project("demo") is True
     assert store.load_project("demo") is None
     assert store.delete_project("demo") is False
+
+
+# ── Concurrency: the inter-process lock prevents lost updates ──
+
+
+def _add_member_worker(base_path: str, work_id: str) -> None:
+    """Module-level worker so it is importable by spawned processes."""
+    ProjectStore(base_path=base_path).add_members("demo", [work_id])
+
+
+def test_concurrent_add_members_no_lost_update(tmp_path):
+    """Parallel add_members from separate processes must preserve every member.
+
+    Without the per-project flock, the read-modify-write on spec.json races:
+    two processes read the same membership and the later write clobbers the
+    earlier one's new member (a lost-update anomaly). The lock serialises the
+    cycle so all members survive.
+    """
+    import multiprocessing as mp
+
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(_spec(member_work_ids=[]))
+
+    work_ids = [f"w{i}" for i in range(20)]
+    ctx = mp.get_context("fork")
+    procs = [
+        ctx.Process(target=_add_member_worker, args=(str(tmp_path), wid))
+        for wid in work_ids
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=30)
+
+    loaded = store.load_project("demo")
+    assert loaded is not None
+    assert sorted(loaded.member_work_ids) == sorted(work_ids)
+
+
+def test_lock_file_not_listed_as_project(tmp_path):
+    """The per-project lock file must not pollute list_projects()."""
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(_spec("demo", member_work_ids=[]))
+    store.add_members("demo", ["w1"])  # creates demo.lock
+    assert (tmp_path / "demo.lock").exists()
+    assert store.list_projects() == ["demo"]
