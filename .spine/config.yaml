@@ -101,6 +101,19 @@ providers:
       provider: local
     implement:
       provider: local
+    # The decomposer (structured slice/micro-slice JSON) and the slice
+    # implementer (exact-match read_edit_lint) are where a weak local model
+    # burns the most tokens — failed edits and length-capped decompositions
+    # cascade into fallback re-decomposition (trace 019ed3dc). These two keys
+    # let you route just those roles to a stronger endpoint without moving the
+    # rest of IMPLEMENT. The 'implement/decomposer' key covers all three
+    # decomposer modes (plan/fallback/per_file) via prefix resolution. To flip:
+    # enable a stronger provider in providers.llm[] (e.g. 'pat' or
+    # 'openrouter') and change 'provider: local' below to its name.
+    implement/decomposer:
+      provider: local
+    implement/subagents/slice-implementer:
+      provider: local
     verify:
       provider: local
     critic:

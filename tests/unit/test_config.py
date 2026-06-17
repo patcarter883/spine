@@ -80,6 +80,33 @@ class TestSpineConfig:
         model = config.resolve_model()
         assert model == "openai:gpt-4o-mini"
 
+    def test_resolve_model_intermediate_phase_prefix(self) -> None:
+        """An intermediate path key (implement/decomposer) overrides all of its
+        modes, while an exact key still wins and the bare phase is the floor."""
+        config = SpineConfig()
+        config.providers = {
+            "llm": [
+                {"name": "local", "enabled": True, "model": "openai:local"},
+                {"name": "strong", "enabled": False, "model": "openai:strong"},
+                {"name": "exact", "enabled": False, "model": "openai:exact"},
+            ],
+            "phases": {
+                "implement": {"provider": "local"},
+                "implement/decomposer": {"provider": "strong"},
+                "implement/decomposer/fallback": {"provider": "exact"},
+            },
+        }
+        # Exact key wins for the mode it names.
+        assert config.resolve_model("implement/decomposer/fallback") == "openai:exact"
+        # Intermediate key covers the other modes.
+        assert config.resolve_model("implement/decomposer/plan") == "openai:strong"
+        assert config.resolve_model("implement/decomposer/per_file") == "openai:strong"
+        # Unrelated implement sub-paths fall through to the bare phase default.
+        assert (
+            config.resolve_model("implement/subagents/slice-implementer")
+            == "openai:local"
+        )
+
     def test_resolve_model_from_env(self) -> None:
         """Test resolving model from environment variable."""
         config = SpineConfig()

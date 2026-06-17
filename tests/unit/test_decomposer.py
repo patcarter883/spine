@@ -75,6 +75,23 @@ async def test_decomposer_clamps_completion_budget():
 
 
 @pytest.mark.asyncio
+async def test_decomposer_suppresses_reasoning():
+    """The decomposer must suppress the reasoning channel. Without it, a local
+    thinking model (e.g. Qwen3.6) spends the whole completion cap on
+    chain-of-thought before emitting any JSON and dies with
+    LengthFinishReasonError after burning the full budget (trace 019ed3dc)."""
+    model = _make_structured_mock(_decomposition("a"))
+    with (
+        patch("spine.agents.decomposer.resolve_chat_model", return_value=model),
+        patch(
+            "spine.agents.decomposer.suppress_reasoning", return_value=model
+        ) as suppress,
+    ):
+        await run_decomposer(mode="PLAN", spec_markdown="# Spec\n\nDo it.")
+    suppress.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_plan_mode_rejects_empty_spec():
     with pytest.raises(ValueError, match="spec_markdown"):
         await run_decomposer(mode="PLAN", spec_markdown="")

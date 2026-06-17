@@ -39,6 +39,7 @@ from spine.agents.helpers import (
     bind_structured_output,
     cap_completion_tokens,
     resolve_chat_model,
+    suppress_reasoning,
 )
 from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
@@ -220,6 +221,15 @@ async def run_decomposer(
     decompose_cap = SpineConfig.load().decompose_max_completion_tokens
     if decompose_cap and decompose_cap > 0:
         model = cap_completion_tokens(model, decompose_cap)
+    # Suppress the reasoning channel on local thinking models (e.g. Qwen3.6).
+    # Without this, chain-of-thought consumes the entire decompose_cap before
+    # any JSON is emitted, so the structured call dies with
+    # LengthFinishReasonError *after* burning the full completion budget — a
+    # multi-minute, fully-wasted call on a slow local backend that then drops
+    # the slice (trace 019ed3dc: every fallback_decomposer span errored this
+    # way). Mirrors the cap+suppress pattern in plan_do/researcher_supervisor.
+    # No-op for OpenRouter / real OpenAI models.
+    model = suppress_reasoning(model)
     structured = bind_structured_output(model, DecompositionResult)
 
     if mode == "PLAN":

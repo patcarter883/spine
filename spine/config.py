@@ -335,6 +335,15 @@ class SpineConfig:
     # into a fallback-decompose retry storm (trace 019ed360). Per-phase
     # max_completion_tokens overrides still win.
     decompose_max_completion_tokens: int = 4096
+    # Max depth of the IMPLEMENT fallback-decompose recursion. Each failed
+    # slice that is re-sliced increments the depth; at the cap the slice is
+    # surfaced as permanently blocked instead of being decomposed again. Depth
+    # is a fan-out MULTIPLIER: at depth 2 one stubborn slice can spawn 1 + 3 +
+    # 9 = 13 implementer attempts, each re-reading its target file into a fresh
+    # context (trace 019ed3dc). For weak local models that fail the original
+    # slice, finer micro-slicing rarely succeeds, so default to a single
+    # decomposition pass (1) and let stronger setups raise it.
+    implement_max_decompose_depth: int = 1
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -683,6 +692,12 @@ class SpineConfig:
                     spine.get("decompose_max_completion_tokens", 4096),
                 )
             ),
+            implement_max_decompose_depth=int(
+                os.getenv(
+                    "SPINE_IMPLEMENT_MAX_DECOMPOSE_DEPTH",
+                    spine.get("implement_max_decompose_depth", 1),
+                )
+            ),
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 5)),
             topic_lookup_min_similarity=float(
                 spine.get("topic_lookup_min_similarity", 0.5)
@@ -743,9 +758,12 @@ class SpineConfig:
         5. ``SPINE_MODEL`` env var
         6. ``ValueError`` if none of the above are set
 
-        The path-style key (``phase/subagents/name``) is checked **before**
-        the bare phase key so that subagent overrides take priority over the
-        phase default.
+        Path-style keys are resolved by walking prefixes from most-specific to
+        least: ``implement/decomposer/fallback`` consults
+        ``implement/decomposer/fallback``, then ``implement/decomposer``, then
+        ``implement`` — so a subagent/sub-phase override always wins over the
+        bare phase default, and an intermediate key (e.g.
+        ``implement/decomposer``) covers all of its modes at once.
 
         Args:
             phase: Optional phase or phase/subagent path (e.g. ``"implement"``
@@ -758,13 +776,17 @@ class SpineConfig:
         Raises:
             ValueError: If no model is configured anywhere.
         """
-        # Check phase-specific overrides first (more specific key wins)
+        # Check phase-specific overrides first (more specific key wins).
         if phase:
             phases = self.providers.get("phases", {})
-            # Check both exact key and parent phase key, in that order
-            for key in (phase, phase.split("/")[0] if "/" in phase else None):
-                if key is None:
-                    continue
+            # Walk path prefixes from most-specific to least: e.g.
+            # 'implement/decomposer/fallback' -> 'implement/decomposer' ->
+            # 'implement'. An intermediate key like 'implement/decomposer' can
+            # then override all three decomposer modes (plan/fallback/per_file)
+            # without enumerating each, while an exact key still wins over it.
+            parts = phase.split("/")
+            for i in range(len(parts), 0, -1):
+                key = "/".join(parts[:i])
                 phase_cfg = phases.get(key, {})
                 if not isinstance(phase_cfg, dict):
                     continue

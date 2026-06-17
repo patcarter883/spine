@@ -46,7 +46,22 @@ from spine.workflow.subgraph_state import ImplementSubgraphState
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
-_MAX_DECOMPOSE_DEPTH = 2
+
+
+def _max_decompose_depth() -> int:
+    """Configured cap on the fallback-decompose recursion.
+
+    Read from SpineConfig (``implement_max_decompose_depth``) so deployments on
+    weaker local models can fail a stubborn slice fast instead of letting it
+    fan out into 1 + 3 + 9 = 13 implementer attempts (trace 019ed3dc). Fails
+    open to 1 if config can't be loaded.
+    """
+    try:
+        from spine.config import SpineConfig
+
+        return max(0, int(SpineConfig.load().implement_max_decompose_depth))
+    except Exception:  # noqa: BLE001 — never let config break the dispatch loop
+        return 1
 
 # Substrings that mark a slice failure as a context-window overflow rather than
 # a logic error. A finite-window local model (llama.cpp/vLLM GGUF) rejects the
@@ -639,15 +654,28 @@ async def _fallback_decomposer_node(
     active_slice: dict = state.get("active_slice") or {}
     slice_id = active_slice.get("id", "unknown")
     depth = active_slice.get("_decompose_depth", 0)
+    max_depth = _max_decompose_depth()
 
-    if depth >= _MAX_DECOMPOSE_DEPTH:
+    # Every terminal path below removes the slice from ``failed_slices`` and
+    # records a blocked SliceResult in ``completed_slices``. The removal is
+    # mandatory for termination: ``_route_slices`` re-dispatches every failed
+    # slice and only reaches synthesis once ``failed_slices`` is empty, so a
+    # slice left in place loops back into this node forever. Recording the
+    # blocked result keeps the failure visible in synthesis instead of silently
+    # vanishing (the pre-fix cap path returned ``{}`` — neither terminating nor
+    # reporting).
+    if depth >= max_depth:
         logger.warning(
-            "[%s] fallback_decomposer: slice=%r hit depth cap (%d) — leaving as blocked",
+            "[%s] fallback_decomposer: slice=%r hit depth cap (%d/%d) — marking blocked",
             work_id,
             slice_id,
             depth,
+            max_depth,
         )
-        return {}
+        return {
+            "failed_slices": {"remove": [slice_id]},
+            "completed_slices": {"add": [_failed_to_blocked(active_slice)]},
+        }
 
     try:
         overflow = bool(active_slice.get("_overflow"))
@@ -661,36 +689,72 @@ async def _fallback_decomposer_node(
         )
     except Exception as e:
         logger.error(
-            "[%s] fallback_decomposer failed for %r: %s — dropping slice",
+            "[%s] fallback_decomposer failed for %r: %s — marking blocked",
             work_id,
             slice_id,
             e,
             exc_info=True,
         )
-        return {"failed_slices": {"remove": [slice_id]}}
+        blocked = _failed_to_blocked({**active_slice, "_failure_traceback": str(e)})
+        return {
+            "failed_slices": {"remove": [slice_id]},
+            "completed_slices": {"add": [blocked]},
+        }
 
     if not micro_slices:
         logger.warning(
-            "[%s] fallback_decomposer: slice=%r produced 0 micro-slices — dropping",
+            "[%s] fallback_decomposer: slice=%r produced 0 micro-slices — marking blocked",
             work_id,
             slice_id,
         )
-        return {"failed_slices": {"remove": [slice_id]}}
+        return {
+            "failed_slices": {"remove": [slice_id]},
+            "completed_slices": {"add": [_failed_to_blocked(active_slice)]},
+        }
 
     next_depth = depth + 1
     for sl in micro_slices:
         sl["_decompose_depth"] = next_depth
 
-    logger.info(
-        "[%s] fallback_decomposer: slice=%r -> %d micro-slice(s) at depth=%d",
-        work_id,
-        slice_id,
-        len(micro_slices),
-        next_depth,
-    )
+    # When the micro-slices all target the SAME single file (the common case —
+    # a failed single-file slice re-sliced into region-scoped pieces), dispatch
+    # them through one sibling-queue chain instead of fanning out N parallel
+    # implementers. N parallel branches on one file each re-read the whole file
+    # into a fresh context (trace 019ed3dc: one 1.6k-line file read 4× in 60s)
+    # and race on edits to it; a sequential chain reads per step and lets each
+    # micro build on the last.
+    micro_files = {
+        f for sl in micro_slices for f in (sl.get("target_files") or []) if f
+    }
+    if len(micro_files) == 1 and len(micro_slices) > 1:
+        head = _build_subslice_chain(active_slice, micro_slices)
+        # _build_subslice_chain stamps the PARENT's depth onto every member;
+        # re-stamp the incremented depth so the fallback cap still advances.
+        head["_decompose_depth"] = next_depth
+        for q in head.get("_sibling_queue", []):
+            q["_decompose_depth"] = next_depth
+        adds: list[dict] = [head]
+        logger.info(
+            "[%s] fallback_decomposer: slice=%r -> %d micro-slice(s) chained "
+            "sequentially on %s at depth=%d",
+            work_id,
+            slice_id,
+            len(micro_slices),
+            next(iter(micro_files)),
+            next_depth,
+        )
+    else:
+        adds = micro_slices
+        logger.info(
+            "[%s] fallback_decomposer: slice=%r -> %d micro-slice(s) at depth=%d",
+            work_id,
+            slice_id,
+            len(micro_slices),
+            next_depth,
+        )
     return {
         "failed_slices": {"remove": [slice_id]},
-        "pending_slices": {"add": micro_slices},
+        "pending_slices": {"add": adds},
     }
 
 
@@ -701,7 +765,7 @@ def _failed_to_blocked(s: dict) -> dict:
     """Coerce a failed-slice dict into the SliceResult shape expected by synthesis."""
     issues = (
         ["exceeded fallback depth"]
-        if s.get("_decompose_depth", 0) >= _MAX_DECOMPOSE_DEPTH
+        if s.get("_decompose_depth", 0) >= _max_decompose_depth()
         else ["implementer failed"]
     )
     return {
