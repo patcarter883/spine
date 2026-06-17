@@ -21,6 +21,37 @@ SPINE is a deterministic AI agent harness with a workflow engine and modular pro
 
 ---
 
+## Development Workflow — Isolated Worktrees
+
+**Do all work in a dedicated git worktree on its own branch, then merge into `main` when the work is complete.** Never edit, stage, or commit directly in the shared primary checkout.
+
+**Why this is mandatory:** the primary checkout has a single working tree *and* a single git index. When two agents (or an agent and a spine run) operate there at once, their edits and `git add`/`commit` calls race on that shared index — one process's commit silently sweeps up another's staged files, branch checkouts switch underneath in-flight work, and `main` gets rewritten under your feet. (Trace `019ed38f` follow-up: a fix was staged in the primary checkout, a concurrent commit reset the index, and the fix landed in the wrong commit / not at all.) Worktrees give each line of work its own working tree and index, so the only shared state is the commit graph — which git is designed to handle concurrently.
+
+**Workflow:**
+
+```bash
+# 1. Create an isolated worktree + branch for the work item
+git worktree add ../spine-wt/<short-slug> -b <type>/<short-slug>    # e.g. fix/dispatcher-stall
+
+# 2. Do all editing, testing, and committing inside that worktree
+cd ../spine-wt/<short-slug>
+# ... edit, run tests, commit ...
+
+# 3. When the work is complete and green, merge back into main
+git -C /home/pat/projects/spine merge --ff-only <type>/<short-slug>   # or open a PR
+
+# 4. Clean up
+git worktree remove ../spine-wt/<short-slug>
+git branch -d <type>/<short-slug>
+```
+
+**Rules:**
+- One worktree per work item; branch name mirrors the work (`fix/…`, `feat/…`, `chore/…`).
+- Merge only when tests pass and the work is finished — prefer `--ff-only` (or a PR) so history stays linear and no in-progress branch pollutes `main`.
+- If you find yourself about to `git add` in the primary checkout, stop and move the work to a worktree first.
+
+---
+
 ## Configuration
 ```yaml
 spine:
