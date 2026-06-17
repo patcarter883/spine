@@ -1089,6 +1089,97 @@ async def resume_work(
 # ── Resume interrupted work (using Command + interrupt) ──
 
 
+async def _resume_flagged_without_interrupt(
+    *,
+    work_id: str,
+    work_type: str,
+    action: str,
+    flagged_phase: str,
+    feedback: str,
+    config: SpineConfig,
+    db: sqlite_utils.Database,
+    audit: AuditService,
+) -> dict[str, Any]:
+    """Resume a needs_review item whose graph never paused at an interrupt().
+
+    Autonomous work types (``task`` / ``critical_task``) route a
+    ``needs_review`` verdict to the ``flag_needs_review`` terminal node, not
+    to the ``human_review`` interrupt — so their thread is already at END and
+    there is no checkpoint to resume via ``Command(resume=...)``. Translate
+    the human's action into the equivalent real operation:
+
+    - ``rework``  → re-run from the flagged phase (``restart_from_phase``).
+    - ``approve`` → re-run from the phase *after* the flagged one; if the
+      flagged phase was the last, finalise as completed.
+    - ``abort``   → finalise the entry as cancelled.
+
+    ``restart_from_phase`` carries the prior run's ``execution_waves`` /
+    ``plan_json`` forward from the checkpoint, so the re-run has the slices to
+    implement rather than starting empty.
+    """
+    from spine.workflow.compose import WORKFLOW_SEQUENCES
+
+    audit.log_event(
+        work_id,
+        "work_resumed_no_interrupt",
+        "dispatcher",
+        {"action": action, "flagged_phase": flagged_phase, "feedback": feedback[:200]},
+    )
+
+    if action == "abort":
+        db["work_entries"].update(
+            work_id,
+            {
+                "status": TaskStatus.CANCELLED.value,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.CANCELLED.value,
+            "work_type": work_type,
+        }
+
+    # Ordered non-critic phases for this work type (restart targets).
+    ordered_phases = [
+        name
+        for name, _ in WORKFLOW_SEQUENCES.get(work_type, [])
+        if not name.startswith(PhaseName.CRITIC.value)
+    ]
+
+    target_phase = flagged_phase
+    if action == "approve":
+        # Approving the flagged phase means advancing past it.
+        if flagged_phase in ordered_phases:
+            idx = ordered_phases.index(flagged_phase)
+            if idx + 1 < len(ordered_phases):
+                target_phase = ordered_phases[idx + 1]
+            else:
+                # Flagged phase was the last — nothing left to run.
+                db["work_entries"].update(
+                    work_id,
+                    {
+                        "status": TaskStatus.COMPLETED.value,
+                        "updated_at": datetime.now().isoformat(),
+                    },
+                )
+                return {
+                    "work_id": work_id,
+                    "status": TaskStatus.COMPLETED.value,
+                    "work_type": work_type,
+                }
+
+    if not target_phase or target_phase not in ordered_phases:
+        # No usable phase to resume from — surface the error instead of
+        # silently completing (the very failure mode this guard exists for).
+        raise ValueError(
+            f"Cannot resume work '{work_id}' for action '{action}': "
+            f"no valid flagged phase recorded in state (got '{flagged_phase!r}')."
+        )
+
+    return await restart_from_phase(work_id, target_phase, config)
+
+
 async def resume_interrupted_work(
     work_id: str,
     action: str,
@@ -1143,9 +1234,47 @@ async def resume_interrupted_work(
         }
     }
 
+    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
+
+    # ── Guard: is there actually an interrupt to resume from? ──
+    # Command(resume=...) only advances a thread that paused at an interrupt()
+    # awaiting human input. Reviewed work types (reviewed_task,
+    # critical_reviewed_task) do pause there. Autonomous types (task,
+    # critical_task) instead route a needs_review verdict to the
+    # flag_needs_review TERMINAL node — their thread is already at END. A
+    # resume Command against an ended thread executes no nodes, streams zero
+    # updates, and the empty result then defaults to "completed" in
+    # _derive_final_status — silently marking the work done with nothing run
+    # (trace 019ed36f). Detect that and translate the action into a real
+    # rerun instead of a no-op resume.
+    snapshot = await graph.aget_state(thread_config)
+    has_pending_interrupt = bool(snapshot.next) and any(
+        getattr(task, "interrupts", None) for task in snapshot.tasks
+    )
+    if not has_pending_interrupt:
+        values = snapshot.values or {}
+        flagged_phase = values.get("needs_review_phase") or values.get(
+            "current_phase", ""
+        )
+        logger.info(
+            f"[{work_id}] resume_interrupted_work: thread has no pending "
+            f"interrupt (work type '{work_type}', flagged at "
+            f"'{flagged_phase or 'unknown'}'); translating action '{action}' "
+            f"into a real rerun."
+        )
+        return await _resume_flagged_without_interrupt(
+            work_id=work_id,
+            work_type=work_type,
+            action=action,
+            flagged_phase=flagged_phase,
+            feedback=feedback,
+            config=config,
+            db=db,
+            audit=audit,
+        )
+
     command = Command(resume={"action": action, "feedback": feedback})
 
-    audit = AuditService(db_path=str(Path(config.queue_path).parent / "audit.db"))
     audit.log_event(
         work_id,
         "work_resumed_interrupt",
@@ -1191,6 +1320,29 @@ async def resume_interrupted_work(
         # inside traced_astream) so the LangSmith root span closes even on
         # an exception/early exit instead of waiting on GC.
         await stream.aclose()
+
+    # Defense in depth: the pending-interrupt guard above should ensure at
+    # least one node runs, but if the resume still streamed zero updates the
+    # result is empty — and _derive_final_status would default that to
+    # "completed", silently marking the work done with nothing run. Preserve
+    # needs_review instead so the item stays actionable.
+    if not result:
+        logger.warning(
+            f"[{work_id}] resume_interrupted_work streamed no updates — "
+            f"preserving needs_review instead of defaulting to completed."
+        )
+        db["work_entries"].update(
+            work_id,
+            {
+                "status": TaskStatus.NEEDS_REVIEW.value,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.NEEDS_REVIEW.value,
+            "work_type": work_type,
+        }
 
     final_phase = result.get("current_phase", "")
     final_status = _derive_final_status(

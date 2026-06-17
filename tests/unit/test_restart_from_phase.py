@@ -11,7 +11,8 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -177,3 +178,118 @@ class TestRestartFromPhaseActiveTaskCheck:
         # Status preserved → the restart can be retried after cleaning the tree.
         entry = work_db["work_entries"].get("test-work-1")
         assert entry["status"] == "running"
+
+
+class TestResumeInterruptedWithoutInterrupt:
+    """resume_interrupted_work must not silently complete an autonomous task.
+
+    Autonomous work types (``task`` / ``critical_task``) route needs_review
+    to the ``flag_needs_review`` terminal node — their graph thread ends at
+    END with no pending interrupt. Issuing ``Command(resume=...)`` against an
+    ended thread used to stream zero updates, and the empty result then
+    defaulted to "completed" — marking the work done with nothing run
+    (trace 019ed36f). The guard must detect the absent interrupt and translate
+    the action into a real rerun instead.
+    """
+
+    def _setup_work_entry(
+        self, work_db, work_id: str = "afd125a6", status: str = "running"
+    ):
+        work_db["work_entries"].insert(
+            {
+                "id": work_id,
+                "description": "test work",
+                "work_type": "task",
+                "status": status,
+                "current_phase": "implement",
+                "created_at": "2024-06-15T12:00:00",
+                "updated_at": "2024-06-15T13:00:00",
+                "result": "{}",
+            }
+        )
+
+    def _fake_ended_graph(self, flagged_phase: str = "implement"):
+        """A compiled-graph stand-in whose thread is already at END."""
+        snapshot = SimpleNamespace(
+            next=(),  # no pending nodes → graph reached END
+            tasks=[],  # no interrupt tasks awaiting resume
+            values={
+                "needs_review_phase": flagged_phase,
+                "current_phase": flagged_phase,
+            },
+        )
+        graph = MagicMock()
+        graph.aget_state = AsyncMock(return_value=snapshot)
+        return graph
+
+    @pytest.mark.asyncio
+    async def test_rework_without_interrupt_delegates_to_restart(
+        self, tmp_config, work_db
+    ):
+        self._setup_work_entry(work_db)
+
+        captured: dict = {}
+
+        async def fake_restart(work_id, phase, config):
+            captured["call"] = (work_id, phase)
+            return {"work_id": work_id, "status": "completed", "work_type": "task"}
+
+        with patch(
+            "spine.workflow.compose.build_workflow_graph",
+            return_value=self._fake_ended_graph("implement"),
+        ), patch(
+            "spine.work.dispatcher.restart_from_phase", side_effect=fake_restart
+        ):
+            from spine.work.dispatcher import resume_interrupted_work
+
+            await resume_interrupted_work(
+                "afd125a6", "rework", "Redo implementation", tmp_config
+            )
+
+        # The flagged phase is re-run rather than no-op resumed.
+        assert captured["call"] == ("afd125a6", "implement")
+
+    @pytest.mark.asyncio
+    async def test_approve_without_interrupt_advances_to_next_phase(
+        self, tmp_config, work_db
+    ):
+        self._setup_work_entry(work_db)
+
+        captured: dict = {}
+
+        async def fake_restart(work_id, phase, config):
+            captured["call"] = (work_id, phase)
+            return {"work_id": work_id, "status": "completed", "work_type": "task"}
+
+        with patch(
+            "spine.workflow.compose.build_workflow_graph",
+            return_value=self._fake_ended_graph("implement"),
+        ), patch(
+            "spine.work.dispatcher.restart_from_phase", side_effect=fake_restart
+        ):
+            from spine.work.dispatcher import resume_interrupted_work
+
+            await resume_interrupted_work("afd125a6", "approve", "looks good", tmp_config)
+
+        # Approving implement advances to verify (next non-critic phase).
+        assert captured["call"] == ("afd125a6", "verify")
+
+    @pytest.mark.asyncio
+    async def test_abort_without_interrupt_cancels(self, tmp_config, work_db):
+        self._setup_work_entry(work_db)
+
+        with patch(
+            "spine.workflow.compose.build_workflow_graph",
+            return_value=self._fake_ended_graph("implement"),
+        ), patch(
+            "spine.work.dispatcher.restart_from_phase",
+            side_effect=AssertionError("restart must not run on abort"),
+        ):
+            from spine.work.dispatcher import resume_interrupted_work
+
+            result = await resume_interrupted_work(
+                "afd125a6", "abort", "stop", tmp_config
+            )
+
+        assert result["status"] == "cancelled"
+        assert work_db["work_entries"].get("afd125a6")["status"] == "cancelled"
