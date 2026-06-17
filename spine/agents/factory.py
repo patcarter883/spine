@@ -694,6 +694,15 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
 
         middleware.append(ToolSchemaValidator())
 
+    # SearchLoopGuard — break zero-result search spins. A subagent that keeps
+    # rewording a codebase_query/grep for something that doesn't exist burns
+    # turns and tokens (trace 019ed3b8: ~7 empty reranker/recall searches).
+    # After 3 consecutive empty searches it nudges the model to stop hunting
+    # and act. Tools stay bound, so non-search work is unaffected.
+    from spine.agents.context_editing import SearchLoopGuard
+
+    middleware.append(SearchLoopGuard())
+
     # Note: ToolOutputTrimmer was removed (2026-05) — excessive trimming of
     # filesystem results was causing agents to lose critical context during
     # implementation/verification phases. ReadCacheMiddleware now handles
