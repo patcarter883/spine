@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from spine.agents.helpers import (
     ainvoke_structured_with_retry,
     bind_structured_output,
+    cap_completion_tokens,
     resolve_chat_model,
 )
 from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
@@ -208,6 +209,17 @@ async def run_decomposer(
 
     phase_path = f"implement/decomposer/{mode.lower()}"
     model = resolve_chat_model(config, session_id=session_id, phase=phase_path)
+    # Clamp the completion reservation. DecompositionResult is small, but the
+    # bare structured call would otherwise inherit the global
+    # max_completion_tokens (30K) and ask a finite-window local server to
+    # reserve a 30K generation slot — starving KV cache for the prompt and
+    # OOM-crashing the backend (trace 019ed360). cap_completion_tokens writes
+    # whichever underlying field is set (max_tokens vs its alias).
+    from spine.config import SpineConfig
+
+    decompose_cap = SpineConfig.load().decompose_max_completion_tokens
+    if decompose_cap and decompose_cap > 0:
+        model = cap_completion_tokens(model, decompose_cap)
     structured = bind_structured_output(model, DecompositionResult)
 
     if mode == "PLAN":

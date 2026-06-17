@@ -35,6 +35,11 @@ def _make_structured_mock(result: DecompositionResult) -> MagicMock:
     structured.ainvoke = AsyncMock(return_value=result)
     model = MagicMock()
     model.with_structured_output = MagicMock(return_value=structured)
+    # run_decomposer clamps the completion cap via cap_completion_tokens, which
+    # returns model.model_copy(update=...). A real ChatOpenAI yields a fresh
+    # usable model; mirror that by returning the same configured mock so the
+    # bound async structured output survives the copy.
+    model.model_copy = MagicMock(return_value=model)
     return model
 
 
@@ -48,6 +53,25 @@ async def test_plan_mode_returns_slice_dicts():
         )
     assert [s["id"] for s in slices] == ["a", "b"]
     assert all("acceptance_criteria" in s for s in slices)
+
+
+@pytest.mark.asyncio
+async def test_decomposer_clamps_completion_budget():
+    """The decomposer must clamp its completion reservation rather than inherit
+    the large global max_completion_tokens — a 30K reservation against a finite
+    local window OOM-crashes the backend (trace 019ed360)."""
+    model = _make_structured_mock(_decomposition("a"))
+    with (
+        patch("spine.agents.decomposer.resolve_chat_model", return_value=model),
+        patch(
+            "spine.agents.decomposer.cap_completion_tokens", return_value=model
+        ) as cap,
+    ):
+        await run_decomposer(mode="PLAN", spec_markdown="# Spec\n\nDo it.")
+    cap.assert_called_once()
+    # Called as cap_completion_tokens(model, <decompose_max_completion_tokens>)
+    capped_to = cap.call_args.args[1]
+    assert isinstance(capped_to, int) and 0 < capped_to <= 8192
 
 
 @pytest.mark.asyncio

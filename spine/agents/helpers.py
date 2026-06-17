@@ -913,6 +913,40 @@ def _build_local_model(
         if global_cap and global_cap > 0:
             kwargs["max_completion_tokens"] = int(global_cap)
 
+    # ── Clamp the completion reservation against the context window ───
+    # The completion cap is a slot the server must reserve in its KV cache
+    # *in addition to* the prompt. If it approaches the configured
+    # context_window, a normal-sized prompt no longer fits and a finite local
+    # backend (llama.cpp/vLLM) OOM-crashes while allocating the generation
+    # slot — dropping every in-flight request with "CURL error: Could not
+    # connect" and fanning out into a fallback-decompose retry storm (trace
+    # 019ed360). Never let the reservation exceed half the window, which
+    # guarantees at least that much room for the prompt. Phases that set a sane
+    # per-phase cap (implement/synthesize = 8K, decompose = 4K) are untouched;
+    # this only catches calls that inherited the large global cap. The
+    # DynamicCompletionCapMiddleware still trims further per-turn for the
+    # tool-using agents that carry it.
+    context_window = provider_cfg.get("context_window")
+    cap_field = (
+        "max_tokens"
+        if "max_tokens" in kwargs
+        else "max_completion_tokens"
+        if "max_completion_tokens" in kwargs
+        else None
+    )
+    if context_window and cap_field and kwargs.get(cap_field):
+        ceiling = int(context_window) // 2
+        if 0 < ceiling < int(kwargs[cap_field]):
+            logger.warning(
+                "Clamping %s %d -> %d to fit context_window=%d "
+                "(reserve room for the prompt; avoids backend OOM)",
+                cap_field,
+                int(kwargs[cap_field]),
+                ceiling,
+                int(context_window),
+            )
+            kwargs[cap_field] = ceiling
+
     # ── Default request_timeout ───────────────────────────────────────
     # If not explicitly configured, default to 300s (5 min) to prevent
     # hung connections from blocking the workflow for 30+ minutes.

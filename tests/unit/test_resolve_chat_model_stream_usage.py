@@ -15,7 +15,52 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import langchain.chat_models as lc_chat_models
+import langchain_openai
 import spine.agents.helpers as helpers
+
+
+def _capture_chat_openai(monkeypatch):
+    """Patch ChatOpenAI to capture constructor kwargs without a real client."""
+    captured: dict = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FakeChatOpenAI)
+    return captured
+
+
+def test_local_completion_cap_clamped_to_half_window(monkeypatch):
+    """A completion reservation larger than half the context_window is clamped
+    so the prompt always fits — an over-large reservation OOM-crashes a finite
+    local backend (trace 019ed360)."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local",
+        {
+            "base_url": "http://localhost:8010/v1",
+            "max_completion_tokens": 30000,
+            "context_window": 40000,
+        },
+    )
+    # 30000 > 40000 // 2 -> clamped to 20000.
+    assert captured.get("max_completion_tokens") == 20000
+
+
+def test_local_completion_cap_within_window_untouched(monkeypatch):
+    """A sane per-phase cap (e.g. implement=8K) under half the window is left
+    alone."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local",
+        {
+            "base_url": "http://localhost:8010/v1",
+            "max_completion_tokens": 8000,
+            "context_window": 40000,
+        },
+    )
+    assert captured.get("max_completion_tokens") == 8000
 
 
 def _capture_init_chat_model(monkeypatch):

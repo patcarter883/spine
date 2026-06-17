@@ -323,6 +323,18 @@ class SpineConfig:
     # lowers it further per-turn as the prompt grows. 8K still covers a
     # full_replace of a ~30KB file, which is larger than any single slice's file.
     implement_max_completion_tokens: int = 8000
+    # Completion-token cap for the structural decomposer's no-tool structured
+    # calls (PLAN / FALLBACK / PER_FILE in spine.agents.decomposer). A
+    # DecompositionResult is a handful of small slice objects (2-3 micro-slices,
+    # or one sub-slice per target file), so a few thousand tokens is ample.
+    # Without a cap the bare call inherits the global max_completion_tokens
+    # (30K); against a finite local window (e.g. context_window=40K) the server
+    # must reserve a 30K generation slot, leaving too little KV cache for the
+    # prompt and OOM-crashing the backend — which then drops every in-flight
+    # request with "CURL error: Could not connect" and fans the failures out
+    # into a fallback-decompose retry storm (trace 019ed360). Per-phase
+    # max_completion_tokens overrides still win.
+    decompose_max_completion_tokens: int = 4096
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -663,6 +675,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_MAX_COMPLETION_TOKENS",
                     spine.get("max_completion_tokens", 0),
+                )
+            ),
+            decompose_max_completion_tokens=int(
+                os.getenv(
+                    "SPINE_DECOMPOSE_MAX_COMPLETION_TOKENS",
+                    spine.get("decompose_max_completion_tokens", 4096),
                 )
             ),
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 5)),
