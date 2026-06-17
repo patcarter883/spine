@@ -60,7 +60,7 @@ providers:
   #   context_window: 32000
   - name: local
     type: deepagents-model
-    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
+    model: openai:Qwen3.6-27B-MTP-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
