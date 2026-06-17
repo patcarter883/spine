@@ -1064,12 +1064,28 @@ class UIApi:
 
         update_work_status(work_id, TaskStatus.RUNNING.value, config=self._config)
 
+    def start_work(self, work_id: str) -> dict[str, Any]:
+        """Launch a created-but-not-yet-started (``pending``) work item.
+
+        Project tasks submitted with ``spine run --project`` are parked as
+        ``pending`` for review before running. Starting one runs it from phase
+        0 — the same machinery as :meth:`restart_work` — non-blocking via the
+        worker's background executor.
+
+        Args:
+            work_id: The pending work item ID to launch.
+
+        Returns:
+            Dict with work_id, status, and action.
+        """
+        return self.restart_work(work_id)
+
     def restart_work(
         self,
         work_id: str,
         clear_artifacts: bool = False,
     ) -> dict[str, Any]:
-        """Restart a running, stalled, or needs_review work item from phase 0.
+        """Restart a pending, running, stalled, or needs_review work item from phase 0.
 
         Non-blocking: runs the restart in the background via
         RalphLoopWorker's executor and returns immediately. The work_detail

@@ -229,6 +229,7 @@ async def submit_work(
     work_id: str | None = None,
     plan_id: str | None = None,
     project_id: str | None = None,
+    start: bool = True,
 ) -> dict[str, Any]:
     """Submit a new work item for processing.
 
@@ -237,6 +238,12 @@ async def submit_work(
     2. Builds the workflow graph for the given work type
     3. Invokes the graph with checkpoint persistence
     4. Returns the work ID and initial state
+
+    When ``start`` is False the work item is only *created*: the entry is
+    recorded as ``pending`` and (if given) registered as a project member,
+    but the workflow graph is NOT built or run. This lets a batch of project
+    tasks be reviewed in the UI before any of them executes; each is later
+    launched from phase 0 via ``restart_work`` (the UI "Start" button).
 
     When called from the background queue worker (RalphLoopWorker),
     ``created_at`` should be the original ``enqueued_at`` timestamp so
@@ -260,6 +267,10 @@ async def submit_work(
             ``plan_id`` — it is a project-membership back-reference, NOT a
             planning-source pointer, and the two never imply a hierarchy. When
             set, the work item is registered as a member of the project.
+        start: When True (default), build and run the workflow graph inline.
+            When False, only create the work entry (status ``pending``) and
+            register project membership, then return without running — the
+            item is launched later via ``restart_work``.
 
     Returns:
         A dict with keys: ``work_id``, ``status``, ``work_type``.
@@ -329,7 +340,7 @@ async def submit_work(
             "id": work_id,
             "description": description,
             "work_type": work_type,
-            "status": TaskStatus.RUNNING.value,
+            "status": (TaskStatus.RUNNING if start else TaskStatus.PENDING).value,
             "current_phase": "",
             "created_at": now,
             "updated_at": now,
@@ -354,6 +365,23 @@ async def submit_work(
                 work_id,
                 project_id,
             )
+
+    # ── Create-only mode ──
+    # When start is False the item is parked as ``pending`` for review in the
+    # UI; do NOT build or run the graph. It is launched later from phase 0 via
+    # restart_work (the UI "Start" button).
+    if not start:
+        audit.log_event(
+            work_id,
+            "work_created",
+            "dispatcher",
+            {"project_id": project_id, "deferred": True},
+        )
+        return {
+            "work_id": work_id,
+            "status": TaskStatus.PENDING.value,
+            "work_type": work_type,
+        }
 
     # Build and run the workflow graph
     try:
@@ -1381,11 +1409,13 @@ async def restart_work(
     *,
     clear_artifacts: bool = False,
 ) -> dict[str, Any]:
-    """Restart a work item that is running, stalled, or needs_review.
+    """Restart a work item that is pending, running, stalled, or needs_review.
 
     Unlike ``resume_work`` (which continues from a checkpoint with human
     feedback), ``restart_work`` re-runs the workflow from phase 0.  It
-    is intended for items whose worker or UI died mid-execution.
+    is intended for items whose worker or UI died mid-execution, and to
+    launch a ``pending`` item that was created (e.g. ``spine run --project``)
+    but never started.
 
     Steps:
       1. Validates the work item exists and is in a restartable status.
@@ -1420,6 +1450,7 @@ async def restart_work(
 
     status = entry.get("status", "")
     restartable = (
+        TaskStatus.PENDING.value,
         TaskStatus.RUNNING.value,
         TaskStatus.STALLED.value,
         TaskStatus.NEEDS_REVIEW.value,

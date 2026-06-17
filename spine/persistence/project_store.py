@@ -14,11 +14,21 @@ only a reverse-lookup convenience.
 from __future__ import annotations
 
 import json
+import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 from spine.models.types import ProjectSpec
+
+logger = logging.getLogger(__name__)
+
+try:
+    import fcntl  # POSIX advisory file locking
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 
 class ProjectStore:
@@ -29,6 +39,42 @@ class ProjectStore:
 
     def _project_dir(self, project_id: str) -> Path:
         return self._base / project_id
+
+    @contextmanager
+    def _project_lock(self, project_id: str) -> Iterator[None]:
+        """Hold an exclusive inter-process lock for a single project.
+
+        Membership mutations (:meth:`add_members` / :meth:`remove_members`) are
+        read-modify-write cycles on ``spec.json``. Without a lock, two
+        concurrent submissions — parallel ``spine run --project`` calls, or a
+        CLI submission racing a UI edit, each in its own process — can both
+        read the same spec and the later write clobbers the earlier one's new
+        members (a lost-update anomaly). An exclusive ``flock`` on a per-project
+        lock file serialises the whole cycle across processes so every member
+        is preserved.
+
+        The lock file lives at ``{base}/{project_id}.lock`` (a sibling of the
+        project directory, so it never shows up in ``list_projects``'s
+        ``*/spec.json`` glob). On a non-POSIX platform without ``fcntl`` the
+        lock degrades to a no-op (logged once) — the same best-effort behaviour
+        as before this guard existed.
+        """
+        self._base.mkdir(parents=True, exist_ok=True)
+        lock_path = self._base / f"{project_id}.lock"
+        if fcntl is None:
+            logger.warning(
+                "fcntl unavailable; project membership updates for '%s' are not "
+                "lock-protected against concurrent writers.",
+                project_id,
+            )
+            yield
+            return
+        with open(lock_path, "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def save_project(self, spec: ProjectSpec) -> Path:
         """Persist a project spec atomically and write its metadata sidecar.
@@ -85,17 +131,18 @@ class ProjectStore:
         Raises:
             KeyError: if the project does not exist.
         """
-        spec = self.load_project(project_id)
-        if spec is None:
-            raise KeyError(f"Project '{project_id}' not found")
+        with self._project_lock(project_id):
+            spec = self.load_project(project_id)
+            if spec is None:
+                raise KeyError(f"Project '{project_id}' not found")
 
-        existing = set(spec.member_work_ids)
-        added = [w for w in work_ids if w and w not in existing]
-        if added:
-            spec.member_work_ids = spec.member_work_ids + added
-            spec.updated_at = datetime.now().isoformat()
-            self.save_project(spec)
-        return spec
+            existing = set(spec.member_work_ids)
+            added = [w for w in work_ids if w and w not in existing]
+            if added:
+                spec.member_work_ids = spec.member_work_ids + added
+                spec.updated_at = datetime.now().isoformat()
+                self.save_project(spec)
+            return spec
 
     def remove_members(self, project_id: str, work_ids: list[str]) -> ProjectSpec:
         """Remove work_ids from a project's membership (set difference).
@@ -107,25 +154,26 @@ class ProjectStore:
         Raises:
             KeyError: if the project does not exist.
         """
-        spec = self.load_project(project_id)
-        if spec is None:
-            raise KeyError(f"Project '{project_id}' not found")
+        with self._project_lock(project_id):
+            spec = self.load_project(project_id)
+            if spec is None:
+                raise KeyError(f"Project '{project_id}' not found")
 
-        to_remove = {w for w in work_ids if w}
-        new_members = [w for w in spec.member_work_ids if w not in to_remove]
-        changed = len(new_members) != len(spec.member_work_ids)
+            to_remove = {w for w in work_ids if w}
+            new_members = [w for w in spec.member_work_ids if w not in to_remove]
+            changed = len(new_members) != len(spec.member_work_ids)
 
-        for phase in spec.roadmap.phases:
-            new_phase_members = [w for w in phase.member_work_ids if w not in to_remove]
-            if len(new_phase_members) != len(phase.member_work_ids):
-                phase.member_work_ids = new_phase_members
-                changed = True
+            for phase in spec.roadmap.phases:
+                new_phase_members = [w for w in phase.member_work_ids if w not in to_remove]
+                if len(new_phase_members) != len(phase.member_work_ids):
+                    phase.member_work_ids = new_phase_members
+                    changed = True
 
-        if changed:
-            spec.member_work_ids = new_members
-            spec.updated_at = datetime.now().isoformat()
-            self.save_project(spec)
-        return spec
+            if changed:
+                spec.member_work_ids = new_members
+                spec.updated_at = datetime.now().isoformat()
+                self.save_project(spec)
+            return spec
 
     def delete_project(self, project_id: str) -> bool:
         """Delete a project's on-disk directory.

@@ -47,7 +47,17 @@ def main(ctx: click.Context, verbose: bool) -> None:
     "project_id",
     default=None,
     help="Associate this work item with a project (membership back-reference; "
-    "independent of plan_id). The project must already exist.",
+    "independent of plan_id). The project must already exist. Project work "
+    "items are CREATED but not started — review and launch them from the UI. "
+    "Pass --start to run immediately instead.",
+)
+@click.option(
+    "--start/--no-start",
+    "start",
+    default=None,
+    help="Run the work item immediately (--start) or just create it for later "
+    "review (--no-start). Defaults to creating-only for --project work and "
+    "running immediately otherwise.",
 )
 @click.option(
     "--debug-llm",
@@ -60,11 +70,16 @@ def run(
     work_type: str,
     config_path: str,
     project_id: str | None,
+    start: bool | None,
     debug_llm: bool,
 ) -> None:
     """Submit a new work item and run the workflow.
 
     DESCRIPTION is the work prompt for the agent.
+
+    Project work items (``--project``) are created but not started by default
+    so they can be reviewed in the UI before running; pass ``--start`` to run
+    one immediately, or ``--no-start`` to defer a non-project item.
     """
     import os
 
@@ -74,8 +89,14 @@ def run(
 
         install_global()
 
+    # Default: defer (create-only) for project work, run immediately otherwise.
+    # An explicit --start / --no-start always wins.
+    if start is None:
+        start = project_id is None
+
     config = SpineConfig.load(path=config_path)
-    console.print(f"[bold blue]Submitting work:[/bold blue] {description[:100]}")
+    verb = "Submitting" if start else "Creating"
+    console.print(f"[bold blue]{verb} work:[/bold blue] {description[:100]}")
     console.print(f"[dim]Work type: {work_type}[/dim]")
     if project_id:
         console.print(f"[dim]Project: {project_id}[/dim]")
@@ -83,7 +104,7 @@ def run(
     from spine.work.dispatcher import submit_work
 
     result = asyncio.run(
-        submit_work(description, work_type, config, project_id=project_id)
+        submit_work(description, work_type, config, project_id=project_id, start=start)
     )
 
     if "error" in result:
@@ -91,11 +112,16 @@ def run(
         sys.exit(1)
 
     status_color = "green" if result["status"] == "completed" else "yellow"
+    footer = (
+        "\n[dim]Created — review and start it from the Projects page in the UI.[/dim]"
+        if not start
+        else ""
+    )
     console.print(
         Panel(
             f"Work ID: {result['work_id']}\n"
             f"Status: [{status_color}]{result['status']}[/{status_color}]\n"
-            f"Type: {result['work_type']}",
+            f"Type: {result['work_type']}{footer}",
             title="Work Result",
         )
     )
