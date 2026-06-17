@@ -17,7 +17,9 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from spine.agents.artifacts import scan_artifact_dir
-from spine.agents.retry import MaxTokenBudgetExceeded
+from langgraph.errors import GraphRecursionError
+
+from spine.agents.retry import MaxTokenBudgetExceeded, ServerUnreachable
 from spine.exceptions import CriticalContractFailure
 from spine.models.state import WorkflowState
 from spine.workflow.phase_progress import mark_phase_started
@@ -378,7 +380,29 @@ def make_subgraph_node(
                     attempt_configurable["thread_id"] = (
                         f"{work_id}_{phase_name}_retry{attempt}"
                     )
-                subgraph_config = {"configurable": attempt_configurable}
+                subgraph_config: dict[str, Any] = {"configurable": attempt_configurable}
+
+                # Hard super-step ceiling so a non-converging dispatch loop (or a
+                # 0-token server-crash spin the token breaker can't catch) aborts
+                # fast instead of running to LangGraph's runaway backstop
+                # (trace 019ece87). Read from the injected SpineConfig; fall back
+                # to a fresh load only if it is absent so config never breaks dispatch.
+                _rlim = 0
+                _sc = base_configurable.get("spine_config")
+                if _sc is None:
+                    try:
+                        from spine.config import SpineConfig
+
+                        _sc = SpineConfig.load()
+                    except Exception:  # noqa: BLE001 — never let config break dispatch
+                        _sc = None
+                if _sc is not None:
+                    try:
+                        _rlim = int(getattr(_sc, "subgraph_recursion_limit", 0) or 0)
+                    except (TypeError, ValueError):
+                        _rlim = 0
+                if _rlim > 0:
+                    subgraph_config["recursion_limit"] = _rlim
 
                 attempt_timeout = 0.0
                 if timeout > 0:
@@ -453,6 +477,26 @@ def make_subgraph_node(
                 )
                 return parent_update
 
+        except GraphRecursionError as rec_exc:
+            logger.error(
+                f"[{work_id}] [{phase_name}] hit recursion ceiling "
+                f"({_rlim} super-steps): {rec_exc}"
+            )
+            return _needs_review_update(
+                parent_state,
+                phase_name,
+                (
+                    f"Dispatch loop hit the recursion ceiling ({_rlim} super-steps) "
+                    "— likely a non-converging slice or a backend outage. Surfaced "
+                    "for review instead of spinning. Prior phases preserved."
+                ),
+                suggestions=[
+                    "Check the model backend is healthy and converging",
+                    "Reduce scope or split into smaller work items",
+                    "Raise subgraph_recursion_limit if the scope genuinely warrants it",
+                ],
+            )
+
         except asyncio.TimeoutError:
             logger.error(f"[{work_id}] [{phase_name}] subgraph timed out after {timeout}s")
             return _needs_review_update(
@@ -485,6 +529,24 @@ def make_subgraph_node(
                 suggestions=[
                     "Reduce scope or split into smaller work items",
                     "Raise the per-work-type budget if the scope genuinely warrants it",
+                ],
+            )
+
+        except ServerUnreachable as conn_exc:
+            logger.error(
+                f"[{work_id}] [{phase_name}] LLM endpoint unreachable: {conn_exc}"
+            )
+            return _needs_review_update(
+                parent_state,
+                phase_name,
+                (
+                    f"LLM endpoint unreachable after {conn_exc.count} consecutive "
+                    "connection failures. Phase aborted instead of hammering a "
+                    "down server."
+                ),
+                suggestions=[
+                    "Check the local model server is running and reachable",
+                    "Resume the work item once the endpoint is back up",
                 ],
             )
 

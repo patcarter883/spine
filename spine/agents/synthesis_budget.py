@@ -65,6 +65,21 @@ class EvidenceAllocation:
     recall: int
 
 
+def window_hard_ceiling(
+    window: int, overhead: int, completion_floor: int = 512
+) -> int:
+    """Max prompt tokens that still leave room for overhead + a floor completion.
+
+    Used as the last-resort eviction target so a single prompt can never be
+    sent larger than the model's context window minus framing overhead and a
+    minimum completion reservation. Returns 0 when ``window`` is unknown
+    (cloud/legacy providers), which callers treat as "no hard guard".
+    """
+    if window <= 0:
+        return 0
+    return max(0, window - max(0, overhead) - max(0, completion_floor))
+
+
 def synthesis_completion_cap(phase: str, phase_cap: int | None = None) -> int:
     """Completion-token clamp for a synth call, or 0 when legacy.
 

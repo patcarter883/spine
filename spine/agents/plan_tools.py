@@ -472,6 +472,13 @@ class SearchCodebaseTool(BaseTool):
 # ── write_structured_plan ─────────────────────────────────────────────────
 
 
+# Generous upper bound on feature slices — real plans are well under 20. The
+# cap exists to contain local-model repetition collapse (trace 019ed44a, where
+# the synthesizer emitted 1 real slice followed by 3561 scalar ``False`` values)
+# before the degenerate array can fan out into the IMPLEMENT phase.
+_MAX_FEATURE_SLICES = 60
+
+
 class _FeatureSliceInput(BaseModel):
     """Schema for a single feature slice within a structured plan."""
 
@@ -519,7 +526,42 @@ class _StructuredWritePlanInput(BaseModel):
             "acceptance_criteria, complexity."
         ),
         min_length=1,
+        max_length=_MAX_FEATURE_SLICES,
     )
+
+    @field_validator("feature_slices", mode="before")
+    @classmethod
+    def _sanitize_feature_slices(cls, value: Any) -> Any:
+        """Drop degenerate non-mapping entries before per-element validation.
+
+        Weak local models occasionally collapse into a repetition loop and pad
+        the array with scalars (e.g. 3561 ``False`` values after one real slice,
+        trace 019ed44a). Left unfiltered, pydantic builds a multi-megabyte
+        ValidationError (one error per bad element) that is recorded as the span
+        error and can blow the agent's context window. Stripping the non-mapping
+        entries here turns that into a single, recoverable validation message
+        (the one malformed real slice) and prevents a degenerate-but-valid mega
+        array from fanning out downstream. Non-list inputs are passed through so
+        pydantic raises its normal type error.
+        """
+        if not isinstance(value, list):
+            return value
+        mappings = [v for v in value if isinstance(v, dict)]
+        dropped = len(value) - len(mappings)
+        if dropped:
+            logger.warning(
+                "write_structured_plan: dropped %d non-mapping feature_slice "
+                "entries (likely model repetition collapse)",
+                dropped,
+            )
+        if len(mappings) > _MAX_FEATURE_SLICES:
+            logger.warning(
+                "write_structured_plan: truncating %d feature_slices to %d",
+                len(mappings),
+                _MAX_FEATURE_SLICES,
+            )
+            mappings = mappings[:_MAX_FEATURE_SLICES]
+        return mappings
     testing_strategy: str = Field(
         description=(
             "Test approach — prose paragraph: which tests to add/modify, test file "

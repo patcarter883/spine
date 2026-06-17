@@ -40,7 +40,18 @@ from spine.agents.plan_do import (
     format_directive_for_prompt,
     run_plan_node,
 )
-from spine.agents.retry import ainvoke_with_retry
+from spine.agents.retry import (
+    MaxTokenBudgetExceeded,
+    ServerUnreachable,
+    ainvoke_with_retry,
+)
+
+# Run-level abort signals must NOT be swallowed into a "blocked" slice — they
+# have to propagate past the per-slice handlers to the subgraph wrapper, which
+# converts them into a clean needs_review (token budget exhausted, or the LLM
+# endpoint is unreachable). Catching them here would let a down server keep
+# fanning out dead Sends (trace 019ece87).
+_ABORT_EXCEPTIONS = (MaxTokenBudgetExceeded, ServerUnreachable)
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import ImplementSubgraphState
 
@@ -214,6 +225,8 @@ async def _split_slices_node(
                 config=config,
                 session_id=work_id,
             )
+        except _ABORT_EXCEPTIONS:
+            raise
         except Exception as e:  # noqa: BLE001 — graceful degradation
             logger.warning(
                 "[%s] split_slices: PER_FILE failed for %r: %s — keeping slice whole",
@@ -495,6 +508,8 @@ async def _slice_implementer_node(
         )
         slice_result = _extract_slice_result(result, slice_id)
 
+    except _ABORT_EXCEPTIONS:
+        raise
     except Exception as e:
         logger.error(
             "[%s] slice_implementer failed for %r: %s",
@@ -687,6 +702,8 @@ async def _fallback_decomposer_node(
             config=config,
             session_id=work_id,
         )
+    except _ABORT_EXCEPTIONS:
+        raise
     except Exception as e:
         logger.error(
             "[%s] fallback_decomposer failed for %r: %s — marking blocked",

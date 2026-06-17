@@ -153,6 +153,108 @@ def _check_and_update_token_budget(
     return new_total
 
 
+# ── Connection-failure circuit breaker ──────────────────────────────────────
+#
+# Per-call retry caps (max_retries) bound a SINGLE invocation, but the graph
+# re-invokes nodes hundreds-to-thousands of times via per-slice Send fan-out and
+# slice re-routing. When the LOCAL model server is genuinely down/restarting (it
+# crashes/OOMs/disconnects far more than a cloud API), every one of those calls
+# fails on connect, making no progress while burning minutes and thousands of
+# dead requests (trace 019ece87: ~4000 "Could not connect to server"; 019ed360:
+# 702). This process-wide counter trips ONLY on true endpoint-unreachable errors
+# (never on 5xx/429/timeouts/mid-stream drops) after N consecutive failures with
+# zero intervening successes, raising ServerUnreachable so the run aborts fast.
+_DEFAULT_CONN_FAILURE_THRESHOLD = 8
+_consecutive_conn_failures = 0
+
+
+class ServerUnreachable(Exception):
+    """Raised when the LLM endpoint is unreachable for too many consecutive calls.
+
+    Phase subgraph wrappers catch this — like :class:`MaxTokenBudgetExceeded` —
+    and convert it into a needs_review outcome so a down/restarting local server
+    aborts the run fast instead of being hammered by Send fan-out re-dispatch.
+    """
+
+    def __init__(self, count: int, threshold: int):
+        self.count = count
+        self.threshold = threshold
+        super().__init__(
+            f"LLM endpoint unreachable: {count} consecutive connection "
+            f"failures (threshold {threshold}). Is the local model server up?"
+        )
+
+
+def _conn_breaker_threshold() -> int:
+    """Consecutive-connection-failure threshold (``SPINE_CONN_FAILURE_THRESHOLD``)."""
+    override = os.environ.get("SPINE_CONN_FAILURE_THRESHOLD", "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            logger.warning(
+                "SPINE_CONN_FAILURE_THRESHOLD=%r is not an integer — ignoring",
+                override,
+            )
+    return _DEFAULT_CONN_FAILURE_THRESHOLD
+
+
+def reset_conn_breaker() -> None:
+    """Reset the consecutive-connection-failure counter (called on any success)."""
+    global _consecutive_conn_failures
+    _consecutive_conn_failures = 0
+
+
+def _is_connection_unreachable(exc: Exception) -> bool:
+    """True only for "cannot reach the endpoint" errors — never 5xx/429/timeout.
+
+    Deliberately narrow: a down server is a different failure class from an
+    overloaded one. We trip the breaker for connection-refused / DNS / curl
+    connect failures, but let transient 5xx/429/timeouts keep retrying normally.
+    """
+    name = type(exc).__name__
+    if name in ("APIConnectionError", "ConnectionError", "ConnectError"):
+        return True
+    s = str(exc).lower()
+    if "could not connect to server" in s or "connection refused" in s:
+        return True
+    if "failed to establish a new connection" in s or "name or service not known" in s:
+        return True
+    if "curl error" in s and "connect" in s:
+        return True
+    return False
+
+
+def _note_conn_failure() -> int:
+    """Increment and return the consecutive-connection-failure counter."""
+    global _consecutive_conn_failures
+    _consecutive_conn_failures += 1
+    return _consecutive_conn_failures
+
+
+def _trip_breaker_if_unreachable(exc: Exception, *, prefix: str, phase_label: str) -> None:
+    """Update the breaker for ``exc`` and raise ServerUnreachable past threshold.
+
+    Called from the except branch of every retry loop BEFORE the transient/
+    permanent classification, so a down endpoint aborts the whole run rather
+    than being masked by per-call retry exhaustion. No-op for non-connection
+    errors (the counter only resets on a genuine success).
+    """
+    if not _is_connection_unreachable(exc):
+        return
+    count = _note_conn_failure()
+    threshold = _conn_breaker_threshold()
+    if count >= threshold:
+        logger.error(
+            "%s%s LLM endpoint unreachable for %d consecutive calls — "
+            "tripping circuit breaker",
+            prefix,
+            phase_label,
+            count,
+        )
+        raise ServerUnreachable(count, threshold)
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """Classify an exception as transient (retryable) or permanent.
 
@@ -302,6 +404,9 @@ def invoke_with_retry(
     for attempt in range(max_retries + 1):
         try:
             result = agent.invoke(input_, **invoke_kwargs)
+            # A genuine success means the endpoint is reachable — clear the
+            # consecutive-connection-failure breaker.
+            reset_conn_breaker()
             try:
                 _check_and_update_token_budget(
                     work_id=work_id, work_type=work_type, result=result
@@ -314,8 +419,17 @@ def invoke_with_retry(
             return result
         except MaxTokenBudgetExceeded:
             raise
+        except ServerUnreachable:
+            # Circuit breaker tripped — propagate without retrying so the
+            # subgraph wrapper can route to needs_review.
+            raise
         except Exception as exc:
             last_exc = exc
+
+            # Trip the run-level breaker BEFORE the transient/permanent branch
+            # so a persistently-down endpoint aborts fast instead of being
+            # masked by per-call retry exhaustion across thousands of Sends.
+            _trip_breaker_if_unreachable(exc, prefix=prefix, phase_label=phase_label)
 
             if not _is_transient_error(exc):
                 logger.error(
@@ -410,6 +524,9 @@ async def ainvoke_with_retry(
     for attempt in range(max_retries + 1):
         try:
             result = await agent.ainvoke(input_, **invoke_kwargs)
+            # A genuine success means the endpoint is reachable — clear the
+            # consecutive-connection-failure breaker.
+            reset_conn_breaker()
             # Snapshot the deduper cache onto the result so the calling node
             # can forward it into LangGraph state via the read_cache reducer.
             # ReadCacheMiddleware mutates context.read_cache in place during
@@ -435,8 +552,17 @@ async def ainvoke_with_retry(
             # Already logged inside the inner try-block above. Propagate
             # without the "permanent error" log line and without retrying.
             raise
+        except ServerUnreachable:
+            # Circuit breaker tripped — propagate without retrying so the
+            # subgraph wrapper can route to needs_review.
+            raise
         except Exception as exc:
             last_exc = exc
+
+            # Trip the run-level breaker BEFORE the transient/permanent branch
+            # so a persistently-down endpoint aborts fast instead of being
+            # masked by per-call retry exhaustion across thousands of Sends.
+            _trip_breaker_if_unreachable(exc, prefix=prefix, phase_label=phase_label)
 
             if not _is_transient_error(exc):
                 logger.error(

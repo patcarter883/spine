@@ -183,3 +183,79 @@ class TestTokenBudgetCompactor:
         out = await compactor.awrap_model_call(req, _identity_handler)
         # Disabled: pass through untouched.
         assert out.messages == msgs
+
+
+class TestHardWindowGuard:
+    """Tier-2 hard pre-send guard for finite-window providers."""
+
+    @pytest.mark.asyncio
+    async def test_window_zero_is_noop(self):
+        # Cloud/legacy providers (window=0): even a huge preserved tail under a
+        # disabled normal threshold must pass through unchanged.
+        big = "x" * 80_000
+        msgs = _build_history(n_pairs=4, big_content=big)
+        compactor = TokenBudgetCompactor(
+            threshold_tokens=10_000_000, keep_recent=6, window=0
+        )
+        req = FakeRequest(messages=msgs)
+        out = await compactor.awrap_model_call(req, _identity_handler)
+        assert out.messages == msgs
+
+    @pytest.mark.asyncio
+    async def test_hard_guard_evicts_preserved_tail_over_window(self):
+        from spine.agents.context_editing import _estimate_message_tokens
+        from spine.agents.synthesis_budget import window_hard_ceiling
+
+        # keep_recent covers ALL tool results, so the normal tier can't reduce
+        # anything — the preserved tail alone blows the window (the 36520>window
+        # situation from trace 019ed3dc). The hard guard must escalate.
+        big = "x" * 40_000  # ~10K tokens each
+        msgs = _build_history(n_pairs=6, big_content=big)
+        window = 20_000
+        compactor = TokenBudgetCompactor(
+            threshold_tokens=10_000_000,  # normal tier inert
+            keep_recent=99,               # nothing is "old" for tier 1
+            window=window,
+            overhead=2_000,
+        )
+        req = FakeRequest(messages=msgs)
+        out = await compactor.awrap_model_call(req, _identity_handler)
+
+        ceiling = window_hard_ceiling(window, 2_000)
+        assert _estimate_message_tokens(out.messages) <= ceiling
+        tool_msgs = [m for m in out.messages if isinstance(m, ToolMessage)]
+        # The single most-recent tool result is kept verbatim.
+        assert tool_msgs[-1].content == big
+        # Older ones were degraded to read-metadata placeholders.
+        assert any(m.content.startswith("[read:") for m in tool_msgs[:-1])
+
+    @pytest.mark.asyncio
+    async def test_hard_guard_never_evicts_unacked_write(self):
+        # An unacknowledged write_file body must survive even under the hard
+        # guard — it is the only record of what was written.
+        big = "x" * 40_000
+        write_body = "w" * 40_000
+        msgs: list = [HumanMessage(content="kick off")]
+        msgs.append(
+            _ai_with_tool_call("w-0", "write_file", {"file_path": "/out.py", "content": write_body})
+        )
+        msgs.append(_tool_msg("w-0", "write_file", write_body))
+        for i in range(5):
+            tc = f"r-{i}"
+            msgs.append(_ai_with_tool_call(tc, "read_file", {"file_path": f"/r{i}.py"}))
+            msgs.append(_tool_msg(tc, "read_file", big))
+
+        compactor = TokenBudgetCompactor(
+            threshold_tokens=10_000_000,
+            keep_recent=99,
+            window=20_000,
+            overhead=2_000,
+        )
+        req = FakeRequest(messages=msgs)
+        out = await compactor.awrap_model_call(req, _identity_handler)
+
+        write_outputs = [
+            m for m in out.messages if isinstance(m, ToolMessage) and m.name == "write_file"
+        ]
+        assert len(write_outputs) == 1
+        assert write_outputs[0].content == write_body

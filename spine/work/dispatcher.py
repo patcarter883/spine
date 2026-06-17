@@ -387,7 +387,7 @@ async def submit_work(
     try:
         from spine.persistence.checkpoint import CheckpointStore
         from spine.workflow.compose import build_workflow_graph
-        from spine.agents.retry import reset_token_budget
+        from spine.agents.retry import reset_conn_breaker, reset_token_budget
 
         from spine.git import WorktreeSandbox
 
@@ -397,6 +397,9 @@ async def submit_work(
         # Clear any stale cumulative token count from a prior run of the
         # same work_id (e.g. a restart) so the budget enforcer starts fresh.
         reset_token_budget(work_id)
+        # Likewise clear the connection-failure circuit breaker so a prior
+        # run's down-server failures don't trip a fresh run on its first calls.
+        reset_conn_breaker()
 
         # ── Mandatory worktree sandbox for code-producing work ──
         # Work types that run IMPLEMENT edit the repo, so the graph runs

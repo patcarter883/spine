@@ -34,6 +34,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
+try:  # openai is always present when the model is ChatOpenAI; guard for safety.
+    from openai import LengthFinishReasonError as _LengthFinishReasonError
+except Exception:  # pragma: no cover - openai missing → length salvage is a no-op
+
+    class _LengthFinishReasonError(Exception):  # type: ignore[no-redef]
+        """Fallback sentinel — never raised, so the salvage branch stays inert."""
+
 from spine.agents.helpers import (
     ainvoke_structured_with_retry,
     bind_structured_output,
@@ -218,7 +225,8 @@ async def run_decomposer(
     # whichever underlying field is set (max_tokens vs its alias).
     from spine.config import SpineConfig
 
-    decompose_cap = SpineConfig.load().decompose_max_completion_tokens
+    _spine_cfg = SpineConfig.load()
+    decompose_cap = _spine_cfg.decompose_max_completion_tokens
     if decompose_cap and decompose_cap > 0:
         model = cap_completion_tokens(model, decompose_cap)
     # Suppress the reasoning channel on local thinking models (e.g. Qwen3.6).
@@ -256,7 +264,22 @@ async def run_decomposer(
         )
     else:
         parent_id = failed_slice["id"]
-        slice_json = json.dumps(failed_slice, indent=2, ensure_ascii=False, default=str)
+        # Slim the failed slice before embedding it: the bulky free-text result
+        # fields (test_results / issues / _failure_traceback) are either the same
+        # text already carried in error_traceback or noise the decomposer doesn't
+        # need — dropping them keeps the prompt from doubling the traceback and
+        # truncating the structured call mid-JSON (trace 019ed3dc).
+        slim_slice = {
+            k: v
+            for k, v in failed_slice.items()
+            if k not in ("test_results", "issues", "_failure_traceback")
+        }
+        slice_json = json.dumps(slim_slice, indent=2, ensure_ascii=False, default=str)
+        # Bound the traceback, keeping the tail (most informative end).
+        tb_cap = _spine_cfg.decompose_max_traceback_chars
+        traceback_text = error_traceback.strip()
+        if tb_cap and tb_cap > 0 and len(traceback_text) > tb_cap:
+            traceback_text = "...[traceback truncated]...\n" + traceback_text[-tb_cap:]
         system_prompt = (
             _FALLBACK_PROMPT + "\n\n" + xml_block(Tag.CONSTRAINTS, _OVERFLOW_HINT)
             if overflow_hint
@@ -276,16 +299,47 @@ async def run_decomposer(
             xml_blocks(
                 (Tag.OBJECTIVE, f"Parent slice id: {parent_id}"),
                 (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
-                (Tag.ERRORS, f"```\n{error_traceback.strip()}\n```"),
+                (Tag.ERRORS, f"```\n{traceback_text}\n```"),
             ),
             tail,
         )
 
-    response: Any = await ainvoke_structured_with_retry(
-        structured,
-        [SystemMessage(content=system_prompt), HumanMessage(content=human_content)],
-        label="decomposer",
-    )
+    try:
+        response: Any = await ainvoke_structured_with_retry(
+            structured,
+            [SystemMessage(content=system_prompt), HumanMessage(content=human_content)],
+            label="decomposer",
+        )
+    except _LengthFinishReasonError:
+        # The completion hit the length limit before valid JSON closed. For the
+        # FALLBACK path this would otherwise drop a recoverable slice (trace
+        # 019ed3dc), so salvage once with a hard-shrunk prompt: no traceback at
+        # all (just the slice id + objective) so the small completion budget is
+        # spent on micro-slice JSON, not echoing context. PLAN/PER_FILE keep the
+        # original propagate-immediately behaviour.
+        if mode != "FALLBACK":
+            raise
+        logger.warning(
+            "Decomposer(FALLBACK) hit length limit for %r — retrying with a "
+            "minimal prompt",
+            parent_id,
+        )
+        salvage_content = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, f"Parent slice id: {parent_id}"),
+                (
+                    Tag.FINDINGS,
+                    f"Parent slice {parent_id!r} failed to implement and must be "
+                    "split into 2-3 smaller, region-scoped micro-slices.",
+                ),
+            ),
+            tail,
+        )
+        response = await ainvoke_structured_with_retry(
+            structured,
+            [SystemMessage(content=system_prompt), HumanMessage(content=salvage_content)],
+            label="decomposer-length-salvage",
+        )
 
     if isinstance(response, DecompositionResult):
         parsed = response

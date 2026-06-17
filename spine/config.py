@@ -335,6 +335,13 @@ class SpineConfig:
     # into a fallback-decompose retry storm (trace 019ed360). Per-phase
     # max_completion_tokens overrides still win.
     decompose_max_completion_tokens: int = 4096
+    # Max chars of the failure traceback embedded in a FALLBACK decompose
+    # prompt. The traceback is otherwise unbounded — a large one (plus the
+    # verbatim failed-slice JSON) inflates the prompt until the structured call
+    # truncates mid-JSON and dies with LengthFinishReasonError, dropping a
+    # recoverable slice (trace 019ed3dc). We keep the TAIL (tracebacks are most
+    # informative at the end). 0 = unbounded.
+    decompose_max_traceback_chars: int = 4000
     # Max depth of the IMPLEMENT fallback-decompose recursion. Each failed
     # slice that is re-sliced increments the depth; at the cap the slice is
     # surfaced as permanently blocked instead of being decomposed again. Depth
@@ -355,6 +362,15 @@ class SpineConfig:
     # The guard only nudges — tools stay bound — so legitimate long slices can
     # still finish; 0 disables it.
     implement_max_turns: int = 30
+    # Hard super-step ceiling for phase subgraphs (LangGraph recursion_limit).
+    # LangGraph's default is 25 but SPINE raises it implicitly via fan-out; the
+    # IMPLEMENT dispatch loop re-dispatches one Send per pending/failed slice and
+    # only drains when failed_slices is empty, so a non-converging slice (or a
+    # 0-token server-crash spin where the token-budget breaker can't advance —
+    # trace 019ece87) loops far past any healthy phase. This caps super-steps far
+    # below LangGraph's runaway backstop so a spin aborts in seconds, surfacing as
+    # needs_review rather than thousands of dead Sends. 0 = use LangGraph default.
+    subgraph_recursion_limit: int = 80
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -697,6 +713,12 @@ class SpineConfig:
                     spine.get("max_completion_tokens", 0),
                 )
             ),
+            decompose_max_traceback_chars=int(
+                os.getenv(
+                    "SPINE_DECOMPOSE_MAX_TRACEBACK_CHARS",
+                    spine.get("decompose_max_traceback_chars", 4000),
+                )
+            ),
             decompose_max_completion_tokens=int(
                 os.getenv(
                     "SPINE_DECOMPOSE_MAX_COMPLETION_TOKENS",
@@ -713,6 +735,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_IMPLEMENT_MAX_TURNS",
                     spine.get("implement_max_turns", 30),
+                )
+            ),
+            subgraph_recursion_limit=int(
+                os.getenv(
+                    "SPINE_SUBGRAPH_RECURSION_LIMIT",
+                    spine.get("subgraph_recursion_limit", 80),
                 )
             ),
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 5)),

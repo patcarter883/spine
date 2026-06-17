@@ -218,6 +218,24 @@ spine:
   # Default: 30  | Env: SPINE_IMPLEMENT_MAX_TURNS
   implement_max_turns: 30
 
+  # Hard super-step ceiling for phase subgraphs (LangGraph recursion_limit).
+  # The IMPLEMENT dispatch loop re-dispatches one Send per pending/failed slice;
+  # a non-converging slice or a 0-token server-crash spin (which the token-budget
+  # breaker can't catch) loops far past any healthy phase. This caps super-steps
+  # well below LangGraph's runaway backstop so a spin aborts in seconds and
+  # surfaces as needs_review instead of thousands of dead requests (trace
+  # 019ece87). 0 = use LangGraph's default.
+  # Default: 80  | Env: SPINE_SUBGRAPH_RECURSION_LIMIT
+  subgraph_recursion_limit: 80
+
+  # Max chars of the failure traceback embedded in a FALLBACK decompose prompt.
+  # An unbounded traceback (plus the verbatim failed-slice JSON) inflates the
+  # prompt until the structured call truncates mid-JSON and dies with
+  # LengthFinishReasonError, dropping a recoverable slice (trace 019ed3dc). The
+  # tail is kept (most informative). 0 = unbounded.
+  # Default: 4000  | Env: SPINE_DECOMPOSE_MAX_TRACEBACK_CHARS
+  decompose_max_traceback_chars: 4000
+
   # Total token budget for the SPECIFY explorer context.
   # Default: 30000  | (no env override)
   specify_context_token_budget: 30000

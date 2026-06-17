@@ -31,6 +31,7 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from spine.agents import symbol_cache
 from spine.agents._tokens import count_tokens
+from spine.agents.synthesis_budget import window_hard_ceiling
 
 # Tools (beyond read_file) whose results we deduplicate when called with
 # identical arguments inside a single phase / subagent invocation. Read-only
@@ -714,58 +715,109 @@ class TokenBudgetCompactor(AgentMiddleware):
         threshold_tokens: int,
         keep_recent: int = 6,
         preserved_tools: frozenset[str] = DEFAULT_PRESERVED_TOOLS,
+        *,
+        window: int = 0,
+        overhead: int = 4000,
     ) -> None:
         self.threshold_tokens = threshold_tokens
         self.keep_recent = keep_recent
         self.preserved_tools = preserved_tools
+        # Hard pre-send guard: when the provider declares a finite context
+        # window, no single prompt may exceed it. window<=0 (cloud/legacy
+        # providers) disables the guard entirely — behaviour is unchanged there.
+        self.window = window
+        self.overhead = overhead
 
     async def awrap_model_call(self, request, handler):
         messages = request.messages
 
-        if self.threshold_tokens <= 0:
-            return await handler(request)
-
         total_tokens = _estimate_message_tokens(messages)
-        if total_tokens < self.threshold_tokens:
-            return await handler(request)
 
+        normal_active = (
+            self.threshold_tokens > 0 and total_tokens >= self.threshold_tokens
+        )
         call_map = build_tool_call_map(messages)
         tool_result_indices = [
             i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
         ]
 
-        if len(tool_result_indices) <= self.keep_recent:
-            return await handler(request)
-
-        # Evict everything older than the last `keep_recent`, EXCEPT
-        # preserved-tool outputs which are always kept verbatim.
-        evict_candidate_indices = tool_result_indices[: -self.keep_recent]
         evicted_ids: set[str] = set()
         trimmed_messages = list(messages)
 
-        for idx in evict_candidate_indices:
-            msg = trimmed_messages[idx]
-            assert isinstance(msg, ToolMessage)
-            tc_id = msg.tool_call_id or ""
-            name = msg.name or ""
-            args: dict = {}
-            if tc_id and tc_id in call_map:
-                name, args = call_map[tc_id]
+        # ── Tier 1: normal threshold eviction ────────────────────────────
+        # Evict everything older than the last `keep_recent`, EXCEPT
+        # preserved-tool outputs which are always kept verbatim.
+        if normal_active and len(tool_result_indices) > self.keep_recent:
+            for idx in tool_result_indices[: -self.keep_recent]:
+                msg = trimmed_messages[idx]
+                assert isinstance(msg, ToolMessage)
+                tc_id = msg.tool_call_id or ""
+                name = msg.name or ""
+                args: dict = {}
+                if tc_id and tc_id in call_map:
+                    name, args = call_map[tc_id]
 
-            if name in self.preserved_tools:
-                continue
+                if name in self.preserved_tools:
+                    continue
 
-            content = _stringify_content(msg.content)
-            metadata = extract_metadata(content, name, args)
-            evicted_ids.add(tc_id)
-            try:
-                trimmed_messages[idx] = ToolMessage(
-                    content=metadata,
-                    tool_call_id=msg.tool_call_id,
-                    name=msg.name,
-                )
-            except Exception:
-                pass
+                content = _stringify_content(msg.content)
+                metadata = extract_metadata(content, name, args)
+                evicted_ids.add(tc_id)
+                try:
+                    trimmed_messages[idx] = ToolMessage(
+                        content=metadata,
+                        tool_call_id=msg.tool_call_id,
+                        name=msg.name,
+                    )
+                except Exception:
+                    pass
+
+        # ── Tier 2: hard window guard (finite-window providers only) ──────
+        # If, after tier 1, the prompt still exceeds the window ceiling, the
+        # preserved + keep_recent tail alone is too big to send. Escalate:
+        # evict the OLDEST tool results regardless of preserved/recent status,
+        # oldest-first, until we're under the ceiling — but never the single
+        # most-recent ToolMessage (the agent's live working result) and never
+        # an as-yet-unacknowledged write/edit (its body is the only record of
+        # what was written). Degrading a re-read file body to its `[read: …]`
+        # metadata is recoverable; sending an over-window prompt is not.
+        hard = window_hard_ceiling(self.window, self.overhead)
+        if hard:
+            cur = _estimate_message_tokens(trimmed_messages)
+            if cur > hard and len(tool_result_indices) > 1:
+                for idx in tool_result_indices[:-1]:  # keep the most-recent verbatim
+                    if cur <= hard:
+                        break
+                    msg = trimmed_messages[idx]
+                    if not isinstance(msg, ToolMessage):
+                        continue
+                    tc_id = msg.tool_call_id or ""
+                    if tc_id in evicted_ids:
+                        continue
+                    name = msg.name or ""
+                    args = {}
+                    if tc_id and tc_id in call_map:
+                        name, args = call_map[tc_id]
+                    if name in ("write_file", "edit_file"):
+                        continue
+                    before = _estimate_message_tokens([msg])
+                    metadata = extract_metadata(_stringify_content(msg.content), name, args)
+                    try:
+                        trimmed_messages[idx] = ToolMessage(
+                            content=metadata,
+                            tool_call_id=msg.tool_call_id,
+                            name=msg.name,
+                        )
+                    except Exception:
+                        continue
+                    evicted_ids.add(tc_id)
+                    cur -= max(0, before - count_tokens(metadata))
+                if cur > hard:
+                    logger.warning(
+                        "TokenBudgetCompactor HARD GUARD: prompt still %d > ceiling "
+                        "%d after escalation (window=%d) — preserved tail exceeds window",
+                        cur, hard, self.window,
+                    )
 
         if not evicted_ids:
             return await handler(request)

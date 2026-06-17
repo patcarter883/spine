@@ -583,12 +583,18 @@ async def ainvoke_structured_with_retry(
             "object for the required schema — no prose, no preamble."
         )
     )
+    # Local import avoids any import-order coupling; retry.py is standalone.
+    from spine.agents import retry as _retry
+
     attempt = 0
     api_attempt = 0
     while True:
         invoke_messages = messages if attempt == 0 else [*messages, nudge]
         try:
-            return await structured_model.ainvoke(invoke_messages)
+            result = await structured_model.ainvoke(invoke_messages)
+            # Reachable endpoint → clear the connection-failure circuit breaker.
+            _retry.reset_conn_breaker()
+            return result
         except ValueError as exc:
             if attempt >= retries or not is_empty_structured_parse(exc):
                 raise
@@ -600,6 +606,11 @@ async def ainvoke_structured_with_retry(
                 retries,
             )
         except Exception as exc:
+            # Run-level breaker: this structured path is the dominant offender
+            # under a down local server (trace 019ece87: decomposer 12684 calls).
+            # Trip BEFORE the per-call retry branch so ServerUnreachable aborts
+            # the run rather than being absorbed by api_retries.
+            _retry._trip_breaker_if_unreachable(exc, prefix="", phase_label=label)
             if api_attempt >= api_retries or not _retryable_api_error(exc):
                 raise
             api_attempt += 1

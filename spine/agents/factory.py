@@ -760,6 +760,11 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
                     threshold_tokens=threshold,
                     keep_recent=cfg.keep_recent,
                     preserved_tools=frozenset(cfg.preserved_tools),
+                    # Finite-window providers get the hard pre-send guard so a
+                    # preserved+recent tail can never exceed the window
+                    # (traces 019ed3dc/019ed413). window=0 → guard is inert.
+                    window=_window,
+                    overhead=_spine_cfg.synthesize_overhead_tokens,
                 )
             )
             logger.info(
