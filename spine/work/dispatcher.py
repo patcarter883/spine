@@ -2435,136 +2435,123 @@ async def approve_and_spawn(
         import os as _os
 
         stall_timeout = _os.environ.get("SPINE_STALL_TIMEOUT")
-        stall_timer: Any = None
-        stall_task: Any = None
         stall_timeout_val = int(stall_timeout or "120")
 
-        async def _stall_timer_fn(to: int) -> None:
-            # Marks the run stalled only when the timer expires; the
-            # per-chunk cancel in _stream_graph keeps it from firing while
-            # the stream is making progress.
-            nonlocal stalled
+        result: dict[str, Any] = dict(resume_state)
+
+        # Progress-aware stall detection: time out each chunk individually rather
+        # than imposing a flat wall-clock cap on the whole stream. A long but
+        # progressing generation (e.g. a local model emitting thousands of critic
+        # tokens) runs to completion, while a genuinely hung backend that emits
+        # nothing for stall_timeout_val seconds is caught and marked stalled. The
+        # previous `wait_for(_stream_graph(), stall_timeout_val + 10)` was a flat
+        # deadline that killed healthy long generations mid-flight even while they
+        # streamed steadily (trace 019ed38f cancelled a live critic at exactly
+        # 130s). This mirrors the per-chunk pattern used by the other resume paths.
+        stream_iter = traced_astream(
+            graph.astream(
+                resume_state,
+                thread_config,
+                stream_mode=["updates", "messages"],
+                subgraphs=True,
+                version="v2",
+            ),
+            plan_id,
+            work_type,
+        ).__aiter__()
+
+        while True:
             try:
-                await asyncio.sleep(to)
-                stalled = True
-            except asyncio.CancelledError:
-                pass
-
-        async def _stream_graph() -> dict[str, Any]:
-            nonlocal stalled, stall_timer, stall_task
-            result: dict[str, Any] = dict(resume_state)
-            stream_timeout = stall_timeout_val + 5
-
-            if stall_timeout_val > 0:
-                stall_task = asyncio.ensure_future(_stall_timer_fn(stream_timeout))
-
-            async for chunk in traced_astream(
-                graph.astream(
-                    resume_state,
-                    thread_config,
-                    stream_mode=["updates", "messages"],
-                    subgraphs=True,
-                    version="v2",
-                ),
-                plan_id,
-                work_type,
-            ):
-                if stall_task and not stall_task.done():
-                    stall_task.cancel()
-                    try:
-                        await stall_task
-                    except asyncio.CancelledError:
-                        pass
-                    if stall_timeout_val > 0:
-                        stall_task = asyncio.ensure_future(_stall_timer_fn(stream_timeout))
-
-                if not isinstance(chunk, dict) or chunk.get("type") != "updates":
-                    continue
-                ns = chunk.get("ns", ())
-                if ns != ():
-                    continue
-                data = chunk.get("data", {})
-                for node_name, node_output in data.items():
-                    node_artifacts = node_output.get("artifacts")
-                    if node_artifacts and isinstance(node_artifacts, dict):
-                        existing = result.get("artifacts", {})
-                        if not isinstance(existing, dict):
-                            existing = {}
-                        merged = {**existing, **node_artifacts}
-                        for key in set(existing) & set(node_artifacts):
-                            if isinstance(existing[key], dict) and isinstance(
-                                node_artifacts[key], dict
-                            ):
-                                merged[key] = {**existing[key], **node_artifacts[key]}
-                        node_output = {**node_output, "artifacts": merged}
-                    node_feedback = node_output.get("feedback")
-                    if node_feedback and isinstance(node_feedback, list):
-                        existing_fb = result.get("feedback", [])
-                        if not isinstance(existing_fb, list):
-                            existing_fb = []
-                        node_output = {**node_output, "feedback": existing_fb + node_feedback}
-                    result.update(node_output)
-                    phase = node_output.get("current_phase", "")
-                    status = node_output.get("status", "")
-                    if phase or status:
-                        _update_work_progress(db, plan_id, phase, status)
-                        logger.info(f"[{plan_id}] Resume: Phase {phase or node_name} → {status}")
-                        audit.log_event(
-                            plan_id,
-                            "phase_completed",
-                            node_name,
-                            {"phase": phase, "status": status},
-                        )
-                    if node_artifacts and isinstance(node_artifacts, dict):
-                        for art_phase, phase_arts in node_artifacts.items():
-                            if not isinstance(phase_arts, dict):
-                                continue
-                            for art_name, art_content in phase_arts.items():
-                                if art_content is not None:
-                                    artifacts_store.save_artifact(
-                                        plan_id, art_phase, art_name, str(art_content)
-                                    )
-
-            if stall_task and not stall_task.done():
-                stall_task.cancel()
-            return result
-
-        if stall_timeout_val > 0:
-            try:
-                result = await asyncio.wait_for(_stream_graph(), timeout=stall_timeout_val + 10)
-            except (asyncio.TimeoutError, Exception) as exc:
-                stalled = True
-                result = result if "result" in dir() else {}
-                if isinstance(exc, asyncio.TimeoutError):
-                    logger.error(f"Resume of work {plan_id} stalled after {stall_timeout_val}s")
-                    db["work_entries"].update(
-                        plan_id,
-                        {
-                            "status": TaskStatus.STALLED.value,
-                            "current_phase": result.get("current_phase", ""),
-                            "updated_at": datetime.now().isoformat(),
-                            "result": json.dumps(
-                                {"error": f"stalled after {stall_timeout_val}s", "stalled": True}
-                            ),
-                        },
+                if stall_timeout_val > 0:
+                    chunk = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=stall_timeout_val
                     )
+                else:
+                    chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                stalled = True
+                last_phase = result.get("current_phase", "")
+                logger.error(
+                    f"Resume of work {plan_id} stalled — no chunk received for "
+                    f"{stall_timeout_val}s (last phase: {last_phase})"
+                )
+                break
+
+            if not isinstance(chunk, dict) or chunk.get("type") != "updates":
+                continue
+            ns = chunk.get("ns", ())
+            if ns != ():
+                continue
+            data = chunk.get("data", {})
+            for node_name, node_output in data.items():
+                node_artifacts = node_output.get("artifacts")
+                if node_artifacts and isinstance(node_artifacts, dict):
+                    existing = result.get("artifacts", {})
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    merged = {**existing, **node_artifacts}
+                    for key in set(existing) & set(node_artifacts):
+                        if isinstance(existing[key], dict) and isinstance(
+                            node_artifacts[key], dict
+                        ):
+                            merged[key] = {**existing[key], **node_artifacts[key]}
+                    node_output = {**node_output, "artifacts": merged}
+                node_feedback = node_output.get("feedback")
+                if node_feedback and isinstance(node_feedback, list):
+                    existing_fb = result.get("feedback", [])
+                    if not isinstance(existing_fb, list):
+                        existing_fb = []
+                    node_output = {**node_output, "feedback": existing_fb + node_feedback}
+                result.update(node_output)
+                phase = node_output.get("current_phase", "")
+                status = node_output.get("status", "")
+                if phase or status:
+                    _update_work_progress(db, plan_id, phase, status)
+                    logger.info(f"[{plan_id}] Resume: Phase {phase or node_name} → {status}")
                     audit.log_event(
-                        plan_id, "work_failed", "dispatcher", {"error": "stalled", "stalled": True}
+                        plan_id,
+                        "phase_completed",
+                        node_name,
+                        {"phase": phase, "status": status},
                     )
-                    try:
-                        from spine.ui.ws_bus import get_bus
+                if node_artifacts and isinstance(node_artifacts, dict):
+                    for art_phase, phase_arts in node_artifacts.items():
+                        if not isinstance(phase_arts, dict):
+                            continue
+                        for art_name, art_content in phase_arts.items():
+                            if art_content is not None:
+                                artifacts_store.save_artifact(
+                                    plan_id, art_phase, art_name, str(art_content)
+                                )
 
-                        get_bus().publish_sync(
-                            "work_failed", {"work_id": plan_id, "error": "stalled"}
-                        )
-                    except Exception:
-                        pass
-                    return {
-                        "plan_id": plan_id,
-                        "status": TaskStatus.STALLED.value,
-                        "spawned_ids": [],
-                    }
-                raise
+        if stalled:
+            db["work_entries"].update(
+                plan_id,
+                {
+                    "status": TaskStatus.STALLED.value,
+                    "current_phase": result.get("current_phase", ""),
+                    "updated_at": datetime.now().isoformat(),
+                    "result": json.dumps(
+                        {"error": f"stalled after {stall_timeout_val}s", "stalled": True}
+                    ),
+                },
+            )
+            audit.log_event(
+                plan_id, "work_failed", "dispatcher", {"error": "stalled", "stalled": True}
+            )
+            try:
+                from spine.ui.ws_bus import get_bus
+
+                get_bus().publish_sync("work_failed", {"work_id": plan_id, "error": "stalled"})
+            except Exception:
+                pass
+            return {
+                "plan_id": plan_id,
+                "status": TaskStatus.STALLED.value,
+                "spawned_ids": [],
+            }
 
         final_phase = result.get("current_phase", "")
         result_artifacts = result.get("artifacts", {})

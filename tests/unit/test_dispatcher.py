@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import pytest
 
 from spine.config import SpineConfig
+from spine.models.enums import TaskStatus
 from spine.work.dispatcher import _get_work_db, list_work
 
 
@@ -493,6 +495,67 @@ class TestApproveAndSpawn:
                 )
             finally:
                 # Clean up sys.modules to avoid side effects
+                _sys.modules.pop("spine.workflow.compose", None)
+                _sys.modules.pop("spine.persistence.checkpoint", None)
+
+    # ── Stall detection ───────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_resume_stall_is_per_chunk_not_wall_clock(self):
+        """A backend that goes silent for longer than SPINE_STALL_TIMEOUT is
+        marked stalled. The stall budget is per-chunk: it must NOT be a flat
+        wall-clock cap on the whole stream, which previously killed healthy long
+        generations mid-flight (trace 019ed38f cancelled a live critic at 130s)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._make_config(tmpdir)
+            self._insert_plan_entry(config)
+
+            # astream that emits one chunk immediately (progress), then goes
+            # silent forever — the second __anext__ must trip the per-chunk
+            # timeout and mark the run stalled.
+            async def _mock_astream(*args, **kwargs):
+                yield {
+                    "type": "updates",
+                    "ns": (),
+                    "data": {"some_node": {"current_phase": "review", "status": "running"}},
+                }
+                await asyncio.sleep(60)  # silence longer than the stall timeout
+                yield {"type": "updates", "ns": (), "data": {}}  # never reached
+
+            mock_graph = MagicMock()
+            mock_graph.astream = _mock_astream
+
+            import sys as _sys
+
+            mock_compose = MagicMock()
+            mock_compose.build_workflow_graph.return_value = mock_graph
+            _sys.modules["spine.workflow.compose"] = mock_compose
+
+            mock_cp_mod = MagicMock()
+            mock_cp = MagicMock()
+            mock_cp_mod.CheckpointStore = MagicMock(return_value=mock_cp)
+            mock_cp.get_checkpointer = AsyncMock()
+            mock_cp.get_state = AsyncMock(return_value=None)
+            _sys.modules["spine.persistence.checkpoint"] = mock_cp_mod
+
+            try:
+                with (
+                    patch("spine.work.dispatcher.ArtifactStore", MagicMock()),
+                    patch("spine.work.dispatcher.AuditService", return_value=MagicMock()),
+                    patch.dict("os.environ", {"SPINE_STALL_TIMEOUT": "1"}),
+                ):
+                    from spine.work.dispatcher import approve_and_spawn
+
+                    result = await approve_and_spawn(
+                        config=config,
+                        plan_id=self.PLAN_ID,
+                        action="request_revision",
+                        feedback="go",
+                    )
+
+                assert result["status"] == TaskStatus.STALLED.value
+                assert result["spawned_ids"] == []
+            finally:
                 _sys.modules.pop("spine.workflow.compose", None)
                 _sys.modules.pop("spine.persistence.checkpoint", None)
 
