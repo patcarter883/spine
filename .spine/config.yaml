@@ -60,14 +60,14 @@ providers:
   #   context_window: 32000
   - name: local
     type: deepagents-model
-    model: openai:Qwen3.6-27B-MTP-GGUF
+    model: openai:gemma-4-12B-it-qat-q4_0-gguf-Q4_0
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 1
-    context_window: 40000
+    max_concurrent_calls: 2
+    context_window: 60000
   embedding:
   - name: local-embeddings
     type: openai-embedding
