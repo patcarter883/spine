@@ -66,8 +66,8 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2
-    context_window: 60000
+    max_concurrent_calls: 1
+    context_window: 40000
   embedding:
   - name: local-embeddings
     type: openai-embedding
@@ -91,12 +91,12 @@ providers:
       # completion to synthesize_max_completion_tokens and compresses evidence
       # if it ever exceeds the window. Without this the synth runs "legacy"
       # (no clamp, fixed evidence budgets). poolside/laguna-xs.2 = 262144.
-      context_window: 60000
+      context_window: 40000
     specify/subagents/researcher:
       provider: local
     plan:
       provider: local
-      context_window: 60000
+      context_window: 40000
     plan/subagents/researcher:
       provider: local
     implement:
