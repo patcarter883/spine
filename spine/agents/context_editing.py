@@ -277,10 +277,22 @@ class ReadCacheMiddleware(AgentMiddleware):
                     # an "ALREADY FETCHED" sentinel wrapping a stale error.
                     if isinstance(res, ToolMessage) and getattr(res, "status", None) == "error":
                         return None
-                    if isinstance(res, ToolMessage) and isinstance(res.content, str):
-                        return res.content
-                    if hasattr(res, "content") and isinstance(res.content, str):
-                        return res.content
+                    # codebase_query and the mcp_codebase-index_* tools return
+                    # MULTIMODAL content — a list of {type:text,...} blocks, not
+                    # a bare str. The previous `isinstance(content, str)` guards
+                    # therefore returned None for every facade lookup, so
+                    # get_or_fetch never populated an entry: each call re-ran the
+                    # handler AND fell through to the early return below, skipping
+                    # the per-branch cache write too. Net effect — the dedupe was
+                    # inert for the exact tools it was built for (trace 019ed413:
+                    # one slice issued `codebase_query find_symbol UIApi` 4× with
+                    # zero cache hits). Coerce via _stringify_content (the same
+                    # helper the eviction path uses) so the result is memoisable;
+                    # treat an empty string as a non-result so we don't cache "".
+                    if isinstance(res, ToolMessage):
+                        return _stringify_content(res.content) or None
+                    if hasattr(res, "content"):
+                        return _stringify_content(res.content) or None
                     return None
 
                 cached_content, hit_count = await symbol_cache.get_or_fetch(
@@ -300,10 +312,19 @@ class ReadCacheMiddleware(AgentMiddleware):
                             f"turn {turn}, hit #{hit_count}, content_sha={content_sha}]\n"
                             f"{cached_content}"
                         )
-                    else:
-                        payload = cached_content
+                        return ToolMessage(
+                            content=payload,
+                            tool_call_id=request.tool_call["id"],
+                            name=tool_name,
+                        )
+                    # First fetch for this work_id: the result is now memoised for
+                    # future hits, but return the original handler result verbatim
+                    # so the immediate consumer keeps full (possibly multimodal)
+                    # fidelity rather than the stringified copy.
+                    if "result" in captured:
+                        return captured["result"]
                     return ToolMessage(
-                        content=payload,
+                        content=cached_content,
                         tool_call_id=request.tool_call["id"],
                         name=tool_name,
                     )
@@ -1006,6 +1027,66 @@ class SearchLoopGuard(AgentMiddleware):
         logger.info("SearchLoopGuard: intervening (empty streak=%d)", streak)
         return await handler(
             request.override(messages=[*messages, SystemMessage(content=reminder)])
+        )
+
+    def wrap_tool_call(self, request, handler):
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        return await handler(request)
+
+
+class TurnBudgetGuard(AgentMiddleware):
+    """Bound a single agent's model-turn count with an escalating nudge.
+
+    Per-call token cost is clamped elsewhere (completion caps + the
+    compaction threshold that bounds the prompt), but nothing bounds the
+    NUMBER of turns. Because the full history is re-sent every turn, total
+    input scales linearly with turn count: a slice-implementer that keeps
+    re-querying and re-editing can grind dozens of turns at the compaction
+    ceiling and burn ~1M input tokens on a small edit (trace 019ed413: 69
+    model turns ≈ 954K input for a config-UI change).
+
+    After ``threshold`` model turns this middleware appends a SystemMessage
+    directing the model to converge — finish the edit, report status, stop
+    exploring. Tools stay bound, so a genuinely long slice can still finish;
+    the directive escalates each turn past the threshold so a model that
+    ignores the first nudge gets an increasingly firm one. The recursion
+    limit remains the ultimate backstop.
+    """
+
+    def __init__(self, threshold: int = 30) -> None:
+        if threshold < 1:
+            raise ValueError("threshold must be >= 1")
+        self.threshold = threshold
+
+    @staticmethod
+    def _count_model_turns(messages: list) -> int:
+        """Count assistant turns already taken in this invocation."""
+        return sum(1 for m in messages if isinstance(m, AIMessage))
+
+    async def awrap_model_call(self, request, handler):
+        turns = self._count_model_turns(request.messages)
+        if turns < self.threshold:
+            return await handler(request)
+        over = turns - self.threshold + 1
+        reminder = (
+            f"[TURN BUDGET GUARD] You have taken {turns} turns on this task "
+            f"(soft budget {self.threshold}). Converge NOW: make the remaining "
+            f"edits you are confident about, then return your final result with "
+            f"a status. Do NOT issue more exploratory codebase_query/search "
+            f"calls — act on what you already have. If something genuinely "
+            f"blocks completion, report it as blocked rather than continuing to "
+            f"loop."
+        )
+        if over > 1:
+            reminder += (
+                f" This is reminder #{over}; further looping is wasting tokens "
+                f"with no progress — finish or report blocked on this turn."
+            )
+        logger.info("TurnBudgetGuard: intervening (turns=%d, over=%d)", turns, over)
+        return await handler(
+            request.override(messages=[*request.messages, SystemMessage(content=reminder)])
         )
 
     def wrap_tool_call(self, request, handler):

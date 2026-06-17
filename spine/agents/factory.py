@@ -713,6 +713,19 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     from spine.config import SpineConfig
 
     _spine_cfg = SpineConfig.load()
+
+    # TurnBudgetGuard — bound the IMPLEMENT loop's model-turn count. Per-call
+    # cost is clamped (completion caps + compaction threshold), but nothing
+    # bounds the NUMBER of turns; because the history is re-sent each turn,
+    # total input scales linearly with turns (trace 019ed413: 69 turns ≈ 954K
+    # input on a small edit). Past the soft budget the guard nudges the model
+    # to converge; tools stay bound. Implement-only — the long-running editor
+    # loop is where unbounded turns actually burn tokens.
+    if phase == PhaseName.IMPLEMENT and _spine_cfg.implement_max_turns > 0:
+        from spine.agents.context_editing import TurnBudgetGuard
+
+        middleware.append(TurnBudgetGuard(threshold=_spine_cfg.implement_max_turns))
+
     try:
         _provider_cfg = _spine_cfg.resolve_provider_config(phase=phase.value)
         _window = int(_provider_cfg.get("context_window") or 0)

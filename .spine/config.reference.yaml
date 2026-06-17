@@ -208,6 +208,16 @@ spine:
   research_lean_categories:
     - Frontend/UI
 
+  # Soft ceiling on model turns for a single slice-implementer agent. Per-call
+  # cost is clamped (completion caps + the compaction threshold that bounds the
+  # prompt), but nothing bounds the NUMBER of turns; since the history is
+  # re-sent each turn, total input scales linearly with turn count (trace
+  # 019ed413: 69 turns ≈ 954K input on a config-UI edit). Past this budget the
+  # TurnBudgetGuard injects an escalating "converge now" directive — tools stay
+  # bound, so a genuinely long slice can still finish. 0 disables the guard.
+  # Default: 30  | Env: SPINE_IMPLEMENT_MAX_TURNS
+  implement_max_turns: 30
+
   # Total token budget for the SPECIFY explorer context.
   # Default: 30000  | (no env override)
   specify_context_token_budget: 30000

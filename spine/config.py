@@ -344,6 +344,17 @@ class SpineConfig:
     # slice, finer micro-slicing rarely succeeds, so default to a single
     # decomposition pass (1) and let stronger setups raise it.
     implement_max_decompose_depth: int = 1
+    # Soft ceiling on the number of model turns a single slice-implementer
+    # agent may take before the TurnBudgetGuard injects a hard "converge now"
+    # directive. Per-call cost is already clamped (implement_max_completion_tokens
+    # + DynamicCompletionCap) and the prompt is capped at the compaction
+    # threshold, but neither bounds the NUMBER of turns: a slice that keeps
+    # re-querying and re-editing grinds dozens of turns at the compaction
+    # ceiling, so total input scales linearly with turn count (trace 019ed413:
+    # one slice took 69 model turns ≈ 954K input tokens for a config-UI edit).
+    # The guard only nudges — tools stay bound — so legitimate long slices can
+    # still finish; 0 disables it.
+    implement_max_turns: int = 30
     specify_context_token_budget: int = 30000
 
     # Token budget for the findings block injected into plan/specify
@@ -696,6 +707,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_IMPLEMENT_MAX_DECOMPOSE_DEPTH",
                     spine.get("implement_max_decompose_depth", 1),
+                )
+            ),
+            implement_max_turns=int(
+                os.getenv(
+                    "SPINE_IMPLEMENT_MAX_TURNS",
+                    spine.get("implement_max_turns", 30),
                 )
             ),
             topic_lookup_top_k=int(spine.get("topic_lookup_top_k", 5)),
