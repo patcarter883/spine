@@ -198,6 +198,7 @@ class SpineConfig:
     artifact_path: str = ".spine/artifacts"
     project_path: str = ".spine/project"
     max_critic_retries: int = 2
+    max_adversarial_retries: int = 2
     work_type: str = "task"
     providers: dict = field(default_factory=dict)
     queue_backend: str = "sqlite"
@@ -603,6 +604,12 @@ class SpineConfig:
             ),
             max_critic_retries=int(
                 os.getenv("SPINE_MAX_CRITIC_RETRIES", spine.get("max_critic_retries", 2))
+            ),
+            max_adversarial_retries=int(
+                os.getenv(
+                    "SPINE_MAX_ADVERSARIAL_RETRIES",
+                    spine.get("max_adversarial_retries", 2),
+                )
             ),
             work_type=os.getenv("SPINE_WORK_TYPE", spine.get("work_type", "task")),
             providers=config.get("providers", {}),

@@ -18,9 +18,13 @@ that; there is no reason for a human review gate between those two phases.
 
 Phase sequences by WorkType:
     task:              SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
-    critical_task:     SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY
+    critical_task:     SPECIFY → PLAN → CRITIC_PLAN → ADVERSARIAL_PLAN → IMPLEMENT → VERIFY
     reviewed_task:     SPECIFY → PLAN → CRITIC_PLAN  (graph ENDs; awaits human approval)
-    critical_reviewed: SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN  (graph ENDs; awaits human approval)
+    critical_reviewed: SPECIFY → PLAN → CRITIC_PLAN → ADVERSARIAL_PLAN  (graph ENDs; awaits human approval)
+
+The ADVERSARIAL_PLAN stage red-teams the approved plan: autonomously-fixable
+findings loop back to PLAN on a separate retry budget, human-judgement
+findings escalate to review.
 
 Reviewed work types intentionally terminate after ``critic_plan``. The
 graph never runs IMPLEMENT/VERIFY directly — when the human approves
@@ -29,6 +33,7 @@ spawned for execution. Letting the graph fall through to IMPLEMENT
 would defeat the entire purpose of the human-review gate.
 """
 
+import logging
 from typing import Any, Callable, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -59,6 +64,7 @@ from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
 from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
 from spine.workflow.subgraphs.exploration_subgraph import build_exploration_subgraph
 from spine.workflow.subgraphs.gap_plan_subgraph import build_gap_plan_subgraph
+from spine.workflow.subgraphs.adversarial_subgraph import build_adversarial_subgraph
 from spine.workflow.artifact_gate import (
     make_prerequisite_gate_node,
     _check_spec_prerequisite,
@@ -93,7 +99,13 @@ register_subgraph_builder(PhaseName.PLAN.value, build_plan_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_tasks", build_critic_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_plan", build_critic_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_specify", build_critic_subgraph)
+# Adversarial reviews the PLAN; the node is named "adversarial_plan".
+register_subgraph_builder(
+    f"{PhaseName.ADVERSARIAL.value}_plan", build_adversarial_subgraph
+)
 register_subgraph_builder(PhaseName.GAP_PLAN.value, build_gap_plan_subgraph)
+
+logger = logging.getLogger(__name__)
 
 
 # Feature flags for per-phase subgraph migration.
@@ -205,8 +217,27 @@ def _specify_state_mapper(parent_state: WorkflowState, config) -> dict:
 def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
     workspace_root = parent_state.get("workspace_root", ".")
-    retry_count = parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
+    crit_retry = parent_state.get("retry_count", {}).get(PhaseName.PLAN.value, 0)
+    # The adversarial stage loops the plan back here on its OWN budget. Use
+    # current_phase (last node to route in — set by the result mappers) to tell
+    # an adversarial-driven rework from a critic-driven one. On an adversarial
+    # loopback, drive rework mode off the adversarial round and surface the
+    # adversarial findings instead of the critic's stale PASS verdict.
+    came_from_adversarial = (
+        parent_state.get("current_phase") == PhaseName.ADVERSARIAL.value
+    )
+    retry_count = (
+        parent_state.get("adversarial_retry_count", 0)
+        if came_from_adversarial
+        else crit_retry
+    )
     base = _base_state_mapper(parent_state, config)
+    if came_from_adversarial:
+        # _render_rework_feedback renders the subgraph's last_critic_review
+        # slot; point it at the adversarial verdict so the rework prompt shows
+        # what the red-team flagged. Parent state is untouched — the critic's
+        # own last_critic_review and convergence accounting stay intact.
+        base["last_critic_review"] = parent_state.get("last_adversarial_review")
     # Always attempt to load prior research (see _specify_state_mapper).
     prior_topics, prior_findings = _load_prior_research(
         workspace_root, work_id, PhaseName.PLAN.value
@@ -565,6 +596,167 @@ def _critic_result_mapper(reviewed_phase: str):
     return mapper
 
 
+# ── Adversarial review (critical work types) ──
+# Runs after critic_plan. Structurally wired like a critic node, but reviews
+# the PLAN with a red-team agent and tracks its own retry budget
+# (adversarial_retry_count / max_adversarial_retries) so the critic's
+# retry_count is never touched.
+
+
+def _adversarial_state_mapper(parent_state: WorkflowState, config) -> dict:
+    """Map parent WorkflowState to AdversarialSubgraphState (reviews PLAN)."""
+    work_id = parent_state.get("work_id", "")
+    return {
+        **_base_state_mapper(parent_state, config),
+        "phase": PhaseName.ADVERSARIAL.value,
+        # The adversarial agent's own rework round (separate budget). Passed so
+        # the agent/logging see the right round; never the critic's retry_count.
+        "retry_count": parent_state.get("adversarial_retry_count", 0),
+        "reviewed_phase": PhaseName.PLAN.value,
+        "reviewed_phase_path": artifact_path(work_id, PhaseName.PLAN.value),
+        "artifacts": parent_state.get("artifacts", {}),
+        "specification_json": parent_state.get("specification_json"),
+        "plan_json": parent_state.get("plan_json"),
+    }
+
+
+def _adversarial_result_mapper(
+    subgraph_result: dict, parent_state: WorkflowState
+) -> dict[str, Any]:
+    """Map AdversarialSubgraphState output back to parent WorkflowState.
+
+    Mirrors :func:`_critic_result_mapper`'s escalation shape but on the
+    SEPARATE adversarial budget. Writes ``last_adversarial_review`` (the
+    router's source of truth) and appends the verdict to ``feedback`` so the
+    PLAN synthesizer renders it on a loopback. Never writes ``retry_count`` or
+    ``last_critic_review`` — the critic's accounting stays pristine.
+    """
+    base: dict[str, Any] = {
+        "current_phase": PhaseName.ADVERSARIAL.value,
+        "status": "running",
+        "prompt_request": None,
+    }
+
+    agent_result = subgraph_result.get("agent_result", {})
+    if agent_result:
+        effective_result = agent_result
+    else:
+        effective_result = {
+            "status": ReviewStatus.PASSED.value,
+            "tier": "adversarial",
+            "reason": "No adversarial review performed",
+            "suggestions": [],
+        }
+
+    base["feedback"] = [effective_result]
+
+    phase_status = subgraph_result.get("phase_status", "") or effective_result.get(
+        "status", ""
+    )
+    prior = parent_state.get("adversarial_retry_count", 0)
+    max_adv = parent_state.get("max_adversarial_retries", 2)
+    new_attempt = prior + 1
+
+    blocker_category = effective_result.get("blocker_category")
+    spec_contradiction = blocker_category == "spec_contradiction"
+
+    # Escalation decision on the adversarial budget. A NEEDS_REVISION verdict
+    # loops back to PLAN while budget remains; once the budget is spent it
+    # escalates instead of looping forever. A NEEDS_REVIEW verdict (or a spec
+    # contradiction) escalates immediately — those need human judgement.
+    is_revision = phase_status == ReviewStatus.NEEDS_REVISION.value
+    is_review = phase_status == ReviewStatus.NEEDS_REVIEW.value
+    exhausted = is_revision and prior >= max_adv
+    escalate = is_review or spec_contradiction or exhausted
+
+    if spec_contradiction:
+        escalation_kind = "spec_amendment"
+    elif exhausted:
+        escalation_kind = "adversarial_exhausted"
+    elif is_review:
+        escalation_kind = "adversarial_flagged"
+    else:
+        escalation_kind = None
+
+    base["last_adversarial_review"] = {
+        "phase": PhaseName.PLAN.value,
+        "status": phase_status,
+        "tier": effective_result.get("tier", "adversarial"),
+        "reason": effective_result.get("reason", ""),
+        "suggestions": effective_result.get("suggestions", []),
+        "attempt": new_attempt if is_revision else prior,
+        "blocker_category": blocker_category,
+        "escalate": escalate,
+        "escalation_kind": escalation_kind,
+    }
+
+    # Count the round only when we actually loop back to PLAN.
+    if is_revision and not escalate:
+        base["adversarial_retry_count"] = new_attempt
+
+    if phase_status == "error":
+        base["status"] = "failed"
+    elif escalate:
+        base["status"] = "needs_review"
+        # A spec contradiction targets SPECIFY so a "rework" amends the spec;
+        # every other escalation points the reviewer at the PLAN.
+        base["needs_review_phase"] = (
+            PhaseName.SPECIFY.value if spec_contradiction else PhaseName.PLAN.value
+        )
+        base["needs_review_kind"] = escalation_kind
+    elif is_revision:
+        # Loop back to PLAN with budget remaining.
+        base["status"] = "running"
+    else:
+        # PASSED — the plan survived the red-team.
+        base["status"] = "running"
+        base["adversarial_plan_completed"] = True
+
+    return base
+
+
+def adversarial_router(state: WorkflowState) -> str:
+    """Conditional edge function for the adversarial node.
+
+    Reads ``last_adversarial_review`` (written by
+    :func:`_adversarial_result_mapper`) and returns the routing key:
+    - ``"passed"`` → proceed (implement gate, or END → awaiting_approval)
+    - ``"needs_revision"`` → loop the plan back to PLAN (budget remains)
+    - ``"needs_review"`` → escalate (human review / flag)
+    - ``"failed"`` → stop the workflow as failed
+    """
+    if state.get("status") == "failed":
+        return "failed"
+
+    lar = state.get("last_adversarial_review") or {}
+    if not lar:
+        logger.warning(
+            "adversarial_router: last_adversarial_review missing — routing needs_revision"
+        )
+        return "needs_revision"
+
+    status = lar.get("status", ReviewStatus.NEEDS_REVISION.value)
+    decision: str
+    if status == ReviewStatus.PASSED.value:
+        decision = "passed"
+    elif status == ReviewStatus.NEEDS_REVIEW.value or lar.get("escalate"):
+        # Direct human-judgement verdict, or a revision whose budget is spent.
+        decision = "needs_review"
+    else:
+        decision = "needs_revision"
+
+    logger.info(
+        "[%s] adversarial_router: status=%s rounds=%d/%d kind=%s → %s",
+        state.get("work_id", "?"),
+        status,
+        state.get("adversarial_retry_count", 0),
+        state.get("max_adversarial_retries", 2),
+        lar.get("escalation_kind"),
+        decision,
+    )
+    return decision
+
+
 def _gap_plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     """Map parent WorkflowState to GapPlanSubgraphState."""
     work_id = parent_state.get("work_id", "")
@@ -616,9 +808,9 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
     ],
     WorkType.CRITICAL_TASK.value: [
         (PhaseName.SPECIFY.value, None),
-        (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
+        (f"{PhaseName.ADVERSARIAL.value}_plan", PhaseName.PLAN.value),
         (PhaseName.IMPLEMENT.value, None),
         (PhaseName.VERIFY.value, None),
     ],
@@ -629,9 +821,9 @@ WORKFLOW_SEQUENCES: dict[str, list[tuple[str, str | None]]] = {
     ],
     WorkType.CRITICAL_REVIEWED_TASK.value: [
         (PhaseName.SPECIFY.value, None),
-        (f"{PhaseName.CRITIC.value}_specify", PhaseName.SPECIFY.value),
         (PhaseName.PLAN.value, None),
         (f"{PhaseName.CRITIC.value}_plan", PhaseName.PLAN.value),
+        (f"{PhaseName.ADVERSARIAL.value}_plan", PhaseName.PLAN.value),
     ],
 }
 
@@ -886,7 +1078,23 @@ def build_workflow_graph(
 
     # Add all phase/critic nodes
     for node_name, reviewed_phase in phase_seq:
-        if node_name.startswith(PhaseName.CRITIC.value):
+        if node_name.startswith(PhaseName.ADVERSARIAL.value):
+            # Adversarial node — single-tier red-team subgraph reviewing PLAN.
+            # Checked before the critic branch and the generic _SUBGRAPH_ENABLED
+            # path so "adversarial_plan" routes here (it does not start with
+            # "critic", so there is no collision).
+            adv_subgraph = build_adversarial_subgraph().compile()
+            graph.add_node(
+                node_name,
+                make_subgraph_node(
+                    adv_subgraph,
+                    node_name,
+                    _adversarial_state_mapper,
+                    _adversarial_result_mapper,
+                    use_per_phase_checkpointer=True,
+                ),
+            )
+        elif node_name.startswith(PhaseName.CRITIC.value):
             # Critic node — use subgraph if enabled, else legacy
             _reviewed = reviewed_phase or "unknown"
             if _SUBGRAPH_ENABLED.get(PhaseName.CRITIC.value, False):
@@ -1127,7 +1335,29 @@ def build_workflow_graph(
             }
             return prereq_gate.get(next_node_name, next_node_name)
 
-        if node_name.startswith(PhaseName.CRITIC.value):
+        if node_name.startswith(PhaseName.ADVERSARIAL.value):
+            # Adversarial node → conditional edge. "passed" proceeds (implement
+            # gate for critical_task, END for critical_reviewed_task);
+            # "needs_revision" loops the plan back to PLAN (NOT the previous
+            # node, which is critic_plan); "needs_review" escalates.
+            if has_gate and next_node:
+                adv_proceed_target: str = _gate_node_name(node_name, next_node)
+            elif not is_last and next_node:
+                adv_proceed_target = get_proceed_target(next_node)
+            else:
+                adv_proceed_target = END
+
+            graph.add_conditional_edges(
+                node_name,
+                adversarial_router,
+                {
+                    "passed": adv_proceed_target,
+                    "needs_revision": PhaseName.PLAN.value,  # rework loop → plan
+                    "needs_review": needs_review_target,  # human gate or terminal flag
+                    "failed": END,
+                },
+            )
+        elif node_name.startswith(PhaseName.CRITIC.value):
             # Critic node → conditional edge
             pre_critic = phase_seq[i - 1][0] if i > 0 else phase_seq[0][0]
 
@@ -1314,14 +1544,15 @@ def _make_legacy_node(
 def get_restart_phases(work_type: str) -> list[str]:
     """Return the list of valid phase names for restart_from_phase.
 
-    Filters out critic nodes since restarting into a critic doesn't
-    make sense — the critic is always called after its reviewed phase.
+    Filters out critic and adversarial review nodes since restarting into a
+    review doesn't make sense — they are always called after the phase they
+    review (PLAN).
 
     Args:
         work_type: One of the valid WorkType values.
 
     Returns:
-        Sorted list of non-critic phase names from the workflow sequence.
+        Sorted list of non-review phase names from the workflow sequence.
 
     Raises:
         ValueError: If the work_type is not recognised.
@@ -1334,4 +1565,5 @@ def get_restart_phases(work_type: str) -> list[str]:
         name
         for name, _ in WORKFLOW_SEQUENCES[work_type]
         if not name.startswith(PhaseName.CRITIC.value)
+        and not name.startswith(PhaseName.ADVERSARIAL.value)
     )

@@ -22,7 +22,7 @@ def task_graph():
 
 
 def critical_task_graph():
-    """CRITICAL_TASK: specify → critic_specify → plan → critic_plan → implement → verify."""
+    """CRITICAL_TASK: specify → plan → critic_plan → adversarial_plan → implement → verify."""
     return build_workflow_graph("critical_task")
 
 
@@ -32,5 +32,5 @@ def reviewed_task_graph():
 
 
 def critical_reviewed_task_graph():
-    """CRITICAL_REVIEWED_TASK: specify → critic_specify → plan → critic_plan, then ENDs for human approval."""
+    """CRITICAL_REVIEWED_TASK: specify → plan → critic_plan → adversarial_plan, then ENDs for human approval."""
     return build_workflow_graph("critical_reviewed_task")

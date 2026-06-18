@@ -131,4 +131,5 @@ def _import_phase_modules() -> None:
     import spine.phases.implement  # noqa: F401
     import spine.phases.verify  # noqa: F401
     import spine.phases.critic  # noqa: F401
+    import spine.phases.adversarial  # noqa: F401
     import spine.phases.gap_plan  # noqa: F401

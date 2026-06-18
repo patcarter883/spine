@@ -533,15 +533,19 @@ class TestReviewedTaskHumanApprovalGate:
         assert PhaseName.IMPLEMENT.value not in phase_names
         assert PhaseName.VERIFY.value not in phase_names
 
-    def test_critical_reviewed_task_sequence_stops_at_critic_plan(self):
+    def test_critical_reviewed_task_sequence_stops_at_adversarial_plan(self):
         from spine.models.enums import PhaseName
         from spine.workflow.compose import WORKFLOW_SEQUENCES
 
         sequence = WORKFLOW_SEQUENCES["critical_reviewed_task"]
         phase_names = [name for name, _ in sequence]
-        assert phase_names[-1] == f"{PhaseName.CRITIC.value}_plan", (
-            f"critical_reviewed_task must end at critic_plan, got: {phase_names}"
+        # The adversarial review is the final, human-review gate for critical
+        # reviewed tasks — it runs after critic_plan and before approval.
+        assert phase_names[-1] == f"{PhaseName.ADVERSARIAL.value}_plan", (
+            f"critical_reviewed_task must end at adversarial_plan, got: {phase_names}"
         )
+        assert f"{PhaseName.CRITIC.value}_plan" in phase_names
+        assert f"{PhaseName.CRITIC.value}_specify" not in phase_names
         assert PhaseName.IMPLEMENT.value not in phase_names
         assert PhaseName.VERIFY.value not in phase_names
 

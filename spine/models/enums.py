@@ -14,6 +14,7 @@ class PhaseName(str, Enum):
     IMPLEMENT = "implement"
     VERIFY = "verify"
     CRITIC = "critic"
+    ADVERSARIAL = "adversarial"
     GAP_PLAN = "gap_plan"
 
 
@@ -21,11 +22,14 @@ class WorkType(str, Enum):
     """Work type determines the phase composition of the workflow.
 
     - TASK: specify -> plan -> critic_plan -> implement -> verify
-    - CRITICAL_TASK: specify -> critic_specify -> plan -> critic_plan -> implement -> verify
+    - CRITICAL_TASK: specify -> plan -> critic_plan -> adversarial_plan ->
+      implement -> verify. The adversarial stage red-teams the approved plan;
+      autonomously-fixable findings loop back to plan, human-judgement findings
+      escalate.
     - REVIEWED_TASK: specify -> plan -> critic_plan, then stops for human
       approval. On approval, the SAME work item is re-keyed to TASK and
       continued from implement (reusing the approved spec + plan).
-    - CRITICAL_REVIEWED_TASK: specify -> critic_specify -> plan -> critic_plan,
+    - CRITICAL_REVIEWED_TASK: specify -> plan -> critic_plan -> adversarial_plan,
       then stops for human approval. On approval, the SAME work item is
       re-keyed to CRITICAL_TASK and continued from implement.
     """

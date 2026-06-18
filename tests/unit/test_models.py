@@ -235,6 +235,7 @@ class TestEnums:
         assert PhaseName.IMPLEMENT == "implement"
         assert PhaseName.VERIFY == "verify"
         assert PhaseName.CRITIC == "critic"
+        assert PhaseName.ADVERSARIAL == "adversarial"
 
     def test_work_type_enum(self) -> None:
         """Test WorkType enum values."""
@@ -254,8 +255,9 @@ class TestEnums:
         """Test that we can iterate over enum values."""
         # Test PhaseName
         phases = list(PhaseName)
-        assert len(phases) == 7
+        assert len(phases) == 8
         assert PhaseName.SPECIFY in phases
+        assert PhaseName.ADVERSARIAL in phases
 
         # Test WorkType
         work_types = list(WorkType)

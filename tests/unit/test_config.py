@@ -21,6 +21,7 @@ class TestSpineConfig:
         assert config.checkpoint_path == ".spine/spine.db"
         assert config.artifact_path == ".spine/artifacts"
         assert config.max_critic_retries == 2
+        assert config.max_adversarial_retries == 2
         assert config.work_type == "task"
         assert config.queue_backend == "sqlite"
         assert config.queue_path == ".spine/queue.db"
@@ -59,13 +60,16 @@ class TestSpineConfig:
 
         # Set environment variable
         os.environ["SPINE_CHECKPOINT_PATH"] = ".spine/env.db"
+        os.environ["SPINE_MAX_ADVERSARIAL_RETRIES"] = "4"
 
         try:
             config = SpineConfig.load(str(config_file))
             assert config.checkpoint_path == ".spine/env.db"
+            assert config.max_adversarial_retries == 4
         finally:
             # Clean up environment variable
             del os.environ["SPINE_CHECKPOINT_PATH"]
+            del os.environ["SPINE_MAX_ADVERSARIAL_RETRIES"]
 
     def test_resolve_model_from_config(self) -> None:
         """Test resolving model from provider configuration."""

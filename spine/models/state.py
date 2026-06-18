@@ -107,10 +107,27 @@ class WorkflowState(TypedDict, total=False):
     # operator.add `feedback` list. The convergence fields (stagnation_streak,
     # unaddressed_points) are computed by spine.workflow.critic_convergence and
     # drive early escalation + the "still unaddressed" rework delta.
+    # ── Adversarial review (critical work types) ──
+    # The adversarial stage runs after critic_plan for critical_task /
+    # critical_reviewed_task. It red-teams the approved plan; autonomously-
+    # fixable findings loop back to PLAN, human-judgement findings escalate.
+    # Its rework budget is tracked SEPARATELY from the critic's retry_count so
+    # the two loops never consume each other's attempts.
+    adversarial_retry_count: int  # Adversarial→plan rework rounds taken. Plain
+    # int, last-write-wins (like verify_attempts) — NOT routed through the
+    # retry_count _merge_dicts reducer, so critic accounting is untouched.
+    max_adversarial_retries: int  # Budget for adversarial reworks; seeded from
+    # SpineConfig.max_adversarial_retries alongside max_retries.
+    adversarial_plan_completed: bool  # True when adversarial_plan passed.
+    last_adversarial_review: dict | None  # Mirror of last_critic_review for the
+    # adversarial stage. Written by _adversarial_result_mapper, read by
+    # adversarial_router and (on loopback) the PLAN synthesizer's rework block.
     needs_review_kind: str | None  # Why the workflow paused for human review:
     # "spec_amendment" (spec contradiction the plan can't resolve),
     # "stagnation" (rework rounds stopped converging), "retries_exhausted"
-    # (max_retries hit), or "critic_flagged" (critic returned NEEDS_REVIEW).
+    # (max_retries hit), "critic_flagged" (critic returned NEEDS_REVIEW),
+    # "adversarial_flagged" (adversarial review needs human judgement), or
+    # "adversarial_exhausted" (adversarial rework budget consumed).
     # Surfaced in the human_review interrupt payload so the reviewer knows
     # whether to amend upstream artifacts vs. nudge a rework.
     workspace_root: str  # Project root directory for deep agent backends
@@ -146,6 +163,7 @@ class WorkflowState(TypedDict, total=False):
     verify_completed: bool  # True when VERIFY phase completed successfully
     critic_specify_completed: bool  # True when CRITIC_SPECIFY phase passed
     critic_plan_completed: bool  # True when CRITIC_PLAN phase passed
+    # adversarial_plan_completed declared above with the adversarial fields.
     gap_plan_completed: bool  # True when GAP_PLAN phase completed successfully
 
     # Additional tracking fields

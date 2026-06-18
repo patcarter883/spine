@@ -112,9 +112,11 @@ class TestParentGraphWithSubgraphs:
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
         assert "specify" in nodes
-        assert "critic_specify" in nodes
+        # critic_specify was replaced by a post-plan adversarial review.
+        assert "critic_specify" not in nodes
         assert "plan" in nodes
         assert "critic_plan" in nodes
+        assert "adversarial_plan" in nodes
         assert "implement" in nodes
         assert "verify" in nodes
 

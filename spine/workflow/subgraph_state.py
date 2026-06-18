@@ -213,6 +213,22 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     critic_directive: dict  # SubagentDirective for the agent-check plan→do split
 
 
+class AdversarialSubgraphState(BaseSubgraphState, total=False):
+    """ADVERSARIAL phase — red-teams the approved plan (always reviews PLAN)."""
+
+    reviewed_phase: str
+    reviewed_phase_path: str
+    artifacts: dict  # Phase artifacts from parent WorkflowState.
+    # Structured outputs the reviewer reads (forwarded from parent state).
+    specification_json: str | None
+    plan_json: str | None
+    # Verdict written by the agent_check node — MUST be declared here or
+    # LangGraph drops the update before the result mapper can read it.
+    agent_result: dict | None
+    phase_status: str | None
+    adversarial_directive: dict  # SubagentDirective for the agent plan→do split.
+
+
 class GapPlanSubgraphState(BaseSubgraphState, total=False):
     """GAP_PLAN phase — reads verify feedback, produces gap_plan.md.
 
