@@ -452,6 +452,51 @@ def test_resolve_backing_call_search_clamps_max_results():
     assert args == {"pattern": "def foo", "max_results": 1}
 
 
+def test_resolve_backing_call_search_ignores_nullish_name():
+    """Regression (trace 019ed870): a small model emitted name="None" next to a
+    valid pattern; the literal placeholder must not trip mutual exclusivity."""
+    from spine.agents.tools.codebase_query import resolve_backing_call
+
+    for placeholder in ("None", "null", "NONE", " none "):
+        backing, args = resolve_backing_call("search", placeholder, "def foo")
+        assert backing == "mcp_codebase-index_search_codebase"
+        assert args == {"pattern": "def foo", "max_results": 20}
+
+
+def test_resolve_backing_call_symbol_action_ignores_nullish_pattern():
+    """The inverse: a name action with a placeholder pattern still resolves."""
+    from spine.agents.tools.codebase_query import resolve_backing_call
+
+    backing, args = resolve_backing_call("get_source", "render", "None")
+    assert backing == "mcp_codebase-index_get_function_source"
+    assert args == {"name": "render"}
+
+
+def test_resolve_backing_call_real_name_search_still_rejected():
+    """A genuine (non-placeholder) name on a search action is still an error."""
+    from langchain_core.tools import ToolException
+
+    from spine.agents.tools.codebase_query import resolve_backing_call
+
+    with pytest.raises(ToolException, match="'name' must not be supplied"):
+        resolve_backing_call("search", "render", "def foo")
+
+
+def test_canonical_backing_call_coalesces_nullish_name_for_search():
+    """Cache keying must collapse name=None and name='None' to one backing call."""
+    from spine.agents.tools.codebase_query import canonical_backing_call
+
+    with_placeholder = canonical_backing_call(
+        {"action": "search", "pattern": "def foo", "name": "None"}
+    )
+    without = canonical_backing_call({"action": "search", "pattern": "def foo"})
+    assert with_placeholder == without
+    assert with_placeholder == (
+        "mcp_codebase-index_search_codebase",
+        {"pattern": "def foo", "max_results": 20},
+    )
+
+
 def test_resolve_backing_call_unknown_action_raises():
     from langchain_core.tools import ToolException
 

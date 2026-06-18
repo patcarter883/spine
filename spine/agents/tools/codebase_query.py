@@ -63,6 +63,14 @@ CodebaseQueryAction = Literal[
 ]
 
 
+# Literal null-word placeholders a small model emits for an optional field it
+# means to leave empty (e.g. name="None"). Compared case-insensitively after
+# stripping; see :func:`_blank_to_none`. Deliberately excludes the empty /
+# whitespace-only string so a blank value on the field an action actually USES
+# still gets its specific "whitespace-only" validation message.
+_NULLISH_TOKENS: frozenset[str] = frozenset({"none", "null"})
+
+
 # action → backing MCP tool name on the codebase-index server.
 _ACTION_TO_MCP: dict[str, str] = {
     "find_symbol":      "mcp_codebase-index_find_symbol",
@@ -211,9 +219,10 @@ class CodebaseQueryInput(BaseModel):
         description=(
             "Symbol identifier (function, class, or method name). REQUIRED "
             "for find_symbol, get_source, get_dependencies, get_dependents. "
-            "Must be a clean identifier — no whitespace, no module prefix, "
-            "no parentheses. Do not pass any other arguments (e.g. "
-            "file_hint) — they are ignored."
+            "For action='search', OMIT this field entirely — do not pass the "
+            "string 'None' or 'null'. Must be a clean identifier — no "
+            "whitespace, no module prefix, no parentheses. Do not pass any "
+            "other arguments (e.g. file_hint) — they are ignored."
         ),
     )
     pattern: str | None = Field(
@@ -274,6 +283,23 @@ def _normalise_pattern(value: str | None) -> str:
     return value
 
 
+def _blank_to_none(value: Any) -> Any:
+    """Coerce a null-ish placeholder string to ``None``.
+
+    Small local models routinely fill an optional field they mean to OMIT
+    with the literal string ``"None"`` / ``"null"`` instead of leaving it
+    out. Trace ``019ed870`` sank an otherwise valid
+    ``action='search'`` because the model emitted ``name="None"`` next to a
+    well-formed ``pattern`` — the mutual-exclusivity guard saw a non-``None``
+    ``name`` and rejected the call, and the agent retried the identical args.
+    Mapping these placeholders to ``None`` lets the guard treat the field as
+    absent. Non-string values pass through untouched.
+    """
+    if not isinstance(value, str):
+        return value
+    return None if value.strip().lower() in _NULLISH_TOKENS else value
+
+
 def resolve_backing_call(
     action: str,
     name: str | None,
@@ -286,6 +312,10 @@ def resolve_backing_call(
     cache keying (:func:`canonical_backing_call`) so the two can never
     diverge. Raises ``ToolException`` on invalid input.
     """
+    # Treat null-ish placeholder strings ("None"/"null"/"") as field-absent so
+    # a stray placeholder on the unused field doesn't trip mutual exclusivity.
+    name = _blank_to_none(name)
+    pattern = _blank_to_none(pattern)
     if action == "search":
         if name is not None:
             raise ToolException(
