@@ -61,7 +61,7 @@ providers:
 
   - name: local-nex
     type: deepagents-model
-    model: openai:nex-agi_Nex-N2-mini-GGUF-IQ4_XS
+    model: openai:nex-agi_Nex-N2-mini-GGUF-Q4_K_M
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
