@@ -247,6 +247,19 @@ class CriticReview(BaseModel):
     tier: Literal["structural", "agent"] = Field(description="Review tier")
     reason: str = Field(description="Reason for the review decision")
     suggestions: list[str] = Field(default_factory=list, description="Suggestions for improvement")
+    cited_exclusions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "When (and only when) you flag a scope-creep / out-of-scope "
+            "VIOLATION, copy here — verbatim, character-for-character — the "
+            "exact scope_exclusions bullet(s) from the <specification> that the "
+            "work overlaps. Leave empty otherwise. NEVER cite a scope_inclusions "
+            "item here: inclusions are IN scope by definition. A scope-exclusion "
+            "violation asserted without a verbatim citation that matches a real "
+            "scope_exclusions bullet is treated as unsupported and overturned "
+            "automatically, so do not flag one you cannot quote."
+        ),
+    )
     score: int | None = Field(
         default=None, description="Optional 1-10 quality score"
     )

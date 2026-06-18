@@ -20,7 +20,9 @@ original event loop.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from spine.exceptions import CriticalContractFailure
@@ -321,21 +323,41 @@ async def agent_critic_check(
                 prompt = block + "\n" + prompt
 
         ctx = build_context(state, PhaseName.CRITIC)
+        work_id = state.get("work_id", "unknown")
 
-        result = await ainvoke_with_retry(
-            critic_agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            phase_name=f"critic/{reviewed_phase}",
-            work_id=state.get("work_id", "unknown"),
-            work_type=state.get("work_type", ""),
-            context=ctx,
+        async def run_once(p: str) -> dict[str, Any]:
+            """Invoke the critic agent once with prompt ``p`` and parse the verdict."""
+            res = await ainvoke_with_retry(
+                critic_agent,
+                {"messages": [{"role": "user", "content": p}]},
+                phase_name=f"critic/{reviewed_phase}",
+                work_id=work_id,
+                work_type=state.get("work_type", ""),
+                context=ctx,
+            )
+            return _parse_agent_review(res, reviewed_phase)
+
+        parsed = await run_once(prompt)
+
+        # Rec 1 — deterministically refute an uncited scope-exclusion rejection
+        # (cheap; may demote a terminal NEEDS_REVIEW before corroboration).
+        parsed = _validate_scope_claim(parsed, spec_payload, reviewed_phase, work_id)
+
+        # Rec 3 — no single agent vote may halt the run for human review without
+        # a second, independent opinion agreeing it is a true blocker.
+        parsed = await _corroborate_terminal_verdict(
+            parsed,
+            run_once,
+            reviewed_phase=reviewed_phase,
+            structured_payload=structured_payload,
+            spec_payload=spec_payload,
+            description=state.get("description") or "",
+            work_id=work_id,
         )
 
-        # Parse the agent's response for the review status
-        parsed = _parse_agent_review(result, reviewed_phase)
         logger.info(
             "[%s] Critic agent review complete: status=%s reason=%s",
-            state.get("work_id", "?"), parsed.get("status"), parsed.get("reason", "")[:120],
+            work_id, parsed.get("status"), parsed.get("reason", "")[:120],
         )
         return parsed
 
@@ -376,6 +398,7 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
         reason = data.get("reason", "Structured review completed")
         suggestions = data.get("suggestions", [])
         blocker_category = data.get("blocker_category")
+        cited_exclusions = data.get("cited_exclusions") or []
 
         # Normalize status to lowercase (CriticReview uses uppercase)
         status = status_raw.lower() if isinstance(status_raw, str) else status_raw
@@ -386,6 +409,7 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
             "reason": reason,
             "suggestions": suggestions,
             "blocker_category": blocker_category,
+            "cited_exclusions": cited_exclusions,
         }
 
     # Fallback to keyword parsing for backwards compatibility
@@ -421,7 +445,312 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
         "tier": "agent",
         "reason": f"Agent review of {reviewed_phase}: {content}",
         "suggestions": [],
+        "cited_exclusions": [],
     }
+
+
+# ── Scope-claim refutation + terminal-verdict corroboration ──────────────────
+# A weak critic model can hallucinate that in-scope work is "scope creep" and
+# fire a terminal NEEDS_REVIEW that halts the whole run (trace 019ed849: it
+# claimed embedding/reranker config — both in scope_inclusions — were
+# excluded). Two guards run on the parsed verdict before it leaves
+# agent_critic_check:
+#   1. _validate_scope_claim — deterministically overturn a scope-exclusion
+#      rejection that cites no real scope_exclusions bullet.
+#   2. _corroborate_terminal_verdict — never let a single agent vote escalate
+#      to human review without a second, independent opinion agreeing.
+
+# Phrasing a critic uses when it claims the plan does TOO MUCH and reaches into
+# an EXCLUDED area. Deliberately omits the spec_contradiction direction (plan
+# NEEDS something the spec omits) — that opposite claim is handled by
+# corroboration, not by this refutation.
+_SCOPE_CREEP_MARKERS = (
+    "scope creep",
+    "scope_creep",
+    "out of scope",
+    "out-of-scope",
+    "outside scope",
+    "outside the scope",
+    "outside of scope",
+    "exceeds scope",
+    "exceeds the scope",
+    "scope violation",
+    "violates scope",
+    "violates the scope",
+    "scope_exclusions",
+)
+
+_SCOPE_REMOVAL_VERBS = ("remove", "delete", "drop", "strip", "exclude")
+
+
+def _norm_tokens(text: str) -> set[str]:
+    """Lowercase alphanumeric tokens (length > 2) for fuzzy text matching."""
+    return {t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if len(t) > 2}
+
+
+def _citation_matches_exclusion(citation: str, exclusions: list[str]) -> bool:
+    """True when ``citation`` plausibly refers to a real scope_exclusions bullet.
+
+    Accepts a substring match either direction, or ≥0.5 Jaccard overlap on
+    content tokens — tolerant of light paraphrase while still rejecting a
+    citation that has nothing to do with any declared exclusion.
+    """
+    cl = (citation or "").strip().lower()
+    if not cl:
+        return False
+    ctoks = _norm_tokens(citation)
+    for ex in exclusions:
+        el = (ex or "").strip().lower()
+        if not el:
+            continue
+        if cl in el or el in cl:
+            return True
+        etoks = _norm_tokens(ex)
+        if ctoks and etoks:
+            overlap = len(ctoks & etoks) / len(ctoks | etoks)
+            if overlap >= 0.5:
+                return True
+    return False
+
+
+def _load_scope_lists(spec_payload: str | None) -> tuple[list[str], list[str]] | None:
+    """Parse (scope_inclusions, scope_exclusions) from a Specification JSON.
+
+    Returns None when the payload is absent or unparseable — callers then skip
+    scope validation rather than guessing.
+    """
+    if not spec_payload or not isinstance(spec_payload, str):
+        return None
+    try:
+        spec = json.loads(spec_payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(spec, dict):
+        return None
+    incl = [str(x) for x in (spec.get("scope_inclusions") or []) if str(x).strip()]
+    excl = [str(x) for x in (spec.get("scope_exclusions") or []) if str(x).strip()]
+    return incl, excl
+
+
+def _validate_scope_claim(
+    parsed: dict[str, Any],
+    spec_payload: str | None,
+    reviewed_phase: str,
+    work_id: str,
+) -> dict[str, Any]:
+    """Refute an UNSUPPORTED scope-exclusion rejection (rec 1).
+
+    Fires only for PLAN reviews carrying a spec, and never on a
+    spec_contradiction verdict (the opposite, legitimate claim). When the
+    verdict alleges scope creep / an exclusion violation but cites no
+    scope_exclusions bullet that actually matches the spec:
+
+    - a terminal NEEDS_REVIEW is demoted to NEEDS_REVISION, its reason
+      rewritten to RETAIN the in-scope work, and removal-style suggestions
+      dropped — so the run reworks with corrected feedback instead of halting
+      on a fabricated blocker;
+    - a non-terminal NEEDS_REVISION is left to run (it may carry legitimate
+      defects) but gets a short caution appended so the author does not delete
+      in-scope work.
+
+    Genuinely-cited scope objections pass through untouched.
+    """
+    if reviewed_phase != PhaseName.PLAN.value:
+        return parsed
+    if parsed.get("blocker_category") == "spec_contradiction":
+        return parsed
+    status = parsed.get("status")
+    if status not in (
+        ReviewStatus.NEEDS_REVISION.value,
+        ReviewStatus.NEEDS_REVIEW.value,
+    ):
+        return parsed
+
+    scope_lists = _load_scope_lists(spec_payload)
+    if scope_lists is None:
+        return parsed
+    _inclusions, exclusions = scope_lists
+
+    citations = [c for c in (parsed.get("cited_exclusions") or []) if str(c).strip()]
+    reason = str(parsed.get("reason") or "")
+    suggestions = parsed.get("suggestions") or []
+    haystack = (reason + " " + " ".join(str(s) for s in suggestions)).lower()
+    is_scope_claim = bool(citations) or any(m in haystack for m in _SCOPE_CREEP_MARKERS)
+    if not is_scope_claim:
+        return parsed
+
+    # Supported if at least one citation matches a real exclusion bullet.
+    if any(_citation_matches_exclusion(c, exclusions) for c in citations):
+        return parsed
+
+    out = dict(parsed)
+    if status == ReviewStatus.NEEDS_REVIEW.value:
+        notice = (
+            "[scope objection overturned] A scope-creep / out-of-scope objection "
+            "was raised but cited no matching scope_exclusions bullet"
+            + (f" (offered: {citations})" if citations else "")
+            + ". The flagged work is within the declared scope and MUST be "
+            "retained — items in scope_inclusions are IN scope by definition. "
+            "Do not remove them; address only concrete, in-scope defects."
+        )
+        if exclusions:
+            notice += f" Actual scope_exclusions: {exclusions}."
+        kept = [
+            s
+            for s in suggestions
+            if not (
+                any(v in str(s).lower() for v in _SCOPE_REMOVAL_VERBS)
+                and any(m in str(s).lower() for m in ("scope", "exclud"))
+            )
+        ]
+        out["status"] = ReviewStatus.NEEDS_REVISION.value
+        out["blocker_category"] = None
+        out["suggestions"] = kept
+        out["reason"] = notice + " | original: " + reason
+        logger.warning(
+            "[%s] critic scope verdict OVERTURNED (terminal→revision): no cited "
+            "exclusion matched spec for phase '%s'. citations=%s",
+            work_id,
+            reviewed_phase,
+            citations,
+        )
+    else:
+        # Non-terminal: keep status/suggestions (may hold real defects); only
+        # caution the author against acting on the unsupported scope objection.
+        out["reason"] = (
+            reason
+            + " | NOTE: any scope-exclusion objection must cite a real "
+            "scope_exclusions bullet; items in scope_inclusions are in scope "
+            "and must not be removed."
+        )
+        logger.info(
+            "[%s] critic scope objection uncited (non-terminal) for phase '%s'; "
+            "annotated. citations=%s",
+            work_id,
+            reviewed_phase,
+            citations,
+        )
+    return out
+
+
+def _build_reconsideration_prompt(
+    *,
+    reviewed_phase: str,
+    structured_payload: str,
+    spec_payload: str | None,
+    description: str,
+    first_verdict: dict[str, Any],
+) -> str:
+    """Prompt for an independent second opinion on a terminal verdict (rec 3)."""
+    from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
+
+    findings_block = f"```json\n{structured_payload}\n```" if structured_payload else ""
+    prior = (
+        f"A prior review returned {first_verdict.get('status')} and wants to HALT "
+        "this run for human review. Its stated reason:\n"
+        f"  {first_verdict.get('reason', '')}\n"
+    )
+    directive = (
+        f"Give a SECOND, INDEPENDENT opinion on the {reviewed_phase}-phase output "
+        "above. Terminal human review is expensive and must be reserved for "
+        "issues the author genuinely CANNOT resolve by reworking this phase. "
+        "Decide for yourself from the payload and specification:\n"
+        "- If the blocking issue is real AND unresolvable by rework (e.g. the "
+        "spec truly omits/excludes something the requirement needs), respond "
+        "NEEDS_REVIEW (set blocker_category='spec_contradiction' if it is a spec "
+        "gap).\n"
+        "- If the author could plausibly fix it by reworking, respond "
+        "NEEDS_REVISION.\n"
+        "- If the prior objection does not hold up against the specification "
+        "(e.g. it calls in-scope work 'scope creep'), respond PASSED.\n"
+        "Judge only the tagged blocks; do not read files."
+    )
+    return hostage_layout(
+        xml_blocks(
+            (Tag.OBJECTIVE, description or ""),
+            (Tag.SPECIFICATION, spec_payload or ""),
+            (Tag.CRITIC_FEEDBACK, prior),
+            (Tag.FINDINGS, findings_block),
+        ),
+        directive,
+    )
+
+
+def _is_terminal_verdict(parsed: dict[str, Any]) -> bool:
+    """A verdict that would escalate to human review on a single agent vote."""
+    return (
+        parsed.get("status") == ReviewStatus.NEEDS_REVIEW.value
+        or parsed.get("blocker_category") == "spec_contradiction"
+    )
+
+
+async def _corroborate_terminal_verdict(
+    parsed: dict[str, Any],
+    run_once: Any,
+    *,
+    reviewed_phase: str,
+    structured_payload: str,
+    spec_payload: str | None,
+    description: str,
+    work_id: str,
+) -> dict[str, Any]:
+    """Require a second opinion before a single vote halts the run (rec 3).
+
+    ``run_once`` is an async callable ``(prompt) -> parsed_verdict`` that
+    re-invokes the critic agent. If the verdict would terminally escalate, run
+    one independent reconsideration pass; downgrade to NEEDS_REVISION unless the
+    second review also calls it a blocker. Non-terminal verdicts are returned
+    unchanged (no extra LLM call).
+    """
+    if not _is_terminal_verdict(parsed):
+        return parsed
+
+    recon_prompt = _build_reconsideration_prompt(
+        reviewed_phase=reviewed_phase,
+        structured_payload=structured_payload,
+        spec_payload=spec_payload,
+        description=description,
+        first_verdict=parsed,
+    )
+    try:
+        second = await run_once(recon_prompt)
+    except Exception as e:  # corroboration is best-effort — never crash the critic
+        logger.warning(
+            "[%s] terminal-verdict corroboration failed (%s); keeping first verdict",
+            work_id,
+            e,
+        )
+        return parsed
+
+    if _is_terminal_verdict(second):
+        logger.info(
+            "[%s] terminal critic verdict corroborated by second review (2nd=%s)",
+            work_id,
+            second.get("status"),
+        )
+        return parsed
+
+    out = dict(parsed)
+    out["status"] = ReviewStatus.NEEDS_REVISION.value
+    out["blocker_category"] = None
+    out["reason"] = (
+        "[terminal escalation not corroborated] A second independent review did "
+        f"not agree this requires human review (it returned {second.get('status')}). "
+        "Downgraded to revision so the author can attempt a fix. Original basis: "
+        + str(parsed.get("reason") or "")
+    )
+    merged = list(parsed.get("suggestions") or [])
+    for s in second.get("suggestions") or []:
+        if s not in merged:
+            merged.append(s)
+    out["suggestions"] = merged
+    logger.warning(
+        "[%s] terminal critic verdict NOT corroborated (2nd=%s) → downgraded to "
+        "revision",
+        work_id,
+        second.get("status"),
+    )
+    return out
 
 
 def critic_router(state: WorkflowState) -> str:
