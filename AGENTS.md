@@ -23,9 +23,11 @@ SPINE is a deterministic AI agent harness with a workflow engine and modular pro
 
 ## Development Workflow — Isolated Worktrees
 
-**Do all work in a dedicated git worktree on its own branch, then merge into `main` when the work is complete.** Never edit, stage, or commit directly in the shared primary checkout.
+**Do all work in a dedicated git worktree on its own branch, then merge into `main` when the work is complete.** Never edit, stage, commit, or **switch the branch** directly in the shared primary checkout. The primary checkout stays on `main` at all times — it is active, running code that other agents and live `spine` runs depend on.
 
 **Why this is mandatory:** the primary checkout has a single working tree *and* a single git index. When two agents (or an agent and a spine run) operate there at once, their edits and `git add`/`commit` calls race on that shared index — one process's commit silently sweeps up another's staged files, branch checkouts switch underneath in-flight work, and `main` gets rewritten under your feet. (Trace `019ed38f` follow-up: a fix was staged in the primary checkout, a concurrent commit reset the index, and the fix landed in the wrong commit / not at all.) Worktrees give each line of work its own working tree and index, so the only shared state is the commit graph — which git is designed to handle concurrently.
+
+**Never switch the primary checkout's branch.** Do not run `git switch`, `git checkout <branch>`, or `git switch -c` there — not even "just to commit". Creating a branch with `git switch -c` and committing in the primary checkout changes the branch out from under any other agent or running `spine` process using it: their in-flight work is now on the wrong branch, their next checkout conflicts, and `main` may be left pointing somewhere unexpected. It is both unsafe and impolite. The *only* git operations that may target the primary checkout are read-only inspection (`git status`, `git log`) and the final sanctioned `git -C <primary> merge --ff-only <branch>` step below. To get your branch into a working tree, use `git worktree add` — it checks out your branch elsewhere without touching the primary.
 
 **Workflow:**
 
@@ -47,8 +49,9 @@ git branch -d <type>/<short-slug>
 
 **Rules:**
 - One worktree per work item; branch name mirrors the work (`fix/…`, `feat/…`, `chore/…`).
+- The primary checkout is read-only working space: never `git switch`/`checkout`/`switch -c` there, and never edit/stage/commit there. It stays on `main`.
 - Merge only when tests pass and the work is finished — prefer `--ff-only` (or a PR) so history stays linear and no in-progress branch pollutes `main`.
-- If you find yourself about to `git add` in the primary checkout, stop and move the work to a worktree first.
+- If you find yourself about to `git add` — or about to `git switch -c` "just to commit" — in the primary checkout, stop and move the work to a worktree first.
 
 ---
 
