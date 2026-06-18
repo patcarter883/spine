@@ -58,9 +58,30 @@ providers:
   #   stream_usage: true
   #   max_concurrent_calls: 2
   #   context_window: 32000
+
   - name: local
     type: deepagents-model
-    model: openai:gemma-4-12B-it-qat-q4_0-gguf-Q4_0
+    model: openai:nex-agi_Nex-N2-mini-GGUF-IQ4_XS
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2
+    context_window: 60000
+  - name: local-high
+    type: deepagents-model
+    model: openai:gemma-4-26B-A4B-it-qat-q4_0-gguf-Q4_0
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2
+    context_window: 60000
+  - name: local-low
+    type: deepagents-model
+    model: openai:LFM2.5-8B-A1B
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -85,22 +106,22 @@ providers:
     rerank_path: /reranking
   phases:
     specify:
-      provider: local
+      provider: local-high
       # Declare the model's real context window so the synthesizer runs under
       # the window-aware budget ledger (synthesis_budget): it clamps the synth
       # completion to synthesize_max_completion_tokens and compresses evidence
       # if it ever exceeds the window. Without this the synth runs "legacy"
       # (no clamp, fixed evidence budgets). poolside/laguna-xs.2 = 262144.
-      context_window: 40000
+      context_window: 60000
     specify/subagents/researcher:
       provider: local
     plan:
-      provider: local
-      context_window: 40000
+      provider: local-high
+      context_window: 60000
     plan/subagents/researcher:
       provider: local
     implement:
-      provider: local
+      provider: local-high
     # The decomposer (structured slice/micro-slice JSON) and the slice
     # implementer (exact-match read_edit_lint) are where a weak local model
     # burns the most tokens — failed edits and length-capped decompositions
@@ -113,15 +134,15 @@ providers:
     implement/decomposer:
       provider: local
     implement/subagents/slice-implementer:
-      provider: local
+      provider: local-low
     verify:
       provider: local
     critic:
-      provider: local
+      provider: local-high
     gap_plan:
       provider: local
     classification:
-      provider: local
+      provider: local-low
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false
@@ -131,4 +152,4 @@ providers:
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local
+      provider: local-high

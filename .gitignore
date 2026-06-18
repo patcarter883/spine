@@ -38,3 +38,4 @@ test_root.py
 
 # Claude Code local settings & runtime
 .claude/
+scratch/
