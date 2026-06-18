@@ -300,24 +300,32 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "  - `name` and `pattern` are mutually exclusive. Do NOT pass "
             "both.\n"
             "- `read_edit_lint` — your ONLY filesystem tool: read AND write.\n"
-            "  READ: pass just `file_path` for line-numbered content, or add "
-            "`start_line`+`end_line` (no `replacement`) for a range. Prefer "
-            "ranged reads — whole-file reads of large files waste your "
-            "context. NEVER re-read a file you just edited: a status=\"ok\" "
-            "result means the edit is in the file exactly as you sent it.\n"
-            "  EDIT: pass exactly ONE edit mode: `old_str`+`new_str` (exact, "
-            "single-occurrence find-and-replace); `full_replace` (whole-file "
-            "content); `edits` (a batch of find-and-replace ops applied "
-            "ATOMICALLY — all-or-nothing, prefer this to make several changes "
-            "to one file in a single call); or `start_line`+`end_line`+"
-            "`replacement` (replace a line range — token-efficient and "
-            "disambiguates repeated snippets; pass `expected` with the current "
-            "range text to guard against stale line numbers). The tool runs a "
-            "syntax check before writing — on a syntax error or failed match "
-            "it returns `{\"status\":\"syntax_error\",...}` (or `no_match`/"
-            "`ambiguous_match`/`stale`) and the file is left untouched. Fix "
-            "and call again. `already_applied` means the change is ALREADY in "
-            "the file — move on, do not retry.\n"
+            "  READ is ANCHORED only (no whole-file or arbitrary line-range "
+            "reads — you already know the target from the plan): "
+            "`read_symbol=\"ClassName.method\"` returns a definition's current "
+            "source; `read_around=\"exact snippet\"` returns the region around a "
+            "snippet. Read at most the ONE symbol you are about to edit. NEVER "
+            "re-read a file you just edited: a status=\"ok\" result means the "
+            "edit is in the file exactly as you sent it.\n"
+            "  EDIT: pass exactly ONE edit mode. Prefer the robust modes:\n"
+            "    • `ast_edit` — BEST for changing or adding a whole "
+            "function/method/class: name the symbol (e.g. "
+            "`{\"symbol\":\"ClassName.method\",\"action\":\"replace\","
+            "\"code\":\"...\"}`) or `insert_before`/`insert_after`. No line "
+            "numbers, no exact-byte matching — immune to indentation drift.\n"
+            "    • `patch` — a batch of WHITESPACE-TOLERANT search/replace ops "
+            "(`[{\"search\":...,\"replace\":...}]`); use when you are not "
+            "certain of exact indentation. Re-indents to the match.\n"
+            "    • `old_str`+`new_str` / `edits` — EXACT find-and-replace "
+            "(single / atomic batch). Use only when you have the bytes exactly.\n"
+            "    • `full_replace` (whole-file content) for new or small files; "
+            "`start_line`+`end_line`+`replacement` for a line range (pass "
+            "`expected` to guard stale line numbers).\n"
+            "  The tool runs a syntax check before writing — on a syntax error "
+            "or failed match it returns `{\"status\":\"syntax_error\",...}` (or "
+            "`no_match`/`ambiguous_match`/`stale`) and the file is left "
+            "untouched. Fix and call again. `already_applied` means the change "
+            "is ALREADY in the file — move on, do not retry.\n"
             "  LINT: successful Python writes include a `ruff` field with "
             "bounded diagnostics. There is no shell — do not try to run "
             "tests or linters; the verify phase does that.",
@@ -785,13 +793,23 @@ def build_subagent_spec(
             )
         )
 
-    # ── Inject codebase_query wrapper for researcher + slice-implementer ──
-    # Both subagents benefit enormously from structural queries instead of
-    # full-file reads (see trace 019e486e: 11× redundant dispatcher.py reads
-    # during implement).  The codebase_query wrapper gives "where is X / who
-    # calls X" in milliseconds without exposing any raw mcp_-prefixed tool.
-    # slice-verifier is read+execute only and rarely needs deep navigation.
-    if name in ("researcher", "slice-implementer"):
+    # ── Inject codebase_query wrapper (researcher; implementer ONLY when the
+    #    planner gave it no edit_plan) ──
+    # The researcher's whole job is structural survey, so it always gets the
+    # wrapper. The slice-implementer is different: handing it codebase_query
+    # lets it re-research the codebase instead of editing — across every model
+    # tested it ran 20-26 codebase_query calls and made ZERO edits, burning
+    # 1.4M+ prompt tokens on a fully specified slice. When the planner supplied
+    # an ``edit_plan`` (symbols already resolved, applied via read_edit_lint's
+    # ast_edit), the implementer needs no research surface at all: its only
+    # move should be to read the target region and apply the edit. So withhold
+    # codebase_query whenever the active slice carries an edit_plan; legacy
+    # slices without one keep the lookup as a fallback.
+    active_slice = (state or {}).get("active_slice") or {}
+    implementer_has_plan = name == "slice-implementer" and bool(
+        active_slice.get("edit_plan")
+    )
+    if name == "researcher" or (name == "slice-implementer" and not implementer_has_plan):
         _inject_mcp_tools(tools, workspace_root, subagent_name=name)
 
     # ── Build spec ───────────────────────────────────────────────

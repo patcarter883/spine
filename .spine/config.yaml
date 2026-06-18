@@ -69,9 +69,29 @@ providers:
     stream_usage: true
     max_concurrent_calls: 2
     context_window: 60000
+  - name: local-nex-iq4xs
+    type: deepagents-model
+    model: openai:nex-agi_Nex-N2-mini-GGUF-IQ4_XS
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2
+    context_window: 60000
   - name: local-gemma
     type: deepagents-model
     model: openai:gemma-4-26B-A4B-it-qat-q4_0-gguf-Q4_0
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2
+    context_window: 60000
+  - name: local-qwen
+    type: deepagents-model
+    model: openai:Qwen3.6-27B-MTP-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -116,7 +136,7 @@ providers:
     rerank_path: /reranking
   phases:
     specify:
-      provider: local-gemma
+      provider: local-qwen
       # Declare the model's real context window so the synthesizer runs under
       # the window-aware budget ledger (synthesis_budget): it clamps the synth
       # completion to synthesize_max_completion_tokens and compresses evidence
@@ -128,7 +148,7 @@ providers:
     specify/subagents/researcher/supervisor:
       provider: local-nex
     plan:
-      provider: local-gemma
+      provider: local-qwen
       context_window: 60000
     plan/subagents/researcher:
       provider: local-north-code
@@ -154,13 +174,13 @@ providers:
     verify/subagents/slice-verifier:
       provider: local-nex
     critic:
-      provider: local-gemma
+      provider: local-qwen
     critic/specify:
-      provider: local-gemma
+      provider: local-qwen
     critic/plan:
-      provider: local-gemma
+      provider: local-qwen
     gap_plan:
-      provider: local-gemma
+      provider: local-qwen
     exploration/manager:
       provider: local-nex
     classification:
@@ -174,8 +194,8 @@ providers:
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-gemma
+      provider: local-qwen
     onboarding/doc-manager:
-      provider: local-gemma
+      provider: local-qwen
     onboarding/section-worker:
-      provider: local-gemma
+      provider: local-qwen

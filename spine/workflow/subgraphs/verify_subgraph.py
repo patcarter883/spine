@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
@@ -177,6 +178,46 @@ async def _plan_slice_verifier_node(
 # ── Node: run_slice_verifier ────────────────────────────────────────────
 
 
+_DIFF_MAX_CHARS = 24000
+
+
+def _worktree_diff(workspace_root: str, paths: list[str] | None) -> str:
+    """Return the sandbox worktree's git diff, scoped to ``paths``.
+
+    The implement sandbox leaves its edits UNCOMMITTED in this worktree, so a
+    diff against HEAD plus any new untracked files is the exact, ground-truth
+    record of what changed. Handing this to the verifier replaces "read the
+    codebase to discover what was edited" — which cost ~1M input tokens on an
+    empty diff (it surveyed the tree to confirm nothing changed). Returns ''
+    on any git failure so the verifier falls back to reading files.
+    """
+    def _git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", workspace_root, *args],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+        except Exception:  # noqa: BLE001 — diff is best-effort
+            return ""
+
+    clean_paths = [p for p in (paths or []) if p]
+    pathspec = ["--", *clean_paths] if clean_paths else []
+    diff = _git("--no-pager", "diff", "HEAD", *pathspec)
+    # git diff HEAD omits untracked (new) files — append them as add-only diffs.
+    others = _git("ls-files", "--others", "--exclude-standard", *pathspec).split()
+    for f in others:
+        try:
+            body = (Path(workspace_root) / f).read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            continue
+        diff += f"\n--- /dev/null\n+++ b/{f}\n" + "".join(
+            f"+{ln}\n" for ln in body.splitlines()
+        )
+    if len(diff) > _DIFF_MAX_CHARS:
+        diff = diff[:_DIFF_MAX_CHARS] + "\n...[diff truncated — read the file for the rest]"
+    return diff
+
+
 async def _run_slice_verifier_node(
     state: VerifySubgraphState,
     config: RunnableConfig | None = None,
@@ -229,6 +270,17 @@ async def _run_slice_verifier_node(
         directive_block = format_directive_for_prompt(
             directive_from_state(dict(state), "active_slice_directive")
         )
+        # The worktree diff is the ground truth of what the implementer changed
+        # for this slice. Hand it over so the verifier checks the CHANGES
+        # against the criteria instead of reading the codebase to find them.
+        diff_text = _worktree_diff(
+            state.get("workspace_root", "."), slice_data.get("target_files")
+        )
+        diff_block = (
+            "<worktree_diff>\nThis git diff is EVERY change made for this slice "
+            "(empty ⇒ nothing was implemented — fail the slice):\n```diff\n"
+            f"{diff_text or '(no changes in the working tree)'}\n```\n</worktree_diff>"
+        )
         # Hostage layout: data blocks first, plain-text directive at the
         # absolute tail. The directive_block from format_directive_for_prompt
         # is already wrapped in <directive> — splice it after xml_blocks
@@ -238,12 +290,14 @@ async def _run_slice_verifier_node(
                 (Tag.OBJECTIVE, f"Verify slice: {slice_id}"),
                 (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
             )
+            + "\n\n" + diff_block
             + ("\n\n" + directive_block if directive_block else ""),
             (
-                "Verify the implementation against the acceptance_criteria "
-                "in the slice JSON above. Inspect the actual code files on "
-                "disk — do not trust that the implementation summary matches "
-                "reality."
+                "Check the worktree_diff above against the acceptance_criteria "
+                "in the slice JSON. The diff is the ground truth of what "
+                "changed: if it is empty, the slice was NOT implemented — fail "
+                "it. Read a file ONLY when you need surrounding context the "
+                "diff does not show; do NOT survey the codebase."
             ),
         )
 

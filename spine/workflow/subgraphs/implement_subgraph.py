@@ -265,6 +265,63 @@ async def _split_slices_node(
 _LARGE_FILE_TOKEN_BUDGET = 6000
 
 
+def _format_edit_plan(active_slice: dict) -> str:
+    """Render the planner's targeted edit plan into the implementer task.
+
+    Moves the *where*/*what* of each edit out of the implementer's discovery
+    loop: the (stronger) decomposer named the symbol/anchor and the change, so
+    the implementer applies it directly — ``ast_edit`` by symbol where given.
+    Returns '' when the slice carries no plan (older plans, or edits the
+    decomposer couldn't anchor), preserving the legacy read-then-edit flow.
+    """
+    plan = active_slice.get("edit_plan") or []
+    if not plan:
+        return ""
+    lines: list[str] = []
+    for h in plan:
+        if not isinstance(h, dict):
+            h = getattr(h, "__dict__", {}) or {}
+        file = h.get("file", "")
+        symbol = h.get("symbol", "")
+        mode = h.get("mode", "")
+        intent = h.get("intent", "")
+        anchor = f" symbol=`{symbol}`" if symbol else ""
+        via = f" via `{mode}`" if mode else ""
+        lines.append(f"- {file}{anchor}{via}: {intent}")
+    return (
+        "\n\n## Targeted edits (from the planner — APPLY THESE NOW)\n"
+        "These ARE your task. Your FIRST tool calls must apply them with "
+        "`read_edit_lint`: use `ast_edit` (by symbol) for the symbol-anchored "
+        "ones, `patch` for snippet edits. Do NOT read the whole file or survey "
+        "the codebase first — at most read the named region if you need "
+        "surrounding context for an edit. You are NOT done until each edit "
+        "returns status=\"ok\"; never report success without an applied edit.\n"
+        + "\n".join(lines)
+    )
+
+
+def _format_reference_symbols(active_slice: dict) -> str:
+    """Render the planner's reference symbols as a read_symbol checklist.
+
+    These are the existing definitions the slice's code calls/extends/mimics,
+    identified upstream in PLAN's codebase research. Handing them to the
+    implementer as named anchors means it reads exactly those with
+    ``read_symbol`` — instead of surveying whole files to rediscover them,
+    which is the codebase-research loop we removed the tools for.
+    """
+    refs = active_slice.get("reference_symbols") or []
+    if not refs:
+        return ""
+    listed = "\n".join(f"- `{r}`" for r in refs)
+    return (
+        "\n\n## Reference symbols (read these for context, don't survey)\n"
+        "The plan identified these existing definitions as the ones your code "
+        "calls/extends/mimics. `read_symbol` each ONCE to see its current "
+        "source, then write your edit — do NOT search or read whole files:\n"
+        + listed
+    )
+
+
 def _large_file_directive(active_slice: dict, workspace_root: str) -> str:
     """Read-narrow directive when a slice's target file is large, else ''.
 
@@ -278,6 +335,16 @@ def _large_file_directive(active_slice: dict, workspace_root: str) -> str:
     from pathlib import Path
 
     from spine.agents._tokens import count_tokens
+
+    # When the planner supplied an edit_plan, the implementer applies edits by
+    # symbol via `ast_edit` (which locates the symbol itself — no whole-file or
+    # ranged reading needed), and `codebase_query` has been withheld from its
+    # tool surface. This read-narrow directive steers toward ranged reads + a
+    # `codebase_query` the agent no longer has, which is exactly the
+    # read-the-file-12-times survey loop we want to kill — so suppress it
+    # entirely once targeting is in hand.
+    if active_slice.get("edit_plan"):
+        return ""
 
     targets = [f for f in (active_slice.get("target_files") or []) if f]
     big: list[tuple[str, int]] = []
@@ -328,10 +395,11 @@ def _subslice_context(active_slice: dict) -> str:
         )
     else:
         validate = (
-            "Sibling files are still being built in later steps — do NOT expect "
-            "slice-level/integration tests to pass yet. Make your one file "
-            "correct and self-consistent; note any sibling-dependent check as "
-            "pending rather than failing."
+            "Sibling files are still being built in later steps, so slice-level/"
+            "integration tests may not pass yet — that is expected and is NOT a "
+            "reason to skip your work. You MUST still apply this file's edits "
+            "now and make it correct and self-consistent; only a "
+            "sibling-dependent check may be noted as pending."
         )
     return (
         f"\n\n## Single-file scope (file {idx}/{total} of slice "
@@ -376,6 +444,8 @@ async def _plan_slice_implementer_node(
         f"## Description\n{description or '(none)'}\n\n"
         f"## Target files\n{file_lines}\n\n"
         f"## Acceptance criteria\n{crit_lines}"
+        f"{_format_reference_symbols(active_slice)}"
+        f"{_format_edit_plan(active_slice)}"
         f"{_subslice_context(active_slice)}"
     )
     directive = await run_plan_node(
@@ -495,6 +565,8 @@ async def _slice_implementer_node(
                 "Read the slice JSON above carefully — it specifies "
                 "target_files, acceptance_criteria, and (optionally) a "
                 "description. Make only the changes described in the slice."
+                + _format_reference_symbols(active_slice)
+                + _format_edit_plan(active_slice)
                 + _subslice_context(active_slice)
                 + _large_file_directive(active_slice, workspace_root)
             ),

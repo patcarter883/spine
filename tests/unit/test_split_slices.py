@@ -130,7 +130,10 @@ def test_subslice_context_lists_siblings_and_pending_note():
     text = _subslice_context(sub)
     assert "only this one file: src/models.py" in text
     assert "src/login.py" in text  # sibling listed for context
-    assert "do NOT expect" in text.lower() or "do not expect" in text.lower()
+    # Sibling-dependent tests may not pass yet, but the implementer must still
+    # apply its edits (no bail-to-pending excuse).
+    assert "may not pass yet" in text.lower()
+    assert "must still apply" in text.lower()
 
 
 def test_subslice_context_last_file_validates():

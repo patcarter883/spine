@@ -74,6 +74,15 @@ class FeatureSlice:
     dependencies: list[str] = field(default_factory=list)
     acceptance_criteria: list[str] = field(default_factory=list)
     complexity: str = "small"  # "small" | "medium" | "large"
+    # Qualified names of existing symbols the implementer must read to write
+    # this slice (the code it calls/extends/mimics). Lets the implementer
+    # read_symbol them directly instead of surveying files. Empty on older plans.
+    reference_symbols: list[str] = field(default_factory=list)
+    # Optional planner-provided targeted edits (file/symbol/mode/intent dicts)
+    # that let a lightweight implementer apply changes without re-discovering
+    # where to work. Empty on older plans — the implementer falls back to the
+    # read-then-edit flow.
+    edit_plan: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this slice to a plain dict suitable for JSON encoding."""

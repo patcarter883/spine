@@ -53,6 +53,39 @@ from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_block
 logger = logging.getLogger(__name__)
 
 
+class EditHint(BaseModel):
+    """A planner-provided pointer to ONE concrete edit the implementer makes.
+
+    The targeting work — *where* and *what* — moves here, to the (stronger)
+    decomposer, so the slice-implementer can be a thin model that just applies
+    the edit. Anchors are by SYMBOL (drift-proof) wherever a named definition
+    is involved, so the implementer can call ``read_edit_lint`` with
+    ``ast_edit`` and never hunt for line numbers.
+    """
+
+    file: str = Field(description="Workspace-relative file to edit or create.")
+    symbol: str = Field(
+        default="",
+        description=(
+            "Qualified name of the definition to target (e.g. "
+            "'SpineConfig.resolve_model', 'UIApi.set_phase_provider') when the "
+            "edit changes or sits adjacent to a named function/method/class. "
+            "Leave empty for new files or non-symbol edits (imports, config)."
+        ),
+    )
+    mode: str = Field(
+        default="",
+        description=(
+            "Suggested read_edit_lint mode: 'ast_edit' (replace/insert "
+            "by symbol), 'patch' (whitespace-tolerant search/replace), or "
+            "'full_replace' (new/small file). Empty = implementer chooses."
+        ),
+    )
+    intent: str = Field(
+        description="Precise statement of the change to make at this anchor."
+    )
+
+
 class FeatureSliceSchema(BaseModel):
     """Minimal slice schema used by the structural decomposer."""
 
@@ -61,6 +94,25 @@ class FeatureSliceSchema(BaseModel):
     description: str = Field(description="One-paragraph statement of intent.")
     target_files: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(min_length=1)
+    reference_symbols: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Qualified names of existing symbols this slice's code calls, "
+            "extends, or mimics — so the implementer can read_symbol them for "
+            "context instead of surveying files. Carry through any provided on "
+            "the parent slice; add ones specific to this file."
+        ),
+    )
+    edit_plan: list[EditHint] = Field(
+        default_factory=list,
+        description=(
+            "Ordered, concrete edits that satisfy this slice — one entry per "
+            "change site. Populate when you can name the target symbol or the "
+            "exact change; this lets a lightweight implementer apply edits "
+            "directly instead of re-discovering where to work. Omit entries "
+            "you genuinely cannot anchor."
+        ),
+    )
 
 
 class DecompositionResult(BaseModel):
@@ -84,7 +136,14 @@ _PLAN_PROMPT = (
         "pieces of work modify the same file, merge them into a single slice.\n"
         "- Each slice MUST have at least one acceptance criterion that a "
         "verifier could check against the working tree.\n"
-        "- Slice ids are lowercase slugs (e.g. 'add-token-refresh').",
+        "- Slice ids are lowercase slugs (e.g. 'add-token-refresh').\n"
+        "- Populate `edit_plan` with the concrete edits each slice needs — one "
+        "entry per change site. Anchor by `symbol` (qualified name, e.g. "
+        "'ClassName.method') whenever the edit touches a named definition, and "
+        "suggest a `mode` ('ast_edit' for symbol edits, 'patch' for "
+        "snippet-level changes, 'full_replace' for new files). This lets a "
+        "lightweight implementer apply edits directly. Omit only what you "
+        "genuinely cannot anchor.",
     )
 )
 
@@ -138,6 +197,11 @@ _PER_FILE_PROMPT = (
         "be expected to satisfy slice-level tests.\n"
         "- Do NOT introduce files that are not in the parent's target_files, "
         "and do NOT merge two files into one sub-slice.\n"
+        "- For each sub-slice, populate `edit_plan` with the concrete edits in "
+        "that one file — anchor by `symbol` (qualified name) for edits to a "
+        "named function/method/class and set `mode` to 'ast_edit', use 'patch' "
+        "for snippet edits, 'full_replace' for a new file. This lets a "
+        "lightweight implementer apply the edits without re-discovering them.\n"
         "- Sub-slice ids are placeholders; they will be reassigned by the "
         "caller, so any unique slug is fine.",
     )
@@ -390,6 +454,7 @@ def _normalize_per_file_slices(
     parent_id = source_slice["id"]
     parent_title = source_slice.get("title", parent_id)
     parent_criteria = list(source_slice.get("acceptance_criteria") or [])
+    parent_refs = list(source_slice.get("reference_symbols") or [])
     parent_files = [f for f in (source_slice.get("target_files") or []) if f]
 
     # Map each model sub-slice to a parent file (first target_files entry that
@@ -415,6 +480,18 @@ def _normalize_per_file_slices(
             f"Implement the portion of slice {parent_id!r} that lives in "
             f"{path}."
         )
+        # Carry only the edit hints that target THIS sub-slice's file (the
+        # model may emit a file-scoped plan or none).
+        plan = [
+            h for h in (sl.get("edit_plan") or [])
+            if not h.get("file") or h.get("file") == path
+        ]
+        # Inherit the parent's reference symbols; merge any the model added for
+        # this file (deduped, order-preserving).
+        refs = list(parent_refs)
+        for r in sl.get("reference_symbols") or []:
+            if r not in refs:
+                refs.append(r)
         normalized.append(
             {
                 "id": f"{parent_id}::{i}-{os.path.basename(path)}",
@@ -422,6 +499,8 @@ def _normalize_per_file_slices(
                 "description": description,
                 "target_files": [path],
                 "acceptance_criteria": list(parent_criteria),
+                "reference_symbols": refs,
+                "edit_plan": plan,
             }
         )
     return normalized

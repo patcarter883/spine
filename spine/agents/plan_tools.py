@@ -491,6 +491,17 @@ class _FeatureSliceInput(BaseModel):
     execution_requirements: str = Field(
         description="What must be done to implement this slice.",
     )
+    reference_symbols: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Qualified names of EXISTING symbols the implementer must read to "
+            "write this slice correctly — the methods/classes its new code "
+            "calls, extends, or mimics (e.g. 'UIApi.update_mcp_server', "
+            "'SpineConfig'). Populate from your codebase research so the "
+            "implementer can read_symbol them directly instead of searching. "
+            "Names only — no source."
+        ),
+    )
     dependencies: list[str] = Field(
         description="IDs of other slices this depends on (empty if none).",
         default_factory=list,
@@ -522,8 +533,11 @@ class _StructuredWritePlanInput(BaseModel):
     feature_slices: list[_FeatureSliceInput] = Field(
         description=(
             "Array of feature slices. Each slice is a structured object with: id, "
-            "title, target_files, execution_requirements, dependencies, "
-            "acceptance_criteria, complexity."
+            "title, target_files, execution_requirements, reference_symbols, "
+            "dependencies, acceptance_criteria, complexity. Populate "
+            "reference_symbols from your codebase research — the existing "
+            "symbols each slice's code calls/extends/mimics — so the "
+            "implementer reads exactly those instead of surveying files."
         ),
         min_length=1,
         max_length=_MAX_FEATURE_SLICES,
@@ -674,6 +688,10 @@ class StructuredWritePlanTool(BaseTool):
             lines.append(f"**Complexity:** {sl.complexity}  \n")
             lines.append(f"**Dependencies:** {deps}  \n")
             lines.append(f"**Target files:** {', '.join(sl.target_files) or 'TBD'}\n\n")
+            if sl.reference_symbols:
+                lines.append(
+                    f"**Reference symbols:** {', '.join(sl.reference_symbols)}\n\n"
+                )
             lines.append(f"{sl.execution_requirements.strip()}\n\n")
             lines.append("**Acceptance Criteria:**\n")
             for ac in sl.acceptance_criteria:

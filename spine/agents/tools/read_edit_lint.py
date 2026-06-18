@@ -51,6 +51,10 @@ from spine.agents.tools._fs import _atomic_write
 
 logger = logging.getLogger(__name__)
 
+# Languages for which ast_edit can resolve a symbol anchor (must match the
+# tree-sitter grammars wired into spine.agents.tools.ast_extract).
+_AST_EDIT_LANGS = {".py", ".php", ".ts", ".tsx"}
+
 
 _LINT_LANG_BY_EXT: dict[str, str] = {
     ".py": "python",
@@ -72,15 +76,84 @@ class FindReplaceEdit(BaseModel):
     )
 
 
+class PatchOp(BaseModel):
+    """A whitespace-tolerant find-and-replace, for the ``patch`` batch mode."""
+
+    search: str = Field(
+        description=(
+            "Code to locate. Matched WHITESPACE-TOLERANTLY: per-line leading "
+            "indentation and trailing whitespace are ignored, so you do not "
+            "need byte-exact indentation — only the trimmed lines must match, "
+            "uniquely. Falls back to exact match first."
+        )
+    )
+    replace: str = Field(
+        default="",
+        description=(
+            "Replacement code (empty to delete). Re-indented to the matched "
+            "block's indentation when the match was whitespace-tolerant."
+        ),
+    )
+
+
+class AstEdit(BaseModel):
+    """A symbol-anchored structural edit, for the ``ast_edit`` mode.
+
+    Targets a named definition (function/method/class) by qualified name via
+    tree-sitter — drift-proof and indentation-agnostic. No line numbers, no
+    exact byte matching: name the symbol and supply the new code.
+    """
+
+    symbol: str = Field(
+        description=(
+            "Qualified name of the target definition, e.g. "
+            "'SpineConfig.resolve_model' (method) or 'baseline_config_yaml' "
+            "(function) or 'UIApi' (class). Must resolve to exactly one symbol."
+        )
+    )
+    action: str = Field(
+        default="replace",
+        description=(
+            "'replace' the whole definition, or 'insert_before' / "
+            "'insert_after' to add a new top-level construct adjacent to it."
+        ),
+    )
+    code: str = Field(
+        description=(
+            "New source. For 'replace': the complete new definition. For "
+            "'insert_before'/'insert_after': a complete construct (def/class/"
+            "import) to splice in adjacent to the symbol."
+        )
+    )
+
+
 class ReadEditLintInput(BaseModel):
     """Input schema for :class:`ReadEditLintTool`."""
 
     file_path: str = Field(
         description=(
-            "Workspace-relative path to the file to read, edit, or create "
-            "(with full_replace). Passing ONLY file_path (optionally with "
-            "start_line/end_line) READS the file with line numbers."
+            "Workspace-relative path to the file to read, edit, or create. To "
+            "READ, anchor with read_symbol or read_around (arbitrary whole-file "
+            "and line-range reads are disabled — by IMPLEMENT you already know "
+            "the symbol or snippet from the plan)."
         )
+    )
+    read_symbol: Optional[str] = Field(
+        default=None,
+        description=(
+            "READ a single definition's current source by qualified name "
+            "(e.g. 'UIApi.update_llm_provider' or 'baseline_config_yaml'). The "
+            "anchored way to view code before an ast_edit — no whole-file "
+            "survey. Python/PHP/TypeScript."
+        ),
+    )
+    read_around: Optional[str] = Field(
+        default=None,
+        description=(
+            "READ the region around an exact code snippet (whitespace-tolerant, "
+            "must match uniquely) with a few lines of surrounding context. Use "
+            "for non-symbol targets (imports, module-level code, config)."
+        ),
     )
     old_str: Optional[str] = Field(
         default=None,
@@ -108,6 +181,27 @@ class ReadEditLintInput(BaseModel):
             "syntax check) nothing is written. Each edit must match exactly once "
             "in the buffer at the time it is applied. Mutually exclusive with the "
             "other edit modes."
+        ),
+    )
+    patch: Optional[list[PatchOp]] = Field(
+        default=None,
+        description=(
+            "Batch of WHITESPACE-TOLERANT find-and-replace ops applied in order, "
+            "all-or-nothing. Like `edits`, but each op's `search` ignores "
+            "per-line indentation and trailing whitespace, and `replace` is "
+            "re-indented to the match — so a slightly-off snippet still lands. "
+            "Prefer this over `edits` when you are not certain of exact "
+            "indentation. Mutually exclusive with the other edit modes."
+        ),
+    )
+    ast_edit: Optional[AstEdit] = Field(
+        default=None,
+        description=(
+            "Symbol-anchored structural edit: name a definition (e.g. "
+            "'ClassName.method') and replace it, or insert a construct before/"
+            "after it. No line numbers or exact-byte matching — robust to "
+            "formatting. Python/PHP/TypeScript only. Mutually exclusive with "
+            "the other edit modes."
         ),
     )
     start_line: Optional[int] = Field(
@@ -459,6 +553,218 @@ def _apply_line_range(
     return before + replacement + after, None
 
 
+# ── Whitespace-tolerant patch resolver (borrowed from opencode #24511) ──
+# The exact `old_str`/`edits` contract fails when a model's snippet is
+# indentation- or trailing-whitespace-off. `patch` retries an exact match
+# first, then a per-line-trimmed match, re-indenting the replacement to the
+# matched block. The all-or-nothing in-memory + syntax-gate guarantees still
+# hold, so a fuzzy match that produces broken code is rejected, not written.
+
+
+def _leading_ws(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _reindent(replacement: str, from_indent: str, to_indent: str) -> str:
+    """Shift ``replacement`` from ``from_indent`` to ``to_indent`` base indent."""
+    if from_indent == to_indent:
+        return replacement
+    out: list[str] = []
+    for line in replacement.split("\n"):
+        if not line.strip():
+            out.append(line)
+            continue
+        body = line[len(from_indent) :] if line.startswith(from_indent) else line.lstrip()
+        out.append(to_indent + body)
+    return "\n".join(out)
+
+
+def _fuzzy_locate(
+    buffer: str, search: str
+) -> tuple[Optional[tuple[int, int, str, str]], Optional[dict[str, Any]]]:
+    """Locate ``search`` in ``buffer`` exactly, else whitespace-tolerantly.
+
+    Returns ``((start, end, matched_indent, search_indent), None)`` for a
+    unique match (char offsets into ``buffer``), or ``(None, error_payload)``.
+    """
+    exact = buffer.count(search)
+    if exact == 1:
+        start = buffer.index(search)
+        return (start, start + len(search), "", ""), None
+    if exact > 1:
+        return None, {
+            "status": "ambiguous_match",
+            "detail": f"search matches {exact} locations. Add surrounding context.",
+        }
+
+    # Whitespace-tolerant: match a contiguous run of lines whose trimmed text
+    # equals the trimmed search lines.
+    buf_lines = buffer.split("\n")
+    s_lines = search.split("\n")
+    if s_lines and s_lines[-1] == "":  # trailing newline in search → drop empty tail
+        s_lines = s_lines[:-1]
+    if not s_lines:
+        return None, {"status": "input_error", "detail": "search is empty."}
+    s_trim = [ln.strip() for ln in s_lines]
+    n = len(s_lines)
+
+    hits: list[int] = []
+    for i in range(len(buf_lines) - n + 1):
+        if [buf_lines[i + j].strip() for j in range(n)] == s_trim:
+            hits.append(i)
+    if len(hits) == 0:
+        return None, {
+            "status": "no_match",
+            "detail": (
+                "search not found (even ignoring indentation). Re-read the "
+                "file and copy the target lines, or use ast_edit by symbol."
+            ),
+        }
+    if len(hits) > 1:
+        return None, {
+            "status": "ambiguous_match",
+            "detail": f"search matches {len(hits)} locations (whitespace-insensitive). Add context.",
+        }
+    i = hits[0]
+    # Char span of buffer lines [i, i+n).
+    start = sum(len(buf_lines[k]) + 1 for k in range(i))
+    end = start + sum(len(buf_lines[i + j]) for j in range(n)) + (n - 1)
+    return (start, end, _leading_ws(buf_lines[i]), _leading_ws(s_lines[0])), None
+
+
+def _apply_patch(
+    current: str, patches: list[Any], file_path: str
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Apply whitespace-tolerant search/replace ops in order, all-or-nothing."""
+    if not patches:
+        return None, {"status": "input_error", "detail": "patch must be a non-empty list."}
+    buffer = current
+    for index, op in enumerate(patches):
+        search = op.get("search") if isinstance(op, dict) else getattr(op, "search", None)
+        replace = (op.get("replace") if isinstance(op, dict) else getattr(op, "replace", "")) or ""
+        if not search:
+            return None, {
+                "status": "input_error",
+                "detail": f"patch[{index}] is missing search.",
+                "edit_index": index,
+            }
+        located, error = _fuzzy_locate(buffer, search)
+        if error is not None:
+            if error.get("status") == "no_match" and replace and replace.strip() in buffer:
+                payload = _already_applied_payload(file_path)
+                payload["edit_index"] = index
+                return None, payload
+            error["edit_index"] = index
+            return None, error
+        start, end, matched_indent, search_indent = located
+        buffer = buffer[:start] + _reindent(replace, search_indent, matched_indent) + buffer[end:]
+    return buffer, None
+
+
+# ── Symbol-anchored structural edit (borrowed from opencode #18822) ──
+# Reuses spine's existing tree-sitter symbol extractor instead of an external
+# ast-grep dependency: locate a definition by qualified name, then replace it
+# or splice code adjacent to it — drift-proof and indentation-agnostic.
+
+
+def _match_symbols(symbols: list, symbol: str) -> list:
+    """Match ``symbol`` against extracted symbols, tolerating over-qualification.
+
+    The planner emits module-dotted names ('spine.ui_api.api.UIApi' or
+    'pkg.mod.Cls.method'); tree-sitter exposes 'UIApi' / 'Cls.method'. Match the
+    qualified_name / bare name, or the trailing segment(s) of what was asked.
+    Callers handle the >1-match (ambiguous) case.
+    """
+    tail1 = symbol.split(".")[-1]
+    tail2 = ".".join(symbol.split(".")[-2:])
+    return [
+        s for s in symbols
+        if symbol in (s.qualified_name, s.symbol_name)
+        or s.symbol_name == tail1
+        or s.qualified_name == tail2
+    ]
+
+
+_READ_AROUND_CONTEXT = 4
+
+
+def _read_around(file_path: str, content: str, snippet: str) -> str:
+    """Render the region around a (whitespace-tolerant) snippet match ± context."""
+    located, error = _fuzzy_locate(content, snippet)
+    if error is not None:
+        return _result(**error)
+    start, end, _mi, _si = located
+    lo = content.count("\n", 0, start) + 1
+    hi = content.count("\n", 0, end) + 1
+    return _render_read(
+        file_path, content, max(1, lo - _READ_AROUND_CONTEXT), hi + _READ_AROUND_CONTEXT
+    )
+
+
+def _apply_ast_edit(
+    current: str,
+    file_path: str,
+    symbol: str,
+    action: str,
+    code: str,
+    workspace_path: str,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Resolve ``symbol`` via tree-sitter and apply a structural edit."""
+    if action not in ("replace", "insert_before", "insert_after"):
+        return None, {
+            "status": "input_error",
+            "detail": f"ast_edit action must be replace|insert_before|insert_after, got {action!r}.",
+        }
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in _AST_EDIT_LANGS:
+        return None, {
+            "status": "input_error",
+            "detail": f"ast_edit unsupported for {ext or 'this file type'}; use patch/edits instead.",
+        }
+    try:
+        from spine.agents.tools.ast_extract import extract_symbols
+    except Exception as exc:  # pragma: no cover — module always present
+        return None, {"status": "io_error", "detail": f"ast_extract unavailable: {exc}"}
+
+    # extract_symbols reads from disk; `current` equals the on-disk content at
+    # read time, so its byte offsets index `current` (utf-8) correctly.
+    full_path = os.path.join(workspace_path, file_path.lstrip("/"))
+    try:
+        symbols = extract_symbols(full_path, file_path)
+    except Exception as exc:  # noqa: BLE001 — surface as a clean tool status
+        return None, {"status": "io_error", "detail": f"Could not parse {file_path}: {exc}"}
+
+    matches = _match_symbols(symbols, symbol)
+    if not matches:
+        names = sorted({s.qualified_name for s in symbols})[:15]
+        return None, {
+            "status": "no_match",
+            "detail": f"symbol {symbol!r} not found in {file_path}.",
+            "available_symbols": names,
+        }
+    if len(matches) > 1:
+        return None, {
+            "status": "ambiguous_match",
+            "detail": f"symbol {symbol!r} matches {len(matches)} definitions in {file_path}.",
+        }
+    sym = matches[0]
+    buf = current.encode("utf-8")
+    code_bytes = code.encode("utf-8")
+    # A method's start_byte sits AFTER its leading indentation; anchor replace/
+    # insert_before at the start of the symbol's LINE so the spliced `code`
+    # owns the indentation (it should carry the symbol's natural indent).
+    line_start = buf.rfind(b"\n", 0, sym.start_byte) + 1
+    if action == "replace":
+        new_bytes = buf[:line_start] + code_bytes + buf[sym.end_byte :]
+    elif action == "insert_before":
+        new_bytes = buf[:line_start] + code_bytes + b"\n\n" + buf[line_start:]
+    else:  # insert_after
+        tail = buf[sym.end_byte :]
+        sep = b"\n\n" if not tail.startswith(b"\n\n") else b""
+        new_bytes = buf[: sym.end_byte] + sep + code_bytes + tail
+    return new_bytes.decode("utf-8"), None
+
+
 class ReadEditLintTool(BaseTool):
     """Single write surface for the slice-implementer subagent.
 
@@ -474,13 +780,19 @@ class ReadEditLintTool(BaseTool):
     name: str = "read_edit_lint"
     description: str = (
         "Read, edit, or create a file — your single filesystem tool. "
-        "READ: pass only file_path (plus optional start_line/end_line) to "
-        "get line-numbered content; prefer ranged reads on large files. "
+        "READ (anchored only — arbitrary whole-file/line-range reads are "
+        "disabled): read_symbol='ClassName.method' returns a definition's "
+        "source; read_around='exact snippet' returns the region around a "
+        "snippet. "
         "EDIT: pass exactly ONE edit mode: old_str+new_str "
         "(single-occurrence find-and-replace); full_replace (whole-file "
-        "content); edits (a batch of find-and-replace ops applied "
-        "atomically — all-or-nothing); or start_line+end_line+replacement "
-        "(line-range edit, with optional `expected` staleness guard). On a "
+        "content); edits (a batch of EXACT find-and-replace ops applied "
+        "atomically — all-or-nothing); patch (a batch of WHITESPACE-TOLERANT "
+        "search/replace ops — use when unsure of exact indentation); ast_edit "
+        "(symbol-anchored structural edit — name a def/class and replace or "
+        "insert before/after it, no line numbers needed); or "
+        "start_line+end_line+replacement (line-range edit, with optional "
+        "`expected` staleness guard). On a "
         "syntax error or failed match the write is rejected without "
         "modifying the file — fix and call again. status='already_applied' "
         "means the change is ALREADY in the file: move on, do not retry. "
@@ -497,6 +809,40 @@ class ReadEditLintTool(BaseTool):
         clean = file_path.lstrip("/")
         return Path(self.workspace_root) / clean
 
+    def _read_symbol(self, file_path: str, content: str, symbol: str) -> str:
+        """Return the named definition's current source, line-numbered."""
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in _AST_EDIT_LANGS:
+            return _result(
+                "input_error",
+                detail=f"read_symbol unsupported for {ext or 'this file type'}; "
+                "use read_around='snippet' instead.",
+            )
+        try:
+            from spine.agents.tools.ast_extract import extract_symbols
+
+            full_path = os.path.join(self.workspace_root, file_path.lstrip("/"))
+            symbols = extract_symbols(full_path, file_path)
+        except Exception as exc:  # noqa: BLE001
+            return _result("io_error", detail=f"Could not parse {file_path}: {exc}")
+        matches = _match_symbols(symbols, symbol)
+        if not matches:
+            names = sorted({s.qualified_name for s in symbols})[:20]
+            return _result(
+                "no_match",
+                detail=f"symbol {symbol!r} not found in {file_path}.",
+                available_symbols=names,
+            )
+        if len(matches) > 1:
+            return _result(
+                "ambiguous_match",
+                detail=f"symbol {symbol!r} matches {len(matches)} definitions.",
+            )
+        sym = matches[0]
+        lo = content.count("\n", 0, sym.start_byte) + 1
+        hi = content.count("\n", 0, sym.end_byte) + 1
+        return _render_read(file_path, content, lo, hi)
+
     def _run(
         self,
         file_path: str,
@@ -504,6 +850,10 @@ class ReadEditLintTool(BaseTool):
         new_str: Optional[str] = None,
         full_replace: Optional[str] = None,
         edits: Optional[list[Any]] = None,
+        patch: Optional[list[Any]] = None,
+        ast_edit: Optional[Any] = None,
+        read_symbol: Optional[str] = None,
+        read_around: Optional[str] = None,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         replacement: Optional[str] = None,
@@ -517,13 +867,21 @@ class ReadEditLintTool(BaseTool):
             active.append("find_replace")
         if edits is not None:
             active.append("edits")
+        if patch is not None:
+            active.append("patch")
+        if ast_edit is not None:
+            active.append("ast_edit")
+        if read_symbol is not None:
+            active.append("read_symbol")
+        if read_around is not None:
+            active.append("read_around")
         if replacement is not None or expected is not None:
             active.append("line_range")
         elif start_line is not None or end_line is not None:
-            # Bare line bounds with no replacement/expected = ranged READ.
-            active.append("read")
+            # Bare line bounds = an arbitrary ranged read — now disabled.
+            active.append("read_disabled")
         if not active:
-            active.append("read")  # file_path alone = whole-file read
+            active.append("read_disabled")  # file_path alone = whole-file read
         if len(active) > 1:
             return _result(
                 "input_error",
@@ -534,18 +892,36 @@ class ReadEditLintTool(BaseTool):
         path = self._resolve_path(file_path)
         existed = path.exists()
 
-        # ── Read mode ───────────────────────────────────────────────
-        if mode == "read":
+        # ── Arbitrary reads are disabled ────────────────────────────
+        # By IMPLEMENT the plan/decompose stages have already identified the
+        # target symbol or snippet, so a whole-file / arbitrary line-range read
+        # is the model surveying the codebase a second time (trace: read all of
+        # config.py to "understand the structure of SpineConfig"). Steer it to
+        # an anchored read instead.
+        if mode == "read_disabled":
+            return _result(
+                "read_disabled",
+                detail=(
+                    f"Arbitrary reads of {file_path} are disabled. View code by "
+                    "ANCHOR: read_symbol='ClassName.method' for a definition, or "
+                    "read_around='exact snippet' for a region. Your slice's "
+                    "edit_plan names the symbol to target — read_symbol it, then "
+                    "apply ast_edit. Do not re-survey the file."
+                ),
+            )
+
+        if mode in ("read_symbol", "read_around"):
             if not existed:
                 return _result(
-                    "not_found",
-                    detail=f"Cannot read {file_path}: file does not exist.",
+                    "not_found", detail=f"Cannot read {file_path}: file does not exist."
                 )
             try:
                 content = path.read_text(encoding="utf-8")
             except OSError as exc:
                 return _result("io_error", detail=f"Could not read {file_path}: {exc}")
-            return _render_read(file_path, content, start_line, end_line)
+            if mode == "read_symbol":
+                return self._read_symbol(file_path, content, read_symbol or "")
+            return _read_around(file_path, content, read_around or "")
 
         # ── Build the new content in memory per mode ────────────────
         if mode == "full_replace":
@@ -570,6 +946,18 @@ class ReadEditLintTool(BaseTool):
                 new_content, error = _apply_find_replace(current, old_str, new_str, file_path)
             elif mode == "edits":
                 new_content, error = _apply_batch(current, edits or [], file_path)
+            elif mode == "patch":
+                new_content, error = _apply_patch(current, patch or [], file_path)
+            elif mode == "ast_edit":
+                ae = ast_edit if isinstance(ast_edit, dict) else ast_edit.__dict__
+                new_content, error = _apply_ast_edit(
+                    current,
+                    file_path,
+                    ae.get("symbol", ""),
+                    ae.get("action", "replace"),
+                    ae.get("code", ""),
+                    self.workspace_root,
+                )
             else:  # line_range
                 new_content, error = _apply_line_range(
                     current, start_line, end_line, replacement, expected, file_path
@@ -613,6 +1001,10 @@ class ReadEditLintTool(BaseTool):
         new_str: Optional[str] = None,
         full_replace: Optional[str] = None,
         edits: Optional[list[Any]] = None,
+        patch: Optional[list[Any]] = None,
+        ast_edit: Optional[Any] = None,
+        read_symbol: Optional[str] = None,
+        read_around: Optional[str] = None,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         replacement: Optional[str] = None,
@@ -624,6 +1016,10 @@ class ReadEditLintTool(BaseTool):
             new_str=new_str,
             full_replace=full_replace,
             edits=edits,
+            patch=patch,
+            ast_edit=ast_edit,
+            read_symbol=read_symbol,
+            read_around=read_around,
             start_line=start_line,
             end_line=end_line,
             replacement=replacement,

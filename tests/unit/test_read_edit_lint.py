@@ -309,47 +309,54 @@ def test_multiple_modes_rejected(workspace: Path) -> None:
 # ── Read mode (trace 019eb502: read_file removed from the implementer) ──
 
 
-def test_read_whole_file_with_line_numbers(workspace: Path) -> None:
-    target = workspace / "src" / "r.py"
-    target.write_text("a = 1\nb = 2\nc = 3\n")
-    out = _tool(workspace)._run(file_path="src/r.py")
-    assert out.startswith("[read: src/r.py lines 1-3 of 3]")
-    assert "1| a = 1" in out
-    assert "3| c = 3" in out
+def test_bare_whole_file_read_is_disabled(workspace: Path) -> None:
+    (workspace / "src" / "r.py").write_text("a = 1\nb = 2\nc = 3\n")
+    out = _decode(_tool(workspace)._run(file_path="src/r.py"))
+    assert out["status"] == "read_disabled"
+    assert "read_symbol" in out["detail"]
 
 
-def test_read_line_range(workspace: Path) -> None:
-    target = workspace / "src" / "r2.py"
-    target.write_text("".join(f"x{i} = {i}\n" for i in range(1, 11)))
-    out = _tool(workspace)._run(file_path="src/r2.py", start_line=4, end_line=6)
-    assert "[read: src/r2.py lines 4-6 of 10]" in out
-    assert "4| x4 = 4" in out
-    assert "6| x6 = 6" in out
-    assert "x7" not in out
+def test_arbitrary_line_range_read_is_disabled(workspace: Path) -> None:
+    (workspace / "src" / "r2.py").write_text("".join(f"x{i} = {i}\n" for i in range(1, 11)))
+    out = _decode(_tool(workspace)._run(file_path="src/r2.py", start_line=4, end_line=6))
+    assert out["status"] == "read_disabled"
+
+
+def test_read_symbol_returns_definition_source(workspace: Path) -> None:
+    (workspace / "src" / "rs.py").write_text(
+        "import os\n\n\ndef alpha():\n    return 1\n\n\ndef beta():\n    return 2\n"
+    )
+    out = _tool(workspace)._run(file_path="src/rs.py", read_symbol="beta")
+    assert "def beta():" in out and "return 2" in out
+    assert "def alpha" not in out  # only the requested symbol
+
+
+def test_read_symbol_unknown_lists_available(workspace: Path) -> None:
+    (workspace / "src" / "rs2.py").write_text("def alpha():\n    return 1\n")
+    out = _decode(_tool(workspace)._run(file_path="src/rs2.py", read_symbol="zeta"))
+    assert out["status"] == "no_match"
+    assert "alpha" in out.get("available_symbols", [])
+
+
+def test_read_symbol_tolerates_module_qualified_name(workspace: Path) -> None:
+    (workspace / "src" / "rs3.py").write_text("class UIApi:\n    def m(self):\n        return 1\n")
+    out = _tool(workspace)._run(file_path="src/rs3.py", read_symbol="pkg.mod.rs3.UIApi")
+    assert "class UIApi:" in out
+
+
+def test_read_around_returns_region_with_context(workspace: Path) -> None:
+    (workspace / "src" / "ra.py").write_text(
+        "".join(f"line{i} = {i}\n" for i in range(1, 21))
+    )
+    out = _tool(workspace)._run(file_path="src/ra.py", read_around="line10 = 10")
+    assert "10| line10 = 10" in out
+    assert "line1 = 1" not in out  # not the whole file
+    assert "line20" not in out
 
 
 def test_read_missing_file_reports_not_found(workspace: Path) -> None:
-    out = _decode(_tool(workspace)._run(file_path="src/nope.py"))
+    out = _decode(_tool(workspace)._run(file_path="src/nope.py", read_symbol="x"))
     assert out["status"] == "not_found"
-
-
-def test_read_truncates_huge_files_with_notice(workspace: Path) -> None:
-    from spine.agents.tools.read_edit_lint import _READ_MAX_LINES
-
-    target = workspace / "src" / "big.py"
-    target.write_text("".join(f"v{i} = {i}\n" for i in range(_READ_MAX_LINES + 50)))
-    out = _tool(workspace)._run(file_path="src/big.py")
-    assert "truncated" in out
-    assert f"v{_READ_MAX_LINES + 10}" not in out
-
-
-def test_line_bounds_without_replacement_is_a_read_not_an_error(workspace: Path) -> None:
-    """start_line/end_line with no replacement used to input_error; it is
-    now a ranged read — the closest useful interpretation."""
-    target = workspace / "src" / "rr.py"
-    target.write_text("one = 1\ntwo = 2\n")
-    out = _tool(workspace)._run(file_path="src/rr.py", start_line=2, end_line=2)
-    assert "2| two = 2" in out
 
 
 # ── already_applied (trace 019eb502: re-sent edits read as failures) ──
@@ -444,3 +451,129 @@ def test_ruff_unavailable_fails_open(workspace: Path, monkeypatch) -> None:
     )
     assert out["status"] == "ok"
     assert "ruff" not in out
+
+
+# ── patch mode (whitespace-tolerant) ────────────────────────────────
+
+
+def test_patch_exact_match_replaces(workspace: Path) -> None:
+    (workspace / "src" / "p.py").write_text("def f():\n    return 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/p.py",
+            patch=[{"search": "    return 1", "replace": "    return 2"}],
+        )
+    )
+    assert out["status"] == "ok"
+    assert (workspace / "src" / "p.py").read_text() == "def f():\n    return 2\n"
+
+
+def test_patch_tolerates_indentation_drift(workspace: Path) -> None:
+    # File body is indented 4 spaces; model supplies the snippet at 2 spaces.
+    (workspace / "src" / "q.py").write_text("def f():\n    x = 1\n    return x\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/q.py",
+            patch=[{"search": "  x = 1", "replace": "  x = 42"}],  # wrong indent
+        )
+    )
+    assert out["status"] == "ok"
+    # Replacement re-indented to the matched block (4 spaces), stays valid.
+    assert (workspace / "src" / "q.py").read_text() == "def f():\n    x = 42\n    return x\n"
+
+
+def test_patch_no_match_reports_index(workspace: Path) -> None:
+    (workspace / "src" / "r.py").write_text("a = 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/r.py",
+            patch=[{"search": "nonexistent line", "replace": "z = 9"}],
+        )
+    )
+    assert out["status"] == "no_match"
+    assert out["edit_index"] == 0
+
+
+def test_patch_rejects_result_failing_syntax_check(workspace: Path) -> None:
+    target = workspace / "src" / "s.py"
+    target.write_text("def f():\n    return 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/s.py",
+            patch=[{"search": "    return 1", "replace": "    return ("}],
+        )
+    )
+    assert out["status"] == "syntax_error"
+    assert target.read_text() == "def f():\n    return 1\n"  # untouched
+
+
+# ── ast_edit mode (symbol-anchored) ─────────────────────────────────
+
+
+def test_ast_edit_replaces_function_by_name(workspace: Path) -> None:
+    (workspace / "src" / "m.py").write_text(
+        "import os\n\n\ndef greet(name):\n    return 'hi ' + name\n\n\nX = 1\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/m.py",
+            ast_edit={
+                "symbol": "greet",
+                "action": "replace",
+                "code": "def greet(name):\n    return f'hello {name}'",
+            },
+        )
+    )
+    assert out["status"] == "ok"
+    text = (workspace / "src" / "m.py").read_text()
+    assert "return f'hello {name}'" in text
+    assert "X = 1" in text  # surrounding code preserved
+
+
+def test_ast_edit_insert_after_symbol(workspace: Path) -> None:
+    (workspace / "src" / "n.py").write_text("def a():\n    return 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/n.py",
+            ast_edit={
+                "symbol": "a",
+                "action": "insert_after",
+                "code": "def b():\n    return 2",
+            },
+        )
+    )
+    assert out["status"] == "ok"
+    text = (workspace / "src" / "n.py").read_text()
+    assert "def a():" in text and "def b():" in text
+    assert text.index("def a()") < text.index("def b()")
+
+
+def test_ast_edit_unknown_symbol_lists_available(workspace: Path) -> None:
+    (workspace / "src" / "o.py").write_text("def alpha():\n    return 1\n")
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/o.py",
+            ast_edit={"symbol": "beta", "action": "replace", "code": "def beta():\n    pass"},
+        )
+    )
+    assert out["status"] == "no_match"
+    assert "alpha" in out.get("available_symbols", [])
+
+
+def test_ast_edit_replace_method_by_qualified_name(workspace: Path) -> None:
+    (workspace / "src" / "c.py").write_text(
+        "class C:\n    def m(self):\n        return 1\n\n    def k(self):\n        return 2\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/c.py",
+            ast_edit={
+                "symbol": "C.m",
+                "action": "replace",
+                "code": "    def m(self):\n        return 99",
+            },
+        )
+    )
+    assert out["status"] == "ok"
+    text = (workspace / "src" / "c.py").read_text()
+    assert "return 99" in text and "return 2" in text
