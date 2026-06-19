@@ -621,25 +621,26 @@ class TestStructuredWritePlanTool:
         assert isinstance(data["risks"], list)
         assert data["risks"] == ["Tight deadline", "Cold-start latency"]
 
-    def test_feature_slices_validated_in_schema(self, tmp_path):
-        """Per-slice validation should happen at the Pydantic boundary, not in _run."""
-        from spine.agents.plan_tools import _StructuredWritePlanInput
-        import pytest
-
-        # Missing acceptance_criteria (min_length=1) on a slice → schema error
-        with pytest.raises(Exception):
-            _StructuredWritePlanInput(
-                architecture_overview="x",
-                feature_slices=[
-                    {
-                        "id": "s",
-                        "title": "t",
-                        "execution_requirements": "do it",
-                        "acceptance_criteria": [],
-                    }
-                ],
-                testing_strategy="y",
-            )
+    def test_missing_acceptance_criteria_rejected_in_run(self, tmp_path):
+        """Completeness is validated in _run (not the Pydantic schema) so a
+        partial retry can pass the schema and receive a clear, actionable
+        message instead of a raw nested ValidationError. The schema is kept
+        lenient (fields optional) to enable incremental patching."""
+        tool = self._tool(tmp_path)
+        out = tool._run(
+            architecture_overview="x",
+            feature_slices=[
+                {
+                    "id": "s",
+                    "title": "t",
+                    "execution_requirements": "do it",
+                    "acceptance_criteria": [],
+                }
+            ],
+            testing_strategy="y",
+        )
+        assert out.startswith("VALIDATION_ERROR")
+        assert "acceptance_criteria" in out
 
     def test_optional_sections_omitted_when_empty(self, tmp_path):
         tool = self._tool(tmp_path)

@@ -144,18 +144,18 @@ providers:
       # (no clamp, fixed evidence budgets). poolside/laguna-xs.2 = 262144.
       context_window: 60000
     specify/subagents/researcher:
-      provider: local-nex
+      provider: local-qwen
     specify/subagents/researcher/supervisor:
-      provider: local-nex
+      provider: local-qwen
     plan:
       provider: local-qwen
       context_window: 60000
     plan/subagents/researcher:
-      provider: local-north-code
+      provider: local-qwen
     plan/subagents/researcher/supervisor:
-      provider: local-north-code
+      provider: local-qwen
     implement:
-      provider: local-nex
+      provider: local-qwen
     # The decomposer (structured slice/micro-slice JSON) and the slice
     # implementer (exact-match read_edit_lint) are where a weak local model
     # burns the most tokens — failed edits and length-capped decompositions
@@ -166,13 +166,13 @@ providers:
     # enable a stronger provider in providers.llm[] (e.g. 'pat' or
     # 'openrouter') and change 'provider: local' below to its name.
     implement/decomposer:
-      provider: local-nex
+      provider: local-qwen
     implement/subagents/slice-implementer:
-      provider: local-mellum
+      provider: local-qwen
     verify:
-      provider: local-nex
+      provider: local-qwen
     verify/subagents/slice-verifier:
-      provider: local-nex
+      provider: local-qwen
     critic:
       provider: local-qwen
     critic/specify:
@@ -182,14 +182,14 @@ providers:
     gap_plan:
       provider: local-qwen
     exploration/manager:
-      provider: local-nex
+      provider: local-qwen
     classification:
-      provider: local-mellum
+      provider: local-qwen
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-north-code
+      provider: local-qwen
       max_completion_tokens: 1024
       temperature: 0
       reasoning: false

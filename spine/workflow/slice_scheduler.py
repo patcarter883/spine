@@ -86,6 +86,157 @@ def validate_feature_slices(slices: list[FeatureSlice]) -> None:
         raise ValueError(f"Dependency cycle detected among slices: {exc}") from exc
 
 
+_COMPLEXITY_ORDER = {"small": 0, "medium": 1, "large": 2}
+
+
+def _as_text(value: Any) -> str:
+    """execution_requirements may be a str or list[str]; render to str."""
+    if isinstance(value, list):
+        return "\n".join(str(v) for v in value)
+    return str(value or "")
+
+
+def merge_file_overlapping_slices(slices: list[FeatureSlice]) -> list[FeatureSlice]:
+    """Merge slices that share a target file into one slice.
+
+    A plan that puts several slices over the SAME file(s) (e.g. three feature
+    slices all editing ``config_view.py`` + ``api.py``) forces the IMPLEMENT
+    loop to do that file 3× — overlapping per-file sub-slices that conflict and
+    re-decompose, blowing the token budget (trace r2: 34 invocations / ~1M
+    tokens). Slices touching a shared file cannot run in parallel anyway, so
+    union them (transitively) and combine their fields into a single slice.
+    Fully defensive: any failure returns the input unchanged.
+    """
+    try:
+        if len(slices) < 2:
+            return slices
+        parent = {s.id: s.id for s in slices}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        file_owner: dict[str, str] = {}
+        for s in slices:
+            for f in s.target_files or []:
+                if f in file_owner:
+                    parent[find(s.id)] = find(file_owner[f])
+                else:
+                    file_owner[f] = s.id
+
+        groups: dict[str, list[FeatureSlice]] = {}
+        for s in slices:
+            groups.setdefault(find(s.id), []).append(s)
+        if len(groups) == len(slices):
+            return slices  # nothing shares files
+
+        remap: dict[str, str] = {}
+        merged: list[FeatureSlice] = []
+        for members in groups.values():
+            if len(members) == 1:
+                merged.append(members[0])
+                remap[members[0].id] = members[0].id
+                continue
+            members = sorted(members, key=lambda s: s.id)
+            new_id = members[0].id
+            member_ids = {m.id for m in members}
+            tf: list[str] = []
+            ac: list[str] = []
+            rs: list[str] = []
+            ep: list = []
+            er: list[str] = []
+            deps: set[str] = set()
+            comp = 0
+            for m in members:
+                for f in m.target_files or []:
+                    if f not in tf:
+                        tf.append(f)
+                for a in m.acceptance_criteria or []:
+                    if a not in ac:
+                        ac.append(a)
+                for r in m.reference_symbols or []:
+                    if r not in rs:
+                        rs.append(r)
+                ep.extend(m.edit_plan or [])
+                er.append(f"[{m.title}]\n{_as_text(m.execution_requirements)}".strip())
+                deps |= set(m.dependencies or [])
+                comp = max(comp, _COMPLEXITY_ORDER.get(m.complexity, 1))
+            for mid in member_ids:
+                remap[mid] = new_id
+            merged.append(FeatureSlice(
+                id=new_id,
+                title=" + ".join(m.title for m in members),
+                target_files=tf,
+                execution_requirements="\n\n".join(er),
+                dependencies=sorted(deps - member_ids),
+                acceptance_criteria=ac,
+                complexity=next(k for k, v in _COMPLEXITY_ORDER.items() if v == comp),
+                reference_symbols=rs,
+                edit_plan=ep,
+            ))
+        # Remap any dependency references to the merged representative ids.
+        for s in merged:
+            s.dependencies = sorted(
+                {remap.get(d, d) for d in (s.dependencies or [])} - {s.id}
+            )
+        return merged
+    except Exception:  # noqa: BLE001 — never let merging break scheduling
+        return slices
+
+
+def serialize_file_overlapping_slices(slices: list[FeatureSlice]) -> list[FeatureSlice]:
+    """Chain slices that share a target file so they run sequentially.
+
+    Same-file slices can't run in parallel (they'd conflict), but merging them
+    into one big slice overwhelms the implementer. Instead, within each group of
+    slices touching a shared file, add a dependency from each slice to the
+    previous one — so they land in consecutive waves (the sandbox carries each
+    edit forward) while staying small and individually actionable. Independent
+    files still run in parallel. Fully defensive: returns the input on any error.
+    """
+    try:
+        if len(slices) < 2:
+            return slices
+        parent = {s.id: s.id for s in slices}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        file_owner: dict[str, str] = {}
+        for s in slices:
+            for f in s.target_files or []:
+                if f in file_owner:
+                    parent[find(s.id)] = find(file_owner[f])
+                else:
+                    file_owner[f] = s.id
+
+        groups: dict[str, list[FeatureSlice]] = {}
+        for s in slices:
+            groups.setdefault(find(s.id), []).append(s)
+        if len(groups) == len(slices):
+            return slices  # nothing shares files
+
+        ids = {s.id for s in slices}
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            members = sorted(members, key=lambda s: s.id)
+            for prev, cur in zip(members, members[1:]):
+                deps = set(cur.dependencies or [])
+                # Don't introduce a cycle: only chain forward.
+                if prev.id != cur.id and prev.id in ids:
+                    deps.add(prev.id)
+                cur.dependencies = sorted(deps)
+        return slices
+    except Exception:  # noqa: BLE001 — never let serialization break scheduling
+        return slices
+
+
 def compute_execution_waves(
     feature_slices: list[FeatureSlice],
 ) -> list[list[FeatureSlice]]:
@@ -108,6 +259,13 @@ def compute_execution_waves(
         ValueError: If slices are invalid (empty, duplicates, bad
             references, or cycles).
     """
+    # Serialize slices that share a target file BEFORE scheduling — they cannot
+    # run in parallel (same-file edit conflict), but MERGING them into one big
+    # slice overwhelms the implementer (trace 019ede24: a merged 27-reference
+    # slice → the model read 24 symbols and never edited). Instead chain them
+    # with dependencies so they run in separate waves, each small and
+    # actionable, with the sandbox carrying earlier edits forward.
+    feature_slices = serialize_file_overlapping_slices(feature_slices)
     validate_feature_slices(feature_slices)
 
     # Build lookup from ID -> FeatureSlice for wave assembly.

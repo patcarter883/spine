@@ -800,14 +800,18 @@ def build_subagent_spec(
     # lets it re-research the codebase instead of editing — across every model
     # tested it ran 20-26 codebase_query calls and made ZERO edits, burning
     # 1.4M+ prompt tokens on a fully specified slice. When the planner supplied
-    # an ``edit_plan`` (symbols already resolved, applied via read_edit_lint's
-    # ast_edit), the implementer needs no research surface at all: its only
-    # move should be to read the target region and apply the edit. So withhold
-    # codebase_query whenever the active slice carries an edit_plan; legacy
-    # slices without one keep the lookup as a fallback.
+    # an ``edit_plan`` OR ``reference_symbols`` (symbols already resolved by the
+    # planner, read via read_edit_lint's read_symbol and applied via ast_edit),
+    # the implementer needs no research surface at all: its only move should be
+    # to read the named symbols and apply the edit. So withhold codebase_query
+    # whenever the active slice carries targeting; legacy slices without any
+    # keep the lookup as a fallback. (trace 019ede24: the decomposed plan
+    # provides reference_symbols, not edit_plan — gating only on edit_plan left
+    # codebase_query available and the implementer ran 23 codebase_query calls
+    # with 2 read_edit_lint calls.)
     active_slice = (state or {}).get("active_slice") or {}
     implementer_has_plan = name == "slice-implementer" and bool(
-        active_slice.get("edit_plan")
+        active_slice.get("edit_plan") or active_slice.get("reference_symbols")
     )
     if name == "researcher" or (name == "slice-implementer" and not implementer_has_plan):
         _inject_mcp_tools(tools, workspace_root, subagent_name=name)

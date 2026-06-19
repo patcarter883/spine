@@ -874,6 +874,7 @@ class SpineConfig:
         "max_tokens",
         "max_completion_tokens",
         "request_timeout",
+        "stream_chunk_timeout",
         "max_retries",
         "guided_decoding",
         "max_concurrent_calls",

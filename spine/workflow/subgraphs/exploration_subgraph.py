@@ -823,15 +823,65 @@ def _hit_length_cap(
 # ── Node: synthesize (PLAN) ─────────────────────────────────────────────
 
 
+async def _try_decomposed_plan(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None,
+    workspace_root: str,
+    work_id: str,
+    retry_count: int,
+    feedback: list,
+    last_critic_review: dict,
+) -> bool:
+    """Decomposed plan synthesis (manager skeleton → per-slice workers).
+
+    Asking a local 30B to emit the WHOLE plan in one forced structured call
+    spins or degenerates (trace 019edd7c: 24 calls / 1.77M tokens; 019eddd3: a
+    single slice with 250+ duplicate target_files). Decompose like onboarding
+    doc synthesis — small per-slice calls, no single call produces the whole
+    plan. Writes plan.json on success. Returns True if it wrote a usable plan;
+    False (with a logged reason) hands off to the monolithic agent fallback.
+    """
+    spec_dir = state.get("spec_path") or f".spine/artifacts/{work_id}/specify"
+    spec_file = Path(workspace_root) / spec_dir / "specification.md"
+    if not spec_file.exists():
+        logger.warning("[%s] PLAN: no spec for decomposed synthesis — monolithic", work_id)
+        return False
+    try:
+        from spine.agents.plan_synthesis import synthesize_plan
+        from spine.agents.artifacts import artifact_path
+
+        spec_md = spec_file.read_text(encoding="utf-8")
+        plan_dir = artifact_path(work_id, PhaseName.PLAN.value)
+        fb = ""
+        if retry_count > 0:
+            fb = _render_rework_feedback(last_critic_review, feedback) or ""
+        syn = await synthesize_plan(
+            dict(state), config, spec_md, workspace_root, plan_dir, feedback=fb
+        )
+        if not syn.startswith(("ERROR", "VALIDATION_ERROR")):
+            logger.info("[%s] PLAN: decomposed synthesis succeeded — %s", work_id, syn[:100])
+            return True
+        logger.warning(
+            "[%s] PLAN: decomposed synthesis rejected (%s) — monolithic fallback",
+            work_id, syn[:140],
+        )
+    except Exception as exc:  # noqa: BLE001 — fall back, never block PLAN
+        logger.warning(
+            "[%s] PLAN: decomposed synthesis errored (%s) — monolithic fallback",
+            work_id, exc, exc_info=True,
+        )
+    return False
+
+
 async def _synthesize_plan(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
     """Synthesize research findings into a plan.
 
-    Uses the existing plan agent infrastructure — builds a Deep Agent
-    with the ``write_structured_plan`` tool and research findings as context.
-    Reads ``plan.json`` from disk after invocation and computes execution waves.
+    Tries the decomposed synthesizer first (manager skeleton → per-slice
+    workers); on failure falls back to the monolithic ``write_structured_plan``
+    agent. Reads ``plan.json`` from disk after, and computes execution waves.
     """
     from spine.agents.plan_agent import build_plan_synthesizer
 
@@ -852,8 +902,16 @@ async def _synthesize_plan(
     )
 
     try:
-        agent = build_plan_synthesizer(dict(state), config)
         materialize_artifacts(dict(state), workspace_root, work_id=work_id)
+
+        # Decomposed synthesis first — writes plan.json directly. On success the
+        # monolithic agent build + forced write_structured_plan call below are
+        # skipped (the corrective-retry block keys off plan.json existence).
+        decomposed_ok = await _try_decomposed_plan(
+            state, config, workspace_root, work_id, retry_count, feedback, last_critic_review
+        )
+
+        agent = None if decomposed_ok else build_plan_synthesizer(dict(state), config)
 
         feedback_body = ""
         if retry_count > 0:
@@ -988,7 +1046,13 @@ async def _synthesize_plan(
         # 8K completion tokens in the reasoning channel with no tool
         # call). Don't fail yet — fall through to the corrective retry.
         invoke_error: Exception | None = None
-        try:
+        if decomposed_ok:
+            # plan.json already written by the decomposed synthesizer — skip the
+            # monolithic forced-tool call entirely (the corrective-retry block
+            # below is gated on plan.json existence, so it no-ops too).
+            result = {"messages": []}
+        else:
+          try:
             result = await ainvoke_with_retry(
                 agent,
                 {"messages": [{"role": "user", "content": prompt}]},
@@ -997,7 +1061,7 @@ async def _synthesize_plan(
                 work_type=work_type,
                 context=ctx,
             )
-        except Exception as invoke_exc:
+          except Exception as invoke_exc:
             logger.warning(
                 "[%s] Synthesize (plan) invocation failed (%s) — "
                 "proceeding to corrective retry",

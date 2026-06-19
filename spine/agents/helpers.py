@@ -885,9 +885,25 @@ def _build_local_model(
         "max_completion_tokens",
         "max_retries",
         "request_timeout",
+        "stream_chunk_timeout",
     ):
         if key in provider_cfg:
             kwargs[key] = provider_cfg[key]
+
+    # ── Per-chunk streaming watchdog for local servers ────────────────
+    # langchain_openai raises StreamChunkTimeoutError when no parsed chunk
+    # arrives within `stream_chunk_timeout` (default 120s). On local 30B-class
+    # backends the model emits NO chunk until prefill completes, and prefill
+    # scales with prompt size (~6-7s per 1K tokens measured — trace D13): a
+    # 20K-token prompt prefills past 120s and the watchdog fires before the
+    # first token, marking the call failed. Default the timeout to cover a
+    # near-full-context-window prefill so large implement/plan prompts don't
+    # false-timeout; providers can still override explicitly.
+    if "stream_chunk_timeout" not in kwargs:
+        ctx_window = provider_cfg.get("context_window")
+        kwargs["stream_chunk_timeout"] = (
+            max(300.0, (ctx_window / 1000.0) * 8.0) if ctx_window else 600.0
+        )
 
     # ── Disable model reasoning when `reasoning: false` is configured ──
     # Reasoning ("thinking") models spend their output budget on

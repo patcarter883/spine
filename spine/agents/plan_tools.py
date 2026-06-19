@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.tools.base import ArgsSchema
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator
 
 from spine.agents.artifacts import artifact_path
 # Reuse the canonical tool-call-markup token list so search_codebase and
@@ -518,10 +518,11 @@ class _FeatureSliceInput(BaseModel):
 
 class _StructuredWritePlanInput(BaseModel):
     architecture_overview: str = Field(
+        default="",
         description=(
             "Components, data flow, and interfaces — prose paragraph describing "
             "how the pieces fit together."
-        )
+        ),
     )
     technology_choices: list[str] = Field(
         default_factory=list,
@@ -537,7 +538,9 @@ class _StructuredWritePlanInput(BaseModel):
             "dependencies, acceptance_criteria, complexity. Populate "
             "reference_symbols from your codebase research — the existing "
             "symbols each slice's code calls/extends/mimics — so the "
-            "implementer reads exactly those instead of surveying files."
+            "implementer reads exactly those instead of surveying files. "
+            "RETRY: slices are merged by id across calls, so to fix a rejected "
+            "slice re-call with ONLY that corrected slice — the others are kept."
         ),
         min_length=1,
         max_length=_MAX_FEATURE_SLICES,
@@ -577,10 +580,11 @@ class _StructuredWritePlanInput(BaseModel):
             mappings = mappings[:_MAX_FEATURE_SLICES]
         return mappings
     testing_strategy: str = Field(
+        default="",
         description=(
             "Test approach — prose paragraph: which tests to add/modify, test file "
             "paths, and how to verify correctness."
-        )
+        ),
     )
     risks: list[str] = Field(
         default_factory=list,
@@ -617,24 +621,81 @@ class StructuredWritePlanTool(BaseTool):
 
     workspace_root: str = ""
     plan_dir: str = ""
+    # Accumulates fields/slices across retries within a single synthesizer run so
+    # the model can PATCH a rejected slice (re-submit only it) instead of
+    # re-emitting the whole plan every retry (trace 019edd41: a missing prose
+    # field forced full ~78K-token plan regenerations until it passed).
+    _cache: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     def _run(
         self,
-        architecture_overview: str,
-        feature_slices: list[_FeatureSliceInput | dict[str, Any]],
-        testing_strategy: str,
+        architecture_overview: str = "",
+        feature_slices: list[_FeatureSliceInput | dict[str, Any]] | None = None,
+        testing_strategy: str = "",
         technology_choices: list[str] | None = None,
         risks: list[str] | None = None,
         codebase_map: str = "",
     ) -> str:
-        # Pydantic may pass either model instances or raw dicts depending on
-        # the call site — coerce dicts so we can rely on attribute access.
-        validated_slices: list[_FeatureSliceInput] = [
-            sl if isinstance(sl, _FeatureSliceInput) else _FeatureSliceInput(**sl)
-            for sl in feature_slices
-        ]
-        tech_choices = [c.strip() for c in (technology_choices or []) if c and c.strip()]
-        risk_items = [r.strip() for r in (risks or []) if r and r.strip()]
+        # ── Merge this call over the running cache ──────────────────────
+        # Each non-empty field overrides the cached one; feature_slices merge BY
+        # ID (submitted slices replace/add; previously-submitted ones are kept).
+        # So a retry to fix one slice need only send that slice.
+        def _slice_dict(sl: Any) -> dict[str, Any]:
+            if isinstance(sl, dict):
+                return sl
+            return sl.model_dump() if hasattr(sl, "model_dump") else dict(sl)
+
+        cached_slices: dict[str, dict[str, Any]] = dict(self._cache.get("slices", {}))
+        seen_this_call: set[str] = set()
+        for sl in feature_slices or []:
+            d = _slice_dict(sl)
+            sid = (d.get("id") or "").strip()
+            # Duplicate ids WITHIN one call are a mistake (re-submitting the same
+            # slice id across SEPARATE calls is the intended patch path).
+            if sid and sid in seen_this_call:
+                return (
+                    f"VALIDATION_ERROR: duplicate slice id '{sid}' in this call. "
+                    "Each slice needs a unique id."
+                )
+            if sid:
+                seen_this_call.add(sid)
+                cached_slices[sid] = d
+        arch = architecture_overview.strip() or self._cache.get("architecture_overview", "")
+        test = testing_strategy.strip() or self._cache.get("testing_strategy", "")
+        tech_choices = [c.strip() for c in (technology_choices or []) if c and c.strip()] \
+            or list(self._cache.get("technology_choices", []))
+        risk_items = [r.strip() for r in (risks or []) if r and r.strip()] \
+            or list(self._cache.get("risks", []))
+        cmap = codebase_map.strip() or self._cache.get("codebase_map", "")
+        # Persist the accumulated state so the next (partial) call builds on it.
+        self._cache = {
+            "slices": cached_slices,
+            "architecture_overview": arch,
+            "testing_strategy": test,
+            "technology_choices": tech_choices,
+            "risks": risk_items,
+            "codebase_map": cmap,
+        }
+        architecture_overview, testing_strategy, codebase_map = arch, test, cmap
+
+        if not cached_slices:
+            return (
+                "ERROR: no feature_slices yet. Provide at least one slice "
+                "(id, title, target_files, execution_requirements, "
+                "acceptance_criteria). Prior fields are retained across calls."
+            )
+        # Coerce merged slice dicts; report which slice is malformed rather than
+        # surfacing a raw nested Pydantic error.
+        validated_slices: list[_FeatureSliceInput] = []
+        for sid, d in cached_slices.items():
+            try:
+                validated_slices.append(_FeatureSliceInput(**d))
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    f"VALIDATION_ERROR: slice '{sid}' is malformed: {exc}\n"
+                    "Re-call write_structured_plan with ONLY that corrected "
+                    "slice — the other slices and fields are retained."
+                )
 
         # Run the same structural validation the downstream scheduler will run
         # (unique IDs, dependency integrity, no cycles). Pulling it upstream
@@ -662,7 +723,9 @@ class StructuredWritePlanTool(BaseTool):
         except ValueError as exc:
             return (
                 f"VALIDATION_ERROR: plan rejected before writing.\n{exc}\n"
-                "Fix the structural issue and call write_structured_plan again."
+                "Re-call write_structured_plan with ONLY the slice(s) that need "
+                "fixing (e.g. correct a bad dependency id) — all other slices "
+                "and fields are retained from your previous calls."
             )
 
         # ── Prepare output directory ──────────────────────────────────
@@ -736,6 +799,7 @@ class StructuredWritePlanTool(BaseTool):
             return f"ERROR: Could not write plan.json: {exc}"
 
         slice_count = len(validated_slices)
+        self._cache = {}  # plan landed — reset so a later plan starts clean
         # ForceToolUntilCalledMiddleware treats any result not starting with
         # VALIDATION_ERROR/ERROR as a successful write — keep failure strings
         # on those prefixes (trace 019eb43f).

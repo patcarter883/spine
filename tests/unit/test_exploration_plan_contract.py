@@ -235,6 +235,13 @@ async def test_synthesize_plan_inlines_spec_into_prompt(
 
     monkeypatch.setattr(es, "ainvoke_with_retry", _fake_invoke)
 
+    # Force the monolithic path — this test asserts on the monolithic prompt's
+    # inlined spec; the decomposed synthesizer (tried first) would bypass it.
+    async def _no_decomposed(*a, **k):
+        return False
+
+    monkeypatch.setattr(es, "_try_decomposed_plan", _no_decomposed)
+
     await es._synthesize_plan(_state(tmp_path), None)
 
     prompt = captured[0]["messages"][0]["content"]

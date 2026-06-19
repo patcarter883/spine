@@ -160,60 +160,97 @@ async def call_plan(
     logger.info(f"[{work_id}] PLAN phase starting (retry={retry_count})")
 
     try:
-        agent = build_plan_agent(state, config)
-
-        # Materialize prior artifacts to disk
+        # Materialize prior artifacts to disk (spec.md, findings) so both the
+        # decomposed synthesizer and the agent fallback can read them.
         materialize_artifacts(state, workspace_root, work_id=work_id)
 
-        # Build prompt — specification is on disk at work_id-scoped path.
-        # The original description is intentionally NOT re-included — the
-        # specification file already captures and expands on it.
-        rework_prefix = ""
-        if retry_count > 0:
-            rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior plan. Address all points from the critic feedback.\n\n"
-
         spec_path = artifact_path(work_id, PhaseName.SPECIFY.value)
+        plan_dir = artifact_path(work_id, PhaseName.PLAN.value)
+        spec_md_path = Path(workspace_root) / spec_path / "specification.md"
 
-        # Check if spec exists to formulate the exact dynamic spec instruction
-        has_spec = True
-        if state.get("artifacts", {}).get(PhaseName.SPECIFY.value):
-            has_spec = True
+        plan_content: str | None = None
 
-        spec_instruction = (
-            f"The full specification is available on disk at `{spec_path}/specification.md` "
-            "and is also loaded by `read_prior_artifacts` under "
-            "`artifacts.specify['specification.md']`. Use it as the source of truth — "
-            "the upstream exploration subgraph has already dispatched researchers "
-            "against the spec; their findings are in your context.\n\n"
-            if has_spec
-            else "No prior artifacts found. Work directly from the description returned by `read_prior_artifacts`.\n\n"
-        )
+        # ── Decomposed synthesis (manager skeleton → per-slice workers) ──
+        # Asking a local 30B to emit the WHOLE plan in one forced structured
+        # call spins / degenerates (trace 019edd7c: 24 calls / 1.77M tokens;
+        # later: a single slice with 250+ duplicate target_files). Decompose it
+        # like onboarding doc synthesis: small per-slice calls, no single call
+        # produces the whole plan. Used on ALL attempts (rework feedback is
+        # threaded into the manager); only an outright failure falls back to the
+        # monolithic agent.
+        if spec_md_path.exists():
+            try:
+                from spine.agents.plan_synthesis import synthesize_plan
 
-        prompt = (
-            rework_prefix
-            + "Create a detailed technical plan based on the specification.\n\n"
-            + spec_instruction
-        )
-        if retry_count > 0 and feedback:
-            feedback_text = "\n".join(
-                f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
-                for f in feedback
-                if isinstance(f, dict)
+                spec_md = spec_md_path.read_text(encoding="utf-8")
+                feedback_text = "\n".join(
+                    f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
+                    for f in feedback
+                    if isinstance(f, dict)
+                ) if (retry_count > 0 and feedback) else ""
+                syn = await synthesize_plan(
+                    state, config, spec_md, workspace_root, plan_dir,
+                    feedback=feedback_text,
+                )
+                if not syn.startswith(("ERROR", "VALIDATION_ERROR")):
+                    pm = Path(workspace_root) / plan_dir / "plan.md"
+                    plan_content = pm.read_text(encoding="utf-8") if pm.exists() else syn
+                    logger.info("[%s] PLAN: decomposed synthesis succeeded", work_id)
+                else:
+                    logger.warning(
+                        "[%s] PLAN: decomposed synthesis rejected (%s) — agent fallback",
+                        work_id, syn[:120],
+                    )
+            except Exception as exc:  # noqa: BLE001 — fall back, never block PLAN
+                logger.warning(
+                    "[%s] PLAN: decomposed synthesis errored (%s) — agent fallback",
+                    work_id, exc,
+                )
+
+        # ── Monolithic agent fallback (rework passes + synthesis failure) ──
+        if plan_content is None:
+            agent = build_plan_agent(state, config)
+
+            rework_prefix = ""
+            if retry_count > 0:
+                rework_prefix = "⚠ **REWORK PASS**: Your primary objective is to revise the prior plan. Address all points from the critic feedback.\n\n"
+
+            has_spec = bool(state.get("artifacts", {}).get(PhaseName.SPECIFY.value))
+            spec_instruction = (
+                f"The full specification is available on disk at `{spec_path}/specification.md` "
+                "and is also loaded by `read_prior_artifacts` under "
+                "`artifacts.specify['specification.md']`. Use it as the source of truth — "
+                "the upstream exploration subgraph has already dispatched researchers "
+                "against the spec; their findings are in your context.\n\n"
+                if has_spec
+                else "No prior artifacts found. Work directly from the description returned by `read_prior_artifacts`.\n\n"
             )
-            prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
-        ctx = build_context(state, PhaseName.PLAN)
+            prompt = (
+                rework_prefix
+                + "Create a detailed technical plan based on the specification.\n\n"
+                + spec_instruction
+            )
+            if retry_count > 0 and feedback:
+                feedback_text = "\n".join(
+                    f"- [{f.get('tier', 'unknown')}] {f.get('reason', '')}"
+                    for f in feedback
+                    if isinstance(f, dict)
+                )
+                prompt += f"## Previous Review Feedback\n{feedback_text}\n"
 
-        result = await ainvoke_with_retry(
-            agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            phase_name=PhaseName.PLAN.value,
-            work_id=work_id,
-            work_type=work_type,
-            context=ctx,
-        )
+            ctx = build_context(state, PhaseName.PLAN)
 
-        plan_content = extract_response(result)
+            result = await ainvoke_with_retry(
+                agent,
+                {"messages": [{"role": "user", "content": prompt}]},
+                phase_name=PhaseName.PLAN.value,
+                work_id=work_id,
+                work_type=work_type,
+                context=ctx,
+            )
+
+            plan_content = extract_response(result)
 
         # Materialize this phase's artifacts to disk immediately.
         # plan.md is the narrative artifact produced by the agent; plan.json
