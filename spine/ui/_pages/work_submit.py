@@ -44,7 +44,7 @@ def render(api: UIApi) -> None:
         options=["task", "critical_task"],
         format_func=lambda x: {
             "task": "⚡ Task (SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY)",
-            "critical_task": "🔒 Critical Task (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY)",
+            "critical_task": "🔒 Critical Task (SPECIFY → PLAN → CRITIC_PLAN → ADVERSARIAL_PLAN → IMPLEMENT → VERIFY)",
         }.get(x, x),
     )
 
@@ -73,11 +73,11 @@ def render(api: UIApi) -> None:
         "Type": ["Task", "Critical Task"],
         "Phases": [
             "SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY",
-            "SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → IMPLEMENT → VERIFY",
+            "SPECIFY → PLAN → CRITIC_PLAN → ADVERSARIAL_PLAN → IMPLEMENT → VERIFY",
         ],
         "Best For": [
             "Standard tasks with full workflow",
-            "Important tasks needing extra critic review",
+            "Important tasks needing adversarial red-team review of the plan",
         ],
     }
     st.table(workflow_data)

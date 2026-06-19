@@ -1,7 +1,8 @@
 """SPINE Spec & Planning page — review and approve specifications and plans.
 
 This page is the interface for the planning workflow. Users can:
-1. Submit new planning work (spec+plan with approval gate after critic_plan)
+1. Submit new planning work (spec+plan with approval gate after critic_plan,
+   plus an adversarial red-team stage for critical workflows)
 2. View existing planning work items awaiting review
 3. Review and approve specifications and plans
 4. Spawn execution tasks from approved plans
@@ -65,9 +66,13 @@ def _render_submit_tab(api: UIApi) -> None:
         options=["reviewed_task", "critical_reviewed_task"],
         format_func=lambda x: {
             "reviewed_task": "📋 Reviewed Task (SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs)",
-            "critical_reviewed_task": "📐 Critical Reviewed Task (SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs)",
+            "critical_reviewed_task": "📐 Critical Reviewed Task (SPECIFY → PLAN → CRITIC_PLAN → ADVERSARIAL_PLAN → await approval → spawn TASKs)",
         }.get(x, x),
-        help="Planning workflows stop after the critic_plan phase. On approval, fresh task work items are spawned for execution.",
+        help=(
+            "Reviewed Task stops after critic_plan; Critical Reviewed Task adds an "
+            "adversarial red-team stage and stops after adversarial_plan. On approval, "
+            "fresh task work items are spawned for execution."
+        ),
     )
 
     if st.button("🚀 Submit Planning Work", type="primary", disabled=not description.strip()):
@@ -95,7 +100,7 @@ def _render_submit_tab(api: UIApi) -> None:
     | Type | Phases | Use Case |
     |------|--------|----------|
     | **Reviewed Task** | SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs | Standard planning with plan review |
-    | **Critical Reviewed Task** | SPECIFY → CRITIC_SPECIFY → PLAN → CRITIC_PLAN → await approval → spawn TASKs | Full planning with spec critic review |
+    | **Critical Reviewed Task** | SPECIFY → PLAN → CRITIC_PLAN → ADVERSARIAL_PLAN → await approval → spawn TASKs | Full planning with an adversarial red-team review of the approved plan |
 
     On approval, fresh ``task`` work items are spawned for each unit and run
     through their own implement/verify cycle. The reviewed-task graph itself

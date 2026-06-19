@@ -22,18 +22,18 @@ _PHASE_SEQUENCE: dict[str, list[str]] = {
     "task": ["specify", "plan", "critic_plan", "implement", "verify"],
     "critical_task": [
         "specify",
-        "critic_specify",
         "plan",
         "critic_plan",
+        "adversarial_plan",
         "implement",
         "verify",
     ],
     "reviewed_task": ["specify", "plan", "critic_plan"],
     "critical_reviewed_task": [
         "specify",
-        "critic_specify",
         "plan",
         "critic_plan",
+        "adversarial_plan",
     ],
 }
 
@@ -44,6 +44,8 @@ _PHASE_EMOJI = {
     "critic_specify": "🔍",
     "critic_plan": "🔍",
     "critic_tasks": "🔍",
+    "adversarial": "⚔️",
+    "adversarial_plan": "⚔️",
     "tasks": "📦",
     "implement": "🛠️",
     "verify": "✅",
@@ -73,9 +75,12 @@ def _render_phase_bar(phases: list[str], current: str) -> None:
 
     for i, (col, phase) in enumerate(zip(cols, phases)):
         icon = _PHASE_EMOJI.get(phase, "⚙️")
-        # Pretty label: "critic_plan" → "𝘊 Plan", "specify" → "Specify"
+        # Pretty label: "critic_plan" → "𝘊 Plan", "adversarial_plan" →
+        # "𝘈 Plan" (red-team), "specify" → "Specify".
         if phase.startswith("critic_"):
             label = f"𝘊 {phase[len('critic_') :].title()}"
+        elif phase.startswith("adversarial_"):
+            label = f"𝘈 {phase[len('adversarial_') :].title()}"
         else:
             label = phase.title()
         if current_idx < 0:
