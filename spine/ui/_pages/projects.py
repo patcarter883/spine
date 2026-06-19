@@ -30,6 +30,35 @@ _PHASE_COLORS = {
     "in_progress": "orange",
     "pending": "gray",
 }
+_VERDICT_COLORS = {
+    "VERIFIED": "green",
+    "PARTIAL": "orange",
+    "FAILED": "red",
+    "PASSED": "green",
+    "NEEDS_REVISION": "orange",
+    "NEEDS_REVIEW": "red",
+}
+_SEVERITY_COLORS = {
+    "CRITICAL": "red",
+    "HIGH": "orange",
+    "MEDIUM": "blue",
+    "LOW": "gray",
+}
+
+
+def _project_health_badge(verify_result: dict | None, review_result: dict | None) -> str:
+    """Return an emoji health badge based on the last pipeline results."""
+    if verify_result is None and review_result is None:
+        return "⚪"
+    v_verdict = (verify_result or {}).get("overall_verdict", "")
+    r_verdict = (review_result or {}).get("verdict", "")
+    if v_verdict == "FAILED" or r_verdict == "NEEDS_REVIEW":
+        return "🔴"
+    if v_verdict == "PARTIAL" or r_verdict == "NEEDS_REVISION":
+        return "🟡"
+    if v_verdict == "VERIFIED":
+        return "🟢"
+    return "⚪"
 
 
 # ── Spec-editor helpers (shared by create + edit) ──
@@ -146,12 +175,18 @@ def _render_project_list(api: UIApi) -> None:
         return
 
     for proj in projects:
-        col1, col2, col3, col4 = st.columns([3, 5, 1, 1])
-        col1.markdown(f"**{proj['id']}**")
+        pid = proj["id"]
+        verify_result = api.get_project_verification(pid)
+        review_result = api.get_project_review(pid)
+        badge = _project_health_badge(verify_result, review_result)
+
+        col1, col2, col3, col4, col5 = st.columns([3, 5, 1, 1, 1])
+        col1.markdown(f"**{pid}**")
         col2.write(proj.get("title", ""))
         col3.write(f"👥 {proj.get('members', 0)}")
-        if col4.button("View", key=f"view_{proj['id']}"):
-            st.switch_page(get_page("projects"), query_params={"project_id": proj["id"]})
+        col4.write(badge)
+        if col5.button("View", key=f"view_{pid}"):
+            st.switch_page(get_page("projects"), query_params={"project_id": pid})
 
 
 def _render_create_form(api: UIApi) -> None:
@@ -286,6 +321,118 @@ def _render_members(api: UIApi, project_id: str) -> None:
             )
 
 
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_verification_panel(api: UIApi, project_id: str) -> None:
+    """Auto-refreshing integration verification results panel."""
+    st.subheader("Integration Verification")
+    result = api.get_project_verification(project_id)
+
+    if result:
+        verdict = result.get("overall_verdict", "—")
+        color = _VERDICT_COLORS.get(verdict, "gray")
+        ts = result.get("run_at", "")[:19].replace("T", " ")
+        summary = result.get("summary", {})
+
+        st.markdown(
+            f":{color}[**{verdict}**]  —  "
+            f"{summary.get('verified', 0)} verified · "
+            f"{summary.get('partial', 0)} partial · "
+            f"{summary.get('failed', 0)} failed  "
+            f"<span style='color:gray;font-size:0.85em'>{ts} UTC</span>",
+            unsafe_allow_html=True,
+        )
+
+        phase_results = result.get("phase_results", [])
+        if phase_results:
+            for pr in phase_results:
+                pv = pr.get("verdict", "—")
+                pc = _VERDICT_COLORS.get(pv, "gray")
+                n_gaps = len(pr.get("integration_gaps", [])) + sum(
+                    len(r.get("gaps", [])) for r in pr.get("requirement_results", [])
+                )
+                label = (
+                    f":{pc}[{pv}] — **{pr.get('phase_id', '?')}** "
+                    f"({n_gaps} gap(s))"
+                )
+                if pv != "VERIFIED":
+                    with st.expander(label):
+                        st.write(pr.get("summary", ""))
+                        if pr.get("integration_gaps"):
+                            st.markdown("**Integration gaps:**")
+                            for g in pr["integration_gaps"]:
+                                st.markdown(f"- {g}")
+                        if pr.get("recommendations"):
+                            st.markdown("**Recommendations:**")
+                            for rec in pr["recommendations"]:
+                                st.markdown(f"- {rec}")
+                else:
+                    st.markdown(f"- {label}")
+    else:
+        st.info("No integration verification run yet.")
+
+    if st.button("▶ Run Verification", key=f"run_verify_{project_id}"):
+        with st.spinner("Running integration verification… this may take a few minutes."):
+            res = api.run_project_verify(project_id)
+        if "error" in res:
+            st.error(f"Verification failed: {res['error']}")
+        else:
+            st.success(f"Verification complete: {res.get('overall_verdict', '—')}")
+            st.rerun()
+
+
+@st.fragment(run_every=_POLL_INTERVAL)
+def _render_review_panel(api: UIApi, project_id: str) -> None:
+    """Auto-refreshing adversarial review results panel."""
+    st.subheader("Adversarial Review")
+    result = api.get_project_review(project_id)
+
+    if result:
+        verdict = result.get("verdict", "—")
+        color = _VERDICT_COLORS.get(verdict, "gray")
+        ts = result.get("run_at", "")[:19].replace("T", " ")
+        counts = result.get("finding_counts", {})
+        total = len(result.get("findings", []))
+
+        st.markdown(
+            f":{color}[**{verdict}**]  —  {total} finding(s): "
+            f"<span style='color:red'>{counts.get('critical', 0)}C</span> "
+            f"<span style='color:orange'>{counts.get('high', 0)}H</span> "
+            f"{counts.get('medium', 0)}M {counts.get('low', 0)}L  "
+            f"<span style='color:gray;font-size:0.85em'>{ts} UTC</span>",
+            unsafe_allow_html=True,
+        )
+
+        if result.get("summary"):
+            with st.expander("Summary"):
+                st.write(result["summary"])
+
+        findings = result.get("findings", [])
+        if findings:
+            for i, f in enumerate(findings):
+                sev = f.get("severity", "LOW")
+                sc = _SEVERITY_COLORS.get(sev, "gray")
+                req = f.get("requirement_id") or ""
+                req_label = f" · {req}" if req else ""
+                label = (
+                    f":{sc}[{sev}] **{f.get('category', '')}**{req_label} — "
+                    f"{truncate(f.get('description', ''), 70)}"
+                )
+                with st.expander(label):
+                    st.markdown(f"**Evidence:** {f.get('evidence', '')}")
+                    st.markdown(f"**Recommendation:** {f.get('recommendation', '')}")
+    else:
+        st.info("No adversarial review run yet.")
+
+    if st.button("▶ Run Adversarial Review", key=f"run_review_{project_id}"):
+        with st.spinner("Running adversarial review… this may take a few minutes."):
+            res = api.run_project_review(project_id)
+        if "error" in res:
+            st.error(f"Review failed: {res['error']}")
+        else:
+            st.success(f"Review complete: {res.get('verdict', '—')}")
+            st.rerun()
+
+
 def _render_management(api: UIApi, project_id: str, spec: dict) -> None:
     """Add/remove members, edit the spec, and delete the project."""
     members = list(spec.get("member_work_ids", []))
@@ -410,6 +557,12 @@ def _render_detail_view(api: UIApi, project_id: str) -> None:
 
     st.divider()
     _render_coverage(api, project_id)
+
+    st.divider()
+    _render_verification_panel(api, project_id)
+
+    st.divider()
+    _render_review_panel(api, project_id)
 
     st.divider()
     _render_members(api, project_id)

@@ -738,6 +738,42 @@ def project_show(project_id: str, config_path: str) -> None:
         ]
         console.print(Panel("\n".join(lines), title="Roadmap Phases"))
 
+    # Show last verification and review results if present
+    verify_result = store.load_result(project_id, "project_verification.json")
+    review_result = store.load_result(project_id, "project_review.json")
+
+    if verify_result or review_result:
+        verdict_colors = {
+            "VERIFIED": "green", "PARTIAL": "yellow", "FAILED": "red",
+            "PASSED": "green", "NEEDS_REVISION": "yellow", "NEEDS_REVIEW": "red",
+        }
+        lines = []
+        if verify_result:
+            v = verify_result.get("overall_verdict", "—")
+            ts = verify_result.get("run_at", "")[:19].replace("T", " ")
+            color = verdict_colors.get(v, "white")
+            s = verify_result.get("summary", {})
+            lines.append(
+                f"Integration verify: [{color}]{v}[/{color}] "
+                f"({s.get('verified', 0)} verified, {s.get('partial', 0)} partial, "
+                f"{s.get('failed', 0)} failed phases)  [dim]{ts}[/dim]"
+            )
+        if review_result:
+            v = review_result.get("verdict", "—")
+            ts = review_result.get("run_at", "")[:19].replace("T", " ")
+            color = verdict_colors.get(v, "white")
+            counts = review_result.get("finding_counts", {})
+            total = len(review_result.get("findings", []))
+            lines.append(
+                f"Adversarial review: [{color}]{v}[/{color}] "
+                f"({total} finding(s): "
+                f"[red]{counts.get('critical', 0)}C[/red] "
+                f"[yellow]{counts.get('high', 0)}H[/yellow] "
+                f"{counts.get('medium', 0)}M {counts.get('low', 0)}L)  "
+                f"[dim]{ts}[/dim]"
+            )
+        console.print(Panel("\n".join(lines), title="Pipeline Results"))
+
 
 @project.command(name="list")
 @click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
@@ -762,3 +798,133 @@ def project_list(config_path: str) -> None:
             continue
         table.add_row(spec.id, spec.title, str(len(spec.member_work_ids)))
     console.print(table)
+
+
+@project.command(name="verify")
+@click.argument("project_id")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def project_verify(project_id: str, config_path: str) -> None:
+    """Run integration verification for PROJECT_ID.
+
+    Confirms that each roadmap phase's requirements are truly satisfied
+    by the combined codebase — beyond per-member VERIFY checks.
+    Results are persisted and shown in 'project show'.
+    """
+    from spine.persistence.project_store import ProjectStore
+    from spine.project.project_verifier import run_project_verify
+
+    config = SpineConfig.load(path=config_path)
+    store = ProjectStore(base_path=config.project_path)
+
+    if store.load_project(project_id) is None:
+        console.print(f"[bold red]Project '{project_id}' not found.[/bold red]")
+        sys.exit(1)
+
+    console.print(f"[dim]Running integration verification for '{project_id}'…[/dim]")
+
+    result = asyncio.run(run_project_verify(project_id, config))
+
+    if "error" in result:
+        console.print(f"[bold red]Verification failed:[/bold red] {result['error']}")
+        sys.exit(1)
+
+    verdict = result.get("overall_verdict", "—")
+    verdict_colors = {"VERIFIED": "green", "PARTIAL": "yellow", "FAILED": "red"}
+    color = verdict_colors.get(verdict, "white")
+    summary = result.get("summary", {})
+
+    console.print(
+        Panel(
+            f"Overall verdict: [{color}]{verdict}[/{color}]\n"
+            f"Phases verified: {summary.get('verified', 0)}  "
+            f"partial: {summary.get('partial', 0)}  "
+            f"failed: {summary.get('failed', 0)}",
+            title=f"Integration Verification: {project_id}",
+        )
+    )
+
+    phase_results = result.get("phase_results", [])
+    if phase_results:
+        table = Table(title="Phase Verdicts")
+        table.add_column("Phase", style="bold")
+        table.add_column("Verdict")
+        table.add_column("Gaps")
+        for pr in phase_results:
+            v = pr.get("verdict", "—")
+            c = verdict_colors.get(v, "white")
+            n_gaps = len(pr.get("integration_gaps", [])) + sum(
+                len(r.get("gaps", [])) for r in pr.get("requirement_results", [])
+            )
+            table.add_row(
+                pr.get("phase_id", "?"),
+                f"[{c}]{v}[/{c}]",
+                str(n_gaps),
+            )
+        console.print(table)
+
+
+@project.command(name="review")
+@click.argument("project_id")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def project_review(project_id: str, config_path: str) -> None:
+    """Run an adversarial review for PROJECT_ID.
+
+    Red-teams the completed project holistically: integration gaps,
+    unimplemented requirements, hidden assumptions, and cross-member
+    contradictions.  Results are persisted and shown in 'project show'.
+    """
+    from spine.persistence.project_store import ProjectStore
+    from spine.project.project_reviewer import run_project_review
+
+    config = SpineConfig.load(path=config_path)
+    store = ProjectStore(base_path=config.project_path)
+
+    if store.load_project(project_id) is None:
+        console.print(f"[bold red]Project '{project_id}' not found.[/bold red]")
+        sys.exit(1)
+
+    console.print(f"[dim]Running adversarial review for '{project_id}'…[/dim]")
+
+    result = asyncio.run(run_project_review(project_id, config))
+
+    if "error" in result:
+        console.print(f"[bold red]Review failed:[/bold red] {result['error']}")
+        sys.exit(1)
+
+    verdict = result.get("verdict", "—")
+    verdict_colors = {"PASSED": "green", "NEEDS_REVISION": "yellow", "NEEDS_REVIEW": "red"}
+    color = verdict_colors.get(verdict, "white")
+    findings = result.get("findings", [])
+    counts = result.get("finding_counts", {})
+
+    console.print(
+        Panel(
+            f"Verdict: [{color}]{verdict}[/{color}]\n"
+            f"Findings: {len(findings)} total — "
+            f"[red]{counts.get('critical', 0)}C[/red] "
+            f"[yellow]{counts.get('high', 0)}H[/yellow] "
+            f"{counts.get('medium', 0)}M {counts.get('low', 0)}L\n\n"
+            + result.get("summary", ""),
+            title=f"Adversarial Review: {project_id}",
+        )
+    )
+
+    if findings:
+        table = Table(title="Findings")
+        table.add_column("Severity", style="bold")
+        table.add_column("Category")
+        table.add_column("Req")
+        table.add_column("Description")
+        severity_colors = {
+            "CRITICAL": "red", "HIGH": "yellow", "MEDIUM": "cyan", "LOW": "dim"
+        }
+        for f in findings:
+            sev = f.get("severity", "LOW")
+            sc = severity_colors.get(sev, "white")
+            table.add_row(
+                f"[{sc}]{sev}[/{sc}]",
+                f.get("category", ""),
+                f.get("requirement_id", "—"),
+                f.get("description", "")[:70],
+            )
+        console.print(table)

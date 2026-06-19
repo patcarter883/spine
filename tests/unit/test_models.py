@@ -255,7 +255,7 @@ class TestEnums:
         """Test that we can iterate over enum values."""
         # Test PhaseName
         phases = list(PhaseName)
-        assert len(phases) == 8
+        assert len(phases) == 10
         assert PhaseName.SPECIFY in phases
         assert PhaseName.ADVERSARIAL in phases
 

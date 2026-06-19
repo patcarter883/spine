@@ -16,6 +16,8 @@ class PhaseName(str, Enum):
     CRITIC = "critic"
     ADVERSARIAL = "adversarial"
     GAP_PLAN = "gap_plan"
+    PROJECT_VERIFY = "project_verify"
+    PROJECT_REVIEW = "project_review"
 
 
 class WorkType(str, Enum):

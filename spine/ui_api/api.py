@@ -87,6 +87,44 @@ class UIApi:
 
         return asyncio.run(aggregate_project_coverage(spec, self._config))
 
+    def get_project_verification(self, project_id: str) -> dict[str, Any] | None:
+        """Return the last project_verification.json result, or None."""
+        return self._projects.load_result(project_id, "project_verification.json")
+
+    def get_project_review(self, project_id: str) -> dict[str, Any] | None:
+        """Return the last project_review.json result, or None."""
+        return self._projects.load_result(project_id, "project_review.json")
+
+    def run_project_verify(self, project_id: str) -> dict[str, Any]:
+        """Run the integration verification pipeline for a project.
+
+        Blocks until complete (wraps async pipeline with asyncio.run).
+        Returns the result dict, or ``{"error": ...}`` on failure.
+        """
+        import asyncio
+
+        from spine.project.project_verifier import run_project_verify
+
+        try:
+            return asyncio.run(run_project_verify(project_id, self._config))
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def run_project_review(self, project_id: str) -> dict[str, Any]:
+        """Run the adversarial review pipeline for a project.
+
+        Blocks until complete (wraps async pipeline with asyncio.run).
+        Returns the result dict, or ``{"error": ...}`` on failure.
+        """
+        import asyncio
+
+        from spine.project.project_reviewer import run_project_review
+
+        try:
+            return asyncio.run(run_project_review(project_id, self._config))
+        except Exception as exc:
+            return {"error": str(exc)}
+
     # ── Project operations (write) ──
 
     def create_project(

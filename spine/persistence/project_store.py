@@ -224,6 +224,40 @@ class ProjectStore:
                 self.save_project(spec)
             return spec
 
+    def save_result(self, project_id: str, filename: str, data: dict) -> Path:
+        """Atomically persist a project-level result JSON file.
+
+        Follows the same tmp→replace pattern as :meth:`save_project` so a
+        crash mid-write never leaves a half-written file.
+
+        Args:
+            project_id: The project slug.
+            filename: Filename within the project dir (e.g.
+                ``"project_verification.json"``).
+            data: JSON-serialisable dict to persist.
+
+        Returns:
+            The path to the written file.
+        """
+        project_dir = self._project_dir(project_id)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        target = project_dir / filename
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
+        return target
+
+    def load_result(self, project_id: str, filename: str) -> dict | None:
+        """Load a project-level result JSON file, or None if absent/unreadable."""
+        path = self._project_dir(project_id) / filename
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
     def delete_project(self, project_id: str) -> bool:
         """Delete a project's on-disk directory.
 
