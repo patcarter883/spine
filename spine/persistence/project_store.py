@@ -144,6 +144,55 @@ class ProjectStore:
                 self.save_project(spec)
             return spec
 
+    def add_phase_members(
+        self, project_id: str, phase_id: str, work_ids: list[str]
+    ) -> ProjectSpec:
+        """Assign work_ids to a roadmap phase (and the project's membership).
+
+        A phase's ``member_work_ids`` is by definition a subset of the
+        project's ``member_work_ids``, so this idempotently unions the ids into
+        BOTH the project membership and the named phase — there is no way for a
+        work item to be a phase member without also being a project member.
+        Order is preserved and existing members are not duplicated; bumps
+        ``updated_at`` only when something actually changed.
+
+        Raises:
+            KeyError: if the project does not exist.
+            ValueError: if the project has no phase with ``phase_id``.
+        """
+        with self._project_lock(project_id):
+            spec = self.load_project(project_id)
+            if spec is None:
+                raise KeyError(f"Project '{project_id}' not found")
+
+            phase = next((p for p in spec.roadmap.phases if p.id == phase_id), None)
+            if phase is None:
+                raise ValueError(
+                    f"Project '{project_id}' has no roadmap phase '{phase_id}'"
+                )
+
+            changed = False
+            # Dedupe within the request too, so passing the same id twice in one
+            # call doesn't append it twice.
+            requested = list(dict.fromkeys(w for w in work_ids if w))
+
+            project_existing = set(spec.member_work_ids)
+            project_added = [w for w in requested if w not in project_existing]
+            if project_added:
+                spec.member_work_ids = spec.member_work_ids + project_added
+                changed = True
+
+            phase_existing = set(phase.member_work_ids)
+            phase_added = [w for w in requested if w not in phase_existing]
+            if phase_added:
+                phase.member_work_ids = phase.member_work_ids + phase_added
+                changed = True
+
+            if changed:
+                spec.updated_at = datetime.now().isoformat()
+                self.save_project(spec)
+            return spec
+
     def remove_members(self, project_id: str, work_ids: list[str]) -> ProjectSpec:
         """Remove work_ids from a project's membership (set difference).
 

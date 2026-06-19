@@ -52,6 +52,13 @@ def main(ctx: click.Context, verbose: bool) -> None:
     "Pass --start to run immediately instead.",
 )
 @click.option(
+    "--phase",
+    "phase_id",
+    default=None,
+    help="Assign this work item to a roadmap phase of --project (adds it to the "
+    "phase's member_work_ids). Requires --project; the phase must already exist.",
+)
+@click.option(
     "--start/--no-start",
     "start",
     default=None,
@@ -70,6 +77,7 @@ def run(
     work_type: str,
     config_path: str,
     project_id: str | None,
+    phase_id: str | None,
     start: bool | None,
     debug_llm: bool,
 ) -> None:
@@ -89,6 +97,10 @@ def run(
 
         install_global()
 
+    if phase_id and not project_id:
+        console.print("[bold red]--phase requires --project.[/bold red]")
+        sys.exit(1)
+
     # Default: defer (create-only) for project work, run immediately otherwise.
     # An explicit --start / --no-start always wins.
     if start is None:
@@ -100,11 +112,20 @@ def run(
     console.print(f"[dim]Work type: {work_type}[/dim]")
     if project_id:
         console.print(f"[dim]Project: {project_id}[/dim]")
+    if phase_id:
+        console.print(f"[dim]Phase: {phase_id}[/dim]")
 
     from spine.work.dispatcher import submit_work
 
     result = asyncio.run(
-        submit_work(description, work_type, config, project_id=project_id, start=start)
+        submit_work(
+            description,
+            work_type,
+            config,
+            project_id=project_id,
+            phase_id=phase_id,
+            start=start,
+        )
     )
 
     if "error" in result:

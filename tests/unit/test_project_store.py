@@ -87,6 +87,57 @@ def test_list_projects_sorted(tmp_path):
     assert store.list_projects() == ["alpha", "beta"]
 
 
+def test_add_phase_members_joins_phase_and_project(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(
+        _spec(
+            member_work_ids=["w1"],
+            roadmap=Roadmap(phases=[RoadmapPhase(id="M-001", title="P1")]),
+        )
+    )
+
+    spec = store.add_phase_members("demo", "M-001", ["w2"])
+    # Joined the project membership (superset)...
+    assert spec.member_work_ids == ["w1", "w2"]
+    # ...and the phase membership (subset).
+    assert spec.roadmap.phases[0].member_work_ids == ["w2"]
+
+
+def test_add_phase_members_idempotent(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(
+        _spec(
+            member_work_ids=["w1"],
+            roadmap=Roadmap(
+                phases=[RoadmapPhase(id="M-001", title="P1", member_work_ids=["w1"])]
+            ),
+        )
+    )
+
+    spec = store.add_phase_members("demo", "M-001", ["w1", "w2", "w2"])
+    assert spec.member_work_ids == ["w1", "w2"]
+    assert spec.roadmap.phases[0].member_work_ids == ["w1", "w2"]
+
+
+def test_add_phase_members_unknown_project_raises(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    try:
+        store.add_phase_members("ghost", "M-001", ["w1"])
+    except KeyError:
+        return
+    raise AssertionError("expected KeyError for unknown project")
+
+
+def test_add_phase_members_unknown_phase_raises(tmp_path):
+    store = ProjectStore(base_path=str(tmp_path))
+    store.save_project(_spec(member_work_ids=["w1"]))
+    try:
+        store.add_phase_members("demo", "M-404", ["w1"])
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for unknown phase")
+
+
 def test_remove_members_set_difference(tmp_path):
     store = ProjectStore(base_path=str(tmp_path))
     store.save_project(_spec(member_work_ids=["w1", "w2", "w3"]))

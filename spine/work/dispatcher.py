@@ -229,6 +229,7 @@ async def submit_work(
     work_id: str | None = None,
     plan_id: str | None = None,
     project_id: str | None = None,
+    phase_id: str | None = None,
     start: bool = True,
 ) -> dict[str, Any]:
     """Submit a new work item for processing.
@@ -267,6 +268,11 @@ async def submit_work(
             ``plan_id`` — it is a project-membership back-reference, NOT a
             planning-source pointer, and the two never imply a hierarchy. When
             set, the work item is registered as a member of the project.
+        phase_id: Optional roadmap phase (within ``project_id``) to assign this
+            work item to. When set, the work item is added to that phase's
+            ``member_work_ids`` in addition to the project membership. Requires
+            ``project_id``; a missing project or unknown phase is logged and
+            skipped rather than failing the submission.
         start: When True (default), build and run the workflow graph inline.
             When False, only create the work entry (status ``pending``) and
             register project membership, then return without running — the
@@ -352,12 +358,18 @@ async def submit_work(
 
     # Register membership in the project store (source of truth). The DB column
     # above is only a reverse-lookup convenience. Missing project → warn, don't
-    # fail the submission.
+    # fail the submission. When a phase_id is given, route through
+    # add_phase_members so the item joins both the project and the phase in a
+    # single locked read-modify-write.
     if project_id:
         try:
             from spine.persistence.project_store import ProjectStore
 
-            ProjectStore(base_path=config.project_path).add_members(project_id, [work_id])
+            store = ProjectStore(base_path=config.project_path)
+            if phase_id:
+                store.add_phase_members(project_id, phase_id, [work_id])
+            else:
+                store.add_members(project_id, [work_id])
         except KeyError:
             logger.warning(
                 "Work %s submitted with project_id=%s but no such project exists; "
@@ -365,6 +377,27 @@ async def submit_work(
                 work_id,
                 project_id,
             )
+        except ValueError:
+            # Project exists but the phase does not — still record plain
+            # membership so the work isn't orphaned, then warn about the phase.
+            try:
+                store.add_members(project_id, [work_id])
+            except KeyError:
+                pass
+            logger.warning(
+                "Work %s submitted with project_id=%s phase_id=%s but that "
+                "project has no such phase; recorded project membership only.",
+                work_id,
+                project_id,
+                phase_id,
+            )
+    elif phase_id:
+        logger.warning(
+            "Work %s submitted with phase_id=%s but no project_id; phase "
+            "assignment ignored (a phase belongs to a project).",
+            work_id,
+            phase_id,
+        )
 
     # ── Create-only mode ──
     # When start is False the item is parked as ``pending`` for review in the
@@ -984,6 +1017,11 @@ async def resume_work(
 
                 data = chunk.get("data", {})
                 for node_name, node_output in data.items():
+                    # Only dict outputs carry mergeable state; non-dict payloads
+                    # (e.g. tuples from subgraph routing / multi-update super-
+                    # steps) would crash on .get() — skip them.
+                    if not isinstance(node_output, dict):
+                        continue
                     # Deep-merge artifacts
                     node_artifacts = node_output.get("artifacts")
                     if node_artifacts and isinstance(node_artifacts, dict):
@@ -1971,6 +2009,14 @@ async def _run_workflow_graph_inner(
 
         data = chunk.get("data", {})
         for node_name, node_output in data.items():
+            # Only dict outputs carry state updates we can merge. A node can also
+            # surface non-dict payloads in the "updates" stream (e.g. tuples from
+            # subgraph-internal routing / multi-update super-steps) — skip those
+            # rather than calling .get() on them (critic_plan emitted a tuple →
+            # 'tuple' object has no attribute 'get' at this line). Mirrors the
+            # guard in the primary streaming loop above.
+            if not isinstance(node_output, dict):
+                continue
             node_artifacts = node_output.get("artifacts")
             if node_artifacts and isinstance(node_artifacts, dict):
                 existing = result.get("artifacts", {})
