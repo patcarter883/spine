@@ -108,6 +108,51 @@ def test_oversized_get_source_is_not_truncated(tool_with_fake_backend):
     assert out == big
 
 
+def test_search_cap_for_subagent_is_phase_aware():
+    # Phase-aware: implementer/verifier stay tight; researcher gets breadth.
+    from spine.agents.tools.codebase_query import (
+        _SEARCH_RESULT_CHAR_CAP,
+        _SEARCH_RESULT_CHAR_CAP_RESEARCH,
+        search_cap_for_subagent,
+    )
+
+    assert search_cap_for_subagent("slice-implementer") == _SEARCH_RESULT_CHAR_CAP
+    assert search_cap_for_subagent("slice-verifier") == _SEARCH_RESULT_CHAR_CAP
+    assert search_cap_for_subagent("researcher") == _SEARCH_RESULT_CHAR_CAP_RESEARCH
+    assert search_cap_for_subagent(None) == _SEARCH_RESULT_CHAR_CAP_RESEARCH  # safe default
+    assert _SEARCH_RESULT_CHAR_CAP_RESEARCH > _SEARCH_RESULT_CHAR_CAP
+
+
+def test_research_cap_keeps_breadth_that_tight_cap_would_truncate():
+    # A result between the tight and research caps: truncated under the
+    # implementer cap, but passes through whole under the research cap.
+    from spine.agents.tools.codebase_query import (
+        _SEARCH_RESULT_CHAR_CAP_RESEARCH,
+        CodebaseQueryTool,
+    )
+
+    body = "match\n" * 1500  # ~9000 chars: between tight (4000) and research (16000)
+
+    def _wired(cap: int) -> CodebaseQueryTool:
+        cqt = CodebaseQueryTool(
+            workspace_root="/tmp/x", mcp_servers={}, search_result_char_cap=cap
+        )
+        cqt._tool_map = {
+            b: _make_fake_mcp_tool(b) for b in _ACTION_TO_MCP.values()
+        }
+        cqt._tool_map["mcp_codebase-index_search_codebase"].invoke = MagicMock(
+            return_value=body
+        )
+        return cqt
+
+    tight = _wired(4000)._run(action="search", pattern="m", max_results=5)
+    research = _wired(_SEARCH_RESULT_CHAR_CAP_RESEARCH)._run(
+        action="search", pattern="m", max_results=5
+    )
+    assert "truncated" in tight
+    assert "truncated" not in research and research == body
+
+
 @pytest.mark.asyncio
 async def test_async_dispatch_via_ainvoke(tool_with_fake_backend):
     out = await tool_with_fake_backend._arun(action="find_symbol", name="MyClass")

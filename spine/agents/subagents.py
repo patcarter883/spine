@@ -536,13 +536,17 @@ def _inject_mcp_tools(
         # in trace 019e6cc4 (23/23 research branches failed with malformed
         # args) and ensures no raw mcp_-prefixed tool reaches any agent.
         # The wrapper lazy-loads its MCP backend on first use.
-        from spine.agents.tools.codebase_query import CodebaseQueryTool
+        from spine.agents.tools.codebase_query import (
+            CodebaseQueryTool,
+            search_cap_for_subagent,
+        )
 
         mcp_tools: list = [
             CodebaseQueryTool(
                 workspace_root=workspace_root,
                 mcp_servers=config.mcp_servers,
                 db_path=config.checkpoint_path,
+                search_result_char_cap=search_cap_for_subagent(subagent_name),
             )
         ]
         tools.extend(mcp_tools)

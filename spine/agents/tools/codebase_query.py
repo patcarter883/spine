@@ -114,17 +114,36 @@ def _looks_empty(result: Any) -> bool:
 # length grows) without losing access: the truncation hint tells the model how
 # to retrieve specifics on demand. Deliberately NOT applied to ``get_source``
 # (the model explicitly asked for that body) or to metadata actions.
+#
+# The cap is PHASE-AWARE (see :func:`search_cap_for_subagent`): the
+# slice-implementer/verifier stay tightly bounded — the tight cap exists to stop
+# the implementer "researching half the codebase" mid-edit (trace 019e784c) —
+# while the researcher (SPECIFY/PLAN/exploration) gets a generous bound because
+# broad codebase understanding is the whole point of those phases.
 _SEARCH_RESULT_CHAR_CAP = 4000
+_SEARCH_RESULT_CHAR_CAP_RESEARCH = 16000
 
 
-def _bound_search_result(result: Any) -> str:
+def search_cap_for_subagent(subagent_name: str | None) -> int:
+    """Phase-aware ``search`` result char cap, keyed on the subagent role.
+
+    The slice-implementer and slice-verifier stay tightly bounded; the
+    researcher (and any other read/explore role, the safe default) gets the
+    generous research cap so SPECIFY/PLAN research keeps its breadth.
+    """
+    if subagent_name in ("slice-implementer", "slice-verifier"):
+        return _SEARCH_RESULT_CHAR_CAP
+    return _SEARCH_RESULT_CHAR_CAP_RESEARCH
+
+
+def _bound_search_result(result: Any, cap: int = _SEARCH_RESULT_CHAR_CAP) -> str:
     """Truncate an oversized ``search`` result to a head + expand-on-demand hint."""
     text = result if isinstance(result, str) else str(result)
-    if len(text) <= _SEARCH_RESULT_CHAR_CAP:
+    if len(text) <= cap:
         return text
-    head = text[:_SEARCH_RESULT_CHAR_CAP]
+    head = text[:cap]
     nl = head.rfind("\n")
-    if nl > _SEARCH_RESULT_CHAR_CAP // 2:  # avoid cutting mid-line when practical
+    if nl > cap // 2:  # avoid cutting mid-line when practical
         head = head[:nl]
     return (
         head + "\n\n[search results truncated: "
@@ -446,6 +465,9 @@ class CodebaseQueryTool(BaseTool):
 
     workspace_root: str = ""
     db_path: str = ".spine/spine.db"
+    # Phase-aware ``search`` result cap (see :func:`search_cap_for_subagent`),
+    # set per subagent at injection time.
+    search_result_char_cap: int = _SEARCH_RESULT_CHAR_CAP
 
     # Lazily-loaded MCP tool map: { mcp_tool_name → BaseTool }.
     _tool_map: dict[str, BaseTool] | None = PrivateAttr(default=None)
@@ -457,8 +479,13 @@ class CodebaseQueryTool(BaseTool):
         workspace_root: str,
         mcp_servers: dict[str, dict[str, Any]],
         db_path: str = ".spine/spine.db",
+        search_result_char_cap: int = _SEARCH_RESULT_CHAR_CAP,
     ):
-        super().__init__(workspace_root=workspace_root, db_path=db_path)
+        super().__init__(
+            workspace_root=workspace_root,
+            db_path=db_path,
+            search_result_char_cap=search_result_char_cap,
+        )
         # Store the server config; the actual tool load happens on first use.
         self._server_configs = mcp_servers or {}
 
@@ -553,7 +580,7 @@ class CodebaseQueryTool(BaseTool):
             if local is not None:
                 return local
         if action == "search":
-            return _bound_search_result(result)
+            return _bound_search_result(result, self.search_result_char_cap)
         return result
 
     def _backing_tool_or_fallback(
