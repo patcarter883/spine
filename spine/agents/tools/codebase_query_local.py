@@ -87,6 +87,20 @@ def lookup_local_langs(db_path: str, name: str) -> set[str]:
     return {r["lang"] for r in rows} if rows else set()
 
 
+def local_list_file_symbols(db_path: str, file_path: str) -> list[str]:
+    """Return all symbol_name values indexed for *file_path*, alphabetically.
+
+    Used by the decomposer to inject a ground-truth symbol menu into its prompt
+    so it never guesses qualified names it can't verify.
+    """
+    rows = _query(
+        db_path,
+        "SELECT symbol_name FROM symbol_metadata WHERE file_path = ? ORDER BY symbol_name",
+        (file_path,),
+    )
+    return [r["symbol_name"] for r in rows] if rows else []
+
+
 def local_find_symbol(db_path: str, name: str) -> str | None:
     """Locate a symbol via symbol_metadata; None when not indexed."""
     rows = _query(

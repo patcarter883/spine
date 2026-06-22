@@ -315,10 +315,21 @@ async def run_decomposer(
         parent_files = [f for f in (source_slice.get("target_files") or []) if f]
         slice_json = json.dumps(source_slice, indent=2, ensure_ascii=False, default=str)
         system_prompt = _PER_FILE_PROMPT
+        # Inject a ground-truth symbol menu so the model never invents names.
+        # Each target file's indexed symbols are listed; the decomposer must
+        # anchor edit_plan entries and reference_symbols to names from this
+        # list — any name not here is a new definition, not an existing anchor.
+        known_syms_text = _build_known_symbols_block(
+            _spine_cfg.checkpoint_path, parent_files
+        )
+        known_syms_pairs = (
+            [(Tag.RETRIEVED_CODE, known_syms_text)] if known_syms_text else []
+        )
         human_content = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, f"Parent slice id: {parent_id}"),
                 (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+                *known_syms_pairs,
             ),
             (
                 f"Return a DecompositionResult with EXACTLY {len(parent_files)} "
@@ -426,6 +437,8 @@ async def run_decomposer(
     elif mode == "PER_FILE":
         slices = _normalize_per_file_slices(source_slice, slices)
 
+    _scrub_phantom_symbols(slices, _spine_cfg.checkpoint_path)
+
     logger.info(
         "Decomposer(%s) produced %d slice(s): %s",
         mode,
@@ -433,6 +446,103 @@ async def run_decomposer(
         [s.get("id", "?") for s in slices],
     )
     return slices
+
+
+def _build_known_symbols_block(db_path: str, files: list[str]) -> str:
+    """Return a text block listing indexed symbols for each file in *files*.
+
+    Used to inject a ground-truth symbol menu into the PER_FILE decomposer
+    prompt so it never invents qualified names when anchoring edit_plan entries
+    or reference_symbols. Returns '' when the local index has no data.
+    """
+    try:
+        from spine.agents.tools.codebase_query_local import local_list_file_symbols
+    except ImportError:
+        return ""
+
+    lines: list[str] = [
+        "Symbols that ALREADY EXIST in the target files "
+        "(use only these as edit_plan symbol= values or reference_symbols; "
+        "anything not listed here is a NEW definition, not an existing anchor):"
+    ]
+    found_any = False
+    for f in files:
+        try:
+            syms = local_list_file_symbols(db_path, f)
+        except Exception:
+            continue
+        if syms:
+            found_any = True
+            # Cap at 60 names to avoid token waste on huge files.
+            cap = 60
+            suffix = f" … (+{len(syms) - cap} more)" if len(syms) > cap else ""
+            lines.append(f"  {f}: {', '.join(syms[:cap])}{suffix}")
+        else:
+            lines.append(f"  {f}: (not yet indexed — file may be new)")
+    return "\n".join(lines) if found_any else ""
+
+
+def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
+    """Remove hallucinated symbol names from *slices* in-place.
+
+    For each slice:
+    - edit_plan entries whose symbol is not in the local index have their
+      symbol cleared (and mode demoted from ast_edit to '' so the implementer
+      falls back to patch/full_replace instead of a guaranteed-failing ast_edit).
+    - reference_symbols that don't exist in the local index are dropped so the
+      implementer doesn't waste turns searching for them.
+
+    No-op when db_path is falsy or the local index is unavailable.
+    """
+    if not db_path:
+        return
+    try:
+        from spine.agents.tools.codebase_query_local import local_find_symbol
+    except ImportError:
+        return
+
+    for sl in slices:
+        slice_id = sl.get("id", "?")
+
+        # Scrub edit_plan symbols.
+        for hint in sl.get("edit_plan") or []:
+            sym = hint.get("symbol", "")
+            if not sym:
+                continue
+            try:
+                exists = local_find_symbol(db_path, sym) is not None
+            except Exception:
+                continue
+            if not exists:
+                logger.warning(
+                    "decomposer: clearing phantom edit_plan symbol %r in slice %r "
+                    "(not found in codebase index — likely a new definition, not an anchor)",
+                    sym, slice_id,
+                )
+                hint["symbol"] = ""
+                if hint.get("mode") == "ast_edit":
+                    hint["mode"] = ""
+
+        # Scrub reference_symbols.
+        refs = sl.get("reference_symbols") or []
+        if not refs:
+            continue
+        good: list[str] = []
+        for sym in refs:
+            try:
+                exists = local_find_symbol(db_path, sym) is not None
+            except Exception:
+                good.append(sym)
+                continue
+            if exists:
+                good.append(sym)
+            else:
+                logger.warning(
+                    "decomposer: removing phantom reference_symbol %r from slice %r "
+                    "(not in codebase index — may need to be created first)",
+                    sym, slice_id,
+                )
+        sl["reference_symbols"] = good
 
 
 def _normalize_per_file_slices(

@@ -322,6 +322,74 @@ def _format_reference_symbols(active_slice: dict) -> str:
     )
 
 
+def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
+    """Return a copy of *active_slice* with non-existent reference_symbols removed.
+
+    Also clears edit_plan[].symbol values not found in the local codebase index
+    and demotes their mode from 'ast_edit' to '' so the implementer falls back
+    to patch/full_replace rather than a guaranteed-failing symbol lookup.
+
+    Queries only the local spine.db (no MCP round-trip). No-op when the index
+    is unavailable or the slice has no reference_symbols / edit_plan.
+    """
+    needs_refs = bool(active_slice.get("reference_symbols"))
+    needs_plan = any(h.get("symbol") for h in (active_slice.get("edit_plan") or []))
+    if not needs_refs and not needs_plan:
+        return active_slice
+
+    try:
+        from spine.agents.tools.codebase_query_local import local_find_symbol
+        from spine.config import SpineConfig
+        db_path = SpineConfig.load().checkpoint_path
+    except Exception:
+        return active_slice
+
+    slice_id = active_slice.get("id", "?")
+    result = dict(active_slice)
+
+    if needs_refs:
+        good: list[str] = []
+        for sym in active_slice.get("reference_symbols") or []:
+            try:
+                exists = local_find_symbol(db_path, sym) is not None
+            except Exception:
+                good.append(sym)
+                continue
+            if exists:
+                good.append(sym)
+            else:
+                logger.warning(
+                    "[%s] scrub_phantom_refs: dropping reference_symbol %r from slice %r "
+                    "(not in codebase index — new method or planner forward-reference)",
+                    work_id, sym, slice_id,
+                )
+        result["reference_symbols"] = good
+
+    if needs_plan:
+        new_plan = []
+        for hint in active_slice.get("edit_plan") or []:
+            h = dict(hint)
+            sym = h.get("symbol", "")
+            if sym:
+                try:
+                    exists = local_find_symbol(db_path, sym) is not None
+                except Exception:
+                    exists = True
+                if not exists:
+                    logger.warning(
+                        "[%s] scrub_phantom_refs: clearing edit_plan symbol %r in slice %r "
+                        "(not in codebase index)",
+                        work_id, sym, slice_id,
+                    )
+                    h["symbol"] = ""
+                    if h.get("mode") == "ast_edit":
+                        h["mode"] = ""
+            new_plan.append(h)
+        result["edit_plan"] = new_plan
+
+    return result
+
+
 def _large_file_directive(active_slice: dict, workspace_root: str) -> str:
     """Read-narrow directive when a slice's target file is large, else ''.
 
@@ -429,6 +497,14 @@ async def _plan_slice_implementer_node(
     """
     work_id = state.get("work_id", "unknown")
     active_slice: dict = state.get("active_slice") or {}
+    # Strip reference_symbols that don't exist in the codebase index before
+    # they reach the implementer. Plan-phase outputs routinely include forward
+    # references to methods that will be created by a sibling slice (e.g.
+    # UIApi.update_phase_providers before slice 0 adds it). The implementer
+    # treats reference_symbols as "read these NOW" — a missing symbol triggers
+    # a futile 70-turn search loop that consumes the entire token budget
+    # (GLM-5.2 trace 019eec68). Scrubbing them here keeps the menu honest.
+    active_slice = _scrub_phantom_refs(active_slice, work_id)
     slice_id = active_slice.get("id", "unknown")
     title = active_slice.get("title", "")
     target_files = active_slice.get("target_files") or []
