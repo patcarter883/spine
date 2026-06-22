@@ -10,7 +10,54 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from spine.agents.decomposer import DecompositionResult, FeatureSliceSchema, run_decomposer
+from spine.agents.decomposer import (
+    DecompositionResult,
+    FeatureSliceSchema,
+    _EnrichmentOutput,
+    _enrichment_schema,
+    run_decomposer,
+)
+
+
+def _symbol_enum(schema_cls) -> list:
+    """Pull the EditHint.symbol JSON-schema enum from an enrichment schema."""
+    js = schema_cls.model_json_schema()
+    for definition in js.get("$defs", {}).values():
+        sym = definition.get("properties", {}).get("symbol")
+        if sym and "enum" in sym:
+            return sym["enum"]
+    raise AssertionError("no enum found on EditHint.symbol")
+
+
+def test_enrichment_schema_constrains_symbol_to_anchor_set(monkeypatch) -> None:
+    # PR-A(a): with the index populated, EditHint.symbol becomes an enum of the
+    # live anchors (+ "") so a phantom anchor is unrepresentable at decode time.
+    import spine.agents.tools.codebase_query as cq
+
+    monkeypatch.setattr(
+        cq, "list_file_symbols", lambda _db, _f: ["Svc.alpha", "Svc.beta"]
+    )
+    schema = _enrichment_schema("db", ["src/svc.py"])
+    assert schema is not _EnrichmentOutput
+    assert set(_symbol_enum(schema)) == {"", "Svc.alpha", "Svc.beta"}
+
+
+def test_enrichment_schema_falls_back_without_index(monkeypatch) -> None:
+    # No indexed symbols (new file) → unconstrained schema; scrub is the backstop.
+    import spine.agents.tools.codebase_query as cq
+
+    monkeypatch.setattr(cq, "list_file_symbols", lambda _db, _f: [])
+    assert _enrichment_schema("db", ["src/new.py"]) is _EnrichmentOutput
+
+
+def test_enrichment_schema_falls_back_when_anchor_set_too_large(monkeypatch) -> None:
+    # Oversized anchor set → drop the enum (keep grammar cheap); plain schema.
+    import spine.agents.tools.codebase_query as cq
+
+    monkeypatch.setattr(
+        cq, "list_file_symbols", lambda _db, _f: [f"sym_{i}" for i in range(500)]
+    )
+    assert _enrichment_schema("db", ["src/big.py"]) is _EnrichmentOutput
 
 
 def _decomposition(*ids: str) -> DecompositionResult:

@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 try:  # openai is always present when the model is ChatOpenAI; guard for safety.
     from openai import LengthFinishReasonError as _LengthFinishReasonError
@@ -628,6 +628,59 @@ class _EnrichmentOutput(BaseModel):
     edit_plan: list[EditHint] = Field(default_factory=list)
 
 
+# Hard cap on the anchor enum injected into the enrichment schema. Beyond this
+# the enum is dropped (prompt constraint + scrub still apply) so the JSON-schema
+# grammar stays cheap and within provider structured-output limits.
+_MAX_ANCHOR_ENUM = 200
+
+
+def _known_anchor_set(db_path: str, files: list[str]) -> list[str]:
+    """Sorted union of indexed symbol names across *files* — the valid anchors."""
+    try:
+        from spine.agents.tools.codebase_query import list_file_symbols
+    except ImportError:
+        return []
+    names: set[str] = set()
+    for f in files:
+        try:
+            names.update(list_file_symbols(db_path, f))
+        except Exception:
+            continue
+    return sorted(names)
+
+
+def _enrichment_schema(db_path: str, files: list[str]) -> type[BaseModel]:
+    """Enrichment output schema, constraining ``EditHint.symbol`` to live anchors.
+
+    With the json_schema structured-output path (vLLM guided decoding), an
+    ``enum`` on ``symbol`` makes a phantom anchor *unrepresentable at decode
+    time*: the model can only emit an existing symbol or ``''`` (new file,
+    new-definition insert, or non-symbol edit). This is the generation-time
+    complement to ``_scrub_phantom_symbols``, which stays as the backstop for
+    providers that ignore the enum or fall back off json_schema. Degrades to the
+    unconstrained schema when nothing is indexed or the anchor set is too large.
+    """
+    anchors = _known_anchor_set(db_path, files)
+    if not anchors or len(anchors) > _MAX_ANCHOR_ENUM:
+        return _EnrichmentOutput
+    # "" stays valid — new files, new-definition inserts (anchored via the last
+    # existing symbol + action), and non-symbol edits all need an empty slot.
+    sym_type = Literal[tuple([""] + anchors)]  # type: ignore[valid-type]
+    anchored_hint = create_model(
+        "AnchoredEditHint",
+        __base__=EditHint,
+        symbol=(
+            sym_type,
+            Field(default="", description=EditHint.model_fields["symbol"].description),
+        ),
+    )
+    return create_model(
+        "AnchoredEnrichmentOutput",
+        __base__=_EnrichmentOutput,
+        edit_plan=(list[anchored_hint], Field(default_factory=list)),
+    )
+
+
 _ENRICH_PROMPT = (
     xml_block(
         Tag.ROLE,
@@ -690,7 +743,9 @@ async def enrich_slice(
     if decompose_cap and decompose_cap > 0:
         model = cap_completion_tokens(model, decompose_cap)
     model = suppress_reasoning(model)
-    structured = bind_structured_output(model, _EnrichmentOutput)
+    structured = bind_structured_output(
+        model, _enrichment_schema(_spine_cfg.checkpoint_path, files)
+    )
 
     slice_json = json.dumps(
         {
