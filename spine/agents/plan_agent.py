@@ -25,6 +25,7 @@ covered by the upstream exploration.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -154,12 +155,40 @@ def _resolve_prior_phase_dirs(
     state: WorkflowState,
     work_id: str,
 ) -> dict[str, str]:
-    """Map phase names to their artifact directories for phases with artifacts."""
-    artifacts = state.get("artifacts", {}) or {}
+    """Map phase names to their artifact directories for phases with artifacts.
+
+    Disk is the source of truth. ``state["artifacts"]`` is an unreliable carrier:
+    subgraph state schemas that don't declare the channel silently drop it (e.g.
+    ``PlanSubgraphState``), and the standalone plan path never populates it — so
+    ``read_prior_artifacts`` answered "No prior artifacts found" while the spec
+    sat on disk, confusing the model it told to call that tool first. We
+    therefore discover prior-phase dirs by scanning the work item's artifact tree
+    and union them with any state-declared phases. The current phase is excluded
+    so a re-run that already wrote its own dir isn't treated as prior.
+    """
     dirs: dict[str, str] = {}
+
+    # State-declared phases (unchanged behaviour for callers that populate it).
+    artifacts = state.get("artifacts", {}) or {}
     for phase, phase_artifacts in artifacts.items():
         if phase_artifacts and isinstance(phase_artifacts, dict):
             dirs[phase] = artifact_path(work_id, phase)
+
+    # Disk-discovered phases (the fix): any phase subdir holding a real
+    # (non-``.meta.json``) artifact file — found even when state never carried it.
+    current_phase = state.get("phase", "")
+    workspace_root = Path(state.get("workspace_root", ".") or ".")
+    base = workspace_root / Path(artifact_path(work_id, ""))
+    if base.is_dir():
+        for phase_dir in sorted(base.iterdir()):
+            phase = phase_dir.name
+            if not phase_dir.is_dir() or phase == current_phase or phase in dirs:
+                continue
+            if any(
+                f.is_file() and not f.name.endswith(".meta.json")
+                for f in phase_dir.iterdir()
+            ):
+                dirs[phase] = artifact_path(work_id, phase)
     return dirs
 
 

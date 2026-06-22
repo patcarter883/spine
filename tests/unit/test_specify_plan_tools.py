@@ -19,6 +19,8 @@ from spine.agents.plan_tools import (
     SearchCodebaseTool,
     build_plan_agent_tools,
 )
+from spine.agents.artifacts import artifact_path
+from spine.agents.plan_agent import _resolve_prior_phase_dirs
 
 
 # ── ReadWorkContextTool ───────────────────────────────────────────────────
@@ -791,3 +793,58 @@ class TestBuildPlanAgentTools:
         search_tool = next(t for t in tools if t.name == "search_codebase")
         assert isinstance(search_tool, SearchCodebaseTool)
         assert search_tool.workspace_root == str(tmp_path)
+
+
+# ── _resolve_prior_phase_dirs (disk is source of truth) ───────────────────
+
+
+class TestResolvePriorPhaseDirs:
+    """prior-phase dirs must be discovered from disk, not just state['artifacts'].
+
+    Regression: PlanSubgraphState drops the 'artifacts' channel and the
+    standalone plan path never sets it, so read_prior_artifacts answered
+    "No prior artifacts found" while the spec sat on disk.
+    """
+
+    def _spec_on_disk(self, tmp_path: Path, work_id: str) -> None:
+        specify = tmp_path / artifact_path(work_id, "specify")
+        specify.mkdir(parents=True)
+        (specify / "specification.md").write_text("# spec", encoding="utf-8")
+        (specify / "specification.md.meta.json").write_text("{}", encoding="utf-8")
+
+    def test_discovers_specify_from_disk_when_state_empty(self, tmp_path):
+        work_id = "wk-r1"
+        self._spec_on_disk(tmp_path, work_id)
+        state = {
+            "workspace_root": str(tmp_path),
+            "phase": "plan",
+            "artifacts": {},  # the dropped/empty channel
+        }
+        dirs = _resolve_prior_phase_dirs(state, work_id)
+        assert dirs.get("specify") == artifact_path(work_id, "specify")
+
+    def test_excludes_current_phase(self, tmp_path):
+        work_id = "wk-r2"
+        plan = tmp_path / artifact_path(work_id, "plan")
+        plan.mkdir(parents=True)
+        (plan / "plan.json").write_text("{}", encoding="utf-8")
+        state = {"workspace_root": str(tmp_path), "phase": "plan", "artifacts": {}}
+        assert "plan" not in _resolve_prior_phase_dirs(state, work_id)
+
+    def test_ignores_meta_only_dir(self, tmp_path):
+        work_id = "wk-r3"
+        d = tmp_path / artifact_path(work_id, "specify")
+        d.mkdir(parents=True)
+        (d / "specification.md.meta.json").write_text("{}", encoding="utf-8")
+        state = {"workspace_root": str(tmp_path), "phase": "plan", "artifacts": {}}
+        assert "specify" not in _resolve_prior_phase_dirs(state, work_id)
+
+    def test_state_declared_phase_still_honoured(self, tmp_path):
+        work_id = "wk-r4"
+        state = {
+            "workspace_root": str(tmp_path),
+            "phase": "plan",
+            "artifacts": {"specify": {"specification.md": "# spec"}},
+        }
+        dirs = _resolve_prior_phase_dirs(state, work_id)
+        assert dirs.get("specify") == artifact_path(work_id, "specify")
