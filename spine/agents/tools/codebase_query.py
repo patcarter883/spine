@@ -107,6 +107,33 @@ def _looks_empty(result: Any) -> bool:
     return False
 
 
+# Cap on the size of a ``search`` result handed back to the agent. Search
+# returns MANY matches, but a model only needs the pointers — then it expands
+# the few it cares about with ``get_source``. Bounding the inline footprint
+# keeps the active context small (context-rot: reliability falls as input
+# length grows) without losing access: the truncation hint tells the model how
+# to retrieve specifics on demand. Deliberately NOT applied to ``get_source``
+# (the model explicitly asked for that body) or to metadata actions.
+_SEARCH_RESULT_CHAR_CAP = 4000
+
+
+def _bound_search_result(result: Any) -> str:
+    """Truncate an oversized ``search`` result to a head + expand-on-demand hint."""
+    text = result if isinstance(result, str) else str(result)
+    if len(text) <= _SEARCH_RESULT_CHAR_CAP:
+        return text
+    head = text[:_SEARCH_RESULT_CHAR_CAP]
+    nl = head.rfind("\n")
+    if nl > _SEARCH_RESULT_CHAR_CAP // 2:  # avoid cutting mid-line when practical
+        head = head[:nl]
+    return (
+        head + "\n\n[search results truncated: "
+        f"{len(head)} of {len(text)} chars shown to keep context small. "
+        "Expand the specific symbols you need with action='get_source', "
+        "or narrow the search pattern.]"
+    )
+
+
 def _parse_tool_result(result: Any) -> list[Any]:
     """Normalise an MCP tool result to a list of entries.
 
@@ -496,11 +523,13 @@ class CodebaseQueryTool(BaseTool):
         return None
 
     def _finish(self, action: str, args: dict[str, Any], result: Any) -> str:
-        """Apply the empty-result fallback to an MCP response."""
+        """Apply the empty-result fallback (and search size-bound) to an MCP response."""
         if _looks_empty(result):
             local = self._local_fallback(action, args)
             if local is not None:
                 return local
+        if action == "search":
+            return _bound_search_result(result)
         return result
 
     def _backing_tool_or_fallback(

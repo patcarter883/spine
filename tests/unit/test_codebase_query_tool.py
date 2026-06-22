@@ -78,6 +78,36 @@ def test_search_dispatches_via_invoke(tool_with_fake_backend):
     backing.invoke.assert_called_once_with({"pattern": "foo|bar", "max_results": 10})
 
 
+def test_small_search_result_passes_through_unbounded(tool_with_fake_backend):
+    # PR-C: a short search result must reach the model unchanged (no marker).
+    out = tool_with_fake_backend._run(action="search", pattern="foo|bar", max_results=10)
+    assert "truncated" not in out
+
+
+def test_oversized_search_result_truncated_with_expand_hint(tool_with_fake_backend):
+    # PR-C: a large search result is bounded and points the model at
+    # expand-on-demand (get_source) instead of dumping every match inline.
+    big = "\n".join(
+        f"match {i}: spine/mod_{i}.py:42  def func_{i}(): ..." for i in range(400)
+    )
+    backend = tool_with_fake_backend._tool_map["mcp_codebase-index_search_codebase"]
+    backend.invoke = MagicMock(return_value=big)
+    out = tool_with_fake_backend._run(action="search", pattern="func", max_results=50)
+    assert "search results truncated" in out
+    assert "get_source" in out
+    assert len(out) < len(big)
+
+
+def test_oversized_get_source_is_not_truncated(tool_with_fake_backend):
+    # PR-C: get_source returns a body the model explicitly asked for — never bound.
+    big = "def huge():\n" + "\n".join(f"    x{i} = {i}" for i in range(2000))
+    backend = tool_with_fake_backend._tool_map["mcp_codebase-index_get_function_source"]
+    backend.invoke = MagicMock(return_value=big)
+    out = tool_with_fake_backend._run(action="get_source", name="huge")
+    assert "truncated" not in out
+    assert out == big
+
+
 @pytest.mark.asyncio
 async def test_async_dispatch_via_ainvoke(tool_with_fake_backend):
     out = await tool_with_fake_backend._arun(action="find_symbol", name="MyClass")
