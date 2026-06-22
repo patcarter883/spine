@@ -701,6 +701,37 @@ def _read_around(file_path: str, content: str, snippet: str) -> str:
     )
 
 
+def _edit_feedback(
+    status: str,
+    detail: str,
+    *,
+    target: Optional[str] = None,
+    next_action: Optional[str] = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build a reference-shaped edit-failure dict (PR-B feedback contract).
+
+    Every structured ``ast_edit`` failure returns the same shape so a weak model
+    can recover deterministically instead of guessing — the three parts are:
+
+    - ``detail``: the specific defect, in prose.
+    - ``target``: a *resolvable* reference the model can act on next — a symbol
+      qualified name or a ``file:line`` location (omitted when not applicable).
+    - ``next_action``: the concrete next call to make.
+
+    Status-specific extras (e.g. ``available_symbols``) pass straight through.
+    This is what lets a 30B model self-correct from a failed edit in one step
+    rather than spiralling into a blind ``full_replace`` (GLM_QWEN_BENCH_ANALYSIS.md).
+    """
+    fb: dict[str, Any] = {"status": status, "detail": detail}
+    if target is not None:
+        fb["target"] = target
+    if next_action is not None:
+        fb["next_action"] = next_action
+    fb.update(extra)
+    return fb
+
+
 def _apply_ast_edit(
     current: str,
     file_path: str,
@@ -711,20 +742,22 @@ def _apply_ast_edit(
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Resolve ``symbol`` via tree-sitter and apply a structural edit."""
     if action not in ("replace", "insert_before", "insert_after"):
-        return None, {
-            "status": "input_error",
-            "detail": f"ast_edit action must be replace|insert_before|insert_after, got {action!r}.",
-        }
+        return None, _edit_feedback(
+            "input_error",
+            f"ast_edit action must be replace|insert_before|insert_after, got {action!r}.",
+            next_action="Re-call ast_edit with action set to 'replace', 'insert_before', or 'insert_after'.",
+        )
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in _AST_EDIT_LANGS:
-        return None, {
-            "status": "input_error",
-            "detail": f"ast_edit unsupported for {ext or 'this file type'}; use patch/edits instead.",
-        }
+        return None, _edit_feedback(
+            "input_error",
+            f"ast_edit unsupported for {ext or 'this file type'}; use patch/edits instead.",
+            next_action="Use the patch or edits mode for this file type instead of ast_edit.",
+        )
     try:
         from spine.agents.tools.ast_extract import extract_symbols
     except Exception as exc:  # pragma: no cover — module always present
-        return None, {"status": "io_error", "detail": f"ast_extract unavailable: {exc}"}
+        return None, _edit_feedback("io_error", f"ast_extract unavailable: {exc}")
 
     # extract_symbols reads from disk; `current` equals the on-disk content at
     # read time, so its byte offsets index `current` (utf-8) correctly.
@@ -732,16 +765,15 @@ def _apply_ast_edit(
     try:
         symbols = extract_symbols(full_path, file_path)
     except Exception as exc:  # noqa: BLE001 — surface as a clean tool status
-        return None, {"status": "io_error", "detail": f"Could not parse {file_path}: {exc}"}
+        return None, _edit_feedback(
+            "io_error",
+            f"Could not parse {file_path}: {exc}",
+            next_action="Fix the syntax error in the file (or use full_replace) before ast_edit.",
+        )
 
     matches = _match_symbols(symbols, symbol)
     if not matches:
         names = sorted({s.qualified_name for s in symbols})[:15]
-        feedback: dict[str, Any] = {
-            "status": "no_match",
-            "detail": f"symbol {symbol!r} not found in {file_path}.",
-            "available_symbols": names,
-        }
         # Creation-anchor guard: if the edit body itself defines a symbol whose
         # leaf name matches the requested anchor, the model is trying to CREATE
         # that definition while anchoring to itself — a phantom anchor, and the
@@ -766,28 +798,44 @@ def _apply_ast_edit(
                 if parent and s.qualified_name.startswith(parent + ".")
             ]
             anchor = max(scope or symbols, key=lambda s: s.end_byte).qualified_name
-            feedback["detail"] = (
-                f"symbol {symbol!r} does not exist in {file_path} yet — your code "
-                f"defines it, so you are CREATING it, not editing it. Do not anchor "
-                f"to a symbol you are creating. To add it, call ast_edit with "
-                f"action='insert_after' anchored to the last existing symbol "
-                f"({anchor!r})."
+            return None, _edit_feedback(
+                "no_match",
+                (
+                    f"symbol {symbol!r} does not exist in {file_path} yet — your "
+                    f"code defines it, so you are CREATING it, not editing it. Do "
+                    f"not anchor to a symbol you are creating."
+                ),
+                target=anchor,
+                next_action=(
+                    f"Call ast_edit with action='insert_after' anchored to "
+                    f"{anchor!r} (the last existing symbol)."
+                ),
+                available_symbols=names,
             )
-            feedback["suggested_anchor"] = anchor
-            feedback["suggested_action"] = "insert_after"
-        return None, feedback
+        return None, _edit_feedback(
+            "no_match",
+            f"symbol {symbol!r} not found in {file_path}.",
+            next_action=(
+                "Anchor to one of available_symbols, or to add a NEW definition "
+                "use action='insert_after' anchored to an existing symbol."
+            ),
+            available_symbols=names,
+        )
     if len(matches) > 1:
         enc = current.encode("utf-8")
         locs = [enc[: m.start_byte].count(b"\n") + 1 for m in matches]
-        return None, {
-            "status": "ambiguous_match",
-            "detail": (
+        return None, _edit_feedback(
+            "ambiguous_match",
+            (
                 f"symbol {symbol!r} matches {len(matches)} definitions in "
-                f"{file_path} at lines {locs}. Remove the duplicate(s) "
-                "(use old_str/new_str targeting the duplicate block), "
-                "then retry ast_edit."
+                f"{file_path} at lines {locs}."
             ),
-        }
+            target=f"{file_path}:{','.join(str(line) for line in locs)}",
+            next_action=(
+                "Remove the duplicate block(s) with old_str/new_str targeting one "
+                "definition, then retry ast_edit."
+            ),
+        )
     sym = matches[0]
     if action in ("insert_after", "insert_before"):
         import re as _re
@@ -797,14 +845,18 @@ def _apply_ast_edit(
             existing_simple = {s.qualified_name.split(".")[-1] for s in symbols}
             conflicts = sorted(inserted_defs & existing_simple)
             if conflicts:
-                return None, {
-                    "status": "conflict_error",
-                    "detail": (
+                return None, _edit_feedback(
+                    "conflict_error",
+                    (
                         f"Inserted code re-defines {conflicts} which already "
-                        f"exist in {file_path}. Remove the duplicate(s) first, "
-                        "or use action='replace' to update an existing definition."
+                        f"exist in {file_path}."
                     ),
-                }
+                    target=f"{file_path}: {', '.join(conflicts)}",
+                    next_action=(
+                        "Remove the existing definition(s) first, or use "
+                        "action='replace' to update one in place."
+                    ),
+                )
     buf = current.encode("utf-8")
     code_bytes = code.encode("utf-8")
     # A method's start_byte sits AFTER its leading indentation; anchor replace/

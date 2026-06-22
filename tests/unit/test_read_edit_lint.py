@@ -602,14 +602,16 @@ def test_ast_edit_creation_anchor_guard_suggests_last_sibling(workspace: Path) -
         )
     )
     assert out["status"] == "no_match"
-    assert out["suggested_action"] == "insert_after"
-    assert out["suggested_anchor"] == "Svc.beta"
+    # PR-B reference contract: defect + resolvable target + concrete next action.
+    assert out["target"] == "Svc.beta"
+    assert "insert_after" in out["next_action"]
     assert "creating" in out["detail"].lower()
 
 
-def test_ast_edit_no_match_without_creation_intent_offers_no_anchor(workspace: Path) -> None:
+def test_ast_edit_no_match_without_creation_intent_offers_no_target(workspace: Path) -> None:
     # A genuine wrong/typo anchor (code does NOT define the requested symbol)
-    # must NOT trigger the creation guard — only the available-symbols menu.
+    # must NOT trigger the creation guard — no target, just the symbol menu and
+    # a generic next_action.
     (workspace / "src" / "svc2.py").write_text(
         "class Svc:\n    def alpha(self):\n        return 1\n"
     )
@@ -624,4 +626,44 @@ def test_ast_edit_no_match_without_creation_intent_offers_no_anchor(workspace: P
         )
     )
     assert out["status"] == "no_match"
-    assert "suggested_anchor" not in out
+    assert "target" not in out
+    assert out["next_action"]
+    assert "Svc.alpha" in out.get("available_symbols", [])
+
+
+def test_ast_edit_ambiguous_match_carries_target_and_next_action(workspace: Path) -> None:
+    (workspace / "src" / "amb.py").write_text(
+        "def dup():\n    return 1\n\n\ndef dup():\n    return 2\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/amb.py",
+            ast_edit={
+                "symbol": "dup",
+                "action": "replace",
+                "code": "def dup():\n    return 3\n",
+            },
+        )
+    )
+    assert out["status"] == "ambiguous_match"
+    assert out["target"].startswith("src/amb.py:")
+    assert "retry ast_edit" in out["next_action"]
+
+
+def test_ast_edit_conflict_error_carries_next_action(workspace: Path) -> None:
+    (workspace / "src" / "conf.py").write_text(
+        "class C:\n    def a(self):\n        return 1\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/conf.py",
+            ast_edit={
+                "symbol": "C.a",
+                "action": "insert_after",
+                "code": "    def a(self):\n        return 2\n",
+            },
+        )
+    )
+    assert out["status"] == "conflict_error"
+    assert "a" in out["target"]
+    assert "replace" in out["next_action"]
