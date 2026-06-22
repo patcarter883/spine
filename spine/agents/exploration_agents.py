@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import warnings
 from pathlib import Path
@@ -2204,6 +2205,13 @@ def build_findings_ledger(
         A markdown block, or ``""`` when no file map was discovered (so the
         caller can omit the block entirely).
     """
+    # Experimental A/B kill-switch: when set, the ledger collapses to empty so a
+    # control run can measure how much groundedness the durable map actually
+    # contributes (vs. vector recall alone). Read at call time so a bench
+    # subprocess can toggle it via the environment. Unset in production.
+    if os.environ.get("SPINE_DISABLE_FINDINGS_LEDGER"):
+        return ""
+
     # current-phase findings win on conflict → iterate prior first, then current.
     ordered: list[dict] = []
     if prior_findings:

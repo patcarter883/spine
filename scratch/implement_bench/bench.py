@@ -48,9 +48,16 @@ from pathlib import Path
 import yaml
 
 # ── Fixed bench parameters ────────────────────────────────────────────────────
-REPO = Path("/home/pat/projects/spine")
-BENCH = REPO / "scratch" / "implement_bench"
-BASELINE = BENCH / "baseline"
+# Paths are env-overridable so a branch/worktree can drive the bench against its
+# OWN code + run dir while still reading the (single, expensive) frozen baseline
+# from wherever it lives. Defaults reproduce the original main-tree layout.
+#   SPINE_BENCH_REPO     — clone source for the disposable run repo
+#   SPINE_BENCH_DIR      — bench root (holds _inner_*.py + runs/); set to a
+#                          worktree's scratch/implement_bench to use its drivers
+#   SPINE_BENCH_BASELINE — frozen baseline dir (default <bench>/baseline)
+REPO = Path(os.environ.get("SPINE_BENCH_REPO", "/home/pat/projects/spine"))
+BENCH = Path(os.environ.get("SPINE_BENCH_DIR", str(REPO / "scratch" / "implement_bench")))
+BASELINE = Path(os.environ.get("SPINE_BENCH_BASELINE", str(BENCH / "baseline")))
 RUNS = BENCH / "runs"
 WORK_ID = "b68c01b3"  # the frozen reviewed_task (spec+plan, awaiting_approval)
 
