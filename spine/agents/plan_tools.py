@@ -1,19 +1,19 @@
-"""Custom tools for the PLAN phase agent.
+"""Custom tools for the PLAN phase.
 
-Replaces generic filesystem tools with purpose-built tools that enforce
-the plan agent's role: read the specification + codebase context, then
-write a structured technical plan. Nothing else.
-
-Tools:
-- ``read_prior_artifacts`` — loads the specification and any other prior
-  artifacts in one call. Eliminates multi-turn read_file hunting.
 - ``search_codebase`` — targeted codebase lookup: given a list of topics
   or keywords, finds relevant files and returns their content summaries.
-  Combines glob + grep + read_file into one composable call.
-- ``write_structured_plan`` — the only write surface. Accepts structured
-  plan fields (architecture_overview, technology_choices, feature_slices,
-  testing_strategy, risks, codebase_map) and writes both plan.md and
-  plan.json to the fixed plan dir.
+  Combines glob + grep + read_file into one composable call. Used by the
+  exploration subgraph's researcher subagents (NOT by the plan synthesizer,
+  which has no read/search tools — see ``spine.agents.plan_agent``).
+- ``write_structured_plan`` — the only write surface for the plan
+  synthesizer. Accepts structured plan fields (architecture_overview,
+  technology_choices, feature_slices, testing_strategy, risks, codebase_map)
+  and writes both plan.md and plan.json to the fixed plan dir.
+
+The legacy ``read_prior_artifacts`` tool and the ``build_plan_agent_tools``
+3-tool bundle were removed with the monolithic plan agent — a local model
+spiralled re-researching what exploration already owns. Do not re-add a
+read/search tool to the plan synthesizer.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from langchain_core.tools import BaseTool, ToolException
 from langchain_core.tools.base import ArgsSchema
 from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator
 
-from spine.agents.artifacts import artifact_path
 # Reuse the canonical tool-call-markup token list so search_codebase and
 # codebase_query agree on what a spilled <tool_call>/<arg_value> envelope
 # looks like (codebase_query.py imports nothing from spine at module level,
@@ -62,84 +61,6 @@ _CODE_EXTENSIONS = {
 }
 _MAX_FILE_PREVIEW = 3000  # chars per file returned in search results
 _MAX_SEARCH_FILES = 8  # max files to return per search query
-
-
-# ── read_prior_artifacts ──────────────────────────────────────────────────
-
-
-class _ReadPriorArtifactsInput(BaseModel):
-    """No inputs — artifact paths are determined by build-time config."""
-
-
-class ReadPriorArtifactsTool(BaseTool):
-    """Load all prior phase artifacts in one call.
-
-    Returns a JSON object with one key per available phase (e.g. "specify"),
-    each containing the full text of every artifact file in that phase's
-    directory. The plan agent uses this to read the specification without
-    needing to know the artifact path or call read_file.
-
-    Also includes:
-    - ``work_id``, ``work_type``, ``description`` — basic context
-    - ``plan_dir`` — where to write plan.md
-    - ``feedback`` — prior rework feedback (empty list on first run)
-    """
-
-    name: str = "read_prior_artifacts"
-    description: str = (
-        "Load all prior phase artifacts (specification, etc.) in one call. "
-        "No arguments. Returns the full content of every prior artifact "
-        "plus basic work context. Call this FIRST."
-    )
-    args_schema: Optional[ArgsSchema] = _ReadPriorArtifactsInput
-
-    # Injected at build time
-    workspace_root: str = ""
-    work_id: str = ""
-    work_type: str = ""
-    description: str = ""
-    feedback: list[str] = Field(default_factory=list)
-    plan_dir: str = ""
-    prior_phase_dirs: dict[str, str] = Field(default_factory=dict)
-
-    def _run(self, **kwargs: Any) -> str:  # noqa: ARG002
-        result: dict[str, Any] = {
-            "work_id": self.work_id,
-            "work_type": self.work_type,
-            "description": self.description,
-            "feedback": self.feedback,
-            "plan_dir": self.plan_dir,
-            "artifacts": {},
-        }
-
-        root = Path(self.workspace_root)
-        for phase, phase_dir in self.prior_phase_dirs.items():
-            phase_path = root / phase_dir
-            if not phase_path.exists():
-                continue
-            phase_content: dict[str, str] = {}
-            for fpath in sorted(phase_path.iterdir()):
-                if (
-                    fpath.is_file()
-                    and not fpath.name.endswith(".meta.json")
-                    and fpath.suffix in _CODE_EXTENSIONS | {".md", ""}
-                ):
-                    try:
-                        phase_content[fpath.name] = fpath.read_text(encoding="utf-8")
-                    except OSError as exc:
-                        phase_content[fpath.name] = f"[read error: {exc}]"
-            if phase_content:
-                result["artifacts"][phase] = phase_content
-
-        if not result["artifacts"]:
-            result["warning"] = (
-                "No prior artifacts found — work directly from the description."
-            )
-
-        return json.dumps(result, ensure_ascii=False)
-
-    async def _arun(self, **kwargs: Any) -> str:
-        return self._run(**kwargs)
 
 
 # ── search_codebase ───────────────────────────────────────────────────────
@@ -835,58 +756,3 @@ class StructuredWritePlanTool(BaseTool):
         return self._run(**kwargs)
 
 
-# ── Factory ───────────────────────────────────────────────────────────────
-
-
-def build_plan_agent_tools(
-    workspace_root: str,
-    work_id: str,
-    description: str,
-    work_type: str,
-    prior_phase_dirs: dict[str, str],
-    feedback: list[str] | None = None,
-) -> list[BaseTool]:
-    """Build the custom tool set for the plan agent.
-
-    Returns three tools:
-    - ``read_prior_artifacts``: loads spec + context in one call
-    - ``search_codebase``: targeted multi-query file search
-    - ``write_structured_plan``: structured write to plan.md + plan.json
-      with feature slices and dependencies
-
-    These replace all generic filesystem tools. No ls/glob/grep/read_file/write_file
-    exposed. Researcher subagents (when needed) are dispatched by the
-    exploration subgraph router, not by the agent itself.
-
-    Args:
-        workspace_root: Absolute path to the project workspace root.
-        work_id: The current work item ID.
-        description: The work description from WorkflowState.
-        work_type: The work type (quick, spec, etc.).
-        prior_phase_dirs: Mapping of phase name → artifact directory
-            (relative to workspace_root). E.g. {"specify": ".spine/artifacts/x/specify"}.
-        feedback: List of prior feedback strings (for rework passes).
-
-    Returns:
-        List of three BaseTool instances.
-    """
-    plan_dir = artifact_path(work_id, "plan")
-
-    return [
-        ReadPriorArtifactsTool(
-            workspace_root=workspace_root,
-            work_id=work_id,
-            work_type=work_type,
-            description=description,
-            feedback=feedback or [],
-            plan_dir=plan_dir,
-            prior_phase_dirs=prior_phase_dirs,
-        ),
-        SearchCodebaseTool(
-            workspace_root=workspace_root,
-        ),
-        StructuredWritePlanTool(
-            workspace_root=workspace_root,
-            plan_dir=plan_dir,
-        ),
-    ]

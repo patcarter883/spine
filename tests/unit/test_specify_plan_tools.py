@@ -15,12 +15,8 @@ from spine.agents.specify_tools import (
     build_specify_orchestrator_tools,
 )
 from spine.agents.plan_tools import (
-    ReadPriorArtifactsTool,
     SearchCodebaseTool,
-    build_plan_agent_tools,
 )
-from spine.agents.artifacts import artifact_path
-from spine.agents.plan_agent import _resolve_prior_phase_dirs
 
 
 # ── ReadWorkContextTool ───────────────────────────────────────────────────
@@ -343,55 +339,6 @@ class TestEagerWorkContext:
         block = build_work_context_block("# Prior Spec\nstuff")
         assert "Prior Specification" in block
         assert "# Prior Spec" in block
-
-
-# ── ReadPriorArtifactsTool ────────────────────────────────────────────────
-
-
-class TestReadPriorArtifactsTool:
-    def _setup(self, tmp_path: Path, work_id: str = "wk-p") -> tuple[str, dict[str, str]]:
-        spec_dir = f".spine/artifacts/{work_id}/specify"
-        p = tmp_path / spec_dir
-        p.mkdir(parents=True)
-        (p / "specification.md").write_text("# Spec\nContent here.")
-        return work_id, {PhaseName_SPECIFY: spec_dir}
-
-    def _tool(self, tmp_path, work_id, prior_dirs) -> ReadPriorArtifactsTool:
-        return ReadPriorArtifactsTool(
-            workspace_root=str(tmp_path),
-            work_id=work_id,
-            work_type="task",
-            description="Plan a widget.",
-            feedback=[],
-            plan_dir=f".spine/artifacts/{work_id}/plan",
-            prior_phase_dirs=prior_dirs,
-        )
-
-    def test_loads_prior_spec(self, tmp_path):
-        work_id, prior_dirs = self._setup(tmp_path)
-        tool = self._tool(tmp_path, work_id, prior_dirs)
-        result = json.loads(tool._run())
-        assert "specify" in result["artifacts"]
-        assert "specification.md" in result["artifacts"]["specify"]
-        assert "Content here." in result["artifacts"]["specify"]["specification.md"]
-
-    def test_missing_phase_dir_omitted(self, tmp_path):
-        tool = self._tool(tmp_path, "wk-p2", {})
-        result = json.loads(tool._run())
-        assert result["artifacts"] == {}
-        assert "warning" in result
-
-    def test_basic_context_fields(self, tmp_path):
-        work_id, prior_dirs = self._setup(tmp_path)
-        tool = self._tool(tmp_path, work_id, prior_dirs)
-        result = json.loads(tool._run())
-        assert result["work_id"] == work_id
-        assert result["description"] == "Plan a widget."
-        assert "plan_dir" in result
-
-
-# Constant alias for test readability
-PhaseName_SPECIFY = "specify"
 
 
 # ── SearchCodebaseTool ────────────────────────────────────────────────────
@@ -748,106 +695,6 @@ class TestStructuredWritePlanTool:
         assert not result.startswith("VALIDATION_ERROR")
         assert (tmp_path / ".spine/artifacts/ok/plan/plan.md").exists()
         assert (tmp_path / ".spine/artifacts/ok/plan/plan.json").exists()
-
-
-# ── build_plan_agent_tools ────────────────────────────────────────────────
-
-
-class TestBuildPlanAgentTools:
-    def test_returns_three_tools(self, tmp_path):
-        tools = build_plan_agent_tools(
-            workspace_root=str(tmp_path),
-            work_id="abc",
-            description="desc",
-            work_type="task",
-            prior_phase_dirs={},
-        )
-        assert len(tools) == 3
-        names = {t.name for t in tools}
-        assert "read_prior_artifacts" in names
-        assert "search_codebase" in names
-        assert "write_structured_plan" in names
-        assert "write_plan" not in names
-
-    def test_prior_phase_dirs_passed_through(self, tmp_path):
-        prior = {"specify": ".spine/artifacts/x/specify"}
-        tools = build_plan_agent_tools(
-            workspace_root=str(tmp_path),
-            work_id="x",
-            description="d",
-            work_type="task",
-            prior_phase_dirs=prior,
-        )
-        read_tool = next(t for t in tools if t.name == "read_prior_artifacts")
-        assert isinstance(read_tool, ReadPriorArtifactsTool)
-        assert read_tool.prior_phase_dirs == prior
-
-    def test_search_tool_has_workspace(self, tmp_path):
-        tools = build_plan_agent_tools(
-            workspace_root=str(tmp_path),
-            work_id="y",
-            description="d",
-            work_type="task",
-            prior_phase_dirs={},
-        )
-        search_tool = next(t for t in tools if t.name == "search_codebase")
-        assert isinstance(search_tool, SearchCodebaseTool)
-        assert search_tool.workspace_root == str(tmp_path)
-
-
-# ── _resolve_prior_phase_dirs (disk is source of truth) ───────────────────
-
-
-class TestResolvePriorPhaseDirs:
-    """prior-phase dirs must be discovered from disk, not just state['artifacts'].
-
-    Regression: PlanSubgraphState drops the 'artifacts' channel and the
-    standalone plan path never sets it, so read_prior_artifacts answered
-    "No prior artifacts found" while the spec sat on disk.
-    """
-
-    def _spec_on_disk(self, tmp_path: Path, work_id: str) -> None:
-        specify = tmp_path / artifact_path(work_id, "specify")
-        specify.mkdir(parents=True)
-        (specify / "specification.md").write_text("# spec", encoding="utf-8")
-        (specify / "specification.md.meta.json").write_text("{}", encoding="utf-8")
-
-    def test_discovers_specify_from_disk_when_state_empty(self, tmp_path):
-        work_id = "wk-r1"
-        self._spec_on_disk(tmp_path, work_id)
-        state = {
-            "workspace_root": str(tmp_path),
-            "phase": "plan",
-            "artifacts": {},  # the dropped/empty channel
-        }
-        dirs = _resolve_prior_phase_dirs(state, work_id)
-        assert dirs.get("specify") == artifact_path(work_id, "specify")
-
-    def test_excludes_current_phase(self, tmp_path):
-        work_id = "wk-r2"
-        plan = tmp_path / artifact_path(work_id, "plan")
-        plan.mkdir(parents=True)
-        (plan / "plan.json").write_text("{}", encoding="utf-8")
-        state = {"workspace_root": str(tmp_path), "phase": "plan", "artifacts": {}}
-        assert "plan" not in _resolve_prior_phase_dirs(state, work_id)
-
-    def test_ignores_meta_only_dir(self, tmp_path):
-        work_id = "wk-r3"
-        d = tmp_path / artifact_path(work_id, "specify")
-        d.mkdir(parents=True)
-        (d / "specification.md.meta.json").write_text("{}", encoding="utf-8")
-        state = {"workspace_root": str(tmp_path), "phase": "plan", "artifacts": {}}
-        assert "specify" not in _resolve_prior_phase_dirs(state, work_id)
-
-    def test_state_declared_phase_still_honoured(self, tmp_path):
-        work_id = "wk-r4"
-        state = {
-            "workspace_root": str(tmp_path),
-            "phase": "plan",
-            "artifacts": {"specify": {"specification.md": "# spec"}},
-        }
-        dirs = _resolve_prior_phase_dirs(state, work_id)
-        assert dirs.get("specify") == artifact_path(work_id, "specify")
 
 
 # ── SearchCodebaseTool: forgiving term matching (meet the model's phrasing) ──

@@ -127,7 +127,10 @@ def get_registry() -> PhaseRegistry:
 def _import_phase_modules() -> None:
     """Import all phase modules to trigger their registration side effects."""
     import spine.phases.specify  # noqa: F401
-    import spine.phases.plan  # noqa: F401
+    # PLAN has no legacy phase module — it runs only as the exploration
+    # subgraph (registered in spine.workflow.compose). The old monolithic
+    # spine.phases.plan (a 3-tool search_codebase agent) was removed; do not
+    # re-add it.
     import spine.phases.implement  # noqa: F401
     import spine.phases.verify  # noqa: F401
     import spine.phases.critic  # noqa: F401

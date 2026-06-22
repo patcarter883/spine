@@ -48,12 +48,18 @@ class TestAllSubgraphsCompile:
         assert "save_artifacts" in nodes
 
     def test_plan_subgraph_compiles(self):
-        from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
+        # PLAN ships as the exploration → synthesis subgraph (the legacy linear
+        # plan_subgraph was removed — it spiralled on search_codebase). Assert
+        # the production builder compiles with the research+synthesis nodes.
+        from spine.workflow.subgraphs.exploration_subgraph import (
+            build_exploration_subgraph,
+        )
 
-        graph = build_plan_subgraph().compile()
+        graph = build_exploration_subgraph(phase="plan").compile()
         assert graph is not None
         nodes = set(graph.get_graph().nodes.keys())
-        assert "run_agent" in nodes
+        assert "research_manager" in nodes
+        assert "synthesize" in nodes
         assert "save_artifacts" in nodes
 
     def test_critic_subgraph_compiles(self):
@@ -282,10 +288,16 @@ class TestGraphBackwardsCompatibility:
     def test_legacy_mode_compiles(self):
         from spine.workflow.compose import build_workflow_graph, _SUBGRAPH_ENABLED
 
-        # Temporarily disable all subgraphs
+        # Temporarily disable subgraphs for the phases that still have a legacy
+        # call_fn. PLAN is excluded: it is subgraph-ONLY now — the legacy
+        # monolithic plan node (a 3-tool search_codebase agent) was removed
+        # because it spiralled, so there is no call_fn to fall back to. Forcing
+        # PLAN into "legacy mode" would (correctly) fail to compile.
         original = dict(_SUBGRAPH_ENABLED)
         try:
             for key in _SUBGRAPH_ENABLED:
+                if key == "plan":
+                    continue
                 _SUBGRAPH_ENABLED[key] = False
             graph = build_workflow_graph("task")
             assert graph is not None

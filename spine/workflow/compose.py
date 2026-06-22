@@ -60,7 +60,6 @@ from spine.workflow.subgraph_wrapper import (
 from spine.workflow.subgraphs.verify_subgraph import build_verify_subgraph
 from spine.workflow.subgraphs.implement_subgraph import build_implement_subgraph
 from spine.workflow.subgraphs.specify_subgraph import build_specify_subgraph
-from spine.workflow.subgraphs.plan_subgraph import build_plan_subgraph
 from spine.workflow.subgraphs.critic_subgraph import build_critic_subgraph
 from spine.workflow.subgraphs.exploration_subgraph import build_exploration_subgraph
 from spine.workflow.subgraphs.gap_plan_subgraph import build_gap_plan_subgraph
@@ -94,7 +93,16 @@ def get_subgraph_builder(phase: str) -> Callable | None:
 register_subgraph_builder(PhaseName.VERIFY.value, build_verify_subgraph)
 register_subgraph_builder(PhaseName.IMPLEMENT.value, build_implement_subgraph)
 register_subgraph_builder(PhaseName.SPECIFY.value, build_specify_subgraph)
-register_subgraph_builder(PhaseName.PLAN.value, build_plan_subgraph)
+# PLAN runs the exploration → synthesis subgraph (research upstream, a
+# single-tool synthesizer downstream). The legacy linear plan_subgraph
+# (a 3-tool agent carrying search_codebase) was removed: a finite-window
+# local model spiralled on it (~62 search_codebase calls, never converging)
+# because it re-researched what exploration already owns. Do NOT reintroduce
+# a search-carrying plan agent here.
+register_subgraph_builder(
+    PhaseName.PLAN.value,
+    lambda: build_exploration_subgraph(phase=PhaseName.PLAN.value),
+)
 # Critic is parameterized by reviewed_phase — register keyed variants.
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_tasks", build_critic_subgraph)
 register_subgraph_builder(f"{PhaseName.CRITIC.value}_plan", build_critic_subgraph)
@@ -1065,15 +1073,12 @@ def build_workflow_graph(
     # linear subgraph builder with the multi-node research loop.
     # This must happen before the phase node loop below so the builder
     # lookup finds the exploration subgraph instead of the standard one.
+    # (PLAN registers the exploration builder directly at module import — see
+    # register_subgraph_builder above — so it needs no override here.)
     if _USE_EXPLORATION_SUBGRAPH.get(PhaseName.SPECIFY.value, False):
         register_subgraph_builder(
             PhaseName.SPECIFY.value,
             lambda: build_exploration_subgraph(phase=PhaseName.SPECIFY.value),
-        )
-    if _USE_EXPLORATION_SUBGRAPH.get(PhaseName.PLAN.value, False):
-        register_subgraph_builder(
-            PhaseName.PLAN.value,
-            lambda: build_exploration_subgraph(phase=PhaseName.PLAN.value),
         )
 
     # Add all phase/critic nodes
