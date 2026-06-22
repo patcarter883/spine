@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -577,3 +576,52 @@ def test_ast_edit_replace_method_by_qualified_name(workspace: Path) -> None:
     assert out["status"] == "ok"
     text = (workspace / "src" / "c.py").read_text()
     assert "return 99" in text and "return 2" in text
+
+
+def test_ast_edit_creation_anchor_guard_suggests_last_sibling(workspace: Path) -> None:
+    # A weak model trying to CREATE a method via action='replace' anchored to the
+    # not-yet-existing symbol gets a grounded recovery anchor (the last existing
+    # method of the same class), not a bare symbol list — the misstep that began
+    # the GLM destructive-recovery spiral (GLM_QWEN_BENCH_ANALYSIS.md, PR-A).
+    (workspace / "src" / "svc.py").write_text(
+        "class Svc:\n"
+        "    def alpha(self):\n"
+        "        return 1\n"
+        "\n"
+        "    def beta(self):\n"
+        "        return 2\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/svc.py",
+            ast_edit={
+                "symbol": "Svc.gamma",
+                "action": "replace",
+                "code": "    def gamma(self):\n        return 3\n",
+            },
+        )
+    )
+    assert out["status"] == "no_match"
+    assert out["suggested_action"] == "insert_after"
+    assert out["suggested_anchor"] == "Svc.beta"
+    assert "creating" in out["detail"].lower()
+
+
+def test_ast_edit_no_match_without_creation_intent_offers_no_anchor(workspace: Path) -> None:
+    # A genuine wrong/typo anchor (code does NOT define the requested symbol)
+    # must NOT trigger the creation guard — only the available-symbols menu.
+    (workspace / "src" / "svc2.py").write_text(
+        "class Svc:\n    def alpha(self):\n        return 1\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/svc2.py",
+            ast_edit={
+                "symbol": "Svc.typo",
+                "action": "replace",
+                "code": "    def something_else(self):\n        return 9\n",
+            },
+        )
+    )
+    assert out["status"] == "no_match"
+    assert "suggested_anchor" not in out

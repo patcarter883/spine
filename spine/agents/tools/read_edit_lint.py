@@ -737,11 +737,45 @@ def _apply_ast_edit(
     matches = _match_symbols(symbols, symbol)
     if not matches:
         names = sorted({s.qualified_name for s in symbols})[:15]
-        return None, {
+        feedback: dict[str, Any] = {
             "status": "no_match",
             "detail": f"symbol {symbol!r} not found in {file_path}.",
             "available_symbols": names,
         }
+        # Creation-anchor guard: if the edit body itself defines a symbol whose
+        # leaf name matches the requested anchor, the model is trying to CREATE
+        # that definition while anchoring to itself — a phantom anchor, and the
+        # exact misstep that began the GLM destructive-recovery spiral
+        # (scratch/implement_bench/GLM_QWEN_BENCH_ANALYSIS.md). Hand back a
+        # concrete, grounded anchor so a weak model recovers in one step instead
+        # of falling back to a blind full_replace.
+        import re as _re
+
+        leaf = symbol.rsplit(".", 1)[-1]
+        defined = set(
+            _re.findall(r"(?m)^[ \t]*(?:async\s+)?(?:def|class)\s+(\w+)", code)
+        )
+        if leaf and leaf in defined and symbols:
+            # Prefer the last existing symbol in the target's own scope (e.g. the
+            # last method of the same class) so the insert lands in the right
+            # place; fall back to the last symbol in the file.
+            parent = symbol.rsplit(".", 1)[0] if "." in symbol else ""
+            scope = [
+                s
+                for s in symbols
+                if parent and s.qualified_name.startswith(parent + ".")
+            ]
+            anchor = max(scope or symbols, key=lambda s: s.end_byte).qualified_name
+            feedback["detail"] = (
+                f"symbol {symbol!r} does not exist in {file_path} yet — your code "
+                f"defines it, so you are CREATING it, not editing it. Do not anchor "
+                f"to a symbol you are creating. To add it, call ast_edit with "
+                f"action='insert_after' anchored to the last existing symbol "
+                f"({anchor!r})."
+            )
+            feedback["suggested_anchor"] = anchor
+            feedback["suggested_action"] = "insert_after"
+        return None, feedback
     if len(matches) > 1:
         enc = current.encode("utf-8")
         locs = [enc[: m.start_byte].count(b"\n") + 1 for m in matches]
