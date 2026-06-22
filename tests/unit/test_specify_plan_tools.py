@@ -848,3 +848,44 @@ class TestResolvePriorPhaseDirs:
         }
         dirs = _resolve_prior_phase_dirs(state, work_id)
         assert dirs.get("specify") == artifact_path(work_id, "specify")
+
+
+# ── SearchCodebaseTool: forgiving term matching (meet the model's phrasing) ──
+
+
+class TestSearchCodebaseTokenization:
+    """A query is an OR of its whitespace-separated terms, so a model that
+    crams several symbols into one query string still gets results instead of
+    grepping the whole phrase as one regex and matching nothing.
+    """
+
+    def _tool(self, tmp_path):
+        return SearchCodebaseTool(workspace_root=str(tmp_path))
+
+    def test_crammed_multiword_query_matches_any_term(self, tmp_path):
+        (tmp_path / "a.py").write_text(
+            "class UIApi:\n    def get_providers(self):\n        return []\n"
+        )
+        (tmp_path / "b.py").write_text("def add_llm_provider(name):\n    return name\n")
+        (tmp_path / "c.py").write_text("x = 1\n")
+        out = json.loads(
+            self._tool(tmp_path)._run(queries=["UIApi get_providers add_llm_provider"])
+        )
+        files = {r["file"] for r in out["results"]}
+        assert "a.py" in files
+        assert "b.py" in files
+        assert "c.py" not in files
+
+    def test_ranks_files_by_number_of_queries_matched(self, tmp_path):
+        (tmp_path / "hi.py").write_text("UIApi and set_phase_provider both here\n")
+        (tmp_path / "lo.py").write_text("only UIApi here\n")
+        out = json.loads(
+            self._tool(tmp_path)._run(queries=["UIApi", "set_phase_provider"])
+        )
+        scores = {r["file"]: r["score"] for r in out["results"]}
+        assert scores["hi.py"] > scores["lo.py"]
+
+    def test_dotted_filename_term_matched_as_fixed_string(self, tmp_path):
+        (tmp_path / "uses.py").write_text("# see config.reference.yaml for an example\n")
+        out = json.loads(self._tool(tmp_path)._run(queries=["config.reference.yaml"]))
+        assert "uses.py" in {r["file"] for r in out["results"]}

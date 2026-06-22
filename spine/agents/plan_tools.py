@@ -207,11 +207,14 @@ class _SearchCodebaseInput(BaseModel):
     queries: list[str] = Field(
         default_factory=list,
         description=(
-            "REQUIRED. Non-empty list of search terms or topic keywords. "
-            "Each query is run as a case-insensitive substring search across "
-            "all source files. E.g. ['WorkflowState', 'submit_work', 'UIApi']. "
-            "You MUST pass this as a list of strings — a bare string will be "
-            "rejected."
+            "REQUIRED. List of keyword/symbol terms to search for — ideally ONE "
+            "term per item (a class, function, or filename), e.g. "
+            "['UIApi', 'set_phase_provider', 'config_view']. A file matches a "
+            "query if it contains ANY of the query's terms (case-insensitive), "
+            "so you don't need exact phrases; if you do put several words in one "
+            "item they are split and OR-matched, not required to appear together. "
+            "Files are ranked by how many of your queries they match. Pass a list "
+            "of strings (a bare string is coerced)."
         ),
     )
     file_patterns: list[str] = Field(
@@ -255,10 +258,12 @@ class SearchCodebaseTool(BaseTool):
 
     name: str = "search_codebase"
     description: str = (
-        "Search the codebase for files relevant to given topics or keywords. "
-        "Pass a list of search terms; get back matching file paths with content "
-        "previews. Use this to understand existing code before writing the plan. "
-        "Replaces ls + glob + grep + read_file for exploratory research."
+        "Search the codebase for files relevant to given keywords/symbols. Pass "
+        "a list of terms (one symbol or keyword per item works best); get back "
+        "the files matching the most terms, with content previews. A file "
+        "matches if it contains ANY term in a query, so approximate keywords "
+        "still surface results. Use this to understand existing code before "
+        "writing the plan. Replaces ls + glob + grep + read_file."
     )
     args_schema: Optional[ArgsSchema] = _SearchCodebaseInput
 
@@ -398,20 +403,37 @@ class SearchCodebaseTool(BaseTool):
         query: str,
         candidates: set[Path],
     ) -> dict[Path, list[dict[str, Any]]]:
-        """Return files containing query with matching line info."""
-        matched: dict[Path, list[dict[str, Any]]] = {}
+        """Return files containing the query, matched as an OR of its TERMS.
 
-        # Try rg first (fast)
+        The query string is split on whitespace into terms and matched as an OR
+        of fixed strings: a file matches if it contains ANY term. This keeps the
+        tool forgiving of how a model phrases a search. Models routinely cram
+        several symbols into one query (e.g. ``"UIApi get_providers
+        add_llm_provider"``); grepping that whole phrase as a single regex
+        required all the words on one line and returned NOTHING — which sent
+        weaker local models into search-retry spirals (the whole point of the
+        tool is to help the model, not punish its phrasing). Fixed-string
+        matching (``-F``) also means dotted names like ``config.reference.yaml``
+        aren't mangled by regex metacharacters.
+        """
+        matched: dict[Path, list[dict[str, Any]]] = {}
+        terms = query.split()
+        if not terms:
+            return matched
+
+        # Try rg first (fast). One ``-e`` per term ⇒ rg ORs them.
         try:
             cmd = [
                 "rg",
                 "-i",
+                "-F",
                 "--line-number",
                 "--with-filename",
                 "--max-count=5",
-                query,
-                str(root),
             ]
+            for term in terms:
+                cmd += ["-e", term]
+            cmd.append(str(root))
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=str(root))
             for line in out.stdout.splitlines():
                 parts = line.split(":", 2)
@@ -434,15 +456,15 @@ class SearchCodebaseTool(BaseTool):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass  # rg not available, fall back to Python
 
-        # Pure Python fallback
-        q_lower = query.lower()
+        # Pure Python fallback — a line matches if it contains ANY term.
+        lowered_terms = [t.lower() for t in terms]
         for fpath in candidates:
             try:
                 lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
                 hits = [
                     {"line": str(i + 1), "text": ln[:120]}
                     for i, ln in enumerate(lines)
-                    if q_lower in ln.lower()
+                    if any(t in ln.lower() for t in lowered_terms)
                 ][:5]
                 if hits:
                     matched[fpath] = hits
