@@ -377,7 +377,7 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
         return active_slice
 
     try:
-        from spine.agents.tools.codebase_query_local import local_find_symbol
+        from spine.agents.tools.codebase_query import find_symbol
         from spine.config import SpineConfig
         db_path = SpineConfig.load().checkpoint_path
     except Exception:
@@ -390,7 +390,7 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
         good: list[str] = []
         for sym in active_slice.get("reference_symbols") or []:
             try:
-                exists = local_find_symbol(db_path, sym) is not None
+                exists = find_symbol(db_path, sym) is not None
             except Exception:
                 good.append(sym)
                 continue
@@ -411,7 +411,7 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
             sym = h.get("symbol", "")
             if sym:
                 try:
-                    exists = local_find_symbol(db_path, sym) is not None
+                    exists = find_symbol(db_path, sym) is not None
                 except Exception:
                     exists = True
                 if not exists:

@@ -164,6 +164,30 @@ def _parse_tool_result(result: Any) -> list[Any]:
     return []
 
 
+def list_file_symbols(db_path: str, file_path: str) -> list[str]:
+    """Indexed symbol names for *file_path*, via the local codebase index.
+
+    A sanctioned programmatic entry point (alongside :func:`list_files`) for
+    non-agent callers — decomposer enrichment, implement-phase anchor scrubbing —
+    that need the ground-truth symbol menu without the agent-facing
+    :class:`CodebaseQueryTool`. Keeps :mod:`codebase_query_local` reachable only
+    through this facade.
+    """
+    from spine.agents.tools.codebase_query_local import local_list_file_symbols
+
+    return local_list_file_symbols(db_path, file_path)
+
+
+def find_symbol(db_path: str, name: str) -> str | None:
+    """Resolve *name* against the local codebase index, or ``None`` if absent.
+
+    Programmatic facade over the local index (see :func:`list_file_symbols`).
+    """
+    from spine.agents.tools.codebase_query_local import local_find_symbol
+
+    return local_find_symbol(db_path, name)
+
+
 async def list_files(
     workspace_root: str,
     mcp_servers: dict[str, dict[str, Any]] | None,

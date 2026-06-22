@@ -464,7 +464,7 @@ def _build_known_symbols_block(db_path: str, files: list[str]) -> str:
     or reference_symbols. Returns '' when the local index has no data.
     """
     try:
-        from spine.agents.tools.codebase_query_local import local_list_file_symbols
+        from spine.agents.tools.codebase_query import list_file_symbols
     except ImportError:
         return ""
 
@@ -476,7 +476,7 @@ def _build_known_symbols_block(db_path: str, files: list[str]) -> str:
     found_any = False
     for f in files:
         try:
-            syms = local_list_file_symbols(db_path, f)
+            syms = list_file_symbols(db_path, f)
         except Exception:
             continue
         if syms:
@@ -505,7 +505,7 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
     if not db_path:
         return
     try:
-        from spine.agents.tools.codebase_query_local import local_find_symbol
+        from spine.agents.tools.codebase_query import find_symbol
     except ImportError:
         return
 
@@ -518,7 +518,7 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
             if not sym:
                 continue
             try:
-                exists = local_find_symbol(db_path, sym) is not None
+                exists = find_symbol(db_path, sym) is not None
             except Exception:
                 continue
             if not exists:
@@ -538,7 +538,7 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
         good: list[str] = []
         for sym in refs:
             try:
-                exists = local_find_symbol(db_path, sym) is not None
+                exists = find_symbol(db_path, sym) is not None
             except Exception:
                 good.append(sym)
                 continue
