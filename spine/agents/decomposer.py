@@ -81,6 +81,14 @@ class EditHint(BaseModel):
             "'full_replace' (new/small file). Empty = implementer chooses."
         ),
     )
+    action: str = Field(
+        default="",
+        description=(
+            "For ast_edit: 'replace' to overwrite the symbol, 'insert_after' "
+            "or 'insert_before' to add code adjacent to it. Leave empty for "
+            "patch/full_replace or when mode is unset."
+        ),
+    )
     intent: str = Field(
         description="Precise statement of the change to make at this anchor."
     )
@@ -614,3 +622,136 @@ def _normalize_per_file_slices(
             }
         )
     return normalized
+
+
+class _EnrichmentOutput(BaseModel):
+    edit_plan: list[EditHint] = Field(default_factory=list)
+
+
+_ENRICH_PROMPT = (
+    xml_block(
+        Tag.ROLE,
+        "You are a slice enricher. Given one feature slice targeting a single "
+        "file and the list of symbols that currently exist in that file, "
+        "produce a concrete edit_plan: ordered, targeted edits the implementer "
+        "applies directly without re-discovering where to work.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "- Each edit_plan entry MUST anchor by a symbol that is in the "
+        "provided symbol list. Symbols being CREATED do not exist yet — "
+        "they are not valid anchors.\n"
+        "- To ADD new methods/functions to a class: use the last existing "
+        "method of that class as symbol, set action='insert_after'.\n"
+        "- To MODIFY an existing method: set symbol to its qualified name, "
+        "action='replace'.\n"
+        "- To add module-level code (imports, constants, top-level functions): "
+        "set symbol to the nearest existing top-level definition, "
+        "action='insert_before' or 'insert_after'.\n"
+        "- For a completely new file: one entry, mode='full_replace', "
+        "symbol='', action=''.\n"
+        "- Do NOT anchor by symbols absent from the provided list.",
+    )
+)
+
+
+async def enrich_slice(
+    *,
+    source_slice: dict,
+    config: RunnableConfig | None = None,
+    session_id: str | None = None,
+) -> dict:
+    """Populate edit_plan for a single-file slice from the codebase index.
+
+    Runs the enricher model on *source_slice* to generate a concrete
+    edit_plan grounded in the currently-indexed symbols for the target file.
+    Returns the slice unchanged on error, empty index, or when edit_plan is
+    already populated.
+    """
+    if source_slice.get("edit_plan"):
+        return source_slice
+
+    files = [f for f in (source_slice.get("target_files") or []) if f]
+    if not files:
+        return source_slice
+
+    from spine.config import SpineConfig
+
+    _spine_cfg = SpineConfig.load()
+    known_block = _build_known_symbols_block(_spine_cfg.checkpoint_path, files)
+    if not known_block:
+        return source_slice
+
+    model = resolve_chat_model(
+        config, session_id=session_id, phase="implement/decomposer/enrich"
+    )
+    decompose_cap = _spine_cfg.decompose_max_completion_tokens
+    if decompose_cap and decompose_cap > 0:
+        model = cap_completion_tokens(model, decompose_cap)
+    model = suppress_reasoning(model)
+    structured = bind_structured_output(model, _EnrichmentOutput)
+
+    slice_json = json.dumps(
+        {
+            k: source_slice.get(k)
+            for k in (
+                "id",
+                "title",
+                "description",
+                "target_files",
+                "acceptance_criteria",
+            )
+        },
+        indent=2,
+        ensure_ascii=False,
+        default=str,
+    )
+    human_content = hostage_layout(
+        xml_blocks(
+            (Tag.SPECIFICATION, slice_json),
+            (Tag.FINDINGS, known_block),
+        ),
+        "Return an _EnrichmentOutput with a concrete edit_plan for this slice.",
+    )
+
+    try:
+        response: Any = await ainvoke_structured_with_retry(
+            structured,
+            [SystemMessage(content=_ENRICH_PROMPT), HumanMessage(content=human_content)],
+            label="enrich_slice",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "enrich_slice: failed for slice %r: %s — continuing without edit_plan",
+            source_slice.get("id"),
+            exc,
+        )
+        return source_slice
+
+    if isinstance(response, _EnrichmentOutput):
+        parsed = response
+    elif hasattr(response, "parsed") and isinstance(response.parsed, _EnrichmentOutput):
+        parsed = response.parsed
+        response.parsed = None
+    else:
+        logger.warning(
+            "enrich_slice: unexpected response type %r for slice %r",
+            type(response).__name__,
+            source_slice.get("id"),
+        )
+        return source_slice
+
+    if not parsed.edit_plan:
+        return source_slice
+
+    enriched = dict(source_slice)
+    enriched["edit_plan"] = [h.model_dump() for h in parsed.edit_plan]
+    _scrub_phantom_symbols([enriched], _spine_cfg.checkpoint_path)
+
+    logger.info(
+        "enrich_slice: slice=%r populated %d edit_plan entry(ies)",
+        source_slice.get("id"),
+        len(enriched.get("edit_plan") or []),
+    )
+    return enriched

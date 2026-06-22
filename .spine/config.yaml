@@ -48,6 +48,10 @@ providers:
   #   model: openrouter:poolside/laguna-xs.2:free
   #   enabled: true
   #   guided_decoding: true
+  - name: openrouter-glm
+    type: deepagents-model
+    model: openrouter:z-ai/glm-5.2
+    enabled: true
   # - name: pat
   #   type: deepagents-model
   #   model: openai:model

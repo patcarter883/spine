@@ -743,11 +743,34 @@ def _apply_ast_edit(
             "available_symbols": names,
         }
     if len(matches) > 1:
+        enc = current.encode("utf-8")
+        locs = [enc[: m.start_byte].count(b"\n") + 1 for m in matches]
         return None, {
             "status": "ambiguous_match",
-            "detail": f"symbol {symbol!r} matches {len(matches)} definitions in {file_path}.",
+            "detail": (
+                f"symbol {symbol!r} matches {len(matches)} definitions in "
+                f"{file_path} at lines {locs}. Remove the duplicate(s) "
+                "(use old_str/new_str targeting the duplicate block), "
+                "then retry ast_edit."
+            ),
         }
     sym = matches[0]
+    if action in ("insert_after", "insert_before"):
+        import re as _re
+
+        inserted_defs = set(_re.findall(r"(?m)^\s*(?:async\s+)?def\s+(\w+)", code))
+        if inserted_defs:
+            existing_simple = {s.qualified_name.split(".")[-1] for s in symbols}
+            conflicts = sorted(inserted_defs & existing_simple)
+            if conflicts:
+                return None, {
+                    "status": "conflict_error",
+                    "detail": (
+                        f"Inserted code re-defines {conflicts} which already "
+                        f"exist in {file_path}. Remove the duplicate(s) first, "
+                        "or use action='replace' to update an existing definition."
+                    ),
+                }
     buf = current.encode("utf-8")
     code_bytes = code.encode("utf-8")
     # A method's start_byte sits AFTER its leading indentation; anchor replace/

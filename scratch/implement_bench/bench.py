@@ -399,6 +399,28 @@ def cmd_replan(args: argparse.Namespace) -> None:
             shutil.rmtree(baseline_plan)
         shutil.copytree(plan_dst, baseline_plan)
         print(f"[replan] baseline plan updated → {baseline_plan}")
+
+        # Also patch the LangGraph checkpoint in the baseline's spine.db so
+        # approve_and_spawn reads the new plan_json + execution_waves.
+        # Without this the checkpoint holds the old plan and the new artifact
+        # is ignored at implement time (dispatcher line 2710 reads checkpoint first).
+        baseline_db = BASELINE / "spine" / "spine.db"
+        plan_json_path = baseline_plan / "plan.json"
+        if baseline_db.exists() and plan_json_path.exists():
+            import asyncio as _asyncio
+            import sys as _sys
+            patch_script = str(BENCH / "_patch_checkpoint.py")
+            proc2 = _run(
+                [_sys.executable, patch_script, str(baseline_db), WORK_ID,
+                 str(plan_json_path)],
+                capture_output=True,
+            )
+            if proc2.returncode == 0:
+                print(f"[replan] checkpoint patched — execution_waves updated")
+            else:
+                print(f"[replan] WARNING: checkpoint patch failed (bench will use old waves):")
+                print(f"         {proc2.stderr.strip()}")
+
         print(f"[replan] next: run `bench.py run --provider <model>` to test against the new plan")
     else:
         print(f"[replan] plan saved to {plan_dst}")

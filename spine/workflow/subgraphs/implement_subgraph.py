@@ -212,10 +212,16 @@ async def _split_slices_node(
         for sl in pending
         if len([f for f in (sl.get("target_files") or []) if f]) >= 2
     ]
-    if not multi:
+    single_no_plan = [
+        sl
+        for sl in pending
+        if len([f for f in (sl.get("target_files") or []) if f]) < 2
+        and not (sl.get("edit_plan") or [])
+    ]
+    if not multi and not single_no_plan:
         return {}
 
-    from spine.agents.decomposer import run_decomposer
+    from spine.agents.decomposer import enrich_slice, run_decomposer
 
     async def _decompose(parent: dict) -> list[dict] | None:
         try:
@@ -253,6 +259,37 @@ async def _split_slices_node(
             len(subs),
         )
 
+    if single_no_plan:
+        async def _enrich(sl: dict) -> dict:
+            try:
+                return await enrich_slice(
+                    source_slice=sl,
+                    config=config,
+                    session_id=work_id,
+                )
+            except _ABORT_EXCEPTIONS:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[%s] split_slices: enrich failed for %r: %s",
+                    work_id,
+                    sl.get("id"),
+                    e,
+                )
+                return sl
+
+        enriched_singles = await asyncio.gather(*[_enrich(sl) for sl in single_no_plan])
+        for orig, enriched in zip(single_no_plan, enriched_singles):
+            if enriched is not orig and (enriched.get("edit_plan") or []):
+                remove_ids.append(orig.get("id"))
+                adds.append(enriched)
+                logger.info(
+                    "[%s] split_slices: enriched slice=%r -> %d edit_plan entry(ies)",
+                    work_id,
+                    orig.get("id"),
+                    len(enriched.get("edit_plan") or []),
+                )
+
     if not remove_ids:
         return {}
     return {"pending_slices": {"remove": remove_ids, "add": adds}}
@@ -286,8 +323,10 @@ def _format_edit_plan(active_slice: dict) -> str:
         mode = h.get("mode", "")
         intent = h.get("intent", "")
         anchor = f" symbol=`{symbol}`" if symbol else ""
+        action_str = h.get("action", "")
+        act = f" action=`{action_str}`" if action_str else ""
         via = f" via `{mode}`" if mode else ""
-        lines.append(f"- {file}{anchor}{via}: {intent}")
+        lines.append(f"- {file}{anchor}{act}{via}: {intent}")
     return (
         "\n\n## Targeted edits (from the planner — APPLY THESE NOW)\n"
         "These ARE your task. Your FIRST tool calls must apply them with "
