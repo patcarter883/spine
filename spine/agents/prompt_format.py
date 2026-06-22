@@ -75,6 +75,7 @@ class Tag(str, Enum):
     PRIOR_RESEARCH = "prior_research"
     RETRIEVED_CODE = "retrieved_code"
     FINDINGS = "findings"
+    CODEBASE_LEDGER = "codebase_ledger"
     LATEST_FINDING = "latest_finding"
     HISTORY = "history"
     TOPICS_ALREADY_EXPLORED = "topics_already_explored"

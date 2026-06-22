@@ -34,7 +34,10 @@ from spine.agents.evidence_compression import (
     compress_findings as _compress_findings,
     compress_recall_chunks as _compress_recall_chunks,
 )
-from spine.agents.exploration_agents import format_findings as _format_findings
+from spine.agents.exploration_agents import (
+    build_findings_ledger as _build_findings_ledger,
+    format_findings as _format_findings,
+)
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.synthesis_budget import (
     allocate_evidence as _allocate_evidence,
@@ -974,11 +977,24 @@ async def _synthesize_plan(
             )
             + _BASE_PROMPT
         )
+
+        # ── Durable codebase ledger (A2) ────────────────────────────────
+        # A compact file→role map derived from the FULL findings (before any
+        # compression) plus any inherited prior-phase map. It is injected at
+        # full fidelity and is NOT subject to the findings budget below, so
+        # when _compress_findings trims the verbose <findings> the synthesizer
+        # still sees every file the researchers identified. Counted as fixed
+        # prompt text so the total window stays bounded (findings shrink to
+        # make room, the structural map never does).
+        ledger_text = _build_findings_ledger(
+            findings, prior_findings=state.get("prior_phase_findings"),
+        )
+
         synth_budget = _resolve_synthesis_budget(
             PhaseName.PLAN.value,
             fixed_texts=[
                 system_estimate, description, spec_body, feedback_body,
-                scratchpad, instruction,
+                scratchpad, instruction, ledger_text,
             ],
         )
 
@@ -1010,10 +1026,14 @@ async def _synthesize_plan(
         # the feedback in the model's high-attention tail. Injecting it mid-
         # prompt (the old order) shifted every following byte and forced a
         # full cache miss on the retry call (trace 019ec997 call 5: cache=0).
+        # The ledger sits in the cache-stable prefix (it is deterministic and
+        # byte-identical across a structural retry) and BEFORE the compressible
+        # <findings>, so the durable map leads and the trimmed detail follows.
         prompt = hostage_layout(
             xml_blocks(
                 (Tag.OBJECTIVE, description),
                 (Tag.SPECIFICATION, spec_body),
+                (Tag.CODEBASE_LEDGER, ledger_text),
                 (Tag.FINDINGS, findings_text),
                 (Tag.SCRATCHPAD, scratchpad),
                 (Tag.CRITIC_FEEDBACK, feedback_body),

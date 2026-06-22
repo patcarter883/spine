@@ -2165,3 +2165,86 @@ def format_findings(
 # Backwards-compatible alias for the legacy underscore name used by the
 # synthesizers in exploration_subgraph.py.
 _format_findings = format_findings
+
+
+def build_findings_ledger(
+    findings: list[dict],
+    *,
+    prior_findings: list[dict] | None = None,
+    max_files: int = 80,
+    max_role_chars: int = 140,
+    max_chars: int = 4000,
+) -> str:
+    """Render a compact, DURABLE structural map of every researched file.
+
+    Why this exists (the A2 "findings ledger"): the synthesizers compress the
+    verbose ``<findings>`` blocks to fit the completion window
+    (``compress_findings`` / the per-finding token budget in
+    :func:`format_findings`, the 8000-char ``_research_text`` cap in the
+    decomposed manager). That compression can drop whole findings — and with
+    them the only record that a given file/role was ever discovered. This
+    ledger is the antidote: ONE line per file (``path: role``), derived
+    deterministically from each finding's ``file_map``, small enough to inject
+    at FULL fidelity and exempt from the budget compaction. When the bulk
+    findings are trimmed, the synthesizer still has the complete file map.
+
+    Deterministic by design — no extra LLM step (proposal principle #1/#4): it
+    is a pure reduction over ``file_map`` dicts the researchers already emit.
+
+    Args:
+        findings: ResearchFindings dicts from the current phase's exploration.
+        prior_findings: Findings inherited from an earlier phase (e.g. SPECIFY's
+            map injected into PLAN). Folded in so the ledger is complete; the
+            current phase's roles win on conflict.
+        max_files: Hard cap on listed files (older/duplicate files drop first).
+        max_role_chars: Per-line role truncation.
+        max_chars: Hard cap on the whole block.
+
+    Returns:
+        A markdown block, or ``""`` when no file map was discovered (so the
+        caller can omit the block entirely).
+    """
+    # current-phase findings win on conflict → iterate prior first, then current.
+    ordered: list[dict] = []
+    if prior_findings:
+        ordered.extend(f for f in prior_findings if isinstance(f, dict))
+    ordered.extend(f for f in findings if isinstance(f, dict))
+
+    file_roles: dict[str, str] = {}
+    for f in ordered:
+        if f.get("error"):
+            continue
+        file_map = f.get("file_map")
+        if not isinstance(file_map, dict):
+            continue
+        for path, role in file_map.items():
+            if not isinstance(path, str) or not path.strip():
+                continue
+            role_str = " ".join(str(role).split()) if role else ""
+            if len(role_str) > max_role_chars:
+                role_str = role_str[: max_role_chars - 1].rstrip() + "…"
+            # Keep the most informative role: prefer a non-empty role, and let a
+            # later (current-phase) finding overwrite an earlier one.
+            if path not in file_roles or role_str:
+                file_roles[path] = role_str
+
+    if not file_roles:
+        return ""
+
+    lines = [
+        "## Codebase ledger (durable map — every file the researchers "
+        "identified; NEVER trimmed)",
+    ]
+    omitted = 0
+    for i, (path, role) in enumerate(file_roles.items()):
+        if i >= max_files:
+            omitted = len(file_roles) - max_files
+            break
+        lines.append(f"- {path}: {role}" if role else f"- {path}")
+    if omitted > 0:
+        lines.append(f"- …and {omitted} more file(s) (read from disk if needed).")
+
+    block = "\n".join(lines)
+    if len(block) > max_chars:
+        block = block[: max_chars - 1].rstrip() + "…"
+    return block

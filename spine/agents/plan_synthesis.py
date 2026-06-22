@@ -41,6 +41,7 @@ from spine.agents.helpers import (
     resolve_chat_model,
     suppress_reasoning,
 )
+from spine.agents.exploration_agents import build_findings_ledger
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.models.enums import PhaseName
 
@@ -151,6 +152,7 @@ async def _run_manager(
     config: RunnableConfig | None,
     work_id: str,
     feedback: str = "",
+    ledger: str = "",
 ) -> PlanSkeleton:
     """One small structured call → the plan skeleton (stubs)."""
     model = resolve_chat_model(config, session_id=work_id, phase=_phase("manager"))
@@ -158,6 +160,9 @@ async def _run_manager(
     structured = bind_structured_output(model, PlanSkeleton)
     blocks = [
         (Tag.SPECIFICATION, spec_md.strip()),
+        # Durable file→role map (A2): full fidelity, never truncated by the
+        # _research_text cap that bounds the verbose findings below it.
+        (Tag.CODEBASE_LEDGER, ledger),
         (Tag.FINDINGS, research or "(no research context)"),
     ]
     if feedback.strip():
@@ -214,6 +219,7 @@ async def _run_slice_worker(
     research: str,
     config: RunnableConfig | None,
     work_id: str,
+    ledger: str = "",
 ) -> SliceDetail:
     """One small structured call → this slice's execution detail.
 
@@ -231,6 +237,7 @@ async def _run_slice_worker(
             (Tag.CONSTRAINTS, "Other slices — owned by separate workers, do NOT describe their work:\n"
              + _siblings_block(stub, all_stubs)),
             (Tag.SPECIFICATION, spec_md.strip()[:6000]),
+            (Tag.CODEBASE_LEDGER, ledger),
             (Tag.FINDINGS, research or "(no research context)"),
         ),
         f"Return a SliceDetail for slice '{stub.id}': execution_requirements + "
@@ -293,10 +300,26 @@ async def synthesize_plan(
     work_id = state.get("work_id", "unknown")
     research = _research_text(state)
 
-    skeleton = await _run_manager(spec_md, research, config, work_id, feedback=feedback)
+    # Durable file→role map (A2). The decomposed manager/workers otherwise see
+    # only ``retrieved_context`` (vector recall) via ``_research_text`` — the
+    # exploration ``findings`` never reach them. The ledger carries that
+    # structural map in at full fidelity, exempt from the 8000-char research
+    # cap, so the skeleton's target_files/reference_symbols are grounded in
+    # what exploration actually found.
+    ledger = build_findings_ledger(
+        state.get("findings") or [],
+        prior_findings=state.get("prior_phase_findings"),
+    )
+
+    skeleton = await _run_manager(
+        spec_md, research, config, work_id, feedback=feedback, ledger=ledger,
+    )
     details = await asyncio.gather(
         *(
-            _run_slice_worker(stub, skeleton.slices, spec_md, research, config, work_id)
+            _run_slice_worker(
+                stub, skeleton.slices, spec_md, research, config, work_id,
+                ledger=ledger,
+            )
             for stub in skeleton.slices
         )
     )
