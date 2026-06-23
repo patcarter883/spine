@@ -103,6 +103,17 @@ providers:
     stream_usage: true
     max_concurrent_calls: 2
     context_window: 60000
+    # Qwen-Coder model-card sampling: curbs the repeated-survey / re-read loops
+    # a tool-using agent falls into (trace 019ef2ae: one file read 89×).
+    # repeat_penalty is the key anti-loop lever (llama.cpp's native name —
+    # confirmed accepted by this server; vLLM's "repetition_penalty" is also
+    # supported by _build_local_model for portability). top_k/repeat_penalty
+    # ride extra_body to the server (no ChatOpenAI field); top_p/temperature
+    # are native — see _build_local_model.
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    repeat_penalty: 1.05
   - name: local-north-code
     type: deepagents-model
     model: openai:North-Mini-Code-1.0-GGUF-UD-Q4_K_XL

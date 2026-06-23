@@ -63,6 +63,53 @@ def test_local_completion_cap_within_window_untouched(monkeypatch):
     assert captured.get("max_completion_tokens") == 8000
 
 
+def test_local_sampler_knobs_routed_correctly(monkeypatch):
+    """top_p is a native ChatOpenAI kwarg; top_k/repetition_penalty have no
+    field and must ride extra_body or the llama.cpp server never sees them."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local",
+        {
+            "base_url": "http://localhost:8010/v1",
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "repetition_penalty": 1.05,
+        },
+    )
+    assert captured.get("temperature") == 0.7
+    assert captured.get("top_p") == 0.8
+    extra = captured.get("extra_body") or {}
+    assert extra.get("top_k") == 20
+    assert extra.get("repetition_penalty") == 1.05
+
+
+def test_local_sampler_knobs_merge_with_reasoning_suppression(monkeypatch):
+    """Sampler extra_body and the reasoning:false suppression coexist."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local",
+        {
+            "base_url": "http://localhost:8010/v1",
+            "repetition_penalty": 1.05,
+            "reasoning": False,
+        },
+    )
+    extra = captured.get("extra_body") or {}
+    assert extra.get("repetition_penalty") == 1.05
+    assert extra.get("reasoning_budget") == 0
+    assert extra.get("chat_template_kwargs") == {"enable_thinking": False}
+
+
+def test_local_no_sampler_config_no_extra_body(monkeypatch):
+    """With no sampler/reasoning config, extra_body is not set at all."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local", {"base_url": "http://localhost:8010/v1"}
+    )
+    assert "extra_body" not in captured
+
+
 def _capture_init_chat_model(monkeypatch):
     captured: dict = {}
 

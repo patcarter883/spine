@@ -878,9 +878,12 @@ def _build_local_model(
     if api_key := provider_cfg.get("api_key"):
         kwargs["api_key"] = api_key
 
-    # Pass through optional tuning fields if present
+    # Pass through optional tuning fields if present (native ChatOpenAI kwargs).
     for key in (
         "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
         "max_tokens",
         "max_completion_tokens",
         "max_retries",
@@ -923,11 +926,26 @@ def _build_local_model(
     # both is safe — each model picks up whichever it understands and ignores
     # the unused jinja kwarg. Only injected when reasoning is explicitly False;
     # unset/True leaves the model's default behaviour intact.
+    # ── Sampler knobs the OpenAI schema lacks (forwarded via extra_body) ──
+    # top_k / repetition_penalty / min_p are llama.cpp/vLLM sampler params with
+    # no field on ChatOpenAI — set as plain kwargs they are silently dropped, so
+    # they must ride in extra_body. Qwen3-Coder's model card recommends
+    # top_k=20 / repetition_penalty=1.05 (with temperature 0.7 / top_p 0.8)
+    # specifically to curb the repeated-survey / re-read loops a tool-using
+    # agent falls into (trace 019ef2ae: one file read 89×). Without these the
+    # server applies its own defaults (often repetition_penalty=1.0, i.e. none).
+    # Values stay in provider config — this just stops them being dropped.
+    extra_body: dict[str, Any] = {}
+    for key in ("top_k", "repetition_penalty", "repeat_penalty", "min_p"):
+        if key in provider_cfg:
+            extra_body[key] = provider_cfg[key]
+
     if provider_cfg.get("reasoning") is False:
-        kwargs["extra_body"] = {
-            "reasoning_budget": 0,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
+        extra_body["reasoning_budget"] = 0
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+    if extra_body:
+        kwargs["extra_body"] = extra_body
 
     # Fall back to global SpineConfig.max_completion_tokens when neither
     # max_completion_tokens nor max_tokens is set on the provider. Without
