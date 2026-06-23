@@ -17,7 +17,9 @@ import json
 import pytest
 
 from spine.agents.tools.read_edit_lint import (
+    _FILE_READ_CAP,
     _READ_PRESSURE_SOFT,
+    _READ_PRESSURE_WALL,
     ReadEditLintTool,
 )
 
@@ -130,3 +132,57 @@ def test_pressure_resets_after_edit(ws):
     # counter reset → the next read is read #1, no nudge
     nxt = tool._run("pkg/mod.py", read_symbol="Foo.bar")
     assert "reads since your last edit" not in nxt
+
+
+# ── Per-file read budget (anchor-varied re-reads) ───────────────────────
+# Distinct anchors into the same file slip past the exact-anchor cache; the
+# per-file budget caps them. Five distinct snippets in _SRC.
+_ANCHORS = ["class Foo", "def bar", "return 1", "def baz", "return 2"]
+
+
+def test_file_read_cap_withholds_body_after_cap(ws):
+    tool = ReadEditLintTool(workspace_root=str(ws))
+    outs = [tool._run("pkg/mod.py", read_around=a) for a in _ANCHORS]
+    # the first _FILE_READ_CAP distinct-anchor reads return real bodies
+    for o in outs[:_FILE_READ_CAP]:
+        assert o.startswith("[read:")
+    # the read landing ON the cap flags itself as the final full read
+    assert "final full read" in outs[_FILE_READ_CAP - 1]
+    # reads beyond the cap are refused without a body
+    assert _status(outs[_FILE_READ_CAP]) == "read_capped"
+
+
+def test_file_read_cap_resets_after_edit(ws):
+    tool = ReadEditLintTool(workspace_root=str(ws))
+    for a in _ANCHORS[:_FILE_READ_CAP]:
+        tool._run("pkg/mod.py", read_around=a)
+    assert _status(tool._run("pkg/mod.py", read_around="return 2")) == "read_capped"
+    # a successful edit clears the budget → reads flow again
+    tool._run("pkg/mod.py", full_replace=_SRC.replace("return 1", "return 8"))
+    assert tool._run("pkg/mod.py", read_around="return 2").startswith("[read:")
+
+
+def test_global_read_wall_refuses_breadth_spiral(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    n_files = (_READ_PRESSURE_WALL // _FILE_READ_CAP) + 2
+    for i in range(n_files):
+        (pkg / f"m{i}.py").write_text(_SRC, encoding="utf-8")
+    tool = ReadEditLintTool(workspace_root=str(tmp_path))
+    outs = []
+    for i in range(n_files):
+        for a in _ANCHORS[:_FILE_READ_CAP]:
+            outs.append(tool._run(f"pkg/m{i}.py", read_around=a))
+    # once reads pile up past the wall, a fresh file read is still refused
+    assert any("reading is now disabled" in o for o in outs)
+
+
+def test_not_found_escalates_after_repeated_guesses(ws):
+    tool = ReadEditLintTool(workspace_root=str(ws), target_files=["pkg/mod.py"])
+    first = json.loads(tool._run("a/x.py", read_symbol="Foo.bar"))
+    assert first["status"] == "not_found"
+    assert "STOP guessing" not in first["detail"]
+    # second miss with no intervening edit → hard directive to use target_files
+    second = json.loads(tool._run("b/y.py", read_symbol="Foo.bar"))
+    assert "STOP guessing" in second["detail"]
+    assert "pkg/mod.py" in second["did_you_mean"]

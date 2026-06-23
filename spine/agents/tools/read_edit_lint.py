@@ -62,6 +62,26 @@ _AST_EDIT_LANGS = {".py", ".php", ".ts", ".tsx"}
 _READ_PRESSURE_SOFT = 8
 _READ_PRESSURE_HARD = 16
 
+# Per-file read budget: after this many distinct-anchor reads of the SAME file
+# since the last successful edit, the body is withheld. The exact-(path,anchor)
+# read cache only catches verbatim repeats; trace 019ef2ae showed one file read
+# 89× at *varying* anchors, slipping past it. The read that lands ON the cap
+# still returns the body (a fresh copy, in case Tier-2 eviction has dropped the
+# earlier ones from context); reads beyond it return `read_capped` with no body.
+_FILE_READ_CAP = 4
+
+# Global read wall: once this many reads accumulate since the last successful
+# edit, every further read is refused regardless of file — this stops the
+# breadth-spiral the per-file cap can't (reading many files a few times each).
+# Set above the hard nudge so a genuine multi-file survey still completes.
+_READ_PRESSURE_WALL = 24
+
+# After this many not_found path misses (no intervening edit), the editor is
+# guessing paths: escalate from a polite did_you_mean to a hard directive to
+# read only the slice's target_files. Trace 019ef2ae: ~30 reads burned on
+# invented path variants (spine/ui/api.py ×20, spine/ui/ui_api.py ×8).
+_NOT_FOUND_ESCALATE = 2
+
 # Directories never worth scanning when suggesting a corrected path.
 _PATH_SUGGEST_SKIP = {
     ".git", ".venv", "venv", "__pycache__", "node_modules", ".spine",
@@ -950,6 +970,11 @@ class ReadEditLintTool(BaseTool):
     _reads_since_edit: int = PrivateAttr(default=0)
     _read_calls: int = PrivateAttr(default=0)
     _file_index_cache: Optional[dict] = PrivateAttr(default=None)
+    # Body-returning reads of each file since the last edit (drives the per-file
+    # read budget). Distinct from _read_cache, which keys on the exact anchor.
+    _file_read_count: dict = PrivateAttr(default_factory=dict)  # file_path -> int
+    # not_found path misses since the last edit (drives path-guess escalation).
+    _not_found_count: int = PrivateAttr(default=0)
 
     def _build_file_index(self) -> dict:
         """Lazily map basename -> [workspace-relative paths] for suggestions."""
@@ -988,6 +1013,26 @@ class ReadEditLintTool(BaseTool):
         seen: set[str] = set()
         ordered = [h for h in hits if not (h in seen or seen.add(h))]
         return {"did_you_mean": ordered[:5]} if ordered else {}
+
+    def _not_found(self, file_path: str, *, action: str) -> str:
+        """Build a ``not_found`` result, escalating after repeated misses.
+
+        The first miss(es) carry a polite ``did_you_mean``. Once the editor has
+        missed ``_NOT_FOUND_ESCALATE`` non-existent paths without an intervening
+        edit it is guessing — the detail hardens into a directive to read/edit
+        ONLY the slice's authoritative ``target_files``.
+        """
+        self._not_found_count += 1
+        fields = self._did_you_mean(file_path)
+        detail = f"Cannot {action} {file_path}: file does not exist."
+        if self._not_found_count >= _NOT_FOUND_ESCALATE and self.target_files:
+            detail += (
+                f" You have now missed {self._not_found_count} non-existent "
+                "paths — STOP guessing. Read and edit ONLY the slice's "
+                f"target_files: {list(self.target_files)}."
+            )
+            fields.setdefault("did_you_mean", list(self.target_files))
+        return _result("not_found", detail=detail, **fields)
 
     def _pressure(self, out: str) -> str:
         """Append a one-shot edit-pressure nudge at each read threshold."""
@@ -1129,11 +1174,7 @@ class ReadEditLintTool(BaseTool):
             anchor = read_symbol if mode == "read_symbol" else f"~{read_around}"
             key = (file_path, anchor)
             if not existed:
-                return _result(
-                    "not_found",
-                    detail=f"Cannot read {file_path}: file does not exist.",
-                    **self._did_you_mean(file_path),
-                )
+                return self._not_found(file_path, action="read")
             # Per-slice read cache: a repeat anchored read of an UNCHANGED file
             # returns a compact pointer instead of re-injecting the body — the
             # source is already above in the conversation. Invalidated per-file
@@ -1153,6 +1194,34 @@ class ReadEditLintTool(BaseTool):
                         ),
                     )
                 )
+            # Global read wall: too many reads since the last edit. Refuse every
+            # body now — surveying is over. Catches the breadth-spiral (many
+            # files, a few reads each) the per-file cap below cannot.
+            if self._reads_since_edit > _READ_PRESSURE_WALL:
+                return _result(
+                    "read_capped",
+                    detail=(
+                        f"{self._reads_since_edit} reads since your last "
+                        "successful edit — reading is now disabled until you "
+                        "edit. Everything the slice needs has been read and is "
+                        "above in this conversation. Apply an edit with "
+                        "read_edit_lint (ast_edit/patch/full_replace), or return "
+                        "a status explaining the specific blocker."
+                    ),
+                )
+            # Per-file read budget: catch anchor-varied re-reads of one file that
+            # slip past the exact-anchor cache (trace 019ef2ae: api.py read 89×).
+            fcount = self._file_read_count.get(file_path, 0)
+            if fcount >= _FILE_READ_CAP:
+                return _result(
+                    "read_capped",
+                    detail=(
+                        f"You have already read {file_path} {fcount} times since "
+                        "your last edit — its source is above. Re-reading at a new "
+                        "anchor will not help. Apply your edit to it now, or report "
+                        "what specifically blocks you."
+                    ),
+                )
             try:
                 content = path.read_text(encoding="utf-8")
             except OSError as exc:
@@ -1165,6 +1234,16 @@ class ReadEditLintTool(BaseTool):
             # error statuses are JSON and must stay re-tryable.
             if out.startswith("[read:"):
                 self._read_cache[key] = (epoch, self._read_calls)
+                fcount += 1
+                self._file_read_count[file_path] = fcount
+                # The read landing ON the cap is the last full body for this file
+                # until an edit lands — flag it so the model knows to stop here.
+                if fcount == _FILE_READ_CAP:
+                    out += (
+                        f"\n\n[⚠ final full read of {file_path} — you have now "
+                        "read it enough; further reads will be refused. Make your "
+                        "edit next.]"
+                    )
             return self._pressure(out)
 
         # ── Reject edits to reference-only files ────────────────────
@@ -1187,11 +1266,7 @@ class ReadEditLintTool(BaseTool):
             new_content = full_replace or ""
         else:
             if not existed:
-                return _result(
-                    "not_found",
-                    detail=f"Cannot edit {file_path}: file does not exist.",
-                    **self._did_you_mean(file_path),
-                )
+                return self._not_found(file_path, action="edit")
             try:
                 current = path.read_text(encoding="utf-8")
             except OSError as exc:
@@ -1257,6 +1332,11 @@ class ReadEditLintTool(BaseTool):
         # just made progress).
         self._file_epoch[file_path] = self._file_epoch.get(file_path, 0) + 1
         self._reads_since_edit = 0
+        # A successful edit is real progress, not a spiral: clear the per-file
+        # read budgets and the path-guess counter so the editor gets a clean
+        # slate for its next target.
+        self._file_read_count.clear()
+        self._not_found_count = 0
         return _result("ok", **ok_fields)
 
     async def _arun(
