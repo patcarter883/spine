@@ -122,7 +122,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2
+    max_concurrent_calls: 4
     context_window: 60000
   - name: local-mellum
     type: deepagents-model
@@ -132,7 +132,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2
+    max_concurrent_calls: 4
     context_window: 60000
   embedding:
   - name: local-embeddings
