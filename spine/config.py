@@ -325,17 +325,22 @@ class SpineConfig:
     # full_replace of a ~30KB file, which is larger than any single slice's file.
     implement_max_completion_tokens: int = 8000
     # Completion-token cap for the structural decomposer's no-tool structured
-    # calls (PLAN / FALLBACK / PER_FILE in spine.agents.decomposer). A
-    # DecompositionResult is a handful of small slice objects (2-3 micro-slices,
-    # or one sub-slice per target file), so a few thousand tokens is ample.
-    # Without a cap the bare call inherits the global max_completion_tokens
+    # calls (PLAN / FALLBACK / PER_FILE in spine.agents.decomposer) AND the
+    # single-file enrich pass. The edit_plan now carries ONE entry per change
+    # site / new method (not a single bundled "add all the methods" entry), so a
+    # large slice emits ~10 EditHint objects with full-signature intents — the
+    # old 4096 truncated that mid-JSON on tight-cap local models, raising
+    # LengthFinishReasonError and silently dropping the whole edit_plan (North
+    # bench 0624: enrich failed for backend-persistence/config-* → slices ran
+    # with no plan, neutralising source pre-loading). 8192 fits the larger plan.
+    # Without any cap the bare call inherits the global max_completion_tokens
     # (30K); against a finite local window (e.g. context_window=40K) the server
     # must reserve a 30K generation slot, leaving too little KV cache for the
     # prompt and OOM-crashing the backend — which then drops every in-flight
     # request with "CURL error: Could not connect" and fans the failures out
     # into a fallback-decompose retry storm (trace 019ed360). Per-phase
     # max_completion_tokens overrides still win.
-    decompose_max_completion_tokens: int = 4096
+    decompose_max_completion_tokens: int = 8192
     # Max chars of the failure traceback embedded in a FALLBACK decompose
     # prompt. The traceback is otherwise unbounded — a large one (plus the
     # verbatim failed-slice JSON) inflates the prompt until the structured call
