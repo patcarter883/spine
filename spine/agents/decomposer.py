@@ -90,7 +90,11 @@ class EditHint(BaseModel):
         ),
     )
     intent: str = Field(
-        description="Precise statement of the change to make at this anchor."
+        description=(
+            "Precise statement of the change at this anchor — naming exactly "
+            "ONE symbol and its full signature + behaviour. One change site per "
+            "entry; never bundle multiple new methods into one intent."
+        )
     )
 
 
@@ -146,12 +150,14 @@ _PLAN_PROMPT = (
         "verifier could check against the working tree.\n"
         "- Slice ids are lowercase slugs (e.g. 'add-token-refresh').\n"
         "- Populate `edit_plan` with the concrete edits each slice needs — one "
-        "entry per change site. Anchor by `symbol` (qualified name, e.g. "
-        "'ClassName.method') whenever the edit touches a named definition, and "
-        "suggest a `mode` ('ast_edit' for symbol edits, 'patch' for "
-        "snippet-level changes, 'full_replace' for new files). This lets a "
-        "lightweight implementer apply edits directly. Omit only what you "
-        "genuinely cannot anchor.",
+        "entry per change site, and ONE entry per new method/function (never a "
+        "single 'add all the methods' umbrella entry — a bundled entry forces "
+        "the implementer to survey the whole file). Anchor by `symbol` "
+        "(qualified name, e.g. 'ClassName.method') whenever the edit touches a "
+        "named definition, and suggest a `mode` ('ast_edit' for symbol edits, "
+        "'patch' for snippet-level changes, 'full_replace' for new files). This "
+        "lets a lightweight implementer apply edits directly. Omit only what "
+        "you genuinely cannot anchor.",
     )
 )
 
@@ -206,7 +212,9 @@ _PER_FILE_PROMPT = (
         "- Do NOT introduce files that are not in the parent's target_files, "
         "and do NOT merge two files into one sub-slice.\n"
         "- For each sub-slice, populate `edit_plan` with the concrete edits in "
-        "that one file — anchor by `symbol` (qualified name) for edits to a "
+        "that one file — one entry per change site, and ONE entry per new "
+        "method/function (never a single 'add all the methods' umbrella entry). "
+        "Anchor by `symbol` (qualified name) for edits to a "
         "named function/method/class and set `mode` to 'ast_edit', use 'patch' "
         "for snippet edits, 'full_replace' for a new file. This lets a "
         "lightweight implementer apply the edits without re-discovering them.\n"
@@ -695,8 +703,16 @@ _ENRICH_PROMPT = (
         "- Each edit_plan entry MUST anchor by a symbol that is in the "
         "provided symbol list. Symbols being CREATED do not exist yet — "
         "they are not valid anchors.\n"
-        "- To ADD new methods/functions to a class: use the last existing "
-        "method of that class as symbol, set action='insert_after'.\n"
+        "- ONE entry per change site. Emit a SEPARATE entry for EACH new "
+        "method/function you add — never a single umbrella entry like 'add "
+        "the embedding, reranker and timeout methods'. If the slice adds six "
+        "methods, emit six entries. Each entry's `intent` names exactly ONE "
+        "symbol and states its full signature + behaviour (a thin implementer "
+        "writes one small edit per entry; a bundled entry forces it to survey "
+        "the whole file and is the api.py 89×-read spiral).\n"
+        "- To ADD a new method/function to a class: anchor each new symbol on "
+        "the last existing method of that class, action='insert_after' (still "
+        "one entry per new method — they may share the same anchor).\n"
         "- To MODIFY an existing method: set symbol to its qualified name, "
         "action='replace'.\n"
         "- To add module-level code (imports, constants, top-level functions): "

@@ -123,7 +123,9 @@ def empty_directive(reason: str = "") -> SubagentDirective:
     )
 
 
-def format_directive_for_prompt(directive: SubagentDirective | dict) -> str:
+def format_directive_for_prompt(
+    directive: SubagentDirective | dict, *, compact: bool = False
+) -> str:
     """Render a SubagentDirective wrapped in a ``<directive>`` block.
 
     Output is XML-bounded so it can be safely concatenated into a parent
@@ -131,6 +133,12 @@ def format_directive_for_prompt(directive: SubagentDirective | dict) -> str:
     see :mod:`spine.agents.prompt_format` for the convention. Accepts
     either a SubagentDirective instance or the dict shape LangGraph
     round-trips through state.
+
+    ``compact=True`` renders only the strategic fields (``approach`` and
+    ``notes``) and drops ``target_files`` / ``tool_calls_to_make`` /
+    ``acceptance`` — used by the implement-phase prompt, where those fields are
+    already carried by the ``<findings>`` and ``<edit_plan>`` blocks and would
+    otherwise be stated a third time.
     """
     if isinstance(directive, SubagentDirective):
         data = directive.model_dump()
@@ -144,23 +152,24 @@ def format_directive_for_prompt(directive: SubagentDirective | dict) -> str:
     if approach:
         lines.append(f"**Approach:** {approach}")
 
-    targets = data.get("target_files") or []
-    if targets:
-        lines.append("**Target files:**")
-        for t in targets:
-            lines.append(f"- {t}")
+    if not compact:
+        targets = data.get("target_files") or []
+        if targets:
+            lines.append("**Target files:**")
+            for t in targets:
+                lines.append(f"- {t}")
 
-    calls = data.get("tool_calls_to_make") or []
-    if calls:
-        lines.append("**Suggested tool calls:**")
-        for c in calls:
-            lines.append(f"- {c}")
+        calls = data.get("tool_calls_to_make") or []
+        if calls:
+            lines.append("**Suggested tool calls:**")
+            for c in calls:
+                lines.append(f"- {c}")
 
-    acceptance = data.get("acceptance") or []
-    if acceptance:
-        lines.append("**Acceptance:**")
-        for a in acceptance:
-            lines.append(f"- {a}")
+        acceptance = data.get("acceptance") or []
+        if acceptance:
+            lines.append("**Acceptance:**")
+            for a in acceptance:
+                lines.append(f"- {a}")
 
     notes = (data.get("notes") or "").strip()
     if notes:

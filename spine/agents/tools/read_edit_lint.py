@@ -665,6 +665,33 @@ def _fuzzy_locate(
     return (start, end, _leading_ws(buf_lines[i]), _leading_ws(s_lines[0])), None
 
 
+def _first_match_span(buffer: str, search: str) -> Optional[tuple[int, int]]:
+    """Char span of the FIRST occurrence of ``search`` (exact, else trimmed).
+
+    Used by the READ path to tolerate ambiguity — editing still demands a
+    unique match (see :func:`_fuzzy_locate`), but a read of an ambiguous anchor
+    should show the first region instead of refusing, so the model stops
+    re-querying for a unique anchor (the survey treadmill in trace 019ef2ae).
+    """
+    idx = buffer.find(search)
+    if idx != -1:
+        return idx, idx + len(search)
+    buf_lines = buffer.split("\n")
+    s_lines = [ln for ln in search.split("\n")]
+    if s_lines and s_lines[-1] == "":
+        s_lines = s_lines[:-1]
+    if not s_lines:
+        return None
+    s_trim = [ln.strip() for ln in s_lines]
+    n = len(s_lines)
+    for i in range(len(buf_lines) - n + 1):
+        if [buf_lines[i + j].strip() for j in range(n)] == s_trim:
+            start = sum(len(buf_lines[k]) + 1 for k in range(i))
+            end = start + sum(len(buf_lines[i + j]) for j in range(n)) + (n - 1)
+            return start, end
+    return None
+
+
 def _apply_patch(
     current: str, patches: list[Any], file_path: str
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
@@ -722,16 +749,34 @@ _READ_AROUND_CONTEXT = 4
 
 
 def _read_around(file_path: str, content: str, snippet: str) -> str:
-    """Render the region around a (whitespace-tolerant) snippet match ± context."""
+    """Render the region around a (whitespace-tolerant) snippet match ± context.
+
+    Ambiguity is tolerated for reads: when the snippet matches several places
+    the first region is returned with a note (rather than refusing) so the
+    model can see code and proceed instead of re-querying for a unique anchor.
+    """
     located, error = _fuzzy_locate(content, snippet)
+    note = ""
     if error is not None:
-        return _result(**error)
-    start, end, _mi, _si = located
+        if error.get("status") == "ambiguous_match":
+            span = _first_match_span(content, snippet)
+            if span is None:
+                return _result(**error)
+            start, end = span
+            note = (
+                f"\n[note: {error['detail']} Showing the FIRST — add surrounding "
+                "context to target a different one.]"
+            )
+        else:
+            return _result(**error)
+    else:
+        start, end, _mi, _si = located
     lo = content.count("\n", 0, start) + 1
     hi = content.count("\n", 0, end) + 1
-    return _render_read(
+    body = _render_read(
         file_path, content, max(1, lo - _READ_AROUND_CONTEXT), hi + _READ_AROUND_CONTEXT
     )
+    return body + note if note else body
 
 
 def _edit_feedback(
@@ -1014,6 +1059,26 @@ class ReadEditLintTool(BaseTool):
         ordered = [h for h in hits if not (h in seen or seen.add(h))]
         return {"did_you_mean": ordered[:5]} if ordered else {}
 
+    def _autoresolve_target(self, file_path: str) -> Optional[str]:
+        """Return the real path *file_path* unambiguously refers to, else None.
+
+        The editor often guesses a plausible-but-wrong sibling path (trace
+        019ef2ae: ``spine/ui/api.py`` read 111× when the real target is
+        ``spine/ui_api/api.py``). When the missed path's basename matches
+        exactly ONE of the slice's authoritative ``target_files``, silently
+        redirect to it instead of bouncing a ``not_found`` — the plan already
+        pinned the file, so there is no ambiguity to defer to the model. Only
+        fires on a single unambiguous match; multiple candidates fall through
+        to the ``did_you_mean`` suggestion path.
+        """
+        name = Path(file_path).name
+        hits = [t for t in self.target_files if Path(t).name == name]
+        if len(hits) == 1 and hits[0].lstrip("/") != file_path.lstrip("/"):
+            cand = self._resolve_path(hits[0])
+            if cand.exists():
+                return hits[0]
+        return None
+
     def _not_found(self, file_path: str, *, action: str) -> str:
         """Build a ``not_found`` result, escalating after repeated misses.
 
@@ -1091,15 +1156,24 @@ class ReadEditLintTool(BaseTool):
                 detail=f"symbol {symbol!r} not found in {file_path}.",
                 available_symbols=names,
             )
+        note = ""
         if len(matches) > 1:
-            return _result(
-                "ambiguous_match",
-                detail=f"symbol {symbol!r} matches {len(matches)} definitions.",
+            # Reads tolerate ambiguity: show the first definition with a note
+            # listing the rest, rather than refusing and forcing another query.
+            others = ", ".join(
+                f"{m.qualified_name} (line {content.count(chr(10), 0, m.start_byte) + 1})"
+                for m in matches[1:]
+            )
+            note = (
+                f"\n[note: symbol {symbol!r} matches {len(matches)} definitions; "
+                f"showing the first. Others: {others}. Qualify the name to target "
+                "a different one.]"
             )
         sym = matches[0]
         lo = content.count("\n", 0, sym.start_byte) + 1
         hi = content.count("\n", 0, sym.end_byte) + 1
-        return _render_read(file_path, content, lo, hi)
+        body = _render_read(file_path, content, lo, hi)
+        return body + note if note else body
 
     def _run(
         self,
@@ -1150,13 +1224,48 @@ class ReadEditLintTool(BaseTool):
         path = self._resolve_path(file_path)
         existed = path.exists()
 
+        # ── Path auto-correction ────────────────────────────────────
+        # A missed path that unambiguously matches a slice target_file is a
+        # guessed sibling (e.g. spine/ui/api.py for spine/ui_api/api.py);
+        # redirect silently rather than bouncing a not_found the model ignores.
+        redirect_note = ""
+        if not existed:
+            corrected = self._autoresolve_target(file_path)
+            if corrected is not None:
+                redirect_note = (
+                    f"[note: {file_path} does not exist — auto-corrected to the "
+                    f"slice target {corrected}. Use that path from now on.]\n"
+                )
+                file_path = corrected
+                path = self._resolve_path(file_path)
+                existed = True
+
         # ── Arbitrary reads are disabled ────────────────────────────
         # By IMPLEMENT the plan/decompose stages have already identified the
         # target symbol or snippet, so a whole-file / arbitrary line-range read
         # is the model surveying the codebase a second time (trace: read all of
         # config.py to "understand the structure of SpineConfig"). Steer it to
-        # an anchored read instead.
+        # an anchored read instead — EXCEPT one whole-file read of a sanctioned
+        # target_file the editor has not yet seen (it is meant to edit that
+        # file; a single orienting read of it is legitimate, and refusing it
+        # outright is what dead-ends the survey when no anchor lands).
         if mode == "read_disabled":
+            norm = file_path.strip().lstrip("/")
+            is_target = any(norm == t.strip().lstrip("/") for t in self.target_files)
+            if (
+                is_target
+                and existed
+                and self._file_read_count.get(file_path, 0) == 0
+            ):
+                self._read_calls += 1
+                self._reads_since_edit += 1
+                self._file_read_count[file_path] = 1
+                try:
+                    whole = path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    return _result("io_error", detail=f"Could not read {file_path}: {exc}")
+                body = _render_read(file_path, whole, 1, None)
+                return self._pressure(redirect_note + body)
             return _result(
                 "read_disabled",
                 detail=(
@@ -1244,6 +1353,8 @@ class ReadEditLintTool(BaseTool):
                         "read it enough; further reads will be refused. Make your "
                         "edit next.]"
                     )
+                if redirect_note:
+                    out = redirect_note + out
             return self._pressure(out)
 
         # ── Reject edits to reference-only files ────────────────────
@@ -1324,6 +1435,8 @@ class ReadEditLintTool(BaseTool):
             "bytes_written": len(new_content.encode("utf-8")),
             "created": not existed,
         }
+        if redirect_note:
+            ok_fields["note"] = redirect_note.strip().strip("[]")
         ruff = _ruff_report(path, self.workspace_root)
         if ruff is not None:
             ok_fields["ruff"] = ruff

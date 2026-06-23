@@ -59,6 +59,11 @@ class Tag(str, Enum):
         DIRECTIVE: supervisor's next-step instruction (when shown to a worker
             as a data block — distinct from the plain-text final-instruction
             tail that lives outside any tag, see :func:`hostage_layout`).
+        REFERENCE_SYMBOLS: implement-phase — existing definitions the slice's
+            code calls/extends/mimics, with their current source inlined so the
+            implementer never surveys to find them.
+        EDIT_PLAN: implement-phase — the planner's ordered targeted edits, each
+            with the current source of the symbol it changes inlined.
 
     Role / system blocks (used in system prompts):
         ROLE: agent identity / mission paragraph.
@@ -84,6 +89,10 @@ class Tag(str, Enum):
     ERRORS = "errors"
     DIRECTIVE = "directive"
     ONBOARDING_DOCS = "onboarding_documentation"
+    # Implement-phase slice payload: existing definitions the slice's code
+    # extends (with their source inlined), and the planner's targeted edits.
+    REFERENCE_SYMBOLS = "reference_symbols"
+    EDIT_PLAN = "edit_plan"
 
     # Role / system
     ROLE = "role"
