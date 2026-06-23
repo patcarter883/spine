@@ -101,6 +101,27 @@ def test_edit_pressure_nudges_after_threshold(ws):
     assert "reads since your last edit" not in outs[0]
 
 
+def test_reference_only_file_rejects_edits(ws):
+    (ws / "pkg" / "ref.yaml").write_text("ref: 1\n", encoding="utf-8")
+    tool = ReadEditLintTool(
+        workspace_root=str(ws), reference_only_files=["pkg/ref.yaml"]
+    )
+    # edit is blocked
+    out = tool._run("pkg/ref.yaml", full_replace="ref: 2\n")
+    assert _status(out) == "reference_only"
+    assert (ws / "pkg" / "ref.yaml").read_text() == "ref: 1\n"  # untouched
+    # reading it is still allowed
+    assert tool._run("pkg/ref.yaml", read_around="ref").startswith("[read:")
+
+
+def test_spine_runtime_path_is_reference_only(ws):
+    (ws / ".spine").mkdir()
+    (ws / ".spine" / "config.reference.yaml").write_text("a: 1\n", encoding="utf-8")
+    tool = ReadEditLintTool(workspace_root=str(ws))  # no explicit list
+    out = tool._run(".spine/config.reference.yaml", full_replace="a: 2\n")
+    assert _status(out) == "reference_only"
+
+
 def test_pressure_resets_after_edit(ws):
     tool = ReadEditLintTool(workspace_root=str(ws))
     for _ in range(_READ_PRESSURE_SOFT - 1):

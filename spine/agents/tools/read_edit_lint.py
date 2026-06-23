@@ -922,6 +922,8 @@ class ReadEditLintTool(BaseTool):
         "and the file is unchanged — its source is already above; do not re-read, "
         "make your edit. status='not_found' includes a `did_you_mean` list of "
         "real paths when the path looks mistyped — use one of those. "
+        "status='reference_only' means you tried to edit a read-only file — "
+        "edit one of the slice's target_files instead. "
         "Successful Python writes include a `ruff` field with lint "
         "diagnostics — no shell needed to lint."
     )
@@ -932,6 +934,10 @@ class ReadEditLintTool(BaseTool):
     # ground path-correction suggestions so the editor stops inventing variants
     # of files the plan already pinned. Empty for non-slice callers (researcher).
     target_files: list[str] = Field(default_factory=list)
+    # Files the implementer may READ but must NOT modify (from the plan's
+    # grounding pass). Edits to these — and to anything under .spine/ — are
+    # rejected so the editor never authors a file it was only meant to read.
+    reference_only_files: list[str] = Field(default_factory=list)
 
     # ── Per-slice editor-session state ──────────────────────────────────
     # One tool instance is bound per slice-implementer invocation (see
@@ -1002,6 +1008,13 @@ class ReadEditLintTool(BaseTool):
                 "change with read_edit_lint.]"
             )
         return out
+
+    def _is_reference_only(self, file_path: str) -> bool:
+        """True if this path is read-only for the slice (plan-marked or .spine)."""
+        norm = file_path.strip().lstrip("/")
+        if norm.startswith(".spine/"):
+            return True
+        return any(norm == r.strip().lstrip("/") for r in self.reference_only_files)
 
     def _resolve_path(self, file_path: str) -> Path:
         # Treat absolute paths under the workspace as the user intends them
@@ -1153,6 +1166,21 @@ class ReadEditLintTool(BaseTool):
             if out.startswith("[read:"):
                 self._read_cache[key] = (epoch, self._read_calls)
             return self._pressure(out)
+
+        # ── Reject edits to reference-only files ────────────────────
+        # The plan marked these read-for-context (or they are .spine runtime
+        # state). Block the write and steer the editor back to its real targets
+        # instead of letting it author a file it was only meant to read.
+        if self._is_reference_only(file_path):
+            return _result(
+                "reference_only",
+                detail=(
+                    f"{file_path} is reference-only for this slice — read it for "
+                    "context, but do NOT create or modify it. Make your edits in "
+                    "the slice's target_files instead."
+                ),
+                target_files=list(self.target_files),
+            )
 
         # ── Build the new content in memory per mode ────────────────
         if mode == "full_replace":

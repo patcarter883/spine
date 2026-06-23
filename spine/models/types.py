@@ -83,6 +83,12 @@ class FeatureSlice:
     # where to work. Empty on older plans — the implementer falls back to the
     # read-then-edit flow.
     edit_plan: list[dict[str, Any]] = field(default_factory=list)
+    # Files the implementer may READ for context but must NOT create or modify
+    # (e.g. .spine runtime state, or a reference file the planner mis-scoped as
+    # a target because exploration could not retrieve it). Populated by the
+    # deterministic grounding pass at plan-write time and enforced by
+    # read_edit_lint. Empty on older plans.
+    reference_only_files: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this slice to a plain dict suitable for JSON encoding."""

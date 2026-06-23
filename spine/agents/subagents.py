@@ -794,6 +794,9 @@ def build_subagent_spec(
             ReadEditLintTool(
                 workspace_root=workspace_root,
                 target_files=list(_active_slice.get("target_files") or []),
+                reference_only_files=list(
+                    _active_slice.get("reference_only_files") or []
+                ),
             )
         )
     if "ast_extract_symbol" in allowed_tool_names:
