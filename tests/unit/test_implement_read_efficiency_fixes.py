@@ -275,3 +275,36 @@ async def test_structured_escalation_respects_window(
             object(), object(), [], label="t", base_cap=16384, window=33000, max_escalations=3
         )
     assert calls == [16384]
+
+
+# ── enrich gets reference-symbol signatures + module paths ───────────────
+
+
+def test_reference_signatures_block_groups_by_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spine.agents import decomposer as dc
+
+    sigs = {
+        "UIApi.set_phase_provider": ("spine/ui_api/api.py", "def set_phase_provider(self, phase, config): ..."),
+        "UIApi.get_providers": ("spine/ui_api/api.py", "def get_providers(self): ..."),
+        "SpineConfig": ("spine/config.py", "class SpineConfig: ..."),
+    }
+    monkeypatch.setattr(
+        "spine.agents.tools.codebase_query.get_symbol_signature",
+        lambda db, root, name: sigs.get(name),
+    )
+    block = dc._build_reference_signatures_block(
+        "db", ".", ["UIApi.set_phase_provider", "UIApi.get_providers", "SpineConfig"]
+    )
+    # correct module path is surfaced, grouped by file, with the real signatures
+    assert "# spine/ui_api/api.py" in block
+    assert "# spine/config.py" in block
+    assert "set_phase_provider" in block and "get_providers" in block
+    assert "do NOT invent a module path" in block
+
+
+def test_reference_signatures_block_empty_when_no_refs() -> None:
+    from spine.agents import decomposer as dc
+
+    assert dc._build_reference_signatures_block("db", ".", []) == ""

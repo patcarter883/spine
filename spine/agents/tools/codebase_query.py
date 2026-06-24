@@ -235,6 +235,39 @@ def get_symbol_source(db_path: str, workspace_root: str, name: str) -> str | Non
     return code or None
 
 
+def get_symbol_signature(
+    db_path: str, workspace_root: str, name: str, max_lines: int = 14
+) -> tuple[str, str] | None:
+    """``(file_path, signature head)`` for *name* from the index, or ``None``.
+
+    The "signature head" is the first ``max_lines`` of the symbol's source — the
+    def/class header, its type annotations, and the start of the docstring —
+    enough for a caller to use the symbol with the RIGHT name and import path
+    without re-discovering it. Used to feed the enrich step the real
+    ``UIApi`` method signatures + module path so it stops guessing both
+    (North/Qwen both hallucinated ``spine.api.ui``/``spine.ui.api`` when the
+    real module is ``spine.ui_api.api``).
+    """
+    from spine.agents.tools.codebase_query_local import local_get_source
+
+    try:
+        raw = local_get_source(db_path, workspace_root, name)
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        matches = json.loads(raw).get("matches") or []
+    except (ValueError, AttributeError):
+        return None
+    if not matches:
+        return None
+    m = matches[0]
+    code = m.get("raw_code") or ""
+    head = "\n".join(code.splitlines()[:max_lines]).rstrip()
+    return (m.get("file_path") or ""), head
+
+
 async def list_files(
     workspace_root: str,
     mcp_servers: dict[str, dict[str, Any]] | None,

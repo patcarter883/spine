@@ -555,6 +555,46 @@ def _build_known_symbols_block(db_path: str, files: list[str]) -> str:
     return "\n".join(lines) if found_any else ""
 
 
+def _build_reference_signatures_block(
+    db_path: str, workspace_root: str, refs: list[str]
+) -> str:
+    """Signatures + module paths of the slice's reference_symbols, or ''.
+
+    Feeds enrich the EXACT names and import paths of the existing symbols its
+    code will call/extend (e.g. the ``UIApi`` methods a UI slice persists
+    through), grouped by file. Without this the model guesses both the method
+    names and the module path — North guessed ``spine.api.ui`` and Qwen
+    ``spine.ui.api`` for what is really ``spine/ui_api/api.py``.
+    """
+    if not refs:
+        return ""
+    try:
+        from spine.agents.tools.codebase_query import get_symbol_signature
+    except ImportError:
+        return ""
+    by_file: dict[str, list[str]] = {}
+    for r in refs:
+        try:
+            res = get_symbol_signature(db_path, workspace_root, r)
+        except Exception:  # noqa: BLE001
+            res = None
+        if res:
+            fp, head = res
+            by_file.setdefault(fp or "(unknown)", []).append(head)
+    if not by_file:
+        return ""
+    lines = [
+        "Signatures of EXISTING symbols this slice calls or extends. Use these "
+        "EXACT names and import paths — do NOT invent a module path or method "
+        "name. Import a class from the module path shown here:",
+    ]
+    for fp, heads in by_file.items():
+        lines.append(f"# {fp}")
+        for head in heads:
+            lines.append("\n".join("    " + ln for ln in head.splitlines()))
+    return "\n".join(lines)
+
+
 def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
     """Remove hallucinated symbol names from *slices* in-place.
 
@@ -832,16 +872,25 @@ async def enrich_slice(
                 "description",
                 "target_files",
                 "acceptance_criteria",
+                "reference_symbols",
             )
         },
         indent=2,
         ensure_ascii=False,
         default=str,
     )
+    # Resolve the slice's reference_symbols to their real signatures + module
+    # paths so enrich calls them correctly instead of guessing names/imports.
+    ref_block = _build_reference_signatures_block(
+        _spine_cfg.checkpoint_path,
+        os.getcwd(),
+        source_slice.get("reference_symbols") or [],
+    )
+    findings = known_block + ("\n\n" + ref_block if ref_block else "")
     human_content = hostage_layout(
         xml_blocks(
             (Tag.SPECIFICATION, slice_json),
-            (Tag.FINDINGS, known_block),
+            (Tag.FINDINGS, findings),
         ),
         "Return an _EnrichmentOutput with a concrete edit_plan for this slice.",
     )
