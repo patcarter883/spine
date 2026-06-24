@@ -100,7 +100,19 @@ providers:
     context_window: 60000
   - name: local-mellum
     type: deepagents-model
-    model: openai:Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M
+    model: openai:Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M-Q4_K_M
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 4
+    context_window: 60000
+  # Reasoning lane (PLAN synthesis, critic): bench winner — perfect on the hard
+  # reasoning bench at ~1/3 the Qwens' reasoning cost; 6.7GB = fast GPU swap.
+  - name: local-gemma-12b
+    type: deepagents-model
+    model: openai:gemma-4-12B-it-qat-q4_0-gguf-Q4_0
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -124,60 +136,61 @@ providers:
     api_key: vllm
     rerank_path: /reranking
   phases:
+    # ═══ REASONING lane -> local-gemma-12b (open-ended judgment) ═══
+    # Bench: reasoning models own plan-synthesis + critic; instruct can't. The
+    # whole supervisor->worker research tree is one model = ZERO intra-phase swaps.
     specify:
-      provider: local-glm
+      provider: local-gemma-12b
     specify/subagents/researcher:
-      provider: local-glm
+      provider: local-gemma-12b
     specify/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: local-gemma-12b
     plan:
-      provider: local-glm
+      provider: local-gemma-12b
     plan/subagents/researcher:
-      provider: local-glm
+      provider: local-gemma-12b
     plan/subagents/researcher/supervisor:
-      provider: local-glm
-    implement:
-      provider: local-glm
-    # The decomposer (structured slice/micro-slice JSON) and the slice
-    # implementer (exact-match read_edit_lint) are where a weak local model
-    # burns the most tokens — failed edits and length-capped decompositions
-    # cascade into fallback re-decomposition (trace 019ed3dc). These two keys
-    # let you route just those roles to a stronger endpoint without moving the
-    # rest of IMPLEMENT. The 'implement/decomposer' key covers all three
-    # decomposer modes (plan/fallback/per_file) via prefix resolution. To flip:
-    # enable a stronger provider in providers.llm[] (e.g. 'pat' or
-    # 'openrouter') and change 'provider: local' below to its name.
-    implement/decomposer:
-      provider: local-glm
-    implement/subagents/slice-implementer:
-      provider: local-glm
-    verify:
-      provider: local-glm
-    verify/subagents/slice-verifier:
-      provider: local-glm
+      provider: local-gemma-12b
     critic:
-      provider: local-glm
+      provider: local-gemma-12b
     critic/specify:
-      provider: local-glm
+      provider: local-gemma-12b
     critic/plan:
-      provider: local-glm
+      provider: local-gemma-12b
     gap_plan:
-      provider: local-glm
+      provider: local-gemma-12b
     exploration/manager:
-      provider: local-glm
+      provider: local-gemma-12b
+    # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
+    # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
+    # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
+    # summaries. The whole IMPLEMENT tree (decomposer + N slice-implementer
+    # workers + verify) is one model = ZERO intra-phase swaps in the heaviest phase.
+    implement:
+      provider: local-mellum
+    # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
+    # AND the enrich pass via prefix resolution.
+    implement/decomposer:
+      provider: local-mellum
+    implement/subagents/slice-implementer:
+      provider: local-mellum
+    verify:
+      provider: local-mellum
+    verify/subagents/slice-verifier:
+      provider: local-mellum
     classification:
-      provider: local-glm
+      provider: local-mellum
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-glm
+      provider: local-mellum
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-glm
+      provider: local-mellum
     onboarding/doc-manager:
-      provider: local-glm
+      provider: local-mellum
     onboarding/section-worker:
-      provider: local-glm
+      provider: local-mellum
