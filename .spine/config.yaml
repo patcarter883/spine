@@ -43,11 +43,6 @@ mcp_servers:
     args: []
 providers:
   llm:
-  # - name: openrouter
-  #   type: deepagents-model
-  #   model: openrouter:poolside/laguna-xs.2:free
-  #   enabled: true
-  #   guided_decoding: true
   - name: openrouter-glm
     type: deepagents-model
     model: openrouter:z-ai/glm-5.2
@@ -62,30 +57,9 @@ providers:
   #   stream_usage: true
   #   max_concurrent_calls: 2
   #   context_window: 32000
-
-  - name: local-nex
+  - name: local-glm
     type: deepagents-model
-    model: openai:nex-agi_Nex-N2-mini-GGUF-Q4_K_M
-    base_url: http://localhost:8010/v1
-    api_key: vllm
-    guided_decoding: true
-    enabled: true
-    stream_usage: true
-    max_concurrent_calls: 2
-    context_window: 60000
-  - name: local-nex-iq4xs
-    type: deepagents-model
-    model: openai:nex-agi_Nex-N2-mini-GGUF-IQ4_XS
-    base_url: http://localhost:8010/v1
-    api_key: vllm
-    guided_decoding: true
-    enabled: true
-    stream_usage: true
-    max_concurrent_calls: 2
-    context_window: 60000
-  - name: local-gemma
-    type: deepagents-model
-    model: openai:gemma-4-26B-A4B-it-qat-q4_0-gguf-Q4_0
+    model: openai:GLM-4.7-Flash-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -95,7 +69,7 @@ providers:
     context_window: 60000
   - name: local-qwen
     type: deepagents-model
-    model: openai:Qwen3.6-27B-MTP-GGUF
+    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -126,7 +100,7 @@ providers:
     context_window: 60000
   - name: local-mellum
     type: deepagents-model
-    model: openai:Mellum2-12B-A2.5B-Thinking-GGUF-Q4_K_M
+    model: openai:Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -151,26 +125,19 @@ providers:
     rerank_path: /reranking
   phases:
     specify:
-      provider: local-north-code
-      # Declare the model's real context window so the synthesizer runs under
-      # the window-aware budget ledger (synthesis_budget): it clamps the synth
-      # completion to synthesize_max_completion_tokens and compresses evidence
-      # if it ever exceeds the window. Without this the synth runs "legacy"
-      # (no clamp, fixed evidence budgets). poolside/laguna-xs.2 = 262144.
-      context_window: 60000
+      provider: local-glm
     specify/subagents/researcher:
-      provider: local-north-code
+      provider: local-glm
     specify/subagents/researcher/supervisor:
-      provider: local-north-code
+      provider: local-glm
     plan:
-      provider: local-north-code
-      context_window: 60000
+      provider: local-glm
     plan/subagents/researcher:
-      provider: local-north-code
+      provider: local-glm
     plan/subagents/researcher/supervisor:
-      provider: local-north-code
+      provider: local-glm
     implement:
-      provider: local-north-code
+      provider: local-glm
     # The decomposer (structured slice/micro-slice JSON) and the slice
     # implementer (exact-match read_edit_lint) are where a weak local model
     # burns the most tokens — failed edits and length-capped decompositions
@@ -181,36 +148,36 @@ providers:
     # enable a stronger provider in providers.llm[] (e.g. 'pat' or
     # 'openrouter') and change 'provider: local' below to its name.
     implement/decomposer:
-      provider: local-north-code
+      provider: local-glm
     implement/subagents/slice-implementer:
-      provider: local-north-code
+      provider: local-glm
     verify:
-      provider: local-north-code
+      provider: local-glm
     verify/subagents/slice-verifier:
-      provider: local-north-code
+      provider: local-glm
     critic:
-      provider: local-north-code
+      provider: local-glm
     critic/specify:
-      provider: local-north-code
+      provider: local-glm
     critic/plan:
-      provider: local-north-code
+      provider: local-glm
     gap_plan:
-      provider: local-north-code
+      provider: local-glm
     exploration/manager:
-      provider: local-north-code
+      provider: local-glm
     classification:
-      provider: local-north-code
+      provider: local-glm
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-north-code
+      provider: local-glm
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-north-code
+      provider: local-glm
     onboarding/doc-manager:
-      provider: local-north-code
+      provider: local-glm
     onboarding/section-worker:
-      provider: local-north-code
+      provider: local-glm
