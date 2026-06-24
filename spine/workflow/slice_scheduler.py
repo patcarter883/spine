@@ -225,10 +225,29 @@ def serialize_file_overlapping_slices(slices: list[FeatureSlice]) -> list[Featur
         for members in groups.values():
             if len(members) < 2:
                 continue
-            members = sorted(members, key=lambda s: s.id)
-            for prev, cur in zip(members, members[1:]):
+            # Order the group consistently with any dependencies ALREADY declared
+            # between its members, then chain forward in THAT order. Sorting by id
+            # (the old behaviour) chained alphabetically, which reversed an
+            # existing edge when the later-alphabetical slice was a dependency of
+            # the earlier one — injecting a 2-cycle that compute_execution_waves
+            # then rejected (two api.py slices, trace 55ae1919). A topological
+            # order over intra-group edges makes "chain forward" cycle-free.
+            member_ids = {s.id for s in members}
+            by_id = {s.id: s for s in members}
+            ts: TopologicalSorter[str] = TopologicalSorter()
+            for s in sorted(members, key=lambda s: s.id):
+                intra = [d for d in (s.dependencies or []) if d in member_ids]
+                ts.add(s.id, *intra)
+            try:
+                ordered = [by_id[i] for i in ts.static_order()]
+            except CycleError:
+                # Authored cycle within the group (the critic should reject these);
+                # leave deps untouched and let validation surface it.
+                continue
+            for prev, cur in zip(ordered, ordered[1:]):
                 deps = set(cur.dependencies or [])
-                # Don't introduce a cycle: only chain forward.
+                # Chain forward only; the ordering guarantees this never reverses
+                # an existing edge.
                 if prev.id != cur.id and prev.id in ids:
                     deps.add(prev.id)
                 cur.dependencies = sorted(deps)

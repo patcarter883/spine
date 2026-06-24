@@ -2713,15 +2713,43 @@ async def approve_and_spawn(
     prior_artifacts = saved_state.get("artifacts") or {}
     read_cache = saved_state.get("read_cache") or {}
 
-    if not execution_waves and isinstance(plan_json, dict) and plan_json.get("feature_slices"):
-        from spine.models.types import FeatureSlice
-        from spine.workflow.slice_scheduler import (
-            compute_execution_waves,
-            slices_to_state_dict,
-        )
+    if not execution_waves:
+        # Rebuild the waves from the approved plan's feature_slices. plan_json is
+        # persisted as a serialized JSON STRING in checkpoint state (not a dict),
+        # so the old isinstance(dict) guard never matched and this fallback never
+        # fired — dead-ending the resume even though plan.json had slices. Parse
+        # the string, and fall back to the on-disk plan.json artifact if state
+        # has no usable plan_json at all.
+        plan_obj: dict[str, Any] | None = None
+        if isinstance(plan_json, dict):
+            plan_obj = plan_json
+        elif isinstance(plan_json, str) and plan_json.strip():
+            try:
+                parsed = json.loads(plan_json)
+                plan_obj = parsed if isinstance(parsed, dict) else None
+            except (ValueError, TypeError):
+                plan_obj = None
+        if not (plan_obj and plan_obj.get("feature_slices")):
+            disk_plan = (
+                Path(config.workspace_root)
+                / ".spine" / "artifacts" / plan_id / "plan" / "plan.json"
+            )
+            try:
+                loaded = json.loads(disk_plan.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and loaded.get("feature_slices"):
+                    plan_obj = loaded
+            except (OSError, ValueError, TypeError):
+                pass
 
-        slices = [FeatureSlice(**s) for s in plan_json["feature_slices"]]
-        execution_waves = slices_to_state_dict(compute_execution_waves(slices))
+        if plan_obj and plan_obj.get("feature_slices"):
+            from spine.models.types import FeatureSlice
+            from spine.workflow.slice_scheduler import (
+                compute_execution_waves,
+                slices_to_state_dict,
+            )
+
+            slices = [FeatureSlice(**s) for s in plan_obj["feature_slices"]]
+            execution_waves = slices_to_state_dict(compute_execution_waves(slices))
 
     if not execution_waves:
         raise ValueError(
