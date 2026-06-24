@@ -177,3 +177,44 @@ def test_enrich_prompt_requires_one_entry_per_method() -> None:
     assert "umbrella" in _ENRICH_PROMPT
     # the old foot-gun instruction is gone
     assert "use the last existing\nmethod of that class as symbol, set action" not in _ENRICH_PROMPT
+
+
+# ── plan_slice_implementer: deterministic directive for edit_plan slices ──
+
+
+@pytest.mark.asyncio
+async def test_edit_plan_slice_skips_llm_planner_and_forbids_exploration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langgraph.types import Command, Send
+
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    async def _boom(**kwargs):
+        raise AssertionError("run_plan_node must NOT run for an edit_plan slice")
+
+    monkeypatch.setattr(impl, "run_plan_node", _boom)
+
+    state = {
+        "phase": "implement",
+        "work_id": "test-work",
+        "work_type": "feature",
+        "workspace_root": "/tmp/test",
+        "plan_path": ".spine/artifacts/test-work/plan",
+        "active_slice": {
+            "id": "backend",
+            "title": "backend",
+            "target_files": ["spine/ui_api/api.py"],
+            "acceptance_criteria": ["it persists"],
+            "edit_plan": [
+                {"file": "spine/ui_api/api.py", "symbol": "UIApi.x", "action": "replace", "intent": "y"},
+            ],
+        },
+    }
+    out = await impl._plan_slice_implementer_node(state, None)
+    assert isinstance(out, Command) and isinstance(out.goto, Send)
+    approach = out.goto.arg["active_slice_directive"]["approach"].lower()
+    # Deterministic edit-first directive that explicitly FORBIDS exploration
+    # (the negated "do NOT explore" mention is the fix, not a foot-gun).
+    assert approach.startswith("apply the edits in <edit_plan>")
+    assert "do not explore" in approach

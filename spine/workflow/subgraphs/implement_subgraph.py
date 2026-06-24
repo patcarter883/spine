@@ -36,6 +36,7 @@ from spine.agents.artifacts import (
 )
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.plan_do import (
+    SubagentDirective,
     directive_from_state,
     format_directive_for_prompt,
     run_plan_node,
@@ -609,33 +610,73 @@ async def _plan_slice_implementer_node(
     crit_lines = "\n".join(f"- {c}" for c in criteria) if criteria else "(none)"
     file_lines = "\n".join(f"- {p}" for p in target_files) if target_files else "(none listed)"
 
-    db_path, workspace_root = _index_ctx(state)
-    refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
-    plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
-    refs_md = f"\n\n## Reference symbols (source inlined)\n{refs_body}" if refs_body else ""
-    plan_md = f"\n\n## Targeted edits (from the planner)\n{plan_body}" if plan_body else ""
-
-    task = (
-        f"Plan how to implement slice {slice_id!r} (title: {title!r}). The do "
-        "node will use read_edit_lint and MCP tools to make atomic edits.\n\n"
-        f"## Description\n{description or '(none)'}\n\n"
-        f"## Target files\n{file_lines}\n\n"
-        f"## Acceptance criteria\n{crit_lines}"
-        f"{refs_md}"
-        f"{plan_md}"
-        f"{_subslice_context(active_slice)}"
-    )
-    directive = await run_plan_node(
-        state=dict(state),
-        config=config,
-        phase_path=f"{PhaseName.IMPLEMENT.value}/subagents/slice-implementer",
-        task_description=task,
-        role_hint=f"slice-implementer for slice {slice_id!r}",
-    )
-    logger.info(
-        "[%s] plan_slice_implementer: slice=%r approach=%r",
-        work_id, slice_id, directive.approach[:80],
-    )
+    # When the slice already has an edit_plan, the work is fully specified — the
+    # ordered edits plus the inlined source ARE the plan. Running the LLM planner
+    # here adds nothing and actively harms: it does not know the editor receives
+    # pre-loaded source, so its `approach` routinely opens with "explore the
+    # repository structure to locate X" — the exact mass-survey the inlining was
+    # meant to eliminate. Synthesise a deterministic edit-first directive instead
+    # (no LLM call, no exploration foot-gun, one fewer slow local round-trip).
+    if active_slice.get("edit_plan"):
+        directive = SubagentDirective(
+            approach=(
+                "Apply the edits in <edit_plan> in order with read_edit_lint — "
+                "ast_edit by symbol for replace/insert, patch for snippet edits. "
+                "The current source of every target and reference symbol is "
+                "inlined in your prompt; do NOT explore, search, or read files to "
+                "locate them. One edit per entry; you are done only when each "
+                'edit returns status="ok".'
+            ),
+            target_files=list(target_files),
+            acceptance=list(criteria),
+        )
+        logger.info(
+            "[%s] plan_slice_implementer: slice=%r — deterministic edit-first "
+            "directive (edit_plan has %d entr(ies))",
+            work_id, slice_id, len(active_slice.get("edit_plan") or []),
+        )
+    else:
+        # No edit_plan: the planner may legitimately suggest a read of an
+        # inlined reference, but must not send the editor on a broad survey —
+        # arbitrary/whole-file reads are disabled and reference source is inlined.
+        db_path, workspace_root = _index_ctx(state)
+        refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
+        plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
+        refs_md = f"\n\n## Reference symbols (source inlined)\n{refs_body}" if refs_body else ""
+        plan_md = f"\n\n## Targeted edits (from the planner)\n{plan_body}" if plan_body else ""
+        guidance = (
+            "The implementer ALREADY has the target file(s) and every reference "
+            "symbol's current SOURCE inlined in its prompt, and arbitrary "
+            "whole-file reads are DISABLED — it cannot and must not survey the "
+            "repo. Make your `approach` edit-first: which symbols to change and "
+            "in what order. Do NOT tell it to explore, locate, examine, search, "
+            "or read files to orient — that is already done; do NOT put "
+            "read/search/explore steps in tool_calls_to_make."
+            if refs_md
+            else "Keep the approach concrete and edit-focused; avoid broad exploration."
+        )
+        task = (
+            f"Plan how to implement slice {slice_id!r} (title: {title!r}). The do "
+            "node applies atomic edits with read_edit_lint.\n\n"
+            f"{guidance}\n\n"
+            f"## Description\n{description or '(none)'}\n\n"
+            f"## Target files\n{file_lines}\n\n"
+            f"## Acceptance criteria\n{crit_lines}"
+            f"{refs_md}"
+            f"{plan_md}"
+            f"{_subslice_context(active_slice)}"
+        )
+        directive = await run_plan_node(
+            state=dict(state),
+            config=config,
+            phase_path=f"{PhaseName.IMPLEMENT.value}/subagents/slice-implementer",
+            task_description=task,
+            role_hint=f"slice-implementer for slice {slice_id!r}",
+        )
+        logger.info(
+            "[%s] plan_slice_implementer: slice=%r approach=%r",
+            work_id, slice_id, directive.approach[:80],
+        )
     send_payload: dict[str, Any] = {
         **_base_send_payload(state),
         "active_slice": active_slice,
