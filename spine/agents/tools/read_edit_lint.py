@@ -1275,17 +1275,34 @@ class ReadEditLintTool(BaseTool):
         return body + note if note else body
 
     def _fail_write(self, file_path: str, error: dict[str, Any]) -> str:
-        """Record a failed write and render its error result.
+        """Record a failed write and render its result, escalating as needed.
 
-        Increments the write-failure counters and, once one file has failed
-        ``_WRITE_FAIL_CAP`` times in a row, appends a circuit-breaker hint so the
-        model stops re-sending identical broken content (trace beaa8507: a
-        full_replace looping on the same syntax error). The hard wall lives in
-        ``_run``; this only records + nudges.
+        The single choke point for EVERY failed or malformed write — including
+        the mode-conflict input_error that used to return before the counters
+        (trace 4aa24c6b: a find_replace+patch combo looped unbounded past the
+        breaker). Once total failures since the last successful edit reach
+        ``_WRITE_PRESSURE_WALL`` the write is hard-capped (writing paused →
+        re-read + minimal edit, or return a blocker). Once ONE file fails
+        ``_WRITE_FAIL_CAP`` times in a row a circuit-breaker hint is appended to
+        the genuine error (trace beaa8507: a full_replace looping on one syntax
+        error). Both counters reset only on a successful edit.
         """
         self._write_fails_since_edit += 1
         n = self._write_fail_count.get(file_path, 0) + 1
         self._write_fail_count[file_path] = n
+        if self._write_fails_since_edit >= _WRITE_PRESSURE_WALL:
+            return _result(
+                "write_capped",
+                detail=(
+                    f"{self._write_fails_since_edit} writes have failed since your "
+                    "last successful edit — writing is paused. The file on disk is "
+                    "unchanged. Re-read the current state with read_symbol/"
+                    "read_around and apply ONE minimal edit that fixes the specific "
+                    "error; if you cannot, return a status explaining the exact "
+                    "blocker. Do not re-send the whole file."
+                ),
+                file_path=file_path,
+            )
         fields = dict(error)
         status = fields.pop("status", "edit_error")
         if n >= _WRITE_FAIL_CAP:
@@ -1338,10 +1355,17 @@ class ReadEditLintTool(BaseTool):
         if not active:
             active.append("read_disabled")  # file_path alone = whole-file read
         if len(active) > 1:
-            return _result(
-                "input_error",
-                detail=f"Pass exactly one edit mode, but several were provided: {active}.",
-            )
+            err = {
+                "status": "input_error",
+                "detail": f"Pass exactly one edit mode, but several were provided: {active}.",
+            }
+            # A malformed WRITE call (e.g. find_replace+patch) counts toward the
+            # circuit breaker so it can't loop unbounded past it (trace 4aa24c6b);
+            # a pure read-mode clash does not.
+            write_modes = {"full_replace", "find_replace", "edits", "patch", "ast_edit", "line_range"}
+            if write_modes.intersection(active):
+                return self._fail_write(file_path, err)
+            return _result(**err)
         mode = active[0]
 
         path = self._resolve_path(file_path)
