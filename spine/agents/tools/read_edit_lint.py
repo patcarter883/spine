@@ -76,6 +76,18 @@ _FILE_READ_CAP = 4
 # Set above the hard nudge so a genuine multi-file survey still completes.
 _READ_PRESSURE_WALL = 24
 
+# Write-side circuit breaker — the symmetric counterpart of the read walls. A
+# write that fails its match/lint check leaves the file unchanged, so a model
+# re-sending the same broken content (e.g. a full_replace looping on one
+# unterminated-triple-quote syntax error — trace beaa8507) makes zero progress
+# while re-paying the whole-file prompt each turn. Bound consecutive failures
+# per file (a targeted nudge), and total failures since the last successful edit
+# (writes paused → the editor must re-read + minimal-edit, or return a blocker).
+# Reset only by a SUCCESSFUL edit, so interleaved failing reads can't keep the
+# wall from firing.
+_WRITE_FAIL_CAP = 3
+_WRITE_PRESSURE_WALL = 8
+
 # After this many not_found path misses (no intervening edit), the editor is
 # guessing paths: escalate from a polite did_you_mean to a hard directive to
 # read only the slice's target_files. Trace 019ef2ae: ~30 reads burned on
@@ -1095,6 +1107,11 @@ class ReadEditLintTool(BaseTool):
     _file_read_count: dict = PrivateAttr(default_factory=dict)  # file_path -> int
     # not_found path misses since the last edit (drives path-guess escalation).
     _not_found_count: int = PrivateAttr(default=0)
+    # Failed writes (drive the write circuit-breaker). Per-file consecutive
+    # failures and the total since the last successful edit; both reset on a
+    # successful write.
+    _write_fail_count: dict = PrivateAttr(default_factory=dict)  # file_path -> int
+    _write_fails_since_edit: int = PrivateAttr(default=0)
 
     def _build_file_index(self) -> dict:
         """Lazily map basename -> [workspace-relative paths] for suggestions."""
@@ -1256,6 +1273,30 @@ class ReadEditLintTool(BaseTool):
         hi = content.count("\n", 0, sym.end_byte) + 1
         body = _render_read(file_path, content, lo, hi)
         return body + note if note else body
+
+    def _fail_write(self, file_path: str, error: dict[str, Any]) -> str:
+        """Record a failed write and render its error result.
+
+        Increments the write-failure counters and, once one file has failed
+        ``_WRITE_FAIL_CAP`` times in a row, appends a circuit-breaker hint so the
+        model stops re-sending identical broken content (trace beaa8507: a
+        full_replace looping on the same syntax error). The hard wall lives in
+        ``_run``; this only records + nudges.
+        """
+        self._write_fails_since_edit += 1
+        n = self._write_fail_count.get(file_path, 0) + 1
+        self._write_fail_count[file_path] = n
+        fields = dict(error)
+        status = fields.pop("status", "edit_error")
+        if n >= _WRITE_FAIL_CAP:
+            fields["circuit_breaker"] = (
+                f"{n} consecutive failed writes to {file_path} with no successful "
+                "edit. STOP re-sending the same content — re-read the file "
+                "(read_symbol/read_around) and apply ONE small, targeted edit "
+                "(edits/patch/ast_edit) that fixes exactly this error, or return a "
+                "status naming the blocker. Do not full_replace the whole file again."
+            )
+        return _result(status, **fields)
 
     def _run(
         self,
@@ -1454,6 +1495,27 @@ class ReadEditLintTool(BaseTool):
                 target_files=list(self.target_files),
             )
 
+        # ── Write circuit-breaker (hard wall) ───────────────────────
+        # Once writes have failed repeatedly with no successful edit between
+        # them, disable writing so the editor stops burning the token budget
+        # re-sending broken content (trace beaa8507). Checked up front so a
+        # repeated 15K-char full_replace is not even re-linted. The only exits
+        # are a successful edit (impossible while walled) or returning a blocker
+        # status — i.e. the slice ends gracefully instead of looping to the cap.
+        if self._write_fails_since_edit >= _WRITE_PRESSURE_WALL:
+            return _result(
+                "write_capped",
+                detail=(
+                    f"{self._write_fails_since_edit} writes have failed since your "
+                    "last successful edit — writing is paused. The file on disk is "
+                    "unchanged. Re-read the current state with read_symbol/"
+                    "read_around and apply ONE minimal edit that fixes the specific "
+                    "error; if you cannot, return a status explaining the exact "
+                    "blocker. Do not re-send the whole file."
+                ),
+                file_path=file_path,
+            )
+
         # ── Build the new content in memory per mode ────────────────
         if mode == "full_replace":
             new_content = full_replace or ""
@@ -1492,17 +1554,20 @@ class ReadEditLintTool(BaseTool):
                 )
 
             if error is not None:
-                return _result(**error)
+                return self._fail_write(file_path, error)
             assert new_content is not None
 
         # ── Lint the proposed content ───────────────────────────────
         lint_error = _dispatch_lint(file_path, new_content)
         if lint_error is not None:
-            return _result(
-                "syntax_error",
-                detail=lint_error,
-                file_path=file_path,
-                wrote=False,
+            return self._fail_write(
+                file_path,
+                {
+                    "status": "syntax_error",
+                    "detail": lint_error,
+                    "file_path": file_path,
+                    "wrote": False,
+                },
             )
 
         # ── Write atomically ────────────────────────────────────────
@@ -1532,6 +1597,10 @@ class ReadEditLintTool(BaseTool):
         # slate for its next target.
         self._file_read_count.clear()
         self._not_found_count = 0
+        # Real progress also clears write-failure pressure — the circuit breaker
+        # only fires on a run of failures with no successful edit between them.
+        self._write_fail_count.clear()
+        self._write_fails_since_edit = 0
         return _result("ok", **ok_fields)
 
     async def _arun(
