@@ -62,3 +62,26 @@ def test_successful_edit_resets_the_breaker(tmp_path):
     after = tool._run("m.py", full_replace=BROKEN)
     assert _status(after) == "syntax_error"
     assert "circuit_breaker" not in json.loads(after)
+
+
+def test_mode_conflict_write_counts_toward_breaker(tmp_path):
+    """A malformed WRITE call (two edit modes) returns input_error but must also
+    count toward the breaker — otherwise it loops unbounded past it (trace
+    4aa24c6b: find_replace+patch on config_view.py).
+    """
+    (tmp_path / "m.py").write_text("x = 1\n")
+    tool = ReadEditLintTool(workspace_root=str(tmp_path), target_files=["m.py"])
+
+    first = tool._run(
+        "m.py", old_str="x = 1", new_str="x = 2",
+        patch=[{"search": "x = 1", "replace": "x = 2"}],
+    )
+    assert _status(first) == "input_error"
+
+    out = first
+    for _ in range(_WRITE_PRESSURE_WALL):
+        out = tool._run(
+            "m.py", old_str="x = 1", new_str="x = 2",
+            patch=[{"search": "x = 1", "replace": "x = 2"}],
+        )
+    assert _status(out) == "write_capped"
