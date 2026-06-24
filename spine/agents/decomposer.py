@@ -573,6 +573,7 @@ def _build_reference_signatures_block(
     except ImportError:
         return ""
     by_file: dict[str, list[str]] = {}
+    imports: dict[str, set[str]] = {}  # module -> {ClassName}
     for r in refs:
         try:
             res = get_symbol_signature(db_path, workspace_root, r)
@@ -581,13 +582,31 @@ def _build_reference_signatures_block(
         if res:
             fp, head = res
             by_file.setdefault(fp or "(unknown)", []).append(head)
+            # Derive the exact import for class-qualified refs (e.g.
+            # 'UIApi.set_phase_provider' in spine/ui_api/api.py ->
+            # 'from spine.ui_api.api import UIApi'). Skip module-path refs whose
+            # leading segment is lowercase (a module/function, not a class).
+            cls = r.split(".")[0]
+            if fp and cls[:1].isupper():
+                module = fp[:-3] if fp.endswith(".py") else fp
+                module = module.replace("/", ".").strip(".")
+                imports.setdefault(module, set()).add(cls)
     if not by_file:
         return ""
-    lines = [
+    lines: list[str] = []
+    if imports:
+        # An explicit, imperative import directive — instruct models under-attend
+        # to the file-header hint below and otherwise guess the module path
+        # (North->spine.api.ui, Qwen->spine.ui.api for spine/ui_api/api.py).
+        lines.append("Import these EXISTING classes EXACTLY as written — do NOT "
+                     "invent a module path:")
+        for module, classes in sorted(imports.items()):
+            lines.append(f"    from {module} import {', '.join(sorted(classes))}")
+        lines.append("")
+    lines.append(
         "Signatures of EXISTING symbols this slice calls or extends. Use these "
-        "EXACT names and import paths — do NOT invent a module path or method "
-        "name. Import a class from the module path shown here:",
-    ]
+        "EXACT names — do NOT invent a method name:"
+    )
     for fp, heads in by_file.items():
         lines.append(f"# {fp}")
         for head in heads:
