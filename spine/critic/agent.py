@@ -20,6 +20,16 @@ from spine.workflow.critic_review import _get_reviewed_phase
 from spine.models.types import CriticReview
 
 
+# Bound the critic's completion budget. A structured CriticReview needs ~1-2K
+# tokens; the global 32768 cap (commit 0733437, intended for implement/decompose)
+# let a repetition loop run to 30K tokens / 126K chars before truncating (trace
+# 019ef7fd). Cap it so a degenerate generation fails fast and cheap — the
+# finish_reason guard in critic_review then routes that truncation to a revision
+# round instead of a salvaged PASS. Applies regardless of which model is on the
+# critic lane (Gemma, GLM, …).
+_CRITIC_COMPLETION_CAP = 6000
+
+
 # ── PLAN-specific review instructions appended to the system prompt ──────────
 _PLAN_REVIEW_INSTRUCTIONS = (
     "## Structured Plan Validation (PLAN phase)\n\n"
@@ -181,6 +191,7 @@ def build_critic_agent(
         response_format=CriticReview,
         allowed_tools=[],
         skip_filesystem_middleware=True,
+        completion_token_cap=_CRITIC_COMPLETION_CAP,
     )
 
     return agent
