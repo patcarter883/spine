@@ -785,7 +785,20 @@ def build_subagent_spec(
     if "read_edit_lint" in allowed_tool_names:
         from spine.agents.tools.read_edit_lint import ReadEditLintTool
 
-        tools.append(ReadEditLintTool(workspace_root=workspace_root))
+        # Pass the active slice's authoritative target_files so the tool can
+        # ground "did you mean" path suggestions on the plan's pinned paths
+        # (the editor otherwise invents variants — trace 019ef1e5). Absent for
+        # non-slice callers (e.g. researcher), which leaves it an empty list.
+        _active_slice = state.get("active_slice") or {}
+        tools.append(
+            ReadEditLintTool(
+                workspace_root=workspace_root,
+                target_files=list(_active_slice.get("target_files") or []),
+                reference_only_files=list(
+                    _active_slice.get("reference_only_files") or []
+                ),
+            )
+        )
     if "ast_extract_symbol" in allowed_tool_names:
         from spine.agents.tools.ast_extract_symbol import AstExtractSymbolTool
         from spine.config import SpineConfig

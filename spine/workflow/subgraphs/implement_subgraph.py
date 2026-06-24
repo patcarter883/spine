@@ -36,6 +36,7 @@ from spine.agents.artifacts import (
 )
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.plan_do import (
+    SubagentDirective,
     directive_from_state,
     format_directive_for_prompt,
     run_plan_node,
@@ -302,63 +303,119 @@ async def _split_slices_node(
 _LARGE_FILE_TOKEN_BUDGET = 6000
 
 
-def _format_edit_plan(active_slice: dict) -> str:
-    """Render the planner's targeted edit plan into the implementer task.
+# Per-symbol inline cap. A reference symbol can be a whole class (SpineConfig
+# is ~1000 lines); inlining it verbatim would crowd the window worse than the
+# survey we are replacing. Beyond this we inline the head and point the model at
+# read_symbol for the rest — still anchored, still no blind survey.
+_MAX_INLINE_SYMBOL_CHARS = 4000
+_MAX_INLINE_SYMBOL_LINES = 60
 
-    Moves the *where*/*what* of each edit out of the implementer's discovery
-    loop: the (stronger) decomposer named the symbol/anchor and the change, so
-    the implementer applies it directly — ``ast_edit`` by symbol where given.
-    Returns '' when the slice carries no plan (older plans, or edits the
-    decomposer couldn't anchor), preserving the legacy read-then-edit flow.
+
+def _index_ctx(state_or_root: Any) -> tuple[str | None, str]:
+    """Return ``(db_path, workspace_root)`` for index-backed source inlining.
+
+    Accepts either the subgraph state dict (reads ``workspace_root``) or a bare
+    workspace-root string. ``db_path`` is ``None`` when the index is
+    unavailable, in which case callers fall back to name-only references.
+    """
+    if isinstance(state_or_root, dict):
+        workspace_root = state_or_root.get("workspace_root", ".")
+    else:
+        workspace_root = state_or_root or "."
+    try:
+        from spine.config import SpineConfig
+
+        return SpineConfig.load().checkpoint_path, workspace_root
+    except Exception:  # noqa: BLE001 — degrade to name-only references
+        return None, workspace_root
+
+
+def _inline_symbol_source(db_path: str | None, workspace_root: str, symbol: str) -> str:
+    """Fenced current source of *symbol* from the index, or '' if unavailable.
+
+    Truncated to a head slice for very large symbols so a whole class never
+    dominates the prompt (the model can ``read_symbol`` for the remainder).
+    """
+    if not db_path or not symbol:
+        return ""
+    try:
+        from spine.agents.tools.codebase_query import get_symbol_source
+
+        src = get_symbol_source(db_path, workspace_root, symbol)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not src:
+        return ""
+    lines = src.splitlines()
+    truncated = len(src) > _MAX_INLINE_SYMBOL_CHARS or len(lines) > _MAX_INLINE_SYMBOL_LINES
+    if truncated:
+        lines = lines[:_MAX_INLINE_SYMBOL_LINES]
+        src = "\n".join(lines) + (
+            f"\n# … truncated — read_symbol '{symbol}' for the full body."
+        )
+    return f"```python\n{src}\n```"
+
+
+def _edit_plan_body(active_slice: dict, db_path: str | None, workspace_root: str) -> str:
+    """Inner body for the targeted-edit block — '' when the slice has no plan.
+
+    Each entry states the file, the anchor symbol, the action, and the precise
+    intent, followed by the symbol's CURRENT source inlined from the index so
+    the implementer edits from what is in front of it instead of surveying to
+    rediscover the edit site (the api.py 89×-read spiral, trace 019ef2ae).
     """
     plan = active_slice.get("edit_plan") or []
     if not plan:
         return ""
-    lines: list[str] = []
-    for h in plan:
+    blocks: list[str] = []
+    for i, h in enumerate(plan, start=1):
         if not isinstance(h, dict):
             h = getattr(h, "__dict__", {}) or {}
         file = h.get("file", "")
         symbol = h.get("symbol", "")
-        mode = h.get("mode", "")
+        action = h.get("action", "") or h.get("mode", "")
         intent = h.get("intent", "")
-        anchor = f" symbol=`{symbol}`" if symbol else ""
-        action_str = h.get("action", "")
-        act = f" action=`{action_str}`" if action_str else ""
-        via = f" via `{mode}`" if mode else ""
-        lines.append(f"- {file}{anchor}{act}{via}: {intent}")
-    return (
-        "\n\n## Targeted edits (from the planner — APPLY THESE NOW)\n"
-        "These ARE your task. Your FIRST tool calls must apply them with "
-        "`read_edit_lint`: use `ast_edit` (by symbol) for the symbol-anchored "
-        "ones, `patch` for snippet edits. Do NOT read the whole file or survey "
-        "the codebase first — at most read the named region if you need "
-        "surrounding context for an edit. You are NOT done until each edit "
-        "returns status=\"ok\"; never report success without an applied edit.\n"
-        + "\n".join(lines)
-    )
+        header = f"{i}. {file}"
+        if symbol:
+            header += f" — `{symbol}`"
+        if action:
+            header += f" ({action})"
+        parts = [header]
+        if intent:
+            parts.append(f"   intent: {intent}")
+        src = _inline_symbol_source(db_path, workspace_root, symbol)
+        if src:
+            label = (
+                "current source (edit this with ast_edit replace)"
+                if action == "replace"
+                else "current source of the anchor"
+            )
+            parts.append(f"   {label}:\n{src}")
+        blocks.append("\n".join(parts))
+    return "\n\n".join(blocks)
 
 
-def _format_reference_symbols(active_slice: dict) -> str:
-    """Render the planner's reference symbols as a read_symbol checklist.
+def _reference_symbols_body(
+    active_slice: dict, db_path: str | None, workspace_root: str
+) -> str:
+    """Inner body for the reference-symbols block — '' when the slice has none.
 
-    These are the existing definitions the slice's code calls/extends/mimics,
-    identified upstream in PLAN's codebase research. Handing them to the
-    implementer as named anchors means it reads exactly those with
-    ``read_symbol`` — instead of surveying whole files to rediscover them,
-    which is the codebase-research loop we removed the tools for.
+    Existing definitions the slice's code calls/extends/mimics, each with its
+    current source inlined so the implementer never surveys to find them. A
+    symbol whose source cannot be resolved degrades to a name the model may
+    ``read_symbol`` on demand.
     """
     refs = active_slice.get("reference_symbols") or []
     if not refs:
         return ""
-    listed = "\n".join(f"- `{r}`" for r in refs)
-    return (
-        "\n\n## Reference symbols (read these for context, don't survey)\n"
-        "The plan identified these existing definitions as the ones your code "
-        "calls/extends/mimics. `read_symbol` each ONCE to see its current "
-        "source, then write your edit — do NOT search or read whole files:\n"
-        + listed
-    )
+    blocks: list[str] = []
+    for r in refs:
+        src = _inline_symbol_source(db_path, workspace_root, r)
+        if src:
+            blocks.append(f"### `{r}`\n{src}")
+        else:
+            blocks.append(f"### `{r}`\n(source unavailable — read_symbol it if needed)")
+    return "\n\n".join(blocks)
 
 
 def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
@@ -553,27 +610,73 @@ async def _plan_slice_implementer_node(
     crit_lines = "\n".join(f"- {c}" for c in criteria) if criteria else "(none)"
     file_lines = "\n".join(f"- {p}" for p in target_files) if target_files else "(none listed)"
 
-    task = (
-        f"Plan how to implement slice {slice_id!r} (title: {title!r}). The do "
-        "node will use read_edit_lint and MCP tools to make atomic edits.\n\n"
-        f"## Description\n{description or '(none)'}\n\n"
-        f"## Target files\n{file_lines}\n\n"
-        f"## Acceptance criteria\n{crit_lines}"
-        f"{_format_reference_symbols(active_slice)}"
-        f"{_format_edit_plan(active_slice)}"
-        f"{_subslice_context(active_slice)}"
-    )
-    directive = await run_plan_node(
-        state=dict(state),
-        config=config,
-        phase_path=f"{PhaseName.IMPLEMENT.value}/subagents/slice-implementer",
-        task_description=task,
-        role_hint=f"slice-implementer for slice {slice_id!r}",
-    )
-    logger.info(
-        "[%s] plan_slice_implementer: slice=%r approach=%r",
-        work_id, slice_id, directive.approach[:80],
-    )
+    # When the slice already has an edit_plan, the work is fully specified — the
+    # ordered edits plus the inlined source ARE the plan. Running the LLM planner
+    # here adds nothing and actively harms: it does not know the editor receives
+    # pre-loaded source, so its `approach` routinely opens with "explore the
+    # repository structure to locate X" — the exact mass-survey the inlining was
+    # meant to eliminate. Synthesise a deterministic edit-first directive instead
+    # (no LLM call, no exploration foot-gun, one fewer slow local round-trip).
+    if active_slice.get("edit_plan"):
+        directive = SubagentDirective(
+            approach=(
+                "Apply the edits in <edit_plan> in order with read_edit_lint — "
+                "ast_edit by symbol for replace/insert, patch for snippet edits. "
+                "The current source of every target and reference symbol is "
+                "inlined in your prompt; do NOT explore, search, or read files to "
+                "locate them. One edit per entry; you are done only when each "
+                'edit returns status="ok".'
+            ),
+            target_files=list(target_files),
+            acceptance=list(criteria),
+        )
+        logger.info(
+            "[%s] plan_slice_implementer: slice=%r — deterministic edit-first "
+            "directive (edit_plan has %d entr(ies))",
+            work_id, slice_id, len(active_slice.get("edit_plan") or []),
+        )
+    else:
+        # No edit_plan: the planner may legitimately suggest a read of an
+        # inlined reference, but must not send the editor on a broad survey —
+        # arbitrary/whole-file reads are disabled and reference source is inlined.
+        db_path, workspace_root = _index_ctx(state)
+        refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
+        plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
+        refs_md = f"\n\n## Reference symbols (source inlined)\n{refs_body}" if refs_body else ""
+        plan_md = f"\n\n## Targeted edits (from the planner)\n{plan_body}" if plan_body else ""
+        guidance = (
+            "The implementer ALREADY has the target file(s) and every reference "
+            "symbol's current SOURCE inlined in its prompt, and arbitrary "
+            "whole-file reads are DISABLED — it cannot and must not survey the "
+            "repo. Make your `approach` edit-first: which symbols to change and "
+            "in what order. Do NOT tell it to explore, locate, examine, search, "
+            "or read files to orient — that is already done; do NOT put "
+            "read/search/explore steps in tool_calls_to_make."
+            if refs_md
+            else "Keep the approach concrete and edit-focused; avoid broad exploration."
+        )
+        task = (
+            f"Plan how to implement slice {slice_id!r} (title: {title!r}). The do "
+            "node applies atomic edits with read_edit_lint.\n\n"
+            f"{guidance}\n\n"
+            f"## Description\n{description or '(none)'}\n\n"
+            f"## Target files\n{file_lines}\n\n"
+            f"## Acceptance criteria\n{crit_lines}"
+            f"{refs_md}"
+            f"{plan_md}"
+            f"{_subslice_context(active_slice)}"
+        )
+        directive = await run_plan_node(
+            state=dict(state),
+            config=config,
+            phase_path=f"{PhaseName.IMPLEMENT.value}/subagents/slice-implementer",
+            task_description=task,
+            role_hint=f"slice-implementer for slice {slice_id!r}",
+        )
+        logger.info(
+            "[%s] plan_slice_implementer: slice=%r approach=%r",
+            work_id, slice_id, directive.approach[:80],
+        )
     send_payload: dict[str, Any] = {
         **_base_send_payload(state),
         "active_slice": active_slice,
@@ -656,36 +759,64 @@ async def _slice_implementer_node(
             ),
         )
 
-        # Strip private sequencing keys (e.g. _sibling_queue, which nests the
-        # remaining sub-slices) from the JSON block so the prompt stays small;
-        # the single-file scope is rendered as plain text by _subslice_context.
+        # Trim the slice JSON to scannable metadata only. The reference symbols
+        # and edit_plan get dedicated blocks below (with source inlined), so
+        # repeating them here would render each datum THREE times (JSON +
+        # directive + section) — the triplication that bloated every turn and
+        # let the three renderings drift. The run-on `execution_requirements`
+        # string is dropped: the edit_plan is the authoritative "what to change".
+        title = active_slice.get("title", "")
         public_slice = {
-            k: v for k, v in active_slice.items() if not k.startswith("_")
+            k: active_slice.get(k)
+            for k in ("id", "title", "description", "target_files", "acceptance_criteria")
+            if active_slice.get(k) not in (None, "", [], {})
         }
         slice_json = json.dumps(public_slice, indent=2, ensure_ascii=False, default=str)
+
+        db_path, workspace_root = _index_ctx(state)
+        refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
+        plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
+
+        # Directive: approach + notes only — target_files / acceptance / tool
+        # calls already live in <findings> / <edit_plan>, so the full directive
+        # would state them a third time.
         directive_block = format_directive_for_prompt(
-            directive_from_state(dict(state), "active_slice_directive")
+            directive_from_state(dict(state), "active_slice_directive"),
+            compact=True,
         )
-        # Hostage layout: data blocks first, plain-text directive at the
-        # absolute tail. The directive_block from format_directive_for_prompt
-        # is already wrapped in <directive> — splice it after xml_blocks
-        # rather than re-wrapping.
-        prompt = hostage_layout(
-            xml_blocks(
-                (Tag.OBJECTIVE, f"Implement slice: {slice_id}"),
-                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+
+        # Hostage layout: data blocks first, plain-text instruction at the tail.
+        objective = f"Implement slice: {slice_id} — {title}" if title else f"Implement slice: {slice_id}"
+        blocks = xml_blocks(
+            (Tag.OBJECTIVE, objective),
+            (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+            (Tag.REFERENCE_SYMBOLS, refs_body),
+            (Tag.EDIT_PLAN, plan_body),
+        ) + ("\n\n" + directive_block if directive_block else "")
+
+        if plan_body:
+            instruction = (
+                "Apply the edits in <edit_plan> NOW with read_edit_lint — "
+                "ast_edit (by symbol) to replace or insert at an anchor, patch "
+                "for snippet edits, full_replace for a new file. The current "
+                "source of every target and reference symbol is inlined above, "
+                "so do NOT survey or re-read the files. Make one edit per "
+                "<edit_plan> entry; you are NOT done until each returns "
+                'status="ok". Never report success without an applied edit.'
             )
-            + ("\n\n" + directive_block if directive_block else ""),
-            (
-                "Read the slice JSON above carefully — it specifies "
-                "target_files, acceptance_criteria, and (optionally) a "
-                "description. Make only the changes described in the slice."
-                + _format_reference_symbols(active_slice)
-                + _format_edit_plan(active_slice)
-                + _subslice_context(active_slice)
-                + _large_file_directive(active_slice, workspace_root)
-            ),
-        )
+        else:
+            instruction = (
+                "Implement the slice in <findings>. The reference symbols above "
+                "have their source inlined — read_symbol one only if you need a "
+                "definition not shown. Apply edits with read_edit_lint "
+                "(ast_edit / patch / full_replace); make only the changes the "
+                'slice describes, and you are NOT done until each edit returns '
+                'status="ok".'
+            )
+        instruction += _subslice_context(active_slice)
+        instruction += _large_file_directive(active_slice, workspace_root)
+
+        prompt = hostage_layout(blocks, instruction)
 
         result = await ainvoke_with_retry(
             agent,

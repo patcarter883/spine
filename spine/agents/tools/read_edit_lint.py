@@ -45,7 +45,7 @@ from typing import Any, Optional
 
 from langchain_core.tools import BaseTool
 from langchain_core.tools.base import ArgsSchema
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from spine.agents.tools._fs import _atomic_write
 
@@ -54,6 +54,39 @@ logger = logging.getLogger(__name__)
 # Languages for which ast_edit can resolve a symbol anchor (must match the
 # tree-sitter grammars wired into spine.agents.tools.ast_extract).
 _AST_EDIT_LANGS = {".py", ".php", ".ts", ".tsx"}
+
+# Edit-pressure thresholds: after this many anchored reads with no intervening
+# successful edit, the read result carries a nudge to stop surveying and edit.
+# Derived from trace 019ef1e5 where a slice editor made 332 reads / 8 edits and
+# spiralled the token budget. Fires once at each threshold (not every call).
+_READ_PRESSURE_SOFT = 8
+_READ_PRESSURE_HARD = 16
+
+# Per-file read budget: after this many distinct-anchor reads of the SAME file
+# since the last successful edit, the body is withheld. The exact-(path,anchor)
+# read cache only catches verbatim repeats; trace 019ef2ae showed one file read
+# 89× at *varying* anchors, slipping past it. The read that lands ON the cap
+# still returns the body (a fresh copy, in case Tier-2 eviction has dropped the
+# earlier ones from context); reads beyond it return `read_capped` with no body.
+_FILE_READ_CAP = 4
+
+# Global read wall: once this many reads accumulate since the last successful
+# edit, every further read is refused regardless of file — this stops the
+# breadth-spiral the per-file cap can't (reading many files a few times each).
+# Set above the hard nudge so a genuine multi-file survey still completes.
+_READ_PRESSURE_WALL = 24
+
+# After this many not_found path misses (no intervening edit), the editor is
+# guessing paths: escalate from a polite did_you_mean to a hard directive to
+# read only the slice's target_files. Trace 019ef2ae: ~30 reads burned on
+# invented path variants (spine/ui/api.py ×20, spine/ui/ui_api.py ×8).
+_NOT_FOUND_ESCALATE = 2
+
+# Directories never worth scanning when suggesting a corrected path.
+_PATH_SUGGEST_SKIP = {
+    ".git", ".venv", "venv", "__pycache__", "node_modules", ".spine",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist",
+}
 
 
 _LINT_LANG_BY_EXT: dict[str, str] = {
@@ -632,6 +665,33 @@ def _fuzzy_locate(
     return (start, end, _leading_ws(buf_lines[i]), _leading_ws(s_lines[0])), None
 
 
+def _first_match_span(buffer: str, search: str) -> Optional[tuple[int, int]]:
+    """Char span of the FIRST occurrence of ``search`` (exact, else trimmed).
+
+    Used by the READ path to tolerate ambiguity — editing still demands a
+    unique match (see :func:`_fuzzy_locate`), but a read of an ambiguous anchor
+    should show the first region instead of refusing, so the model stops
+    re-querying for a unique anchor (the survey treadmill in trace 019ef2ae).
+    """
+    idx = buffer.find(search)
+    if idx != -1:
+        return idx, idx + len(search)
+    buf_lines = buffer.split("\n")
+    s_lines = [ln for ln in search.split("\n")]
+    if s_lines and s_lines[-1] == "":
+        s_lines = s_lines[:-1]
+    if not s_lines:
+        return None
+    s_trim = [ln.strip() for ln in s_lines]
+    n = len(s_lines)
+    for i in range(len(buf_lines) - n + 1):
+        if [buf_lines[i + j].strip() for j in range(n)] == s_trim:
+            start = sum(len(buf_lines[k]) + 1 for k in range(i))
+            end = start + sum(len(buf_lines[i + j]) for j in range(n)) + (n - 1)
+            return start, end
+    return None
+
+
 def _apply_patch(
     current: str, patches: list[Any], file_path: str
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
@@ -689,16 +749,34 @@ _READ_AROUND_CONTEXT = 4
 
 
 def _read_around(file_path: str, content: str, snippet: str) -> str:
-    """Render the region around a (whitespace-tolerant) snippet match ± context."""
+    """Render the region around a (whitespace-tolerant) snippet match ± context.
+
+    Ambiguity is tolerated for reads: when the snippet matches several places
+    the first region is returned with a note (rather than refusing) so the
+    model can see code and proceed instead of re-querying for a unique anchor.
+    """
     located, error = _fuzzy_locate(content, snippet)
+    note = ""
     if error is not None:
-        return _result(**error)
-    start, end, _mi, _si = located
+        if error.get("status") == "ambiguous_match":
+            span = _first_match_span(content, snippet)
+            if span is None:
+                return _result(**error)
+            start, end = span
+            note = (
+                f"\n[note: {error['detail']} Showing the FIRST — add surrounding "
+                "context to target a different one.]"
+            )
+        else:
+            return _result(**error)
+    else:
+        start, end, _mi, _si = located
     lo = content.count("\n", 0, start) + 1
     hi = content.count("\n", 0, end) + 1
-    return _render_read(
+    body = _render_read(
         file_path, content, max(1, lo - _READ_AROUND_CONTEXT), hi + _READ_AROUND_CONTEXT
     )
+    return body + note if note else body
 
 
 def _edit_feedback(
@@ -905,12 +983,148 @@ class ReadEditLintTool(BaseTool):
         "syntax error or failed match the write is rejected without "
         "modifying the file — fix and call again. status='already_applied' "
         "means the change is ALREADY in the file: move on, do not retry. "
+        "status='already_read' means you read this exact symbol/snippet before "
+        "and the file is unchanged — its source is already above; do not re-read, "
+        "make your edit. status='not_found' includes a `did_you_mean` list of "
+        "real paths when the path looks mistyped — use one of those. "
+        "status='reference_only' means you tried to edit a read-only file — "
+        "edit one of the slice's target_files instead. "
         "Successful Python writes include a `ruff` field with lint "
         "diagnostics — no shell needed to lint."
     )
     args_schema: Optional[ArgsSchema] = ReadEditLintInput
 
     workspace_root: str = ""
+    # The plan's authoritative target files for THIS slice (when known). Used to
+    # ground path-correction suggestions so the editor stops inventing variants
+    # of files the plan already pinned. Empty for non-slice callers (researcher).
+    target_files: list[str] = Field(default_factory=list)
+    # Files the implementer may READ but must NOT modify (from the plan's
+    # grounding pass). Edits to these — and to anything under .spine/ — are
+    # rejected so the editor never authors a file it was only meant to read.
+    reference_only_files: list[str] = Field(default_factory=list)
+
+    # ── Per-slice editor-session state ──────────────────────────────────
+    # One tool instance is bound per slice-implementer invocation (see
+    # spine/agents/subagents.py), so this state spans exactly one editor's
+    # read/edit loop. It powers three anti-spiral behaviours observed missing
+    # in trace 019ef1e5: read de-duplication, "did you mean" path correction,
+    # and edit-pressure nudges.
+    _read_cache: dict = PrivateAttr(default_factory=dict)  # key -> (epoch, call#)
+    _file_epoch: dict = PrivateAttr(default_factory=dict)  # file_path -> int
+    _reads_since_edit: int = PrivateAttr(default=0)
+    _read_calls: int = PrivateAttr(default=0)
+    _file_index_cache: Optional[dict] = PrivateAttr(default=None)
+    # Body-returning reads of each file since the last edit (drives the per-file
+    # read budget). Distinct from _read_cache, which keys on the exact anchor.
+    _file_read_count: dict = PrivateAttr(default_factory=dict)  # file_path -> int
+    # not_found path misses since the last edit (drives path-guess escalation).
+    _not_found_count: int = PrivateAttr(default=0)
+
+    def _build_file_index(self) -> dict:
+        """Lazily map basename -> [workspace-relative paths] for suggestions."""
+        if self._file_index_cache is not None:
+            return self._file_index_cache
+        idx: dict[str, list[str]] = {}
+        root = Path(self.workspace_root)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _PATH_SUGGEST_SKIP]
+            for fn in filenames:
+                try:
+                    rel = (Path(dirpath) / fn).relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                idx.setdefault(fn, []).append(rel)
+        self._file_index_cache = idx
+        return idx
+
+    def _did_you_mean(self, file_path: str) -> dict:
+        """Suggest real workspace paths for a missed path.
+
+        Prefers the slice's ``target_files`` (the plan's authoritative paths),
+        then falls back to basename, then stem matches across the tree.
+        """
+        name = Path(file_path).name
+        stem = Path(file_path).stem
+        idx = self._build_file_index()
+        targets = {t.lstrip("/") for t in self.target_files}
+        hits: list[str] = [t for t in targets if Path(t).name == name]
+        hits += idx.get(name, [])
+        if not hits:
+            for n, paths in idx.items():
+                if Path(n).stem == stem:
+                    hits += paths
+        # de-dup preserving order, target_files first
+        seen: set[str] = set()
+        ordered = [h for h in hits if not (h in seen or seen.add(h))]
+        return {"did_you_mean": ordered[:5]} if ordered else {}
+
+    def _autoresolve_target(self, file_path: str) -> Optional[str]:
+        """Return the real path *file_path* unambiguously refers to, else None.
+
+        The editor often guesses a plausible-but-wrong sibling path (trace
+        019ef2ae: ``spine/ui/api.py`` read 111× when the real target is
+        ``spine/ui_api/api.py``). When the missed path's basename matches
+        exactly ONE of the slice's authoritative ``target_files``, silently
+        redirect to it instead of bouncing a ``not_found`` — the plan already
+        pinned the file, so there is no ambiguity to defer to the model. Only
+        fires on a single unambiguous match; multiple candidates fall through
+        to the ``did_you_mean`` suggestion path.
+        """
+        name = Path(file_path).name
+        hits = [t for t in self.target_files if Path(t).name == name]
+        if len(hits) == 1 and hits[0].lstrip("/") != file_path.lstrip("/"):
+            cand = self._resolve_path(hits[0])
+            if cand.exists():
+                return hits[0]
+        return None
+
+    def _not_found(self, file_path: str, *, action: str) -> str:
+        """Build a ``not_found`` result, escalating after repeated misses.
+
+        The first miss(es) carry a polite ``did_you_mean``. Once the editor has
+        missed ``_NOT_FOUND_ESCALATE`` non-existent paths without an intervening
+        edit it is guessing — the detail hardens into a directive to read/edit
+        ONLY the slice's authoritative ``target_files``.
+        """
+        self._not_found_count += 1
+        fields = self._did_you_mean(file_path)
+        detail = f"Cannot {action} {file_path}: file does not exist."
+        if self._not_found_count >= _NOT_FOUND_ESCALATE and self.target_files:
+            detail += (
+                f" You have now missed {self._not_found_count} non-existent "
+                "paths — STOP guessing. Read and edit ONLY the slice's "
+                f"target_files: {list(self.target_files)}."
+            )
+            fields.setdefault("did_you_mean", list(self.target_files))
+        return _result("not_found", detail=detail, **fields)
+
+    def _pressure(self, out: str) -> str:
+        """Append a one-shot edit-pressure nudge at each read threshold."""
+        n = self._reads_since_edit
+        if n == _READ_PRESSURE_HARD:
+            return out + (
+                f"\n\n[⚠⚠ {n} anchored reads since your last successful edit and "
+                "still no change applied. STOP reading — surveying is done. The "
+                "slice's edit_plan / target_files name exactly what to change. "
+                "Apply the next edit NOW with read_edit_lint (ast_edit by symbol, "
+                "patch, or full_replace), or return a status explaining the "
+                "specific blocker.]"
+            )
+        if n == _READ_PRESSURE_SOFT:
+            return out + (
+                f"\n\n[⚠ {n} reads since your last edit. The code you need is "
+                "already above — switch from surveying to editing: make the next "
+                "change with read_edit_lint.]"
+            )
+        return out
+
+    def _is_reference_only(self, file_path: str) -> bool:
+        """True if this path is read-only for the slice (plan-marked or .spine)."""
+        norm = file_path.strip().lstrip("/")
+        if norm.startswith(".spine/"):
+            return True
+        return any(norm == r.strip().lstrip("/") for r in self.reference_only_files)
 
     def _resolve_path(self, file_path: str) -> Path:
         # Treat absolute paths under the workspace as the user intends them
@@ -942,15 +1156,24 @@ class ReadEditLintTool(BaseTool):
                 detail=f"symbol {symbol!r} not found in {file_path}.",
                 available_symbols=names,
             )
+        note = ""
         if len(matches) > 1:
-            return _result(
-                "ambiguous_match",
-                detail=f"symbol {symbol!r} matches {len(matches)} definitions.",
+            # Reads tolerate ambiguity: show the first definition with a note
+            # listing the rest, rather than refusing and forcing another query.
+            others = ", ".join(
+                f"{m.qualified_name} (line {content.count(chr(10), 0, m.start_byte) + 1})"
+                for m in matches[1:]
+            )
+            note = (
+                f"\n[note: symbol {symbol!r} matches {len(matches)} definitions; "
+                f"showing the first. Others: {others}. Qualify the name to target "
+                "a different one.]"
             )
         sym = matches[0]
         lo = content.count("\n", 0, sym.start_byte) + 1
         hi = content.count("\n", 0, sym.end_byte) + 1
-        return _render_read(file_path, content, lo, hi)
+        body = _render_read(file_path, content, lo, hi)
+        return body + note if note else body
 
     def _run(
         self,
@@ -1001,13 +1224,48 @@ class ReadEditLintTool(BaseTool):
         path = self._resolve_path(file_path)
         existed = path.exists()
 
+        # ── Path auto-correction ────────────────────────────────────
+        # A missed path that unambiguously matches a slice target_file is a
+        # guessed sibling (e.g. spine/ui/api.py for spine/ui_api/api.py);
+        # redirect silently rather than bouncing a not_found the model ignores.
+        redirect_note = ""
+        if not existed:
+            corrected = self._autoresolve_target(file_path)
+            if corrected is not None:
+                redirect_note = (
+                    f"[note: {file_path} does not exist — auto-corrected to the "
+                    f"slice target {corrected}. Use that path from now on.]\n"
+                )
+                file_path = corrected
+                path = self._resolve_path(file_path)
+                existed = True
+
         # ── Arbitrary reads are disabled ────────────────────────────
         # By IMPLEMENT the plan/decompose stages have already identified the
         # target symbol or snippet, so a whole-file / arbitrary line-range read
         # is the model surveying the codebase a second time (trace: read all of
         # config.py to "understand the structure of SpineConfig"). Steer it to
-        # an anchored read instead.
+        # an anchored read instead — EXCEPT one whole-file read of a sanctioned
+        # target_file the editor has not yet seen (it is meant to edit that
+        # file; a single orienting read of it is legitimate, and refusing it
+        # outright is what dead-ends the survey when no anchor lands).
         if mode == "read_disabled":
+            norm = file_path.strip().lstrip("/")
+            is_target = any(norm == t.strip().lstrip("/") for t in self.target_files)
+            if (
+                is_target
+                and existed
+                and self._file_read_count.get(file_path, 0) == 0
+            ):
+                self._read_calls += 1
+                self._reads_since_edit += 1
+                self._file_read_count[file_path] = 1
+                try:
+                    whole = path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    return _result("io_error", detail=f"Could not read {file_path}: {exc}")
+                body = _render_read(file_path, whole, 1, None)
+                return self._pressure(redirect_note + body)
             return _result(
                 "read_disabled",
                 detail=(
@@ -1020,27 +1278,106 @@ class ReadEditLintTool(BaseTool):
             )
 
         if mode in ("read_symbol", "read_around"):
+            self._read_calls += 1
+            self._reads_since_edit += 1
+            anchor = read_symbol if mode == "read_symbol" else f"~{read_around}"
+            key = (file_path, anchor)
             if not existed:
+                return self._not_found(file_path, action="read")
+            # Per-slice read cache: a repeat anchored read of an UNCHANGED file
+            # returns a compact pointer instead of re-injecting the body — the
+            # source is already above in the conversation. Invalidated per-file
+            # by a successful edit (epoch bump). This is the direct fix for the
+            # 56%-redundant re-reads in trace 019ef1e5.
+            epoch = self._file_epoch.get(file_path, 0)
+            cached = self._read_cache.get(key)
+            if cached is not None and cached[0] == epoch:
+                return self._pressure(
+                    _result(
+                        "already_read",
+                        detail=(
+                            f"You already read {file_path} :: {anchor} (call "
+                            f"#{cached[1]}, unchanged since). Its source is above "
+                            "in this conversation — do NOT re-read it. Apply your "
+                            "edit now, or report what specifically blocks you."
+                        ),
+                    )
+                )
+            # Global read wall: too many reads since the last edit. Refuse every
+            # body now — surveying is over. Catches the breadth-spiral (many
+            # files, a few reads each) the per-file cap below cannot.
+            if self._reads_since_edit > _READ_PRESSURE_WALL:
                 return _result(
-                    "not_found", detail=f"Cannot read {file_path}: file does not exist."
+                    "read_capped",
+                    detail=(
+                        f"{self._reads_since_edit} reads since your last "
+                        "successful edit — reading is now disabled until you "
+                        "edit. Everything the slice needs has been read and is "
+                        "above in this conversation. Apply an edit with "
+                        "read_edit_lint (ast_edit/patch/full_replace), or return "
+                        "a status explaining the specific blocker."
+                    ),
+                )
+            # Per-file read budget: catch anchor-varied re-reads of one file that
+            # slip past the exact-anchor cache (trace 019ef2ae: api.py read 89×).
+            fcount = self._file_read_count.get(file_path, 0)
+            if fcount >= _FILE_READ_CAP:
+                return _result(
+                    "read_capped",
+                    detail=(
+                        f"You have already read {file_path} {fcount} times since "
+                        "your last edit — its source is above. Re-reading at a new "
+                        "anchor will not help. Apply your edit to it now, or report "
+                        "what specifically blocks you."
+                    ),
                 )
             try:
                 content = path.read_text(encoding="utf-8")
             except OSError as exc:
                 return _result("io_error", detail=f"Could not read {file_path}: {exc}")
             if mode == "read_symbol":
-                return self._read_symbol(file_path, content, read_symbol or "")
-            return _read_around(file_path, content, read_around or "")
+                out = self._read_symbol(file_path, content, read_symbol or "")
+            else:
+                out = _read_around(file_path, content, read_around or "")
+            # Cache only successful reads (rendered output starts with "[read:");
+            # error statuses are JSON and must stay re-tryable.
+            if out.startswith("[read:"):
+                self._read_cache[key] = (epoch, self._read_calls)
+                fcount += 1
+                self._file_read_count[file_path] = fcount
+                # The read landing ON the cap is the last full body for this file
+                # until an edit lands — flag it so the model knows to stop here.
+                if fcount == _FILE_READ_CAP:
+                    out += (
+                        f"\n\n[⚠ final full read of {file_path} — you have now "
+                        "read it enough; further reads will be refused. Make your "
+                        "edit next.]"
+                    )
+                if redirect_note:
+                    out = redirect_note + out
+            return self._pressure(out)
+
+        # ── Reject edits to reference-only files ────────────────────
+        # The plan marked these read-for-context (or they are .spine runtime
+        # state). Block the write and steer the editor back to its real targets
+        # instead of letting it author a file it was only meant to read.
+        if self._is_reference_only(file_path):
+            return _result(
+                "reference_only",
+                detail=(
+                    f"{file_path} is reference-only for this slice — read it for "
+                    "context, but do NOT create or modify it. Make your edits in "
+                    "the slice's target_files instead."
+                ),
+                target_files=list(self.target_files),
+            )
 
         # ── Build the new content in memory per mode ────────────────
         if mode == "full_replace":
             new_content = full_replace or ""
         else:
             if not existed:
-                return _result(
-                    "not_found",
-                    detail=f"Cannot edit {file_path}: file does not exist.",
-                )
+                return self._not_found(file_path, action="edit")
             try:
                 current = path.read_text(encoding="utf-8")
             except OSError as exc:
@@ -1098,9 +1435,21 @@ class ReadEditLintTool(BaseTool):
             "bytes_written": len(new_content.encode("utf-8")),
             "created": not existed,
         }
+        if redirect_note:
+            ok_fields["note"] = redirect_note.strip().strip("[]")
         ruff = _ruff_report(path, self.workspace_root)
         if ruff is not None:
             ok_fields["ruff"] = ruff
+        # A successful write changes the file → bump its epoch so cached reads of
+        # it are re-fetched fresh, and reset the edit-pressure counter (the agent
+        # just made progress).
+        self._file_epoch[file_path] = self._file_epoch.get(file_path, 0) + 1
+        self._reads_since_edit = 0
+        # A successful edit is real progress, not a spiral: clear the per-file
+        # read budgets and the path-guess counter so the editor gets a clean
+        # slate for its next target.
+        self._file_read_count.clear()
+        self._not_found_count = 0
         return _result("ok", **ok_fields)
 
     async def _arun(

@@ -323,19 +323,37 @@ class SpineConfig:
     # buys ~4K more prompt headroom before overflow; DynamicCompletionCap then
     # lowers it further per-turn as the prompt grows. 8K still covers a
     # full_replace of a ~30KB file, which is larger than any single slice's file.
-    implement_max_completion_tokens: int = 8000
+    # Raised to 32768 to give reasoning-heavy local models (North-Mini-Code,
+    # whose CoT leaks into the completion) room for both their thinking and the
+    # edit payload. On a 64K-window model this halves the prompt budget;
+    # DynamicCompletionCap still shrinks it per-turn as the conversation grows.
+    implement_max_completion_tokens: int = 32768
     # Completion-token cap for the structural decomposer's no-tool structured
-    # calls (PLAN / FALLBACK / PER_FILE in spine.agents.decomposer). A
-    # DecompositionResult is a handful of small slice objects (2-3 micro-slices,
-    # or one sub-slice per target file), so a few thousand tokens is ample.
-    # Without a cap the bare call inherits the global max_completion_tokens
+    # calls (PLAN / FALLBACK / PER_FILE in spine.agents.decomposer) AND the
+    # single-file enrich pass. The edit_plan now carries ONE entry per change
+    # site / new method (not a single bundled "add all the methods" entry), so a
+    # large slice emits ~10 EditHint objects with full-signature intents — the
+    # old 4096 truncated that mid-JSON on tight-cap local models, raising
+    # LengthFinishReasonError and silently dropping the whole edit_plan (North
+    # bench 0624: enrich failed for backend-persistence/config-* → slices ran
+    # with no plan, neutralising source pre-loading). 8192 fits the larger plan.
+    # Without any cap the bare call inherits the global max_completion_tokens
     # (30K); against a finite local window (e.g. context_window=40K) the server
     # must reserve a 30K generation slot, leaving too little KV cache for the
     # prompt and OOM-crashing the backend — which then drops every in-flight
     # request with "CURL error: Could not connect" and fans the failures out
     # into a fallback-decompose retry storm (trace 019ed360). Per-phase
     # max_completion_tokens overrides still win.
-    decompose_max_completion_tokens: int = 4096
+    #
+    # 16384: North-Mini-Code (a thinking model served via llama.cpp/lemonade,
+    # where suppress_reasoning's vLLM knobs are ignored) leaks chain-of-thought
+    # into the completion, exhausting 4096 AND 8192 before the JSON closed —
+    # every enrich call dropped its edit_plan (North bench 0624). The larger
+    # base, plus the length-escalation retry in decomposer (doubles the cap once
+    # on LengthFinishReasonError), gives the structured JSON room to land.
+    # Raised to 32768 (global completion bump) for North, whose leaked CoT
+    # exhausted 4096/8192/16384 before the edit_plan JSON closed.
+    decompose_max_completion_tokens: int = 32768
     # Max chars of the failure traceback embedded in a FALLBACK decompose
     # prompt. The traceback is otherwise unbounded — a large one (plus the
     # verbatim failed-slice JSON) inflates the prompt until the structured call

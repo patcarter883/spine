@@ -207,6 +207,67 @@ def find_symbol(db_path: str, name: str) -> str | None:
     return local_find_symbol(db_path, name)
 
 
+def get_symbol_source(db_path: str, workspace_root: str, name: str) -> str | None:
+    """Current source text of *name* (fresh AST slice), or ``None`` if absent.
+
+    Programmatic facade over :func:`local_get_source` that unwraps the first
+    match's ``raw_code`` for callers that want the bare source string — the
+    implement-phase prompt builder inlines this so the slice-implementer reads
+    its targets from the prompt instead of issuing a ``read_symbol`` round-trip
+    (the survey loop that read api.py 89× in trace 019ef2ae). Returns ``None``
+    on any lookup/parse failure so callers degrade to a name-only reference.
+    """
+    from spine.agents.tools.codebase_query_local import local_get_source
+
+    try:
+        raw = local_get_source(db_path, workspace_root, name)
+    except Exception:  # noqa: BLE001 — index unavailable / parse error
+        return None
+    if not raw:
+        return None
+    try:
+        matches = json.loads(raw).get("matches") or []
+    except (ValueError, AttributeError):
+        return None
+    if not matches:
+        return None
+    code = matches[0].get("raw_code")
+    return code or None
+
+
+def get_symbol_signature(
+    db_path: str, workspace_root: str, name: str, max_lines: int = 14
+) -> tuple[str, str] | None:
+    """``(file_path, signature head)`` for *name* from the index, or ``None``.
+
+    The "signature head" is the first ``max_lines`` of the symbol's source — the
+    def/class header, its type annotations, and the start of the docstring —
+    enough for a caller to use the symbol with the RIGHT name and import path
+    without re-discovering it. Used to feed the enrich step the real
+    ``UIApi`` method signatures + module path so it stops guessing both
+    (North/Qwen both hallucinated ``spine.api.ui``/``spine.ui.api`` when the
+    real module is ``spine.ui_api.api``).
+    """
+    from spine.agents.tools.codebase_query_local import local_get_source
+
+    try:
+        raw = local_get_source(db_path, workspace_root, name)
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        matches = json.loads(raw).get("matches") or []
+    except (ValueError, AttributeError):
+        return None
+    if not matches:
+        return None
+    m = matches[0]
+    code = m.get("raw_code") or ""
+    head = "\n".join(code.splitlines()[:max_lines]).rstrip()
+    return (m.get("file_path") or ""), head
+
+
 async def list_files(
     workspace_root: str,
     mcp_servers: dict[str, dict[str, Any]] | None,

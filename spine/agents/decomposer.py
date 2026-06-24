@@ -90,7 +90,11 @@ class EditHint(BaseModel):
         ),
     )
     intent: str = Field(
-        description="Precise statement of the change to make at this anchor."
+        description=(
+            "Precise statement of the change at this anchor — naming exactly "
+            "ONE symbol and its full signature + behaviour. One change site per "
+            "entry; never bundle multiple new methods into one intent."
+        )
     )
 
 
@@ -146,12 +150,14 @@ _PLAN_PROMPT = (
         "verifier could check against the working tree.\n"
         "- Slice ids are lowercase slugs (e.g. 'add-token-refresh').\n"
         "- Populate `edit_plan` with the concrete edits each slice needs — one "
-        "entry per change site. Anchor by `symbol` (qualified name, e.g. "
-        "'ClassName.method') whenever the edit touches a named definition, and "
-        "suggest a `mode` ('ast_edit' for symbol edits, 'patch' for "
-        "snippet-level changes, 'full_replace' for new files). This lets a "
-        "lightweight implementer apply edits directly. Omit only what you "
-        "genuinely cannot anchor.",
+        "entry per change site, and ONE entry per new method/function (never a "
+        "single 'add all the methods' umbrella entry — a bundled entry forces "
+        "the implementer to survey the whole file). Anchor by `symbol` "
+        "(qualified name, e.g. 'ClassName.method') whenever the edit touches a "
+        "named definition, and suggest a `mode` ('ast_edit' for symbol edits, "
+        "'patch' for snippet-level changes, 'full_replace' for new files). This "
+        "lets a lightweight implementer apply edits directly. Omit only what "
+        "you genuinely cannot anchor.",
     )
 )
 
@@ -206,7 +212,9 @@ _PER_FILE_PROMPT = (
         "- Do NOT introduce files that are not in the parent's target_files, "
         "and do NOT merge two files into one sub-slice.\n"
         "- For each sub-slice, populate `edit_plan` with the concrete edits in "
-        "that one file — anchor by `symbol` (qualified name) for edits to a "
+        "that one file — one entry per change site, and ONE entry per new "
+        "method/function (never a single 'add all the methods' umbrella entry). "
+        "Anchor by `symbol` (qualified name) for edits to a "
         "named function/method/class and set `mode` to 'ast_edit', use 'patch' "
         "for snippet edits, 'full_replace' for a new file. This lets a "
         "lightweight implementer apply the edits without re-discovering them.\n"
@@ -227,6 +235,56 @@ _OVERFLOW_HINT = (
     "line range with offset/limit, NOT the whole file.\n"
     "- Prefer MORE, SMALLER micro-slices over fewer large ones."
 )
+
+
+def _bind_capped(base_model: Any, schema: type, cap: int) -> Any:
+    """Cap completion + suppress reasoning + bind structured output for *schema*.
+
+    ``base_model`` is the uncapped resolved model; a fresh capped copy is made
+    each call so the escalation retry can re-bind at a larger cap.
+    """
+    m = cap_completion_tokens(base_model, cap) if cap and cap > 0 else base_model
+    return bind_structured_output(suppress_reasoning(m), schema)
+
+
+async def _ainvoke_structured_escalating(
+    base_model: Any,
+    schema: type,
+    messages: list,
+    *,
+    label: str,
+    base_cap: int,
+    window: int = 0,
+    max_escalations: int = 1,
+) -> Any:
+    """Invoke a structured model, doubling the completion cap on length-truncation.
+
+    Reasoning-heavy local models (North-Mini-Code via llama.cpp, where
+    ``suppress_reasoning``'s vLLM knobs are ignored) burn the whole completion
+    budget on chain-of-thought before the JSON closes, raising
+    ``LengthFinishReasonError`` — which otherwise silently drops the slice's
+    edit_plan. Doubling the cap (bounded by ``max_escalations`` and the model's
+    context window) gives the JSON room to land. No-op-ish for cloud models:
+    ``base_cap<=0`` means a single invoke with no escalation.
+    """
+    cap = base_cap if (base_cap and base_cap > 0) else 0
+    attempt = 0
+    while True:
+        try:
+            return await ainvoke_structured_with_retry(
+                _bind_capped(base_model, schema, cap), messages, label=label
+            )
+        except _LengthFinishReasonError:
+            nxt = cap * 2
+            # Stop if uncapped, out of escalations, or the doubled cap would
+            # crowd the window (leave ~2K headroom for the prompt).
+            if not cap or attempt >= max_escalations or (window and nxt + 2048 >= window):
+                raise
+            attempt += 1
+            logger.warning(
+                "%s: length-truncated at cap=%d — escalating to %d", label, cap, nxt
+            )
+            cap = nxt
 
 
 async def run_decomposer(
@@ -299,18 +357,19 @@ async def run_decomposer(
 
     _spine_cfg = SpineConfig.load()
     decompose_cap = _spine_cfg.decompose_max_completion_tokens
-    if decompose_cap and decompose_cap > 0:
-        model = cap_completion_tokens(model, decompose_cap)
-    # Suppress the reasoning channel on local thinking models (e.g. Qwen3.6).
-    # Without this, chain-of-thought consumes the entire decompose_cap before
-    # any JSON is emitted, so the structured call dies with
-    # LengthFinishReasonError *after* burning the full completion budget — a
-    # multi-minute, fully-wasted call on a slow local backend that then drops
-    # the slice (trace 019ed3dc: every fallback_decomposer span errored this
-    # way). Mirrors the cap+suppress pattern in plan_do/researcher_supervisor.
-    # No-op for OpenRouter / real OpenAI models.
-    model = suppress_reasoning(model)
-    structured = bind_structured_output(model, DecompositionResult)
+    # ``model`` stays UNCAPPED here; _bind_capped (inside the escalation helper)
+    # applies the cap + suppress_reasoning per attempt, doubling the cap once on
+    # LengthFinishReasonError so a reasoning-heavy local model's JSON still lands
+    # instead of silently dropping the slice. Window bounds the escalation.
+    try:
+        _window = int(
+            (_spine_cfg.resolve_provider_config(phase=phase_path) or {}).get(
+                "context_window"
+            )
+            or 0
+        )
+    except Exception:  # noqa: BLE001
+        _window = 0
 
     if mode == "PLAN":
         system_prompt = _PLAN_PROMPT
@@ -388,10 +447,13 @@ async def run_decomposer(
         )
 
     try:
-        response: Any = await ainvoke_structured_with_retry(
-            structured,
+        response: Any = await _ainvoke_structured_escalating(
+            model,
+            DecompositionResult,
             [SystemMessage(content=system_prompt), HumanMessage(content=human_content)],
             label="decomposer",
+            base_cap=decompose_cap,
+            window=_window,
         )
     except _LengthFinishReasonError:
         # The completion hit the length limit before valid JSON closed. For the
@@ -418,10 +480,13 @@ async def run_decomposer(
             ),
             tail,
         )
-        response = await ainvoke_structured_with_retry(
-            structured,
+        response = await _ainvoke_structured_escalating(
+            model,
+            DecompositionResult,
             [SystemMessage(content=system_prompt), HumanMessage(content=salvage_content)],
             label="decomposer-length-salvage",
+            base_cap=decompose_cap,
+            window=_window,
         )
 
     if isinstance(response, DecompositionResult):
@@ -488,6 +553,65 @@ def _build_known_symbols_block(db_path: str, files: list[str]) -> str:
         else:
             lines.append(f"  {f}: (not yet indexed — file may be new)")
     return "\n".join(lines) if found_any else ""
+
+
+def _build_reference_signatures_block(
+    db_path: str, workspace_root: str, refs: list[str]
+) -> str:
+    """Signatures + module paths of the slice's reference_symbols, or ''.
+
+    Feeds enrich the EXACT names and import paths of the existing symbols its
+    code will call/extend (e.g. the ``UIApi`` methods a UI slice persists
+    through), grouped by file. Without this the model guesses both the method
+    names and the module path — North guessed ``spine.api.ui`` and Qwen
+    ``spine.ui.api`` for what is really ``spine/ui_api/api.py``.
+    """
+    if not refs:
+        return ""
+    try:
+        from spine.agents.tools.codebase_query import get_symbol_signature
+    except ImportError:
+        return ""
+    by_file: dict[str, list[str]] = {}
+    imports: dict[str, set[str]] = {}  # module -> {ClassName}
+    for r in refs:
+        try:
+            res = get_symbol_signature(db_path, workspace_root, r)
+        except Exception:  # noqa: BLE001
+            res = None
+        if res:
+            fp, head = res
+            by_file.setdefault(fp or "(unknown)", []).append(head)
+            # Derive the exact import for class-qualified refs (e.g.
+            # 'UIApi.set_phase_provider' in spine/ui_api/api.py ->
+            # 'from spine.ui_api.api import UIApi'). Skip module-path refs whose
+            # leading segment is lowercase (a module/function, not a class).
+            cls = r.split(".")[0]
+            if fp and cls[:1].isupper():
+                module = fp[:-3] if fp.endswith(".py") else fp
+                module = module.replace("/", ".").strip(".")
+                imports.setdefault(module, set()).add(cls)
+    if not by_file:
+        return ""
+    lines: list[str] = []
+    if imports:
+        # An explicit, imperative import directive — instruct models under-attend
+        # to the file-header hint below and otherwise guess the module path
+        # (North->spine.api.ui, Qwen->spine.ui.api for spine/ui_api/api.py).
+        lines.append("Import these EXISTING classes EXACTLY as written — do NOT "
+                     "invent a module path:")
+        for module, classes in sorted(imports.items()):
+            lines.append(f"    from {module} import {', '.join(sorted(classes))}")
+        lines.append("")
+    lines.append(
+        "Signatures of EXISTING symbols this slice calls or extends. Use these "
+        "EXACT names — do NOT invent a method name:"
+    )
+    for fp, heads in by_file.items():
+        lines.append(f"# {fp}")
+        for head in heads:
+            lines.append("\n".join("    " + ln for ln in head.splitlines()))
+    return "\n".join(lines)
 
 
 def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
@@ -695,8 +819,16 @@ _ENRICH_PROMPT = (
         "- Each edit_plan entry MUST anchor by a symbol that is in the "
         "provided symbol list. Symbols being CREATED do not exist yet — "
         "they are not valid anchors.\n"
-        "- To ADD new methods/functions to a class: use the last existing "
-        "method of that class as symbol, set action='insert_after'.\n"
+        "- ONE entry per change site. Emit a SEPARATE entry for EACH new "
+        "method/function you add — never a single umbrella entry like 'add "
+        "the embedding, reranker and timeout methods'. If the slice adds six "
+        "methods, emit six entries. Each entry's `intent` names exactly ONE "
+        "symbol and states its full signature + behaviour (a thin implementer "
+        "writes one small edit per entry; a bundled entry forces it to survey "
+        "the whole file and is the api.py 89×-read spiral).\n"
+        "- To ADD a new method/function to a class: anchor each new symbol on "
+        "the last existing method of that class, action='insert_after' (still "
+        "one entry per new method — they may share the same anchor).\n"
         "- To MODIFY an existing method: set symbol to its qualified name, "
         "action='replace'.\n"
         "- To add module-level code (imports, constants, top-level functions): "
@@ -736,16 +868,19 @@ async def enrich_slice(
     if not known_block:
         return source_slice
 
-    model = resolve_chat_model(
-        config, session_id=session_id, phase="implement/decomposer/enrich"
-    )
+    enrich_phase = "implement/decomposer/enrich"
+    model = resolve_chat_model(config, session_id=session_id, phase=enrich_phase)
     decompose_cap = _spine_cfg.decompose_max_completion_tokens
-    if decompose_cap and decompose_cap > 0:
-        model = cap_completion_tokens(model, decompose_cap)
-    model = suppress_reasoning(model)
-    structured = bind_structured_output(
-        model, _enrichment_schema(_spine_cfg.checkpoint_path, files)
-    )
+    enrich_schema = _enrichment_schema(_spine_cfg.checkpoint_path, files)
+    try:
+        enrich_window = int(
+            (_spine_cfg.resolve_provider_config(phase=enrich_phase) or {}).get(
+                "context_window"
+            )
+            or 0
+        )
+    except Exception:  # noqa: BLE001
+        enrich_window = 0
 
     slice_json = json.dumps(
         {
@@ -756,25 +891,37 @@ async def enrich_slice(
                 "description",
                 "target_files",
                 "acceptance_criteria",
+                "reference_symbols",
             )
         },
         indent=2,
         ensure_ascii=False,
         default=str,
     )
+    # Resolve the slice's reference_symbols to their real signatures + module
+    # paths so enrich calls them correctly instead of guessing names/imports.
+    ref_block = _build_reference_signatures_block(
+        _spine_cfg.checkpoint_path,
+        os.getcwd(),
+        source_slice.get("reference_symbols") or [],
+    )
+    findings = known_block + ("\n\n" + ref_block if ref_block else "")
     human_content = hostage_layout(
         xml_blocks(
             (Tag.SPECIFICATION, slice_json),
-            (Tag.FINDINGS, known_block),
+            (Tag.FINDINGS, findings),
         ),
         "Return an _EnrichmentOutput with a concrete edit_plan for this slice.",
     )
 
     try:
-        response: Any = await ainvoke_structured_with_retry(
-            structured,
+        response: Any = await _ainvoke_structured_escalating(
+            model,
+            enrich_schema,
             [SystemMessage(content=_ENRICH_PROMPT), HumanMessage(content=human_content)],
             label="enrich_slice",
+            base_cap=decompose_cap,
+            window=enrich_window,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

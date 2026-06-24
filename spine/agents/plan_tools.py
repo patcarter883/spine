@@ -528,6 +528,15 @@ class _FeatureSliceInput(BaseModel):
         description="IDs of other slices this depends on (empty if none).",
         default_factory=list,
     )
+    reference_only_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Files the implementer may READ for context but must NOT create or "
+            "modify. Usually left empty — the grounding pass populates it "
+            "automatically by demoting target_files that are runtime state "
+            "(.spine/) or that the planner mis-pathed."
+        ),
+    )
     acceptance_criteria: list[str] = Field(
         description="Measurable criteria for this slice to be considered complete.",
         min_length=1,
@@ -750,6 +759,25 @@ class StructuredWritePlanTool(BaseTool):
                 "and fields are retained from your previous calls."
             )
 
+        # ── Ground writable targets against the live tree ─────────────
+        # Demote any target_file that is .spine runtime state or that the
+        # planner mis-pathed (its basename exists elsewhere) into
+        # reference_only_files, so the implementer never authors a file it was
+        # only meant to read (trace 019ef1e5). Deterministic — no LLM call.
+        from spine.agents.plan_grounding import ground_slice_targets
+
+        grounded = ground_slice_targets(
+            [sl.model_dump() for sl in validated_slices], self.workspace_root
+        )
+        for sl, g in zip(validated_slices, grounded):
+            sl.target_files = list(g.get("target_files") or [])
+            sl.reference_only_files = list(g.get("reference_only_files") or [])
+            er = g.get("execution_requirements")
+            sl.execution_requirements = (
+                er if isinstance(er, str) else "\n".join(er) if isinstance(er, list)
+                else sl.execution_requirements
+            )
+
         # ── Prepare output directory ──────────────────────────────────
         plan_path = Path(self.workspace_root) / self.plan_dir
         plan_path.mkdir(parents=True, exist_ok=True)
@@ -773,6 +801,11 @@ class StructuredWritePlanTool(BaseTool):
             lines.append(f"**Complexity:** {sl.complexity}  \n")
             lines.append(f"**Dependencies:** {deps}  \n")
             lines.append(f"**Target files:** {', '.join(sl.target_files) or 'TBD'}\n\n")
+            if sl.reference_only_files:
+                lines.append(
+                    "**Reference-only files (read, do not modify):** "
+                    f"{', '.join(sl.reference_only_files)}\n\n"
+                )
             if sl.reference_symbols:
                 lines.append(
                     f"**Reference symbols:** {', '.join(sl.reference_symbols)}\n\n"
