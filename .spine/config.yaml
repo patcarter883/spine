@@ -152,11 +152,11 @@ providers:
     plan/subagents/researcher/supervisor:
       provider: local-gemma-12b
     critic:
-      provider: local-gemma-12b
+      provider: local-glm
     critic/specify:
-      provider: local-gemma-12b
+      provider: local-glm
     critic/plan:
-      provider: local-gemma-12b
+      provider: local-glm
     gap_plan:
       provider: local-gemma-12b
     exploration/manager:
