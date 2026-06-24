@@ -323,7 +323,11 @@ class SpineConfig:
     # buys ~4K more prompt headroom before overflow; DynamicCompletionCap then
     # lowers it further per-turn as the prompt grows. 8K still covers a
     # full_replace of a ~30KB file, which is larger than any single slice's file.
-    implement_max_completion_tokens: int = 8000
+    # Raised to 32768 to give reasoning-heavy local models (North-Mini-Code,
+    # whose CoT leaks into the completion) room for both their thinking and the
+    # edit payload. On a 64K-window model this halves the prompt budget;
+    # DynamicCompletionCap still shrinks it per-turn as the conversation grows.
+    implement_max_completion_tokens: int = 32768
     # Completion-token cap for the structural decomposer's no-tool structured
     # calls (PLAN / FALLBACK / PER_FILE in spine.agents.decomposer) AND the
     # single-file enrich pass. The edit_plan now carries ONE entry per change
@@ -347,7 +351,9 @@ class SpineConfig:
     # every enrich call dropped its edit_plan (North bench 0624). The larger
     # base, plus the length-escalation retry in decomposer (doubles the cap once
     # on LengthFinishReasonError), gives the structured JSON room to land.
-    decompose_max_completion_tokens: int = 16384
+    # Raised to 32768 (global completion bump) for North, whose leaked CoT
+    # exhausted 4096/8192/16384 before the edit_plan JSON closed.
+    decompose_max_completion_tokens: int = 32768
     # Max chars of the failure traceback embedded in a FALLBACK decompose
     # prompt. The traceback is otherwise unbounded — a large one (plus the
     # verbatim failed-slice JSON) inflates the prompt until the structured call
