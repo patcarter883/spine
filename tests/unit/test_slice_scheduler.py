@@ -401,3 +401,31 @@ class TestSlicesToStateDict:
         assert entry["dependencies"] == []
         assert entry["acceptance_criteria"] == ["test passes"]
         assert entry["complexity"] == "medium"
+
+
+# ── Same-file serialization must not inject a cycle (regression: trace 55ae1919) ──
+
+
+def test_same_file_chain_respects_existing_dep_direction() -> None:
+    """Two slices on one file where the alphabetically-EARLIER id depends on the
+    later one must NOT be chained alphabetically — doing so reverses the existing
+    edge and creates a 2-cycle that compute_execution_waves then rejects.
+    """
+    slices = [
+        FeatureSlice(
+            id="api_phase_timeout",  # alphabetically first…
+            title="phase+timeout",
+            dependencies=["api_specialized"],  # …but depends on the later one
+            target_files=["spine/ui_api/api.py"],
+        ),
+        FeatureSlice(
+            id="api_specialized",
+            title="specialized",
+            dependencies=[],
+            target_files=["spine/ui_api/api.py"],
+        ),
+    ]
+    # Must not raise CycleError, and must order the dependency root first.
+    waves = compute_execution_waves(slices)
+    ids = [sorted(s.id for s in wave) for wave in waves]
+    assert ids == [["api_specialized"], ["api_phase_timeout"]]
