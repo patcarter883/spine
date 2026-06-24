@@ -39,6 +39,29 @@ _STRUCTURED_STATE_FIELD: dict[str, str] = {
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on the length of a critic ``reason`` we persist/render. A degenerate
+# critic once emitted a 126K-char repetition that the keyword fallback embedded
+# verbatim and the work-detail UI rendered as a wall of repeated PASSED blocks
+# (trace 019ef7fd).
+_MAX_REASON_CHARS = 800
+
+
+def _clip_reason(text: str) -> str:
+    """Bound a critic reason: collapse consecutive duplicate lines (kills
+    repetition-loop bloat) and hard-cap the length."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    deduped: list[str] = []
+    for ln in s.splitlines():
+        if deduped and deduped[-1] == ln:
+            continue
+        deduped.append(ln)
+    s = "\n".join(deduped)
+    if len(s) > _MAX_REASON_CHARS:
+        s = s[:_MAX_REASON_CHARS].rstrip() + f" … [reason truncated, {len(text)} chars total]"
+    return s
+
 
 def _format_prior_review(prior_review: dict[str, Any] | None) -> str:
     """Render the critic's own previous verdict for a rework pass.
@@ -395,7 +418,7 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
             return _parse_agent_review_fallback(result, reviewed_phase)
 
         status_raw = data.get("status", "NEEDS_REVISION")
-        reason = data.get("reason", "Structured review completed")
+        reason = _clip_reason(data.get("reason", "Structured review completed"))
         suggestions = data.get("suggestions", [])
         blocker_category = data.get("blocker_category")
         cited_exclusions = data.get("cited_exclusions") or []
@@ -425,8 +448,37 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
     messages = result.get("messages", [])
     last_message = messages[-1] if messages else None
     content = ""
+    finish_reason = ""
     if last_message:
         content = getattr(last_message, "content", str(last_message))
+        meta = getattr(last_message, "response_metadata", None) or {}
+        finish_reason = str(meta.get("finish_reason", "")).lower()
+
+    clipped = _clip_reason(content)
+
+    # A structured-output critic that fell through to keyword parsing produced no
+    # parseable CriticReview. If it ALSO hit the token ceiling
+    # (finish_reason='length'), it degenerated/looped rather than rendering a
+    # verdict — never salvage a PASS from that noise (trace 019ef7fd: a 126K-char
+    # repetition keyword-matched to PASSED). Force a revision round instead.
+    if finish_reason == "length":
+        logger.warning(
+            "critic fallback: response truncated at token limit without a "
+            "structured verdict for phase '%s' — routing NEEDS_REVISION",
+            reviewed_phase,
+        )
+        return {
+            "status": ReviewStatus.NEEDS_REVISION.value,
+            "tier": "agent",
+            "reason": (
+                "Critic response was truncated at the token limit "
+                "(finish_reason=length) without a structured verdict — treating "
+                "as NEEDS_REVISION rather than trusting a salvaged keyword. "
+                f"Partial output: {clipped}"
+            ),
+            "suggestions": [],
+            "cited_exclusions": [],
+        }
 
     content_upper = content.upper()
 
@@ -443,7 +495,7 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
     return {
         "status": status,
         "tier": "agent",
-        "reason": f"Agent review of {reviewed_phase}: {content}",
+        "reason": f"Agent review of {reviewed_phase}: {clipped}",
         "suggestions": [],
         "cited_exclusions": [],
     }

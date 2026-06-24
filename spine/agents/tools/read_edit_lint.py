@@ -745,6 +745,81 @@ def _match_symbols(symbols: list, symbol: str) -> list:
     ]
 
 
+# A class whose body exceeds this many lines is returned as a signature
+# SKELETON (header + per-method def lines) rather than its full source. A
+# god-class like SpineConfig (860+ lines) otherwise dumps ~46K chars from a
+# single anchored read, and that buffer then rides every later turn's prompt —
+# the 1.7M-token implement blow-up in trace 019ef809.
+_CLASS_SKELETON_MIN_LINES = 160
+_SKELETON_HEADER_MAX_LINES = 80
+
+
+def _signature_lines(method_src_lines: list[str]) -> list[str]:
+    """The def-signature portion of a method's source.
+
+    Handles multi-line signatures by stopping at the first line whose stripped
+    text ends with ':' (the line that closes the ``def``).
+    """
+    out: list[str] = []
+    for ln in method_src_lines:
+        out.append(ln)
+        if ln.rstrip().endswith(":"):
+            break
+    return out or method_src_lines[:1]
+
+
+def _class_skeleton(
+    file_path: str, content: str, class_sym: Any, symbols: list
+) -> Optional[str]:
+    """Render a large class as header + folded method signatures, line-numbered.
+
+    Returns ``None`` when the class is small enough to show in full (the caller
+    then renders the whole body) or exposes no methods to fold. The output
+    starts with ``[read:`` so it is cached like any other successful read, and
+    every line keeps its real file line number so edits can still anchor.
+    """
+    lines = content.splitlines()
+    class_lo = content.count("\n", 0, class_sym.start_byte) + 1
+    class_hi = content.count("\n", 0, class_sym.end_byte) + 1
+    if class_hi - class_lo + 1 < _CLASS_SKELETON_MIN_LINES:
+        return None
+    methods = sorted(
+        (s for s in symbols if s.parent_class == class_sym.symbol_name),
+        key=lambda s: s.start_byte,
+    )
+    if not methods:
+        return None
+
+    first_method_lo = content.count("\n", 0, methods[0].start_byte) + 1
+    header_hi = max(
+        class_lo,
+        min(first_method_lo - 1, class_lo + _SKELETON_HEADER_MAX_LINES - 1),
+    )
+    rendered: list[str] = [f"{i}| {lines[i - 1]}" for i in range(class_lo, header_hi + 1)]
+    omitted_header = (first_method_lo - 1) - header_hi
+    if omitted_header > 0:
+        rendered.append(f"… ({omitted_header} more header lines — read_around to view)")
+
+    for m in methods:
+        m_lo = content.count("\n", 0, m.start_byte) + 1
+        sig = _signature_lines(m.raw_code.splitlines())
+        rendered.extend(f"{m_lo + off}| {sline}" for off, sline in enumerate(sig))
+        rendered.append(f"{m_lo + len(sig)}|     …")
+
+    header = (
+        f"[read: {file_path} :: class {class_sym.symbol_name} SKELETON "
+        f"(lines {class_lo}-{class_hi} of {len(lines)}; {len(methods)} methods, "
+        "bodies folded)]"
+    )
+    hint = (
+        f"\n[skeleton: method bodies are hidden. read_symbol="
+        f"'{class_sym.symbol_name}.<method>' for one body, or read_around='snippet' "
+        "for a region. Do NOT request the whole class body — edit the specific "
+        "method by anchored ast_edit/patch.]"
+    )
+    return header + "\n" + "\n".join(rendered) + hint
+
+
 _READ_AROUND_CONTEXT = 4
 
 
@@ -1170,6 +1245,13 @@ class ReadEditLintTool(BaseTool):
                 "a different one.]"
             )
         sym = matches[0]
+        # A god-class anchored read otherwise dumps the whole file (SpineConfig
+        # spans 860+ lines); fold it to a signature skeleton and make the model
+        # drill into 'Class.method' for a body.
+        if sym.symbol_type == "class":
+            skeleton = _class_skeleton(file_path, content, sym, symbols)
+            if skeleton is not None:
+                return skeleton + note if note else skeleton
         lo = content.count("\n", 0, sym.start_byte) + 1
         hi = content.count("\n", 0, sym.end_byte) + 1
         body = _render_read(file_path, content, lo, hi)
