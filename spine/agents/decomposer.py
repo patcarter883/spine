@@ -629,31 +629,70 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
     if not db_path:
         return
     try:
-        from spine.agents.tools.codebase_query import find_symbol
+        from spine.agents.tools.codebase_query import find_symbol, list_file_symbols
     except ImportError:
         return
 
+    _file_syms: dict[str, set[str]] = {}
+
+    def _syms_for(fp: str) -> set[str]:
+        if fp not in _file_syms:
+            try:
+                _file_syms[fp] = set(list_file_symbols(db_path, fp))
+            except Exception:
+                _file_syms[fp] = set()
+        return _file_syms[fp]
+
+    def _in_files(sym: str, files: list[str]) -> bool:
+        """True if *sym* (or its bare tail) is indexed in any of *files*."""
+        tail = sym.split(".")[-1]
+        for fp in files:
+            fs = _syms_for(fp)
+            if sym in fs or any(s == tail or s.rsplit(".", 1)[-1] == tail for s in fs):
+                return True
+        return False
+
     for sl in slices:
         slice_id = sl.get("id", "?")
+        target_files = [f for f in (sl.get("target_files") or []) if f]
 
-        # Scrub edit_plan symbols.
+        # Scrub edit_plan symbols: clear a symbol that (a) is not in the index at
+        # all (a phantom — likely a new definition, not an anchor), or (b) exists
+        # but NOT in the file the edit targets (a guaranteed-failing ast_edit
+        # anchor — trace 4aa24c6b: SpineConfig.load, which lives in config.py,
+        # anchored into an api.py slice). Demote ast_edit so the implementer falls
+        # back to patch/full_replace instead.
         for hint in sl.get("edit_plan") or []:
             sym = hint.get("symbol", "")
             if not sym:
                 continue
+            hint_file = hint.get("file") or ""
+            scope_files = [hint_file] if hint_file else target_files
+
+            if scope_files and _in_files(sym, scope_files):
+                continue  # resolves in its own target file → valid anchor
+
             try:
-                exists = find_symbol(db_path, sym) is not None
+                exists_anywhere = find_symbol(db_path, sym) is not None
             except Exception:
                 continue
-            if not exists:
-                logger.warning(
-                    "decomposer: clearing phantom edit_plan symbol %r in slice %r "
-                    "(not found in codebase index — likely a new definition, not an anchor)",
-                    sym, slice_id,
-                )
-                hint["symbol"] = ""
-                if hint.get("mode") == "ast_edit":
-                    hint["mode"] = ""
+
+            if exists_anywhere and not scope_files:
+                continue  # real symbol, no target files to scope-check → keep
+
+            reason = (
+                "not found in codebase index — likely a new definition, not an anchor"
+                if not exists_anywhere
+                else f"exists in the index but not in target {scope_files} — a "
+                "guaranteed-failing ast_edit anchor"
+            )
+            logger.warning(
+                "decomposer: clearing edit_plan symbol %r in slice %r (%s)",
+                sym, slice_id, reason,
+            )
+            hint["symbol"] = ""
+            if hint.get("mode") == "ast_edit":
+                hint["mode"] = ""
 
         # Scrub reference_symbols.
         refs = sl.get("reference_symbols") or []
