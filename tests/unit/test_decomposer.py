@@ -272,3 +272,38 @@ async def test_per_file_mode_requires_two_files():
             mode="PER_FILE",
             source_slice={"id": "solo", "target_files": ["only.py"]},
         )
+
+
+def test_scrub_clears_wrong_file_anchor(monkeypatch) -> None:
+    """An edit_plan symbol that exists but in a DIFFERENT file than the slice
+    targets is a guaranteed-failing ast_edit anchor — clear it + demote mode
+    (trace 4aa24c6b: SpineConfig.load anchored into an api.py slice)."""
+    import spine.agents.tools.codebase_query as cq
+    from spine.agents.decomposer import _scrub_phantom_symbols
+
+    # config.py owns SpineConfig.load; api.py has unrelated symbols.
+    file_syms = {
+        "spine/config.py": ["SpineConfig", "SpineConfig.load"],
+        "spine/ui_api/api.py": ["UIApi", "UIApi.add_llm_provider"],
+    }
+    monkeypatch.setattr(cq, "list_file_symbols", lambda _db, f: file_syms.get(f, []))
+    # find_symbol: exists anywhere iff it's some file's symbol.
+    all_syms = {s for v in file_syms.values() for s in v}
+    monkeypatch.setattr(cq, "find_symbol", lambda _db, s: s if s in all_syms else None)
+
+    slices = [
+        {
+            "id": "api_slice",
+            "target_files": ["spine/ui_api/api.py"],
+            "edit_plan": [
+                # wrong file: real symbol, but not in api.py → cleared
+                {"file": "spine/ui_api/api.py", "symbol": "SpineConfig.load", "mode": "ast_edit"},
+                # correct: in api.py → kept
+                {"file": "spine/ui_api/api.py", "symbol": "UIApi.add_llm_provider", "mode": "ast_edit"},
+            ],
+        }
+    ]
+    _scrub_phantom_symbols(slices, "db")
+    hints = slices[0]["edit_plan"]
+    assert hints[0]["symbol"] == "" and hints[0]["mode"] == ""   # wrong-file cleared
+    assert hints[1]["symbol"] == "UIApi.add_llm_provider"        # valid anchor kept
