@@ -237,6 +237,56 @@ _OVERFLOW_HINT = (
 )
 
 
+def _bind_capped(base_model: Any, schema: type, cap: int) -> Any:
+    """Cap completion + suppress reasoning + bind structured output for *schema*.
+
+    ``base_model`` is the uncapped resolved model; a fresh capped copy is made
+    each call so the escalation retry can re-bind at a larger cap.
+    """
+    m = cap_completion_tokens(base_model, cap) if cap and cap > 0 else base_model
+    return bind_structured_output(suppress_reasoning(m), schema)
+
+
+async def _ainvoke_structured_escalating(
+    base_model: Any,
+    schema: type,
+    messages: list,
+    *,
+    label: str,
+    base_cap: int,
+    window: int = 0,
+    max_escalations: int = 1,
+) -> Any:
+    """Invoke a structured model, doubling the completion cap on length-truncation.
+
+    Reasoning-heavy local models (North-Mini-Code via llama.cpp, where
+    ``suppress_reasoning``'s vLLM knobs are ignored) burn the whole completion
+    budget on chain-of-thought before the JSON closes, raising
+    ``LengthFinishReasonError`` — which otherwise silently drops the slice's
+    edit_plan. Doubling the cap (bounded by ``max_escalations`` and the model's
+    context window) gives the JSON room to land. No-op-ish for cloud models:
+    ``base_cap<=0`` means a single invoke with no escalation.
+    """
+    cap = base_cap if (base_cap and base_cap > 0) else 0
+    attempt = 0
+    while True:
+        try:
+            return await ainvoke_structured_with_retry(
+                _bind_capped(base_model, schema, cap), messages, label=label
+            )
+        except _LengthFinishReasonError:
+            nxt = cap * 2
+            # Stop if uncapped, out of escalations, or the doubled cap would
+            # crowd the window (leave ~2K headroom for the prompt).
+            if not cap or attempt >= max_escalations or (window and nxt + 2048 >= window):
+                raise
+            attempt += 1
+            logger.warning(
+                "%s: length-truncated at cap=%d — escalating to %d", label, cap, nxt
+            )
+            cap = nxt
+
+
 async def run_decomposer(
     *,
     mode: Literal["PLAN", "FALLBACK", "PER_FILE"],
@@ -307,18 +357,19 @@ async def run_decomposer(
 
     _spine_cfg = SpineConfig.load()
     decompose_cap = _spine_cfg.decompose_max_completion_tokens
-    if decompose_cap and decompose_cap > 0:
-        model = cap_completion_tokens(model, decompose_cap)
-    # Suppress the reasoning channel on local thinking models (e.g. Qwen3.6).
-    # Without this, chain-of-thought consumes the entire decompose_cap before
-    # any JSON is emitted, so the structured call dies with
-    # LengthFinishReasonError *after* burning the full completion budget — a
-    # multi-minute, fully-wasted call on a slow local backend that then drops
-    # the slice (trace 019ed3dc: every fallback_decomposer span errored this
-    # way). Mirrors the cap+suppress pattern in plan_do/researcher_supervisor.
-    # No-op for OpenRouter / real OpenAI models.
-    model = suppress_reasoning(model)
-    structured = bind_structured_output(model, DecompositionResult)
+    # ``model`` stays UNCAPPED here; _bind_capped (inside the escalation helper)
+    # applies the cap + suppress_reasoning per attempt, doubling the cap once on
+    # LengthFinishReasonError so a reasoning-heavy local model's JSON still lands
+    # instead of silently dropping the slice. Window bounds the escalation.
+    try:
+        _window = int(
+            (_spine_cfg.resolve_provider_config(phase=phase_path) or {}).get(
+                "context_window"
+            )
+            or 0
+        )
+    except Exception:  # noqa: BLE001
+        _window = 0
 
     if mode == "PLAN":
         system_prompt = _PLAN_PROMPT
@@ -396,10 +447,13 @@ async def run_decomposer(
         )
 
     try:
-        response: Any = await ainvoke_structured_with_retry(
-            structured,
+        response: Any = await _ainvoke_structured_escalating(
+            model,
+            DecompositionResult,
             [SystemMessage(content=system_prompt), HumanMessage(content=human_content)],
             label="decomposer",
+            base_cap=decompose_cap,
+            window=_window,
         )
     except _LengthFinishReasonError:
         # The completion hit the length limit before valid JSON closed. For the
@@ -426,10 +480,13 @@ async def run_decomposer(
             ),
             tail,
         )
-        response = await ainvoke_structured_with_retry(
-            structured,
+        response = await _ainvoke_structured_escalating(
+            model,
+            DecompositionResult,
             [SystemMessage(content=system_prompt), HumanMessage(content=salvage_content)],
             label="decomposer-length-salvage",
+            base_cap=decompose_cap,
+            window=_window,
         )
 
     if isinstance(response, DecompositionResult):
@@ -752,16 +809,19 @@ async def enrich_slice(
     if not known_block:
         return source_slice
 
-    model = resolve_chat_model(
-        config, session_id=session_id, phase="implement/decomposer/enrich"
-    )
+    enrich_phase = "implement/decomposer/enrich"
+    model = resolve_chat_model(config, session_id=session_id, phase=enrich_phase)
     decompose_cap = _spine_cfg.decompose_max_completion_tokens
-    if decompose_cap and decompose_cap > 0:
-        model = cap_completion_tokens(model, decompose_cap)
-    model = suppress_reasoning(model)
-    structured = bind_structured_output(
-        model, _enrichment_schema(_spine_cfg.checkpoint_path, files)
-    )
+    enrich_schema = _enrichment_schema(_spine_cfg.checkpoint_path, files)
+    try:
+        enrich_window = int(
+            (_spine_cfg.resolve_provider_config(phase=enrich_phase) or {}).get(
+                "context_window"
+            )
+            or 0
+        )
+    except Exception:  # noqa: BLE001
+        enrich_window = 0
 
     slice_json = json.dumps(
         {
@@ -787,10 +847,13 @@ async def enrich_slice(
     )
 
     try:
-        response: Any = await ainvoke_structured_with_retry(
-            structured,
+        response: Any = await _ainvoke_structured_escalating(
+            model,
+            enrich_schema,
             [SystemMessage(content=_ENRICH_PROMPT), HumanMessage(content=human_content)],
             label="enrich_slice",
+            base_cap=decompose_cap,
+            window=enrich_window,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

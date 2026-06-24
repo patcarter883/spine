@@ -218,3 +218,60 @@ async def test_edit_plan_slice_skips_llm_planner_and_forbids_exploration(
     # (the negated "do NOT explore" mention is the fix, not a foot-gun).
     assert approach.startswith("apply the edits in <edit_plan>")
     assert "do not explore" in approach
+
+
+# ── Decomposer length-escalation (reasoning-heavy local models) ──────────
+
+
+@pytest.mark.asyncio
+async def test_structured_escalation_doubles_cap_on_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spine.agents import decomposer as dc
+
+    class _StubLength(Exception):
+        pass
+
+    monkeypatch.setattr(dc, "_LengthFinishReasonError", _StubLength)
+    calls: list[int] = []
+    # _bind_capped returns the cap itself so the fake invoke can branch on it.
+    monkeypatch.setattr(dc, "_bind_capped", lambda base, schema, cap: cap)
+
+    async def fake_invoke(model, messages, *, label):
+        calls.append(model)
+        if model < 30000:
+            raise _StubLength()
+        return "ok"
+
+    monkeypatch.setattr(dc, "ainvoke_structured_with_retry", fake_invoke)
+    out = await dc._ainvoke_structured_escalating(
+        object(), object(), [], label="t", base_cap=16384, window=65536, max_escalations=1
+    )
+    assert out == "ok"
+    assert calls == [16384, 32768]  # doubled once, then succeeded
+
+
+@pytest.mark.asyncio
+async def test_structured_escalation_respects_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spine.agents import decomposer as dc
+
+    class _StubLength(Exception):
+        pass
+
+    monkeypatch.setattr(dc, "_LengthFinishReasonError", _StubLength)
+    calls: list[int] = []
+    monkeypatch.setattr(dc, "_bind_capped", lambda base, schema, cap: cap)
+
+    async def always_length(model, messages, *, label):
+        calls.append(model)
+        raise _StubLength()
+
+    monkeypatch.setattr(dc, "ainvoke_structured_with_retry", always_length)
+    # window leaves no room to double (32768 + 2048 >= 33000) → no escalation.
+    with pytest.raises(_StubLength):
+        await dc._ainvoke_structured_escalating(
+            object(), object(), [], label="t", base_cap=16384, window=33000, max_escalations=3
+        )
+    assert calls == [16384]
