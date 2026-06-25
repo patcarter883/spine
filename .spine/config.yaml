@@ -20,7 +20,7 @@ spine:
   # slices to synthesis_implementer instead of the tool-using slice_implementer.
   # variants=3: synthesize 3 candidates, keep the one that applies+lints cleanest.
   implement_synthesis_placement: true
-  implement_synthesis_variants: 3
+  implement_synthesis_variants: 1
   # PLAN best-of-N (Graph-of-Thoughts Score+KeepBest): synthesize 3 candidate
   # plans, score each with the structural scorer (rejects the duplicate-path
   # explosion / unschedulable plans), keep the best before the critic sees it.
@@ -200,13 +200,13 @@ providers:
     specify/subagents/researcher:
       provider: local-glm
     specify/subagents/researcher/supervisor:
-      provider: laguna
+      provider: local-glm
     plan:
       provider: local-glm
     plan/subagents/researcher:
       provider: local-glm
     plan/subagents/researcher/supervisor:
-      provider: laguna
+      provider: local-glm
     critic:
       provider: local-glm
     critic/specify:
@@ -229,30 +229,30 @@ providers:
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
     implement:
-      provider: local-mellum
+      provider: local-qwen-coder
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-mellum
+      provider: local-qwen-coder
     implement/subagents/slice-implementer:
-      provider: local-mellum
+      provider: local-qwen-coder
     verify:
-      provider: local-mellum
+      provider: local-qwen-coder
     verify/subagents/slice-verifier:
-      provider: local-mellum
+      provider: local-qwen-coder
     classification:
-      provider: local-mellum
+      provider: local-qwen-coder
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-mellum
+      provider: local-qwen-coder
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-mellum
+      provider: local-qwen-coder
     onboarding/doc-manager:
-      provider: local-mellum
+      provider: local-qwen-coder
     onboarding/section-worker:
-      provider: local-mellum
+      provider: local-qwen-coder
