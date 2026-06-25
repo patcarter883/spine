@@ -68,7 +68,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
   - name: local-qwen
     type: deepagents-model
@@ -78,7 +78,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
     # Qwen-Coder model-card sampling: curbs the repeated-survey / re-read loops
     # a tool-using agent falls into (trace 019ef2ae: one file read 89×).
@@ -99,7 +99,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 4
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
   - name: local-mellum
     type: deepagents-model
@@ -109,7 +109,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 4
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
   - name: laguna
     type: deepagents-model
@@ -136,7 +136,7 @@ providers:
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 4
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
   embedding:
   - name: local-embeddings
@@ -145,6 +145,7 @@ providers:
     base_url: http://localhost:8010/v1
     api_key: vllm
     stream_usage: true
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     query_prefix: 'search_query: '
     document_prefix: 'search_document: '
   reranker:
@@ -152,6 +153,7 @@ providers:
     model: bge-reranker-v2-m3-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     rerank_path: /reranking
   phases:
     # ═══ REASONING lane -> local-glm (open-ended judgment) ═══
