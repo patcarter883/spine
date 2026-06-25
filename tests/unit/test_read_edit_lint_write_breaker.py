@@ -85,3 +85,20 @@ def test_mode_conflict_write_counts_toward_breaker(tmp_path):
             patch=[{"search": "x = 1", "replace": "x = 2"}],
         )
     assert _status(out) == "write_capped"
+
+
+def test_read_mode_conflict_also_counts_toward_breaker(tmp_path):
+    """A pure-read mode clash (read_symbol+read_around) is malformed too and must
+    trip the breaker — a weak model spun exactly this 1M tokens (trace 019efc1a,
+    Mellum2) because the breaker used to skip non-write conflicts.
+    """
+    (tmp_path / "m.py").write_text("x = 1\n")
+    tool = ReadEditLintTool(workspace_root=str(tmp_path), target_files=["m.py"])
+
+    first = tool._run("m.py", read_symbol="Foo", read_around="x = 1")
+    assert _status(first) == "input_error"
+
+    out = first
+    for _ in range(_WRITE_PRESSURE_WALL):
+        out = tool._run("m.py", read_symbol="Foo", read_around="x = 1")
+    assert _status(out) == "write_capped"

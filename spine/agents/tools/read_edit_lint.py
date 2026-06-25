@@ -1355,17 +1355,19 @@ class ReadEditLintTool(BaseTool):
         if not active:
             active.append("read_disabled")  # file_path alone = whole-file read
         if len(active) > 1:
-            err = {
-                "status": "input_error",
-                "detail": f"Pass exactly one edit mode, but several were provided: {active}.",
-            }
-            # A malformed WRITE call (e.g. find_replace+patch) counts toward the
-            # circuit breaker so it can't loop unbounded past it (trace 4aa24c6b);
-            # a pure read-mode clash does not.
-            write_modes = {"full_replace", "find_replace", "edits", "patch", "ast_edit", "line_range"}
-            if write_modes.intersection(active):
-                return self._fail_write(file_path, err)
-            return _result(**err)
+            # ANY multi-mode call is malformed — route it through the circuit
+            # breaker so a model that keeps repeating it gets walled instead of
+            # looping unbounded to the token budget. Originally this counted only
+            # write-mode clashes; a weak model spun a pure-read clash
+            # (read_symbol+read_around) 1M tokens (trace 019efc1a, Mellum2), so it
+            # now covers every conflict.
+            return self._fail_write(
+                file_path,
+                {
+                    "status": "input_error",
+                    "detail": f"Pass exactly ONE mode per call, but several were provided: {active}.",
+                },
+            )
         mode = active[0]
 
         path = self._resolve_path(file_path)
