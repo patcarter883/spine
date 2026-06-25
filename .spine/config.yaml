@@ -5,7 +5,10 @@ spine:
   synthesize_findings_token_budget: 20000
   max_completion_tokens: 30000
   researcher_supervisor_max_completion_tokens: 4096
-  max_critic_retries: 3
+  # 3->5: GLM planner converges but addresses critic feedback incrementally —
+  # trace 019efcc1 was one retry short of PASS (attempt 3: "covers the majority,
+  # one gap left"). Give it room to finish converging.
+  max_critic_retries: 5
   reranker_provider: bge-reranker
   embedding_provider: local-embeddings
   recall_k: 10
