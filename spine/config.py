@@ -307,6 +307,27 @@ class SpineConfig:
     research_lean_categories: list[str] = field(
         default_factory=lambda: ["Frontend/UI"]
     )
+    # ── Best-of-N plan synthesis (Graph-of-Thoughts Score + KeepBest) ──────
+    # Number of candidate plans the PLAN synthesizer generates, scores
+    # (spine.workflow.plan_score), and selects the best of before handing one
+    # to the critic. ``1`` (default) is the historical single-shot behaviour
+    # with zero added cost. ``>1`` front-loads convergence that the critic
+    # loop otherwise grinds out one rework cycle at a time. Variants run
+    # SEQUENTIALLY (local providers cap max_concurrent_calls at 1-2, so
+    # parallel synthesis buys no wall-clock and would collide on plan.json).
+    research_synth_variants: int = 1
+    # Scorer for KeepBest. ``"structural"`` = deterministic, LLM-free (the
+    # default — cheap, reproducible). ``"hybrid"`` adds an LLM-judge tiebreak
+    # among the top structural candidates (not yet wired; reserved).
+    research_synth_scorer: str = "structural"
+    # ── Findings aggregation (Graph-of-Thoughts Aggregate) ─────────────────
+    # When true, an LLM merge pass dedups/reconciles/ranks accumulated
+    # findings into a tighter evidence set just before synthesis, instead of
+    # feeding the raw append-only list straight to the synthesizer. Reduces
+    # synthesizer context (mitigates the read-spiral / context-blowup aborts).
+    # Only fires when there are at least ``research_aggregate_min_findings``.
+    research_aggregate_merge: bool = False
+    research_aggregate_min_findings: int = 8
     # Completion-token cap for the no-tool plan_do (run_plan_node)
     # SubagentDirective calls (e.g. plan_slice_implementer). A directive is
     # a few hundred tokens; without a cap the call inherits the provider's
@@ -384,6 +405,21 @@ class SpineConfig:
     # The guard only nudges — tools stay bound — so legitimate long slices can
     # still finish; 0 disables it.
     implement_max_turns: int = 30
+    # ── Synthesis + placement editor (two pure nodes, no tool loop) ────────
+    # When True, ``_route_slices`` sends each pending slice to the synthesis
+    # implementer (spine.agents.synthesis_implementer) instead of the tool-using
+    # slice_implementer: a no-tool structured call synthesizes complete
+    # symbol-anchored edits, then placement applies them deterministically
+    # through ReadEditLintTool (lint is the oracle). The editor cannot read, so
+    # it cannot survey-spiral (Laguna 79 calls / 0 edits; Qwen3-Coder empty diff).
+    # Default off — opt-in until benched against the tool-using path.
+    implement_synthesis_placement: bool = False
+    # Best-of-N for synthesis (Graph-of-Thoughts Score + KeepBest, the
+    # IMPLEMENT-side mirror of research_synth_variants / plan_score). Synthesis
+    # is side-effect-free, so sampling N candidates is cheap; placement scores
+    # each by how cleanly its edits apply + lint and keeps the best. 1 = single
+    # candidate (no extra cost). Only meaningful with implement_synthesis_placement.
+    implement_synthesis_variants: int = 1
     # Hard super-step ceiling for phase subgraphs (LangGraph recursion_limit).
     # LangGraph's default is 25 but SPINE raises it implicitly via fan-out; the
     # IMPLEMENT dispatch loop re-dispatches one Send per pending/failed slice and
@@ -703,6 +739,16 @@ class SpineConfig:
             research_lean_categories=list(
                 spine.get("research_lean_categories", ["Frontend/UI"])
             ),
+            research_synth_variants=int(spine.get("research_synth_variants", 1)),
+            research_synth_scorer=str(
+                spine.get("research_synth_scorer", "structural")
+            ),
+            research_aggregate_merge=bool(
+                spine.get("research_aggregate_merge", False)
+            ),
+            research_aggregate_min_findings=int(
+                spine.get("research_aggregate_min_findings", 8)
+            ),
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)
             ),
@@ -764,6 +810,12 @@ class SpineConfig:
                     "SPINE_IMPLEMENT_MAX_TURNS",
                     spine.get("implement_max_turns", 30),
                 )
+            ),
+            implement_synthesis_placement=bool(
+                spine.get("implement_synthesis_placement", False)
+            ),
+            implement_synthesis_variants=int(
+                spine.get("implement_synthesis_variants", 1)
             ),
             subgraph_recursion_limit=int(
                 os.getenv(
