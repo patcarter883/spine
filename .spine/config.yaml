@@ -166,14 +166,18 @@ providers:
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
     # summaries. The whole IMPLEMENT tree (decomposer + N slice-implementer
     # workers + verify) is one model = ZERO intra-phase swaps in the heaviest phase.
+    # EDITOR lane -> local-north-code: Mellum2-12B was too weak for the editor
+    # role — it failed the one-mode-per-call tool contract and spun the budget
+    # (trace 019efc1a). North-Mini-Code is a code model; whole IMPLEMENT tree on
+    # one model keeps ZERO intra-phase swaps.
     implement:
-      provider: local-mellum
+      provider: local-north-code
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-mellum
+      provider: local-north-code
     implement/subagents/slice-implementer:
-      provider: local-mellum
+      provider: local-north-code
     verify:
       provider: local-mellum
     verify/subagents/slice-verifier:
