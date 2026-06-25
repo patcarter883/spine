@@ -873,15 +873,191 @@ async def _try_decomposed_plan(
     return False
 
 
+# Variant hints for best-of-N. Index 0 is the neutral (historical) prompt so
+# variants>1 is a strict superset of the single-shot path. Cycled modulo length.
+_PLAN_VARIANT_HINTS: tuple[str, ...] = (
+    "",  # neutral — byte-identical to the historical synthesis prompt
+    "VARIANT BIAS: prefer FEWER, COARSER feature_slices — merge closely related "
+    "changes into one slice and keep the plan compact.",
+    "VARIANT BIAS: prefer FINER-GRAINED feature_slices with explicit interfaces "
+    "between them; never duplicate a target file across slices.",
+    "VARIANT BIAS: structure feature_slices to MINIMISE cross-slice dependencies "
+    "so as many slices as possible run in the first execution wave.",
+)
+
+
 async def _synthesize_plan(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Synthesize research findings into a plan.
+    """Best-of-N plan synthesis (Graph-of-Thoughts Generate → Score → KeepBest).
+
+    Generates ``research_synth_variants`` candidate plans sequentially, scores
+    each with :mod:`spine.workflow.plan_score`, and keeps the highest-scoring
+    schedulable plan — handing the critic a pre-selected best instead of a
+    single first draft. ``variants <= 1`` (default) is the historical
+    single-shot path with zero added cost or disk I/O.
+
+    Variants run sequentially by design: local providers cap
+    ``max_concurrent_calls`` at 1-2 (parallel synthesis buys no wall-clock)
+    and every candidate writes the same canonical ``plan.json`` (parallel
+    writes would collide). Each candidate is snapshotted under
+    ``plan/variants/`` before the next overwrites the canonical file; the
+    winner is restored to ``plan.json`` at the end, since ``save_artifacts``
+    and the critic both read it from disk.
+    """
+    from spine.config import SpineConfig
+
+    work_id = state.get("work_id", "unknown")
+    try:
+        cfg = SpineConfig.load()
+        variants = int(cfg.research_synth_variants)
+    except Exception:  # noqa: BLE001 — config issues must never block PLAN
+        cfg = None
+        variants = 1
+
+    # ── Aggregate (GoT) ── consolidate findings ONCE before synthesis, so
+    # both the fast path and every best-of-N variant synthesize from the
+    # deduped/ranked set. Transient: we replace findings in a local copy for
+    # synthesis only — we do NOT write the merged set back to the findings
+    # channel (a later rework round still sees the full raw evidence).
+    if cfg is not None and getattr(cfg, "research_aggregate_merge", False):
+        findings = state.get("findings", []) or []
+        if len(findings) >= int(cfg.research_aggregate_min_findings):
+            try:
+                from spine.agents.evidence_compression import aggregate_findings
+
+                merged = await aggregate_findings(
+                    findings, phase=PhaseName.PLAN.value, work_id=work_id, config=config
+                )
+                if merged is not findings:
+                    state = {**dict(state), "findings": merged}
+            except Exception:  # noqa: BLE001 — aggregation never blocks PLAN
+                logger.warning(
+                    "[%s] findings aggregation errored — using raw findings",
+                    work_id, exc_info=True,
+                )
+
+    # Fast path: identical to the historical single-shot synthesizer.
+    if variants <= 1:
+        result = await _synthesize_plan_once(state, config)
+        result.pop("_plan_data", None)
+        return result
+
+    from spine.workflow.plan_score import score_plan
+
+    workspace_root = state.get("workspace_root", ".")
+    spec_dir = state.get("spec_path") or f".spine/artifacts/{work_id}/specify"
+    spec_file = Path(workspace_root) / spec_dir / "specification.md"
+    spec_body = ""
+    if spec_file.exists():
+        try:
+            spec_body = spec_file.read_text(encoding="utf-8")
+        except OSError:
+            spec_body = ""
+
+    plan_json_path = (
+        Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+    )
+    variants_dir = plan_json_path.parent / "variants"
+
+    best: dict[str, Any] | None = None
+    best_score = float("-inf")
+    best_json: str | None = None
+    last_failure: Exception | None = None
+    n_ok = 0
+
+    for i in range(variants):
+        hint = _PLAN_VARIANT_HINTS[i % len(_PLAN_VARIANT_HINTS)]
+        logger.info(
+            "[%s] PLAN best-of-%d: synthesizing variant %d/%d (%s)",
+            work_id, variants, i + 1, variants,
+            f"hint: {hint[:48]}…" if hint else "neutral",
+        )
+        try:
+            result = await _synthesize_plan_once(state, config, variant_hint=hint)
+        except CriticalContractFailure as exc:
+            # One candidate failing to produce plan.json must not sink the
+            # whole synthesis — record and try the next. If ALL fail we
+            # re-raise the last one (carryover intact) below.
+            logger.warning(
+                "[%s] PLAN best-of-N: variant %d failed (%s) — continuing",
+                work_id, i + 1, exc,
+            )
+            last_failure = exc
+            continue
+
+        plan_data = result.get("_plan_data") or {}
+        score = score_plan(plan_data, spec_body=spec_body, work_id=work_id)
+        n_ok += 1
+
+        # Snapshot this candidate before the next variant overwrites the
+        # canonical plan.json (archive only — best-effort, never blocks).
+        plan_json = result.get("plan_json")
+        if plan_json:
+            try:
+                variants_dir.mkdir(parents=True, exist_ok=True)
+                (variants_dir / f"v{i}_score{score.total:.3f}.json").write_text(
+                    plan_json, encoding="utf-8"
+                )
+            except OSError as exc:
+                logger.debug("[%s] variant snapshot failed: %s", work_id, exc)
+
+        if score.total > best_score:
+            best_score = score.total
+            best = result
+            best_json = plan_json
+
+    if best is None:
+        # Every variant failed the plan.json contract — propagate the last
+        # CriticalContractFailure so the wrapper's structural retry fires
+        # (carryover preserved), exactly as the single-shot path would.
+        if last_failure is not None:
+            raise last_failure
+        raise CriticalContractFailure(
+            phase="plan",
+            reason="best-of-N synthesis produced no usable plan candidate",
+        )
+
+    logger.info(
+        "[%s] PLAN best-of-%d: selected winner score=%.3f "
+        "(%d/%d candidates succeeded)",
+        work_id, variants, best_score, n_ok, variants,
+    )
+
+    # Restore the winner to the canonical path — a later (losing) variant may
+    # have overwritten it, and save_artifacts + the critic read it from disk.
+    if best_json:
+        try:
+            plan_json_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_json_path.write_text(best_json, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "[%s] PLAN best-of-N: could not restore winning plan.json (%s)",
+                work_id, exc,
+            )
+
+    best.pop("_plan_data", None)
+    return best
+
+
+async def _synthesize_plan_once(
+    state: ExplorationSubgraphState,
+    config: RunnableConfig | None = None,
+    *,
+    variant_hint: str = "",
+) -> dict[str, Any]:
+    """Synthesize research findings into a single plan (one candidate).
 
     Tries the decomposed synthesizer first (manager skeleton → per-slice
     workers); on failure falls back to the monolithic ``write_structured_plan``
     agent. Reads ``plan.json`` from disk after, and computes execution waves.
+
+    ``variant_hint`` biases the synthesis toward a particular plan shape
+    (e.g. coarser vs. finer slices) so best-of-N (:func:`_synthesize_plan`)
+    samples a diverse candidate set. Empty hint == the historical prompt.
+    The returned dict carries ``_plan_data`` (the parsed plan) for the
+    selector; the orchestrator strips it before returning to the graph.
     """
     from spine.agents.plan_agent import build_plan_synthesizer
 
@@ -935,6 +1111,12 @@ async def _synthesize_plan(
             "`target_files` (the concrete file paths it creates or "
             "modifies) — never leave that array empty."
         )
+        if variant_hint:
+            # Best-of-N: bias this candidate toward a distinct plan shape so
+            # the selector has genuinely different options to score. Appended
+            # AFTER the stable instruction so it does not disturb the cacheable
+            # prefix of sibling variants that share everything before it.
+            instruction = f"{instruction}\n\n{variant_hint}"
 
         # ── Inline the specification (trace 019eb52c) ────────────────────
         # The synthesizer used to be told to fetch the spec via
@@ -1248,6 +1430,9 @@ async def _synthesize_plan(
             "plan_json": plan_json_str,
             "execution_waves": execution_waves,
             "read_cache": result.get("read_cache") or {},
+            # Internal: consumed by the best-of-N selector, stripped before
+            # the dict reaches the graph state.
+            "_plan_data": plan_data,
         }
 
     except CriticalContractFailure:

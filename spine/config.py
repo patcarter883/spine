@@ -307,6 +307,27 @@ class SpineConfig:
     research_lean_categories: list[str] = field(
         default_factory=lambda: ["Frontend/UI"]
     )
+    # ── Best-of-N plan synthesis (Graph-of-Thoughts Score + KeepBest) ──────
+    # Number of candidate plans the PLAN synthesizer generates, scores
+    # (spine.workflow.plan_score), and selects the best of before handing one
+    # to the critic. ``1`` (default) is the historical single-shot behaviour
+    # with zero added cost. ``>1`` front-loads convergence that the critic
+    # loop otherwise grinds out one rework cycle at a time. Variants run
+    # SEQUENTIALLY (local providers cap max_concurrent_calls at 1-2, so
+    # parallel synthesis buys no wall-clock and would collide on plan.json).
+    research_synth_variants: int = 1
+    # Scorer for KeepBest. ``"structural"`` = deterministic, LLM-free (the
+    # default — cheap, reproducible). ``"hybrid"`` adds an LLM-judge tiebreak
+    # among the top structural candidates (not yet wired; reserved).
+    research_synth_scorer: str = "structural"
+    # ── Findings aggregation (Graph-of-Thoughts Aggregate) ─────────────────
+    # When true, an LLM merge pass dedups/reconciles/ranks accumulated
+    # findings into a tighter evidence set just before synthesis, instead of
+    # feeding the raw append-only list straight to the synthesizer. Reduces
+    # synthesizer context (mitigates the read-spiral / context-blowup aborts).
+    # Only fires when there are at least ``research_aggregate_min_findings``.
+    research_aggregate_merge: bool = False
+    research_aggregate_min_findings: int = 8
     # Completion-token cap for the no-tool plan_do (run_plan_node)
     # SubagentDirective calls (e.g. plan_slice_implementer). A directive is
     # a few hundred tokens; without a cap the call inherits the provider's
@@ -702,6 +723,16 @@ class SpineConfig:
             ),
             research_lean_categories=list(
                 spine.get("research_lean_categories", ["Frontend/UI"])
+            ),
+            research_synth_variants=int(spine.get("research_synth_variants", 1)),
+            research_synth_scorer=str(
+                spine.get("research_synth_scorer", "structural")
+            ),
+            research_aggregate_merge=bool(
+                spine.get("research_aggregate_merge", False)
+            ),
+            research_aggregate_min_findings=int(
+                spine.get("research_aggregate_min_findings", 8)
             ),
             specify_context_token_budget=int(
                 spine.get("specify_context_token_budget", 30000)
