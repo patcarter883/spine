@@ -181,13 +181,13 @@ providers:
     specify/subagents/researcher:
       provider: local-glm
     specify/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: laguna
     plan:
       provider: local-glm
     plan/subagents/researcher:
       provider: local-glm
     plan/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: laguna
     critic:
       provider: local-glm
     critic/specify:
@@ -210,13 +210,13 @@ providers:
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
     implement:
-      provider: laguna
+      provider: local-mellum
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
       provider: local-mellum
     implement/subagents/slice-implementer:
-      provider: laguna
+      provider: local-mellum
     verify:
       provider: local-mellum
     verify/subagents/slice-verifier:
