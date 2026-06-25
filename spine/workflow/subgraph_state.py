@@ -156,6 +156,12 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
     completed_slices: Annotated[list[dict], _slice_list_reducer]
     failed_slices: Annotated[list[dict], _slice_list_reducer]
 
+    # Monotonic count of implementer/decomposer node executions. Summed across
+    # parallel Send branches (operator.add) so ``_route_slices`` can enforce a
+    # hard dispatch ceiling and abort a decompose/same-file runaway instead of
+    # fanning out hundreds of Sends (trace 019efd92: 687 executions / 1.33M tok).
+    slice_dispatch_count: Annotated[int, _op_add]
+
     # ── Phase Completion Invariants ──
     # OR-reduced: parallel slice-implementer Send branches each write True in
     # the same super-step, which a plain bool channel rejects (trace 019e784c).

@@ -38,9 +38,13 @@ class TestRouteSlices:
         assert isinstance(result, list)
         assert len(result) == 2
         assert all(isinstance(s, Send) for s in result)
-        # Each pending slice is dispatched to the plan-before-do branch
-        # head; plan_slice_implementer chains into slice_implementer.
-        assert all(s.node == "plan_slice_implementer" for s in result)
+        # Each pending slice is dispatched to the editor head — either the
+        # tool path (plan_slice_implementer) or the synthesis editor, depending
+        # on the implement_synthesis_placement flag in the ambient config.
+        assert all(
+            s.node in ("plan_slice_implementer", "synthesis_implementer")
+            for s in result
+        )
         ids = [s.arg["active_slice"]["id"] for s in result]
         assert ids == ["a", "b"]
 
@@ -69,7 +73,12 @@ class TestRouteSlices:
         by_node: dict[str, list[str]] = {}
         for s in result:
             by_node.setdefault(s.node, []).append(s.arg["active_slice"]["id"])
-        assert by_node["plan_slice_implementer"] == ["p1"]
+        # Pending → editor head (tool or synthesis, per the flag); failed →
+        # fallback_decomposer.
+        editor_node = next(
+            n for n in by_node if n in ("plan_slice_implementer", "synthesis_implementer")
+        )
+        assert by_node[editor_node] == ["p1"]
         assert sorted(by_node["fallback_decomposer"]) == ["f1", "f2"]
 
     def test_send_payload_carries_base_context(self):

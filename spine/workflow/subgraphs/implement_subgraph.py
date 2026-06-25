@@ -119,40 +119,122 @@ def _base_send_payload(state: ImplementSubgraphState) -> dict[str, Any]:
     }
 
 
+def _slice_marker_ids(slices: list[dict]) -> set[str]:
+    """All ids a slice is known by — its own id/slice_name plus its parent's.
+
+    Sub-slices produced by ``split_slices`` / ``fallback_decomposer`` carry a
+    synthetic ``id`` but reference the originating plan slice via
+    ``_parent_slice_id``. A dependency named after the parent is satisfied once
+    the parent's sub-slices land, so dependency matching considers all three
+    keys.
+    """
+    ids: set[str] = set()
+    for s in slices:
+        for k in ("id", "slice_name", "_parent_slice_id"):
+            v = s.get(k)
+            if v:
+                ids.add(v)
+    return ids
+
+
+def _ready_slices(pending: list[dict], completed: list[dict]) -> list[dict]:
+    """Pending slices whose declared ``dependencies`` have all completed.
+
+    Enforces the plan's dependency DAG at dispatch — it is otherwise discarded
+    by the flat ``pending_slices`` seed in ``compose._implement_state_mapper``,
+    which lets every slice (including ones editing the SAME file) fan out
+    concurrently and race (the 019efd92 dispatch explosion: 3 slices all editing
+    config_view.py → ~687 executions / 1.33M tokens). A slice is ready only when
+    every id in its ``dependencies`` is present in ``completed_slices`` AND no
+    longer anywhere in ``pending`` — so a dependency that was split into a
+    sub-slice chain counts as done only after its LAST file lands, not its first.
+    A blocked slice lands in ``completed_slices`` too, so a dead dependency
+    unblocks its dependents rather than deadlocking the loop.
+    """
+    done = _slice_marker_ids(completed)
+    in_pending = _slice_marker_ids(pending)
+    ready: list[dict] = []
+    for sl in pending:
+        deps = [d for d in (sl.get("dependencies") or []) if d]
+        if all(d in done and d not in in_pending for d in deps):
+            ready.append(sl)
+    return ready
+
+
 def _route_slices(
     state: ImplementSubgraphState,
 ) -> list[Send] | Literal["synthesize_implementation"]:
     """Conditional edge from START / slice_implementer / fallback_decomposer.
 
-    Fans out one Send per pending slice (to ``slice_implementer``) and
-    one Send per failed slice (to ``fallback_decomposer``). When both
-    lists are empty, routes to synthesis.
+    Fans out one Send per *dependency-ready* pending slice (to the editor) and
+    one Send per failed slice (to ``fallback_decomposer``). Dispatch respects
+    the plan DAG (see :func:`_ready_slices`) so dependent slices — and slices
+    sharing a target file — are serialized instead of racing. When pending and
+    failed are both empty, or a hard dispatch ceiling is hit, routes to synthesis.
     """
     pending = state.get("pending_slices", []) or []
     failed = state.get("failed_slices", []) or []
+    work_id = state.get("work_id", "?")
 
     if not pending and not failed:
         logger.info(
             "[%s] IMPLEMENT route: pending=0 failed=0 — routing to synthesis",
-            state.get("work_id", "?"),
+            work_id,
+        )
+        return "synthesize_implementation"
+
+    # ── Backstop (C): bound total slice executions ──────────────────────
+    # Every implementer/decomposer execution increments ``slice_dispatch_count``.
+    # If a runaway slips past the DAG gating (e.g. a same-file race the gating
+    # can't serialize because two slices are genuinely independent), abort the
+    # loop to synthesis instead of dispatching hundreds of Sends and burning
+    # the token budget (trace 019efd92).
+    try:
+        from spine.config import SpineConfig
+
+        cfg = SpineConfig.load()
+        cap = int(cfg.implement_max_slice_dispatches)
+    except Exception:  # noqa: BLE001
+        cfg, cap = None, 100
+    dispatched = int(state.get("slice_dispatch_count", 0) or 0)
+    if cap > 0 and dispatched >= cap:
+        logger.error(
+            "[%s] IMPLEMENT route: dispatch ceiling hit (%d>=%d) — aborting to "
+            "synthesis with pending=%d failed=%d. Likely a decompose / same-file "
+            "runaway; remaining slices surface as incomplete.",
+            work_id, dispatched, cap, len(pending), len(failed),
         )
         return "synthesize_implementation"
 
     base = _base_send_payload(state)
     sends: list[Send] = []
+
+    # ── Dependency gating (A): only dispatch slices whose deps are done ──
+    ready = _ready_slices(pending, state.get("completed_slices", []) or [])
+    if pending and not ready and not failed:
+        # No pending slice is dependency-ready and nothing is decomposing — a
+        # dangling or circular dependency the plan critic missed. Dispatch all
+        # rather than stall the loop forever; they may fail, but the phase
+        # terminates and reports.
+        logger.warning(
+            "[%s] IMPLEMENT route: %d pending slice(s), none dependency-ready, no "
+            "failed slices — dispatching all to avoid deadlock (dangling/cyclic dep?).",
+            work_id, len(pending),
+        )
+        ready = pending
+
     # Flag-gate the editor architecture. The synthesis path is a single no-tool
     # node (synthesize → place), so it skips the plan_slice_implementer
     # "plan approach" pre-step the tool path uses; the tool path keeps the
     # two-step split that helps smaller models stop fixating on the slice JSON.
     pending_target = "plan_slice_implementer"
     try:
-        from spine.config import SpineConfig
-
-        if SpineConfig.load().implement_synthesis_placement:
+        if (cfg or SpineConfig.load()).implement_synthesis_placement:
             pending_target = "synthesis_implementer"
     except Exception:  # noqa: BLE001 — config issues fall back to the tool path
         pass
-    for sl in pending:
+
+    for sl in ready:
         sends.append(Send(pending_target, {**base, "active_slice": sl}))
     for sl in failed:
         # The decomposer is already a no-tool structured-output call, so it
@@ -160,11 +242,9 @@ def _route_slices(
         sends.append(Send("fallback_decomposer", {**base, "active_slice": sl}))
 
     logger.info(
-        "[%s] IMPLEMENT route: pending=%d failed=%d — dispatching %d Send(s)",
-        state.get("work_id", "?"),
-        len(pending),
-        len(failed),
-        len(sends),
+        "[%s] IMPLEMENT route: pending=%d ready=%d failed=%d dispatched_total=%d "
+        "— %d Send(s)",
+        work_id, len(pending), len(ready), len(failed), dispatched, len(sends),
     )
     return sends
 
@@ -854,7 +934,8 @@ async def _slice_implementer_node(
             "issues": [str(e)],
         }
 
-    return _slice_result_to_update(active_slice, slice_result)
+    # Tick the dispatch counter so _route_slices can enforce its ceiling.
+    return {**_slice_result_to_update(active_slice, slice_result), "slice_dispatch_count": 1}
 
 
 def _slice_result_to_update(
@@ -1149,7 +1230,8 @@ async def _synthesis_implementer_node(
             "issues": [str(e)],
         }
 
-    return _slice_result_to_update(active_slice, slice_result)
+    # Tick the dispatch counter so _route_slices can enforce its ceiling.
+    return {**_slice_result_to_update(active_slice, slice_result), "slice_dispatch_count": 1}
 
 
 # ── fallback_decomposer node ────────────────────────────────────────────

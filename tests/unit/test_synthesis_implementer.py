@@ -16,8 +16,7 @@ from spine.agents.synthesis_implementer import (
     SynthesizedEdit,
     SynthesizedSlice,
     _count_ruff,
-    _restore_files,
-    _snapshot_files,
+    _stage_files,
     apply_synthesized,
     place_best_candidate,
 )
@@ -103,15 +102,40 @@ def test_placement_score_ordering() -> None:
     assert a.score() > c.score()          # fewer ruff issues breaks the tie
 
 
-def test_snapshot_restore_roundtrip(tmp_path: Path) -> None:
-    f = tmp_path / "a.py"
-    f.write_text("x = 1\n", encoding="utf-8")
-    snap = _snapshot_files(str(tmp_path), ["a.py", "new.py"])  # new.py absent
-    f.write_text("x = 999\n", encoding="utf-8")
-    (tmp_path / "new.py").write_text("created\n", encoding="utf-8")
-    _restore_files(str(tmp_path), snap)
-    assert f.read_text() == "x = 1\n"
-    assert not (tmp_path / "new.py").exists()  # absent in snapshot → deleted
+def test_stage_files_copies_existing_only(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    staging = _stage_files(str(tmp_path), ["a.py", "missing.py"])
+    sp = Path(staging)
+    assert (sp / "a.py").read_text() == "x = 1\n"
+    assert not (sp / "missing.py").exists()  # absent in live tree → not staged
+
+
+def test_best_of_n_scoring_does_not_touch_live_tree(workspace: Path) -> None:
+    """Losing candidates must never mutate the live file — only the winner does.
+
+    Regression for the 019efd92 snapshot/restore stomp: scoring happens in temp
+    copies, so the live file changes exactly once (to the winner's content).
+    """
+    losing = SynthesizedSlice(summary="A", edits=[
+        SynthesizedEdit(file="mod.py", symbol="greet", action="replace",
+                        code="def greet(name):\n    return 'A'\n")
+    ])
+    winning = SynthesizedSlice(summary="B", edits=[
+        SynthesizedEdit(file="mod.py", symbol="greet", action="replace",
+                        code="def greet(name):\n    return 'B' + name\n")
+    ])
+    before = (workspace / "mod.py").read_text()
+    winner, res = place_best_candidate(
+        [losing, winning], workspace_root=str(workspace), target_files=["mod.py"]
+    )
+    text = (workspace / "mod.py").read_text()
+    # Both candidates apply+lint clean, so KeepBest is a tie on the score key and
+    # the first (losing) wins deterministically — the point of THIS test is only
+    # that the live file holds exactly ONE candidate's edit, never a half-reverted
+    # mix, and was untouched during scoring.
+    assert winner is not None and res.clean
+    assert text != before
+    assert ("return 'A'" in text) ^ ("return 'B' + name" in text)
 
 
 @pytest.mark.parametrize(

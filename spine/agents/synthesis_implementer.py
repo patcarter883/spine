@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -339,32 +341,26 @@ def _count_ruff(ruff: Any) -> int:
     return 0
 
 
-def _snapshot_files(workspace_root: str, files: list[str]) -> dict[str, bytes | None]:
-    """Capture current bytes of each file (``None`` when it does not yet exist)."""
-    snap: dict[str, bytes | None] = {}
-    root = Path(workspace_root)
+def _stage_files(workspace_root: str, files: list[str]) -> str:
+    """Copy *files* into a fresh temp dir at their relative paths; return its root.
+
+    Only files that exist in the live tree are copied — a candidate that creates
+    a new file just creates it inside the staging dir. The caller owns cleanup.
+    """
+    src_root = Path(workspace_root)
+    staging = tempfile.mkdtemp(prefix="spine-place-")
+    dst_root = Path(staging)
     for f in files:
-        p = root / f
+        src = src_root / f
+        if not src.is_file():
+            continue
+        dst = dst_root / f
+        dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            snap[f] = p.read_bytes() if p.exists() else None
-        except OSError:
-            snap[f] = None
-    return snap
-
-
-def _restore_files(workspace_root: str, snapshot: dict[str, bytes | None]) -> None:
-    """Restore files to a prior snapshot — deleting any that did not exist then."""
-    root = Path(workspace_root)
-    for f, data in snapshot.items():
-        p = root / f
-        try:
-            if data is None:
-                if p.exists():
-                    p.unlink()
-            else:
-                p.write_bytes(data)
+            shutil.copy2(src, dst)
         except OSError as exc:  # noqa: BLE001
-            logger.warning("could not restore %s: %s", f, exc)
+            logger.warning("could not stage %s for scoring: %s", f, exc)
+    return staging
 
 
 def place_best_candidate(
@@ -376,11 +372,14 @@ def place_best_candidate(
 ) -> tuple[SynthesizedSlice | None, PlacementResult]:
     """Score + KeepBest over synthesized candidates, with the linter as scorer.
 
-    Each candidate is applied against the *pristine* target files (snapshot →
-    apply → score → restore) so candidates are judged independently, never
-    compounding one another's edits. The highest-scoring candidate is then
-    re-applied and left on disk as the slice's real result. ``n == 1`` skips the
-    snapshot/restore dance and just applies the single candidate.
+    Scoring is done in throwaway temp COPIES of the touched files — never on the
+    live tree — so concurrent sibling slices editing the same file cannot revert
+    one another's committed edits (the 019efd92 best-of-N snapshot/restore stomp
+    that turned a same-file race into a non-terminating rework loop). Each
+    candidate gets a pristine staging copy, is applied + linted there, and scored;
+    only the winner is then applied ONCE to the live ``workspace_root``. ``n == 1``
+    skips staging entirely and applies the single candidate directly (one write,
+    no revert).
 
     Returns ``(winner, placement)`` — ``(None, empty)`` when there are no
     candidates to place.
@@ -398,38 +397,36 @@ def place_best_candidate(
             reference_only_files=reference_only_files,
         )
 
-    # Files any candidate touches — the snapshot/restore set.
-    touched: list[str] = sorted(
-        {e.file for c in real for e in c.edits if e.file}
-    )
-    snapshot = _snapshot_files(workspace_root, touched)
-
     best: SynthesizedSlice | None = None
-    best_result = PlacementResult()
     best_key: tuple[int, int, int] | None = None
     for i, cand in enumerate(real):
-        _restore_files(workspace_root, snapshot)  # pristine for every candidate
-        res = apply_synthesized(
-            cand,
-            workspace_root=workspace_root,
-            target_files=target_files,
-            reference_only_files=reference_only_files,
-        )
+        files = sorted({e.file for e in cand.edits if e.file})
+        staging = _stage_files(workspace_root, files)
+        try:
+            res = apply_synthesized(
+                cand,
+                workspace_root=staging,
+                target_files=target_files,
+                reference_only_files=reference_only_files,
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
         key = res.score()
         logger.info(
             "synthesis best-of-%d: candidate %d/%d applied=%d failed=%d ruff=%d",
             len(real), i + 1, len(real), res.n_applied, res.n_failures, res.ruff_issues,
         )
         if best_key is None or key > best_key:
-            best_key, best, best_result = key, cand, res
+            best_key, best = key, cand
 
-    # Restore pristine, then re-apply the winner so disk holds exactly its edits.
-    _restore_files(workspace_root, snapshot)
-    if best is not None:
-        best_result = apply_synthesized(
-            best,
-            workspace_root=workspace_root,
-            target_files=target_files,
-            reference_only_files=reference_only_files,
-        )
-    return best, best_result
+    assert best is not None  # len(real) >= 2 → the loop set a winner
+
+    # Apply the winner ONCE to the live tree — the only mutation of the real
+    # workspace, and the authoritative placement we report.
+    placement = apply_synthesized(
+        best,
+        workspace_root=workspace_root,
+        target_files=target_files,
+        reference_only_files=reference_only_files,
+    )
+    return best, placement

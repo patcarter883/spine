@@ -420,6 +420,14 @@ class SpineConfig:
     # each by how cleanly its edits apply + lint and keeps the best. 1 = single
     # candidate (no extra cost). Only meaningful with implement_synthesis_placement.
     implement_synthesis_variants: int = 1
+    # Hard ceiling on total slice-implementer executions in one IMPLEMENT run, a
+    # backstop against the dispatch runaway in trace 019efd92 (3 same-file slices
+    # raced to ~687 executions / 1.33M tokens). Each implementer execution ticks
+    # ``slice_dispatch_count``; when it reaches this cap ``_route_slices`` aborts
+    # the dispatch loop to synthesis and surfaces remaining slices as incomplete.
+    # 100 comfortably clears a sane plan (slices + per-file splits + bounded
+    # decompose) while catching a runaway early. 0 disables the backstop.
+    implement_max_slice_dispatches: int = 100
     # Hard super-step ceiling for phase subgraphs (LangGraph recursion_limit).
     # LangGraph's default is 25 but SPINE raises it implicitly via fan-out; the
     # IMPLEMENT dispatch loop re-dispatches one Send per pending/failed slice and
@@ -834,6 +842,12 @@ class SpineConfig:
             ),
             implement_synthesis_variants=int(
                 spine.get("implement_synthesis_variants", 1)
+            ),
+            implement_max_slice_dispatches=int(
+                os.getenv(
+                    "SPINE_IMPLEMENT_MAX_SLICE_DISPATCHES",
+                    spine.get("implement_max_slice_dispatches", 100),
+                )
             ),
             subgraph_recursion_limit=int(
                 os.getenv(
