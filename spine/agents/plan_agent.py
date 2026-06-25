@@ -125,6 +125,7 @@ def build_plan_synthesizer(
 
     from spine.agents.synthesis_budget import synthesis_completion_cap
     from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
+    from spine.config import SpineConfig
 
     return build_phase_agent(
         state=state,
@@ -139,7 +140,10 @@ def build_plan_synthesizer(
         completion_token_cap=(
             completion_cap_override
             if completion_cap_override and completion_cap_override > 0
-            else synthesis_completion_cap(PhaseName.PLAN.value)
+            else synthesis_completion_cap(
+                PhaseName.PLAN.value,
+                phase_cap=SpineConfig.load().plan_synthesize_max_completion_tokens,
+            )
         ),
         # Forcing with a single-tool surface: the model cannot end a turn
         # in prose/reasoning (trace 019eb412) and cannot stall on a read

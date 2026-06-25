@@ -446,6 +446,18 @@ class SpineConfig:
     # 8K (not 4K) leaves headroom for reasoning-channel tokens on thinking
     # models. Per-phase ``max_completion_tokens`` overrides still win.
     synthesize_max_completion_tokens: int = 8000
+    # PLAN-specific override of the synth completion clamp (passed as the
+    # ``phase_cap`` to synthesis_completion_cap, exactly as IMPLEMENT passes
+    # implement_max_completion_tokens). The plan JSON has grown well past the
+    # 2-4K the shared 8K cap assumed: every slice now carries target_files,
+    # reference_symbols and an edit_plan with full-signature intents, so a
+    # larger plan truncated the forced write_structured_plan tool call mid-
+    # arguments at exactly 8K and an identical retry truncated identically
+    # (trace 019eb940). GLM-4.7-Flash plans on a 60K window, so 16K leaves
+    # ample prompt room; the length-escalation retry (escalated_completion_cap)
+    # still doubles from here if a plan legitimately needs more. SPECIFY keeps
+    # the tighter shared cap. 0 falls back to synthesize_max_completion_tokens.
+    plan_synthesize_max_completion_tokens: int = 16384
     # Safety margin subtracted from the window when computing the synth
     # input budget — covers tool schemas, chat-template framing, and
     # tiktoken-vs-model-tokenizer drift (cl100k underestimates Qwen ~10%).
@@ -762,6 +774,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_SYNTHESIZE_MAX_COMPLETION_TOKENS",
                     spine.get("synthesize_max_completion_tokens", 8000),
+                )
+            ),
+            plan_synthesize_max_completion_tokens=int(
+                os.getenv(
+                    "SPINE_PLAN_SYNTHESIZE_MAX_COMPLETION_TOKENS",
+                    spine.get("plan_synthesize_max_completion_tokens", 16384),
                 )
             ),
             synthesize_overhead_tokens=int(
