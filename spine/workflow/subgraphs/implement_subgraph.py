@@ -140,11 +140,20 @@ def _route_slices(
 
     base = _base_send_payload(state)
     sends: list[Send] = []
+    # Flag-gate the editor architecture. The synthesis path is a single no-tool
+    # node (synthesize → place), so it skips the plan_slice_implementer
+    # "plan approach" pre-step the tool path uses; the tool path keeps the
+    # two-step split that helps smaller models stop fixating on the slice JSON.
+    pending_target = "plan_slice_implementer"
+    try:
+        from spine.config import SpineConfig
+
+        if SpineConfig.load().implement_synthesis_placement:
+            pending_target = "synthesis_implementer"
+    except Exception:  # noqa: BLE001 — config issues fall back to the tool path
+        pass
     for sl in pending:
-        # Each parallel slice goes through plan_slice_implementer → slice_implementer
-        # so the model splits "plan approach" from "execute with tools" — a
-        # mitigation for smaller models that fixate on the slice JSON.
-        sends.append(Send("plan_slice_implementer", {**base, "active_slice": sl}))
+        sends.append(Send(pending_target, {**base, "active_slice": sl}))
     for sl in failed:
         # The decomposer is already a no-tool structured-output call, so it
         # doesn't get a plan-before-do step.
@@ -845,6 +854,21 @@ async def _slice_implementer_node(
             "issues": [str(e)],
         }
 
+    return _slice_result_to_update(active_slice, slice_result)
+
+
+def _slice_result_to_update(
+    active_slice: dict, slice_result: dict
+) -> dict[str, Any]:
+    """Map a SliceResult onto the dispatch-loop state update.
+
+    Shared by the tool-using ``_slice_implementer_node`` and the
+    ``_synthesis_implementer_node`` so both honour the same
+    pending→completed/failed contract and the same ``_sibling_queue`` promotion
+    (one parent file lands, the next is re-queued) — a divergence here would let
+    one editor strand sub-slices the other handles.
+    """
+    slice_id = active_slice.get("id", "unknown")
     # The remaining single-file sub-slices of this parent (empty for an
     # ordinary slice). Promoted one at a time so a parent's files land
     # sequentially while other parents proceed in parallel.
@@ -967,6 +991,165 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
         "test_results": "(no output from subagent)",
         "issues": ["Subagent produced no output"],
     }
+
+
+# ── synthesis_implementer node (no tools: synthesize → place) ───────────
+
+
+def _placement_feedback(placement: Any) -> str:
+    """Render placement failures as compact feedback for the synthesis retry."""
+    lines = []
+    for f in placement.failures:
+        loc = f.get("file", "?")
+        sym = f.get("symbol", "")
+        if sym:
+            loc += f" `{sym}`"
+        detail = (f.get("detail", "") or "").strip().replace("\n", " ")
+        lines.append(f"- {loc} ({f.get('status', 'error')}): {detail[:300]}")
+    return "\n".join(lines)
+
+
+def _placement_to_slice_result(
+    slice_id: str, placement: Any, summary: str = ""
+) -> dict:
+    """Convert a PlacementResult into the SliceResult dict the contract expects.
+
+    ``implemented`` when every edit placed, ``partial`` when some did and some
+    failed, ``blocked`` when nothing placed. Files touched come from the applied
+    edits; failures become ``issues`` so synthesis (and any fallback decompose)
+    can see exactly what the linter rejected.
+    """
+    n_ok = placement.n_applied
+    n_fail = placement.n_failures
+    if n_ok and not n_fail:
+        status = "implemented"
+    elif n_ok and n_fail:
+        status = "partial"
+    else:
+        status = "blocked"
+    files = sorted({a.get("file") for a in placement.applied if a.get("file")})
+    issues = [
+        f"{f.get('file', '?')} {f.get('symbol', '')} — {f.get('status', 'error')}: "
+        f"{(f.get('detail', '') or '')[:300]}"
+        for f in placement.failures
+    ]
+    return {
+        "slice_name": slice_id,
+        "status": status,
+        "files_modified": files,
+        "files_created": [],
+        "test_results": summary or f"synthesis placed {n_ok} edit(s), {n_fail} failed",
+        "issues": issues,
+    }
+
+
+async def _synthesis_implementer_node(
+    state: ImplementSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Synthesis + placement editor — the no-tool IMPLEMENT path (flag-gated).
+
+    Replaces the tool-using ``_slice_implementer_node`` when
+    ``implement_synthesis_placement`` is set. A structured-output call with no
+    filesystem tools synthesizes complete, symbol-anchored edits from the
+    inlined source already in the prompt; placement applies them deterministically
+    through ``ReadEditLintTool`` (lint is the oracle). The editor cannot read, so
+    it cannot survey-spiral. Synthesis is side-effect-free, so
+    ``implement_synthesis_variants > 1`` samples N candidates and keeps the one
+    that applies + lints cleanest (Score + KeepBest). Honours the same
+    pending→completed/failed contract and ``_sibling_queue`` promotion as the
+    tool path via ``_slice_result_to_update``.
+    """
+    from spine.agents.synthesis_implementer import (
+        place_best_candidate,
+        synthesize_slice_code,
+    )
+    from spine.config import SpineConfig
+
+    work_id = state.get("work_id", "unknown")
+    active_slice: dict = state.get("active_slice") or {}
+    slice_id = active_slice.get("id", "unknown")
+    title = active_slice.get("title", "")
+
+    logger.info(
+        "[%s] synthesis_implementer: slice=%r title=%r", work_id, slice_id, title
+    )
+
+    try:
+        cfg = SpineConfig.load()
+        variants = max(1, int(cfg.implement_synthesis_variants))
+
+        # Same grounding as the tool path: drop phantom anchors, then inline the
+        # current source of every target + reference symbol so synthesis rewrites
+        # from what is in front of it (never surveys to rediscover it).
+        active_slice = _scrub_phantom_refs(active_slice, work_id)
+        db_path, workspace_root = _index_ctx(state)
+        public_slice = {
+            k: active_slice.get(k)
+            for k in ("id", "title", "description", "target_files", "acceptance_criteria")
+            if active_slice.get(k) not in (None, "", [], {})
+        }
+        slice_json = json.dumps(public_slice, indent=2, ensure_ascii=False, default=str)
+        refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
+        plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
+        target_files = [f for f in (active_slice.get("target_files") or []) if f]
+
+        candidates = await synthesize_slice_code(
+            slice_json=slice_json,
+            refs_body=refs_body,
+            plan_body=plan_body,
+            config=config,
+            session_id=work_id,
+            n=variants,
+        )
+        winner, placement = place_best_candidate(
+            candidates, workspace_root=workspace_root, target_files=target_files
+        )
+
+        # One corrective retry: feed the exact lint failures back to synthesis so
+        # it repairs them, then re-place. Keep whichever attempt placed cleaner.
+        if placement.n_failures:
+            retry = await synthesize_slice_code(
+                slice_json=slice_json,
+                refs_body=refs_body,
+                plan_body=plan_body,
+                config=config,
+                session_id=work_id,
+                n=1,
+                feedback=_placement_feedback(placement),
+            )
+            if retry:
+                winner2, placement2 = place_best_candidate(
+                    retry, workspace_root=workspace_root, target_files=target_files
+                )
+                if placement2.score() > placement.score():
+                    winner, placement = winner2, placement2
+
+        summary = getattr(winner, "summary", "") if winner else ""
+        slice_result = _placement_to_slice_result(slice_id, placement, summary)
+        logger.info(
+            "[%s] synthesis_implementer: slice=%r status=%s applied=%d failed=%d",
+            work_id, slice_id, slice_result["status"],
+            placement.n_applied, placement.n_failures,
+        )
+
+    except _ABORT_EXCEPTIONS:
+        raise
+    except Exception as e:
+        logger.error(
+            "[%s] synthesis_implementer failed for %r: %s",
+            work_id, slice_id, e, exc_info=True,
+        )
+        slice_result = {
+            "slice_name": slice_id,
+            "status": "blocked",
+            "files_modified": [],
+            "files_created": [],
+            "test_results": f"Synthesis error: {e}",
+            "issues": [str(e)],
+        }
+
+    return _slice_result_to_update(active_slice, slice_result)
 
 
 # ── fallback_decomposer node ────────────────────────────────────────────
@@ -1313,6 +1496,7 @@ async def _save_implement_artifacts(
 _ROUTE_MAP = {
     "plan_slice_implementer": "plan_slice_implementer",
     "slice_implementer": "slice_implementer",
+    "synthesis_implementer": "synthesis_implementer",
     "fallback_decomposer": "fallback_decomposer",
     "synthesize_implementation": "synthesize_implementation",
 }
@@ -1340,6 +1524,7 @@ def build_implement_subgraph() -> Any:
     builder.add_node("split_slices", _split_slices_node)
     builder.add_node("plan_slice_implementer", _plan_slice_implementer_node)
     builder.add_node("slice_implementer", _slice_implementer_node)
+    builder.add_node("synthesis_implementer", _synthesis_implementer_node)
     builder.add_node("fallback_decomposer", _fallback_decomposer_node)
     builder.add_node("synthesize_implementation", _synthesize_implementation_node)
     builder.add_node("save_artifacts", _save_implement_artifacts)
@@ -1355,6 +1540,9 @@ def build_implement_subgraph() -> Any:
     # LastValue channel. slice_implementer's outgoing conditional edge
     # re-enters the router so the dispatch loop terminates correctly.
     builder.add_conditional_edges("slice_implementer", _route_slices, _ROUTE_MAP)
+    # The flag-gated synthesis editor re-enters the router exactly like the tool
+    # path, so the dispatch loop terminates the same way.
+    builder.add_conditional_edges("synthesis_implementer", _route_slices, _ROUTE_MAP)
     builder.add_conditional_edges("fallback_decomposer", _route_slices, _ROUTE_MAP)
     builder.add_edge("synthesize_implementation", "save_artifacts")
     builder.add_edge("save_artifacts", END)

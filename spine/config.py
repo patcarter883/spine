@@ -405,6 +405,21 @@ class SpineConfig:
     # The guard only nudges — tools stay bound — so legitimate long slices can
     # still finish; 0 disables it.
     implement_max_turns: int = 30
+    # ── Synthesis + placement editor (two pure nodes, no tool loop) ────────
+    # When True, ``_route_slices`` sends each pending slice to the synthesis
+    # implementer (spine.agents.synthesis_implementer) instead of the tool-using
+    # slice_implementer: a no-tool structured call synthesizes complete
+    # symbol-anchored edits, then placement applies them deterministically
+    # through ReadEditLintTool (lint is the oracle). The editor cannot read, so
+    # it cannot survey-spiral (Laguna 79 calls / 0 edits; Qwen3-Coder empty diff).
+    # Default off — opt-in until benched against the tool-using path.
+    implement_synthesis_placement: bool = False
+    # Best-of-N for synthesis (Graph-of-Thoughts Score + KeepBest, the
+    # IMPLEMENT-side mirror of research_synth_variants / plan_score). Synthesis
+    # is side-effect-free, so sampling N candidates is cheap; placement scores
+    # each by how cleanly its edits apply + lint and keeps the best. 1 = single
+    # candidate (no extra cost). Only meaningful with implement_synthesis_placement.
+    implement_synthesis_variants: int = 1
     # Hard super-step ceiling for phase subgraphs (LangGraph recursion_limit).
     # LangGraph's default is 25 but SPINE raises it implicitly via fan-out; the
     # IMPLEMENT dispatch loop re-dispatches one Send per pending/failed slice and
@@ -795,6 +810,12 @@ class SpineConfig:
                     "SPINE_IMPLEMENT_MAX_TURNS",
                     spine.get("implement_max_turns", 30),
                 )
+            ),
+            implement_synthesis_placement=bool(
+                spine.get("implement_synthesis_placement", False)
+            ),
+            implement_synthesis_variants=int(
+                spine.get("implement_synthesis_variants", 1)
             ),
             subgraph_recursion_limit=int(
                 os.getenv(
