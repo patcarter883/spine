@@ -49,8 +49,12 @@ logger = logging.getLogger(__name__)
 # Per-call completion caps. The skeleton is small (stubs only); each slice
 # detail is a paragraph + a few criteria. Keep them tight so a local model can't
 # burn the global 30K window on one call (LengthFinishReasonError).
-_MANAGER_MAX_COMPLETION_TOKENS = 4096
-_SLICE_MAX_COMPLETION_TOKENS = 2048
+# Raised (4096->8192 / 2048->8192): a GLM reasoning model on the plan-synthesis
+# lane ignores the suppress_reasoning flags (like Gemma-4-26B QAT) and reasons
+# past the tighter caps, raising LengthFinishReasonError -> monolithic fallback
+# (trace 019efca3). Give it headroom; instruct models still finish well under it.
+_MANAGER_MAX_COMPLETION_TOKENS = 8192
+_SLICE_MAX_COMPLETION_TOKENS = 8192
 _MAX_SLICES = 12
 _RESEARCH_CHARS = 8000
 
