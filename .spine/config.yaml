@@ -101,6 +101,21 @@ providers:
     stream_usage: true
     max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
+  - name: local-qwen-coder
+    type: deepagents-model
+    model: openai:Qwen3-Coder-30B-A3B-Instruct-GGUF
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
+    context_window: 60000
+    # Anti-loop sampling (matches the local code models for fair comparison).
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    repeat_penalty: 1.05
   - name: local-mellum
     type: deepagents-model
     model: openai:Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M-Q4_K_M
