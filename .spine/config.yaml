@@ -14,6 +14,25 @@ spine:
   recall_k: 10
   topic_lookup_top_k: 5
   index_tests: false
+  # ── Last round of work: all features enabled ──────────────────────────
+  # No-tool IMPLEMENT editor: synthesize complete edits, place them
+  # deterministically via ReadEditLintTool (lint = oracle). Routes pending
+  # slices to synthesis_implementer instead of the tool-using slice_implementer.
+  # variants=3: synthesize 3 candidates, keep the one that applies+lints cleanest.
+  implement_synthesis_placement: true
+  implement_synthesis_variants: 3
+  # PLAN best-of-N (Graph-of-Thoughts Score+KeepBest): synthesize 3 candidate
+  # plans, score each with the structural scorer (rejects the duplicate-path
+  # explosion / unschedulable plans), keep the best before the critic sees it.
+  research_synth_variants: 3
+  research_synth_scorer: structural
+  # Findings aggregation: consolidate findings before synthesis to shrink the
+  # synthesizer prompt (mitigates read-spiral / context blowup).
+  research_aggregate_merge: true
+  research_aggregate_min_findings: 8
+  # Lifted PLAN-synthesis completion cap (8K->16K) so larger plans don't
+  # truncate the forced write_structured_plan call mid-arguments.
+  plan_synthesize_max_completion_tokens: 16384
   rrf_vector_weight: 0.2
   rrf_bm25_weight: 1.0
   vector_indexing:
