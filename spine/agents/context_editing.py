@@ -591,6 +591,34 @@ def _estimate_message_tokens(messages: list) -> int:
     return total
 
 
+def _estimate_tools_tokens(tools: list | None) -> int:
+    """Approximate the prompt cost of the bound tool SCHEMAS.
+
+    The server counts the function/tool definitions as prompt tokens on every
+    request, but :func:`_estimate_message_tokens` does not — a large schema
+    (e.g. ``read_edit_lint``, a few thousand tokens) then makes the window
+    headroom look bigger than it is, leaving the completion cap too high so a
+    finite-window model 400s with "maximum context length exceeded" (trace
+    019efbf9: Laguna, 60K window). Counting the tools closes that gap.
+    """
+    if not tools:
+        return 0
+    total = 0
+    for t in tools:
+        try:
+            if isinstance(t, dict):
+                payload: Any = t
+            else:
+                from langchain_core.utils.function_calling import convert_to_openai_tool
+
+                payload = convert_to_openai_tool(t)
+            total += count_tokens(json.dumps(payload, default=str))
+        except Exception:
+            # Coarse reservation so a serialization failure still leaves room.
+            total += 600
+    return total
+
+
 # ---------------------------------------------------------------------------
 # ToolOutputTrimmer (count-based eviction — used by researcher subagent)
 # ---------------------------------------------------------------------------
@@ -893,9 +921,18 @@ class DynamicCompletionCapMiddleware(AgentMiddleware):
             return model.model_copy(update={"max_tokens": cap})
         return model.model_copy(update={"max_completion_tokens": cap})
 
-    async def awrap_model_call(self, request, handler):
+    def _cap_request(self, request):
+        """Return *request* with ``max_tokens`` lowered to fit the window.
+
+        Measures the prompt (messages + bound tool schemas) and clamps the
+        completion ceiling to whatever room is left. Only ever lowers the cap;
+        a no-op when the window is undeclared. Shared by the sync and async
+        model-call wrappers so the clamp fires on either execution path (the
+        implement slice-implementer runs async, but the sync path must not be a
+        silent gap).
+        """
         if self.window <= 0:
-            return await handler(request)
+            return request
 
         from spine.agents.synthesis_budget import window_aware_completion_cap
 
@@ -904,6 +941,7 @@ class DynamicCompletionCapMiddleware(AgentMiddleware):
         if sys_msg is not None:
             messages = [sys_msg, *messages]
         prompt_tokens = _estimate_message_tokens(messages)
+        prompt_tokens += _estimate_tools_tokens(getattr(request, "tools", None))
 
         current = self._bound_cap(request.model)
         # When the model is uncapped, the window itself is the ceiling.
@@ -917,12 +955,18 @@ class DynamicCompletionCapMiddleware(AgentMiddleware):
         )
         if current is None or cap < current:
             logger.info(
-                "DynamicCompletionCap: prompt=%d window=%d cap %s→%d",
+                "DynamicCompletionCap: prompt=%d (incl tools) window=%d cap %s→%d",
                 prompt_tokens, self.window,
                 current if current is not None else "uncapped", cap,
             )
-            request = request.override(model=self._apply_cap(request.model, cap))
-        return await handler(request)
+            return request.override(model=self._apply_cap(request.model, cap))
+        return request
+
+    def wrap_model_call(self, request, handler):
+        return handler(self._cap_request(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._cap_request(request))
 
     def wrap_tool_call(self, request, handler):
         return handler(request)

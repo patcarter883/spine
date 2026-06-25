@@ -105,6 +105,7 @@ class _FakeReq:
     model: object
     messages: list
     system_message: object = None
+    tools: object = None
 
     def override(self, **kw):
         return replace(self, **kw)
@@ -143,6 +144,42 @@ def test_dynamic_cap_legacy_window_is_noop():
     req = _FakeReq(model=_FakeModel(12000), messages=[HumanMessage(big)])
     out = asyncio.run(mw.awrap_model_call(req, _echo))
     assert out.model.max_tokens == 12000
+
+
+def test_dynamic_cap_counts_bound_tool_schema():
+    # Tiny messages, but a big bound tool schema must still push the cap down —
+    # the exact undercount that 400'd Laguna on its 60K window (trace 019efbf9).
+    mw = DynamicCompletionCapMiddleware(window=32000, overhead=2000, floor=512)
+    big_tool = {
+        "type": "function",
+        "function": {
+            "name": "read_edit_lint",
+            "description": "x " * 24000,  # huge schema, dominates the prompt
+            "parameters": {},
+        },
+    }
+    req = _FakeReq(
+        model=_FakeModel(12000),
+        messages=[HumanMessage("hello")],
+        system_message=SystemMessage("sys"),
+        tools=[big_tool],
+    )
+    out = asyncio.run(mw.awrap_model_call(req, _echo))
+    assert 512 <= out.model.max_tokens < 12000
+
+
+def test_dynamic_cap_sync_path_also_clamps():
+    # The slice-implementer runs async, but the sync wrapper must clamp too —
+    # it used to be a silent gap (no wrap_model_call → no-op on the sync path).
+    mw = DynamicCompletionCapMiddleware(window=32000, overhead=2000, floor=512)
+    big = "token " * 28000
+    req = _FakeReq(
+        model=_FakeModel(12000),
+        messages=[HumanMessage(big)],
+        system_message=SystemMessage("sys"),
+    )
+    out = mw.wrap_model_call(req, lambda r: r)
+    assert 512 <= out.model.max_tokens < 12000
 
 
 # ── overflow routing ─────────────────────────────────────────────────────
