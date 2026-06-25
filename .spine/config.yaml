@@ -151,21 +151,23 @@ providers:
     api_key: vllm
     rerank_path: /reranking
   phases:
-    # ═══ REASONING lane -> local-gemma-12b (open-ended judgment) ═══
-    # Bench: reasoning models own plan-synthesis + critic; instruct can't. The
-    # whole supervisor->worker research tree is one model = ZERO intra-phase swaps.
+    # ═══ REASONING lane -> local-glm (open-ended judgment) ═══
+    # Bench: reasoning models own plan-synthesis + critic; instruct can't. Moved
+    # from gemma-12b to GLM-4.7-Flash (gemma planner kept scope-creeping and the
+    # plan never converged, trace 019efc66). GLM does plan + critic = one model,
+    # ZERO intra-phase swaps across the whole specify/plan/critic tree.
     specify:
-      provider: local-gemma-12b
+      provider: local-glm
     specify/subagents/researcher:
-      provider: local-gemma-12b
+      provider: local-glm
     specify/subagents/researcher/supervisor:
-      provider: local-gemma-12b
+      provider: local-glm
     plan:
-      provider: local-gemma-12b
+      provider: local-glm
     plan/subagents/researcher:
-      provider: local-gemma-12b
+      provider: local-glm
     plan/subagents/researcher/supervisor:
-      provider: local-gemma-12b
+      provider: local-glm
     critic:
       provider: local-glm
     critic/specify:
@@ -173,9 +175,9 @@ providers:
     critic/plan:
       provider: local-glm
     gap_plan:
-      provider: local-gemma-12b
+      provider: local-glm
     exploration/manager:
-      provider: local-gemma-12b
+      provider: local-glm
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
