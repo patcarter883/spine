@@ -108,6 +108,21 @@ providers:
     stream_usage: true
     max_concurrent_calls: 4
     context_window: 60000
+  - name: laguna
+    type: deepagents-model
+    model: openai:/root/.cache/huggingface/Laguna-XS.2-RXF
+    base_url: http://10.50.1.51:8000/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 4
+    context_window: 60000
+    # Anti-loop sampling (matches the local code models for fair comparison).
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    repeat_penalty: 1.05
   # Reasoning lane (PLAN synthesis, critic): bench winner — perfect on the hard
   # reasoning bench at ~1/3 the Qwens' reasoning cost; 6.7GB = fast GPU swap.
   - name: local-gemma-12b
@@ -166,18 +181,20 @@ providers:
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
     # summaries. The whole IMPLEMENT tree (decomposer + N slice-implementer
     # workers + verify) is one model = ZERO intra-phase swaps in the heaviest phase.
-    # EDITOR lane -> local-north-code: Mellum2-12B was too weak for the editor
-    # role — it failed the one-mode-per-call tool contract and spun the budget
-    # (trace 019efc1a). North-Mini-Code is a code model; whole IMPLEMENT tree on
-    # one model keeps ZERO intra-phase swaps.
+    # EDITOR lane -> laguna (remote @ 10.50.1.51:8000): Mellum2-12B failed the
+    # one-mode-per-call tool contract (019efc1a) and North-Mini-Code was too slow
+    # on enrich (5-min ReadTimeouts, 019efc45). Try Laguna-XS.2 as the editor.
+    # Decompose/enrich stays on local-mellum (its strength per the bench, and far
+    # faster than North on structured output). Laguna and Mellum are on DIFFERENT
+    # servers, so this cross-model split costs no model reload.
     implement:
-      provider: local-north-code
+      provider: laguna
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-north-code
+      provider: local-mellum
     implement/subagents/slice-implementer:
-      provider: local-north-code
+      provider: laguna
     verify:
       provider: local-mellum
     verify/subagents/slice-verifier:
