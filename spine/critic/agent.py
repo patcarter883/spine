@@ -27,7 +27,12 @@ from spine.models.types import CriticReview
 # finish_reason guard in critic_review then routes that truncation to a revision
 # round instead of a salvaged PASS. Applies regardless of which model is on the
 # critic lane (Gemma, GLM, …).
-_CRITIC_COMPLETION_CAP = 6000
+#
+# Raised 6000 -> 12000: a well-behaved GLM critic reviewing a multi-slice PLAN
+# truncated at 6000 (finish_reason=length) and the guard burned a plan retry on
+# it (trace 019efc66). GLM does not degenerate like Gemma, so it can use the
+# extra room; the finish_reason guard + dynamic window cap still bound it.
+_CRITIC_COMPLETION_CAP = 12000
 
 
 # ── PLAN-specific review instructions appended to the system prompt ──────────
