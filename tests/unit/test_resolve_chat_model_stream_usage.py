@@ -149,3 +149,25 @@ def test_stream_usage_opt_out_respected(monkeypatch):
     # Explicit opt-out: stream_usage not forced on; streaming still enabled.
     assert "stream_usage" not in captured["kwargs"]
     assert captured["kwargs"].get("streaming") is True
+
+def test_base_url_and_api_key_forwarded_for_local_provider(monkeypatch):
+    """The string/init_chat_model path must pass the provider's base_url + api_key,
+    else the bare openai: client falls back to OPENAI_* env vars and fails with
+    "Missing credentials" on a local provider (trace 019efca3: fallback enrich).
+    """
+    captured = _capture_init_chat_model(monkeypatch)
+    monkeypatch.setattr(helpers, "resolve_model", lambda *a, **k: "openai:Mellum-Local")
+    monkeypatch.setattr(
+        helpers,
+        "_active_provider_config",
+        lambda phase=None: {
+            "model": "openai:Mellum-Local",
+            "base_url": "http://localhost:8010/v1",
+            "api_key": "vllm",
+        },
+    )
+
+    helpers.resolve_chat_model(None, phase="implement/decomposer")
+
+    assert captured["kwargs"].get("base_url") == "http://localhost:8010/v1"
+    assert captured["kwargs"].get("api_key") == "vllm"

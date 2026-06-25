@@ -162,6 +162,17 @@ def resolve_chat_model(
         cap_kwargs: dict[str, Any] = {}
         if provider_cfg:
             _apply_concurrency_cap(cap_kwargs, provider_cfg)
+            # ── Forward the provider's endpoint + key ───────────────────
+            # init_chat_model otherwise builds a bare ``openai:`` client that
+            # falls back to OPENAI_API_KEY / OPENAI_BASE_URL env vars — unset
+            # in a normal ``spine run`` — so the string path fails with
+            # "Missing credentials" (trace 019efca3: the monolithic-fallback
+            # enrich on a local provider). Pass base_url/api_key so it reaches
+            # the configured local server instead of the OpenAI default.
+            if provider_cfg.get("base_url"):
+                cap_kwargs.setdefault("base_url", provider_cfg["base_url"])
+            if provider_cfg.get("api_key"):
+                cap_kwargs.setdefault("api_key", provider_cfg["api_key"])
             # ── Enable streaming + usage reporting (parity with the local /
             # OpenRouter builders) ───────────────────────────────────────
             # The string path routes through init_chat_model, which would

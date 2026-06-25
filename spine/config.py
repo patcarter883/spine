@@ -286,7 +286,10 @@ class SpineConfig:
     # empty. Respond with ONLY the JSON…") sent a thinking model into a
     # multi-minute reasoning burn toward the provider's full completion
     # budget (trace 019eb541, observed live at 300s+ solo on the engine).
-    research_manager_max_completion_tokens: int = 2048
+    # Raised 2048->8192: GLM ignores suppress_reasoning and reasons past 2048,
+    # length-erroring the ResearchManagerDecision -> "defaulting to explore one
+    # topic" (trace 019efca3). Instruct models still finish well under it.
+    research_manager_max_completion_tokens: int = 8192
     # ── Research breadth (task-aware exploration fan-out) ───────────────
     # Default ceilings on the exploration loop: how many research_manager
     # rounds run, and how many explore branches fan out per round. A high-
