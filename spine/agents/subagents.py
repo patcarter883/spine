@@ -411,10 +411,13 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         + xml_block(
             Tag.WORKFLOW,
             "1. Review the slice definition and acceptance criteria from "
-            "your task description.\n"
-            "2. Inspect the implemented files — use read_file and ls "
-            "(batch reads — ≥3 files per turn).\n"
-            "3. Run relevant tests and linters.\n"
+            "your task description — it names the target_files to verify.\n"
+            "2. Inspect the implemented files with read_file (ranged, "
+            "read-only — there is no shell cat/grep/ls); batch your reads "
+            "(≥2 files per turn).\n"
+            "3. Run relevant tests and linters with run_checks (e.g. "
+            "'pytest …', 'ruff check …'). It runs checks only; it will not "
+            "grep/find/list files for you — read_file does that.\n"
             "4. Check each acceptance criterion individually.\n"
             "5. Produce a structured verification report.",
         )
@@ -479,19 +482,25 @@ _IMPLEMENT_TOOLS: list[str] = [
     "read_edit_lint",
 ]
 
-_READ_AND_EXECUTE_TOOLS: list[str] = [
-    "ls",
+# Slice-verifier surface. Like the slice-implementer, the verifier was a leaf
+# code agent still carrying the raw filesystem+shell surface (ls/read_file/
+# glob/grep/execute/search_codebase). Trace 019f0212 showed it doing the exact
+# survey spiral the implementer lockdown (read_edit_lint) was built to kill:
+# ~290 execute calls in one verify pass, >90% shelling grep/find/ls/cat, many
+# returning no output. It now gets two purpose-built tools (built by
+# spine.agents.verify_subagent_tools): a ranged read-only ``read_file`` and a
+# constrained ``run_checks`` runner that rejects pure-exploration shell
+# commands. The verifier legitimately RUNS tests, so — unlike the implementer —
+# it keeps an execute path, but only through the policed wrapper.
+_VERIFY_TOOLS: list[str] = [
     "read_file",
-    "glob",
-    "grep",
-    "search_codebase",
-    "execute",
+    "run_checks",
 ]
 
 SUBAGENT_TOOLS: dict[str, list[str]] = {
     "researcher": _READ_ONLY_TOOLS,
     "slice-implementer": _IMPLEMENT_TOOLS,
-    "slice-verifier": _READ_AND_EXECUTE_TOOLS,
+    "slice-verifier": _VERIFY_TOOLS,
 }
 
 # ── Re-research prompt for empty researcher results ────────────────────
@@ -770,7 +779,29 @@ def build_subagent_spec(
     fs_prompt = SPINE_FILESYSTEM_EXEC_PROMPT if has_execute else SPINE_FILESYSTEM_PROMPT
     fs_mw = FilesystemMiddleware(backend=backend, system_prompt=fs_prompt)
     allowed_tool_names = SUBAGENT_TOOLS[name]
-    tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]
+
+    # ── slice-verifier: bounded, purpose-built surface (no raw fs/shell) ──
+    # Replaces ls/read_file/glob/grep/execute/search_codebase with a ranged
+    # read-only read_file + a constrained run_checks runner (trace 019f0212).
+    # run_checks wraps the FilesystemMiddleware ``execute`` tool so it still
+    # runs real tests, but rejects pure-exploration commands. The generic-tool
+    # injection blocks below are gated on names not in _VERIFY_TOOLS, so they
+    # naturally skip; downstream spec assembly (ToolOutputTrimmer, schema
+    # exclusion) still applies via the existing slice-verifier branches.
+    if name == "slice-verifier":
+        from spine.agents.verify_subagent_tools import build_verify_subagent_tools
+
+        fs_execute = next((t for t in fs_mw.tools if t.name == "execute"), None)
+        if fs_execute is None:
+            logger.warning(
+                "slice-verifier: no execute tool from FilesystemMiddleware; "
+                "run_checks will report an error if invoked."
+            )
+        tools = build_verify_subagent_tools(
+            workspace_root=workspace_root, execute_tool=fs_execute
+        )
+    else:
+        tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]
 
     # ── Inject SearchCodebaseTool for subagents that have it listed ──
     # search_codebase is a standalone BaseTool from plan_tools, not part of
@@ -889,7 +920,7 @@ def build_subagent_spec(
     # - ``slice-implementer``: no schema — model uses write_file/edit_file/
     #   execute tools, then reports SliceResult in its final message.
     #   ``_extract_slice_result()`` parses it from the last assistant content.
-    # - ``slice-verifier``: no schema — model uses read_file/execute tools,
+    # - ``slice-verifier``: no schema — model uses read_file/run_checks tools,
     #   then reports VerificationResult.  The verify subgraph extracts it
     #   from the last assistant content.
     #
