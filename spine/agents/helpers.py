@@ -59,10 +59,42 @@ def suppress_parsed_serializer_warning() -> Iterator[None]:
         yield
 
 
+def escalation_level_for_phase(state: Any, phase: Any) -> int:
+    """Derive the failure-driven escalation rung from a phase's retry counter.
+
+    Critic-reviewed phases re-enter on rework; ``retry_count`` is the persisted
+    rework counter (an ``int`` in subgraph state, a per-phase ``dict`` in the
+    parent :class:`WorkflowState`). Returns that count as the escalation rung —
+    :meth:`SpineConfig.resolve_model` clamps it to the strongest defined ladder
+    entry, and it's a no-op unless an ``escalation`` ladder is configured for the
+    phase. Because it reads only checkpointed state, escalation stays
+    deterministic across replay.
+
+    Args:
+        state: The phase/subgraph state mapping (has ``retry_count``).
+        phase: A :class:`PhaseName` (uses ``.value``) or phase-name string.
+
+    Returns:
+        The escalation rung (``0`` = base).
+    """
+    try:
+        rc = state.get("retry_count", 0)
+    except AttributeError:
+        return 0
+    if isinstance(rc, dict):
+        key = getattr(phase, "value", None) or str(phase)
+        rc = rc.get(key, 0)
+    try:
+        return max(0, int(rc or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def resolve_model(
     config: RunnableConfig | None,
     session_id: str | None = None,
     phase: str | None = None,
+    escalation_level: int = 0,
 ) -> str | BaseChatModel:
     """Resolve the LLM model identifier from config or SpineConfig.
 
@@ -92,18 +124,24 @@ def resolve_model(
         phase: Optional phase or phase/subagent path for model override
             resolution (e.g. ``"implement"`` or
             ``"implement/subagents/slice-implementer"``).
+        escalation_level: Failure-driven escalation rung (0 = base); selects an
+            escalation ladder entry when one is configured for the phase.
 
     Returns:
         A model string like ``"openrouter:z-ai/glm-4.5-air:free"`` or a
         pre-built ``BaseChatModel`` instance when extra config is needed.
     """
-    model_spec = _model_spec_from_config(config, phase=phase)
+    model_spec = _model_spec_from_config(
+        config, phase=phase, escalation_level=escalation_level
+    )
 
     # Only build a pre-built model when the provider needs extra kwargs
     # (base_url, api_key, session_id, etc.) that the string-based
     # init_chat_model path would silently drop.
     if session_id and model_spec.startswith("openrouter:"):
-        return _build_openrouter_model(model_spec, session_id, phase=phase)
+        return _build_openrouter_model(
+            model_spec, session_id, phase=phase, escalation_level=escalation_level
+        )
 
     # For local/OpenAI-compatible servers with custom base_url + api_key,
     # we must build a ChatOpenAI instance ourselves — otherwise
@@ -117,7 +155,7 @@ def resolve_model(
     # (e.g. "openai:gpt-4o-mini" for cloud OpenAI), we must NOT
     # apply the local server's base_url/api_key to it.
     if model_spec.startswith("openai:"):
-        provider_cfg = _active_provider_config(phase=phase)
+        provider_cfg = _active_provider_config(phase=phase, escalation_level=escalation_level)
         if (
             provider_cfg
             and provider_cfg.get("base_url")
@@ -132,6 +170,7 @@ def resolve_chat_model(
     config: RunnableConfig | None,
     session_id: str | None = None,
     phase: str | None = None,
+    escalation_level: int = 0,
 ) -> BaseChatModel:
     """Resolve a ready-to-invoke :class:`BaseChatModel` from config.
 
@@ -154,11 +193,13 @@ def resolve_chat_model(
         A ``BaseChatModel`` instance ready for ``.with_structured_output`` or
         ``.ainvoke``.
     """
-    model = resolve_model(config, session_id=session_id, phase=phase)
+    model = resolve_model(
+        config, session_id=session_id, phase=phase, escalation_level=escalation_level
+    )
     if isinstance(model, str):
         from langchain.chat_models import init_chat_model
 
-        provider_cfg = _active_provider_config(phase=phase)
+        provider_cfg = _active_provider_config(phase=phase, escalation_level=escalation_level)
         cap_kwargs: dict[str, Any] = {}
         if provider_cfg:
             _apply_concurrency_cap(cap_kwargs, provider_cfg)
@@ -680,7 +721,11 @@ def coerce_structured_output(
     return None
 
 
-def _model_spec_from_config(config: RunnableConfig | None, phase: str | None = None) -> str:
+def _model_spec_from_config(
+    config: RunnableConfig | None,
+    phase: str | None = None,
+    escalation_level: int = 0,
+) -> str:
     """Extract the model spec string from config or SpineConfig.
 
     Checks ``config["configurable"]["model"]`` first, then delegates to
@@ -690,6 +735,9 @@ def _model_spec_from_config(config: RunnableConfig | None, phase: str | None = N
     Args:
         config: LangGraph runtime config.
         phase: Optional phase or phase/subagent path for override resolution.
+        escalation_level: Failure-driven escalation rung (0 = base). An explicit
+            ``configurable.model`` is honoured as-is and is never escalated —
+            it's already a deliberate caller override.
 
     Returns:
         A model spec string like ``"openrouter:z-ai/glm-4.5-air:free"``.
@@ -698,31 +746,40 @@ def _model_spec_from_config(config: RunnableConfig | None, phase: str | None = N
         return config["configurable"]["model"]
     from spine.config import SpineConfig
 
-    return SpineConfig.load().resolve_model(phase=phase)
+    return SpineConfig.load().resolve_model(
+        phase=phase, escalation_level=escalation_level
+    )
 
 
-def _active_provider_config(phase: str | None = None) -> dict[str, Any] | None:
+def _active_provider_config(
+    phase: str | None = None, escalation_level: int = 0
+) -> dict[str, Any] | None:
     """Return the full provider config dict for a given phase.
 
     Delegates to :meth:`SpineConfig.resolve_provider_config` so that
     per-phase overrides (``base_url``, ``api_key``, ``provider``
-    references, etc.) are applied before returning.
+    references, etc.) and any failure-driven escalation are applied before
+    returning.
 
     Args:
         phase: Optional phase or phase/subagent path for policy resolution.
+        escalation_level: Failure-driven escalation rung (0 = base).
 
     Returns:
         The merged provider config dict, or ``None`` if no provider found.
     """
     from spine.config import SpineConfig
 
-    return SpineConfig.load().resolve_provider_config(phase=phase)
+    return SpineConfig.load().resolve_provider_config(
+        phase=phase, escalation_level=escalation_level
+    )
 
 
 def _build_openrouter_model(
     model_spec: str,
     session_id: str,
     phase: str | None = None,
+    escalation_level: int = 0,
 ) -> BaseChatModel:
     """Build a ChatOpenRouter instance with session_id set.
 
@@ -766,7 +823,12 @@ def _build_openrouter_model(
     # connections (e.g. OpenRouter dropping mid-stream) can block
     # the workflow for 30+ minutes waiting for OS-level TCP timeouts.
     # Note: ChatOpenRouter expects milliseconds, not seconds.
-    timeout_ms = _resolve_timeout_from_config(default=300, phase=phase) * 1000
+    timeout_ms = (
+        _resolve_timeout_from_config(
+            default=300, phase=phase, escalation_level=escalation_level
+        )
+        * 1000
+    )
 
     # ── Resolve max_completion_tokens ────────────────────────────────
     # When max_completion_tokens is not set, reasoning models (e.g.
@@ -779,7 +841,7 @@ def _build_openrouter_model(
     # or providers.llm[].max_tokens.  max_completion_tokens is preferred
     # (it includes reasoning tokens in the budget, giving the model full
     # control over allocation).
-    provider_cfg = _active_provider_config(phase=phase) or {}
+    provider_cfg = _active_provider_config(phase=phase, escalation_level=escalation_level) or {}
     max_completion_tokens = provider_cfg.get("max_completion_tokens")
     max_tokens = provider_cfg.get("max_tokens")
     # Fall back to the global SpineConfig.max_completion_tokens when the
@@ -1107,7 +1169,9 @@ def debug_enabled() -> bool:
     return os.getenv("SPINE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes")
 
 
-def _resolve_timeout_from_config(default: int = 300, phase: str | None = None) -> int:
+def _resolve_timeout_from_config(
+    default: int = 300, phase: str | None = None, escalation_level: int = 0
+) -> int:
     """Resolve the request_timeout in seconds from provider config.
 
     Checks the phase-aware provider config for a ``request_timeout`` field.
@@ -1118,11 +1182,12 @@ def _resolve_timeout_from_config(default: int = 300, phase: str | None = None) -
     Args:
         default: Default timeout in seconds when not configured.
         phase: Optional phase path for provider config resolution.
+        escalation_level: Failure-driven escalation rung (0 = base).
 
     Returns:
         Timeout value in seconds.
     """
-    provider_cfg = _active_provider_config(phase=phase)
+    provider_cfg = _active_provider_config(phase=phase, escalation_level=escalation_level)
     if provider_cfg and "request_timeout" in provider_cfg:
         try:
             return int(provider_cfg["request_timeout"])

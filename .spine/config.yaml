@@ -1,6 +1,24 @@
 spine:
   checkpoint_path: .spine/spine.db
   guided_decoding: true
+  # ── smallcode-inspired small-model adaptations ────────────────────────
+  # Recover tool calls a local model emits as text (<tool_call>…</tool_call>,
+  # fenced JSON, bare object) instead of native tool_calls. Deterministic.
+  tool_call_normalize: true
+  # Append a one-line LLM fix hint to failed `execute` results. Routed to a
+  # cheap local model via phases.error_diagnosis below (no remote calls).
+  error_diagnosis: true
+  # Per-model behavioural defaults, applied UNDER explicit provider/phase
+  # settings (provider/phase values always win). context_window here is a
+  # backstop for any provider that omits it; tool_format documents the call
+  # style the normalizer should expect for these Hermes-template GGUFs.
+  model_profiles:
+    openai:Qwen3-Coder-30B-A3B-Instruct-GGUF:
+      tool_format: hermes
+      context_window: 60000
+    openai:GLM-4.7-Flash-GGUF:
+      tool_format: hermes
+      context_window: 60000
   topic_lookup_min_similarity: 0.75
   synthesize_findings_token_budget: 20000
   max_completion_tokens: 30000
@@ -230,6 +248,14 @@ providers:
     # servers, so this cross-model split costs no model reload.
     implement:
       provider: local-qwen-coder
+      # Failure-driven escalation (LOCAL — stays true to local-first). When a
+      # slice survives a FALLBACK re-decomposition (_decompose_depth ≥ 1), the
+      # editor escalates from the coder model to the reasoning model, which
+      # tends to land edits the coder couldn't. Covers slice-implementer and
+      # synthesis via prefix resolution. Reachable depth is bounded by
+      # implement_max_decompose_depth (default 1), so only rung 1 fires today.
+      escalation:
+        - provider: local-glm
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
@@ -256,3 +282,11 @@ providers:
       provider: local-qwen-coder
     onboarding/section-worker:
       provider: local-qwen-coder
+    # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
+    # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
+    # actually fail. error_diagnosis is enabled in the spine: block above.
+    error_diagnosis:
+      provider: local-qwen-coder
+      max_completion_tokens: 256
+      temperature: 0
+      reasoning: false

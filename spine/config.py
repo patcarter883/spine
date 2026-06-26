@@ -206,6 +206,14 @@ class SpineConfig:
     workspace_root: str = ""
     interpreter_enabled: bool = False
     tool_schema_validation: bool = True
+    # Forgiving multi-format tool-call parsing (see ToolCallNormalizer). Recovers
+    # tool calls a weak/quantized model emits as text. Deterministic parsing, so
+    # safe for replay; off by default until tuned for the local models in use.
+    tool_call_normalize: bool = False
+    # LLM error diagnosis on command failure (see ExecuteErrorDiagnoser).
+    # Off by default: it makes an extra (cheap) LLM call per failed ``execute``
+    # whose text enters a checkpointed ToolMessage, so replay can differ.
+    error_diagnosis: bool = False
     phase_timeouts: dict = field(
         default_factory=lambda: {
             "specify": 0,
@@ -542,6 +550,13 @@ class SpineConfig:
     # Token-based phase compaction (see TokenBudgetCompactor); default off
     token_compaction: TokenCompactionConfig = field(default_factory=TokenCompactionConfig)
 
+    # Per-model behavioural profiles, keyed by model string. Each entry supplies
+    # provider-level defaults (``context_window``, ``reasoning``,
+    # ``guided_decoding``, ``tool_format``, …) that sit UNDER explicit
+    # provider/phase settings — see resolve_provider_config(). Lets a model be
+    # configured once by name regardless of which phase/provider routes to it.
+    model_profiles: dict = field(default_factory=dict)
+
     @staticmethod
     def _find_workspace_root() -> str:
         """Auto-detect workspace root by searching upward for ``.spine/``.
@@ -702,6 +717,16 @@ class SpineConfig:
                 str(spine.get("tool_schema_validation", True)).lower(),
             )
             not in ("0", "false", "no"),
+            tool_call_normalize=os.getenv(
+                "SPINE_TOOL_CALL_NORMALIZE",
+                str(spine.get("tool_call_normalize", False)).lower(),
+            )
+            in ("1", "true", "yes"),
+            error_diagnosis=os.getenv(
+                "SPINE_ERROR_DIAGNOSIS",
+                str(spine.get("error_diagnosis", False)).lower(),
+            )
+            in ("1", "true", "yes"),
             phase_timeouts=spine.get(
                 "phase_timeouts",
                 {
@@ -897,9 +922,10 @@ class SpineConfig:
             token_compaction=_parse_token_compaction_config(
                 spine.get("token_compaction", {})
             ),
+            model_profiles=spine.get("model_profiles", {}) or {},
         )
 
-    def resolve_model(self, phase: str | None = None) -> str:
+    def resolve_model(self, phase: str | None = None, escalation_level: int = 0) -> str:
         """Resolve the LLM model identifier from provider config.
 
         Supports per-phase and per-subagent model overrides via the
@@ -922,10 +948,19 @@ class SpineConfig:
         bare phase default, and an intermediate key (e.g.
         ``implement/decomposer``) covers all of its modes at once.
 
+        When ``escalation_level > 0`` an escalation ladder entry
+        (``providers.phases.<phase>.escalation[level-1]``, most-specific key
+        wins, clamped to the strongest defined rung) overrides the base model.
+        With no ladder defined anywhere, a non-zero level resolves identically
+        to level 0 — so escalation degrades gracefully to the static config.
+
         Args:
             phase: Optional phase or phase/subagent path (e.g. ``"implement"``
                 or ``"implement/subagents/slice-implementer"``).  When
                 ``None``, only the default provider and env var are consulted.
+            escalation_level: Failure-driven escalation rung (0 = base). Driven
+                by SPINE's persisted counters (slice ``_decompose_depth`` /
+                critic ``retry_count``), not an in-memory failure rate.
 
         Returns:
             A model string like ``openrouter:z-ai/glm-4.5-air:free``.
@@ -933,6 +968,18 @@ class SpineConfig:
         Raises:
             ValueError: If no model is configured anywhere.
         """
+        # Escalation overlay: a defined ladder entry overrides the base model.
+        if phase and escalation_level > 0:
+            entry = self._escalation_entry_for(phase, escalation_level)
+            if entry is not None:
+                if entry.get("model"):
+                    return entry["model"]
+                provider_ref = entry.get("provider")
+                if provider_ref:
+                    named = self._lookup_provider_by_name(provider_ref)
+                    if named and named.get("model"):
+                        return named["model"]
+
         # Check phase-specific overrides first (more specific key wins).
         if phase:
             phases = self.providers.get("phases", {})
@@ -988,6 +1035,35 @@ class SpineConfig:
         "context_window",
     )
 
+    def _resolve_model_profile(
+        self, phase: str | None = None, escalation_level: int = 0
+    ) -> dict:
+        """Return the ``model_profiles`` entry for the phase's effective model.
+
+        Profiles supply provider-level defaults keyed by model string. Matching
+        tries the full model spec first (e.g. ``"openai:qwen3.6"``), then the
+        normalised name (``"qwen3.6"``) using the same stripping that
+        ``helpers._extract_model_name`` applies, so a profile can be keyed either
+        way. Returns an empty dict when profiles are unset or none match — so the
+        merge in :meth:`resolve_provider_config` is a no-op by default.
+        """
+        if not self.model_profiles:
+            return {}
+        try:
+            model_spec = self.resolve_model(
+                phase=phase, escalation_level=escalation_level
+            )
+        except ValueError:
+            return {}
+        if not model_spec:
+            return {}
+        profile = self.model_profiles.get(model_spec)
+        if profile is None:
+            from spine.agents.helpers import _extract_model_name
+
+            profile = self.model_profiles.get(_extract_model_name(model_spec))
+        return dict(profile) if isinstance(profile, dict) else {}
+
     def resolve_active_provider(self) -> dict | None:
         """Return the full config dict for the first enabled LLM provider.
 
@@ -1018,7 +1094,50 @@ class SpineConfig:
                 return provider
         return None
 
-    def resolve_provider_config(self, phase: str | None = None) -> dict:
+    @staticmethod
+    def _escalation_entry(phase_cfg: dict, level: int) -> dict | None:
+        """Return the escalation ladder entry for ``level`` on a phase config.
+
+        ``providers.phases.<phase>.escalation`` is a list where index ``i`` is
+        escalation *level ``i + 1``* (level 0 is the phase's own base config).
+        When ``level`` exceeds the ladder length the request is clamped to the
+        last (strongest) entry — so once the ladder is exhausted, escalation
+        stays at the top rung rather than silently falling back. Returns
+        ``None`` when ``level <= 0`` or no usable ladder is present.
+        """
+        if level <= 0 or not isinstance(phase_cfg, dict):
+            return None
+        ladder = phase_cfg.get("escalation")
+        if not isinstance(ladder, list) or not ladder:
+            return None
+        entry = ladder[min(level, len(ladder)) - 1]
+        return entry if isinstance(entry, dict) else None
+
+    def _escalation_entry_for(
+        self, phase: str | None, level: int
+    ) -> dict | None:
+        """Most-specific escalation ladder entry across a phase path, or None.
+
+        Walks path prefixes most-specific→least (like :meth:`resolve_model`) and
+        returns the first key that defines an ``escalation`` ladder, clamped to
+        ``level`` via :meth:`_escalation_entry`. A ladder defined on the bare
+        phase (``implement``) therefore covers its subagents
+        (``implement/subagents/slice-implementer``) unless one overrides it.
+        """
+        if not phase or level <= 0:
+            return None
+        phases = self.providers.get("phases", {})
+        parts = phase.split("/")
+        for i in range(len(parts), 0, -1):
+            key = "/".join(parts[:i])
+            entry = self._escalation_entry(phases.get(key, {}), level)
+            if entry is not None:
+                return entry
+        return None
+
+    def resolve_provider_config(
+        self, phase: str | None = None, escalation_level: int = 0
+    ) -> dict:
         """Resolve provider-level settings for a given phase.
 
         Unlike :meth:`resolve_model` (which returns only the model string),
@@ -1067,9 +1186,20 @@ class SpineConfig:
                   base_url: http://other:8000/v1  # fully custom
                   api_key: other-key
         """
+        # When escalated, an escalation ladder entry overrides the model/provider
+        # (and may carry its own provider-level keys). Resolved once here and
+        # used both to pick the base provider (its ``provider`` ref) and as the
+        # highest-priority override layer (Step 3).
+        esc_entry = self._escalation_entry_for(phase, escalation_level)
+
         # ── Step 1: resolve base provider (from reference or default) ──
         base: dict = {}
-        if phase:
+        # An escalation entry's ``provider`` ref defines the base provider.
+        if esc_entry is not None and esc_entry.get("provider"):
+            named = self._lookup_provider_by_name(esc_entry["provider"])
+            if named:
+                base = dict(named)
+        if not base and phase:
             phases = self.providers.get("phases", {})
             for key in (phase, phase.split("/")[0] if "/" in phase else None):
                 if key is None:
@@ -1089,6 +1219,17 @@ class SpineConfig:
             if default:
                 base = dict(default)
 
+        # ── Step 1.5: layer per-model profile defaults UNDER explicit values ──
+        # Behavioural defaults (context_window, reasoning, guided_decoding,
+        # tool_format, …) keyed by model string. ``setdefault`` leaves any
+        # provider/base value intact, and Step 2's phase overrides still win
+        # because they run afterwards — so precedence is phase > provider >
+        # profile. No-op when ``model_profiles`` is unset.
+        for k, v in self._resolve_model_profile(
+            phase=phase, escalation_level=escalation_level
+        ).items():
+            base.setdefault(k, v)
+
         # ── Step 2: apply phase-level overrides on top ──
         if phase:
             phases = self.providers.get("phases", {})
@@ -1101,6 +1242,15 @@ class SpineConfig:
                 for k in self._PROVIDER_KEYS:
                     if k in phase_cfg:
                         base[k] = phase_cfg[k]
+
+        # ── Step 3: escalation entry's own keys win (highest priority) ──
+        # The phase's tuning (Step 2) carries onto the escalated model unless the
+        # entry overrides it explicitly — so e.g. a frontier escalation can keep
+        # the phase temperature but bump its own request_timeout/context_window.
+        if esc_entry is not None:
+            for k in self._PROVIDER_KEYS:
+                if k in esc_entry:
+                    base[k] = esc_entry[k]
 
         return base
 

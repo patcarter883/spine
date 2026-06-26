@@ -32,6 +32,7 @@ from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import artifact_path
 from spine.agents.factory import build_phase_agent
+from spine.agents.helpers import escalation_level_for_phase
 from spine.agents.plan_tools import (
     StructuredWritePlanTool,
     build_plan_agent_tools,
@@ -81,6 +82,8 @@ def build_plan_agent(
         system_prompt=system_prompt,
         extra_tools=agent_tools,
         skip_filesystem_middleware=True,
+        # Escalate the model on critic-driven rework (no-op without a ladder).
+        escalation_level=escalation_level_for_phase(state, PhaseName.PLAN),
     )
 
     return agent
@@ -152,6 +155,8 @@ def build_plan_synthesizer(
         extra_middleware=[
             ForceToolUntilCalledMiddleware(final_tool="write_structured_plan")
         ],
+        # Escalate the model on critic-driven rework (no-op without a ladder).
+        escalation_level=escalation_level_for_phase(state, PhaseName.PLAN),
     )
 
 

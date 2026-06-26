@@ -26,6 +26,7 @@ from langchain_core.runnables import RunnableConfig
 
 from spine.agents.artifacts import build_artifact_prompt
 from spine.agents.factory import build_phase_agent
+from spine.agents.helpers import escalation_level_for_phase
 from spine.agents.specify_tools import build_specify_orchestrator_tools
 from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
 from spine.models.enums import PhaseName
@@ -88,6 +89,8 @@ def build_specify_agent(
         # text instead of calling the tool. No gate_tool here: the orchestrator
         # may legitimately call `recall` before the write.
         extra_middleware=[ForceToolUntilCalledMiddleware(final_tool="write_specification")],
+        # Escalate the model on critic-driven rework (no-op without a ladder).
+        escalation_level=escalation_level_for_phase(state, PhaseName.SPECIFY),
     )
 
     return agent
@@ -149,6 +152,8 @@ def build_specify_synthesizer(
         extra_middleware=[
             ForceToolUntilCalledMiddleware(final_tool="write_specification")
         ],
+        # Escalate the model on critic-driven rework (no-op without a ladder).
+        escalation_level=escalation_level_for_phase(state, PhaseName.SPECIFY),
     )
 
 

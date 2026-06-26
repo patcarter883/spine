@@ -825,11 +825,20 @@ async def _slice_implementer_node(
     active_slice: dict = state.get("active_slice") or {}
     slice_id = active_slice.get("id", "unknown")
 
+    # Failure-driven escalation: a slice that has survived one or more FALLBACK
+    # re-decompositions carries a higher ``_decompose_depth``. Reuse it as the
+    # escalation rung so the existing decompose-on-failure loop doubles as the
+    # model ladder (depth 0 → primary, 1 → medium, 2 → strong). No new state or
+    # control loop — purely a function of the checkpointed counter, so replay
+    # stays deterministic. No-op unless an ``escalation`` ladder is configured.
+    escalation_level = int(active_slice.get("_decompose_depth", 0) or 0)
+
     logger.info(
-        "[%s] slice_implementer: slice=%r title=%r",
+        "[%s] slice_implementer: slice=%r title=%r escalation_level=%d",
         work_id,
         slice_id,
         active_slice.get("title", ""),
+        escalation_level,
     )
 
     try:
@@ -872,6 +881,7 @@ async def _slice_implementer_node(
                 PhaseName.IMPLEMENT.value,
                 phase_cap=SpineConfig.load().implement_max_completion_tokens,
             ),
+            escalation_level=escalation_level,
         )
 
         # Trim the slice JSON to scannable metadata only. The reference symbols
@@ -1178,8 +1188,14 @@ async def _synthesis_implementer_node(
     slice_id = active_slice.get("id", "unknown")
     title = active_slice.get("title", "")
 
+    # Failure-driven escalation rung — see _slice_implementer_node. Reuses the
+    # FALLBACK re-decomposition depth so the synthesis path escalates its model
+    # on the same schedule (no-op unless an escalation ladder is configured).
+    escalation_level = int(active_slice.get("_decompose_depth", 0) or 0)
+
     logger.info(
-        "[%s] synthesis_implementer: slice=%r title=%r", work_id, slice_id, title
+        "[%s] synthesis_implementer: slice=%r title=%r escalation_level=%d",
+        work_id, slice_id, title, escalation_level,
     )
 
     try:
@@ -1208,6 +1224,7 @@ async def _synthesis_implementer_node(
             config=config,
             session_id=work_id,
             n=variants,
+            escalation_level=escalation_level,
         )
         winner, placement = place_best_candidate(
             candidates, workspace_root=workspace_root, target_files=target_files
@@ -1224,6 +1241,7 @@ async def _synthesis_implementer_node(
                 session_id=work_id,
                 n=1,
                 feedback=_placement_feedback(placement),
+                escalation_level=escalation_level,
             )
             if retry:
                 winner2, placement2 = place_best_candidate(

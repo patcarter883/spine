@@ -333,6 +333,7 @@ def build_phase_agent(
     extra_tools: list[Any] | None = None,
     skip_filesystem_middleware: bool = False,
     completion_token_cap: int | None = None,
+    escalation_level: int = 0,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -368,6 +369,12 @@ def build_phase_agent(
             the SPECIFY/PLAN synthesizers so a structured 2-4K JSON output
             doesn't request the global 30K budget and push the prompt over
             a finite context window (trace 019eb3dd).
+        escalation_level: Failure-driven escalation rung (0 = base). Derived by
+            callers from SPINE's persisted failure counters (slice
+            ``_decompose_depth`` / critic ``retry_count``); selects an
+            escalation ladder entry for the phase when one is configured. Both
+            the resolved model and the window-relative middleware use the
+            escalated provider so they stay consistent.
 
     Returns:
         A compiled agent (CompiledStateGraph) ready for invocation.
@@ -382,7 +389,12 @@ def build_phase_agent(
     )
 
     # ── Resolve model and backend ────────────────────────────────────
-    model = resolve_model(config, session_id=state.get("work_id"), phase=phase.value)
+    model = resolve_model(
+        config,
+        session_id=state.get("work_id"),
+        phase=phase.value,
+        escalation_level=escalation_level,
+    )
     if completion_token_cap and completion_token_cap > 0:
         if isinstance(model, str):
             # String specs are resolved by create_agent without provider
@@ -501,6 +513,7 @@ def build_phase_agent(
         allowed_tools=allowed_tools,
         skip_filesystem_middleware=skip_filesystem_middleware,
         static_cacheable_prefix=static_cacheable_prefix,
+        escalation_level=escalation_level,
     )
 
     # ── Context schema ───────────────────────────────────────────────
@@ -547,6 +560,7 @@ def _build_middleware_stack(
     allowed_tools: list[str] | None = None,
     skip_filesystem_middleware: bool = False,
     static_cacheable_prefix: str | None = None,
+    escalation_level: int = 0,
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
@@ -602,7 +616,7 @@ def _build_middleware_stack(
     #    to subagents too so that tool runtime errors become a compact
     #    ToolMessage(status="error") instead of a raw traceback that ends up
     #    serialized into ResearchFindings.summary.
-    _add_spine_middleware(middleware, phase)
+    _add_spine_middleware(middleware, phase, escalation_level=escalation_level)
 
     # 5. User-provided extra middleware
     if extra_middleware:
@@ -679,9 +693,31 @@ def _filter_filesystem_tools(
     )
 
 
-def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
-    """Add SPINE-specific middleware for tool validation and context editing."""
+def _add_spine_middleware(
+    middleware: list[Any], phase: PhaseName, escalation_level: int = 0
+) -> None:
+    """Add SPINE-specific middleware for tool validation and context editing.
+
+    ``escalation_level`` is threaded into the window-relative middleware so the
+    compaction threshold and per-turn clamp track the *escalated* model's
+    declared ``context_window`` rather than the base provider's.
+    """
     import os as _os
+
+    from spine.config import SpineConfig
+
+    _spine_cfg = SpineConfig.load()
+
+    # Forgiving tool-call parsing — recover tool calls a weak/quantized model
+    # emitted as text (<tool_call>…</tool_call>, fenced JSON, or a bare object)
+    # before validation runs. Must sit BEFORE ToolSchemaValidator so a recovered
+    # call still gets schema-validated. Opt-in via `tool_call_normalize` /
+    # SPINE_TOOL_CALL_NORMALIZE — strict-envelope matching makes false positives
+    # unlikely, but it stays gated until tuned against the local models in use.
+    if _spine_cfg.tool_call_normalize:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        middleware.append(ToolCallNormalizer())
 
     # Tool schema validation — rebound loop for self-correction
     _validation_enabled = _os.getenv("SPINE_TOOL_SCHEMA_VALIDATION", "true").lower() not in (
@@ -708,11 +744,18 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
     # implementation/verification phases. ReadCacheMiddleware now handles
     # the re-read problem at source, while ToolOutputTrimmer is retired.
 
-    # Resolve the model's declared context window once — both the eviction
-    # threshold and the per-turn completion clamp are window-relative.
-    from spine.config import SpineConfig
+    # The model's declared context window (resolved once below from _spine_cfg)
+    # drives both the eviction threshold and the per-turn completion clamp.
 
-    _spine_cfg = SpineConfig.load()
+    # ExecuteErrorDiagnoser — append a one-line LLM fix hint to failed `execute`
+    # results. Registered AFTER ToolSchemaValidator so it sits *inner*: it sees
+    # the real shell ToolMessage, not the validator's synthetic schema-error
+    # messages. Opt-in (error_diagnosis / SPINE_ERROR_DIAGNOSIS); off by default
+    # because it adds an LLM call whose text enters the checkpointed result.
+    if _spine_cfg.error_diagnosis:
+        from spine.agents.execute_diagnoser import ExecuteErrorDiagnoser
+
+        middleware.append(ExecuteErrorDiagnoser())
 
     # TurnBudgetGuard — bound the IMPLEMENT loop's model-turn count. Per-call
     # cost is clamped (completion caps + compaction threshold), but nothing
@@ -727,7 +770,9 @@ def _add_spine_middleware(middleware: list[Any], phase: PhaseName) -> None:
         middleware.append(TurnBudgetGuard(threshold=_spine_cfg.implement_max_turns))
 
     try:
-        _provider_cfg = _spine_cfg.resolve_provider_config(phase=phase.value)
+        _provider_cfg = _spine_cfg.resolve_provider_config(
+            phase=phase.value, escalation_level=escalation_level
+        )
         _window = int(_provider_cfg.get("context_window") or 0)
     except Exception:  # noqa: BLE001 — config resolution is best-effort here
         _window = 0

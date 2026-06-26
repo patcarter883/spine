@@ -126,7 +126,7 @@ def test_stream_usage_forwarded_for_local_provider(monkeypatch):
     captured = _capture_init_chat_model(monkeypatch)
     monkeypatch.setattr(helpers, "resolve_model", lambda *a, **k: "openai:Qwen-Local")
     monkeypatch.setattr(
-        helpers, "_active_provider_config", lambda phase=None: {"model": "openai:Qwen-Local"}
+        helpers, "_active_provider_config", lambda phase=None, escalation_level=0: {"model": "openai:Qwen-Local"}
     )
 
     helpers.resolve_chat_model(None, phase="specify")
@@ -141,7 +141,7 @@ def test_stream_usage_opt_out_respected(monkeypatch):
     monkeypatch.setattr(
         helpers,
         "_active_provider_config",
-        lambda phase=None: {"model": "openai:Qwen-Local", "stream_usage": False},
+        lambda phase=None, escalation_level=0: {"model": "openai:Qwen-Local", "stream_usage": False},
     )
 
     helpers.resolve_chat_model(None, phase="specify")
@@ -160,7 +160,7 @@ def test_base_url_and_api_key_forwarded_for_local_provider(monkeypatch):
     monkeypatch.setattr(
         helpers,
         "_active_provider_config",
-        lambda phase=None: {
+        lambda phase=None, escalation_level=0: {
             "model": "openai:Mellum-Local",
             "base_url": "http://localhost:8010/v1",
             "api_key": "vllm",

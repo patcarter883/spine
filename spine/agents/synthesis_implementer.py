@@ -168,6 +168,7 @@ async def synthesize_slice_code(
     session_id: str | None,
     n: int = 1,
     feedback: str = "",
+    escalation_level: int = 0,
 ) -> list[SynthesizedSlice]:
     """Generate ``n`` candidate edit-sets for a slice via a no-tool structured call.
 
@@ -186,11 +187,18 @@ async def synthesize_slice_code(
 
     cfg = SpineConfig.load()
     phase_path = "implement/synthesis"
-    model = resolve_chat_model(config, session_id=session_id, phase=phase_path)
+    model = resolve_chat_model(
+        config, session_id=session_id, phase=phase_path, escalation_level=escalation_level
+    )
     base_cap = cfg.implement_max_completion_tokens
     try:
         window = int(
-            (cfg.resolve_provider_config(phase=phase_path) or {}).get("context_window")
+            (
+                cfg.resolve_provider_config(
+                    phase=phase_path, escalation_level=escalation_level
+                )
+                or {}
+            ).get("context_window")
             or 0
         )
     except Exception:  # noqa: BLE001
