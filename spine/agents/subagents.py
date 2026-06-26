@@ -791,14 +791,11 @@ def build_subagent_spec(
     if name == "slice-verifier":
         from spine.agents.verify_subagent_tools import build_verify_subagent_tools
 
-        fs_execute = next((t for t in fs_mw.tools if t.name == "execute"), None)
-        if fs_execute is None:
-            logger.warning(
-                "slice-verifier: no execute tool from FilesystemMiddleware; "
-                "run_checks will report an error if invoked."
-            )
+        # run_checks executes against the backend directly (not the FS execute
+        # BaseTool, which needs a LangGraph runtime the agent injects and a
+        # plain in-tool .invoke cannot supply — trace 019f02b4).
         tools = build_verify_subagent_tools(
-            workspace_root=workspace_root, execute_tool=fs_execute
+            workspace_root=workspace_root, backend=backend
         )
     else:
         tools = [t for t in fs_mw.tools if t.name in allowed_tool_names]

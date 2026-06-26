@@ -95,36 +95,63 @@ def test_leading_executable(command, lead):
     assert _leading_executable(command) == lead
 
 
-class _FakeExecute:
-    """Stand-in for the FilesystemMiddleware execute tool."""
+class _ExecResp:
+    """Duck-typed stand-in for the backend's ExecuteResponse."""
 
-    name = "execute"
+    def __init__(self, output: str, exit_code: int = 0, truncated: bool = False) -> None:
+        self.output = output
+        self.exit_code = exit_code
+        self.truncated = truncated
 
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
 
-    def invoke(self, args: dict[str, Any]) -> str:
-        self.calls.append(args)
-        return "ran: " + args["command"]
+class _FakeBackend:
+    """Stand-in for the sandbox backend (execute/aexecute -> ExecuteResponse)."""
 
-    async def ainvoke(self, args: dict[str, Any]) -> str:
-        self.calls.append(args)
-        return "ran: " + args["command"]
+    def __init__(self, output: str = "ok") -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self._output = output
+
+    def execute(self, command: str, *, timeout: int | None = None) -> _ExecResp:
+        self.calls.append((command, timeout))
+        return _ExecResp(self._output)
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> _ExecResp:
+        self.calls.append((command, timeout))
+        return _ExecResp(self._output)
 
 
 def test_run_checks_allows_test_command():
-    inner = _FakeExecute()
-    tool = RunChecksTool(execute_tool=inner)
+    be = _FakeBackend(output="3 passed")
+    tool = RunChecksTool(backend=be)
     out = tool._run("pytest -q")
-    assert out == "ran: pytest -q"
-    assert inner.calls == [{"command": "pytest -q"}]
+    assert "3 passed" in out
+    assert "[Command succeeded with exit code 0]" in out
+    assert be.calls == [("pytest -q", None)]
 
 
 def test_run_checks_forwards_timeout():
-    inner = _FakeExecute()
-    tool = RunChecksTool(execute_tool=inner)
+    be = _FakeBackend()
+    tool = RunChecksTool(backend=be)
     tool._run("ruff check spine/", timeout=30)
-    assert inner.calls == [{"command": "ruff check spine/", "timeout": 30}]
+    assert be.calls == [("ruff check spine/", 30)]
+
+
+def test_run_checks_reports_nonzero_exit():
+    class _FailBackend(_FakeBackend):
+        def execute(self, command, *, timeout=None):  # noqa: ANN001
+            return _ExecResp("boom", exit_code=1)
+
+    out = RunChecksTool(backend=_FailBackend())._run("pytest -q")
+    assert "[Command failed with exit code 1]" in out
+
+
+def test_run_checks_async_path():
+    import asyncio
+
+    be = _FakeBackend(output="async ok")
+    out = asyncio.run(RunChecksTool(backend=be)._arun("pytest -q"))
+    assert "async ok" in out
+    assert be.calls == [("pytest -q", None)]
 
 
 @pytest.mark.parametrize(
@@ -132,33 +159,52 @@ def test_run_checks_forwards_timeout():
     ["grep -rn foo spine/", "find . -name '*.py'", "cat spine/config.py", "ls -la"],
 )
 def test_run_checks_rejects_exploration(command):
-    inner = _FakeExecute()
-    tool = RunChecksTool(execute_tool=inner)
+    be = _FakeBackend()
+    tool = RunChecksTool(backend=be)
     out = tool._run(command)
     assert "rejected" in out
     assert "read_file" in out  # points the agent at the right tool
-    assert inner.calls == []  # never delegated
+    assert be.calls == []  # never delegated
 
 
 def test_run_checks_caps_output():
-    class _Huge(_FakeExecute):
-        def invoke(self, args):  # noqa: ANN001
-            return "x" * 100_000
-
-    tool = RunChecksTool(execute_tool=_Huge())
+    tool = RunChecksTool(backend=_FakeBackend(output="x" * 100_000))
     out = tool._run("pytest -q")
     assert "capped" in out
     assert len(out) < 100_000
 
 
 def test_run_checks_without_backend_reports_error():
-    tool = RunChecksTool(execute_tool=None)
+    tool = RunChecksTool(backend=None)
     assert "no execute backend" in tool._run("pytest -q")
+
+
+# ── integration: real backend signature (guards the 'runtime' bug) ───────────
+
+
+def test_run_checks_against_real_backend(tmp_path):
+    """run_checks must work against the ACTUAL spine backend.
+
+    A fake backend can't catch a signature mismatch with the real
+    SandboxBackendProtocol — that's exactly how the FS-execute-tool `runtime`
+    bug slipped past the unit tests (trace 019f02b4). This drives the real
+    backend end to end.
+    """
+    from spine.agents.backend import build_backend
+
+    backend = build_backend(str(tmp_path))
+    (tmp_path / "hello.txt").write_text("hi", encoding="utf-8")
+    out = RunChecksTool(backend=backend)._run("echo run_checks_ok && cat hello.txt")
+    assert "run_checks_ok" in out
+    assert "hi" in out
+    assert "exit code 0" in out
+    # exploration is still policed even with a real backend
+    assert "rejected" in RunChecksTool(backend=backend)._run("grep -rn x .")
 
 
 # ── factory ──────────────────────────────────────────────────────────────────
 
 
 def test_factory_builds_exactly_two_tools():
-    tools = build_verify_subagent_tools(workspace_root="/tmp", execute_tool=_FakeExecute())
+    tools = build_verify_subagent_tools(workspace_root="/tmp", backend=_FakeBackend())
     assert [t.name for t in tools] == ["read_file", "run_checks"]

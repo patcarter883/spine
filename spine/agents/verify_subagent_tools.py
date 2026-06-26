@@ -240,9 +240,16 @@ def _leading_executable(command: str) -> str:
 class RunChecksTool(BaseTool):
     """Constrained test/lint/build runner.
 
-    Delegates to the real ``execute`` backend but rejects pure-exploration
-    commands so the verifier inspects files through ``read_file`` instead of
-    spiralling on ``grep``/``find``/``cat`` (trace 019f0212).
+    Runs the command against the sandbox backend directly (``backend.execute`` /
+    ``backend.aexecute``) but rejects pure-exploration commands so the verifier
+    inspects files through ``read_file`` instead of spiralling on
+    ``grep``/``find``/``cat`` (trace 019f0212).
+
+    It deliberately calls the backend rather than wrapping the
+    FilesystemMiddleware ``execute`` BaseTool: that tool requires a LangGraph
+    ``runtime`` injected by the agent's ToolNode, which a plain ``.invoke`` from
+    inside another tool cannot supply (it raises ``missing 'runtime'``). The
+    backend exposes the same execution primitive without that coupling.
     """
 
     name: str = "run_checks"
@@ -257,13 +264,13 @@ class RunChecksTool(BaseTool):
     )
     args_schema: Optional[ArgsSchema] = _RunChecksInput
 
-    # The underlying FilesystemMiddleware ``execute`` BaseTool, injected at
-    # build time. ``run_checks`` is a policy wrapper around it.
-    _inner: Any = PrivateAttr(default=None)
+    # The sandbox backend (SandboxBackendProtocol / CompositeBackend), injected
+    # at build time. ``run_checks`` is a policy wrapper around backend.execute.
+    _backend: Any = PrivateAttr(default=None)
 
-    def __init__(self, execute_tool: Any = None, **kwargs: Any) -> None:
+    def __init__(self, backend: Any = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._inner = execute_tool
+        self._backend = backend
 
     def _reject(self, lead: str) -> str:
         return (
@@ -283,29 +290,47 @@ class RunChecksTool(BaseTool):
             + out[-half:]
         )
 
-    def _inner_args(self, command: str, timeout: Optional[int]) -> dict[str, Any]:
-        args: dict[str, Any] = {"command": command}
-        if timeout is not None:
-            args["timeout"] = timeout
-        return args
+    @staticmethod
+    def _format(result: Any) -> str:
+        """Render a backend ExecuteResponse the way the model expects.
+
+        Mirrors FilesystemMiddleware's execute formatting: output, then an exit
+        status line, then a truncation note.
+        """
+        parts = [str(getattr(result, "output", result) or "")]
+        exit_code = getattr(result, "exit_code", None)
+        if exit_code is not None:
+            status = "succeeded" if exit_code == 0 else "failed"
+            parts.append(f"\n[Command {status} with exit code {exit_code}]")
+        if getattr(result, "truncated", False):
+            parts.append("\n[Output was truncated due to size limits]")
+        return "".join(parts)
 
     def _run(self, command: str, timeout: Optional[int] = None) -> str:
         lead = _leading_executable(command)
         if lead in _EXPLORATION_COMMANDS:
             return self._reject(lead)
-        if self._inner is None:
+        if self._backend is None:
             return "status=error: no execute backend available for run_checks."
-        out = self._inner.invoke(self._inner_args(command, timeout))
-        return self._cap(str(out))
+        result = (
+            self._backend.execute(command, timeout=timeout)
+            if timeout is not None
+            else self._backend.execute(command)
+        )
+        return self._cap(self._format(result))
 
     async def _arun(self, command: str, timeout: Optional[int] = None) -> str:
         lead = _leading_executable(command)
         if lead in _EXPLORATION_COMMANDS:
             return self._reject(lead)
-        if self._inner is None:
+        if self._backend is None:
             return "status=error: no execute backend available for run_checks."
-        out = await self._inner.ainvoke(self._inner_args(command, timeout))
-        return self._cap(str(out))
+        result = (
+            await self._backend.aexecute(command, timeout=timeout)
+            if timeout is not None
+            else await self._backend.aexecute(command)
+        )
+        return self._cap(self._format(result))
 
 
 # ── Factory ────────────────────────────────────────────────────────────────
@@ -313,7 +338,7 @@ class RunChecksTool(BaseTool):
 
 def build_verify_subagent_tools(
     workspace_root: str,
-    execute_tool: Any = None,
+    backend: Any = None,
 ) -> list[BaseTool]:
     """Build the bounded tool surface for the slice-verifier subagent.
 
@@ -324,14 +349,15 @@ def build_verify_subagent_tools(
 
     Args:
         workspace_root: Absolute path to the project workspace root.
-        execute_tool: The FilesystemMiddleware ``execute`` BaseTool that
-            ``run_checks`` wraps. When ``None`` (no execution-capable backend),
-            ``run_checks`` returns a structured error instead of running.
+        backend: The sandbox backend (SandboxBackendProtocol / CompositeBackend)
+            that ``run_checks`` executes against. When ``None`` (no
+            execution-capable backend), ``run_checks`` returns a structured
+            error instead of running.
 
     Returns:
         ``[VerifyReadFileTool, RunChecksTool]``.
     """
     return [
         VerifyReadFileTool(workspace_root=workspace_root),
-        RunChecksTool(execute_tool=execute_tool),
+        RunChecksTool(backend=backend),
     ]
