@@ -141,6 +141,15 @@ def _build_review_prompt(
             "still-unaddressed point remains, or you find a genuinely NEW and "
             "BLOCKING semantic defect (not a schema/field-name nitpick). Keep "
             "your asks stable across rounds so the author can converge. "
+            "Do NOT re-litigate slice ORGANISATION — splitting, merging, "
+            "consolidating, renaming, or re-ordering slices that already form a "
+            "valid dependency graph with full coverage is a structural taste "
+            "preference, not a blocking defect. A deterministic validator "
+            "already owns DAG validity, coverage, and granularity; never block a "
+            "round on 'split this slice' / 'consolidate these slices' "
+            "suggestions. Block only on a concrete SEMANTIC defect: a missing "
+            "requirement, a dangling dependency, or a referenced symbol/method "
+            "that no slice provides. "
             "Everything you need is in the tagged blocks — do not read files."
             + spec_contradiction_note
         )
@@ -852,17 +861,19 @@ def critic_router(state: WorkflowState) -> str:
         "escalate": lcr.get("escalate", False),
         "escalation_kind": lcr.get("escalation_kind"),
         "stagnation_streak": lcr.get("stagnation_streak", 0),
+        "churn_streak": lcr.get("churn_streak", 0),
     }
     decision = _handle_review_outcome(state, reviewed_phase, review)
     retry_count = state.get("retry_count", {})
     logger.info(
-        "[%s] critic_router: phase=%s status=%s retries=%d/%d streak=%d kind=%s → %s",
+        "[%s] critic_router: phase=%s status=%s retries=%d/%d streak=%d churn=%d kind=%s → %s",
         state.get("work_id", "?"),
         reviewed_phase,
         review_status,
         retry_count.get(reviewed_phase, 0),
         state.get("max_retries", 3),
         review.get("stagnation_streak", 0),
+        review.get("churn_streak", 0),
         review.get("escalation_kind"),
         decision,
     )

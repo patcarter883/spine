@@ -494,15 +494,22 @@ def _critic_result_mapper(reviewed_phase: str):
             prior_lcr if prior_lcr.get("phase") == reviewed_phase else {}
         )
 
-        # Convergence detection (rec 1 + rec 3): is this rework round repeating
-        # the previous verdict, and which specific asks are still unaddressed?
+        # Convergence detection: is this rework round repeating the previous
+        # verdict (stagnation), or shifting the goalposts to wholly new asks
+        # (churn)? Both are non-convergence; together they cap the loop well
+        # short of the full retry budget. ``unaddressed`` lists the prior asks
+        # that still recur, for the rework prompt's "STILL NOT ADDRESSED" block.
         unaddressed: list[str] = []
         stagnation_streak = 0
+        churn_streak = 0
         if phase_status == ReviewStatus.NEEDS_REVISION.value and prior_for_phase:
             unaddressed = critic_convergence.unaddressed_points(
                 prior_for_phase, effective_result
             )
             stagnation_streak = critic_convergence.next_stagnation_streak(
+                prior_for_phase, effective_result
+            )
+            churn_streak = critic_convergence.next_churn_streak(
                 prior_for_phase, effective_result
             )
 
@@ -511,6 +518,7 @@ def _critic_result_mapper(reviewed_phase: str):
         blocker_category = effective_result.get("blocker_category")
         spec_contradiction = blocker_category == "spec_contradiction"
         stagnated = stagnation_streak >= critic_convergence.STAGNATION_LIMIT
+        churning = churn_streak >= critic_convergence.CHURN_LIMIT
         retries_exhausted = (
             phase_status == ReviewStatus.NEEDS_REVISION.value
             and new_attempt >= max_retries
@@ -519,12 +527,15 @@ def _critic_result_mapper(reviewed_phase: str):
             phase_status == ReviewStatus.NEEDS_REVIEW.value
             or spec_contradiction
             or stagnated
+            or churning
             or retries_exhausted
         )
         if spec_contradiction:
             escalation_kind = "spec_amendment"
         elif stagnated:
             escalation_kind = "stagnation"
+        elif churning:
+            escalation_kind = "non_convergence"
         elif retries_exhausted:
             escalation_kind = "retries_exhausted"
         elif phase_status == ReviewStatus.NEEDS_REVIEW.value:
@@ -544,6 +555,7 @@ def _critic_result_mapper(reviewed_phase: str):
             "suggestions": effective_result.get("suggestions", []),
             "attempt": new_attempt,
             "stagnation_streak": stagnation_streak,
+            "churn_streak": churn_streak,
             "unaddressed_points": unaddressed,
             "blocker_category": blocker_category,
             "escalate": escalate,

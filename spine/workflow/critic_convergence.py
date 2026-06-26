@@ -43,6 +43,17 @@ REPEAT_VERDICT_RATIO = 0.5
 # retry budget.
 STAGNATION_LIMIT = 2
 
+# Number of *consecutive* goalpost-shift verdicts that trips early escalation.
+# A goalpost shift is the OPPOSITE failure to stagnation: each NEEDS_REVISION
+# round raises a wholly *new* set of asks instead of re-raising the prior ones
+# (trace 019f01c2: the plan critic rejected a structurally-valid plan five
+# times, every round with fresh re-slice/consolidate nitpicks, so the
+# repeat-based stagnation streak never moved off 0 and the loop burned the
+# entire retry budget). Detecting churn caps the loop at ~3 attempts: round 1
+# sets the baseline, two consecutive shifts mean the critic is moving the
+# goalposts rather than driving convergence.
+CHURN_LIMIT = 2
+
 # Short, high-frequency words carry no signal for "is this the same ask"; they
 # would inflate Jaccard overlap between unrelated points. Kept deliberately
 # small — domain words (config, slice, schema, provider…) must survive.
@@ -183,4 +194,45 @@ def next_stagnation_streak(
     """
     if is_repeat_verdict(prior_review, current_review):
         return int((prior_review or {}).get("stagnation_streak", 0) or 0) + 1
+    return 0
+
+
+def is_goalpost_shift(
+    prior_review: dict[str, Any] | None,
+    current_review: dict[str, Any] | None,
+    *,
+    threshold: float = POINT_MATCH_THRESHOLD,
+    ratio: float = REPEAT_VERDICT_RATIO,
+) -> bool:
+    """True when the current verdict moves the goalposts off the prior one.
+
+    A goalpost shift is a NEEDS_REVISION round that, against a real prior
+    verdict, raises a substantially *new* set of asks rather than repeating
+    the prior ones. It is the mirror image of :func:`is_repeat_verdict`:
+
+    * no prior points → nothing to shift from → ``False`` (the first revision
+      round is never a shift);
+    * a repeat verdict is stagnation, not churn → ``False``;
+    * otherwise (a real prior verdict whose asks did NOT recur) → ``True``.
+    """
+    if not review_points(prior_review):
+        return False
+    return not is_repeat_verdict(
+        prior_review, current_review, threshold=threshold, ratio=ratio
+    )
+
+
+def next_churn_streak(
+    prior_review: dict[str, Any] | None,
+    current_review: dict[str, Any] | None,
+) -> int:
+    """Updated consecutive-goalpost-shift streak after the current verdict.
+
+    Reads the prior streak off ``prior_review['churn_streak']`` (0 when
+    absent). Increments it when the current verdict shifts the goalposts off
+    the prior one; resets to 0 otherwise (no prior, or a repeat — repeats are
+    owned by :func:`next_stagnation_streak`).
+    """
+    if is_goalpost_shift(prior_review, current_review):
+        return int((prior_review or {}).get("churn_streak", 0) or 0) + 1
     return 0
