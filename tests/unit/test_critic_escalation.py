@@ -138,6 +138,81 @@ class TestStagnationEscalation:
         assert base["last_critic_review"]["unaddressed_points"] == []
 
 
+class TestChurnEscalation:
+    """trace 019f01c2: the critic shifted goalposts every round (fresh asks),
+    so the repeat-based stagnation streak never moved and the loop burned all
+    five retries. Churn detection escalates after two consecutive shifts."""
+
+    def test_second_consecutive_shift_escalates_early(self):
+        # Prior round already a goalpost shift (churn 1); a wholly different
+        # verdict shifts again — escalate despite remaining budget.
+        parent = {
+            "max_retries": 5,
+            "retry_count": {PLAN: 2},
+            "last_critic_review": {
+                "phase": PLAN,
+                "status": ReviewStatus.NEEDS_REVISION.value,
+                "suggestions": ["Consolidate the embeddings and rerankers sections"],
+                "churn_streak": 1,
+            },
+        }
+        base, state, route = _run(
+            parent,
+            _subgraph_result(
+                ReviewStatus.NEEDS_REVISION.value,
+                suggestions=["Split phase-provider-config-ui into smaller slices"],
+            ),
+        )
+        assert route == "needs_review"
+        assert base["status"] == "needs_review"
+        assert base["needs_review_phase"] == PLAN
+        assert base["needs_review_kind"] == "non_convergence"
+        assert base["last_critic_review"]["churn_streak"] == 2
+
+    def test_first_shift_still_reworks(self):
+        # A single goalpost shift is a warning round — rework continues.
+        parent = {
+            "max_retries": 5,
+            "retry_count": {PLAN: 1},
+            "last_critic_review": {
+                "phase": PLAN,
+                "status": ReviewStatus.NEEDS_REVISION.value,
+                "suggestions": _ASKS,
+                "churn_streak": 0,
+            },
+        }
+        base, state, route = _run(
+            parent,
+            _subgraph_result(
+                ReviewStatus.NEEDS_REVISION.value,
+                suggestions=["Consolidate the embeddings and rerankers sections"],
+            ),
+        )
+        assert route == "needs_revision"
+        assert base["status"] == "running"
+        assert base["last_critic_review"]["churn_streak"] == 1
+        assert base["last_critic_review"]["escalation_kind"] is None
+
+    def test_repeat_does_not_count_as_churn(self):
+        # A repeat verdict drives the stagnation streak, not churn.
+        parent = {
+            "max_retries": 5,
+            "retry_count": {PLAN: 1},
+            "last_critic_review": {
+                "phase": PLAN,
+                "status": ReviewStatus.NEEDS_REVISION.value,
+                "suggestions": _ASKS,
+                "churn_streak": 1,
+                "stagnation_streak": 0,
+            },
+        }
+        base, state, route = _run(
+            parent, _subgraph_result(ReviewStatus.NEEDS_REVISION.value, suggestions=_ASKS)
+        )
+        assert base["last_critic_review"]["churn_streak"] == 0
+        assert base["last_critic_review"]["stagnation_streak"] == 1
+
+
 class TestSpecContradiction:
     def test_spec_contradiction_routes_to_spec_amendment(self):
         parent = {"max_retries": 3, "retry_count": {}}

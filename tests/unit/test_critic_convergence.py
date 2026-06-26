@@ -118,6 +118,44 @@ class TestStagnationStreak:
         assert cc.STAGNATION_LIMIT == 2
 
 
+class TestIsGoalpostShift:
+    def test_new_asks_against_prior_is_a_shift(self):
+        # The trace 019f01c2 failure: each round raises fresh asks.
+        assert cc.is_goalpost_shift(_PRIOR, _DIFFERENT) is True
+
+    def test_repeat_is_not_a_shift(self):
+        # Repeats are stagnation, owned by the stagnation streak — not churn.
+        assert cc.is_goalpost_shift(_PRIOR, _REPEAT) is False
+
+    def test_no_prior_is_never_a_shift(self):
+        assert cc.is_goalpost_shift({}, _DIFFERENT) is False
+        assert cc.is_goalpost_shift(None, _DIFFERENT) is False
+
+
+class TestChurnStreak:
+    def test_increments_on_shift(self):
+        prior = {**_PRIOR, "churn_streak": 0}
+        assert cc.next_churn_streak(prior, _DIFFERENT) == 1
+
+    def test_accumulates_across_rounds(self):
+        prior = {**_DIFFERENT, "churn_streak": 1}
+        # A second, again-different verdict keeps moving the goalposts.
+        another = {"suggestions": ["Add docstrings to every new public method"]}
+        assert cc.next_churn_streak(prior, another) == 2
+
+    def test_resets_on_repeat(self):
+        # A repeat round is stagnation, not churn → churn streak resets.
+        prior = {**_PRIOR, "churn_streak": 2}
+        assert cc.next_churn_streak(prior, _REPEAT) == 0
+
+    def test_no_prior_is_zero(self):
+        assert cc.next_churn_streak({}, _DIFFERENT) == 0
+
+    def test_churn_limit_is_two(self):
+        # Documents the escalation threshold used by the mapper.
+        assert cc.CHURN_LIMIT == 2
+
+
 class TestTokenization:
     def test_stopwords_do_not_create_false_matches(self):
         a = {"suggestions": ["you should add the thing to the file"]}
