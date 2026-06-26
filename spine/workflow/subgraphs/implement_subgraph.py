@@ -249,6 +249,32 @@ def _route_slices(
     return sends
 
 
+async def _dispatch_gate_node(
+    state: ImplementSubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Single barrier between the parallel slice fan-out and the router.
+
+    Every dispatch node (``split_slices`` and each implementer/decomposer) feeds
+    into this node via a *static* edge, so LangGraph collapses all parallel
+    branches of a super-step into **one** ``dispatch_gate`` task. ``_route_slices``
+    is wired only here, so the routing decision is computed exactly once per
+    super-step on the fully-merged state.
+
+    Without this barrier the conditional edge was attached to each fan-out node,
+    so it was re-evaluated once per parallel branch. Sibling branches saw only a
+    subset of each other's slice-list removes (partially-merged state), producing
+    divergent decisions: one branch re-dispatched a slice another had already
+    claimed, and — when the last slices completed together — one branch routed to
+    ``synthesize_implementation`` while another re-dispatched, scheduling
+    ``synthesize_implementation`` and ``save_artifacts`` into a colliding
+    super-step. Both write the un-reduced ``artifacts_output`` channel, tripping
+    ``InvalidUpdateError`` ("Can receive only one value per step", trace
+    019f0193). This mirrors VERIFY's ``aggregate_verification`` barrier.
+    """
+    return {}
+
+
 # ── split_slices node (per-file decomposition) ──────────────────────────
 
 
@@ -1590,20 +1616,26 @@ def build_implement_subgraph() -> Any:
     Nodes:
     1. ``split_slices`` — runs once at START, replacing each multi-file slice
        with the head of a single-file sub-slice chain (PER_FILE decomposition).
-    2. ``slice_implementer`` — per-slice subagent with restricted tools; on
+    2. ``dispatch_gate`` — single barrier; the sole holder of ``_route_slices``.
+    3. ``slice_implementer`` — per-slice subagent with restricted tools; on
        success it promotes the parent's next file from ``_sibling_queue``.
-    3. ``fallback_decomposer`` — micro-slices a failed slice.
-    4. ``synthesize_implementation`` — writes implementation artifacts.
-    5. ``save_artifacts`` — scans disk and materializes to state.
+    4. ``fallback_decomposer`` — micro-slices a failed slice.
+    5. ``synthesize_implementation`` — writes implementation artifacts.
+    6. ``save_artifacts`` — scans disk and materializes to state.
 
-    The conditional edge ``_route_slices`` is wired three times — from
-    ``split_slices`` and from each fan-out node — so the loop re-evaluates
-    after every super-step until both ``pending_slices`` and ``failed_slices``
-    are empty.
+    ``split_slices`` and every fan-out node feed ``dispatch_gate`` via STATIC
+    edges, so LangGraph collapses each super-step's parallel branches into one
+    gate task. ``_route_slices`` is wired ONLY on the gate, so it re-evaluates
+    exactly once per super-step on fully-merged state until both
+    ``pending_slices`` and ``failed_slices`` are empty. (Wiring the router on
+    each fan-out node instead re-evaluated it per parallel branch on
+    partially-merged state — the duplicate-dispatch / artifacts_output-collision
+    bug in trace 019f0193.)
     """
     builder = StateGraph(ImplementSubgraphState)
 
     builder.add_node("split_slices", _split_slices_node)
+    builder.add_node("dispatch_gate", _dispatch_gate_node)
     builder.add_node("plan_slice_implementer", _plan_slice_implementer_node)
     builder.add_node("slice_implementer", _slice_implementer_node)
     builder.add_node("synthesis_implementer", _synthesis_implementer_node)
@@ -1611,21 +1643,30 @@ def build_implement_subgraph() -> Any:
     builder.add_node("synthesize_implementation", _synthesize_implementation_node)
     builder.add_node("save_artifacts", _save_implement_artifacts)
 
-    # START → split_slices (per-file decomposition) → route. The split node
-    # runs once, replacing multi-file slices with single-file chains before
-    # any dispatch; the router then fans out as before.
+    # START → split_slices (per-file decomposition) → dispatch_gate → route.
+    # The split node runs once, replacing multi-file slices with single-file
+    # chains before any dispatch.
     builder.add_edge(START, "split_slices")
-    builder.add_conditional_edges("split_slices", _route_slices, _ROUTE_MAP)
+
+    # Every dispatch node feeds the single ``dispatch_gate`` barrier via a STATIC
+    # edge. LangGraph collapses the parallel branches of a super-step into one
+    # gate task, so ``_route_slices`` (wired ONLY on the gate) is evaluated
+    # exactly once per super-step on the fully-merged state. Attaching the router
+    # to each fan-out node instead re-evaluated it per parallel branch on
+    # partially-merged state, causing duplicate dispatch and the
+    # synthesize/save artifacts_output collision (trace 019f0193). Mirrors
+    # VERIFY's ``aggregate_verification`` barrier.
+    builder.add_edge("split_slices", "dispatch_gate")
     # plan_slice_implementer dispatches to slice_implementer dynamically
     # via Command(goto=Send) (see the node itself) so each parallel
     # branch carries its own directive without colliding on a shared
-    # LastValue channel. slice_implementer's outgoing conditional edge
-    # re-enters the router so the dispatch loop terminates correctly.
-    builder.add_conditional_edges("slice_implementer", _route_slices, _ROUTE_MAP)
-    # The flag-gated synthesis editor re-enters the router exactly like the tool
+    # LastValue channel.
+    builder.add_edge("slice_implementer", "dispatch_gate")
+    # The flag-gated synthesis editor re-enters the gate exactly like the tool
     # path, so the dispatch loop terminates the same way.
-    builder.add_conditional_edges("synthesis_implementer", _route_slices, _ROUTE_MAP)
-    builder.add_conditional_edges("fallback_decomposer", _route_slices, _ROUTE_MAP)
+    builder.add_edge("synthesis_implementer", "dispatch_gate")
+    builder.add_edge("fallback_decomposer", "dispatch_gate")
+    builder.add_conditional_edges("dispatch_gate", _route_slices, _ROUTE_MAP)
     builder.add_edge("synthesize_implementation", "save_artifacts")
     builder.add_edge("save_artifacts", END)
 
