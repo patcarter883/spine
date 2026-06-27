@@ -526,6 +526,40 @@ class UIApi:
         """
         return self._audit.query_events(work_id=work_id, event_type=event_type, limit=limit)
 
+    # ── Cross-run experience (distilled lessons) ──
+
+    def _experience_store(self) -> Any:
+        """Build the experience store anchored at the project's main repo root."""
+        from spine.agents.experience import experience_store_for
+
+        return experience_store_for(self._config)
+
+    def list_experience(self) -> list[dict[str, Any]]:
+        """Return all distilled experience lessons as dicts, newest first.
+
+        Each dict carries the :class:`ExperienceLesson` fields (id, phase,
+        category, trigger, lesson, source_tier, salience, work_id, created_at).
+        """
+        lessons = self._experience_store().all()
+        lessons.sort(key=lambda le: (le.created_at or "", le.salience), reverse=True)
+        return [le.model_dump() for le in lessons]
+
+    def experience_stats(self) -> dict[str, Any]:
+        """Summarise the lesson store: total count and per-phase breakdown."""
+        lessons = self._experience_store().all()
+        by_phase: dict[str, int] = {}
+        for le in lessons:
+            by_phase[le.phase] = by_phase.get(le.phase, 0) + 1
+        return {"total": len(lessons), "by_phase": by_phase}
+
+    def delete_experience_lesson(self, lesson_id: str) -> bool:
+        """Delete a single lesson by id. Returns True if one was removed."""
+        return self._experience_store().delete(lesson_id)
+
+    def clear_experience(self, phase: str | None = None) -> int:
+        """Delete all lessons (or all for ``phase``). Returns the count removed."""
+        return self._experience_store().clear(phase=phase)
+
     # ── Config ──
 
     def get_config(self) -> dict[str, Any]:

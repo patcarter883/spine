@@ -716,6 +716,14 @@ async def submit_work(
             },
         )
 
+        # ── Capture cross-run experience ──
+        # Distil this run's critic feedback into reusable lessons, persisted to
+        # the MAIN repo root (base `config`, not the worktree) so they survive
+        # the sandbox rollback below. Best-effort — never raises.
+        from spine.agents.experience import capture_run_experience
+
+        await capture_run_experience(result, config, final_status)
+
         # ── Land or discard the sandbox patch ──
         # Code-producing work ran against an isolated worktree; merge it to
         # main on success, roll it back on any other terminal status. No-op
@@ -1102,6 +1110,11 @@ async def resume_work(
             final_phase,
             {"status": final_status, "resumed": True},
         )
+
+        # Capture cross-run experience from the resumed run (best-effort).
+        from spine.agents.experience import capture_run_experience
+
+        await capture_run_experience(result, config, final_status)
 
         # Land or discard the worktree patch based on the resumed outcome.
         sandbox.finalize(final_status)
@@ -2107,6 +2120,11 @@ async def _run_workflow_graph_inner(
         final_phase,
         {"status": final_status, "restarted": is_restart},
     )
+
+    # Capture cross-run experience from this run's critic feedback (best-effort).
+    from spine.agents.experience import capture_run_experience
+
+    await capture_run_experience(result, config, final_status)
 
     try:
         from spine.ui.ws_bus import get_bus

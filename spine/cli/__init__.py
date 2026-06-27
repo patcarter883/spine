@@ -928,3 +928,90 @@ def project_review(project_id: str, config_path: str) -> None:
                 f.get("description", "")[:70],
             )
         console.print(table)
+
+
+# ── Experience (cross-run distilled lessons) ─────────────────────────────────
+
+
+@main.group()
+def experience() -> None:
+    """Inspect and prune the cross-run distilled-experience store."""
+
+
+@experience.command(name="list")
+@click.option("--phase", default=None, help="Only show lessons for this phase.")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit raw JSON instead of a table.",
+)
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def experience_list(phase: str | None, as_json: bool, config_path: str) -> None:
+    """List distilled lessons, newest first (optionally filtered by --phase)."""
+    from spine.agents.experience import experience_store_for
+
+    config = SpineConfig.load(path=config_path)
+    lessons = experience_store_for(config).all()
+    lessons.sort(key=lambda le: (le.created_at or "", le.salience), reverse=True)
+    if phase:
+        lessons = [le for le in lessons if le.phase == phase]
+
+    if as_json:
+        import json
+
+        console.print_json(json.dumps([le.model_dump() for le in lessons]))
+        return
+
+    if not lessons:
+        scope = f" for phase '{phase}'" if phase else ""
+        console.print(f"[yellow]No experience lessons{scope}.[/yellow]")
+        return
+
+    table = Table(title=f"Learned Experience ({len(lessons)})")
+    table.add_column("ID", style="bold")
+    table.add_column("Phase")
+    table.add_column("Cat")
+    table.add_column("Sal", justify="right")
+    table.add_column("Tier")
+    table.add_column("Lesson")
+    for le in lessons:
+        table.add_row(
+            le.id,
+            le.phase,
+            le.category or "—",
+            str(le.salience),
+            le.source_tier,
+            (le.lesson or "")[:80],
+        )
+    console.print(table)
+
+
+@experience.command(name="clear")
+@click.option("--phase", default=None, help="Only clear lessons for this phase.")
+@click.option("--id", "lesson_id", default=None, help="Delete a single lesson by id.")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def experience_clear(
+    phase: str | None, lesson_id: str | None, yes: bool, config_path: str
+) -> None:
+    """Delete lessons — a single --id, all of one --phase, or everything."""
+    from spine.agents.experience import experience_store_for
+
+    config = SpineConfig.load(path=config_path)
+    store = experience_store_for(config)
+
+    if lesson_id:
+        if store.delete(lesson_id):
+            console.print(f"[green]Deleted lesson '{lesson_id}'.[/green]")
+        else:
+            console.print(f"[yellow]No lesson with id '{lesson_id}'.[/yellow]")
+        return
+
+    target = f"phase '{phase}'" if phase else "ALL phases"
+    if not yes and not click.confirm(f"Delete every lesson for {target}?"):
+        console.print("Aborted.")
+        return
+
+    removed = store.clear(phase=phase)
+    console.print(f"[green]Removed {removed} lesson(s) for {target}.[/green]")

@@ -21,6 +21,7 @@ build/
 .spine/jobs.db
 .spine/state/
 .spine/audit.db
+.spine/experience/
 
 # Debug / scratch files
 llm_debug.txt
