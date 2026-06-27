@@ -289,3 +289,60 @@ class CriticReview(BaseModel):
             "of consuming retry attempts. Leave null for ordinary defects."
         ),
     )
+
+
+class ExperienceLesson(BaseModel):
+    """A distilled, reusable lesson learned from a prior run's critic feedback.
+
+    Lessons are captured at the end of a run from phases the critic flagged
+    for revision (or escalated for human review), then injected into the
+    corresponding phase's prompt on future runs — a cross-run "distilled
+    experience" loop. The model deliberately keeps each lesson compact so the
+    injected block stays small (the whole point versus dumping raw history).
+    """
+
+    id: str = Field(description="Short unique id for this lesson")
+    work_id: str = Field(description="Work item the lesson was distilled from")
+    phase: str = Field(
+        description="Phase the lesson applies to (e.g. 'specify', 'plan')"
+    )
+    category: str | None = Field(
+        default=None,
+        description="Optional task category for relevance filtering",
+    )
+    trigger: str = Field(
+        description="What the critic flagged — the defect this lesson guards against"
+    )
+    lesson: str = Field(
+        description="The reusable guidance to apply on future runs of this phase"
+    )
+    source_tier: str = Field(
+        default="agent",
+        description="Review tier the lesson came from: agent | adversarial | human",
+    )
+    salience: int = Field(
+        default=1,
+        description="Rework rounds this defect cost — higher ranks first in recall",
+    )
+    created_at: str = Field(
+        default="", description="ISO timestamp when the lesson was captured"
+    )
+    dedup_basis: str = Field(
+        default="",
+        description=(
+            "Pre-generalization lesson text used as the stable dedup identity. "
+            "Frozen at distill time so the LLM generalization pass — which "
+            "rewrites ``lesson`` non-deterministically — cannot defeat cross-run "
+            "de-duplication. Falls back to ``lesson`` when unset (older records)."
+        ),
+    )
+
+    def dedup_key(self) -> str:
+        """Stable key for de-duplicating near-identical lessons within a phase.
+
+        Keys off ``dedup_basis`` (the pre-generalization text) when present, so a
+        recurring defect collides across runs even after generalization paraphrases
+        the visible ``lesson`` differently each time.
+        """
+        norm = " ".join((self.dedup_basis or self.lesson or "").lower().split())
+        return f"{self.phase}::{norm}"

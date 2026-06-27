@@ -89,6 +89,9 @@ class Tag(str, Enum):
     ERRORS = "errors"
     DIRECTIVE = "directive"
     ONBOARDING_DOCS = "onboarding_documentation"
+    # Distilled lessons from prior runs' critic feedback for this phase —
+    # cross-run "experience" injected so the agent avoids repeat defects.
+    LEARNED_EXPERIENCE = "learned_experience"
     # Implement-phase slice payload: existing definitions the slice's code
     # extends (with their source inlined), and the planner's targeted edits.
     REFERENCE_SYMBOLS = "reference_symbols"

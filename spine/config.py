@@ -544,6 +544,22 @@ class SpineConfig:
     # regresses small-model behaviour. See spine.agents.skills_resolver.
     onboarding_context_injection: bool = True
 
+    # ── Cross-run distilled experience ──
+    # SPINE captures a compact "lesson" from each run's critic/adversarial
+    # feedback and injects the relevant lessons into the matching phase's
+    # prompt on future runs, so repeat defects are caught earlier. Lessons
+    # live under ``experience_path`` (file-backed, deduped, per-phase capped).
+    experience_path: str = ".spine/experience"
+    # Capture lessons at the end of each run (write path). Default on.
+    experience_capture: bool = True
+    # Inject lessons into phase prompts (read path). Default on.
+    experience_injection: bool = True
+    # Run a one-shot LLM pass at capture time that rewrites each run-specific
+    # defect into a general, reusable rule (and drops un-generalisable noise).
+    # One cheap call per run that produced lessons; fails open to the raw
+    # deterministic lessons. Default on.
+    experience_generalize: bool = True
+
     # Researcher convergence steering (see ResearcherConvergenceMiddleware)
     convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)
 
@@ -918,6 +934,25 @@ class SpineConfig:
                     spine.get("onboarding_explorer_max_cycles", 3),
                 )
             ),
+            experience_path=os.getenv(
+                "SPINE_EXPERIENCE_PATH",
+                spine.get("experience_path", ".spine/experience"),
+            ),
+            experience_capture=os.getenv(
+                "SPINE_EXPERIENCE_CAPTURE",
+                str(spine.get("experience_capture", True)).lower(),
+            )
+            not in ("0", "false", "no"),
+            experience_injection=os.getenv(
+                "SPINE_EXPERIENCE_INJECTION",
+                str(spine.get("experience_injection", True)).lower(),
+            )
+            not in ("0", "false", "no"),
+            experience_generalize=os.getenv(
+                "SPINE_EXPERIENCE_GENERALIZE",
+                str(spine.get("experience_generalize", True)).lower(),
+            )
+            not in ("0", "false", "no"),
             convergence=_parse_convergence_config(spine.get("convergence", {})),
             token_compaction=_parse_token_compaction_config(
                 spine.get("token_compaction", {})
@@ -1288,3 +1323,4 @@ class SpineConfig:
         for p in [self.checkpoint_path, self.artifact_path, self.queue_path]:
             Path(p).parent.mkdir(parents=True, exist_ok=True)
         Path(self.project_path).mkdir(parents=True, exist_ok=True)
+        Path(self.experience_path).mkdir(parents=True, exist_ok=True)

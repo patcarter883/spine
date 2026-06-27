@@ -478,6 +478,11 @@ def _critic_result_mapper(reviewed_phase: str):
                 "suggestions": [],
             }
 
+        # Stamp the reviewed phase so downstream consumers (notably cross-run
+        # experience capture) can attribute this feedback entry without parsing
+        # it out of the free-text reason. Copy so we don't alias the subgraph's
+        # dict into both ``feedback`` and ``last_critic_review``.
+        effective_result = {**effective_result, "phase": reviewed_phase}
         base["feedback"] = [effective_result]
 
         phase_status = subgraph_result.get("phase_status", "")
@@ -660,6 +665,9 @@ def _adversarial_result_mapper(
             "suggestions": [],
         }
 
+    # Adversarial always reviews the PLAN (see registration above); stamp it so
+    # experience capture attributes the feedback entry without reason-parsing.
+    effective_result = {**effective_result, "phase": PhaseName.PLAN.value}
     base["feedback"] = [effective_result]
 
     phase_status = subgraph_result.get("phase_status", "") or effective_result.get(

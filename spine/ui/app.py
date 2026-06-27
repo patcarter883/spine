@@ -123,6 +123,12 @@ def _projects() -> None:
     render(api)
 
 
+def _experience() -> None:
+    from spine.ui._pages.experience import render
+
+    render(api)
+
+
 pages = {
     "": [
         st.Page(_dashboard, title="Dashboard", icon="🏠", url_path="dashboard"),
@@ -152,6 +158,7 @@ pages = {
     ],
     "System": [
         st.Page(_human_review, title="Human Review", icon="👤", url_path="human-review"),
+        st.Page(_experience, title="Learned Experience", icon="🧠", url_path="experience"),
         st.Page(_audit_log, title="Audit Log", icon="📋", url_path="audit-log"),
         st.Page(_config, title="Config", icon="⚙️", url_path="config"),
     ],

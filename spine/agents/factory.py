@@ -472,15 +472,30 @@ def build_phase_agent(
                     pass
         onboarding_ref_block = build_onboarding_reference(onboarding_ref)
 
+    # ── Cross-run distilled experience ───────────────────────────────
+    # Inject the lessons captured from prior runs' critic feedback for this
+    # phase, so a defect the critic caught before is guarded against up front.
+    # Skipped for subagents (the parent phase carries the context) and resolved
+    # against the main repo root, not the run's worktree (see spine.agents.experience).
+    experience_block = ""
+    if not is_subagent:
+        from spine.agents.experience import resolve_experience_block
+
+        experience_block = resolve_experience_block(
+            phase.value, category=state.get("task_category")
+        )
+
     # ── Assemble final system prompt ─────────────────────────────────
-    # Assembly order: user system_prompt → onboarding references → base prompt.
-    # The reference block sits before the base prompt so the base prompt stays
-    # the trailing static chunk the StaticPrefixCacheMiddleware stamps.
+    # Assembly order: user system_prompt → onboarding references → experience →
+    # base prompt. Dynamic blocks sit before the base prompt so the base prompt
+    # stays the trailing static chunk the StaticPrefixCacheMiddleware stamps.
     prompt_parts: list[str] = []
     if system_prompt is not None:
         prompt_parts.append(system_prompt)
     if onboarding_ref_block:
         prompt_parts.append(onboarding_ref_block)
+    if experience_block:
+        prompt_parts.append(experience_block)
     prompt_parts.append(base_prompt)
     final_system_prompt: str = "\n\n".join(prompt_parts)
 
