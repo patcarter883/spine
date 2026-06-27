@@ -327,8 +327,22 @@ class ExperienceLesson(BaseModel):
     created_at: str = Field(
         default="", description="ISO timestamp when the lesson was captured"
     )
+    dedup_basis: str = Field(
+        default="",
+        description=(
+            "Pre-generalization lesson text used as the stable dedup identity. "
+            "Frozen at distill time so the LLM generalization pass — which "
+            "rewrites ``lesson`` non-deterministically — cannot defeat cross-run "
+            "de-duplication. Falls back to ``lesson`` when unset (older records)."
+        ),
+    )
 
     def dedup_key(self) -> str:
-        """Stable key for de-duplicating near-identical lessons within a phase."""
-        norm = " ".join((self.lesson or "").lower().split())
+        """Stable key for de-duplicating near-identical lessons within a phase.
+
+        Keys off ``dedup_basis`` (the pre-generalization text) when present, so a
+        recurring defect collides across runs even after generalization paraphrases
+        the visible ``lesson`` differently each time.
+        """
+        norm = " ".join((self.dedup_basis or self.lesson or "").lower().split())
         return f"{self.phase}::{norm}"

@@ -151,6 +151,10 @@ def distill_run_experience(result: dict[str, Any], config: Any) -> list[Experien
                 category=category,
                 trigger=_clip(reason, _MAX_TRIGGER_CHARS) or text,
                 lesson=text,
+                # Freeze the dedup identity to this pre-generalization text so the
+                # downstream LLM rewrite can't paraphrase a recurring defect into a
+                # fresh key (see ExperienceLesson.dedup_key).
+                dedup_basis=text,
                 source_tier=tier or "agent",
                 salience=max(1, int(salience or 1)),
                 created_at=created,
@@ -286,7 +290,14 @@ async def generalize_lessons(
             # Some providers return a dict; coerce best-effort.
             res = _GeneralizationResult.model_validate(res)
 
-        by_index: dict[int, _GeneralizedLesson] = {g.index: g for g in res.lessons}
+        # Trust the model's `index` only when it is a valid, unique, in-range
+        # position. A 1-based renumbering or a duplicate index would otherwise
+        # graft a generalized rule onto the WRONG input lesson (keeping that
+        # lesson's phase/trigger); reject those and fall back to the original.
+        by_index: dict[int, _GeneralizedLesson] = {}
+        for g in res.lessons:
+            if 0 <= g.index < len(lessons) and g.index not in by_index:
+                by_index[g.index] = g
         out: list[ExperienceLesson] = []
         for i, le in enumerate(lessons):
             g = by_index.get(i)

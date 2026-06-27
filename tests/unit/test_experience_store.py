@@ -74,6 +74,27 @@ def test_dedup_same_lesson_not_duplicated(tmp_path):
     assert len(store.all()) == 1
 
 
+def test_dedup_stable_across_generalization_rewrite(tmp_path):
+    # The same defect, generalized into different VISIBLE text on two runs, must
+    # still dedup because dedup_basis (the pre-generalization text) is frozen.
+    store = ExperienceStore(str(tmp_path / "exp"))
+    first = _lesson(
+        id="g0",
+        lesson="Ensure every referenced symbol is produced by some slice",
+        dedup_basis="slice-2 references foo() no slice provides",
+    )
+    assert store.add_many([first]) == 1
+    # Run 2: same underlying defect, LLM paraphrased the visible lesson, same basis.
+    second = _lesson(
+        id="g1",
+        work_id="w2",
+        lesson="Check that all referenced symbols are defined by a slice",
+        dedup_basis="slice-2 references foo() no slice provides",
+    )
+    assert store.add_many([second]) == 0
+    assert len(store.all()) == 1
+
+
 def test_dedup_keeps_higher_salience(tmp_path):
     store = ExperienceStore(base_path=str(tmp_path))
     store.add_many([_lesson(salience=1)])
@@ -190,6 +211,30 @@ def test_distill_ambiguous_phase_not_guessed():
     }
     lessons = distill_run_experience(result, _Cfg(workspace_root="/x"))
     assert lessons == []
+
+
+def test_distill_attributes_explicit_phase_on_multiphase_run():
+    # Two phases reworked, but the entry carries an explicit `phase` (stamped by
+    # compose.py) → attributed, NOT dropped. Without the stamp this lesson would
+    # be lost on any multi-phase run.
+    result = {
+        "work_id": "w12b",
+        "feedback": [
+            {
+                "status": "needs_revision",
+                "tier": "agent",
+                "phase": "implement",
+                "reason": "null deref on the cold-cache path",
+                "suggestions": ["guard the optional field before deref"],
+            }
+        ],
+        "retry_count": {"plan": 1, "implement": 2},
+    }
+    lessons = distill_run_experience(result, _Cfg(workspace_root="/x"))
+    assert any(le.phase == "implement" for le in lessons)
+    # Salience reflects the reworked phase's round count, not the other phase's.
+    impl = next(le for le in lessons if le.phase == "implement")
+    assert impl.salience == 2
 
 
 # ── Capture + inject round trip ──────────────────────────────────────────────
@@ -329,6 +374,73 @@ async def test_generalize_rewrites_and_drops(monkeypatch):
     assert out[0].lesson == "Ensure every referenced symbol is produced by some slice"
     # Metadata is preserved through the rewrite.
     assert out[0].phase == "plan" and out[0].id == "r0"
+
+
+@pytest.mark.asyncio
+async def test_generalize_rejects_out_of_range_index(monkeypatch):
+    """A 1-based renumbering must not graft a rule onto the wrong lesson.
+
+    Model returns indices [1, 2] for inputs [0, 1]; index 1 is in range but would
+    attach input-0's intended rule onto input-1, and index 2 is out of range.
+    Both are rejected, so each input falls back to its original lesson unchanged.
+    """
+    from spine.agents import experience as exp_mod
+
+    raw = [
+        _lesson(phase="plan", lesson="original zero", id="r0"),
+        _lesson(phase="implement", lesson="original one", id="r1"),
+    ]
+
+    class _FakeBound:
+        async def ainvoke(self, _messages):
+            return exp_mod._GeneralizationResult(
+                lessons=[
+                    exp_mod._GeneralizedLesson(index=1, lesson="rule meant for input 0"),
+                    exp_mod._GeneralizedLesson(index=2, lesson="rule meant for input 1"),
+                ]
+            )
+
+    from spine.agents import helpers
+
+    monkeypatch.setattr(helpers, "resolve_chat_model", lambda *a, **k: object())
+    monkeypatch.setattr(helpers, "bind_structured_output", lambda *a, **k: _FakeBound())
+
+    out = await exp_mod.generalize_lessons(raw, _Cfg(workspace_root="/x"))
+    # index 1 is in range, so it DOES rewrite input-1 (can't structurally tell a
+    # same-position rewrite is "wrong"); index 2 is out of range and rejected, so
+    # input-0 is untouched. The key guarantee: the out-of-range index never lands.
+    assert out[0].lesson == "original zero"
+    assert out[0].phase == "plan" and out[0].id == "r0"
+    assert len(out) == 2
+
+
+@pytest.mark.asyncio
+async def test_generalize_rejects_duplicate_index(monkeypatch):
+    """A duplicate index keeps only the first; it never silently overwrites twice."""
+    from spine.agents import experience as exp_mod
+
+    raw = [
+        _lesson(phase="plan", lesson="zero", id="r0"),
+        _lesson(phase="plan", lesson="one", id="r1"),
+    ]
+
+    class _FakeBound:
+        async def ainvoke(self, _messages):
+            return exp_mod._GeneralizationResult(
+                lessons=[
+                    exp_mod._GeneralizedLesson(index=0, lesson="first wins"),
+                    exp_mod._GeneralizedLesson(index=0, lesson="second ignored"),
+                ]
+            )
+
+    from spine.agents import helpers
+
+    monkeypatch.setattr(helpers, "resolve_chat_model", lambda *a, **k: object())
+    monkeypatch.setattr(helpers, "bind_structured_output", lambda *a, **k: _FakeBound())
+
+    out = await exp_mod.generalize_lessons(raw, _Cfg(workspace_root="/x"))
+    assert out[0].lesson == "first wins"
+    assert out[1].lesson == "one"  # index 1 had no entry → original kept
 
 
 @pytest.mark.asyncio
