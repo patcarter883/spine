@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import warnings
 from contextlib import contextmanager
 from typing import Any, Iterator, TypeVar
@@ -1196,6 +1197,49 @@ def _resolve_timeout_from_config(
     return default
 
 
+def _content_to_text(content: Any) -> str:
+    """Coerce a message ``content`` to a plain string.
+
+    Providers may return ``content`` as a string or as a list of content
+    blocks (e.g. ``[{"type": "text", "text": "..."}]`` for multimodal /
+    Anthropic-style responses). Calling ``.strip()`` directly on a list raises
+    AttributeError, so normalise here by concatenating any text blocks.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content) if content is not None else ""
+
+
+# Common chain-of-thought openers emitted by thinking models when reasoning
+# leaks into the final message instead of structured output.
+_REASONING_OPENER_RE = re.compile(
+    r"^(okay|ok|so|now|let'?s|let me|first|alright|hmm|well|i'?ll|i will|i need|i should|"
+    r"we need|we should|thinking|reasoning|step \d)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_leaked_reasoning(stripped: str) -> bool:
+    """Heuristically detect leaked chain-of-thought in a final message.
+
+    Conservative by design: a false positive discards the entire phase output,
+    so only flag text that actually *opens* like reasoning. A lowercase first
+    character alone is NOT sufficient (valid artifacts may start lowercase or
+    with a digit).
+    """
+    return bool(_REASONING_OPENER_RE.match(stripped))
+
+
 def extract_response(result: dict[str, Any]) -> str:
     """Extract the text content from a Deep Agent's last message.
 
@@ -1214,17 +1258,15 @@ def extract_response(result: dict[str, Any]) -> str:
     messages = result.get("messages", [])
     if messages:
         last = messages[-1]
-        content = getattr(last, "content", str(last))
+        content = _content_to_text(getattr(last, "content", str(last)))
         # ── Try content first ──────────────────────────────────────────
-        if content and len(content.strip()) > 0:
-            # Detect leaked thinking-model reasoning
+        if content and content.strip():
             stripped = content.strip()
-            if (
-                stripped
-                and not stripped[0].isupper()
-                and stripped[0] not in ("#", "*", "-", "|", "`", "[", '"')
-            ):
-                # Looks like reasoning, not a structured artifact
+            # Detect leaked thinking-model reasoning. Only discard when the text
+            # actually *opens like* chain-of-thought — a lone lowercase first
+            # char is not enough (a valid spec/plan may start with "feature ..."
+            # or a digit), and dropping it loses the entire phase output.
+            if _looks_like_leaked_reasoning(stripped):
                 return ""
             return content
         # ── Fall back to reasoning_content for thinking models ─────────

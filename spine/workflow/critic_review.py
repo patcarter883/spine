@@ -491,14 +491,20 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
 
     content_upper = content.upper()
 
+    # Negation guard: prose like "did not pass" / "cannot be passed" must never
+    # salvage a PASS from a bare "PASSED" substring. Fail closed on any negated
+    # pass token before trusting an affirmative one.
+    negated_pass = re.search(r"\b(?:NOT|NO|CANNOT|CAN'T|NEVER)\b[^.]*\bPASS", content_upper)
+
     if "NEEDS_REVIEW" in content_upper:
         status = ReviewStatus.NEEDS_REVIEW.value
     elif "NEEDS_REVISION" in content_upper:
         status = ReviewStatus.NEEDS_REVISION.value
-    elif "PASSED" in content_upper:
+    elif not negated_pass and re.search(r"\bPASSED\b", content_upper):
         status = ReviewStatus.PASSED.value
     else:
-        # Unclear response → needs revision (conservative)
+        # Unclear / negated / ambiguous response → needs revision (conservative).
+        # A free-text verdict with no clear PASSED token must not fail open.
         status = ReviewStatus.NEEDS_REVISION.value
 
     return {

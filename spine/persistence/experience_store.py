@@ -138,20 +138,20 @@ class ExperienceStore:
             for le in existing:
                 by_key[le.dedup_key()] = le
 
-            added = 0
+            newly_added_keys: set[str] = set()
             for le in new_lessons:
                 key = le.dedup_key()
                 prior = by_key.get(key)
                 if prior is None:
                     by_key[key] = le
-                    added += 1
+                    newly_added_keys.add(key)
                 elif le.salience > prior.salience:
                     # Same lesson seen again, costlier this time — keep the
                     # higher salience (and the newer provenance) but don't
                     # count it as new.
                     by_key[key] = le
 
-            if added == 0:
+            if not newly_added_keys:
                 # Salience bumps still need persisting, but skip the rewrite when
                 # nothing changed at all.
                 if all(by_key[le.dedup_key()] is le for le in existing):
@@ -159,7 +159,11 @@ class ExperienceStore:
 
             merged = self._cap_per_phase(list(by_key.values()))
             self._rewrite(merged)
-            return added
+            # Report only lessons that actually survived the per-phase cap — a
+            # capped-out, lowest-salience new lesson is dropped before write and
+            # would never be recallable, so it must not inflate the count.
+            surviving_keys = {le.dedup_key() for le in merged}
+            return len(newly_added_keys & surviving_keys)
 
     def delete(self, lesson_id: str) -> bool:
         """Remove a single lesson by id. Returns True if one was removed."""

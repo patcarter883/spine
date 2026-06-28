@@ -53,6 +53,12 @@ from spine.models.state import WorkflowState
 from spine.agents.context import SpineContext
 from spine.agents.helpers import resolve_model, debug_enabled
 
+# Phases that delegate their substantive work to slice subagents (built with
+# is_subagent=True) rather than doing it in the main phase agent. Used to route
+# cross-run experience injection to the agent that actually writes code / runs
+# verification instead of the report-writing synthesiser.
+_DELEGATED_WORK_PHASES = frozenset({PhaseName.IMPLEMENT, PhaseName.VERIFY})
+
 # ── Recursion limit ─────────────────────────────────────────────────
 # Removed per-phase limits (2026-05). Each SPINE phase runs an entire
 # Deep Agent loop inside one LangGraph node — the agent's own internal
@@ -475,10 +481,18 @@ def build_phase_agent(
     # ── Cross-run distilled experience ───────────────────────────────
     # Inject the lessons captured from prior runs' critic feedback for this
     # phase, so a defect the critic caught before is guarded against up front.
-    # Skipped for subagents (the parent phase carries the context) and resolved
-    # against the main repo root, not the run's worktree (see spine.agents.experience).
+    # Target the agent that actually does the phase's substantive work:
+    #   - SPECIFY/PLAN author their artifact in the main phase agent, so inject
+    #     there and skip the leaf researcher subagents.
+    #   - IMPLEMENT/VERIFY delegate the real work (writing code / running
+    #     verification) to slice subagents built with is_subagent=True; the
+    #     main agent is only a report-writing synthesiser. Inject into the
+    #     slice workers instead, or an IMPLEMENT/VERIFY lesson reaches an agent
+    #     that writes no code and the defect class recurs.
+    # Resolved against the main repo root, not the run's worktree
+    # (see spine.agents.experience).
     experience_block = ""
-    if not is_subagent:
+    if is_subagent == (phase in _DELEGATED_WORK_PHASES):
         from spine.agents.experience import resolve_experience_block
 
         experience_block = resolve_experience_block(

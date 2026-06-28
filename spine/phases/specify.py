@@ -120,9 +120,13 @@ async def call_specify(
 
     try:
         # ── EARLY COMMITMENT: Classify and Recall ──
-        # Only run on first pass (retry == 0) to avoid re-retrieving
-        task_category = None
-        retrieved_context = []
+        # Only run on first pass (retry == 0) to avoid re-retrieving. On rework
+        # passes, carry forward the values committed on the first pass —
+        # task_category/retrieved_context are LastValue channels (no reducer),
+        # so returning None/[] here would clobber the prior classification and
+        # break downstream vector filtering and cross-run experience capture.
+        task_category = state.get("task_category")
+        retrieved_context = state.get("retrieved_context") or []
         classification_reasoning = ""
         if retry_count == 0:
             task_category, retrieved_context, classification_reasoning = await _early_commitment(

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -319,9 +320,13 @@ def _is_transient_error(exc: Exception) -> bool:
             return False
 
     # ── Check the error message for HTTP status codes ──
+    # Match the code as a standalone token, not a substring — otherwise a
+    # permanent error whose message embeds a number like "max 12500 tokens"
+    # matches "500" and is wrongly retried. Require word boundaries so only a
+    # real status code (e.g. "HTTP 500", "status 429") counts.
     exc_str = str(exc).lower()
     for code in (520, 502, 503, 504, 500, 429):
-        if str(code) in exc_str:
+        if re.search(rf"(?<!\d){code}(?!\d)", exc_str):
             return True
 
     # ── OpenRouter upstream/provider failures ──

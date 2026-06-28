@@ -887,7 +887,20 @@ async def resume_work(
     from spine.persistence.checkpoint import CheckpointStore
 
     checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
-    saved_state = await checkpoint_store.get_state(work_id)
+    try:
+        saved_state = await checkpoint_store.get_state(work_id)
+    except Exception as exc:
+        # A read failure (e.g. SQLite "database is locked") is NOT the same as
+        # an absent checkpoint. Resuming from empty state here would silently
+        # discard all accumulated SPECIFY/PLAN artifacts, so abort and keep the
+        # item resumable instead of corrupting it.
+        logger.error(
+            "[%s] failed to read checkpoint state for resume: %s", work_id, exc
+        )
+        raise RuntimeError(
+            f"Could not read checkpoint state for '{work_id}' "
+            f"({exc}). The item remains in 'needs_review'; retry the resume."
+        ) from exc
 
     # Build initial state for the resumed run, seeded with the
     # accumulated artifacts and feedback from the previous run.
@@ -931,8 +944,41 @@ async def resume_work(
         from spine.workflow.compose import WORKFLOW_SEQUENCES, build_workflow_graph
         from spine.git import WorktreeSandbox
 
+        # Determine the starting phase based on action and prior state.
+        #   rework  → restart from the reviewed phase itself.
+        #   approve → continue from the phase *after* the reviewed one.
+        # This must be threaded into build_workflow_graph as start_from_phase:
+        # the graph's START edge is wired at build time, and seeding phase_index
+        # in resume_state alone does NOT move the entry point — without it an
+        # approve resume re-runs the whole sequence from the first phase.
+        phase_seq = WORKFLOW_SEQUENCES.get(work_type, [])
+        phase_index = 0
+        current_phase = ""
+        start_from_phase: str | None = None
+
+        reviewed_phase = saved_state.get("needs_review_phase", "") if saved_state else ""
+        if reviewed_phase:
+            for idx, (name, _) in enumerate(phase_seq):
+                if name == reviewed_phase:
+                    if action == "rework":
+                        phase_index = idx
+                    else:  # approve: advance past the approved phase
+                        if idx + 1 >= len(phase_seq):
+                            logger.warning(
+                                "[%s] approve resume on final phase '%s'; "
+                                "re-running it as no later phase exists",
+                                work_id,
+                                reviewed_phase,
+                            )
+                        phase_index = min(idx + 1, len(phase_seq) - 1)
+                    current_phase = phase_seq[phase_index][0]
+                    start_from_phase = current_phase
+                    break
+
         checkpointer = await checkpoint_store.get_checkpointer()
-        graph = build_workflow_graph(work_type, checkpointer=checkpointer)
+        graph = build_workflow_graph(
+            work_type, checkpointer=checkpointer, start_from_phase=start_from_phase
+        )
 
         # Resuming code-producing work re-runs IMPLEMENT, so isolate it in a
         # worktree just like a fresh submission. No-op for planning types.
@@ -942,22 +988,6 @@ async def resume_work(
         # Delete the old checkpoint so the graph starts fresh with our resume_state
         # instead of restoring the previous checkpoint state
         await checkpoint_store.delete_state(work_id)
-
-        # Determine the starting phase based on action and prior state
-        # For "rework" action, restart from the phase that needs review
-        # For "approve" action, start from the phase after the review
-        phase_seq = WORKFLOW_SEQUENCES.get(work_type, [])
-        phase_index = 0
-        current_phase = ""
-
-        if action == "rework" and saved_state:
-            needs_review_phase = saved_state.get("needs_review_phase", "")
-            if needs_review_phase:
-                for idx, (name, _) in enumerate(phase_seq):
-                    if name == needs_review_phase:
-                        phase_index = idx
-                        current_phase = needs_review_phase
-                        break
 
         # Seed the new run with all prior state plus the human feedback
         resume_state: dict[str, Any] = {

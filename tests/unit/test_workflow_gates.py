@@ -345,11 +345,19 @@ class TestResumeWork:
 
             import sys as _sys
 
+            # Capture the start_from_phase the resume wires into the graph build
+            # so we can assert the routing rather than just that the run happened.
+            captured: dict[str, object] = {}
+
+            def fake_build_graph(work_type, checkpointer=None, start_from_phase=None):
+                captured["start_from_phase"] = start_from_phase
+                return mock_graph
+
             mock_compose = MagicMock()
             mock_compose.WORKFLOW_SEQUENCES = {
                 "task": [("specify", None), ("plan", None), ("implement", None)]
             }
-            mock_compose.build_workflow_graph.return_value = mock_graph
+            mock_compose.build_workflow_graph = fake_build_graph
             _sys.modules["spine.workflow.compose"] = mock_compose
 
             mock_cp_mod = MagicMock()
@@ -360,10 +368,26 @@ class TestResumeWork:
             mock_cp.delete_state = AsyncMock(return_value=True)
             _sys.modules["spine.persistence.checkpoint"] = mock_cp_mod
 
+            # Stub the sandbox/preflight so the test never shells out to real
+            # git (which would fail on any dirty working tree, unrelated to the
+            # behavior under test).
+            sandbox = MagicMock()
+            sandbox.enter.return_value = MagicMock(workspace_root="/tmp/ws")
+
             try:
-                with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
-                    result = await resume_work("abc", "fix it", action="rework")
+                with patch("spine.work.dispatcher.ArtifactStore", MagicMock()), patch(
+                    "spine.work.dispatcher._preflight_worktree_clean"
+                ), patch("spine.git.WorktreeSandbox", return_value=sandbox):
+                    await resume_work("abc", "fix it", action="rework")
                     mock_cp.delete_state.assert_called_once_with("abc")
+                    # rework restarts from the reviewed phase itself.
+                    assert captured["start_from_phase"] == "plan"
+
+                    # approve continues from the phase *after* the reviewed one.
+                    captured.clear()
+                    mock_cp.delete_state.reset_mock()
+                    await resume_work("abc", "", action="approve")
+                    assert captured["start_from_phase"] == "implement"
             finally:
                 _sys.modules.pop("spine.workflow.compose", None)
                 _sys.modules.pop("spine.persistence.checkpoint", None)
