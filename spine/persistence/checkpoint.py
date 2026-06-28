@@ -75,13 +75,14 @@ class CheckpointStore:
             The state dict if found, or None.
         """
         checkpointer = await self.get_checkpointer()
-        try:
-            config = {"configurable": {"thread_id": work_id}}
-            state = await checkpointer.aget(config)
-            if state:
-                return state.get("channel_values", {})
-        except Exception:
-            pass
+        config = {"configurable": {"thread_id": work_id}}
+        # Let read errors propagate: a transient failure (e.g. SQLite
+        # "database is locked") must NOT be silently treated as "no checkpoint",
+        # which would make the caller resume from empty state and discard all
+        # accumulated artifacts. A genuinely absent checkpoint returns None.
+        state = await checkpointer.aget(config)
+        if state:
+            return state.get("channel_values", {})
         return None
 
     async def delete_state(self, work_id: str) -> bool:

@@ -494,7 +494,12 @@ def _is_empty_search_result(content: str) -> bool:
         return True
     if s in ("[]", "{}", "null", "no results"):
         return True
-    return "→ no results" in s or "0 files" in s or "0 hit" in s
+    if "→ no results" in s:
+        return True
+    # Use word-boundary counts so "10 hit(s)" / "20 files" / "100 hits" (all of
+    # which contain the substrings "0 hit" / "0 files") are NOT misread as empty.
+    # Only a literal zero count (not preceded by another digit) means empty.
+    return bool(re.search(r"(?<!\d)0\s+(?:files|hit\(s\)|hits?\b)", s))
 
 
 def trim_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:

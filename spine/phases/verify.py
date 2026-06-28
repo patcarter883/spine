@@ -12,6 +12,7 @@ subagents inherit the parent checkpointer.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from typing import Optional
@@ -35,6 +36,26 @@ from spine.workflow.registry import get_registry
 logger = logging.getLogger(__name__)
 
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+# Negated pass tokens ("NOT VERIFIED", "not passed") must never read as a pass.
+# A bare `"VERIFIED" in text` substring test fails here because "NOT VERIFIED"
+# contains "VERIFIED"; require a whole-word PASS/VERIFIED token and separately
+# veto any negated form.
+_PASS_VERDICT_RE = re.compile(r"\b(?:verified|passed)\b", re.IGNORECASE)
+_NEGATED_PASS_RE = re.compile(r"\bnot\s+(?:verified|passed)\b", re.IGNORECASE)
+
+
+def _verdict_is_pass(verify_text: str) -> bool:
+    """Return True only when the verify report states an affirmative pass.
+
+    Guards against the substring trap where "NOT VERIFIED" / "not passed"
+    would otherwise satisfy a naive ``"VERIFIED" in text`` check.
+    """
+    if not verify_text:
+        return False
+    if _NEGATED_PASS_RE.search(verify_text):
+        return False
+    return bool(_PASS_VERDICT_RE.search(verify_text))
 
 
 async def call_verify(
@@ -122,7 +143,7 @@ async def call_verify(
         verify_text = ""
         if disk_artifacts:
             verify_text = next(iter(disk_artifacts.values()), "")
-        is_verified = "VERIFIED" in verify_text.upper() or "PASSED" in verify_text.upper()
+        is_verified = _verdict_is_pass(verify_text)
         final_status = "completed" if is_verified else "needs_review"
 
         return {

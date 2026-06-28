@@ -29,6 +29,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from spine.models.enums import PhaseName
 from spine.models.types import ExperienceLesson
 from spine.persistence.experience_store import ExperienceStore
 
@@ -127,6 +128,26 @@ def distill_run_experience(result: dict[str, Any], config: Any) -> list[Experien
     feedback = result.get("feedback") or []
     retry_count = result.get("retry_count") or {}
     category = result.get("task_category")
+
+    # The adversarial loop tracks its rework rounds as a single int
+    # (adversarial_retry_count), SEPARATELY from the critic's per-phase
+    # retry_count. Fold it into a combined per-phase rework map so a phase
+    # reworked only by the adversarial reviewer is still captured, and its
+    # salience reflects the adversarial rounds rather than defaulting to 1.
+    adversarial_retry_count = int(result.get("adversarial_retry_count") or 0)
+    adversarial_phase = None
+    adv_review = result.get("last_adversarial_review")
+    if isinstance(adv_review, dict):
+        adversarial_phase = adv_review.get("phase")
+    if not adversarial_phase and adversarial_retry_count:
+        adversarial_phase = PhaseName.PLAN.value
+    rework_counts: dict[str, int] = {
+        str(p): int(c) for p, c in retry_count.items() if isinstance(c, int) and c >= 1
+    }
+    if adversarial_phase and adversarial_retry_count:
+        rework_counts[str(adversarial_phase)] = (
+            rework_counts.get(str(adversarial_phase), 0) + adversarial_retry_count
+        )
     work_id = result.get("work_id", "unknown")
     created = datetime.now().isoformat()
 
@@ -177,7 +198,7 @@ def distill_run_experience(result: dict[str, Any], config: Any) -> list[Experien
             )
 
     # Source 2 — converged-after-rework rounds from the feedback list.
-    reworked = [p for p, c in retry_count.items() if isinstance(c, int) and c >= 1]
+    reworked = list(rework_counts)
     if reworked:
         for entry in feedback:
             if not isinstance(entry, dict):
@@ -194,7 +215,7 @@ def distill_run_experience(result: dict[str, Any], config: Any) -> list[Experien
                 entry.get("reason", ""),
                 entry.get("suggestions") or [],
                 entry.get("tier") or "agent",
-                int(retry_count.get(phase, 1)),
+                rework_counts.get(str(phase), 1),
             )
 
     return lessons[:_MAX_LESSONS_PER_RUN]
