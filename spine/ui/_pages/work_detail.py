@@ -378,6 +378,12 @@ def render(api: UIApi) -> None:
                             st.markdown(f"- {suggestion}")
 
                     st.divider()
+        else:
+            # No needs_review feedback entries (e.g. a plan-critic verdict
+            # whose status isn't "needs_review" is filtered out of feedback),
+            # but the critic still recorded *why* this was flagged — surface
+            # that verdict so the reviewer isn't left without an explanation.
+            _render_critic_review(api, work_id)
 
         # Show two resume options: interrupt-based (preferred) and legacy
         st.subheader("Resume Options")
