@@ -110,6 +110,63 @@ def test_local_no_sampler_config_no_extra_body(monkeypatch):
     assert "extra_body" not in captured
 
 
+def test_local_rsa_patch_dict_rides_extra_body_and_disables_streaming(monkeypatch):
+    """An active RSA patch dict passes through verbatim on extra_body and forces
+    the non-streaming endpoint (RSA is multi-round, emits nothing until final)."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Zaya-Local",
+        {
+            "base_url": "http://localhost:8010/v1",
+            "rsa": {"n": 32, "k": 4, "t": 3, "selection": "majority"},
+        },
+    )
+    extra = captured.get("extra_body") or {}
+    assert extra.get("rsa") == {"n": 32, "k": 4, "t": 3, "selection": "majority"}
+    assert captured.get("streaming") is False
+    # Non-streaming: no stream_usage / stream_options on the request.
+    assert "stream_usage" not in captured
+    # Active RSA gets the long default request timeout (multi-round run).
+    assert captured.get("request_timeout") == 1800
+
+
+def test_local_rsa_true_disables_streaming(monkeypatch):
+    """rsa: true (server defaults) is still an active run -> non-streaming."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Zaya-Local",
+        {"base_url": "http://localhost:8010/v1", "rsa": True},
+    )
+    assert (captured.get("extra_body") or {}).get("rsa") is True
+    assert captured.get("streaming") is False
+
+
+def test_local_rsa_false_passthrough_keeps_streaming(monkeypatch):
+    """rsa: false is a plain backend passthrough on the shim, so streaming and
+    stream_usage stay on and the normal single-call timeout applies."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Zaya-Local",
+        {"base_url": "http://localhost:8010/v1", "rsa": False},
+    )
+    # The field is still forwarded so the shim explicitly bypasses RSA.
+    assert (captured.get("extra_body") or {}).get("rsa") is False
+    assert captured.get("streaming") is True
+    assert captured.get("stream_usage") is True
+    assert captured.get("request_timeout") == 300
+
+
+def test_local_rsa_dict_enabled_false_keeps_streaming(monkeypatch):
+    """A patch dict with enabled:false opts the call out -> treat as inactive."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Zaya-Local",
+        {"base_url": "http://localhost:8010/v1", "rsa": {"enabled": False, "n": 8}},
+    )
+    assert (captured.get("extra_body") or {}).get("rsa") == {"enabled": False, "n": 8}
+    assert captured.get("streaming") is True
+
+
 def _capture_init_chat_model(monkeypatch):
     captured: dict = {}
 

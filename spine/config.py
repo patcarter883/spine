@@ -1068,6 +1068,7 @@ class SpineConfig:
         "stream_usage",
         "reasoning",
         "context_window",
+        "rsa",
     )
 
     def _resolve_model_profile(

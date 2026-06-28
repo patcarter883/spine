@@ -1018,6 +1018,22 @@ def _build_local_model(
         extra_body["reasoning_budget"] = 0
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
 
+    # ── Zaya RSA (recursive self-aggregation) passthrough ─────────────
+    # Zaya's OpenAI-compatible shim reads a top-level `rsa` field to control
+    # test-time recursive self-aggregation: `true`/omit = server defaults,
+    # `false` = plain passthrough, or a patch dict ({enabled,n,k,t,tail_tokens,
+    # max_tokens,agg_max_tokens,temperature,selection,max_concurrency,
+    # request_timeout,max_retries}) merged over the defaults for this call.
+    # extra_body merges at the top level of the request body, so the whole
+    # value rides through verbatim — new RSA knobs need no code change here.
+    # `rsa` is opaque to spine: pass it as configured and let the shim validate.
+    rsa = provider_cfg.get("rsa")
+    # Only an *active* RSA run is multi-round/non-streaming. `false` (or a dict
+    # with enabled:false) is a plain backend passthrough, so leave streaming on.
+    rsa_active = rsa is True or (isinstance(rsa, dict) and rsa.get("enabled") is not False)
+    if rsa is not None:
+        extra_body["rsa"] = rsa
+
     if extra_body:
         kwargs["extra_body"] = extra_body
 
@@ -1070,7 +1086,10 @@ def _build_local_model(
     # If not explicitly configured, default to 300s (5 min) to prevent
     # hung connections from blocking the workflow for 30+ minutes.
     if "request_timeout" not in kwargs:
-        kwargs["request_timeout"] = 300
+        # An active RSA run is N rollouts across T aggregation rounds and can
+        # take many minutes; give it headroom over the 5-min single-call
+        # default (the shim's own per-backend timeout defaults to 1800s).
+        kwargs["request_timeout"] = 1800 if rsa_active else 300
 
     # ── Enable streaming for stall detection ─────────────────────────
     # Without streaming=True, ChatOpenAI uses the non-streaming API
@@ -1081,7 +1100,16 @@ def _build_local_model(
     # a slow local model that takes >120s to generate produces zero
     # intermediate chunks, and the stall detector falsely marks the work
     # as stalled even though inference is still running.
-    kwargs.setdefault("streaming", True)
+    #
+    # RSA is the exception: the shim runs multiple rounds and emits nothing
+    # until the final selected answer, so a streamed request stalls the
+    # per-chunk watchdog and can't yield meaningfully anyway. Force the
+    # non-streaming completions endpoint for active RSA — token usage still
+    # rides on the final response, so accounting is intact.
+    if rsa_active:
+        kwargs["streaming"] = False
+    else:
+        kwargs.setdefault("streaming", True)
 
     # ── Enable stream_usage for token counting (default-on) ──────────
     # ChatOpenAI sends `stream_options: {"include_usage": true}` when
@@ -1089,8 +1117,10 @@ def _build_local_model(
     # required for LangSmith reporting and the per-work_id budget tracker.
     # Default-on parity with _build_openrouter_model. Some strict local
     # vLLM backends 400 on unexpected request fields; opt out by setting
-    # providers.llm[].stream_usage: false for that provider.
-    if provider_cfg.get("stream_usage") is not False:
+    # providers.llm[].stream_usage: false for that provider. Skipped for active
+    # RSA — the call is non-streaming, so stream_options would be inert (or
+    # rejected) and usage already arrives on the non-streamed response.
+    if not rsa_active and provider_cfg.get("stream_usage") is not False:
         kwargs.setdefault("stream_usage", True)
 
     _apply_concurrency_cap(kwargs, provider_cfg)
