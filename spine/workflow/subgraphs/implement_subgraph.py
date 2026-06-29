@@ -445,16 +445,11 @@ def _index_ctx(state_or_root: Any) -> tuple[str | None, str]:
         return None, workspace_root
 
 
-def _inline_symbol_source(
-    db_path: str | None, workspace_root: str, symbol: str, *, full: bool = False
-) -> str:
+def _inline_symbol_source(db_path: str | None, workspace_root: str, symbol: str) -> str:
     """Fenced current source of *symbol* from the index, or '' if unavailable.
 
     Truncated to a head slice for very large symbols so a whole class never
     dominates the prompt (the model can ``read_symbol`` for the remainder).
-    ``full=True`` skips truncation — used for EDIT TARGETS (the body the model
-    must rewrite) so it can write turn-1 without a read_symbol round-trip
-    (experiment merge-slices-inline-edit-source). Reference symbols keep the cap.
     """
     if not db_path or not symbol:
         return ""
@@ -467,9 +462,7 @@ def _inline_symbol_source(
     if not src:
         return ""
     lines = src.splitlines()
-    truncated = not full and (
-        len(src) > _MAX_INLINE_SYMBOL_CHARS or len(lines) > _MAX_INLINE_SYMBOL_LINES
-    )
+    truncated = len(src) > _MAX_INLINE_SYMBOL_CHARS or len(lines) > _MAX_INLINE_SYMBOL_LINES
     if truncated:
         lines = lines[:_MAX_INLINE_SYMBOL_LINES]
         src = "\n".join(lines) + (
@@ -505,7 +498,7 @@ def _edit_plan_body(active_slice: dict, db_path: str | None, workspace_root: str
         parts = [header]
         if intent:
             parts.append(f"   intent: {intent}")
-        src = _inline_symbol_source(db_path, workspace_root, symbol, full=True)
+        src = _inline_symbol_source(db_path, workspace_root, symbol)
         if src:
             label = (
                 "current source (edit this with ast_edit replace)"

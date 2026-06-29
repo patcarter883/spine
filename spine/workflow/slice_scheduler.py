@@ -278,16 +278,13 @@ def compute_execution_waves(
         ValueError: If slices are invalid (empty, duplicates, bad
             references, or cycles).
     """
-    # EXPERIMENT (merge-slices-inline-edit-source): MERGE same-file slices into
-    # one implementer instead of chaining them as separate subagents. Merge was
-    # previously rejected because the merged slice's references made the model
-    # read-then-never-edit (trace 019ede24: read 24 symbols, 0 edits) — but that
-    # was reading-driven, and the editor now gets each edit-target's CURRENT body
-    # inlined in full (_edit_plan_body / _inline_symbol_source full=True). One
-    # subagent reads the shared file once and edits it across all its changes,
-    # instead of N subagents each re-reading it. Revert to
-    # serialize_file_overlapping_slices if this regresses.
-    feature_slices = merge_file_overlapping_slices(feature_slices)
+    # Serialize slices that share a target file BEFORE scheduling — they cannot
+    # run in parallel (same-file edit conflict), but MERGING them into one big
+    # slice overwhelms the implementer (trace 019ede24: a merged 27-reference
+    # slice → the model read 24 symbols and never edited). Instead chain them
+    # with dependencies so they run in separate waves, each small and
+    # actionable, with the sandbox carrying earlier edits forward.
+    feature_slices = serialize_file_overlapping_slices(feature_slices)
     validate_feature_slices(feature_slices)
 
     # Build lookup from ID -> FeatureSlice for wave assembly.
