@@ -933,8 +933,16 @@ def _human_review_interrupt(state: WorkflowState) -> dict:
     # interrupt() pauses the graph. Human response comes back via Command(resume=...)
     human_decision = interrupt(review_info)
 
+    # Stash the review target on the decision BEFORE we clear needs_review_phase
+    # below. LangGraph applies this node's state update before evaluating the
+    # outgoing conditional edge, so the router would otherwise read a nulled
+    # needs_review_phase and collapse "rework" → "abort" (and "approve" → the
+    # wrong phase via its current_phase fallback).
+    decision = dict(human_decision) if isinstance(human_decision, dict) else {"action": "abort"}
+    decision.setdefault("_review_target", needs_review_phase or state.get("current_phase", ""))
+
     return {
-        "human_feedback": human_decision,
+        "human_feedback": decision,
         "needs_review_phase": None,
         "needs_review_kind": None,
     }
@@ -977,17 +985,23 @@ def _make_human_review_router(phase_seq: list[tuple[str, str | None]]):
             human_feedback.get("action", "abort") if isinstance(human_feedback, dict) else "abort"
         )
 
+        # The interrupt node nulls needs_review_phase in the same update the
+        # router reads, so prefer the target it stashed on the decision; fall
+        # back to live state only if an older resume payload lacks it.
+        target = None
+        if isinstance(human_feedback, dict):
+            target = human_feedback.get("_review_target")
+        target = target or state.get("needs_review_phase")
+
         if action == "rework":
-            needs_review = state.get("needs_review_phase")
-            if needs_review and needs_review in phase_index:
-                return needs_review
+            if target and target in phase_index:
+                return target
             # Fallback: if we can't find the phase, still try rework
-            return needs_review or "abort"
+            return target or "abort"
 
         if action == "approve":
-            needs_review = state.get("needs_review_phase")
-            if needs_review and needs_review in phase_index:
-                idx = phase_index[needs_review]
+            if target and target in phase_index:
+                idx = phase_index[target]
                 if idx + 1 < len(phase_seq):
                     return phase_seq[idx + 1][0]
                 return END
