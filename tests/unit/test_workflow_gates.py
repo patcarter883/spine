@@ -304,7 +304,7 @@ class TestResumeWork:
                 await resume_work("nonexistent", "fix it")
 
     @pytest.mark.asyncio
-    async def test_resume_rework_starts_from_needs_review_phase(self):
+    async def test_resume_rework_starts_from_needs_review_phase(self, monkeypatch):
         """When action='rework', resume should start from the needs_review_phase."""
         from spine.work.dispatcher import resume_work
 
@@ -360,7 +360,6 @@ class TestResumeWork:
                 "task": [("specify", None), ("plan", None), ("implement", None)]
             }
             mock_compose.build_workflow_graph.return_value = mock_graph
-            _sys.modules["spine.workflow.compose"] = mock_compose
 
             mock_cp_mod = MagicMock()
             mock_cp = MagicMock()
@@ -368,15 +367,20 @@ class TestResumeWork:
             mock_cp.get_checkpointer = AsyncMock()
             mock_cp.get_state = AsyncMock(return_value=saved_state)
             mock_cp.delete_state = AsyncMock(return_value=True)
-            _sys.modules["spine.persistence.checkpoint"] = mock_cp_mod
 
-            try:
-                with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
-                    await resume_work("abc", "fix it", action="rework")
-                    mock_cp.delete_state.assert_called_once_with("abc")
-            finally:
-                _sys.modules.pop("spine.workflow.compose", None)
-                _sys.modules.pop("spine.persistence.checkpoint", None)
+            # Use monkeypatch.setitem so the ORIGINAL modules are restored at
+            # teardown. The previous manual ``sys.modules.pop(...)`` deleted the
+            # real cached modules, polluting any later test that had imported
+            # them (e.g. test_project_aggregator imports spine.persistence.
+            # checkpoint at module load) — an order-dependent failure.
+            monkeypatch.setitem(_sys.modules, "spine.workflow.compose", mock_compose)
+            monkeypatch.setitem(
+                _sys.modules, "spine.persistence.checkpoint", mock_cp_mod
+            )
+
+            with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
+                await resume_work("abc", "fix it", action="rework")
+                mock_cp.delete_state.assert_called_once_with("abc")
 
 
 # ── Critic router tests ──
