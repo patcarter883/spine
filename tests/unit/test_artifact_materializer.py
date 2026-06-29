@@ -18,26 +18,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 
 class TestArtifactPath:
-    """Tests for the _artifact_path helper."""
+    """Tests for the artifact_path helper."""
 
     def test_path_without_work_id(self):
-        from spine.agents.artifacts import _artifact_path
+        from spine.agents.artifacts import artifact_path
 
-        result = _artifact_path("", "specify")
+        result = artifact_path("", "specify")
         assert result == ".spine/artifacts/specify"
 
     def test_path_with_work_id(self):
-        from spine.agents.artifacts import _artifact_path
+        from spine.agents.artifacts import artifact_path
 
-        result = _artifact_path("abc123", "specify")
+        result = artifact_path("abc123", "specify")
         assert result == ".spine/artifacts/abc123/specify"
 
     def test_path_different_phases(self):
-        from spine.agents.artifacts import _artifact_path
+        from spine.agents.artifacts import artifact_path
 
-        assert _artifact_path("w1", "plan") == ".spine/artifacts/w1/plan"
-        assert _artifact_path("w1", "tasks") == ".spine/artifacts/w1/tasks"
-        assert _artifact_path("w2", "plan") == ".spine/artifacts/w2/plan"
+        assert artifact_path("w1", "plan") == ".spine/artifacts/w1/plan"
+        assert artifact_path("w1", "tasks") == ".spine/artifacts/w1/tasks"
+        assert artifact_path("w2", "plan") == ".spine/artifacts/w2/plan"
 
 
 # ── materialize_phase_artifacts tests ──

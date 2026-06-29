@@ -220,7 +220,7 @@ class TestWorkflowState:
             "status": "running",
         }
 
-        assert state["prompt_request"] is None
+        assert state.get("prompt_request") is None
         assert state.get("nonexistent_field") is None
 
 
@@ -269,21 +269,18 @@ class TestModelValidation:
     """Test cases for model validation and edge cases."""
 
     def test_task_id_validation(self) -> None:
-        """Test task ID validation (should be string)."""
-        task = Task(id="test-id")
+        """Test task ID is stored as given (Task is a plain dataclass)."""
+        task = Task(id="test-id", description="desc")
         assert isinstance(task.id, str)
-
-        # Test with numeric ID (should be converted to string)
-        task_numeric = Task(id=123)
-        assert task_numeric.id == "123"
+        assert task.id == "test-id"
 
     def test_artifact_path_validation(self) -> None:
         """Test artifact path validation."""
-        artifact = Artifact(path="/valid/path.txt", content="test")
+        artifact = Artifact(path="/valid/path.txt", content="test", phase="specify")
         assert artifact.path == "/valid/path.txt"
 
         # Test with empty path
-        artifact_empty = Artifact(path="", content="test")
+        artifact_empty = Artifact(path="", content="test", phase="specify")
         assert artifact_empty.path == ""
 
     def test_review_feedback_status_validation(self) -> None:

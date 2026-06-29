@@ -51,7 +51,7 @@ class PromptRequest:
     """A request from a phase for human input."""
 
     message: str
-    phase: str
+    phase: str = ""
     context: dict = field(default_factory=dict)
 
 
