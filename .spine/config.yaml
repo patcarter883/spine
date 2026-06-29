@@ -107,6 +107,16 @@ providers:
     stream_usage: true
     max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
+  - name: pat-glm
+    type: deepagents-model
+    model: openai:QuantTrio/GLM-4.7-Flash-AWQ
+    base_url: http://localhost:1919/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 2  # Lemonade @ localhost:8010 is single-stream
+    context_window: 40000
   - name: local-qwen
     type: deepagents-model
     model: openai:Qwen3.6-35B-A3B-MTP-GGUF
@@ -180,16 +190,16 @@ providers:
     repeat_penalty: 1.05
   # Reasoning lane (PLAN synthesis, critic): bench winner — perfect on the hard
   # reasoning bench at ~1/3 the Qwens' reasoning cost; 6.7GB = fast GPU swap.
-  - name: local-gemma-12b
+  - name: local-qwen-small
     type: deepagents-model
-    model: openai:gemma-4-12B-it-qat-q4_0-gguf-Q4_0
+    model: openai:Qwen3.5-4B-MTP-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
-    context_window: 60000
+    max_concurrent_calls: 10  # Lemonade @ localhost:8010 is single-stream
+    context_window: 16384
   embedding:
   - name: local-embeddings
     type: openai-embedding
@@ -197,7 +207,7 @@ providers:
     base_url: http://localhost:8010/v1
     api_key: vllm
     stream_usage: true
-    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
+    max_concurrent_calls: 10  # Lemonade @ localhost:8010 is single-stream
     query_prefix: 'search_query: '
     document_prefix: 'search_document: '
   reranker:
@@ -205,7 +215,7 @@ providers:
     model: bge-reranker-v2-m3-GGUF
     base_url: http://localhost:8010/v1
     api_key: vllm
-    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
+    max_concurrent_calls: 10  # Lemonade @ localhost:8010 is single-stream
     rerank_path: /reranking
   phases:
     # ═══ REASONING lane -> local-glm (open-ended judgment) ═══
@@ -214,27 +224,27 @@ providers:
     # plan never converged, trace 019efc66). GLM does plan + critic = one model,
     # ZERO intra-phase swaps across the whole specify/plan/critic tree.
     specify:
-      provider: local-glm
+      provider: pat-glm
     specify/subagents/researcher:
-      provider: local-glm
+      provider: pat-glm
     specify/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: pat-glm
     plan:
-      provider: local-glm
+      provider: pat-glm
     plan/subagents/researcher:
-      provider: local-glm
+      provider: pat-glm
     plan/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: pat-glm
     critic:
-      provider: local-glm
+      provider: pat-glm
     critic/specify:
-      provider: local-glm
+      provider: pat-glm
     critic/plan:
-      provider: local-glm
+      provider: pat-glm
     gap_plan:
-      provider: local-glm
+      provider: pat-glm
     exploration/manager:
-      provider: local-glm
+      provider: pat-glm
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
@@ -247,7 +257,7 @@ providers:
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
     implement:
-      provider: local-qwen-coder
+      provider: pat-glm
       # Failure-driven escalation (LOCAL — stays true to local-first). When a
       # slice survives a FALLBACK re-decomposition (_decompose_depth ≥ 1), the
       # editor escalates from the coder model to the reasoning model, which
@@ -255,38 +265,38 @@ providers:
       # synthesis via prefix resolution. Reachable depth is bounded by
       # implement_max_decompose_depth (default 1), so only rung 1 fires today.
       escalation:
-        - provider: local-glm
+        - provider: pat-glm
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-qwen-coder
+      provider: pat-glm
     implement/subagents/slice-implementer:
-      provider: local-qwen-coder
+      provider: pat-glm
     verify:
-      provider: local-qwen-coder
+      provider: pat-glm
     verify/subagents/slice-verifier:
-      provider: local-qwen-coder
+      provider: pat-glm
     classification:
-      provider: local-qwen-coder
+      provider: local-qwen-small
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-qwen-coder
+      provider: local-qwen-small
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-qwen-coder
+      provider: pat-glm
     onboarding/doc-manager:
-      provider: local-qwen-coder
+      provider: pat-glm
     onboarding/section-worker:
-      provider: local-qwen-coder
+      provider: pat-glm
     # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
     # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
     # actually fail. error_diagnosis is enabled in the spine: block above.
     error_diagnosis:
-      provider: local-qwen-coder
+      provider: pat-glm
       max_completion_tokens: 256
       temperature: 0
       reasoning: false
