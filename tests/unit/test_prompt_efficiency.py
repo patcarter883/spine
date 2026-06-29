@@ -200,22 +200,39 @@ class TestContextEditing:
 
 
 class TestCodebaseMap:
-    """Verify codebase map artifact support."""
+    """Verify codebase map artifact support.
 
-    def test_codebase_map_in_implement_prompt(self):
-        """Implement agent system prompt should reference codebase-map.md."""
-        import spine.agents.implement_agent as mod
+    Delivery moved from prompt text in the per-phase agents (now thin Send-API
+    orchestrators) to the cross-work memory store: ``backend._seed_store`` loads
+    ``.spine/codebase-map.md`` so agents get it via the memory middleware instead
+    of re-exploring. These tests assert that current mechanism.
+    """
 
-        source = open(mod.__file__).read()
-        assert "codebase-map" in source, (
-            "implement_agent.py must reference codebase-map.md in its prompt"
+    def test_codebase_map_seeded_into_memory_store(self, tmp_path):
+        """`.spine/codebase-map.md` is seeded into the cross-work memory store."""
+        from langgraph.store.memory import InMemoryStore
+
+        from spine.agents.backend import _seed_store
+
+        spine_dir = tmp_path / ".spine"
+        spine_dir.mkdir()
+        (spine_dir / "codebase-map.md").write_text(
+            "# Codebase Map\nmodule spine.work", encoding="utf-8"
         )
 
-    def test_codebase_map_in_verify_prompt(self):
-        """Verify agent system prompt should reference codebase-map.md."""
-        import spine.agents.verify_agent as mod
+        store = InMemoryStore()
+        _seed_store(store, tmp_path)
 
-        source = open(mod.__file__).read()
-        assert "codebase-map" in source, (
-            "verify_agent.py must reference codebase-map.md in its prompt"
-        )
+        item = store.get(("memories",), "codebase-map")
+        assert item is not None, "codebase-map.md was not seeded into the memory store"
+        assert "spine.work" in item.value["content"]
+
+    def test_codebase_map_seed_is_optional(self, tmp_path):
+        """Seeding is a no-op (not an error) when codebase-map.md is absent."""
+        from langgraph.store.memory import InMemoryStore
+
+        from spine.agents.backend import _seed_store
+
+        store = InMemoryStore()
+        _seed_store(store, tmp_path)  # no .spine/ dir present
+        assert store.get(("memories",), "codebase-map") is None

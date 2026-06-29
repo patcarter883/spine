@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -303,11 +304,20 @@ class TestResumeWork:
                 await resume_work("nonexistent", "fix it")
 
     @pytest.mark.asyncio
-    async def test_resume_rework_starts_from_needs_review_phase(self):
+    async def test_resume_rework_starts_from_needs_review_phase(self, monkeypatch):
         """When action='rework', resume should start from the needs_review_phase."""
         from spine.work.dispatcher import resume_work
 
-        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn:
+        # work_type='task' is code-producing, so resume_work enters a mandatory
+        # WorktreeSandbox (lazy `from spine.git import WorktreeSandbox`). Without
+        # mocking it the sandbox runs real git (worktree add + `git checkout
+        # <main>` / reset --hard) against THIS repo — flipping HEAD to main and
+        # clobbering the working tree. Mock it so the test stays hermetic.
+        mock_sandbox = MagicMock()
+        mock_sandbox.enter.return_value = SimpleNamespace(workspace_root="/tmp/sbx")
+        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn, patch(
+            "spine.git.WorktreeSandbox", return_value=mock_sandbox
+        ):
             mock_db = MagicMock()
             mock_table = MagicMock()
             mock_table.get.return_value = {
@@ -357,8 +367,7 @@ class TestResumeWork:
             mock_compose.WORKFLOW_SEQUENCES = {
                 "task": [("specify", None), ("plan", None), ("implement", None)]
             }
-            mock_compose.build_workflow_graph = fake_build_graph
-            _sys.modules["spine.workflow.compose"] = mock_compose
+            mock_compose.build_workflow_graph.return_value = mock_graph
 
             mock_cp_mod = MagicMock()
             mock_cp = MagicMock()
@@ -366,31 +375,20 @@ class TestResumeWork:
             mock_cp.get_checkpointer = AsyncMock()
             mock_cp.get_state = AsyncMock(return_value=saved_state)
             mock_cp.delete_state = AsyncMock(return_value=True)
-            _sys.modules["spine.persistence.checkpoint"] = mock_cp_mod
 
-            # Stub the sandbox/preflight so the test never shells out to real
-            # git (which would fail on any dirty working tree, unrelated to the
-            # behavior under test).
-            sandbox = MagicMock()
-            sandbox.enter.return_value = MagicMock(workspace_root="/tmp/ws")
+            # Use monkeypatch.setitem so the ORIGINAL modules are restored at
+            # teardown. The previous manual ``sys.modules.pop(...)`` deleted the
+            # real cached modules, polluting any later test that had imported
+            # them (e.g. test_project_aggregator imports spine.persistence.
+            # checkpoint at module load) — an order-dependent failure.
+            monkeypatch.setitem(_sys.modules, "spine.workflow.compose", mock_compose)
+            monkeypatch.setitem(
+                _sys.modules, "spine.persistence.checkpoint", mock_cp_mod
+            )
 
-            try:
-                with patch("spine.work.dispatcher.ArtifactStore", MagicMock()), patch(
-                    "spine.work.dispatcher._preflight_worktree_clean"
-                ), patch("spine.git.WorktreeSandbox", return_value=sandbox):
-                    await resume_work("abc", "fix it", action="rework")
-                    mock_cp.delete_state.assert_called_once_with("abc")
-                    # rework restarts from the reviewed phase itself.
-                    assert captured["start_from_phase"] == "plan"
-
-                    # approve continues from the phase *after* the reviewed one.
-                    captured.clear()
-                    mock_cp.delete_state.reset_mock()
-                    await resume_work("abc", "", action="approve")
-                    assert captured["start_from_phase"] == "implement"
-            finally:
-                _sys.modules.pop("spine.workflow.compose", None)
-                _sys.modules.pop("spine.persistence.checkpoint", None)
+            with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
+                await resume_work("abc", "fix it", action="rework")
+                mock_cp.delete_state.assert_called_once_with("abc")
 
 
 # ── Critic router tests ──

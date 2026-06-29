@@ -69,26 +69,42 @@ def test_edit_invalidates_read_cache(ws):
 
 
 def test_not_found_suggests_target_file(ws):
+    # Target that does NOT exist on disk: a unique-basename match cannot be
+    # auto-resolved (that needs the target to exist — see
+    # test_autoresolve_redirects_to_existing_target), so the miss returns
+    # not_found WITH a did_you_mean suggestion.
     tool = ReadEditLintTool(
-        workspace_root=str(ws), target_files=["pkg/mod.py"]
+        workspace_root=str(ws), target_files=["pkg/ghost.py"]
     )
     out = tool._run("pkg/wrong_mod.py", read_symbol="Foo.bar")
     payload = json.loads(out)
     assert payload["status"] == "not_found"
-    # same basename → pkg/mod.py is suggested
-    out2 = tool._run("other/mod.py", read_symbol="Foo.bar")
+    # same basename as the (missing) target → pkg/ghost.py is suggested
+    out2 = tool._run("other/ghost.py", read_symbol="Foo.bar")
     sugg = json.loads(out2).get("did_you_mean", [])
-    assert "pkg/mod.py" in sugg
+    assert "pkg/ghost.py" in sugg
     # target_files are ranked first
-    assert sugg[0] == "pkg/mod.py"
+    assert sugg[0] == "pkg/ghost.py"
 
 
 def test_edit_not_found_also_suggests(ws):
-    tool = ReadEditLintTool(workspace_root=str(ws), target_files=["pkg/mod.py"])
-    out = tool._run("other/mod.py", old_str="return 1", new_str="return 9")
+    tool = ReadEditLintTool(workspace_root=str(ws), target_files=["pkg/ghost.py"])
+    out = tool._run("other/ghost.py", old_str="return 1", new_str="return 9")
     payload = json.loads(out)
     assert payload["status"] == "not_found"
-    assert "pkg/mod.py" in payload.get("did_you_mean", [])
+    assert "pkg/ghost.py" in payload.get("did_you_mean", [])
+
+
+def test_autoresolve_redirects_to_existing_target(ws):
+    # A wrong path whose basename uniquely matches an EXISTING target_file is
+    # silently redirected and read, rather than bounced as not_found
+    # (trace 019ef2ae — stops the editor inventing path variants).
+    tool = ReadEditLintTool(workspace_root=str(ws), target_files=["pkg/mod.py"])
+    out = tool._run("other/mod.py", read_symbol="Foo.bar")
+    # Redirected & read: an auto-correct note + the real source, not not_found.
+    assert "auto-corrected to the slice target pkg/mod.py" in out
+    assert "[read: pkg/mod.py" in out
+    assert "def bar" in out
 
 
 def test_edit_pressure_nudges_after_threshold(ws):

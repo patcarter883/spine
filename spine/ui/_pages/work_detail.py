@@ -302,6 +302,13 @@ def render(api: UIApi) -> None:
         if result.get("error"):
             st.error(f"Error: {result['error']}")
 
+    # ── Critic verdict ──
+    # Surface the critic's most recent verdict for any item it reviewed,
+    # regardless of terminal state (completed, failed, needs_review, stalled,
+    # awaiting_approval, approved, rejected, cancelled), so the reason an item
+    # ended where it did is never hidden. No-op when no verdict was recorded.
+    _render_critic_review(api, work_id)
+
     # ── Detailed Artifacts Section (auto-refreshing) ──
     st.divider()
     st.subheader("📁 Artifacts")
@@ -447,9 +454,6 @@ def render(api: UIApi) -> None:
         st.warning(
             "This plan is awaiting your approval before execution tasks are spawned."
         )
-
-        # ── Critic verdict ──
-        _render_critic_review(api, work_id)
 
         st.subheader("Approval")
         st.caption(

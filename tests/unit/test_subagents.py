@@ -348,10 +348,21 @@ class TestSubagentFactory:
         # output-capped) — raw read_file dumped whole files 35× on 019eb502.
         assert "read_file" not in impl_tools
 
-        # Verifier can execute (tests/lint) but not write
+        # Verifier surface is locked down to two purpose-built tools: a ranged
+        # read-only read_file and a constrained run_checks runner (trace
+        # 019f0212). No raw shell/exploration tools, no write surface.
         verifier_tools = SUBAGENT_TOOLS["slice-verifier"]
-        assert "execute" in verifier_tools
+        assert verifier_tools == ["read_file", "run_checks"]
+        # run_checks (a policed wrapper over execute) is the only execute path —
+        # the raw `execute` tool is no longer bound.
+        assert "execute" not in verifier_tools
+        assert "run_checks" in verifier_tools
+        # No raw filesystem-exploration tools: these drove the grep/find spiral.
+        for banned in ("ls", "glob", "grep", "search_codebase"):
+            assert banned not in verifier_tools
+        # Report-only: no write surface.
         assert "write_file" not in verifier_tools
+        assert "edit_file" not in verifier_tools
         assert "read_edit_lint" not in verifier_tools
 
     def test_build_subagent_spec_rejects_unknown(self) -> None:

@@ -366,3 +366,41 @@ class TestVerifyStateAndResult:
         }
         result = _verify_result_mapper(subgraph_result, {"work_id": "test"})
         assert result["status"] == "failed"
+
+class TestTargetSourcePreload:
+    """The verifier starts grounded on pre-loaded target source (trace 019f10bf)."""
+
+    def test_preload_renders_line_numbered_source(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import _target_source_block
+
+        (tmp_path / "a.py").write_text("import os\nx = 1\n", encoding="utf-8")
+        block = _target_source_block(str(tmp_path), ["a.py"])
+        assert "<target_source>" in block
+        assert "1| import os" in block
+        assert "2| x = 1" in block
+        assert "do NOT re-read" in block
+
+    def test_preload_truncates_long_file_with_pointer(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import (
+            _PRELOAD_MAX_LINES_PER_FILE,
+            _target_source_block,
+        )
+
+        n = _PRELOAD_MAX_LINES_PER_FILE + 50
+        (tmp_path / "big.py").write_text(
+            "\n".join(f"x{i} = {i}" for i in range(n)), encoding="utf-8"
+        )
+        block = _target_source_block(str(tmp_path), ["big.py"])
+        assert "more lines" in block
+        assert "read_file 'big.py'" in block
+
+    def test_preload_empty_when_no_targets(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import _target_source_block
+
+        assert _target_source_block(str(tmp_path), []) == ""
+        assert _target_source_block(str(tmp_path), None) == ""
+
+    def test_preload_skips_missing_files(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import _target_source_block
+
+        assert _target_source_block(str(tmp_path), ["ghost.py"]) == ""

@@ -64,9 +64,35 @@ def _write_valid_plan(tmp_path) -> None:
     )
 
 
+def _force_single_shot_synthesis(monkeypatch) -> None:
+    """Pin ``_synthesize_plan`` to the single-shot path.
+
+    The corrective-retry contract tests count ``ainvoke_with_retry`` calls and
+    expect exactly 2 (1 initial + 1 corrective). ``_synthesize_plan`` reads
+    ``research_synth_variants`` from the ambient ``.spine/config.yaml``; with
+    best-of-N enabled it calls ``_synthesize_plan_once`` N times (N×2 invokes),
+    so the count depends on machine config. Override the loaded config to force
+    variants=1 (and no findings-aggregation) so these tests stay deterministic.
+    best-of-N has its own coverage; here we pin the per-attempt contract.
+    """
+    from spine.config import SpineConfig
+
+    _real_load = SpineConfig.load
+
+    def _load_single(*a, **kw):
+        cfg = _real_load(*a, **kw)
+        cfg.research_synth_variants = 1
+        cfg.research_aggregate_merge = False
+        return cfg
+
+    monkeypatch.setattr(SpineConfig, "load", _load_single)
+
+
 @pytest.fixture
 def _stub_synth(monkeypatch):
     import spine.agents.plan_agent as plan_agent
+
+    _force_single_shot_synthesis(monkeypatch)
 
     monkeypatch.setattr(
         plan_agent, "build_plan_synthesizer", lambda state, config, **kw: object()
@@ -354,6 +380,7 @@ async def test_truncated_attempt_escalates_cap_and_restarts_prompt(
     monkeypatch.setattr(plan_agent, "build_plan_synthesizer", _fake_build)
     monkeypatch.setattr(es, "materialize_artifacts", lambda *a, **kw: None)
     monkeypatch.setattr(es, "build_context", lambda *a, **kw: None)
+    _force_single_shot_synthesis(monkeypatch)
     _fixed_budget(monkeypatch)
     monkeypatch.setattr(
         es, "_escalated_completion_cap", lambda budget, *, prompt_tokens: 16000
@@ -449,6 +476,7 @@ async def test_carried_escalation_flag_starts_synthesizer_at_raised_cap(
     monkeypatch.setattr(plan_agent, "build_plan_synthesizer", _fake_build)
     monkeypatch.setattr(es, "materialize_artifacts", lambda *a, **kw: None)
     monkeypatch.setattr(es, "build_context", lambda *a, **kw: None)
+    _force_single_shot_synthesis(monkeypatch)
     _fixed_budget(monkeypatch)
     monkeypatch.setattr(
         es, "_escalated_completion_cap", lambda budget, *, prompt_tokens: 16000

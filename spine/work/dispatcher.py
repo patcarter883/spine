@@ -218,6 +218,50 @@ def _derive_final_status(
     return status
 
 
+def _completion_result_payload(
+    result: dict[str, Any], *, extra: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build the persisted ``result`` blob for a finished work item.
+
+    Single source of truth so EVERY finalize path (submit, resume, restart,
+    plan-approval) stores the same shape — in particular the ``feedback`` list
+    and ``last_critic_review`` that the work-detail page reads to explain a
+    ``needs_review`` item. The resume/restart paths historically persisted only
+    ``feedback_count``, so a restarted task that ended in needs_review showed
+    the reviewer no reason at all.
+
+    Args:
+        result: The accumulated graph result/state.
+        extra: Optional keys to merge in (e.g. ``{"restarted": True}``).
+
+    Returns:
+        A JSON-serialisable dict ready for ``json.dumps``.
+    """
+    result_artifacts = result.get("artifacts", {})
+    feedback = result.get("feedback", [])
+    if not isinstance(feedback, list):
+        feedback = []
+    # Surface only the needs_review entries for display (passed entries are noise).
+    needs_review_feedback = [
+        f for f in feedback if isinstance(f, dict) and f.get("status") == "needs_review"
+    ]
+    payload: dict[str, Any] = {
+        "artifacts": {
+            k: list(v.keys()) for k, v in result_artifacts.items() if isinstance(v, dict)
+        },
+        "feedback_count": len(feedback),
+        "feedback": needs_review_feedback,
+        # The critic's final verdict — kept regardless of status so reviewers
+        # can see it for awaiting_approval plans (which PASS, leaving
+        # needs_review_feedback empty).
+        "last_critic_review": result.get("last_critic_review"),
+        "prompt_request": result.get("prompt_request"),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 # ── Submit work ──
 
 
@@ -681,29 +725,13 @@ async def submit_work(
                 if content is not None:
                     artifacts.save_artifact(work_id, phase, name, str(content))
 
-        # Filter feedback to only include needs_review entries for display
-        needs_review_feedback = [
-            f for f in feedback if isinstance(f, dict) and f.get("status") == "needs_review"
-        ]
-
         db["work_entries"].update(
             work_id,
             {
                 "status": final_status,
                 "current_phase": final_phase,
                 "updated_at": datetime.now().isoformat(),
-                "result": json.dumps(
-                    {
-                        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
-                        "feedback_count": len(feedback),
-                        "feedback": needs_review_feedback,
-                        # The critic's final verdict — kept regardless of status
-                        # so reviewers can see it for awaiting_approval plans
-                        # (which PASS, and so leave needs_review_feedback empty).
-                        "last_critic_review": result.get("last_critic_review"),
-                        "prompt_request": result.get("prompt_request"),
-                    }
-                ),
+                "result": json.dumps(_completion_result_payload(result)),
             },
         )
 
@@ -1112,7 +1140,6 @@ async def resume_work(
 
         # Derive final status (resume has no stall tracking).
         final_phase = result.get("current_phase", "")
-        result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])
         final_status = _derive_final_status(
             result, stalled=False, feedback=feedback, work_type=work_type
@@ -1125,11 +1152,7 @@ async def resume_work(
                 "current_phase": final_phase,
                 "updated_at": datetime.now().isoformat(),
                 "result": json.dumps(
-                    {
-                        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
-                        "feedback_count": len(feedback),
-                        "prompt_request": result.get("prompt_request"),
-                    }
+                    _completion_result_payload(result, extra={"resumed": True})
                 ),
             },
         )
@@ -2116,7 +2139,6 @@ async def _run_workflow_graph_inner(
     # A user-requested cancel is terminal — it must not be overwritten by the
     # graph-state derivation.
     final_phase = result.get("current_phase", "")
-    result_artifacts = result.get("artifacts", {})
     feedback = result.get("feedback", [])
     final_status = (
         TaskStatus.CANCELLED.value
@@ -2126,13 +2148,9 @@ async def _run_workflow_graph_inner(
         )
     )
 
-    result_payload = {
-        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
-        "feedback_count": len(feedback),
-        "prompt_request": result.get("prompt_request"),
-    }
-    if is_restart:
-        result_payload["restarted"] = True
+    result_payload = _completion_result_payload(
+        result, extra={"restarted": True} if is_restart else None
+    )
 
     db["work_entries"].update(
         work_id,
@@ -2692,7 +2710,6 @@ async def approve_and_spawn(
             }
 
         final_phase = result.get("current_phase", "")
-        result_artifacts = result.get("artifacts", {})
         feedback = result.get("feedback", [])
         final_status = _derive_final_status(
             result, stalled=False, feedback=feedback, work_type=work_type
@@ -2705,11 +2722,7 @@ async def approve_and_spawn(
                 "current_phase": final_phase,
                 "updated_at": datetime.now().isoformat(),
                 "result": json.dumps(
-                    {
-                        "artifacts": {k: list(v.keys()) for k, v in result_artifacts.items()},
-                        "feedback_count": len(feedback),
-                        "prompt_request": result.get("prompt_request"),
-                    }
+                    _completion_result_payload(result, extra={"resumed": True})
                 ),
             },
         )

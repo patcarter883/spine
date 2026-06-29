@@ -63,6 +63,36 @@ def test_format_directive_renders_all_fields():
     assert "jwt_secret" in body
 
 
+def test_format_directive_drops_notes_when_excluded():
+    """include_notes=False omits the notes line — the critic uses this so a
+    no-tool planner's invented notes (e.g. a hallucinated "Tkinter" stack on
+    trace 019f1204) never reach the reviewer, while approach/targets stay.
+    """
+    from spine.agents.prompt_format import Tag, get_block
+
+    d = SubagentDirective(
+        approach="Validate the payload against acceptance criteria.",
+        target_files=["spine/ui/_pages/config_view.py"],
+        notes="spine.ui components are likely Tkinter/Tkinter-based.",
+    )
+    body = get_block(format_directive_for_prompt(d, include_notes=False), Tag.DIRECTIVE)
+    assert "Validate the payload" in body
+    assert "config_view.py" in body
+    assert "Tkinter" not in body
+    assert "Notes" not in body
+    # Default still includes notes for do-nodes that benefit from them.
+    default_body = get_block(format_directive_for_prompt(d), Tag.DIRECTIVE)
+    assert "Tkinter" in default_body
+
+
+def test_plan_system_prompt_forbids_speculation():
+    """The planner prompt must explicitly ban guessing unseen facts — the
+    root cause of the invented Tkinter note on trace 019f1204."""
+    prompt = plan_do._PLAN_SYSTEM_PROMPT.lower()
+    assert "speculate" in prompt or "guess" in prompt
+    assert "stack" in prompt
+
+
 def test_format_directive_handles_dict_round_trip():
     """Directives round-trip through LangGraph state as dicts."""
     from spine.agents.prompt_format import Tag, get_block

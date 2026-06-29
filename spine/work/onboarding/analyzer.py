@@ -69,6 +69,11 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         "external",
         "third_party",
         "extern",
+        # Throwaway / non-architectural dirs: a "scratch" pad of one-off scripts
+        # is not a module boundary to onboard into, and would otherwise crowd out
+        # real source packages in the boundary ranking.
+        "scratch",
+        "tmp",
     }
 )
 
