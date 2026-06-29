@@ -11,12 +11,18 @@ This module gives the verifier two purpose-built tools — the same shape the
 implementer got — so it can inspect and test without a generic shell:
 
 - ``read_file``  — ranged, line-numbered, output-capped, READ-ONLY. Re-reading
-  an unchanged range returns an ``already_read`` nudge instead of the body, so
-  the agent stops re-fetching the same lines.
+  an unchanged range returns an ``already_read`` nudge instead of the body; a
+  per-file cap and a global wall stop the same-file-at-shifting-offsets and
+  breadth re-read spirals the verbatim de-dup misses (trace 019f10bf).
 - ``run_checks`` — a single constrained runner for tests / linters / builds. It
   delegates to the real execute backend but REJECTS pure-exploration commands
   (``grep``/``find``/``ls``/``cat``/``sed``/…): file inspection belongs to
-  ``read_file``, not the shell.
+  ``read_file``, not the shell. It also REPAIRS the sandbox environment (PATH +
+  PYTHONPATH) so the runner and the edited project package are actually
+  reachable, and after repeated *environment* failures it short-circuits with a
+  directive to verify statically rather than looping on a runner that cannot run
+  (trace 019f10bf: every ``pytest`` returned 127, every ``import spine`` raised
+  ModuleNotFoundError, and the verifier spiralled to millions of tokens).
 
 Both are LangChain ``BaseTool`` subclasses that slot directly into a subagent's
 ``tools=[...]`` list.
@@ -25,6 +31,9 @@ Both are LangChain ``BaseTool`` subclasses that slot directly into a subagent's
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,6 +50,48 @@ _MAX_READ_LINES = 400
 _DEFAULT_READ_LINES = 200
 _MAX_READ_CHARS = 20_000
 _MAX_RUN_CHARS = 12_000
+
+# Per-file read budget — distinct-anchor reads of the SAME file before the body
+# is withheld. The exact-(path,offset,limit,mtime) de-dup only catches VERBATIM
+# repeats; trace 019f10bf showed one file (api.py) read 8× at *varying* offsets
+# (54, 78, 102, 127, 154 …), every one slipping past the de-dup. This is the
+# verifier counterpart of read_edit_lint's ``_FILE_READ_CAP``. The verifier has
+# no "edit" to reset on, so the cap is cumulative across the whole verify pass.
+_FILE_READ_CAP = 5
+
+# Global read wall — total body-returning reads before every further read is
+# refused, whatever the file. Stops the breadth-spiral the per-file cap can't
+# (reading many files a few times each). The pre-loaded target source + worktree
+# diff already hand the verifier most of what it needs, so a healthy pass reads
+# only a handful of files; this wall is the backstop, not the budget.
+_READ_WALL = 16
+
+# Execution-environment failure handling. The slice-verifier runs in a sandbox
+# worktree whose shell PATH lacks the test runner and whose interpreter cannot
+# ``import`` the project package — trace 019f10bf: every ``pytest`` returned
+# 127 (command not found) and every ``python -c "import spine…"`` raised
+# ModuleNotFoundError, so the verifier could never obtain a PASS and looped on
+# new commands + re-reads, burning millions of tokens. Two defences:
+#   1. ``_env_prefix`` repairs the environment (PATH + PYTHONPATH) so the
+#      runners and the project package are actually reachable.
+#   2. After this many *environment* failures (not ordinary test failures), the
+#      runner short-circuits with a directive to verify STATICALLY instead of
+#      retrying a runner that cannot run.
+_ENV_FAIL_LIMIT = 2
+# Python entrypoints whose containing bin dir we surface onto the sandbox PATH.
+_RUNNER_TOOLS = ("pytest", "ruff", "mypy", "python", "python3", "pip", "uv", "tox")
+# Substrings (or exit 127) that mark the RUNNER itself being unavailable — the
+# shell could not find the binary, or the test framework isn't installed. We
+# deliberately do NOT treat a generic ``ModuleNotFoundError`` (e.g. for the
+# project package) as an environment failure: once ``_env_prefix`` has repaired
+# PYTHONPATH, a remaining import error is far more likely a REAL defect the
+# verifier should report than an environment problem to skip past. Matching only
+# runner-missing signals keeps the static-fallback from masking real bugs.
+_ENV_FAIL_MARKERS = ("command not found",) + tuple(
+    f"no module named {q}{tool}{q}"
+    for tool in ("pytest", "ruff", "mypy", "tox")
+    for q in ("", "'")
+)
 
 # Pure-exploration shell utilities. The verifier has no reason to run these:
 # reading files is ``read_file``'s job, and listing/searching is what drove the
@@ -98,9 +149,18 @@ class VerifyReadFileTool(BaseTool):
     args_schema: Optional[ArgsSchema] = _VerifyReadInput
 
     workspace_root: str = ""
+    # Caps default to the verifier's tight budget; callers that legitimately
+    # survey breadth (project-level review/verify) raise ``read_wall``.
+    file_read_cap: int = _FILE_READ_CAP
+    read_wall: int = _READ_WALL
 
     # Per-invocation read de-dup: (resolved_path, offset, limit, mtime) -> seen.
     _seen_reads: set = PrivateAttr(default_factory=set)
+    # Body-returning reads of each file this session (drives the per-file cap).
+    # Distinct from ``_seen_reads``, which keys on the exact anchor.
+    _file_read_count: dict = PrivateAttr(default_factory=dict)
+    # Total body-returning reads this session (drives the global wall).
+    _total_reads: int = PrivateAttr(default=0)
 
     def _resolve(self, file_path: str) -> Path:
         p = Path(file_path)
@@ -142,6 +202,29 @@ class VerifyReadFileTool(BaseTool):
                 "The content is above — do not re-read; make your verdict."
             )
 
+        # Global wall: too many distinct reads this pass → stop surveying.
+        if self._total_reads >= self.read_wall:
+            return (
+                f"status=read_wall: you have already read {self._total_reads} "
+                "file ranges this verification pass — that is enough surveying. "
+                "The source you read is above (plus the worktree diff and any "
+                "pre-loaded target source). Judge each acceptance criterion from "
+                "what you have and emit your verdict; do not read more."
+            )
+
+        # Per-file cap: re-reading the SAME file at shifting offsets is the
+        # spiral the verbatim de-dup misses (trace 019f10bf). The read that
+        # lands ON the cap still returns a fresh body (earlier copies may have
+        # been evicted); reads beyond it withhold the body.
+        prior_file_reads = self._file_read_count.get(str(path), 0)
+        if prior_file_reads >= self.file_read_cap:
+            return (
+                f"status=read_capped: you have already read {file_path} "
+                f"{prior_file_reads} times this pass at different offsets. Its "
+                "content is above — do not re-read it. Verify the acceptance "
+                "criteria from what you have, or run a check with run_checks."
+            )
+
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
@@ -170,6 +253,8 @@ class VerifyReadFileTool(BaseTool):
             last_lineno = i
 
         self._seen_reads.add(key)
+        self._file_read_count[str(path)] = prior_file_reads + 1
+        self._total_reads += 1
 
         body = "".join(numbered)
         header = f"# {file_path} (lines {offset + 1}–{last_lineno} of {total})\n"
@@ -264,13 +349,104 @@ class RunChecksTool(BaseTool):
     )
     args_schema: Optional[ArgsSchema] = _RunChecksInput
 
+    # Workspace root of the sandbox worktree. Used to repair PYTHONPATH so the
+    # edited project package is importable (``import spine`` failed in the raw
+    # sandbox — trace 019f10bf).
+    workspace_root: str = ""
+
     # The sandbox backend (SandboxBackendProtocol / CompositeBackend), injected
     # at build time. ``run_checks`` is a policy wrapper around backend.execute.
     _backend: Any = PrivateAttr(default=None)
+    # Consecutive *environment* failures (runner missing / package unimportable),
+    # as opposed to ordinary test failures. Drives the static-fallback directive.
+    _env_fail_streak: int = PrivateAttr(default=0)
+    # Cached ``export PATH=…; export PYTHONPATH=…;`` prefix (computed once).
+    _prefix_cache: Optional[str] = PrivateAttr(default=None)
 
-    def __init__(self, backend: Any = None, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(
+        self, backend: Any = None, workspace_root: str = "", **kwargs: Any
+    ) -> None:
+        super().__init__(workspace_root=workspace_root, **kwargs)
         self._backend = backend
+
+    def _env_prefix(self) -> str:
+        """Build a shell prefix that makes runners + the project importable.
+
+        The sandbox worktree's ``/bin/sh`` PATH lacks the test runner (``pytest``
+        lives in a user/venv bin dir, not ``/usr/bin``) and its interpreter
+        cannot ``import`` the edited project. We resolve each runner's real
+        location with ``shutil.which`` — which sees the harness's full PATH — and
+        prepend those bin dirs plus ``PYTHONPATH=<workspace_root>`` so a bare
+        ``pytest``/``ruff``/``python -c 'import spine'`` actually runs. Without
+        this the verifier can never get a PASS signal and spirals (trace
+        019f10bf). Best-effort and idempotent; returns ``""`` if nothing useful
+        was found.
+        """
+        if self._prefix_cache is not None:
+            return self._prefix_cache
+        bin_dirs: list[str] = []
+        seen: set[str] = set()
+
+        def _add(d: Optional[str]) -> None:
+            if d and d not in seen and os.path.isdir(d):
+                seen.add(d)
+                bin_dirs.append(d)
+
+        _add(os.path.dirname(sys.executable))
+        for tool in _RUNNER_TOOLS:
+            found = shutil.which(tool)
+            if found:
+                _add(os.path.dirname(found))
+
+        parts: list[str] = []
+        if bin_dirs:
+            parts.append(f"export PATH={os.pathsep.join(bin_dirs)}:$PATH;")
+        if self.workspace_root:
+            parts.append(f'export PYTHONPATH="{self.workspace_root}:$PYTHONPATH";')
+        self._prefix_cache = (" ".join(parts) + " ") if parts else ""
+        return self._prefix_cache
+
+    def _normalize(self, command: str) -> str:
+        """Prepend the environment-repair prefix to ``command``.
+
+        Only adds ``export`` statements — it never rewrites the command's own
+        tokens, so ``cd x && pytest`` and ``pytest | grep FAIL`` are preserved.
+        """
+        prefix = self._env_prefix()
+        return prefix + command if prefix else command
+
+    @staticmethod
+    def _is_env_failure(result: Any, formatted: str) -> bool:
+        """True when the command could not RUN (vs. ran and reported failure)."""
+        if getattr(result, "exit_code", None) == 127:
+            return True
+        low = formatted.lower()
+        return any(marker in low for marker in _ENV_FAIL_MARKERS)
+
+    def _env_unavailable(self, last: str = "") -> str:
+        """Terminal directive: stop running checks, verify statically instead."""
+        tail = f"\n\nLast error:\n{self._cap(last)}" if last else ""
+        return (
+            "status=env_unavailable: the sandbox cannot run executable checks — "
+            f"{self._env_fail_streak} commands failed to run (the test runner or "
+            "the project package is not available here, not a test failure). STOP "
+            "calling run_checks; retrying will keep failing. Verify STATICALLY: "
+            "read the changed code with read_file, compare it against the "
+            "worktree diff and the pre-loaded target source, and judge each "
+            "acceptance criterion from the source itself. Note in your report "
+            "that checks could not be executed." + tail
+        )
+
+    def _finish(self, result: Any) -> str:
+        """Format a backend result, tracking environment failures."""
+        formatted = self._format(result)
+        if self._is_env_failure(result, formatted):
+            self._env_fail_streak += 1
+            if self._env_fail_streak >= _ENV_FAIL_LIMIT:
+                return self._env_unavailable(formatted)
+        else:
+            self._env_fail_streak = 0
+        return self._cap(formatted)
 
     def _reject(self, lead: str) -> str:
         return (
@@ -310,27 +486,35 @@ class RunChecksTool(BaseTool):
         lead = _leading_executable(command)
         if lead in _EXPLORATION_COMMANDS:
             return self._reject(lead)
+        # The environment already proved it cannot run checks — don't pay another
+        # backend round-trip to fail again; repeat the static-verify directive.
+        if self._env_fail_streak >= _ENV_FAIL_LIMIT:
+            return self._env_unavailable()
         if self._backend is None:
             return "status=error: no execute backend available for run_checks."
+        cmd = self._normalize(command)
         result = (
-            self._backend.execute(command, timeout=timeout)
+            self._backend.execute(cmd, timeout=timeout)
             if timeout is not None
-            else self._backend.execute(command)
+            else self._backend.execute(cmd)
         )
-        return self._cap(self._format(result))
+        return self._finish(result)
 
     async def _arun(self, command: str, timeout: Optional[int] = None) -> str:
         lead = _leading_executable(command)
         if lead in _EXPLORATION_COMMANDS:
             return self._reject(lead)
+        if self._env_fail_streak >= _ENV_FAIL_LIMIT:
+            return self._env_unavailable()
         if self._backend is None:
             return "status=error: no execute backend available for run_checks."
+        cmd = self._normalize(command)
         result = (
-            await self._backend.aexecute(command, timeout=timeout)
+            await self._backend.aexecute(cmd, timeout=timeout)
             if timeout is not None
-            else await self._backend.aexecute(command)
+            else await self._backend.aexecute(cmd)
         )
-        return self._cap(self._format(result))
+        return self._finish(result)
 
 
 # ── Factory ────────────────────────────────────────────────────────────────
@@ -359,5 +543,5 @@ def build_verify_subagent_tools(
     """
     return [
         VerifyReadFileTool(workspace_root=workspace_root),
-        RunChecksTool(backend=backend),
+        RunChecksTool(backend=backend, workspace_root=workspace_root),
     ]

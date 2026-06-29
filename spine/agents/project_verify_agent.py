@@ -21,6 +21,7 @@ from langchain_core.runnables import RunnableConfig
 
 from spine.agents.factory import build_phase_agent
 from spine.agents.project_verify_tools import build_project_verify_tools
+from spine.agents.verify_subagent_tools import VerifyReadFileTool
 from spine.models.enums import PhaseName
 
 
@@ -101,6 +102,13 @@ def build_project_verify_agent(
         member_states=member_states,
         workspace_root=workspace_root,
     )
+    # Spot-checks use the bounded, read-only read_file (per-file cap + global
+    # wall + re-read de-dup) rather than the middleware's unbounded reader — the
+    # same surface the slice-verifier got after trace 019f10bf. This is a
+    # breadth survey, so the global wall is raised above the slice-verifier's.
+    tools.append(
+        VerifyReadFileTool(workspace_root=workspace_root, read_wall=40)
+    )
 
     agent = build_phase_agent(
         state=pseudo_state,
@@ -108,7 +116,7 @@ def build_project_verify_agent(
         phase=PhaseName.PROJECT_VERIFY,
         system_prompt=system_prompt,
         extra_tools=tools,
-        allowed_tools=["ls", "read_file", "glob", "grep"],
+        allowed_tools=["ls", "glob", "grep"],
     )
 
     return agent

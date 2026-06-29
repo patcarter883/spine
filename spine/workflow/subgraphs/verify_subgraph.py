@@ -218,6 +218,60 @@ def _worktree_diff(workspace_root: str, paths: list[str] | None) -> str:
     return diff
 
 
+# Pre-loaded source bounds. The verifier reads its target files to check them
+# against the criteria; handing the current source up-front means it starts
+# grounded at ZERO reads instead of paging each file in (trace 019f10bf read
+# api.py 8×). Bounded so a god-class file cannot dominate the prompt — the rest
+# is one bounded read_file away.
+_PRELOAD_MAX_LINES_PER_FILE = 400
+_PRELOAD_MAX_CHARS = 24000
+
+
+def _target_source_block(workspace_root: str, target_files: list[str] | None) -> str:
+    """Render the current source of the slice's target files, line-numbered.
+
+    Bounded per-file and overall; a file longer than the per-file cap is shown
+    head-first with a note steering the verifier to ``read_file`` for the rest.
+    Returns ``""`` when there is nothing to show.
+    """
+    files = [f for f in (target_files or []) if f]
+    if not files:
+        return ""
+    root = Path(workspace_root)
+    rendered: list[str] = []
+    budget = _PRELOAD_MAX_CHARS
+    for rel in files:
+        path = root / rel.lstrip("/")
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        lines = text.splitlines()
+        total = len(lines)
+        shown = lines[:_PRELOAD_MAX_LINES_PER_FILE]
+        body = "\n".join(f"{i}| {ln}" for i, ln in enumerate(shown, start=1))
+        note = (
+            ""
+            if len(shown) >= total
+            else f"\n… ({total - len(shown)} more lines — read_file '{rel}' "
+            f"offset={len(shown)} for the rest)"
+        )
+        chunk = f"### {rel} ({total} lines)\n{body}{note}"
+        if len(chunk) > budget:
+            chunk = chunk[:budget] + "\n…[pre-load truncated — read_file for the rest]"
+            rendered.append(chunk)
+            break
+        rendered.append(chunk)
+        budget -= len(chunk)
+    if not rendered:
+        return ""
+    return (
+        "<target_source>\nCurrent source of this slice's target files "
+        "(already loaded — do NOT re-read these with read_file unless you need "
+        "a region beyond what is shown):\n\n" + "\n\n".join(rendered) + "\n</target_source>"
+    )
+
+
 async def _run_slice_verifier_node(
     state: VerifySubgraphState,
     config: RunnableConfig | None = None,
@@ -281,6 +335,11 @@ async def _run_slice_verifier_node(
             "(empty ⇒ nothing was implemented — fail the slice):\n```diff\n"
             f"{diff_text or '(no changes in the working tree)'}\n```\n</worktree_diff>"
         )
+        # Pre-load the target files' current source so the verifier starts
+        # grounded at zero reads instead of paging each file in (trace 019f10bf).
+        source_block = _target_source_block(
+            state.get("workspace_root", "."), slice_data.get("target_files")
+        )
         # Hostage layout: data blocks first, plain-text directive at the
         # absolute tail. The directive_block from format_directive_for_prompt
         # is already wrapped in <directive> — splice it after xml_blocks
@@ -291,13 +350,16 @@ async def _run_slice_verifier_node(
                 (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
             )
             + "\n\n" + diff_block
+            + ("\n\n" + source_block if source_block else "")
             + ("\n\n" + directive_block if directive_block else ""),
             (
                 "Check the worktree_diff above against the acceptance_criteria "
                 "in the slice JSON. The diff is the ground truth of what "
                 "changed: if it is empty, the slice was NOT implemented — fail "
-                "it. Read a file ONLY when you need surrounding context the "
-                "diff does not show; do NOT survey the codebase."
+                "it. The current source of the target files is in "
+                "<target_source> — read it there, NOT with read_file. Read a "
+                "file only when you need a region beyond what is shown; do NOT "
+                "survey the codebase."
             ),
         )
 
