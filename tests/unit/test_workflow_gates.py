@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -307,7 +308,16 @@ class TestResumeWork:
         """When action='rework', resume should start from the needs_review_phase."""
         from spine.work.dispatcher import resume_work
 
-        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn:
+        # work_type='task' is code-producing, so resume_work enters a mandatory
+        # WorktreeSandbox (lazy `from spine.git import WorktreeSandbox`). Without
+        # mocking it the sandbox runs real git (worktree add + `git checkout
+        # <main>` / reset --hard) against THIS repo — flipping HEAD to main and
+        # clobbering the working tree. Mock it so the test stays hermetic.
+        mock_sandbox = MagicMock()
+        mock_sandbox.enter.return_value = SimpleNamespace(workspace_root="/tmp/sbx")
+        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn, patch(
+            "spine.git.WorktreeSandbox", return_value=mock_sandbox
+        ):
             mock_db = MagicMock()
             mock_table = MagicMock()
             mock_table.get.return_value = {
@@ -362,7 +372,7 @@ class TestResumeWork:
 
             try:
                 with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
-                    result = await resume_work("abc", "fix it", action="rework")
+                    await resume_work("abc", "fix it", action="rework")
                     mock_cp.delete_state.assert_called_once_with("abc")
             finally:
                 _sys.modules.pop("spine.workflow.compose", None)
