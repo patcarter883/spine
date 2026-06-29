@@ -81,7 +81,13 @@ class SubagentDirective(BaseModel):
     )
     notes: str = Field(
         default="",
-        description="Optional caveats, risks, or context the do node should keep in mind.",
+        description=(
+            "Optional caveats, risks, or context the do node should keep in "
+            "mind. State ONLY what the task text and provided context "
+            "establish — never guess unstated facts (frameworks, libraries, "
+            "type systems, file layout). If the stack is not given, do not "
+            "name one. Leave empty when you have nothing grounded to add."
+        ),
     )
 
 
@@ -101,7 +107,12 @@ _PLAN_SYSTEM_PROMPT = (
         "- If the task names specific files, list them in target_files.\n"
         "- If the task implies specific tool calls, list short labels in "
         "tool_calls_to_make. If unsure, leave the list empty.\n"
-        "- acceptance bullets should be testable conditions, not vague goals.",
+        "- acceptance bullets should be testable conditions, not vague goals.\n"
+        "- Ground every claim in the task text and the context you were "
+        "given. NEVER speculate about facts you cannot see — the tech "
+        "stack, frameworks, libraries, or type systems in use. Do not write "
+        "'likely X' guesses. If something is not established, omit it rather "
+        "than invent it.",
     )
 )
 
@@ -124,7 +135,10 @@ def empty_directive(reason: str = "") -> SubagentDirective:
 
 
 def format_directive_for_prompt(
-    directive: SubagentDirective | dict, *, compact: bool = False
+    directive: SubagentDirective | dict,
+    *,
+    compact: bool = False,
+    include_notes: bool = True,
 ) -> str:
     """Render a SubagentDirective wrapped in a ``<directive>`` block.
 
@@ -139,6 +153,12 @@ def format_directive_for_prompt(
     ``acceptance`` — used by the implement-phase prompt, where those fields are
     already carried by the ``<findings>`` and ``<edit_plan>`` blocks and would
     otherwise be stated a third time.
+
+    ``include_notes=False`` drops the ``notes`` line entirely. The critic
+    uses this: the critic reviews a self-contained JSON payload, so a
+    planner's free-text ``notes`` adds no grounding and has leaked
+    speculation (e.g. an invented "Tkinter" stack) that the critic then
+    treated as fact — see trace 019f1204.
     """
     if isinstance(directive, SubagentDirective):
         data = directive.model_dump()
@@ -172,7 +192,7 @@ def format_directive_for_prompt(
                 lines.append(f"- {a}")
 
     notes = (data.get("notes") or "").strip()
-    if notes:
+    if notes and include_notes:
         lines.append(f"**Notes:** {notes}")
 
     body = "\n".join(lines).strip()
