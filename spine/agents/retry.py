@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from typing import Any
 
@@ -350,6 +351,98 @@ def _is_transient_error(exc: Exception) -> bool:
     return False
 
 
+def _find_response_headers(exc: Exception) -> Any:
+    """Locate an HTTP response's headers mapping on ``exc`` or its wrapped cause.
+
+    OpenAI/httpx errors carry the response on ``exc.response``; a wrapper
+    exception may instead carry the real error as ``exc.args[0]``. Returns the
+    headers mapping (dict / ``httpx.Headers``) or ``None`` when none is found.
+    """
+    candidates: list[Any] = [exc]
+    args = getattr(exc, "args", ()) or ()
+    if args:
+        candidates.append(args[0])
+    for cand in candidates:
+        resp = getattr(cand, "response", None)
+        headers = getattr(resp, "headers", None) if resp is not None else None
+        if headers is not None:
+            return headers
+    return None
+
+
+def _header_get(headers: Any, name: str) -> Any:
+    """Case-insensitive header lookup over any ``.items()``-able mapping."""
+    try:
+        items = headers.items()
+    except Exception:  # noqa: BLE001 — not a mapping / mock without items
+        return None
+    target = name.lower()
+    for key, value in items:
+        try:
+            if str(key).lower() == target:
+                return value
+        except Exception:  # noqa: BLE001 — defensive against odd key types
+            continue
+    return None
+
+
+def _parse_rate_limit_sleep(exc: Exception) -> float | None:
+    """Return how long to wait from a rate-limit response's headers, or None.
+
+    Honors, in priority order:
+    1. ``Retry-After`` — integer seconds (only when strictly positive).
+    2. ``X-RateLimit-Reset`` — a future epoch-millisecond timestamp; the wait is
+       ``reset - now`` (None when already in the past).
+
+    Malformed or absent values yield ``None`` so the caller falls back to
+    exponential backoff. Honoring the server's own hint avoids hammering a
+    rate-limited endpoint (and the wasted tokens / 429-storms that causes).
+    """
+    headers = _find_response_headers(exc)
+    if not headers:
+        return None
+
+    retry_after = _header_get(headers, "retry-after")
+    if retry_after is not None:
+        try:
+            secs = float(retry_after)
+            if secs > 0:
+                return secs
+        except (TypeError, ValueError):
+            pass
+
+    reset = _header_get(headers, "x-ratelimit-reset")
+    if reset is not None:
+        try:
+            delta = float(reset) / 1000.0 - time.time()
+            if delta > 0:
+                return delta
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def _compute_sleep(
+    exc: Exception, attempt: int, base_delay: float, max_delay: float
+) -> float:
+    """Seconds to sleep before the next retry.
+
+    Prefers the server's rate-limit hint (``_parse_rate_limit_sleep``), capped at
+    ``max_delay`` and used as-is (a small ``Retry-After`` is honored, not floored).
+    Otherwise falls back to exponential backoff with ±10% jitter, capped at
+    ``max_delay`` and floored at 0.5s.
+    """
+    header_sleep = _parse_rate_limit_sleep(exc)
+    if header_sleep is not None:
+        return min(header_sleep, max_delay)
+
+    delay = min(base_delay * (2**attempt), max_delay)
+    jitter = delay * 0.1
+    sleep_time = min(delay + random.uniform(-jitter, jitter), max_delay)
+    return max(sleep_time, 0.5)
+
+
 def invoke_with_retry(
     agent: Any,
     input_: dict[str, Any],
@@ -443,13 +536,9 @@ def invoke_with_retry(
                 )
                 raise
 
-            # Exponential backoff with jitter
-            delay = min(base_delay * (2**attempt), max_delay)
-            jitter = delay * 0.1  # ±10% jitter
-            import random
-
-            sleep_time = delay + random.uniform(-jitter, jitter)
-            sleep_time = max(sleep_time, 0.5)  # floor at 0.5s
+            # Honor the server's rate-limit hint when present, else exponential
+            # backoff with jitter.
+            sleep_time = _compute_sleep(exc, attempt, base_delay, max_delay)
 
             logger.warning(
                 f"{prefix}{phase_label} transient error (attempt {attempt + 1}/{max_retries + 1}), "
@@ -576,13 +665,9 @@ async def ainvoke_with_retry(
                 )
                 raise
 
-            # Exponential backoff with jitter
-            delay = min(base_delay * (2**attempt), max_delay)
-            jitter = delay * 0.1  # ±10% jitter
-            import random
-
-            sleep_time = delay + random.uniform(-jitter, jitter)
-            sleep_time = max(sleep_time, 0.5)  # floor at 0.5s
+            # Honor the server's rate-limit hint when present, else exponential
+            # backoff with jitter.
+            sleep_time = _compute_sleep(exc, attempt, base_delay, max_delay)
 
             logger.warning(
                 f"{prefix}{phase_label} transient error (attempt {attempt + 1}/{max_retries + 1}), "
