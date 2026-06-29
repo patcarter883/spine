@@ -323,6 +323,59 @@ def _critic_state_mapper(reviewed_phase: str):
     return mapper
 
 
+def _verify_failure_reason(subgraph_result: dict) -> str:
+    """Compose a concrete needs_review reason from per-slice verdicts.
+
+    Names the failing slices and their gaps so the reviewer sees *why*
+    verification did not pass. Falls back to the synthesized
+    ``verification.md`` summary, then to a generic message — so the reason is
+    never a bare pointer to an artifact that may have been cleared.
+    """
+    findings = subgraph_result.get("verification_findings") or []
+    failed = [
+        f
+        for f in findings
+        if isinstance(f, dict) and f.get("verdict") not in ("VERIFIED", None)
+    ]
+    if failed:
+        lines = []
+        for f in failed:
+            name = f.get("slice_name", "unknown slice")
+            gaps = [str(g) for g in (f.get("gaps") or []) if g]
+            if gaps:
+                lines.append(f"{name}: " + "; ".join(gaps[:3]))
+            else:
+                lines.append(f"{name}: did not pass verification")
+        reason = f"{len(failed)} slice(s) did not pass verification:\n" + "\n".join(
+            f"- {ln}" for ln in lines
+        )
+        return reason[:2000]
+    # Fall back to the synthesized summary the verify subgraph carried back.
+    artifacts = subgraph_result.get("artifacts_output") or {}
+    if isinstance(artifacts, dict):
+        summary = str(artifacts.get("verification.md", "")).strip()
+        if summary:
+            return summary[:2000]
+    return (
+        "Verification did not pass and no detailed report was produced. "
+        "Manual review required."
+    )
+
+
+def _verify_failure_suggestions(subgraph_result: dict) -> list[str]:
+    """Aggregate per-slice recommendations into actionable suggestions."""
+    findings = subgraph_result.get("verification_findings") or []
+    suggestions: list[str] = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        for rec in f.get("recommendations") or []:
+            text = str(rec).strip()
+            if text and text not in suggestions:
+                suggestions.append(text)
+    return suggestions[:10]
+
+
 def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
     """Map VerifySubgraphState output back to parent WorkflowState.
 
@@ -344,8 +397,8 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
             {
                 "status": "needs_review",
                 "tier": "verify",
-                "reason": "Verification did not pass. See verification.md for details.",
-                "suggestions": [],
+                "reason": _verify_failure_reason(subgraph_result),
+                "suggestions": _verify_failure_suggestions(subgraph_result),
             }
         ]
     elif phase_status == "error":

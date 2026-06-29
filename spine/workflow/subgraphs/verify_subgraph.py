@@ -577,6 +577,30 @@ def _build_verification_summary(verification_results: list[dict]) -> str:
 # ── Node: save_artifacts ────────────────────────────────────────────────
 
 
+def _load_verification_results(workspace_root: str, work_id: str) -> list[dict]:
+    """Load per-slice verdicts from ``verification.json``, if present.
+
+    Returns the list of slice result dicts (``slice_name``, ``verdict``,
+    ``gaps``, ``recommendations``) so downstream consumers — the
+    needs_review feedback reason and the gap-plan phase — can name concrete
+    gaps instead of pointing at an artifact that may have been cleared.
+    Returns ``[]`` when the JSON is missing or unreadable.
+    """
+    verify_json = (
+        Path(workspace_root)
+        / artifact_path(work_id, PhaseName.VERIFY.value)
+        / "verification.json"
+    )
+    if not verify_json.exists():
+        return []
+    try:
+        data = json.loads(verify_json.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    results = data.get("verification_results", [])
+    return results if isinstance(results, list) else []
+
+
 async def _save_verify_artifacts(
     state: VerifySubgraphState,
     config: RunnableConfig | None = None,
@@ -593,9 +617,22 @@ async def _save_verify_artifacts(
     existing_phase_status = state.get("phase_status", "")
 
     if existing_phase_status in ("error", "needs_review"):
+        # Even when verification did not pass, carry the report the
+        # synthesize node wrote to disk back into state. Restarted/resumed
+        # runs execute in a worktree sandbox that is torn down on finalize,
+        # so anything NOT returned in artifacts_output is lost — leaving the
+        # reviewer staring at "needs_review" with no explanation. Surface the
+        # per-slice findings too, so the feedback reason can name the gaps.
+        disk_artifacts = scan_artifact_dir(
+            workspace_root,
+            work_id,
+            PhaseName.VERIFY.value,
+            max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        )
         return {
-            "artifacts_output": {},
+            "artifacts_output": disk_artifacts,
             "phase_status": existing_phase_status,
+            "verification_findings": _load_verification_results(workspace_root, work_id),
         }
 
     disk_artifacts = scan_artifact_dir(
@@ -635,17 +672,10 @@ async def _save_verify_artifacts(
                 work_id,
             )
 
-    verification_findings: list[dict] = []
-    agent_result = state.get("messages", [])
-    if isinstance(agent_result, dict) and "structured_response" in agent_result:
-        sr = agent_result.get("structured_response", {})
-        if isinstance(sr, dict):
-            verification_findings = [sr]
-
     return {
         "artifacts_output": disk_artifacts,
         "phase_status": "success" if is_verified else "needs_review",
-        "verification_findings": verification_findings,
+        "verification_findings": _load_verification_results(workspace_root, work_id),
     }
 
 
