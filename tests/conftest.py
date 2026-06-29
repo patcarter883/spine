@@ -79,6 +79,32 @@ def _no_langsmith_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
+# Modules that dispatcher/resume tests mock by assigning into ``sys.modules`` and
+# then ``pop``-ing in teardown — which DELETES the real cached module. A later
+# test that imported one at module-load time (e.g. test_project_aggregator
+# imports spine.persistence.checkpoint) then sees it missing/re-created: an
+# order-dependent failure that only surfaces in full-suite runs. Snapshot and
+# restore these around every test so such deletions cannot leak across tests.
+_PRESERVED_SYS_MODULES = (
+    "spine.workflow.compose",
+    "spine.persistence.checkpoint",
+)
+
+
+@pytest.fixture(autouse=True)
+def _preserve_lazy_imported_modules() -> Generator[None, None, None]:
+    """Restore ``sys.modules`` entries that tests mock-and-pop (test isolation)."""
+    import sys
+
+    saved = {k: sys.modules.get(k) for k in _PRESERVED_SYS_MODULES}
+    yield
+    for key, original in saved.items():
+        if original is not None:
+            sys.modules[key] = original
+        elif key in sys.modules:
+            del sys.modules[key]
+
+
 @pytest.fixture(scope="session")
 def temp_dir() -> Generator[Path, None, None]:
     """Create a temporary directory for test files."""
