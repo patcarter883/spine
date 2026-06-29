@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Generator
@@ -11,6 +12,54 @@ from pytest_asyncio import fixture as asyncio_fixture
 
 from spine.config import SpineConfig
 from spine.models.types import Task, Artifact, ReviewFeedback, PromptRequest
+
+# Absolute path to THIS repository — fixed regardless of any test's cwd changes.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _repo_head() -> str:
+    """Return the real repo's symbolic HEAD ref (e.g. ``refs/heads/main``)."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "symbolic-ref", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001 — guard must never crash the suite
+        return ""
+
+
+@pytest.fixture(autouse=True)
+def _guard_repo_git_head() -> Generator[None, None, None]:
+    """Fail loudly if a test mutates the real repo's git HEAD, and restore it.
+
+    ``SpineGitOrchestrator`` defaults ``master_dir`` to ``os.getcwd()`` and its
+    merge/rollback paths run ``git checkout <main>`` (and, on rollback,
+    ``git reset --hard`` / ``git clean -fd``). A test that drives those paths
+    without overriding ``master_dir`` to a tmp repo mutates THIS checkout —
+    flipping HEAD to main and potentially wiping the working tree. Running the
+    full suite used to leave HEAD on ``main`` for exactly this reason.
+
+    This autouse guard snapshots HEAD before each test and, if it changed,
+    re-points it (via ``symbolic-ref`` — no working-tree checkout) and fails the
+    offending test by name so the leak is caught at its source instead of
+    silently poisoning the rest of the run.
+    """
+    before = _repo_head()
+    yield
+    after = _repo_head()
+    if before and after and before != after:
+        # Re-point HEAD without touching the working tree, so subsequent tests
+        # (and the developer's checkout) aren't left on the wrong branch.
+        subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "symbolic-ref", "HEAD", before],
+            capture_output=True, text=True,
+        )
+        pytest.fail(
+            f"Test mutated the real repo's git HEAD ({before} -> {after}). It "
+            "likely constructed SpineGitOrchestrator without overriding "
+            "master_dir (which defaults to os.getcwd()). Point it at a tmp repo.",
+            pytrace=False,
+        )
 
 
 @pytest.fixture(autouse=True)
