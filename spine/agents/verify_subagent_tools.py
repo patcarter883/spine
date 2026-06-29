@@ -33,7 +33,9 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import site
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Any, Optional
 
@@ -73,25 +75,29 @@ _READ_WALL = 16
 # ModuleNotFoundError, so the verifier could never obtain a PASS and looped on
 # new commands + re-reads, burning millions of tokens. Two defences:
 #   1. ``_env_prefix`` repairs the environment (PATH + PYTHONPATH) so the
-#      runners and the project package are actually reachable.
-#   2. After this many *environment* failures (not ordinary test failures), the
-#      runner short-circuits with a directive to verify STATICALLY instead of
-#      retrying a runner that cannot run.
-_ENV_FAIL_LIMIT = 2
+#      runners and the project package are actually reachable — resolving the
+#      runners' bin dirs from the interpreter itself, not just ``shutil.which``,
+#      which misses ``~/.local/bin`` under a stripped launch PATH (trace
+#      019f111e: ``ruff`` 127'd despite the env-repair shipping).
+#   2. A runner that still can't run is recorded as unavailable *per tool*
+#      (sticky), so a repeat call short-circuits with a STATIC-verify directive
+#      instead of paying another failing round-trip. Sticky-per-tool — not a
+#      consecutive streak — because a working ``python -c import`` check
+#      interleaved between two dead ``ruff`` checks must not reset the linter
+#      back to "available" (trace 019f111e). If the interpreter itself can't
+#      run, nothing can, and the verifier is told to stop calling run_checks.
 # Python entrypoints whose containing bin dir we surface onto the sandbox PATH.
 _RUNNER_TOOLS = ("pytest", "ruff", "mypy", "python", "python3", "pip", "uv", "tox")
-# Substrings (or exit 127) that mark the RUNNER itself being unavailable — the
-# shell could not find the binary, or the test framework isn't installed. We
-# deliberately do NOT treat a generic ``ModuleNotFoundError`` (e.g. for the
-# project package) as an environment failure: once ``_env_prefix`` has repaired
-# PYTHONPATH, a remaining import error is far more likely a REAL defect the
-# verifier should report than an environment problem to skip past. Matching only
-# runner-missing signals keeps the static-fallback from masking real bugs.
-_ENV_FAIL_MARKERS = ("command not found",) + tuple(
-    f"no module named {q}{tool}{q}"
-    for tool in ("pytest", "ruff", "mypy", "tox")
-    for q in ("", "'")
-)
+# Test/lint frameworks that report unavailability as ``No module named '<tool>'``
+# (e.g. when invoked as ``python -m pytest``) rather than a shell 127. A bare
+# ``ModuleNotFoundError`` for the *project* package is deliberately NOT treated
+# as an environment failure: once ``_env_prefix`` has repaired PYTHONPATH, a
+# remaining import error is far more likely a REAL defect the verifier should
+# report than an environment problem — matching only framework modules keeps the
+# static-fallback from masking real bugs.
+_ENV_FAIL_MODULES = ("pytest", "ruff", "mypy", "tox")
+# Interpreters whose absence means NO check can run (vs. a single missing tool).
+_INTERPRETERS = frozenset({"python", "python3"})
 
 # Pure-exploration shell utilities. The verifier has no reason to run these:
 # reading files is ``read_file``'s job, and listing/searching is what drove the
@@ -322,6 +328,33 @@ def _leading_executable(command: str) -> str:
     return ""
 
 
+def _interpreter_script_dirs() -> list[str]:
+    """Console-script bin dirs for the running interpreter, PATH-independent.
+
+    A ``shutil.which`` probe fails when the process is launched with a stripped
+    PATH that omits ``~/.local/bin`` (pip ``--user`` installs) or the active
+    venv's bin dir, so ``pytest``/``ruff`` return 127 even though they are
+    installed (trace 019f111e). ``sysconfig``/``site`` resolve those dirs from
+    the interpreter itself, independent of the launching PATH. Best-effort: any
+    probe that raises is skipped.
+    """
+    dirs: list[str] = []
+    try:
+        dirs.append(sysconfig.get_path("scripts"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # Per-user scheme (``posix_user`` / ``nt_user``) → ``~/.local/bin``.
+        dirs.append(sysconfig.get_path("scripts", f"{os.name}_user"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        dirs.append(os.path.join(site.getuserbase(), "bin"))
+    except Exception:  # noqa: BLE001
+        pass
+    return [d for d in dirs if d]
+
+
 class RunChecksTool(BaseTool):
     """Constrained test/lint/build runner.
 
@@ -357,9 +390,11 @@ class RunChecksTool(BaseTool):
     # The sandbox backend (SandboxBackendProtocol / CompositeBackend), injected
     # at build time. ``run_checks`` is a policy wrapper around backend.execute.
     _backend: Any = PrivateAttr(default=None)
-    # Consecutive *environment* failures (runner missing / package unimportable),
-    # as opposed to ordinary test failures. Drives the static-fallback directive.
-    _env_fail_streak: int = PrivateAttr(default=0)
+    # Runners proven unable to RUN here (missing binary / framework), tracked
+    # sticky per tool so a working check interleaved between two failing ones
+    # can't reset a dead runner back to "available" (trace 019f111e). Drives the
+    # per-tool and whole-environment static-fallback directives.
+    _unavailable_runners: set = PrivateAttr(default_factory=set)
     # Cached ``export PATH=…; export PYTHONPATH=…;`` prefix (computed once).
     _prefix_cache: Optional[str] = PrivateAttr(default=None)
 
@@ -374,13 +409,19 @@ class RunChecksTool(BaseTool):
 
         The sandbox worktree's ``/bin/sh`` PATH lacks the test runner (``pytest``
         lives in a user/venv bin dir, not ``/usr/bin``) and its interpreter
-        cannot ``import`` the edited project. We resolve each runner's real
-        location with ``shutil.which`` — which sees the harness's full PATH — and
-        prepend those bin dirs plus ``PYTHONPATH=<workspace_root>`` so a bare
+        cannot ``import`` the edited project. We surface the runners' real bin
+        dirs onto PATH and add ``PYTHONPATH=<workspace_root>`` so a bare
         ``pytest``/``ruff``/``python -c 'import spine'`` actually runs. Without
         this the verifier can never get a PASS signal and spirals (trace
-        019f10bf). Best-effort and idempotent; returns ``""`` if nothing useful
-        was found.
+        019f10bf).
+
+        Discovery does NOT rely on ``shutil.which`` alone: a bench launched with
+        a stripped PATH (systemd/cron) that omits ``~/.local/bin`` makes
+        ``which('ruff')`` return ``None``, so the prefix never repaired the
+        linter and every ``ruff``/``pytest`` returned 127 (trace 019f111e). We
+        therefore also resolve the interpreter's console-script dirs directly
+        via ``sysconfig``/``site``, which are independent of the launching PATH.
+        Best-effort and idempotent; returns ``""`` if nothing useful was found.
         """
         if self._prefix_cache is not None:
             return self._prefix_cache
@@ -392,7 +433,13 @@ class RunChecksTool(BaseTool):
                 seen.add(d)
                 bin_dirs.append(d)
 
+        # The interpreter's own bin dir, then its console-script dirs (default +
+        # per-user install schemes) — these resolve ~/.local/bin and venv bin
+        # dirs even when the launching PATH is stripped of them.
         _add(os.path.dirname(sys.executable))
+        for d in _interpreter_script_dirs():
+            _add(d)
+        # Finally whatever the live PATH can resolve (rich interactive launches).
         for tool in _RUNNER_TOOLS:
             found = shutil.which(tool)
             if found:
@@ -416,36 +463,71 @@ class RunChecksTool(BaseTool):
         return prefix + command if prefix else command
 
     @staticmethod
-    def _is_env_failure(result: Any, formatted: str) -> bool:
-        """True when the command could not RUN (vs. ran and reported failure)."""
-        if getattr(result, "exit_code", None) == 127:
-            return True
+    def _env_failure_tool(result: Any, formatted: str, lead: str) -> Optional[str]:
+        """Name of the runner that could not RUN, or ``None`` if it ran.
+
+        Distinguishes a *missing runner* (127 / command-not-found → the leading
+        binary) from a *missing test framework module* (``No module named
+        'pytest'`` when invoked as ``python -m pytest`` → the framework, NOT the
+        interpreter, which ran fine). Attributing the latter to the framework
+        keeps a ``python -m <tool>`` miss from falsely flagging the interpreter
+        as dead and stopping every check.
+        """
         low = formatted.lower()
-        return any(marker in low for marker in _ENV_FAIL_MARKERS)
+        for tool in _ENV_FAIL_MODULES:
+            if f"no module named '{tool}'" in low or f"no module named {tool}" in low:
+                return tool
+        if getattr(result, "exit_code", None) == 127 or "command not found" in low:
+            return lead or "the runner"
+        return None
+
+    def _interpreter_dead(self) -> bool:
+        """True once ``python`` itself proved unrunnable — nothing else can run."""
+        return bool(self._unavailable_runners & _INTERPRETERS)
 
     def _env_unavailable(self, last: str = "") -> str:
         """Terminal directive: stop running checks, verify statically instead."""
         tail = f"\n\nLast error:\n{self._cap(last)}" if last else ""
         return (
             "status=env_unavailable: the sandbox cannot run executable checks — "
-            f"{self._env_fail_streak} commands failed to run (the test runner or "
-            "the project package is not available here, not a test failure). STOP "
-            "calling run_checks; retrying will keep failing. Verify STATICALLY: "
-            "read the changed code with read_file, compare it against the "
-            "worktree diff and the pre-loaded target source, and judge each "
+            "the interpreter itself is not runnable here (not a test failure). "
+            "STOP calling run_checks; retrying will keep failing. Verify "
+            "STATICALLY: read the changed code with read_file, compare it against "
+            "the worktree diff and the pre-loaded target source, and judge each "
             "acceptance criterion from the source itself. Note in your report "
             "that checks could not be executed." + tail
         )
 
-    def _finish(self, result: Any) -> str:
-        """Format a backend result, tracking environment failures."""
+    def _runner_unavailable(self, tool: str, last: str = "") -> str:
+        """Per-tool directive: this runner can't run; don't retry it."""
+        tail = f"\n\nLast error:\n{self._cap(last)}" if last else ""
+        return (
+            f"status=runner_unavailable: '{tool}' cannot run in this sandbox "
+            "(command not found / exit 127 — the tool isn't installed here, not a "
+            f"check failure). Do NOT call '{tool}' again; repeat calls will keep "
+            "failing. Verify what it would have checked STATICALLY with read_file "
+            "(for a linter, eyeball the changed lines), and rely on the runners "
+            'that DO work here — a bare `python -c "import <module>"` smoke-import '
+            f"succeeds. Note in your report that '{tool}' could not be executed."
+            + tail
+        )
+
+    def _finish(self, lead: str, result: Any) -> str:
+        """Format a backend result, tracking *runner-missing* failures.
+
+        A runner that cannot run is recorded as unavailable (sticky, per tool)
+        so subsequent calls short-circuit instead of paying another failing
+        round-trip. An interleaved working check does NOT clear the record — a
+        permanently-missing ``ruff`` must stay flagged even after a passing
+        ``python -c import`` (trace 019f111e).
+        """
         formatted = self._format(result)
-        if self._is_env_failure(result, formatted):
-            self._env_fail_streak += 1
-            if self._env_fail_streak >= _ENV_FAIL_LIMIT:
+        tool = self._env_failure_tool(result, formatted, lead)
+        if tool:
+            self._unavailable_runners.add(tool)
+            if self._interpreter_dead():
                 return self._env_unavailable(formatted)
-        else:
-            self._env_fail_streak = 0
+            return self._runner_unavailable(tool, formatted)
         return self._cap(formatted)
 
     def _reject(self, lead: str) -> str:
@@ -482,14 +564,25 @@ class RunChecksTool(BaseTool):
             parts.append("\n[Output was truncated due to size limits]")
         return "".join(parts)
 
-    def _run(self, command: str, timeout: Optional[int] = None) -> str:
-        lead = _leading_executable(command)
+    def _short_circuit(self, lead: str) -> Optional[str]:
+        """Directive to return without a backend round-trip, or ``None`` to run.
+
+        Rejects pure-exploration commands, and skips re-running a runner already
+        proven unable to run here (the interpreter being dead skips everything).
+        """
         if lead in _EXPLORATION_COMMANDS:
             return self._reject(lead)
-        # The environment already proved it cannot run checks — don't pay another
-        # backend round-trip to fail again; repeat the static-verify directive.
-        if self._env_fail_streak >= _ENV_FAIL_LIMIT:
+        if self._interpreter_dead():
             return self._env_unavailable()
+        if lead in self._unavailable_runners:
+            return self._runner_unavailable(lead)
+        return None
+
+    def _run(self, command: str, timeout: Optional[int] = None) -> str:
+        lead = _leading_executable(command)
+        short = self._short_circuit(lead)
+        if short is not None:
+            return short
         if self._backend is None:
             return "status=error: no execute backend available for run_checks."
         cmd = self._normalize(command)
@@ -498,14 +591,13 @@ class RunChecksTool(BaseTool):
             if timeout is not None
             else self._backend.execute(cmd)
         )
-        return self._finish(result)
+        return self._finish(lead, result)
 
     async def _arun(self, command: str, timeout: Optional[int] = None) -> str:
         lead = _leading_executable(command)
-        if lead in _EXPLORATION_COMMANDS:
-            return self._reject(lead)
-        if self._env_fail_streak >= _ENV_FAIL_LIMIT:
-            return self._env_unavailable()
+        short = self._short_circuit(lead)
+        if short is not None:
+            return short
         if self._backend is None:
             return "status=error: no execute backend available for run_checks."
         cmd = self._normalize(command)
@@ -514,7 +606,7 @@ class RunChecksTool(BaseTool):
             if timeout is not None
             else await self._backend.aexecute(cmd)
         )
-        return self._finish(result)
+        return self._finish(lead, result)
 
 
 # ── Factory ────────────────────────────────────────────────────────────────

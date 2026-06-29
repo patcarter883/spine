@@ -11,6 +11,7 @@ filesystem+shell surface (trace 019f0212):
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 from spine.agents.verify_subagent_tools import (
     RunChecksTool,
     VerifyReadFileTool,
+    _interpreter_script_dirs,
     _leading_executable,
     build_verify_subagent_tools,
 )
@@ -261,6 +263,26 @@ def test_run_checks_injects_pythonpath(tmp_path):
     assert sent.endswith("pytest -q")
 
 
+def test_env_prefix_finds_runners_without_path(monkeypatch, tmp_path):
+    """PATH repair must not depend on shutil.which (trace 019f111e).
+
+    A bench launched with a stripped PATH that omits ``~/.local/bin`` makes
+    ``which('ruff')`` return None — so the runners' bin dirs must instead be
+    resolved from the interpreter via sysconfig/site. With ``which`` blinded,
+    every existing interpreter script dir is still surfaced onto PATH.
+    """
+    import spine.agents.verify_subagent_tools as mod
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _tool: None)
+    tool = RunChecksTool(backend=_FakeBackend(output="ok"), workspace_root=str(tmp_path))
+    prefix = tool._env_prefix()
+    assert "export PATH=" in prefix
+    surfaced = [d for d in _interpreter_script_dirs() if os.path.isdir(d)]
+    assert surfaced  # at least one script dir exists on this interpreter
+    for d in surfaced:
+        assert d in prefix
+
+
 class _EnvFailBackend(_FakeBackend):
     """Backend whose commands cannot run (missing runner / package)."""
 
@@ -274,28 +296,81 @@ class _EnvFailBackend(_FakeBackend):
         return _ExecResp(self._message, exit_code=self._exit)
 
 
-def test_run_checks_env_unavailable_after_repeated_failures():
+def test_run_checks_missing_runner_short_circuits_per_tool():
+    """A missing test runner is flagged per-tool and not re-run.
+
+    A missing test runner (vs. the interpreter) is reported as
+    ``runner_unavailable``, not the whole-env fallback, and a repeat call
+    short-circuits WITHOUT another backend round-trip.
+    """
     be = _EnvFailBackend("pytest: command not found", exit_code=127)
     tool = RunChecksTool(backend=be, workspace_root="/ws")
     first = tool._run("pytest -q")
-    assert "env_unavailable" not in first  # first failure is reported normally
-    second = tool._run("pytest tests/ -q")
-    assert "env_unavailable" in second
-    assert "statically" in second.lower()
-    # Further calls short-circuit WITHOUT another backend round-trip.
+    assert "runner_unavailable" in first
+    assert "env_unavailable" not in first  # interpreter is fine; only pytest is dead
+    assert "pytest" in first
+    # Further pytest calls short-circuit WITHOUT another backend round-trip.
     n_before = len(be.calls)
-    third = tool._run("pytest -q")
-    assert "env_unavailable" in third
+    second = tool._run("pytest tests/ -q")
+    assert "runner_unavailable" in second
     assert len(be.calls) == n_before  # no new execution
 
 
-def test_run_checks_missing_runner_is_env_failure():
-    """The test framework itself missing → env failure (static fallback)."""
-    be = _EnvFailBackend("No module named pytest", exit_code=1)
+def test_run_checks_missing_runner_does_not_kill_interpreter():
+    """``python -m pytest`` missing the framework flags pytest, not python.
+
+    The ``No module named 'pytest'`` is attributed to the framework, so the
+    interpreter stays runnable and a subsequent ``python -c import`` still
+    EXECUTES instead of short-circuiting.
+    """
+    be = _EnvFailBackend("No module named 'pytest'", exit_code=1)
     tool = RunChecksTool(backend=be, workspace_root="/ws")
-    tool._run("python -m pytest -q")
-    out = tool._run("python -m pytest tests/ -q")
+    out = tool._run("python -m pytest -q")
+    assert "runner_unavailable" in out
+    assert "env_unavailable" not in out
+    assert "pytest" in out
+    # The interpreter was NOT marked dead — a python smoke-import still runs.
+    n_before = len(be.calls)
+    tool._run("python -c 'import spine'")
+    assert len(be.calls) == n_before + 1  # executed, not short-circuited
+
+
+def test_run_checks_dead_interpreter_stops_all_checks():
+    """``python: command not found`` → whole-env fallback, all checks stop."""
+    be = _EnvFailBackend("python: command not found", exit_code=127)
+    tool = RunChecksTool(backend=be, workspace_root="/ws")
+    out = tool._run("python -c 'import spine'")
     assert "env_unavailable" in out
+    assert "statically" in out.lower()
+    # Even an unrelated runner short-circuits now — nothing can run.
+    n_before = len(be.calls)
+    assert "env_unavailable" in tool._run("ruff check spine/")
+    assert len(be.calls) == n_before
+
+
+def test_run_checks_unavailable_is_sticky_across_success(tmp_path):
+    """A working check between two dead ``ruff`` calls must not un-flag ruff.
+
+    The core of the per-tool fix (trace 019f111e): the streak-based tracker
+    reset on any success, so an interleaved passing ``python`` check re-armed a
+    permanently-missing linter every time.
+    """
+
+    class _RuffDead(_FakeBackend):
+        def execute(self, command, *, timeout=None):  # noqa: ANN001
+            self.calls.append((command, timeout))
+            if "ruff" in command:
+                return _ExecResp("ruff: command not found", exit_code=127)
+            return _ExecResp("ok", exit_code=0)
+
+    be = _RuffDead()
+    tool = RunChecksTool(backend=be, workspace_root=str(tmp_path))
+    assert "runner_unavailable" in tool._run("ruff check spine/")
+    assert "ok" in tool._run("python -c 'import spine'")  # success in between
+    n_before = len(be.calls)
+    again = tool._run("ruff check spine/agents/")
+    assert "runner_unavailable" in again  # still flagged
+    assert len(be.calls) == n_before  # short-circuited, not re-run
 
 
 def test_run_checks_project_import_error_is_reported_not_masked():
