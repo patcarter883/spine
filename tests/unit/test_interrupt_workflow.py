@@ -61,6 +61,33 @@ class TestInterruptRouter:
         state = {"human_feedback": None}
         assert self.router(state) == "abort"
 
+    def test_router_rework_after_interrupt_clears_phase(self):
+        # Regression (trace 019f11d0): _human_review_interrupt nulls
+        # needs_review_phase in the same update the router reads, so a "rework"
+        # must route off the target stashed on human_feedback — not collapse to
+        # "abort" because live needs_review_phase is None.
+        state = {
+            "human_feedback": {
+                "action": "rework",
+                "feedback": "needs work",
+                "_review_target": "plan",
+            },
+            "needs_review_phase": None,
+            "current_phase": "critic",
+        }
+        assert self.router(state) == "plan"
+
+    def test_router_approve_after_interrupt_clears_phase(self):
+        # Same ordering trap for "approve": with needs_review_phase cleared, the
+        # old current_phase fallback would advance from the wrong phase. The
+        # stashed target keeps it advancing from "plan" → "critic_plan".
+        state = {
+            "human_feedback": {"action": "approve", "_review_target": "plan"},
+            "needs_review_phase": None,
+            "current_phase": "critic",
+        }
+        assert self.router(state) == "critic_plan"
+
 
 class TestInterruptNodeFunction:
     """Tests for _human_review_interrupt node function."""
