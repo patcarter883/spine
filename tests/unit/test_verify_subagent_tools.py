@@ -74,6 +74,29 @@ def test_read_missing_and_directory(tmp_path):
     assert "is_directory" in tool._run(str(tmp_path))
 
 
+def test_read_per_file_cap_withholds_body(tmp_path):
+    """Re-reading one file at shifting offsets is capped (trace 019f10bf)."""
+    path = _write(tmp_path, "f.py", 500)
+    tool = VerifyReadFileTool(workspace_root=str(tmp_path), file_read_cap=3)
+    # Distinct offsets slip past the verbatim de-dup, so they hit the per-file cap.
+    for off in range(3):
+        out = tool._run(path, offset=off * 10, limit=5)
+        assert "read_capped" not in out
+    capped = tool._run(path, offset=999, limit=5)
+    assert "read_capped" in capped
+    assert "line" not in capped.split("read_capped")[0]  # no body before the status
+
+
+def test_read_global_wall_refuses_further_reads(tmp_path):
+    """Once the global wall is hit, even a new file is refused."""
+    tool = VerifyReadFileTool(workspace_root=str(tmp_path), read_wall=3, file_read_cap=99)
+    for i in range(3):
+        p = _write(tmp_path, f"f{i}.py", 10)
+        assert "read_wall" not in tool._run(p, offset=0, limit=5)
+    extra = _write(tmp_path, "extra.py", 10)
+    assert "read_wall" in tool._run(extra, offset=0, limit=5)
+
+
 # ── run_checks policy ───────────────────────────────────────────────────────
 
 
@@ -126,14 +149,22 @@ def test_run_checks_allows_test_command():
     out = tool._run("pytest -q")
     assert "3 passed" in out
     assert "[Command succeeded with exit code 0]" in out
-    assert be.calls == [("pytest -q", None)]
+    # The original command is preserved verbatim at the tail; only an env-repair
+    # prefix may be prepended (PATH/PYTHONPATH exports).
+    assert len(be.calls) == 1
+    sent, sent_timeout = be.calls[0]
+    assert sent.endswith("pytest -q")
+    assert sent_timeout is None
 
 
 def test_run_checks_forwards_timeout():
     be = _FakeBackend()
     tool = RunChecksTool(backend=be)
     tool._run("ruff check spine/", timeout=30)
-    assert be.calls == [("ruff check spine/", 30)]
+    assert len(be.calls) == 1
+    sent, sent_timeout = be.calls[0]
+    assert sent.endswith("ruff check spine/")
+    assert sent_timeout == 30
 
 
 def test_run_checks_reports_nonzero_exit():
@@ -151,7 +182,9 @@ def test_run_checks_async_path():
     be = _FakeBackend(output="async ok")
     out = asyncio.run(RunChecksTool(backend=be)._arun("pytest -q"))
     assert "async ok" in out
-    assert be.calls == [("pytest -q", None)]
+    assert len(be.calls) == 1
+    assert be.calls[0][0].endswith("pytest -q")
+    assert be.calls[0][1] is None
 
 
 @pytest.mark.parametrize(
@@ -208,3 +241,90 @@ def test_run_checks_against_real_backend(tmp_path):
 def test_factory_builds_exactly_two_tools():
     tools = build_verify_subagent_tools(workspace_root="/tmp", backend=_FakeBackend())
     assert [t.name for t in tools] == ["read_file", "run_checks"]
+
+
+def test_factory_passes_workspace_root_to_run_checks():
+    tools = build_verify_subagent_tools(workspace_root="/ws", backend=_FakeBackend())
+    run_checks = next(t for t in tools if t.name == "run_checks")
+    assert run_checks.workspace_root == "/ws"
+
+
+# ── run_checks: environment repair + static fallback (trace 019f10bf) ────────
+
+
+def test_run_checks_injects_pythonpath(tmp_path):
+    be = _FakeBackend(output="ok")
+    tool = RunChecksTool(backend=be, workspace_root=str(tmp_path))
+    tool._run("pytest -q")
+    sent = be.calls[0][0]
+    assert f'PYTHONPATH="{tmp_path}' in sent  # project package made importable
+    assert sent.endswith("pytest -q")
+
+
+class _EnvFailBackend(_FakeBackend):
+    """Backend whose commands cannot run (missing runner / package)."""
+
+    def __init__(self, message: str, exit_code: int = 127) -> None:
+        super().__init__()
+        self._message = message
+        self._exit = exit_code
+
+    def execute(self, command, *, timeout=None):  # noqa: ANN001
+        self.calls.append((command, timeout))
+        return _ExecResp(self._message, exit_code=self._exit)
+
+
+def test_run_checks_env_unavailable_after_repeated_failures():
+    be = _EnvFailBackend("pytest: command not found", exit_code=127)
+    tool = RunChecksTool(backend=be, workspace_root="/ws")
+    first = tool._run("pytest -q")
+    assert "env_unavailable" not in first  # first failure is reported normally
+    second = tool._run("pytest tests/ -q")
+    assert "env_unavailable" in second
+    assert "statically" in second.lower()
+    # Further calls short-circuit WITHOUT another backend round-trip.
+    n_before = len(be.calls)
+    third = tool._run("pytest -q")
+    assert "env_unavailable" in third
+    assert len(be.calls) == n_before  # no new execution
+
+
+def test_run_checks_missing_runner_is_env_failure():
+    """The test framework itself missing → env failure (static fallback)."""
+    be = _EnvFailBackend("No module named pytest", exit_code=1)
+    tool = RunChecksTool(backend=be, workspace_root="/ws")
+    tool._run("python -m pytest -q")
+    out = tool._run("python -m pytest tests/ -q")
+    assert "env_unavailable" in out
+
+
+def test_run_checks_project_import_error_is_reported_not_masked():
+    """A project ModuleNotFoundError (likely a real defect) is NOT masked.
+
+    After PYTHONPATH repair, a missing project import is a finding to report,
+    not an environment problem to skip — so it must never trip the fallback.
+    """
+    be = _EnvFailBackend(
+        "ModuleNotFoundError: No module named 'spine.ui_api.missing'", exit_code=1
+    )
+    tool = RunChecksTool(backend=be, workspace_root="/ws")
+    for _ in range(3):
+        out = tool._run("python -c 'import spine.ui_api.missing'")
+        assert "env_unavailable" not in out
+        assert "No module named" in out
+
+
+def test_run_checks_real_failure_does_not_trip_env_fallback():
+    """An ordinary test failure (exit 1, real output) must NOT short-circuit."""
+
+    class _AssertFail(_FakeBackend):
+        def execute(self, command, *, timeout=None):  # noqa: ANN001
+            self.calls.append((command, timeout))
+            return _ExecResp("1 failed, 2 passed\nassert 1 == 2", exit_code=1)
+
+    be = _AssertFail()
+    tool = RunChecksTool(backend=be, workspace_root="/ws")
+    for _ in range(4):
+        out = tool._run("pytest -q")
+        assert "env_unavailable" not in out
+        assert "1 failed" in out

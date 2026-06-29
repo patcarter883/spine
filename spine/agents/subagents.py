@@ -412,12 +412,16 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             Tag.WORKFLOW,
             "1. Review the slice definition and acceptance criteria from "
             "your task description — it names the target_files to verify.\n"
-            "2. Inspect the implemented files with read_file (ranged, "
-            "read-only — there is no shell cat/grep/ls); batch your reads "
-            "(≥2 files per turn).\n"
+            "2. The current source of the target files is already in "
+            "<target_source>, and every change is in <worktree_diff>. Read "
+            "those FIRST — they are usually all you need. Use read_file only "
+            "for a region not shown (ranged, read-only — there is no shell "
+            "cat/grep/ls); do not re-read files already loaded.\n"
             "3. Run relevant tests and linters with run_checks (e.g. "
             "'pytest …', 'ruff check …'). It runs checks only; it will not "
-            "grep/find/list files for you — read_file does that.\n"
+            "grep/find/list files for you — read_file does that. If run_checks "
+            "reports status=env_unavailable, the sandbox cannot execute checks "
+            "— STOP calling it and verify statically from the source and diff.\n"
             "4. Check each acceptance criterion individually.\n"
             "5. Produce a structured verification report.",
         )
