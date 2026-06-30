@@ -33,11 +33,17 @@ TaskCategory = Literal[
 
 
 class TaskClassificationResult(BaseModel):
-    """Result of task classification."""
+    """Result of task classification.
 
+    Reasoning-first field order (and matching JSON key order in the
+    prompt's output schema) so the model writes its rationale before
+    committing the ``category`` verdict. Consistent with the decision
+    schemas ``CriticReview`` and ``ResearchManagerDecision``.
+    """
+
+    reasoning: str = Field(default="", description="Brief reasoning for classification")
     category: TaskCategory = Field(description="The classified task category")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence score")
-    reasoning: str = Field(default="", description="Brief reasoning for classification")
 
 
 _CLASSIFICATION_SYSTEM = (
@@ -60,8 +66,9 @@ _CLASSIFICATION_SYSTEM = (
     + "\n\n"
     + xml_block(
         Tag.OUTPUT_SCHEMA,
-        "Return ONLY valid JSON with keys: category (string), "
-        "confidence (0-1), reasoning (string).",
+        "Return ONLY valid JSON with keys, in this order: reasoning "
+        "(string), category (string), confidence (0-1). Write reasoning "
+        "first, then commit to the category.",
     )
 )
 
@@ -98,17 +105,15 @@ async def classify_task(description: str, config: dict | None = None) -> TaskCla
             try:
                 result = json.loads(content)
             except json.JSONDecodeError:
-                # Fall back to regex extraction for models that wrap JSON in markdown
-                import re
-
-                match = re.search(
-                    r'\{\s*"category"\s*:.*?"confidence"\s*:\s*[\d.]+.*?\}',
-                    content,
-                    re.DOTALL,
-                )
-                if match:
+                # Fall back for models that wrap JSON in markdown or prose.
+                # Grab the outermost {...} span and parse it — key order is
+                # NOT assumed here (reasoning is emitted before category, so
+                # the object no longer starts with the "category" key).
+                start = content.find("{")
+                end = content.rfind("}")
+                if start != -1 and end > start:
                     try:
-                        result = json.loads(match.group(0))
+                        result = json.loads(content[start : end + 1])
                     except json.JSONDecodeError:
                         raise ValueError(f"No valid JSON in response: {content[:200]}")
                 else:

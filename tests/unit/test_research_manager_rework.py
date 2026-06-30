@@ -248,7 +248,9 @@ def test_research_manager_caps_completion_tokens(monkeypatch):
     monkeypatch.setattr(ea, "bind_structured_output", lambda m, s: m)
 
     async def _fake_structured_invoke(model, messages, **kw):
-        return ResearchManagerDecision(decision="done", topics=[])
+        return ResearchManagerDecision(
+            reasoning="findings already cover the change surface", decision="done", topics=[]
+        )
 
     monkeypatch.setattr(ea, "ainvoke_structured_with_retry", _fake_structured_invoke)
 

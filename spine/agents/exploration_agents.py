@@ -235,8 +235,22 @@ class ResearchManagerDecision(BaseModel):
     Used with ``model.with_structured_output()`` so the LLM returns a
     validated instance instead of raw JSON that needs post-hoc parsing
     and markdown-fence stripping.
+
+    Field order is load-bearing: ``reasoning`` precedes the ``decision``
+    token so the model writes a short chain-of-thought scratchpad before
+    committing to explore/done under guided decoding. This also gives a
+    thinking model a sanctioned, bounded place to reason rather than
+    burning hidden reasoning tokens toward the completion cap. Keep
+    reasoning ahead of enum/boolean verdicts — see ``CriticReview``.
     """
 
+    reasoning: str = Field(
+        description=(
+            "One or two sentences: what the accumulated findings already "
+            "cover and what gap (if any) remains. Write this BEFORE the "
+            "decision so the decision follows from the analysis."
+        )
+    )
     decision: Literal["explore", "done"] = Field(
         description="'explore' to continue research, 'done' when sufficient"
     )

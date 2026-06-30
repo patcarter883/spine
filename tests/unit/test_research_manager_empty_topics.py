@@ -28,7 +28,9 @@ class _FakeStructuredModel:
     """Mimics ``model.with_structured_output(ResearchManagerDecision)``."""
 
     def __init__(self, decision: str, topics: list[str]):
-        self._payload = ResearchManagerDecision(decision=decision, topics=topics)
+        self._payload = ResearchManagerDecision(
+            reasoning="stub reasoning", decision=decision, topics=topics
+        )
 
     async def ainvoke(self, _messages):
         return self._payload

@@ -282,7 +282,7 @@ async def test_plan_research_manager_context_includes_prior_findings(monkeypatch
             captured["system"] = messages[0].content
             captured["context"] = messages[1].content
             return exploration_agents.ResearchManagerDecision(
-                decision="done", topics=[]
+                reasoning="prior findings suffice", decision="done", topics=[]
             )
 
     class _ModelStub:
@@ -342,7 +342,7 @@ async def test_specify_research_manager_context_excludes_prior_findings(monkeypa
             captured["system"] = messages[0].content
             captured["context"] = messages[1].content
             return exploration_agents.ResearchManagerDecision(
-                decision="done", topics=[]
+                reasoning="prior findings suffice", decision="done", topics=[]
             )
 
     class _ModelStub:

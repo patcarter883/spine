@@ -254,13 +254,21 @@ class GapPlan(BaseModel):
 
 
 class CriticReview(BaseModel):
-    """Structured critic output."""
+    """Structured critic output.
 
+    Field order is load-bearing for guided decoding: the free-text
+    ``reason`` is declared before the ``status`` verdict so the model
+    writes its rationale (a localized chain-of-thought scratchpad) before
+    it commits the routing token. Keep reasoning fields ahead of any
+    enum/boolean verdict in decision schemas — see also
+    ``ResearchManagerDecision`` and ``SupervisorDirective``.
+    """
+
+    reason: str = Field(description="Reason for the review decision")
     status: Literal["PASSED", "NEEDS_REVISION", "NEEDS_REVIEW"] = Field(
         description="Review status"
     )
     tier: Literal["structural", "agent"] = Field(description="Review tier")
-    reason: str = Field(description="Reason for the review decision")
     suggestions: list[str] = Field(default_factory=list, description="Suggestions for improvement")
     cited_exclusions: list[str] = Field(
         default_factory=list,
