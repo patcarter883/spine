@@ -89,6 +89,77 @@ class TestInterruptRouter:
         assert self.router(state) == "critic_plan"
 
 
+class TestHumanFeedbackChannel:
+    """human_feedback must be a declared state channel (trace 019f1628).
+
+    The router unit tests above hand a dict straight to the router, so they pass
+    even when ``human_feedback`` is dropped on the real state commit. These tests
+    exercise the schema/commit path that actually broke in production.
+    """
+
+    def test_human_feedback_is_declared_channel(self):
+        from spine.models.state import WorkflowState
+
+        # If this key is missing, LangGraph silently drops the interrupt node's
+        # human_feedback update; the router then reads {} and every resume
+        # collapses to "abort" regardless of the human's choice.
+        assert "human_feedback" in WorkflowState.__annotations__
+
+    def test_human_feedback_survives_state_commit(self):
+        # Round-trip the interrupt node's update through a compiled StateGraph
+        # using the real WorkflowState. If human_feedback is not a channel, the
+        # update is dropped and the router routes to "abort" instead of "plan".
+        from langgraph.graph import StateGraph, END
+
+        from spine.models.state import WorkflowState
+        from spine.workflow.compose import (
+            _make_human_review_router,
+            WORKFLOW_SEQUENCES,
+        )
+
+        router = _make_human_review_router(WORKFLOW_SEQUENCES["critical_task"])
+
+        def emit_decision(state):
+            # Mimics _human_review_interrupt's post-resume return: stamps the
+            # decision on human_feedback and nulls needs_review_phase.
+            return {
+                "human_feedback": {
+                    "action": "rework",
+                    "feedback": "fix it",
+                    "_review_target": "plan",
+                },
+                "needs_review_phase": None,
+            }
+
+        captured = {}
+
+        def plan_node(state):
+            captured["routed_to"] = "plan"
+            return {}
+
+        def abort_node(state):
+            captured["routed_to"] = "abort"
+            return {}
+
+        g = StateGraph(WorkflowState)
+        g.add_node("human_review", emit_decision)
+        g.add_node("plan", plan_node)
+        g.add_node("abort", abort_node)
+        g.set_entry_point("human_review")
+        g.add_conditional_edges(
+            "human_review", router, {"plan": "plan", "abort": "abort"}
+        )
+        g.add_edge("plan", END)
+        g.add_edge("abort", END)
+        app = g.compile()
+
+        app.invoke({"current_phase": "critic"})
+        assert captured.get("routed_to") == "plan", (
+            "human_feedback did not survive the state commit — the router fell "
+            "through to abort (trace 019f1628 regression)."
+        )
+
+
 class TestInterruptNodeFunction:
     """Tests for _human_review_interrupt node function."""
 
