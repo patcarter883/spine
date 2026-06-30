@@ -19,7 +19,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from spine.agents.artifacts import scan_artifact_dir
 from langgraph.errors import GraphRecursionError
 
-from spine.agents.retry import MaxTokenBudgetExceeded, ServerUnreachable
+from spine.agents.retry import (
+    MaxTokenBudgetExceeded,
+    ServerUnreachable,
+    reset_token_budget,
+)
 from spine.exceptions import CriticalContractFailure
 from spine.models.state import WorkflowState
 from spine.workflow.phase_progress import mark_phase_started
@@ -315,6 +319,19 @@ def make_subgraph_node(
     ) -> dict[str, Any]:
         work_id = parent_state.get("work_id", "unknown")
         timeout = _resolve_timeout(phase_name, config)
+
+        # Per-PHASE token budget. The budget is a cumulative-per-work_id counter
+        # whose purpose is to abort a SPIRAL — an unbounded loop within one phase.
+        # Left cumulative across the whole pipeline it instead starves the tail:
+        # a legitimately expensive IMPLEMENT (best-of-N synthesis) consumed ~1.2M
+        # across specify+plan+implement, so VERIFY's first (cheap, one-shot) judge
+        # call tripped the 1M ceiling and every downstream phase crashed with a
+        # verdict already in hand (trace spine-bench-verify-judge-0630). Resetting
+        # at each phase boundary makes the ceiling per-phase: each phase still
+        # aborts if IT spirals, but one phase's honest spend no longer steals the
+        # next phase's allowance. Total spend stays bounded by per-phase timeouts,
+        # recursion limits, and dispatch caps.
+        reset_token_budget(work_id)
 
         # Mark the phase as started so the UI shows the correct phase
         # immediately, before the subgraph begins executing.

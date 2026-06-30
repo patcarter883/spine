@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 from typing import Any
 
@@ -62,10 +63,15 @@ class MaxTokenBudgetExceeded(Exception):
     outcome so the workflow stops instead of burning unbounded tokens.
     """
 
-    def __init__(self, work_id: str, cumulative: int, budget: int):
+    def __init__(self, work_id: str, cumulative: int, budget: int, result: Any = None):
         self.work_id = work_id
         self.cumulative = cumulative
         self.budget = budget
+        # The agent result that pushed cumulative over the budget. The call had
+        # already SUCCEEDED and produced output before the post-hoc budget check
+        # raised, so callers can salvage that output (e.g. a verify judge's
+        # one-shot verdict) instead of discarding paid-for work as a "crash".
+        self.result = result
         super().__init__(
             f"Token budget exceeded for work_id={work_id}: "
             f"{cumulative:,} / {budget:,} tokens"
@@ -150,7 +156,7 @@ def _check_and_update_token_budget(
     _cumulative_tokens[work_id] = new_total
     budget = _get_token_budget(work_type)
     if new_total > budget:
-        raise MaxTokenBudgetExceeded(work_id, new_total, budget)
+        raise MaxTokenBudgetExceeded(work_id, new_total, budget, result=result)
     return new_total
 
 

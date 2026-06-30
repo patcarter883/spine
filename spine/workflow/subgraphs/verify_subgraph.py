@@ -51,7 +51,7 @@ from spine.agents.plan_do import (
     format_directive_for_prompt,
     run_plan_node,
 )
-from spine.agents.retry import ainvoke_with_retry
+from spine.agents.retry import ainvoke_with_retry, MaxTokenBudgetExceeded
 from spine.exceptions import CriticalContractFailure
 from spine.models.enums import PhaseName
 from spine.workflow.subgraph_state import VerifySubgraphState
@@ -455,6 +455,40 @@ async def _run_slice_verifier_node(
         )
 
         verification_result = _extract_verification_result(result, slice_id)
+
+    except MaxTokenBudgetExceeded as budget_exc:
+        # The judge's one-shot call already produced a verdict before the
+        # cumulative budget check raised — salvage it instead of discarding
+        # paid-for work as a "crash". Falls through to the generic handler only
+        # if no parseable verdict was attached.
+        salvaged = (
+            _extract_verification_result(budget_exc.result, slice_id)
+            if getattr(budget_exc, "result", None) is not None
+            else None
+        )
+        if salvaged is not None:
+            logger.warning(
+                "[%s] Slice-verifier %r: budget tripped post-call (%s) — "
+                "salvaged the computed verdict.",
+                work_id, slice_id, budget_exc,
+            )
+            verification_result = salvaged
+        else:
+            logger.error(
+                "[%s] Slice-verifier %r: budget exceeded with no salvageable "
+                "verdict: %s", work_id, slice_id, budget_exc,
+            )
+            verification_result = {
+                "slice_name": slice_id,
+                "verdict": "NOT_VERIFIED",
+                "checklist": [{
+                    "criterion": "Subagent execution",
+                    "passed": False,
+                    "detail": f"Token budget exceeded before a verdict: {budget_exc}",
+                }],
+                "gaps": [f"Verification could not complete: {budget_exc}"],
+                "recommendations": ["Re-run verification for this slice"],
+            }
 
     except Exception as e:
         logger.error(
