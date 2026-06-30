@@ -428,6 +428,19 @@ class SpineConfig:
     # each by how cleanly its edits apply + lint and keeps the best. 1 = single
     # candidate (no extra cost). Only meaningful with implement_synthesis_placement.
     implement_synthesis_variants: int = 1
+    # VERIFY: evidence-then-judge slice-verifier. The default verifier is a
+    # tool-using ReAct agent (read_file + run_checks); with a 9999 recursion
+    # limit and no run_checks call cap it spirals on introspection probes until
+    # the per-work token budget trips and CRASHES the slice to NOT_VERIFIED with
+    # no verdict (trace 019f16cf: 6 verifiers, 2.75M tokens, zero verdicts — the
+    # spiral survives a strong coder model, so it is structural, not model). When
+    # this is on, the verify node pre-computes the evidence deterministically
+    # (worktree diff + pre-loaded target source + a single py_compile/ruff pass
+    # over the changed files) and the verifier becomes a NO-TOOL, schema-bound
+    # judge that emits a VerificationResult in one shot. No loop ⇒ no spiral; the
+    # schema-skips-tools hazard that forces the ReAct design does not apply when
+    # there are no tools. Default off — opt-in until benched against the ReAct path.
+    verify_evidence_then_judge: bool = False
     # Hard ceiling on total slice-implementer executions in one IMPLEMENT run, a
     # backstop against the dispatch runaway in trace 019efd92 (3 same-file slices
     # raced to ~687 executions / 1.33M tokens). Each implementer execution ticks
@@ -883,6 +896,9 @@ class SpineConfig:
             ),
             implement_synthesis_variants=int(
                 spine.get("implement_synthesis_variants", 1)
+            ),
+            verify_evidence_then_judge=bool(
+                spine.get("verify_evidence_then_judge", False)
             ),
             implement_max_slice_dispatches=int(
                 os.getenv(

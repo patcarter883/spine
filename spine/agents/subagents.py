@@ -446,6 +446,56 @@ SUBAGENT_PROMPTS: dict[str, str] = {
     ),
 }
 
+# ── slice-verifier: evidence-then-judge prompt (no tools) ──────────────
+# Used when ``verify_evidence_then_judge`` is on. The node has already
+# pre-computed every fact the verifier needs — the worktree diff, the
+# current source of the target files, and a deterministic py_compile/ruff
+# pass — and inlined them. So the verifier does NOT explore: it reads the
+# supplied evidence and renders a verdict in one shot. This is what lets us
+# bind the VerificationResult schema safely: the "schema makes the model
+# skip its tools and hallucinate" hazard only exists when the model needs
+# tools to gather facts — here it has none, and nothing to skip.
+_VERIFY_JUDGE_PROMPT = (
+    xml_block(
+        Tag.ROLE,
+        "You are a verification engineer. Judge ONE feature slice against its "
+        "acceptance criteria using ONLY the evidence provided in this prompt. "
+        "You have NO tools — do not ask to read files or run commands; "
+        "everything you need is already here.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.WORKFLOW,
+        "The prompt contains, for this slice:\n"
+        "- <worktree_diff>: every change the implementer made (ground truth). "
+        "An empty diff means nothing was implemented — verdict NOT_VERIFIED.\n"
+        "- <target_source>: the current full source of the target files.\n"
+        "- <automated_checks>: results of a deterministic py_compile + ruff "
+        "pass over the changed files (syntax/lint ground truth).\n\n"
+        "Judge each acceptance criterion in the slice JSON against this "
+        "evidence. A criterion passes only if the diff/source actually shows "
+        "it AND the automated checks did not surface a blocking error for it. "
+        "Do not assume; if the evidence does not show a criterion satisfied, "
+        "mark it failed and name the gap.",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.CONSTRAINTS,
+        "Report-only — never propose to edit. verdict is VERIFIED only when "
+        "EVERY acceptance criterion passes and automated_checks are clean; "
+        "otherwise NOT_VERIFIED. Put concrete, evidence-grounded detail in "
+        "each checklist item (cite the symbol/line or the check output).",
+    )
+    + "\n\n"
+    + xml_block(
+        Tag.OUTPUT_SCHEMA,
+        "Return a structured verification result with fields: verdict "
+        "(VERIFIED|NOT_VERIFIED), checklist (one item per acceptance "
+        "criterion: criterion, passed, detail), gaps, recommendations.",
+    )
+)
+
+
 # ── Response format mapping ───────────────────────────────────────────
 
 SUBAGENT_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
@@ -793,7 +843,21 @@ def build_subagent_spec(
     # injection blocks below are gated on names not in _VERIFY_TOOLS, so they
     # naturally skip; downstream spec assembly (ToolOutputTrimmer, schema
     # exclusion) still applies via the existing slice-verifier branches.
-    if name == "slice-verifier":
+    # ``verify_evidence_then_judge`` flips the verifier from a tool-using ReAct
+    # loop to a no-tool, schema-bound judge: the node pre-computes the evidence
+    # (diff + source + py_compile/ruff) and inlines it, so the verifier needs no
+    # filesystem/shell surface at all. Empty tools here; the schema binding and
+    # judge prompt are applied in the spec-assembly block below.
+    from spine.config import SpineConfig
+
+    _verify_judge = (
+        name == "slice-verifier"
+        and SpineConfig.load().verify_evidence_then_judge
+    )
+
+    if _verify_judge:
+        tools = []
+    elif name == "slice-verifier":
         from spine.agents.verify_subagent_tools import build_verify_subagent_tools
 
         # run_checks executes against the backend directly (not the FS execute
@@ -886,7 +950,7 @@ def build_subagent_spec(
         from spine.agents.context_editing import ToolOutputTrimmer
 
         subagent_middleware.append(ToolOutputTrimmer(max_full_tool_results=8))
-    elif name in ("slice-implementer", "slice-verifier"):
+    elif name in ("slice-implementer", "slice-verifier") and not _verify_judge:
         # The leaf code agents run a genuine multi-step read→edit→execute loop
         # (not the researcher's survey pattern), so they keep the agent.ainvoke
         # tool loop. But with no trimming the message history grows
@@ -905,7 +969,10 @@ def build_subagent_spec(
     spec: dict[str, Any] = {
         "name": name,
         "description": SUBAGENT_DESCRIPTIONS[name],
-        "system_prompt": _resolve_subagent_prompt(name, phase),
+        "system_prompt": (
+            _VERIFY_JUDGE_PROMPT if _verify_judge
+            else _resolve_subagent_prompt(name, phase)
+        ),
         "model": model,
         "tools": tools,
         "middleware": subagent_middleware,
@@ -928,10 +995,14 @@ def build_subagent_spec(
     #
     # Subagents NOT in this exclusion list receive ProviderStrategy schema
     # binding by default (suitable for report-only agents with no tools).
-    if name in SUBAGENT_RESPONSE_MODELS and name not in (
-        "researcher",
-        "slice-implementer",
-        "slice-verifier",
+    # The no-tool verify judge is the ONE slice-verifier configuration that
+    # SHOULD carry the schema: with no tools there is nothing to skip, so the
+    # "schema-makes-the-model-answer-before-using-tools" hazard that excludes
+    # the ReAct verifier does not apply — binding VerificationResult gives a
+    # clean one-shot structured verdict.
+    _schema_excluded = ("researcher", "slice-implementer", "slice-verifier")
+    if name in SUBAGENT_RESPONSE_MODELS and (
+        _verify_judge or name not in _schema_excluded
     ):
         schema_model = SUBAGENT_RESPONSE_MODELS[name]
         if _supports_forced_tool_choice(model):

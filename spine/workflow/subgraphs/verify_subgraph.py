@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -218,6 +219,62 @@ def _worktree_diff(workspace_root: str, paths: list[str] | None) -> str:
     return diff
 
 
+_CHECKS_MAX_CHARS = 8000
+
+
+def _automated_checks(workspace_root: str, target_files: list[str] | None) -> str:
+    """Run a deterministic py_compile + ruff pass over the changed Python files.
+
+    This is the evidence-then-judge counterpart of ``_worktree_diff``: instead
+    of letting the verifier spend an unbounded ReAct loop shelling ``py_compile``
+    / ``ruff`` / ``inspect.signature`` probes (trace 019f16cf: the loop never
+    converged and crashed on the token budget), we run the two checks that
+    actually matter ONCE, here, and hand the verifier the results. Best-effort:
+    a missing runner or a subprocess error is reported as such, never raised —
+    the verifier still has the diff and source to judge from.
+    """
+    py_files = [
+        f for f in (target_files or [])
+        if f and f.endswith(".py") and (Path(workspace_root) / f).exists()
+    ]
+    if not py_files:
+        return ""
+
+    def _run(args: list[str]) -> tuple[int, str]:
+        try:
+            proc = subprocess.run(
+                args, cwd=workspace_root,
+                capture_output=True, text=True, timeout=60,
+            )
+            return proc.returncode, (proc.stdout + proc.stderr).strip()
+        except FileNotFoundError:
+            return 127, f"{args[0]}: not found in this sandbox (check skipped)"
+        except Exception as exc:  # noqa: BLE001 — checks are best-effort evidence
+            return 1, f"{args[0]} could not run: {exc}"
+
+    sections: list[str] = []
+    compile_rc, compile_out = _run([sys.executable, "-m", "py_compile", *py_files])
+    sections.append(
+        f"$ python -m py_compile {' '.join(py_files)}\n"
+        + ("OK — all target files compile." if compile_rc == 0
+           else compile_out or f"FAILED (exit {compile_rc})")
+    )
+    ruff_rc, ruff_out = _run([sys.executable, "-m", "ruff", "check", *py_files])
+    sections.append(
+        f"$ ruff check {' '.join(py_files)}\n"
+        + ("OK — no lint findings." if ruff_rc == 0
+           else ruff_out or f"exit {ruff_rc}")
+    )
+    body = "\n\n".join(sections)
+    if len(body) > _CHECKS_MAX_CHARS:
+        body = body[:_CHECKS_MAX_CHARS] + "\n…[checks output truncated]"
+    return (
+        "<automated_checks>\nDeterministic checks already run for you over the "
+        "changed files (you have no tools — judge from these, do not ask to "
+        "re-run them):\n\n" + body + "\n</automated_checks>"
+    )
+
+
 # Pre-loaded source bounds. The verifier reads its target files to check them
 # against the criteria; handing the current source up-front means it starts
 # grounded at ZERO reads instead of paging each file in (trace 019f10bf read
@@ -340,19 +397,35 @@ async def _run_slice_verifier_node(
         source_block = _target_source_block(
             state.get("workspace_root", "."), slice_data.get("target_files")
         )
+        # Evidence-then-judge: when the no-tool judge is on, run the checks the
+        # ReAct verifier used to spend an unbounded loop on (py_compile + ruff)
+        # ONCE, here, and inline the results. The judge has no tools, so this is
+        # the only place those checks can run.
+        from spine.config import SpineConfig
+
+        judge_mode = SpineConfig.load().verify_evidence_then_judge
+        checks_block = (
+            _automated_checks(
+                state.get("workspace_root", "."), slice_data.get("target_files")
+            )
+            if judge_mode
+            else ""
+        )
         # Hostage layout: data blocks first, plain-text directive at the
         # absolute tail. The directive_block from format_directive_for_prompt
         # is already wrapped in <directive> — splice it after xml_blocks
         # rather than re-wrapping.
-        prompt = hostage_layout(
-            xml_blocks(
-                (Tag.OBJECTIVE, f"Verify slice: {slice_id}"),
-                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
-            )
-            + "\n\n" + diff_block
-            + ("\n\n" + source_block if source_block else "")
-            + ("\n\n" + directive_block if directive_block else ""),
+        tail = (
             (
+                "Judge each acceptance criterion in the slice JSON using ONLY "
+                "the evidence above — <worktree_diff> (ground truth of the "
+                "change; empty ⇒ NOT_VERIFIED), <target_source> (current "
+                "source), and <automated_checks> (py_compile + ruff results). "
+                "You have NO tools; do not ask to read or run anything. Emit the "
+                "structured VerificationResult now."
+            )
+            if judge_mode
+            else (
                 "Check the worktree_diff above against the acceptance_criteria "
                 "in the slice JSON. The diff is the ground truth of what "
                 "changed: if it is empty, the slice was NOT implemented — fail "
@@ -360,7 +433,18 @@ async def _run_slice_verifier_node(
                 "<target_source> — read it there, NOT with read_file. Read a "
                 "file only when you need a region beyond what is shown; do NOT "
                 "survey the codebase."
-            ),
+            )
+        )
+        prompt = hostage_layout(
+            xml_blocks(
+                (Tag.OBJECTIVE, f"Verify slice: {slice_id}"),
+                (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+            )
+            + "\n\n" + diff_block
+            + ("\n\n" + source_block if source_block else "")
+            + ("\n\n" + checks_block if checks_block else "")
+            + ("\n\n" + directive_block if directive_block else ""),
+            tail,
         )
 
         result = await ainvoke_with_retry(

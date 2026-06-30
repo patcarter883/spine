@@ -81,8 +81,18 @@ class TestSubagentAutonomy:
         }
 
         mock_model = MagicMock()
+        # The no-schema policy is about TOOL-USING subagents. With the
+        # evidence-then-judge verifier OFF, the slice-verifier is tool-using and
+        # falls under the policy; ON, it is a no-tool judge and SHOULD carry the
+        # schema (covered by test_verify_judge_mode_no_tool_schema_bound). Force
+        # the flag off here so this asserts the legacy invariant regardless of
+        # the live config.
+        from spine.config import SpineConfig
+        cfg_off = SpineConfig.load()
+        object.__setattr__(cfg_off, "verify_evidence_then_judge", False)
         for name in ["researcher", "slice-implementer", "slice-verifier"]:
-            with patch("spine.agents.helpers.resolve_model", return_value=mock_model):
+            with patch("spine.agents.helpers.resolve_model", return_value=mock_model), \
+                 patch("spine.config.SpineConfig.load", return_value=cfg_off):
                 spec = build_subagent_spec(
                     name=name,
                     phase=PhaseName.IMPLEMENT,
@@ -93,6 +103,40 @@ class TestSubagentAutonomy:
                 f"schema binding causes models to skip tool calls on turn 1. "
                 f"Results are extracted from the final assistant message instead."
             )
+
+    def test_verify_judge_mode_no_tool_schema_bound(self):
+        """With ``verify_evidence_then_judge`` on, the slice-verifier is a
+        NO-TOOL, schema-bound judge — the node pre-computes the evidence so the
+        verifier judges in one shot instead of spiralling on a ReAct loop
+        (trace 019f16cf: 2.75M tokens, zero verdicts).
+        """
+        from unittest.mock import patch, MagicMock
+        from spine.agents.subagents import build_subagent_spec, _VERIFY_JUDGE_PROMPT
+        from spine.agents.context_editing import ToolOutputTrimmer
+        from spine.config import SpineConfig
+
+        state: WorkflowState = {
+            "work_id": "test", "work_type": "task", "description": "test",
+            "workspace_root": "/tmp", "artifacts": {}, "critic_reviewing": "",
+            "current_phase": "", "feedback": [], "max_retries": 3,
+            "phase_index": 0, "prompt_request": None, "retry_count": {},
+            "status": "running",
+        }
+        cfg_on = SpineConfig.load()
+        object.__setattr__(cfg_on, "verify_evidence_then_judge", True)
+        mock_model = MagicMock(spec=[])  # no model_kwargs → schema path is exercised in prod
+        with patch("spine.agents.helpers.resolve_model", return_value=mock_model), \
+             patch("spine.config.SpineConfig.load", return_value=cfg_on):
+            spec = build_subagent_spec(
+                name="slice-verifier", phase=PhaseName.VERIFY, state=state
+            )
+        assert spec["tools"] == [], "judge-mode verifier must have NO tools"
+        assert spec["system_prompt"] == _VERIFY_JUDGE_PROMPT, (
+            "judge-mode verifier must use the no-tool judge prompt"
+        )
+        assert not any(
+            isinstance(m, ToolOutputTrimmer) for m in spec.get("middleware", [])
+        ), "judge-mode verifier has no tool output to trim"
 
     def test_subagent_prompt_enforces_tools(self):
         """Subagent prompts must contain 'MUST USE TOOLS' instruction."""
@@ -152,11 +196,18 @@ class TestSubagentAutonomy:
         }
 
         mock_model = MagicMock()
+        # The trimmer bounds the ReAct read→edit→execute loop. The judge-mode
+        # verifier has no tools and no loop, so it carries no trimmer — force the
+        # flag off so the slice-verifier exercises its tool-using configuration.
+        from spine.config import SpineConfig
+        cfg_off = SpineConfig.load()
+        object.__setattr__(cfg_off, "verify_evidence_then_judge", False)
         for name, phase in (
             ("slice-implementer", PhaseName.IMPLEMENT),
             ("slice-verifier", PhaseName.VERIFY),
         ):
-            with patch("spine.agents.helpers.resolve_model", return_value=mock_model):
+            with patch("spine.agents.helpers.resolve_model", return_value=mock_model), \
+                 patch("spine.config.SpineConfig.load", return_value=cfg_off):
                 spec = build_subagent_spec(name=name, phase=phase, state=state)
             trimmers = [
                 m for m in spec.get("middleware", []) if isinstance(m, ToolOutputTrimmer)

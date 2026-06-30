@@ -39,6 +39,13 @@ spine:
   # variants=3: synthesize 3 candidates, keep the one that applies+lints cleanest.
   implement_synthesis_placement: true
   implement_synthesis_variants: 3
+  # No-tool VERIFY judge: pre-compute the evidence (worktree diff + target
+  # source + a single py_compile/ruff pass) and have the slice-verifier emit a
+  # VerificationResult in ONE shot, no tools. Replaces the ReAct verifier whose
+  # unbounded read/run_checks loop spiralled to 2.75M tokens / 0 verdicts even
+  # on the qwen-coder lane (trace 019f16cf) — the spiral was structural, not
+  # model. Kill the loop, not just cap it.
+  verify_evidence_then_judge: true
   # PLAN best-of-N (Graph-of-Thoughts Score+KeepBest): synthesize 3 candidate
   # plans, score each with the structural scorer (rejects the duplicate-path
   # explosion / unschedulable plans), keep the best before the critic sees it.
