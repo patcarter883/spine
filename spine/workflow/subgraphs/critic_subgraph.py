@@ -252,6 +252,36 @@ async def _agent_check_node(
         "[%s] Critic agent check complete: status=%s",
         work_id, result.get("status"),
     )
+
+    # Deterministic plan-validation is a HARD FLOOR: the LLM's verdict may not
+    # upgrade a structural failure (dependency cycle, dangling dep, missing
+    # target_files/acceptance_criteria) into a PASS. The validation reason is
+    # folded into the agent result so the rework prompt actually sees it.
+    validation = state.get("validation_result") or {}
+    if validation.get("status") and validation["status"] != ReviewStatus.PASSED.value:
+        effective_status = ReviewStatus.NEEDS_REVISION.value
+        if result.get("status") != effective_status:
+            logger.info(
+                "[%s] Critic agent voted %s but deterministic validation failed "
+                "(%s) — forcing %s",
+                work_id, result.get("status"),
+                validation.get("reason", ""), effective_status,
+            )
+        merged = dict(result)
+        merged["status"] = effective_status
+        val_reason = validation.get("reason")
+        if val_reason:
+            existing = merged.get("reason") or ""
+            merged["reason"] = (
+                f"Plan validation failed: {val_reason}. {existing}".strip()
+            )
+        existing_sugg = list(merged.get("suggestions") or [])
+        merged["suggestions"] = list(validation.get("suggestions") or []) + existing_sugg
+        return {
+            "agent_result": merged,
+            "phase_status": effective_status,
+        }
+
     return {
         "agent_result": result,
         "phase_status": result["status"],

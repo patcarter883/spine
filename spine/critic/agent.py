@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.agents.factory import build_phase_agent
+from spine.agents.prompt_snippets import SCOPE_EXCLUSION_CITATION_RULE
 from spine.workflow.critic_review import _get_reviewed_phase
 from spine.models.types import CriticReview
 
@@ -77,25 +78,15 @@ _PLAN_REVIEW_INSTRUCTIONS = (
     "`<specification>` block is absent or its scope lists are empty, do\n"
     "NOT invent scope concerns — note the missing data and proceed with\n"
     "the structural checks above.\n\n"
-    "Review each slice's `target_files` and `execution_requirements`:\n\n"
-    "- **Inclusions are IN scope**: Anything listed in `scope_inclusions` is\n"
-    "  explicitly part of this work. NEVER flag an item that appears in\n"
-    "  `scope_inclusions` as scope creep or out-of-scope — doing so is a\n"
-    "  critic error. `scope_inclusions` and `scope_exclusions` are SEPARATE\n"
-    "  lists; read both and do not confuse one for the other. A slice may go\n"
-    "  significantly BEYOND the inclusions (touching areas in neither list)\n"
-    "  — only then is it potential scope creep worth a NEEDS_REVISION.\n\n"
-    "- **Exclusions check**: A slice VIOLATES scope only if its target files\n"
-    "  or requirements overlap an item in `scope_exclusions`. When you flag\n"
-    "  such a violation you MUST copy the exact `scope_exclusions` bullet(s)\n"
-    "  you are relying on — verbatim — into the `cited_exclusions` field. If\n"
-    "  you cannot quote a matching exclusion bullet, it is NOT a violation:\n"
-    "  do not flag it. An exclusion violation asserted without a verbatim\n"
-    "  `cited_exclusions` entry is treated as unsupported and is overturned\n"
-    "  automatically.\n\n"
-    "- **Reporting**: For each genuine scope violation, give the slice ID, the\n"
-    "  quoted `scope_exclusions` bullet (also placed in `cited_exclusions`),\n"
-    "  and the specific target file or requirement that overlaps it.\n\n"
+    "Review each slice's `target_files` and `execution_requirements`. "
+    "`scope_inclusions` and `scope_exclusions` are SEPARATE lists:\n\n"
+    "- **Inclusions are IN scope**: never flag an item in `scope_inclusions` as\n"
+    "  scope creep. A slice is potential creep only when it goes BEYOND the\n"
+    "  inclusions into an area in neither list.\n\n"
+    "- **Exclusions check**: a slice VIOLATES scope only if its `target_files`\n"
+    "  or requirements overlap an item in `scope_exclusions`. "
+    + SCOPE_EXCLUSION_CITATION_RULE
+    + " Also name the overlapping target file/requirement.\n\n"
     "If any check fails, respond with NEEDS_REVISION and list the specific\n"
     "violations in your suggestions.\n\n"
 )

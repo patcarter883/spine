@@ -202,7 +202,9 @@ def test_plan_synthesizer_prompt_renders_real_newlines_and_proportionality():
 
     p = _build_plan_synthesizer_prompt()
     assert "\n" in p and "\\n" not in p  # real newlines, no literal backslash-n
-    assert "Prefer extending existing patterns over creating new modules" in p
+    # Minimalism: prefer extending existing patterns over adding new modules.
+    assert "Extend existing patterns" in p
+    assert "adding modules" in p
     # Dependency-integrity guard (the 019e77fe critic flagged a dangling dep).
     assert "MUST be the id of another slice" in p
 
@@ -215,12 +217,13 @@ def test_plan_synthesizer_prompt_demands_minimal_but_spec_complete():
 
     p = _build_plan_synthesizer_prompt()
     # The two-axis framing: minimal count, complete coverage.
-    assert "minimal slice COUNT" in p
-    assert "Complete COVERAGE" in p
+    assert "FEWEST slices" in p
+    assert "cover EVERY spec requirement" in p
     # Tests must be folded into the slice, not dropped or split off.
     assert "test file" in p.lower()
     assert "target_files" in p
-    assert "every specification requirement must be covered" in p.lower()
+    assert "never drop a requirement" in p.lower()
+    assert "every requirement is covered by a slice" in p.lower()
 
 
 def test_summarise_max_completion_tokens_config_default():

@@ -40,9 +40,18 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 # Negated pass tokens ("NOT VERIFIED", "not passed") must never read as a pass.
 # A bare `"VERIFIED" in text` substring test fails here because "NOT VERIFIED"
 # contains "VERIFIED"; require a whole-word PASS/VERIFIED token and separately
-# veto any negated form.
+# veto any negated or hedged form. The veto is deliberately broad — a false
+# *pass* ships unverified work, so when in doubt we fail closed (finding #8).
+# Covers: "not verified", "not fully/yet verified", "could not be verified",
+# "cannot be verified", "never verified", "unverified", "not (yet) implemented",
+# "incomplete".
 _PASS_VERDICT_RE = re.compile(r"\b(?:verified|passed)\b", re.IGNORECASE)
-_NEGATED_PASS_RE = re.compile(r"\bnot\s+(?:verified|passed)\b", re.IGNORECASE)
+_NEGATED_PASS_RE = re.compile(
+    r"\b(?:not|never|cannot|can\s*not)\b[\s\w]{0,20}?"
+    r"\b(?:verified|passed|implemented|complete[d]?)\b"
+    r"|\bunverified\b|\bincomplete\b",
+    re.IGNORECASE,
+)
 
 
 def _verdict_is_pass(verify_text: str) -> bool:

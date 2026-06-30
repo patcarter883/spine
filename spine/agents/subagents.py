@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 from pydantic import BaseModel, Field
 
 from spine.agents.prompt_format import Tag, xml_block
+from spine.agents.prompt_snippets import WORKSPACE_PATH_RULES
 from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 
@@ -132,8 +133,12 @@ def _build_researcher_prompt(*, scout_kind: str, role_blurb: str, report_format:
     )
 
     tools_body = (
-        "USE `codebase_query` FIRST. It answers symbol-level questions in "
-        "sub-millisecond time — ALWAYS use it before reading files.\n\n"
+        "Check your tool list first: if `codebase_query` is NOT present (the "
+        "code index can be unavailable), use `search_codebase` and "
+        "`ast_extract_symbol` for every step below instead — do not attempt to "
+        "call `codebase_query`.\n\n"
+        "When available, USE `codebase_query` FIRST. It answers symbol-level "
+        "questions in sub-millisecond time — use it before reading files.\n\n"
         "Batching and parallel tool calling (CRITICAL):\n"
         "- NEVER query symbols, function sources, or files sequentially "
         "turn-by-turn. If you need to look up 3 function sources or search "
@@ -186,13 +191,7 @@ def _build_researcher_prompt(*, scout_kind: str, role_blurb: str, report_format:
     )
 
     constraints_body = (
-        "Path conventions: all paths MUST be relative from the project "
-        "workspace root.\n"
-        "- `.spine/artifacts/file.md`, `spine/ui/pages.py`\n"
-        "- A leading `/` is workspace-relative.\n"
-        "- NEVER use absolute paths like `/home/user/project/...` — they "
-        "double-nest under the virtual filesystem root and resolve to "
-        "non-existent files.\n\n"
+        WORKSPACE_PATH_RULES + "\n\n"
         "Hard limits:\n"
         "- You MUST look up every symbol named in your topic before falling "
         "back to search.\n"
@@ -201,9 +200,7 @@ def _build_researcher_prompt(*, scout_kind: str, role_blurb: str, report_format:
         "- Total turns: 3-5. More than 5 calls without producing output "
         "means you're over-exploring — report what you have.\n"
         "- If your tools fail (tool errors, permission issues), report that "
-        "with the error details — do NOT return empty results.\n"
-        "- If you produce empty results, you WILL be re-dispatched, wasting "
-        "time and tokens. Do the work correctly the first time."
+        "with the error details — do NOT return empty results."
     )
 
     output_body = (
@@ -272,63 +269,27 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         + "\n\n"
         + xml_block(
             Tag.TOOLS,
-            "When a specific symbol you must call/extend is NOT already in "
-            "your task context, `codebase_query` answers symbol-level "
-            "questions in sub-millisecond time:\n\n"
-            "| Question | Call |\n"
-            "|----------|------|\n"
-            '| Where is X defined? | `codebase_query(action="find_symbol", name="X")` |\n'
-            '| Show me X\'s source | `codebase_query(action="get_source", name="X")` |\n'
-            '| What does X call? | `codebase_query(action="get_dependencies", name="X")` |\n'
-            '| Who calls X? | `codebase_query(action="get_dependents", name="X")` |\n'
-            '| Regex P across code | `codebase_query(action="search", pattern="P")` |\n\n'
             "Your slice is ALREADY specified — target files, acceptance "
             "criteria, and an implementation directive are in your task. "
             "Codebase research happened upstream in PLAN. Do NOT survey the "
-            "codebase. Read the named files, edit, run tests. Reach for "
-            "`codebase_query` ONLY when a specific unknown symbol blocks an "
-            "edit.\n\n"
-            "Your tools:\n"
-            "- `codebase_query` — targeted symbol lookup (use ONLY when a "
-            "specific symbol you must call/extend isn't in your task context). "
-            "Pick `action`, fill the one argument it needs:\n"
-            "  - `find_symbol`, `get_source`, `get_dependencies`, "
-            "`get_dependents` all take `name` (clean identifier — no "
-            "whitespace, no module prefix, no parentheses).\n"
-            "  - `search` takes `pattern` (regex). Output is capped to ~8 KB / "
-            "50 hits.\n"
-            "  - `name` and `pattern` are mutually exclusive. Do NOT pass "
-            "both.\n"
-            "- `read_edit_lint` — your ONLY filesystem tool: read AND write.\n"
-            "  READ is ANCHORED only (no whole-file or arbitrary line-range "
-            "reads — you already know the target from the plan): "
-            "`read_symbol=\"ClassName.method\"` returns a definition's current "
-            "source; `read_around=\"exact snippet\"` returns the region around a "
-            "snippet. Read at most the ONE symbol you are about to edit. NEVER "
-            "re-read a file you just edited: a status=\"ok\" result means the "
-            "edit is in the file exactly as you sent it.\n"
-            "  EDIT: pass exactly ONE edit mode. Prefer the robust modes:\n"
-            "    • `ast_edit` — BEST for changing or adding a whole "
-            "function/method/class: name the symbol (e.g. "
-            "`{\"symbol\":\"ClassName.method\",\"action\":\"replace\","
-            "\"code\":\"...\"}`) or `insert_before`/`insert_after`. No line "
-            "numbers, no exact-byte matching — immune to indentation drift.\n"
-            "    • `patch` — a batch of WHITESPACE-TOLERANT search/replace ops "
-            "(`[{\"search\":...,\"replace\":...}]`); use when you are not "
-            "certain of exact indentation. Re-indents to the match.\n"
-            "    • `old_str`+`new_str` / `edits` — EXACT find-and-replace "
-            "(single / atomic batch). Use only when you have the bytes exactly.\n"
-            "    • `full_replace` (whole-file content) for new or small files; "
-            "`start_line`+`end_line`+`replacement` for a line range (pass "
-            "`expected` to guard stale line numbers).\n"
-            "  The tool runs a syntax check before writing — on a syntax error "
-            "or failed match it returns `{\"status\":\"syntax_error\",...}` (or "
-            "`no_match`/`ambiguous_match`/`stale`) and the file is left "
-            "untouched. Fix and call again. `already_applied` means the change "
-            "is ALREADY in the file — move on, do not retry.\n"
-            "  LINT: successful Python writes include a `ruff` field with "
-            "bounded diagnostics. There is no shell — do not try to run "
-            "tests or linters; the verify phase does that.",
+            "codebase: read the named files, edit, report.\n\n"
+            "Your tools (each tool's own description has the full argument "
+            "catalogue — this is just when to reach for which):\n"
+            "- `read_edit_lint` — your ONLY filesystem tool (anchored read + "
+            "edit). Read the ONE symbol/region you are about to change; never "
+            "re-read a file after a `status=\"ok\"` edit (the edit landed "
+            "exactly as sent). Prefer the robust edit modes `ast_edit` (name a "
+            "def/class — immune to indentation drift) or `patch` (whitespace-"
+            "tolerant search/replace); use exact `old_str`/`edits` only when you "
+            "have the bytes exactly. A non-`ok` status (`syntax_error`/"
+            "`no_match`/`ambiguous_match`/`stale`) means the file was NOT "
+            "written — fix and call again; `already_applied` means it is already "
+            "in the file, move on. There is no shell — the verify phase runs "
+            "tests.\n"
+            "- `codebase_query` — targeted symbol lookup; use ONLY when a "
+            "specific symbol you must call/extend is not already in your task "
+            "context (actions `find_symbol`/`get_source`/`get_dependencies`/"
+            "`get_dependents` take `name`; `search` takes a regex `pattern`).",
         )
         + "\n\n"
         + xml_block(
@@ -357,15 +318,7 @@ SUBAGENT_PROMPTS: dict[str, str] = {
         + "\n\n"
         + xml_block(
             Tag.CONSTRAINTS,
-            "Path conventions: all file paths MUST be relative from the "
-            "project workspace root.\n"
-            "- Correct: `spine/ui/pages.py`, `.spine/artifacts/doc.md`\n"
-            "- Correct: `/spine/ui/pages.py` (leading `/` = workspace-relative)\n"
-            "- WRONG: `/home/pat/Projects/spine/spine/ui/pages.py` — "
-            "absolute paths double-nest under the virtual filesystem and "
-            "create files in the wrong location.\n"
-            "- WRONG: `../other/file.py` — traversal blocked by virtual "
-            "filesystem.\n"
+            WORKSPACE_PATH_RULES + "\n"
             "- Use `codebase_query` to verify a symbol exists before calling "
             "it. Do not invent paths.\n\n"
             "Hard limits:\n"

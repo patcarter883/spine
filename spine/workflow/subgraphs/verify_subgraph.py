@@ -515,6 +515,27 @@ async def _run_slice_verifier_node(
     return {"verification_results": [verification_result]}
 
 
+def _strip_json_fence(text: str) -> str:
+    """Strip a leading/trailing Markdown code fence around a JSON payload.
+
+    The slice-verifier prompt shows a ```json fenced example, so models often
+    wrap their verdict in a fence. A bare ``json.loads`` fails on the fence and
+    the verdict is discarded as unparseable → spurious NOT_VERIFIED (finding
+    #12). Tolerate ```json … ``` and bare ``` … ``` wrappers.
+    """
+    s = text.strip()
+    if not s.startswith("```"):
+        return s
+    # Drop the opening fence line (``` or ```json) and the trailing fence.
+    first_newline = s.find("\n")
+    if first_newline == -1:
+        return s
+    s = s[first_newline + 1 :]
+    if s.rstrip().endswith("```"):
+        s = s.rstrip()[: -3]
+    return s.strip()
+
+
 def _extract_verification_result(result: dict, slice_id: str) -> dict:
     """Extract a VerificationResult dict from an agent result.
 
@@ -540,7 +561,7 @@ def _extract_verification_result(result: dict, slice_id: str) -> dict:
         content = getattr(msg, "content", "")
         if isinstance(content, str) and content.strip():
             try:
-                parsed = json.loads(content)
+                parsed = json.loads(_strip_json_fence(content))
                 if isinstance(parsed, dict):
                     parsed["slice_name"] = slice_id
                     return parsed

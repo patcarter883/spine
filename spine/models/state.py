@@ -18,6 +18,23 @@ def _merge_dicts(left: dict, right: dict) -> dict:
     return merged
 
 
+# Upper bound on retained ``feedback`` entries. The list accumulates on every
+# critic round, adversarial round, verify failure, gate failure, and subgraph
+# error; routing reads ``last_critic_review`` (not this list) and consumers only
+# read the tail or iterate, so keeping the most recent N entries bounds
+# unbounded growth in deep-rework runs without losing actionable recent
+# feedback (finding #9). Generous enough that normal runs are unaffected.
+_MAX_FEEDBACK_ENTRIES = 40
+
+
+def _append_capped_feedback(left: list, right: list) -> list:
+    """Append feedback entries, bounding total growth to the most recent N."""
+    combined = (left or []) + (right or [])
+    if len(combined) > _MAX_FEEDBACK_ENTRIES:
+        return combined[-_MAX_FEEDBACK_ENTRIES:]
+    return combined
+
+
 def _merge_read_cache(left: dict, right: dict) -> dict:
     """Reducer for the cross-invocation read_cache.
 
@@ -47,8 +64,14 @@ def _merge_artifacts(left: dict, right: dict) -> dict:
     """
     merged = {**left}
     for phase_key, phase_artifacts in right.items():
-        if not phase_artifacts or not isinstance(phase_artifacts, dict):
-            # New value is empty or not a dict — overwrite the key
+        if not phase_artifacts:
+            # Empty update — e.g. a phase exception handler returning
+            # ``{phase: {}}``. Do NOT clobber previously-accumulated artifacts
+            # for this phase: a transient error after a successful pass must not
+            # blank the phase in state (finding #7). Skip the key entirely.
+            continue
+        if not isinstance(phase_artifacts, dict):
+            # Non-dict value — overwrite the key
             merged[phase_key] = phase_artifacts
         elif phase_key in merged and isinstance(merged.get(phase_key), dict):
             # Both sides are dicts — merge at the file level
@@ -93,7 +116,7 @@ class WorkflowState(TypedDict, total=False):
     retry_count: Annotated[dict, _merge_dicts]
     max_retries: int
     artifacts: Annotated[dict, _merge_artifacts]
-    feedback: Annotated[list, operator.add]
+    feedback: Annotated[list, _append_capped_feedback]
     status: str
     prompt_request: dict | None
     critic_reviewing: str  # Phase the current critic node is reviewing
@@ -104,7 +127,7 @@ class WorkflowState(TypedDict, total=False):
     # Written by _critic_result_mapper; consumed by critic_router and by the
     # specify/plan synthesizers when retry_count > 0. Last-write-wins — this
     # is the single source of truth for routing, decoupled from the
-    # operator.add `feedback` list. The convergence fields (stagnation_streak,
+    # (capped-append) `feedback` list. The convergence fields (stagnation_streak,
     # unaddressed_points) are computed by spine.workflow.critic_convergence and
     # drive early escalation + the "still unaddressed" rework delta.
     # ── Adversarial review (critical work types) ──

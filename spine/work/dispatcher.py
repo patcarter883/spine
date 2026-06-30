@@ -1451,7 +1451,11 @@ async def resume_interrupted_work(
                 continue
 
             data = chunk.get("data", {})
+            if not isinstance(data, dict):
+                continue
             for _node_name, node_output in data.items():
+                if not isinstance(node_output, dict):
+                    continue
                 result.update(node_output)
                 phase = node_output.get("current_phase", "")
                 status = node_output.get("status", "")
@@ -2665,7 +2669,11 @@ async def approve_and_spawn(
             if ns != ():
                 continue
             data = chunk.get("data", {})
+            if not isinstance(data, dict):
+                continue
             for node_name, node_output in data.items():
+                if not isinstance(node_output, dict):
+                    continue
                 node_artifacts = node_output.get("artifacts")
                 if node_artifacts and isinstance(node_artifacts, dict):
                     existing = result.get("artifacts", {})

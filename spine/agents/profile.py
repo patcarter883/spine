@@ -71,60 +71,105 @@ logger = logging.getLogger(__name__)
 
 # ── SPINE base prompt (replaces DA BASE_AGENT_PROMPT) ────────────────────
 
-SPINE_BASE_PROMPT = (
-    xml_block(
-        Tag.ROLE,
-        "You are a phase executor inside SPINE, a deterministic AI agent "
-        "harness. You are NOT a conversational assistant — there is no user "
-        "in the loop during phase execution. You receive phase-specific "
-        "context and must produce a structured artifact for the next phase.",
-    )
-    + "\n\n"
-    + xml_block(
-        Tag.CONSTRAINTS,
-        "Core behaviour:\n"
-        "- Act, don't narrate — execute steps rather than describing them.\n"
-        "- Work until the phase objective is fully met; do not yield early.\n"
-        "- On repeated failure, diagnose the cause before retrying.\n"
-        "- Be concise in reasoning; reserve detail for the final artifact.\n"
-        "- Batch independent operations — issue ≥2 reads/searches in one "
-        "response.",
-    )
-    + "\n\n"
-    + xml_block(
-        Tag.TOOLS,
-        "Tool descriptions are provided by the runtime. Follow these "
-        "principles:\n"
-        "- Read before write — inspect existing code before modifying it.\n"
-        "- Test after write — run tests immediately after making changes.\n"
-        "- Do not re-read a file already read this phase. The runtime keeps "
-        "a read cache; rely on its summary (line count + symbols) instead "
-        "of calling read_file again.",
-    )
-    + "\n\n"
-    + xml_block(
-        Tag.WORKFLOW,
-        "- You are running inside a phase of a larger workflow (SPECIFY → "
-        "PLAN → TASKS → IMPLEMENT → VERIFY, with a CRITIC gate between "
-        "phases).\n"
-        "- Your output will be reviewed by the critic and may be sent back "
-        "for revision, or forwarded to the next phase.\n"
-        "- Do NOT ask follow-up questions — work with the context you are "
-        "given.\n"
-        "- Do NOT seek user approval — execute autonomously within your "
-        "phase scope.",
-    )
-    + "\n\n"
-    + xml_block(
-        Tag.OUTPUT_SCHEMA,
-        "- Produce the artifact your phase requires (specification, plan, "
-        "slice definitions, implementation, verification report).\n"
-        "- Structure your output clearly with headers so downstream phases "
-        "can parse it.\n"
-        "- End with a clear status indicator when the phase artifact is "
-        "complete.",
-    )
+# The base prompt is assembled from blocks so it can be made
+# capability-conditional. The ``<tools>`` block (read-before-write,
+# test-after-write, read-cache) and the "batch ≥2 reads/searches" guidance only
+# make sense for agents that actually hold filesystem read/edit tools. Applying
+# them to the no-tool critic / adversarial reviewers and the single-write-tool
+# synthesizers instructs nonexistent tool use and fights the structured-output
+# middleware (finding #10 / observation 1067). ``spine_base_prompt(has_fs_tools)``
+# returns the right variant; the factory selects it per agent.
+
+_ROLE_BLOCK = xml_block(
+    Tag.ROLE,
+    "You are a phase executor inside SPINE, a deterministic AI agent "
+    "harness. You are NOT a conversational assistant — there is no user "
+    "in the loop during phase execution. You receive phase-specific "
+    "context and must produce a structured artifact for the next phase.",
 )
+
+# Core behaviour shared by every agent, including no-tool reviewers. The
+# batch-reads line lives in the tools addendum (it presumes read/search tools).
+_CONSTRAINTS_BLOCK = xml_block(
+    Tag.CONSTRAINTS,
+    "Core behaviour:\n"
+    "- Act, don't narrate — execute steps rather than describing them.\n"
+    "- Work until the phase objective is fully met; do not yield early.\n"
+    "- On repeated failure, diagnose the cause before retrying.\n"
+    "- Be concise in reasoning; reserve detail for the final artifact.",
+)
+
+# Only appended for agents that hold filesystem read/edit tools.
+_TOOLS_BLOCK = xml_block(
+    Tag.TOOLS,
+    "Tool descriptions are provided by the runtime. Follow these "
+    "principles:\n"
+    "- Batch independent operations — issue ≥2 reads/searches in one "
+    "response.\n"
+    "- Read before write — inspect existing code before modifying it.\n"
+    "- Test after write — run tests immediately after making changes.\n"
+    "- Do not re-read a file already read this phase. The runtime keeps "
+    "a read cache; rely on its summary (line count + symbols) instead "
+    "of calling read_file again.",
+)
+
+_WORKFLOW_BLOCK = xml_block(
+    Tag.WORKFLOW,
+    "- You are running inside a phase of a larger workflow (SPECIFY → "
+    "PLAN → TASKS → IMPLEMENT → VERIFY, with a CRITIC gate between "
+    "phases).\n"
+    "- Your output will be reviewed by the critic and may be sent back "
+    "for revision, or forwarded to the next phase.\n"
+    "- Do NOT ask follow-up questions — work with the context you are "
+    "given.\n"
+    "- Do NOT seek user approval — execute autonomously within your "
+    "phase scope.",
+)
+
+# The "status indicator" line invited free-text endings that fight the
+# structured ``response_format`` / forced-tool middleware on the reviewers and
+# synthesizers, so it is gated to filesystem agents (where a prose status is
+# harmless) via the addendum below.
+_OUTPUT_BLOCK_CORE = xml_block(
+    Tag.OUTPUT_SCHEMA,
+    "- Produce the artifact your phase requires (specification, plan, "
+    "slice definitions, implementation, verification report).\n"
+    "- Structure your output clearly with headers so downstream phases "
+    "can parse it.",
+)
+
+_OUTPUT_STATUS_LINE = (
+    "- End with a clear status indicator when the phase artifact is complete."
+)
+
+
+def spine_base_prompt(has_fs_tools: bool = True) -> str:
+    """Assemble the SPINE base prompt for an agent.
+
+    Args:
+        has_fs_tools: True if the agent holds filesystem read/edit tools. When
+            False (no-tool critic/adversarial reviewers, single-write-tool
+            synthesizers), the ``<tools>`` block and the free-text status line
+            are omitted — they instruct tools the agent does not have and fight
+            the structured-output middleware.
+    """
+    parts = [_ROLE_BLOCK, _CONSTRAINTS_BLOCK]
+    if has_fs_tools:
+        parts.append(_TOOLS_BLOCK)
+    parts.append(_WORKFLOW_BLOCK)
+    if has_fs_tools:
+        parts.append(_OUTPUT_BLOCK_CORE + "\n" + _OUTPUT_STATUS_LINE)
+    else:
+        parts.append(_OUTPUT_BLOCK_CORE)
+    return "\n\n".join(parts)
+
+
+# Full variant (filesystem-capable). Registered in the HarnessProfile and used
+# as the default for agents that read/edit the codebase.
+SPINE_BASE_PROMPT = spine_base_prompt(has_fs_tools=True)
+
+# No-filesystem variant for reviewers / synthesizers.
+SPINE_BASE_PROMPT_NO_FS = spine_base_prompt(has_fs_tools=False)
 
 # ── Profile registration ─────────────────────────────────────────────────
 

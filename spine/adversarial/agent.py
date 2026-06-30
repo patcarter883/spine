@@ -27,6 +27,7 @@ from spine.models.enums import PhaseName
 from spine.models.state import WorkflowState
 from spine.models.types import CriticReview
 from spine.agents.factory import build_phase_agent
+from spine.agents.prompt_snippets import SCOPE_EXCLUSION_CITATION_RULE
 
 
 # ── Red-team system prompt ───────────────────────────────────────────────────
@@ -78,10 +79,9 @@ _ADVERSARIAL_PROMPT = (
     "## Stay proportionate\n\n"
     "Weigh findings against the original `<objective>`. For a narrow request, "
     "do not demand new modules, abstractions, or scope the specification did "
-    "not ask for — inventing scope is itself a review failure. If you flag a "
-    "slice for reaching into an EXCLUDED area, you MUST quote the matching "
-    "`scope_exclusions` bullet verbatim in `cited_exclusions`; an uncited "
-    "scope objection is treated as unsupported and overturned automatically.\n\n"
+    "not ask for — inventing scope is itself a review failure. "
+    + SCOPE_EXCLUSION_CITATION_RULE
+    + "\n\n"
     "Always explain your reasoning in `reason` and give specific, actionable "
     "`suggestions` for every NEEDS_REVISION finding."
 )

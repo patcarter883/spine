@@ -62,7 +62,7 @@ def build_gap_plan_agent(
         "- Do NOT produce a full new plan. This is a targeted gap-fix document.\n"
         "- Do NOT overwrite plan.md or any original plan artifacts.\n"
         "- Do NOT implement fixes yourself. Your only output is gap_plan.md + gap_plan.json.\n\n"
-        "## Your Tool Surface (ONLY these tools)\n"
+        "## Tools (ONLY these)\n"
         "- `read_verification_findings` — loads all verification inputs in ONE call. No arguments.\n"
         "- `write_structured_gap_plan` — writes gap_plan.md + gap_plan.json. Call this LAST.\n\n"
         "Use ONLY these tools. Cannot access generic filesystem tools."

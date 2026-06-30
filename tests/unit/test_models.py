@@ -185,12 +185,17 @@ class TestWorkflowState:
         assert merged["specify"]["specification.md"] == "spec"
 
     def test_merge_artifacts_empty_phase_value(self) -> None:
-        """Test that an empty phase dict on the right doesn't corrupt left."""
+        """An empty phase dict on the right must NOT wipe accumulated artifacts.
+
+        A phase exception handler returns ``{phase: {}}``; previously the reducer
+        overwrote the phase key with the empty dict, blanking a phase that had
+        succeeded on an earlier pass (finding #7). The reducer now skips empty
+        updates so prior content is preserved.
+        """
         left = {"tasks": {"tasks.md": "content", "slice-1.md": "slice"}}
         right = {"tasks": {}}  # error path returns empty dict
         merged = _merge_artifacts(left, right)
-        # Empty dict from right overwrites the phase key (LangGraph semantics)
-        assert merged["tasks"] == {}
+        assert merged["tasks"] == {"tasks.md": "content", "slice-1.md": "slice"}
 
     def test_workflow_state_typed_dict(self) -> None:
         """Test that WorkflowState accepts expected fields."""

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointStore:
@@ -96,9 +99,8 @@ class CheckpointStore:
         """
         checkpointer = await self.get_checkpointer()
         try:
-            config = {"configurable": {"thread_id": work_id}}
-            await checkpointer.adelete(config)
+            await checkpointer.adelete_thread(work_id)
             return True
         except Exception:
-            pass
+            logger.exception("Failed to delete checkpoint state for work_id=%s", work_id)
         return False

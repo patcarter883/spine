@@ -88,7 +88,7 @@ def build_project_verify_agent(
         "- VERIFIED: All requirements satisfied, no significant integration gaps.\n"
         "- PARTIAL: Some requirements satisfied but gaps remain.\n"
         "- FAILED: Requirements not satisfied or critical integration gaps found.\n\n"
-        "## Tool Surface\n"
+        "## Tools\n"
         "- ``read_phase_evidence`` — load all evidence (call FIRST).\n"
         "- ``write_phase_verification`` — write verdict (call LAST).\n"
         "- ``read_file``, ``glob``, ``grep``, ``ls`` — read-only filesystem "

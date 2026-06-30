@@ -211,17 +211,33 @@ def _route_slices(
 
     # ── Dependency gating (A): only dispatch slices whose deps are done ──
     ready = _ready_slices(pending, state.get("completed_slices", []) or [])
-    if pending and not ready and not failed:
-        # No pending slice is dependency-ready and nothing is decomposing — a
-        # dangling or circular dependency the plan critic missed. Dispatch all
-        # rather than stall the loop forever; they may fail, but the phase
-        # terminates and reports.
-        logger.warning(
-            "[%s] IMPLEMENT route: %d pending slice(s), none dependency-ready, no "
-            "failed slices — dispatching all to avoid deadlock (dangling/cyclic dep?).",
-            work_id, len(pending),
-        )
-        ready = pending
+    if pending and not ready:
+        # No pending slice is dependency-ready. Distinguish two cases:
+        #   * Legitimately waiting: a slice's unsatisfied dep is in the failed
+        #     set, so the fallback_decomposer may yet complete it — keep waiting.
+        #   * Permanently blocked: every unsatisfied dep is neither completed nor
+        #     being decomposed — a dependency cycle among pending slices or a
+        #     dangling dep the plan critic missed. No future round can make these
+        #     ready, so dispatch them NOW to break the deadlock instead of
+        #     churning failed slices until the dispatch ceiling (finding #5).
+        done_ids = _slice_marker_ids(state.get("completed_slices", []) or [])
+        failed_ids = _slice_marker_ids(failed)
+        deadlocked = []
+        for sl in pending:
+            unsatisfied = [
+                d for d in (sl.get("dependencies") or []) if d and d not in done_ids
+            ]
+            if unsatisfied and not any(d in failed_ids for d in unsatisfied):
+                deadlocked.append(sl)
+        if deadlocked:
+            logger.warning(
+                "[%s] IMPLEMENT route: %d pending slice(s) permanently blocked "
+                "(dependency cycle or dangling dep, none resolvable by the "
+                "decomposer) — dispatching to break deadlock rather than churn to "
+                "the dispatch ceiling.",
+                work_id, len(deadlocked),
+            )
+            ready = deadlocked
 
     # Flag-gate the editor architecture. The synthesis path is a single no-tool
     # node (synthesize → place), so it skips the plan_slice_implementer
@@ -1044,9 +1060,15 @@ def _slice_result_to_update(
 
 
 def _normalize_status(status: str) -> str:
-    """Normalize status to a valid value: implemented, partial, or blocked."""
+    """Normalize status to a valid value: implemented, partial, or blocked.
+
+    An unrecognized or non-string status falls through to ``blocked`` (NOT
+    ``implemented``): a slice whose status we cannot trust must not be recorded
+    as silently done — the verify phase / orchestrator needs to see it was not
+    completed (finding #5b).
+    """
     if not isinstance(status, str):
-        return "implemented"
+        return "blocked"
     status_lower = status.lower().strip()
     if status_lower in ("implemented", "partial", "blocked"):
         return status_lower
@@ -1054,7 +1076,7 @@ def _normalize_status(status: str) -> str:
         return "implemented"
     if status_lower in ("failed", "error", "not_implemented"):
         return "blocked"
-    return "implemented"
+    return "blocked"
 
 
 def _extract_slice_result(result: dict, slice_id: str) -> dict:
@@ -1091,18 +1113,21 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
                     return parsed
             except (json.JSONDecodeError, TypeError):
                 pass
+            # The subagent emitted a final message that is not parseable as a
+            # SliceResult. We cannot confirm the slice was done — record it as
+            # blocked rather than fabricating success (finding #5b).
             return {
                 "slice_name": slice_id,
-                "status": "implemented",
+                "status": "blocked",
                 "files_modified": [],
                 "files_created": [],
                 "test_results": "",
-                "issues": [],
+                "issues": ["Subagent output was not a parseable SliceResult"],
             }
 
     return {
         "slice_name": slice_id,
-        "status": "implemented",
+        "status": "blocked",
         "files_modified": [],
         "files_created": [],
         "test_results": "(no output from subagent)",

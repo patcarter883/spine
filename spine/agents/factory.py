@@ -431,6 +431,20 @@ def build_phase_agent(
     resolved_model = _resolve_model_for_profile(model)
     profile = _resolve_profile(resolved_model, _model_spec)
     base_prompt = _apply_profile_prompt(profile, BASE_AGENT_PROMPT)
+    # Capability-conditional base prompt (finding #10): the filesystem tool
+    # guidance ("read before write / test after write / read cache") and the
+    # free-text status line only apply to agents that actually hold read/edit
+    # tools. For no-tool reviewers (critic, adversarial — allowed_tools=[]) and
+    # single-write-tool synthesizers (no read_file), swap to the no-filesystem
+    # variant so we don't instruct nonexistent tools or fight the structured
+    # output middleware.
+    from spine.agents.profile import SPINE_BASE_PROMPT, SPINE_BASE_PROMPT_NO_FS
+
+    has_fs_tools = not skip_filesystem_middleware and (
+        allowed_tools is None or "read_file" in allowed_tools
+    )
+    if not has_fs_tools and base_prompt == SPINE_BASE_PROMPT:
+        base_prompt = SPINE_BASE_PROMPT_NO_FS
     tool_desc_overrides = _get_tool_description_overrides(profile)
 
     # ── Materialize prior artifacts to disk ──────────────────────────

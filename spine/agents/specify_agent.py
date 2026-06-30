@@ -27,6 +27,7 @@ from langchain_core.runnables import RunnableConfig
 from spine.agents.artifacts import build_artifact_prompt
 from spine.agents.factory import build_phase_agent
 from spine.agents.helpers import escalation_level_for_phase
+from spine.agents.prompt_snippets import NO_MARKDOWN_WRITE_NOTE
 from spine.agents.specify_tools import build_specify_orchestrator_tools
 from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
 from spine.models.enums import PhaseName
@@ -157,71 +158,75 @@ def build_specify_synthesizer(
     )
 
 
+# Shared specification field contract — the structured fields the
+# write_specification tool expects. Both the orchestrator and the synthesizer
+# emit exactly these, so the list lives in one place.
+_SPEC_FIELDS = (
+    "Fields (all lists are arrays of short strings — one item per array entry):\n"
+    "- title: short specification title\n"
+    "- summary: 2-3 sentence executive summary\n"
+    "- objectives: list of high-level goals\n"
+    "- requirements: list of functional + non-functional requirements (each "
+    "measurable). REQUIRED — must have at least one item.\n"
+    "- constraints: list of non-functional constraints\n"
+    "- scope_inclusions: list of areas explicitly in scope\n"
+    "- scope_exclusions: list of areas explicitly out of scope\n"
+    "- known_risks: list of open questions or risks"
+)
+
+# Shared liveness guard — emit the most complete spec the context supports
+# rather than stalling, recording genuine unknowns instead of dropping work.
+_SPEC_TURN_BUDGET = (
+    "Do not stall: by turn 3, call `write_specification` with the most complete "
+    "specification the available context supports — record genuine unknowns in "
+    "`known_risks` rather than omitting requirements."
+)
+
+
 def _build_specify_prompt() -> str:
+    """Orchestrator prompt — identical to the synthesizer plus the optional
+    ``recall`` tool (the one capability difference between the two)."""
     return (
-        "You are the SPECIFY phase orchestrator. Synthesise the exploration results "
-        "already in your context and write the formal specification.\\n\\n"
-        "## Available tools (use only these)\\n"
-        "- `recall` — retrieves relevant code chunks from the vector knowledge base. "
-        "Use this to understand existing patterns before writing the spec.\\n"
-        "- `write_specification` — writes specification.md. Call LAST.\\n\\n"
+        "You are the SPECIFY phase orchestrator. Synthesise the exploration "
+        "results already in your context and write the formal specification.\n\n"
+        "## Tools\n"
+        "- `recall` — retrieve relevant code chunks from the vector knowledge "
+        "base (optional; use once if a specific existing pattern is unclear). "
+        "You cannot dispatch researchers — the exploration subgraph already did "
+        "that and its findings are in your context.\n"
+        "- `write_specification` — writes specification.md + specification.json. "
+        "Call LAST.\n\n"
         "The work description, task classification, pre-retrieved code, and any "
-        "prior critic feedback (plus the prior specification on a rework pass) are "
-        "provided inline in the user message below — you do NOT need to call any "
-        "tool to load them. Researcher subagents that explored the codebase were "
-        "dispatched by the upstream exploration subgraph; their findings are "
-        "already in your context. Do not try to dispatch more.\\n\\n"
-        "## SPECIFY PHASE — STEP-BY-STEP WORKFLOW\\n\\n"
-        "Execute these steps in order. Complete each fully before proceeding.\\n\\n"
-        "### Step 1 — Review the provided context\\n"
-        "Read the work description, classification, and pre-retrieved code chunks "
-        "in the user message. Analyze them to understand existing patterns, "
-        "conventions, and architectural decisions. Do NOT dispatch additional "
-        "researcher subagents unless the pre-retrieved context is insufficient.\\n\\n"
-        "### Step 2 — Call write_specification\\n"
-        "Synthesize the retrieved context and/or research findings into the structured "
-        "fields below and call `write_specification` ONCE. The tool renders markdown and "
-        "emits JSON for you — DO NOT author markdown, DO NOT hand-serialize JSON.\\n\\n"
-        "Fields (all lists are arrays of short strings — one item per array entry):\\n"
-        "- title: short specification title\\n"
-        "- summary: 2-3 sentence executive summary\\n"
-        "- objectives: list of high-level goals\\n"
-        "- requirements: list of functional + non-functional requirements (each measurable). REQUIRED — must have at least one item.\\n"
-        "- constraints: list of non-functional constraints\\n"
-        "- scope_inclusions: list of areas explicitly in scope\\n"
-        "- scope_exclusions: list of areas explicitly out of scope\\n"
-        "- known_risks: list of open questions or risks\\n\\n"
-        "### Turn Budget\\n"
-        "Expected: 1 turn (optionally 1 `recall` first). If exceeding 3 turns "
-        "without calling `write_specification`, proceed to write with the context "
-        "already provided.\\n"
+        "prior critic feedback (plus the prior specification on a rework pass) "
+        "are provided inline in the user message — you do NOT need to call any "
+        "tool to load them.\n\n"
+        "## Workflow\n"
+        "Review the provided context (optionally `recall` once for a specific "
+        "unclear pattern), then synthesize the structured fields below and call "
+        "`write_specification` ONCE. " + NO_MARKDOWN_WRITE_NOTE + "\n\n"
+        + _SPEC_FIELDS + "\n\n"
+        + _SPEC_TURN_BUDGET + "\n"
     )
 
 
 def _build_specify_synthesizer_prompt() -> str:
+    """Synthesizer prompt — write tool only, no exploration."""
     return (
         "You are the SPECIFY phase synthesizer. Codebase research was completed "
         "BEFORE you started — the findings are injected into your prompt below. "
-        "Your job is to synthesize those findings into a structured specification "
-        "and call `write_specification` ONCE. Do NOT re-explore the codebase.\\n\\n"
-        "## Available tools (the ONLY tool you have)\\n"
-        "- `write_specification` — writes both specification.md and specification.json.\\n\\n"
+        "Your job is to synthesize those findings into a structured "
+        "specification and call `write_specification` ONCE. Do NOT re-explore "
+        "the codebase.\n\n"
+        "## Tools\n"
+        "- `write_specification` — writes specification.md + specification.json. "
+        "It is the ONLY tool you have.\n\n"
         "The work description, critic feedback, and (on a rework pass) the prior "
         "specification are all provided inline in the user message — you do NOT "
-        "need to call any tool to load them.\\n\\n"
-        "## Workflow (exactly 1 call)\\n\\n"
-        "### Call write_specification\\n"
-        "Synthesize the findings (already in your prompt) plus the work context into "
-        "the structured fields below and call `write_specification` ONCE. The tool "
-        "renders markdown and emits JSON for you — DO NOT author markdown, DO NOT "
-        "hand-serialize JSON, DO NOT call write_file.\\n\\n"
-        "Fields (all lists are arrays of short strings — one item per array entry):\\n"
-        "- title: short specification title\\n"
-        "- summary: 2-3 sentence executive summary\\n"
-        "- objectives: list of high-level goals\\n"
-        "- requirements: list of functional + non-functional requirements (each measurable). REQUIRED — must have at least one item.\\n"
-        "- constraints: list of non-functional constraints\\n"
-        "- scope_inclusions: list of areas explicitly in scope\\n"
-        "- scope_exclusions: list of areas explicitly out of scope\\n"
-        "- known_risks: list of open questions or risks\\n"
+        "need to call any tool to load them.\n\n"
+        "## Workflow (exactly 1 call)\n"
+        "Synthesize the findings (already in your prompt) plus the work context "
+        "into the structured fields below and call `write_specification` ONCE. "
+        + NO_MARKDOWN_WRITE_NOTE + "\n\n"
+        + _SPEC_FIELDS + "\n\n"
+        + _SPEC_TURN_BUDGET + "\n"
     )

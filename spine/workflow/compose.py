@@ -493,6 +493,15 @@ def _plan_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> d
     # Forward structured plan JSON so CRITIC_PLAN can read it from state.
     if subgraph_result.get("plan_json"):
         base["plan_json"] = subgraph_result["plan_json"]
+    # When this PLAN run was an adversarial-driven rework (the adversarial stage
+    # loops the plan back here on its OWN budget), the reworked plan is
+    # effectively a new plan and deserves a fresh critic budget. Reset
+    # retry_count[plan] to 0 so the subsequent critic_plan does not inherit the
+    # prior plan's exhausted count and escalate prematurely — the outer loop is
+    # still bounded by max_adversarial_retries (finding: adversarial/critic
+    # retry-budget coupling). retry_count uses a right-wins merge reducer.
+    if parent_state.get("current_phase") == PhaseName.ADVERSARIAL.value:
+        base["retry_count"] = {PhaseName.PLAN.value: 0}
     # Set completion invariants
     base["plan_completed"] = phase_status == "success"
     base["feature_slices_count"] = len(subgraph_result.get("feature_slices", []))
@@ -1388,11 +1397,6 @@ def build_workflow_graph(
                 "needs_review": needs_review_target,
             },
         )
-
-    # ── Prerequisite Gate Router ───────────────────────────────────────
-    def prereq_gate_router(state: WorkflowState) -> str:
-        """Route based on prerequisite gate check result."""
-        return state.get("status")  # "running" → proceed, "needs_review" → human_review
 
     # Wire the graph
     if start_from_phase:
