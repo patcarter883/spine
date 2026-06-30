@@ -190,6 +190,17 @@ def _resolve_timeout(phase: str, config: RunnableConfig | None = None) -> int:
 # Max chars of artifact content to store in parent WorkflowState.
 _MAX_ARTIFACT_STATE_CHARS = 500
 
+# Artifacts that must survive at FULL fidelity, not as a truncated state preview.
+# Implement+verify run in a sandbox worktree that is torn down at finalize, so the
+# only copy that reaches the durable .spine is whatever the result mapper puts in
+# parent state (later materialized to disk). A 500-char preview of the verify
+# report leaves the persisted verification.json/.md truncated mid-record — useless
+# to gap_plan (which reads them) and to post-run/restart inspection. These names
+# carry their full content through the mapper instead. Bounded by
+# _MAX_FULL_PERSIST_CHARS so a pathological report still can't blow up state.
+_FULL_PERSIST_ARTIFACTS = frozenset({"verification.json", "verification.md"})
+_MAX_FULL_PERSIST_CHARS = 200_000
+
 
 def _error_update(
     state: WorkflowState,
@@ -590,12 +601,18 @@ def make_success_result_mapper(phase: str) -> Callable:
         artifacts = subgraph_result.get("artifacts_output", {})
         artifact_names = list(artifacts.keys()) if isinstance(artifacts, dict) else []
 
-        # Build artifact previews for parent state (truncated)
+        # Build artifact previews for parent state (truncated), EXCEPT the
+        # report files that must persist whole through teardown.
         artifact_previews = {}
         if isinstance(artifacts, dict):
             for name, content in artifacts.items():
                 if isinstance(content, str):
-                    artifact_previews[name] = content[:_MAX_ARTIFACT_STATE_CHARS]
+                    cap = (
+                        _MAX_FULL_PERSIST_CHARS
+                        if name in _FULL_PERSIST_ARTIFACTS
+                        else _MAX_ARTIFACT_STATE_CHARS
+                    )
+                    artifact_previews[name] = content[:cap]
 
         # Mirror the subgraph's reported phase_status into the per-phase
         # record. Hardcoding "success" here mislabels phases that completed

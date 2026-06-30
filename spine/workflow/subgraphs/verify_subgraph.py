@@ -719,6 +719,37 @@ def _load_verification_results(workspace_root: str, work_id: str) -> list[dict]:
     return results if isinstance(results, list) else []
 
 
+# The verify report must cross the sandbox→durable boundary whole: gap_plan
+# reads verification.md, restart/UI read both, and a 500-char preview leaves the
+# persisted file truncated mid-record. Bounded so a pathological report can't
+# blow up state; the mapper's _FULL_PERSIST_ARTIFACTS keeps these untruncated.
+_FULL_REPORT_FILES = ("verification.json", "verification.md")
+_MAX_FULL_REPORT_CHARS = 200_000
+
+
+def _verify_artifacts_for_state(workspace_root: str, work_id: str) -> dict[str, str]:
+    """Scan the verify artifact dir, but carry the report files at full fidelity.
+
+    ``scan_artifact_dir`` truncates every file to a state-preview length; that is
+    right for incidental files but loses the verification report, whose only copy
+    after sandbox teardown is what we return here. Read verification.json/.md
+    whole (bounded) and let the previews stand for anything else.
+    """
+    artifacts = scan_artifact_dir(
+        workspace_root, work_id, PhaseName.VERIFY.value,
+        max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+    )
+    verify_dir = Path(workspace_root) / artifact_path(work_id, PhaseName.VERIFY.value)
+    for name in _FULL_REPORT_FILES:
+        fp = verify_dir / name
+        if fp.exists():
+            try:
+                artifacts[name] = fp.read_text(encoding="utf-8")[:_MAX_FULL_REPORT_CHARS]
+            except OSError:
+                pass  # keep the truncated preview scan_artifact_dir already returned
+    return artifacts
+
+
 async def _save_verify_artifacts(
     state: VerifySubgraphState,
     config: RunnableConfig | None = None,
@@ -741,24 +772,14 @@ async def _save_verify_artifacts(
         # so anything NOT returned in artifacts_output is lost — leaving the
         # reviewer staring at "needs_review" with no explanation. Surface the
         # per-slice findings too, so the feedback reason can name the gaps.
-        disk_artifacts = scan_artifact_dir(
-            workspace_root,
-            work_id,
-            PhaseName.VERIFY.value,
-            max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
-        )
+        disk_artifacts = _verify_artifacts_for_state(workspace_root, work_id)
         return {
             "artifacts_output": disk_artifacts,
             "phase_status": existing_phase_status,
             "verification_findings": _load_verification_results(workspace_root, work_id),
         }
 
-    disk_artifacts = scan_artifact_dir(
-        workspace_root,
-        work_id,
-        PhaseName.VERIFY.value,
-        max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
-    )
+    disk_artifacts = _verify_artifacts_for_state(workspace_root, work_id)
 
     if not disk_artifacts:
         verify_content = agent_response
