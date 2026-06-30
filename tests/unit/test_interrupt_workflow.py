@@ -226,6 +226,7 @@ class TestResumeInterruptedWork:
         import json as _json
         from unittest.mock import MagicMock
 
+        import spine.agents.experience as _exp_mod
         import spine.persistence.checkpoint as _ckpt_mod
         import spine.workflow.compose as _compose_mod
         from spine.work import dispatcher
@@ -301,6 +302,17 @@ class TestResumeInterruptedWork:
             _compose_mod, "build_workflow_graph", lambda wt, checkpointer=None: FakeGraph()
         )
 
+        # Capture must run on this finalize path too, so rework cycles driven
+        # through "Resume from review" contribute cross-run lessons.
+        captured: dict = {}
+
+        async def fake_capture(result, config, final_status):
+            captured["result"] = result
+            captured["final_status"] = final_status
+            return 0
+
+        monkeypatch.setattr(_exp_mod, "capture_run_experience", fake_capture)
+
         config = MagicMock()
         config.queue_path = "/tmp/spine_test_q.db"
         config.checkpoint_path = "/tmp/spine_test_c.db"
@@ -317,3 +329,8 @@ class TestResumeInterruptedWork:
             == "Unresolved method dependencies between slices."
         )
         assert persisted.get("resumed_from_interrupt") is True
+        # Experience capture was invoked with the resumed run's result.
+        assert captured.get("final_status") == "needs_review"
+        assert captured["result"]["last_critic_review"]["reason"] == (
+            "Unresolved method dependencies between slices."
+        )
