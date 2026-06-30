@@ -213,3 +213,107 @@ class TestResumeInterruptedWork:
 
         with pytest.raises(ValueError, match="not found"):
             await resume_interrupted_work("bad-id", "approve", "looks good")
+
+    @pytest.mark.asyncio
+    async def test_reinterrupt_persists_critic_review(self, monkeypatch):
+        """Regression (trace 019f163e): when an interrupt resume runs a rework
+        and re-pauses at needs_review, the finalize must persist the fresh
+        result blob (last_critic_review/feedback) so the work-detail page can
+        explain WHY it needs review. The path previously wrote only
+        status/current_phase, leaving the reason stale/absent → the UI showed
+        'needs review' with no feedback.
+        """
+        import json as _json
+        from unittest.mock import MagicMock
+
+        import spine.persistence.checkpoint as _ckpt_mod
+        import spine.workflow.compose as _compose_mod
+        from spine.work import dispatcher
+
+        stored = {
+            "id": "w1",
+            "work_type": "reviewed_task",
+            "status": "needs_review",
+            "result": "{}",
+        }
+
+        class FakeTable:
+            def get(self, wid):
+                return dict(stored)
+
+            def update(self, wid, fields):
+                stored.update(fields)
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeTable()
+
+        monkeypatch.setattr(dispatcher, "_get_work_db", lambda config: FakeDB())
+        monkeypatch.setattr(dispatcher, "AuditService", lambda **kw: MagicMock())
+
+        class FakeCkptStore:
+            def __init__(self, db_path=None):
+                pass
+
+            async def get_checkpointer(self):
+                return object()
+
+        monkeypatch.setattr(_ckpt_mod, "CheckpointStore", FakeCkptStore)
+
+        class FakeTask:
+            interrupts = ("pending",)
+
+        class FakeSnapshot:
+            next = ("human_review",)
+            tasks = [FakeTask()]
+            values: dict = {}
+
+        async def fake_astream(command, cfg, **kw):
+            yield {
+                "type": "updates",
+                "ns": (),
+                "data": {
+                    "critic": {
+                        "status": "needs_review",
+                        "current_phase": "plan",
+                        # The accumulated feedback is all needs_revision — it
+                        # gets filtered out of the persisted list, so the reason
+                        # MUST survive via last_critic_review.
+                        "feedback": [
+                            {"status": "needs_revision", "reason": "stale junk"}
+                        ],
+                        "last_critic_review": {
+                            "status": "needs_revision",
+                            "reason": "Unresolved method dependencies between slices.",
+                        },
+                    }
+                },
+            }
+
+        class FakeGraph:
+            async def aget_state(self, cfg):
+                return FakeSnapshot()
+
+            def astream(self, command, cfg, **kw):
+                return fake_astream(command, cfg, **kw)
+
+        monkeypatch.setattr(
+            _compose_mod, "build_workflow_graph", lambda wt, checkpointer=None: FakeGraph()
+        )
+
+        config = MagicMock()
+        config.queue_path = "/tmp/spine_test_q.db"
+        config.checkpoint_path = "/tmp/spine_test_c.db"
+
+        out = await dispatcher.resume_interrupted_work(
+            "w1", "rework", "please fix", config=config
+        )
+
+        assert out["status"] == "needs_review"
+        persisted = _json.loads(stored["result"])
+        # The fresh critic verdict survives so the UI can explain the flag.
+        assert (
+            persisted["last_critic_review"]["reason"]
+            == "Unresolved method dependencies between slices."
+        )
+        assert persisted.get("resumed_from_interrupt") is True
