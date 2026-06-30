@@ -1488,12 +1488,22 @@ async def resume_interrupted_work(
         result, stalled=False, feedback=result.get("feedback", []), work_type=work_type
     )
 
+    # Persist the full result blob — feedback + last_critic_review — like every
+    # other finalize path. Without this, an interrupt resume that re-pauses at
+    # needs_review/awaiting_approval leaves the work record's reason stale (or
+    # empty), so the work-detail page shows "needs review" with no explanation
+    # even though the fresh critic verdict is right here in `result` (trace
+    # 019f163e). _completion_result_payload is the single source of truth for
+    # the persisted shape.
     db["work_entries"].update(
         work_id,
         {
             "status": final_status,
             "current_phase": final_phase,
             "updated_at": datetime.now().isoformat(),
+            "result": json.dumps(
+                _completion_result_payload(result, extra={"resumed_from_interrupt": True})
+            ),
         },
     )
 
