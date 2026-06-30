@@ -224,27 +224,27 @@ providers:
     # plan never converged, trace 019efc66). GLM does plan + critic = one model,
     # ZERO intra-phase swaps across the whole specify/plan/critic tree.
     specify:
-      provider: pat-glm
+      provider: local-glm
     specify/subagents/researcher:
-      provider: pat-glm
+      provider: local-glm
     specify/subagents/researcher/supervisor:
-      provider: pat-glm
+      provider: local-glm
     plan:
-      provider: pat-glm
+      provider: local-glm
     plan/subagents/researcher:
-      provider: pat-glm
+      provider: local-glm
     plan/subagents/researcher/supervisor:
-      provider: pat-glm
+      provider: local-glm
     critic:
-      provider: pat-glm
+      provider: local-glm
     critic/specify:
-      provider: pat-glm
+      provider: local-glm
     critic/plan:
-      provider: pat-glm
+      provider: local-glm
     gap_plan:
-      provider: pat-glm
+      provider: local-glm
     exploration/manager:
-      provider: pat-glm
+      provider: local-glm
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
@@ -257,7 +257,7 @@ providers:
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
     implement:
-      provider: pat-glm
+      provider: local-glm
       # Failure-driven escalation (LOCAL — stays true to local-first). When a
       # slice survives a FALLBACK re-decomposition (_decompose_depth ≥ 1), the
       # editor escalates from the coder model to the reasoning model, which
@@ -265,38 +265,38 @@ providers:
       # synthesis via prefix resolution. Reachable depth is bounded by
       # implement_max_decompose_depth (default 1), so only rung 1 fires today.
       escalation:
-        - provider: pat-glm
+        - provider: local-glm
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: pat-glm
+      provider: local-glm
     implement/subagents/slice-implementer:
-      provider: pat-glm
+      provider: local-glm
     verify:
-      provider: pat-glm
+      provider: local-glm
     verify/subagents/slice-verifier:
-      provider: pat-glm
+      provider: local-glm
     classification:
-      provider: local-qwen-small
+      provider: local-glm
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-qwen-small
+      provider: local-glm
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
     onboarding:
-      provider: pat-glm
+      provider: local-glm
     onboarding/doc-manager:
-      provider: pat-glm
+      provider: local-glm
     onboarding/section-worker:
-      provider: pat-glm
+      provider: local-glm
     # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
     # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
     # actually fail. error_diagnosis is enabled in the spine: block above.
     error_diagnosis:
-      provider: pat-glm
+      provider: local-glm
       max_completion_tokens: 256
       temperature: 0
       reasoning: false
