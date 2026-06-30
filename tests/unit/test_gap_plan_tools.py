@@ -362,15 +362,49 @@ class TestWriteStructuredGapPlanTool:
         assert "ERROR" in result
         assert "missing keys" in result.lower()
 
-    def test_returns_error_for_non_dict_item(self, tmp_path):
+    def test_returns_error_for_non_object_item(self, tmp_path):
+        # A non-JSON string (or any non-object) is still rejected — but a
+        # Pydantic model / dict / JSON-dict string is normalized and accepted
+        # (see test_accepts_pydantic_and_json_string_items), which is the
+        # regression that drove the gap_plan forced-tool retry spiral.
         tool = self._make_tool(tmp_path)
         result = tool._run(
-            remediation_items=["not a dict"],  # Invalid type
+            remediation_items=["not a dict"],  # not parseable as an object
             summary="Test.",
         )
 
         assert "ERROR" in result
-        assert "not a dict" in result
+        assert "not an object" in result
+
+    def test_accepts_pydantic_and_json_string_items(self, tmp_path):
+        """Items coerced by args_schema arrive as Pydantic models (and under
+        guided decoding sometimes as JSON strings); both must be accepted, not
+        false-rejected as 'not a dict' (the spiral root cause)."""
+        import json as _json
+        from spine.agents.gap_plan_tools import _GapRemediationInput
+
+        tool = self._make_tool(tmp_path)
+        fields = {
+            "slice_id": "s1",
+            "failures": ["f1"],
+            "root_cause": "rc",
+            "fixes": [{
+                "file_path": "a.py",
+                "issue_description": "x",
+                "suggested_fix": "y",
+                "acceptance_criteria": ["c1"],
+            }],
+            "priority": "high",
+        }
+        for label, item in (
+            ("model", _GapRemediationInput(**fields)),
+            ("dict", fields),
+            ("json-string", _json.dumps(fields)),
+        ):
+            result = tool._run(remediation_items=[item], summary="s")
+            assert result.startswith("Gap plan artifacts written"), (
+                f"{label} item was rejected: {result}"
+            )
 
     def test_returns_error_for_missing_fix_keys(self, tmp_path):
         tool = self._make_tool(tmp_path)

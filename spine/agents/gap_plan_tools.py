@@ -133,6 +133,32 @@ class ReadVerificationFindingsTool(BaseTool):
 # ── write_structured_gap_plan ───────────────────────────────────────────────
 
 
+def _coerce_to_dict(obj: Any) -> dict[str, Any] | None:
+    """Normalize a tool-call item to a plain dict, or None if it isn't an object.
+
+    LangChain validates tool args through ``args_schema`` (``_StructuredGapPlanInput``),
+    so each ``remediation_items`` entry reaches ``_run`` as a ``_GapRemediationInput``
+    **Pydantic model**, not a dict — and under some guided-decoding paths an entry can
+    instead arrive as a JSON string. The previous validator did ``isinstance(item, dict)``
+    and rejected both shapes as "not a dict," false-failing well-formed plans and driving
+    a forced-tool re-generation spiral where the model degenerated to placeholder garbage
+    (the gap_plan recurrence of the PLAN-synthesizer mismatch, DECISION_LOG D12/D16).
+    Accept model / dict / JSON-string uniformly; return None only for genuinely
+    non-object input.
+    """
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, str):
+        try:
+            parsed = json.loads(obj)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 class _GapFixInput(BaseModel):
     """A single file fix within a gap remediation item."""
 
@@ -215,7 +241,7 @@ class WriteStructuredGapPlanTool(BaseTool):
 
     def _run(
         self,
-        remediation_items: list[dict[str, Any]],
+        remediation_items: list[Any],
         summary: str,
     ) -> str:
         gap_plan_path = Path(self.workspace_root) / self.gap_plan_dir
@@ -225,13 +251,23 @@ class WriteStructuredGapPlanTool(BaseTool):
         validated_items: list[dict[str, Any]] = []
         errors: list[str] = []
 
-        for idx, item in enumerate(remediation_items):
-            if not isinstance(item, dict):
-                errors.append(f"Item at index {idx} is not a dict.")
+        for idx, raw_item in enumerate(remediation_items):
+            # Items arrive as Pydantic models (args_schema coercion), dicts, or
+            # JSON strings depending on the decoding path — normalize before
+            # validating so well-formed input is never false-rejected.
+            item = _coerce_to_dict(raw_item)
+            if item is None:
+                errors.append(
+                    f"Item at index {idx} is not an object "
+                    f"(got {type(raw_item).__name__})."
+                )
                 continue
 
-            # Validate required fields
-            required = {"slice_id", "failures", "root_cause", "fixes", "priority"}
+            # Validate required fields. ``priority`` is intentionally excluded —
+            # it carries a schema default ("medium") and is read with a fallback
+            # below, so requiring it here would false-reject an otherwise valid
+            # item that merely omitted it.
+            required = {"slice_id", "failures", "root_cause", "fixes"}
             missing = required - set(item.keys())
             if missing:
                 errors.append(
@@ -241,7 +277,14 @@ class WriteStructuredGapPlanTool(BaseTool):
 
             # Validate fixes
             validated_fixes = []
-            for fix_idx, fix in enumerate(item.get("fixes", [])):
+            for fix_idx, raw_fix in enumerate(item.get("fixes", [])):
+                fix = _coerce_to_dict(raw_fix)
+                if fix is None:
+                    errors.append(
+                        f"Fix at index {fix_idx} in item {idx} is not an object "
+                        f"(got {type(raw_fix).__name__})."
+                    )
+                    continue
                 fix_required = {"file_path", "issue_description", "suggested_fix", "acceptance_criteria"}
                 fix_missing = fix_required - set(fix.keys())
                 if fix_missing:
@@ -323,7 +366,7 @@ class WriteStructuredGapPlanTool(BaseTool):
 
     async def _arun(
         self,
-        remediation_items: list[dict[str, Any]],
+        remediation_items: list[Any],
         summary: str,
     ) -> str:
         return self._run(remediation_items, summary)
