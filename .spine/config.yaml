@@ -38,7 +38,7 @@ spine:
   # slices to synthesis_implementer instead of the tool-using slice_implementer.
   # variants=3: synthesize 3 candidates, keep the one that applies+lints cleanest.
   implement_synthesis_placement: true
-  implement_synthesis_variants: 1
+  implement_synthesis_variants: 3
   # PLAN best-of-N (Graph-of-Thoughts Score+KeepBest): synthesize 3 candidate
   # plans, score each with the structural scorer (rejects the duplicate-path
   # explosion / unschedulable plans), keep the best before the critic sees it.
@@ -257,7 +257,7 @@ providers:
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
     implement:
-      provider: local-glm
+      provider: local-qwen-coder
       # Failure-driven escalation (LOCAL — stays true to local-first). When a
       # slice survives a FALLBACK re-decomposition (_decompose_depth ≥ 1), the
       # editor escalates from the coder model to the reasoning model, which
@@ -265,24 +265,24 @@ providers:
       # synthesis via prefix resolution. Reachable depth is bounded by
       # implement_max_decompose_depth (default 1), so only rung 1 fires today.
       escalation:
-        - provider: local-glm
+        - provider: local-qwen-coder
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-glm
+      provider: local-qwen-coder
     implement/subagents/slice-implementer:
-      provider: local-glm
+      provider: local-qwen-coder
     verify:
-      provider: local-glm
+      provider: local-qwen-coder
     verify/subagents/slice-verifier:
-      provider: local-glm
+      provider: local-qwen-coder
     classification:
-      provider: local-glm
+      provider: local-qwen-coder
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-glm
+      provider: local-qwen-coder
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
