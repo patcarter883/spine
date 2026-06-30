@@ -133,6 +133,13 @@ class WorkflowState(TypedDict, total=False):
     workspace_root: str  # Project root directory for deep agent backends
     phase_results: Annotated[dict, _merge_dicts]  # phase → PhaseResult
     needs_review_phase: str | None  # Which phase triggered human review
+    human_feedback: dict | None  # Human-review decision from the interrupt:
+    # {"action": "rework"|"approve"|"abort", "feedback": str, "_review_target": str}.
+    # Written by _human_review_interrupt, read by the human_review router. MUST be
+    # a declared channel — LangGraph commits only declared channels, so without
+    # this the update is silently dropped, the router reads {} and defaults the
+    # action to "abort", and EVERY resume (rework and approve alike) collapses to
+    # abort/re-park regardless of what the human chose. See trace 019f1628.
     plan_id: str | None  # Optional reference to an approved planning work item.
     # For execution work items spawned from a plan: references the planning work
     # item that spawned this item. None for standalone quick/critical_quick items.
