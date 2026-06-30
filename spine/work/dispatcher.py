@@ -1514,6 +1514,13 @@ async def resume_interrupted_work(
         {"status": final_status, "resumed_from_interrupt": True},
     )
 
+    # Capture cross-run experience from the resumed run's critic feedback, like
+    # every other finalize path. Without this, rework cycles driven through the
+    # primary "Resume from review" path contribute no lessons. Best-effort.
+    from spine.agents.experience import capture_run_experience
+
+    await capture_run_experience(result, config, final_status)
+
     return {
         "work_id": work_id,
         "status": final_status,

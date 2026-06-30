@@ -183,6 +183,60 @@ def test_distill_from_converged_rework_feedback():
     assert any("R-003" in le.lesson and le.phase == "plan" for le in lessons)
 
 
+def test_distill_skips_harness_noise_truncation():
+    # A critic that truncated at the token limit self-reports a NEEDS_REVISION
+    # with tier "agent" — it passes the tier/status filters but is an
+    # infrastructure failure, not a design lesson. It must never be learned.
+    result = {
+        "work_id": "w-noise",
+        "task_category": "Frontend/UI",
+        "feedback": [
+            {
+                "status": "needs_revision",
+                "tier": "agent",
+                "reason": (
+                    "Critic response was truncated at the token limit "
+                    "(finish_reason=length) without a structured verdict — "
+                    "treating as NEEDS_REVISION rather than trusting a salvaged "
+                    "keyword. Partial output: ..."
+                ),
+                "suggestions": [],
+            },
+            {
+                "status": "needs_revision",
+                "tier": "agent",
+                "reason": "slice references an undefined method",
+                "suggestions": ["Define every referenced method in a slice"],
+            },
+        ],
+        "retry_count": {"plan": 2},
+    }
+    lessons = distill_run_experience(result, _Cfg(workspace_root="/x"))
+    # Only the real design defect survives; the truncation self-report is dropped.
+    assert len(lessons) == 1
+    assert "referenced method" in lessons[0].lesson
+    assert all("finish_reason" not in le.lesson for le in lessons)
+
+
+def test_distill_skips_harness_noise_terminal_review():
+    # Same guard on the terminal-escalation source: a truncated last_critic_review
+    # must not become a lesson.
+    result = {
+        "work_id": "w-noise2",
+        "feedback": [],
+        "retry_count": {},
+        "last_critic_review": {
+            "phase": "plan",
+            "status": "needs_review",
+            "tier": "agent",
+            "reason": "Critic response was truncated at the token limit (finish_reason=length).",
+            "suggestions": [],
+            "attempt": 3,
+        },
+    }
+    assert distill_run_experience(result, _Cfg(workspace_root="/x")) == []
+
+
 def test_distill_skips_structural_tier():
     result = {
         "work_id": "w11",

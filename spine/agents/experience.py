@@ -52,6 +52,26 @@ _INJECT_LIMIT = 5
 # Terminal statuses whose feedback is noise (a crash / abort), not a lesson.
 _SKIP_CAPTURE_STATUSES = {"failed", "cancelled", "stalled"}
 
+# Critic/harness SELF-reports — a review that failed to render (truncated at the
+# token limit, empty output) routes itself to NEEDS_REVISION with tier "agent",
+# so it passes the tier/status filters and would otherwise be distilled into a
+# "lesson". But it describes an INFRASTRUCTURE failure (the critic broke), not a
+# task-design defect the authoring phase can act on — injecting it into a future
+# PLAN/SPECIFY prompt is meaningless noise. Drop any review reason carrying one
+# of these markers. See spine.workflow.critic_review (finish_reason guard) and
+# the critic-repetition-fallback issue.
+_HARNESS_NOISE_MARKERS = (
+    "finish_reason=length",
+    "truncated at the token limit",
+    "without a structured verdict",
+)
+
+
+def _is_harness_noise(reason: str) -> bool:
+    """True when a review reason is a critic/harness self-report, not a defect."""
+    low = (reason or "").lower()
+    return any(marker in low for marker in _HARNESS_NOISE_MARKERS)
+
 
 # ── Store location ───────────────────────────────────────────────────────────
 def experience_store_for(config: Any) -> ExperienceStore:
@@ -156,6 +176,10 @@ def distill_run_experience(result: dict[str, Any], config: Any) -> list[Experien
 
     def add(phase: Any, reason: str, suggestions: list[str], tier: str, salience: int) -> None:
         if not phase:
+            return
+        # A critic/harness self-report (truncated review, empty output) is an
+        # infrastructure failure, not a reusable design lesson — never learn it.
+        if _is_harness_noise(reason):
             return
         text = _lesson_text(reason, suggestions)
         if not text:
