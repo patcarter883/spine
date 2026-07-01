@@ -24,7 +24,7 @@ def _result(content: str, finish_reason: str) -> dict:
 def test_clip_reason_collapses_and_caps():
     blob = ("PASSED line\n" * 5000) + ("x" * 50_000)
     out = _clip_reason(blob)
-    assert len(out) < 1000
+    assert len(out) < 4200  # backstop cap, not the 50K pathological blob
     assert "truncated" in out
 
 
@@ -34,7 +34,7 @@ def test_truncated_critic_is_not_a_pass():
     parsed = _parse_agent_review_fallback(_result(content, "length"), "plan")
     assert parsed["status"] == ReviewStatus.NEEDS_REVISION.value
     assert "finish_reason=length" in parsed["reason"]
-    assert len(parsed["reason"]) < 1200  # not the 126K blob
+    assert len(parsed["reason"]) < 4300  # not the 126K blob
 
 
 def test_clean_text_pass_still_works():

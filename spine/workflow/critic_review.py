@@ -39,11 +39,16 @@ _STRUCTURED_STATE_FIELD: dict[str, str] = {
 
 logger = logging.getLogger(__name__)
 
-# Hard cap on the length of a critic ``reason`` we persist/render. A degenerate
-# critic once emitted a 126K-char repetition that the keyword fallback embedded
-# verbatim and the work-detail UI rendered as a wall of repeated PASSED blocks
-# (trace 019ef7fd).
-_MAX_REASON_CHARS = 800
+# Backstop cap on the length of a critic ``reason`` we persist/render. This is
+# NOT the fix for critic degeneration (trace 019ef7fd) — that's handled by the
+# consecutive-duplicate-line dedup below and, for the keyword-fallback path, the
+# finish_reason=="length" guard in _parse_agent_review_fallback, which routes to
+# NEEDS_REVISION independent of content length. This cap only exists to bound
+# pathological non-repeating content (e.g. one giant non-duplicated line) that
+# dedup can't catch. A real, detailed critic review — the reason text that
+# feeds the next rework attempt (_format_prior_review) and is shown on
+# needs_review — routinely runs several KB and must not be cut for that.
+_MAX_REASON_CHARS = 4000
 
 
 def _clip_reason(text: str) -> str:
