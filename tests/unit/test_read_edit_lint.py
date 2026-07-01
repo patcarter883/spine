@@ -578,6 +578,64 @@ def test_ast_edit_replace_method_by_qualified_name(workspace: Path) -> None:
     assert "return 99" in text and "return 2" in text
 
 
+def test_ast_edit_replace_reindents_flush_left_code_to_method_depth(workspace: Path) -> None:
+    # trace 019f1bed: the synthesizer wrote a fully-correct SpineConfig.load()
+    # body at column 0 (as if top-level) while replacing an existing class
+    # method; the un-reindented splice produced "SyntaxError: unexpected
+    # unindent" and the edit silently failed twice. `code` must be shifted to
+    # the anchor's real indentation, not spliced verbatim.
+    (workspace / "src" / "cfg.py").write_text(
+        "class Cfg:\n"
+        "    def load(self):\n"
+        "        return {}\n"
+        "\n"
+        "    def other(self):\n"
+        "        return 2\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/cfg.py",
+            ast_edit={
+                "symbol": "Cfg.load",
+                "action": "replace",
+                # Flush-left, as if this were a top-level function — the
+                # exact mismatch the trace hit.
+                "code": "def load(self):\n    return {'timeout': 30}",
+            },
+        )
+    )
+    assert out["status"] == "ok"
+    text = (workspace / "src" / "cfg.py").read_text()
+    assert "    def load(self):\n        return {'timeout': 30}" in text
+    assert "    def other(self):\n        return 2" in text
+    import ast
+
+    ast.parse(text)  # must still be syntactically valid Python
+
+
+def test_ast_edit_insert_after_reindents_to_anchor_class_depth(workspace: Path) -> None:
+    (workspace / "src" / "cfg2.py").write_text(
+        "class Cfg:\n    def alpha(self):\n        return 1\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/cfg2.py",
+            ast_edit={
+                "symbol": "Cfg.alpha",
+                "action": "insert_after",
+                # Also flush-left; must land indented as a sibling method.
+                "code": "def beta(self):\n    return 2",
+            },
+        )
+    )
+    assert out["status"] == "ok"
+    text = (workspace / "src" / "cfg2.py").read_text()
+    assert "    def beta(self):\n        return 2" in text
+    import ast
+
+    ast.parse(text)
+
+
 def test_ast_edit_creation_anchor_guard_suggests_last_sibling(workspace: Path) -> None:
     # A weak model trying to CREATE a method via action='replace' anchored to the
     # not-yet-existing symbol gets a grounded recovery anchor (the last existing

@@ -16,6 +16,7 @@ from spine.agents.synthesis_implementer import (
     SynthesizedEdit,
     SynthesizedSlice,
     _count_ruff,
+    _is_stub_body,
     _stage_files,
     apply_synthesized,
     place_best_candidate,
@@ -144,3 +145,47 @@ def test_best_of_n_scoring_does_not_touch_live_tree(workspace: Path) -> None:
 )
 def test_count_ruff(ruff: object, expected: int) -> None:
     assert _count_ruff(ruff) == expected
+
+
+# ── stub-body detection (019f1bed: verify caught after the fact; catch it here)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "def remove_provider(self, name):\n    pass\n",
+        "def remove_provider(self, name):\n    ...\n",
+        "def remove_provider(self, name):\n    raise NotImplementedError\n",
+        "def remove_provider(self, name):\n    raise NotImplementedError()\n",
+        'def remove_provider(self, name):\n    """Docstring only."""\n    pass\n',
+    ],
+)
+def test_is_stub_body_detects_bare_stubs(code: str) -> None:
+    assert _is_stub_body(code)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "def remove_provider(self, name):\n    self._providers.pop(name, None)\n",
+        # A `pass` inside a real branch, not the whole body — not a stub.
+        "def f(x):\n    if x:\n        pass\n    return x\n",
+        # Non-function edits (e.g. a class or constant) are not stub-checked.
+        "class C:\n    pass\n",
+        "X = 1\n",
+    ],
+)
+def test_is_stub_body_ignores_real_code(code: str) -> None:
+    assert not _is_stub_body(code)
+
+
+def test_stub_body_places_but_counts_against_score(workspace: Path) -> None:
+    # The edit is syntactically valid and lints clean, so it still gets
+    # written — but a stub body must not silently score as a clean success.
+    cand = _slice("def greet(name):\n    pass\n")
+    res = apply_synthesized(cand, workspace_root=str(workspace), target_files=["mod.py"])
+    assert res.n_applied == 1  # the write did land
+    assert res.n_failures == 1
+    assert res.failures[0]["status"] == "stub_body"
+    assert not res.clean
+    assert "pass" in (workspace / "mod.py").read_text()

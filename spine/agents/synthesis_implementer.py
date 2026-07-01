@@ -32,6 +32,7 @@ the node wiring and ``_route_slices`` gate live in ``implement_subgraph.py``.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import shutil
@@ -55,6 +56,54 @@ logger = logging.getLogger(__name__)
 # else (syntax_error, no_match, ambiguous_match, reference_only, …) is a
 # failure the synthesizer must fix on the retry pass.
 _OK_STATUSES = frozenset({"ok", "already_applied"})
+
+
+def _is_stub_body(code: str) -> bool:
+    """True when a synthesized def/method's body is a bare stub, not real logic.
+
+    Placement's linter oracle only checks syntax + style, so an edit whose
+    body is just ``pass``/``...``/``raise NotImplementedError`` lints clean
+    and applies — then verify finds it a phase later (019f1bed:
+    ui-provider-controls was marked "implemented" with edit/remove handlers
+    stubbed to ``pass``). Judges only single function/method defs; classes,
+    constants, and other edit shapes are not stub-checked.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    if len(tree.body) != 1 or not isinstance(
+        tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+    ):
+        return False
+    body = list(tree.body[0].body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # drop a leading docstring — not itself a stub marker
+    if not body:
+        return True
+    for stmt in body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis
+        ):
+            continue
+        if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+            exc = stmt.exc
+            name = exc.func.id if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name) else (
+                exc.id if isinstance(exc, ast.Name) else None
+            )
+            if name == "NotImplementedError":
+                continue
+        return False  # a real statement exists — not a stub
+    return True
 
 
 class SynthesizedEdit(BaseModel):
@@ -155,7 +204,18 @@ _SYNTHESIS_SYSTEM_PROMPT = (
     "signature and body, never a fragment or a diff. Rewrite from the inlined "
     "current source; do not invent symbols or files that are not shown. Emit one "
     "edit per change site. If the edit plan lists entries, produce exactly one "
-    "edit per entry."
+    "edit per entry.\n\n"
+    "Placement is purely textual: an 'insert_before'/'insert_after' edit lands "
+    "your new definition as a SIBLING at the anchor's own nesting level — same "
+    "indentation, same scope. It gets NO implicit access to another function's "
+    "locals, and no `self` unless the anchor is itself a method of the class "
+    "you are joining. Never reference `self.<attr>` or a bare name from an "
+    "enclosing function unless it is one of your own parameters or already "
+    "module-global in the inlined source — write the full parameter list the "
+    "edit plan's intent specifies instead of assuming closure capture. If a new "
+    "helper needs to be called for the slice to work, that call must appear in "
+    "a 'replace' edit on the calling function — inserting a helper does not "
+    "wire it in by itself."
 )
 
 
@@ -318,6 +378,20 @@ def apply_synthesized(
         if status in _OK_STATUSES:
             result.applied.append({**rec, "status": status})
             result.ruff_issues += _count_ruff(payload.get("ruff"))
+            if _is_stub_body(edit.code):
+                # Placed and lint-clean, but empty of real behaviour — count it
+                # against the score/retry-trigger without reverting the write
+                # (a corrective retry re-resolves the same symbol and overwrites
+                # it in place; see _synthesis_implementer_node).
+                result.failures.append(
+                    {**rec, "status": "stub_body",
+                     "detail": (
+                         "placed but the body is a bare stub (pass/…/"
+                         "NotImplementedError) — implement the real behaviour "
+                         "the slice's acceptance criteria describe for this "
+                         "symbol."
+                     )}
+                )
         else:
             result.failures.append(
                 {**rec, "status": status or "unknown",
