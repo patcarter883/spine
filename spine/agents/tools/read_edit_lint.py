@@ -1023,11 +1023,20 @@ def _apply_ast_edit(
                     ),
                 )
     buf = current.encode("utf-8")
-    code_bytes = code.encode("utf-8")
     # A method's start_byte sits AFTER its leading indentation; anchor replace/
     # insert_before at the start of the symbol's LINE so the spliced `code`
     # owns the indentation (it should carry the symbol's natural indent).
     line_start = buf.rfind(b"\n", 0, sym.start_byte) + 1
+    # The synthesizer has no way to know the anchor's exact indent depth, and
+    # unlike the patch/find_replace modes this path spliced `code` verbatim —
+    # a one-level indent mismatch produced a silent SyntaxError with no
+    # recoverable feedback (019f1bed: a correct SpineConfig.load() body was
+    # synthesized twice and placed zero times). Re-indent to the anchor's
+    # actual depth using the same _reindent the patch mode already relies on.
+    anchor_indent = buf[line_start : sym.start_byte].decode("utf-8", errors="replace")
+    first_code_line = next((ln for ln in code.split("\n") if ln.strip()), "")
+    code = _reindent(code, _leading_ws(first_code_line), anchor_indent)
+    code_bytes = code.encode("utf-8")
     if action == "replace":
         new_bytes = buf[:line_start] + code_bytes + buf[sym.end_byte :]
     elif action == "insert_before":

@@ -83,8 +83,22 @@ class VerificationResult(BaseModel):
 
     verdict: str = Field(description="One of: VERIFIED, NOT_VERIFIED")
     checklist: list[CheckItem] = Field(description="Verification checklist results")
-    gaps: list[str] = Field(description="Gaps or missing items found (empty if none)")
-    recommendations: list[str] = Field(description="Suggested improvements (empty if none)")
+    gaps: list[str] = Field(
+        description=(
+            "One entry per FAILED checklist item above, restating what that "
+            "specific acceptance criterion required and what the evidence "
+            "showed instead. Empty if every criterion passed. Never add a gap "
+            "for something outside the slice's acceptance_criteria — you are "
+            "verifying against that list, not reviewing the code generally."
+        )
+    )
+    recommendations: list[str] = Field(
+        description=(
+            "One remediation per gap above — how to make that SAME failed "
+            "criterion pass. Never introduce a new requirement, style "
+            "preference, or scope the acceptance_criteria did not state."
+        )
+    )
 
 
 # ── Subagent descriptions ──────────────────────────────────────────────
@@ -384,7 +398,17 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             Tag.CONSTRAINTS,
             "You are report-only. Do not fix issues you find. If a test "
             "fails or a criterion is not met, record it in the checklist "
-            "and gaps. Your job is to provide evidence, not to repair.",
+            "and gaps. Your job is to provide evidence, not to repair.\n\n"
+            "You are verifying against the acceptance_criteria list ONLY — "
+            "you are not a general code reviewer. Every entry in gaps must "
+            "restate a criterion that failed in the checklist above; every "
+            "entry in recommendations must be remediation for one of those "
+            "SAME gaps. If you notice something outside the given "
+            "acceptance_criteria (style, extra validation, unrelated bugs), "
+            "do not fail the slice for it and do not add it to gaps or "
+            "recommendations — the implementer will chase whatever you write "
+            "there, so inventing requirements the spec never stated sends the "
+            "rework loop after a moving target.",
         )
         + "\n\n"
         + xml_block(
@@ -437,7 +461,16 @@ _VERIFY_JUDGE_PROMPT = (
         "Report-only — never propose to edit. verdict is VERIFIED only when "
         "EVERY acceptance criterion passes and automated_checks are clean; "
         "otherwise NOT_VERIFIED. Put concrete, evidence-grounded detail in "
-        "each checklist item (cite the symbol/line or the check output).",
+        "each checklist item (cite the symbol/line or the check output).\n\n"
+        "You are judging against the acceptance_criteria list ONLY — not "
+        "reviewing the code generally. gaps must contain exactly one entry per "
+        "FAILED checklist item, restating what that criterion required; "
+        "recommendations must remediate those SAME gaps. Do not fail a "
+        "criterion, or add a gap/recommendation, for anything the "
+        "acceptance_criteria did not state (missing validation, style, extra "
+        "robustness) — the implementer's next attempt targets exactly what you "
+        "write here, so a requirement you invented becomes a moving target it "
+        "can never satisfy.",
     )
     + "\n\n"
     + xml_block(
