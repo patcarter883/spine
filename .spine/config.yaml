@@ -38,7 +38,7 @@ spine:
   # slices to synthesis_implementer instead of the tool-using slice_implementer.
   # variants=3: synthesize 3 candidates, keep the one that applies+lints cleanest.
   implement_synthesis_placement: true
-  implement_synthesis_variants: 3
+  implement_synthesis_variants: 1
   # No-tool VERIFY judge: pre-compute the evidence (worktree diff + target
   # source + a single py_compile/ruff pass) and have the slice-verifier emit a
   # VerificationResult in ONE shot, no tools. Replaces the ReAct verifier whose
