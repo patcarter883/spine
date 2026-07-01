@@ -14,6 +14,7 @@ from langgraph.types import Command, Send
 from spine.workflow.subgraphs.implement_subgraph import (
     _dispatch_gate_node,
     _fallback_decomposer_node,
+    _placement_feedback,
     _plan_slice_implementer_node,
     _route_slices,
     _slice_result_to_update,
@@ -346,3 +347,38 @@ class TestFallbackDecomposerNode:
         adds = out["pending_slices"]["add"]
         assert len(adds) == 2
         assert all("_sibling_queue" not in s for s in adds)
+
+
+class TestPlacementFeedback:
+    """019f1c10: the creation-anchor guard's target/next_action must reach
+    the synthesis retry, or a broken self-anchor repeats across cycles."""
+
+    def _placement(self, failures):
+        class _FakePlacement:
+            pass
+
+        p = _FakePlacement()
+        p.failures = failures
+        return p
+
+    def test_includes_target_and_next_action_when_present(self):
+        placement = self._placement([{
+            "file": "svc.py",
+            "symbol": "UIApi.add_embedding_provider",
+            "status": "no_match",
+            "detail": "symbol does not exist yet — you are CREATING it.",
+            "target": "UIApi.add_llm_provider",
+            "next_action": "Call ast_edit with action='insert_after' anchored to 'UIApi.add_llm_provider'.",
+        }])
+        text = _placement_feedback(placement)
+        assert "UIApi.add_llm_provider" in text
+        assert "insert_after" in text
+        assert "[DO THIS:" in text
+
+    def test_omits_target_next_action_fields_when_absent(self):
+        placement = self._placement([{
+            "file": "svc.py", "symbol": "x", "status": "syntax_error", "detail": "bad code",
+        }])
+        text = _placement_feedback(placement)
+        assert "[DO THIS:" not in text
+        assert "[target:" not in text

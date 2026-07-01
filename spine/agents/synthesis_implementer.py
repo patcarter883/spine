@@ -393,10 +393,21 @@ def apply_synthesized(
                      )}
                 )
         else:
-            result.failures.append(
-                {**rec, "status": status or "unknown",
-                 "detail": payload.get("detail", "") or payload.get("next_action", "")}
-            )
+            # Preserve `target` (a resolvable anchor/location) and `next_action`
+            # (the concrete corrective call) alongside `detail` — the ast_edit
+            # creation-anchor guard builds these specifically so a weak model
+            # can self-correct in one retry (read_edit_lint._edit_feedback).
+            # Collapsing them into detail-or-next_action dropped the actual
+            # fix-it instruction, so the retry kept re-emitting the same
+            # broken self-anchor for two full implement/verify cycles
+            # (019f1c10: UIApi.add_embedding_provider anchored to itself
+            # instead of the suggested insert_after target).
+            failure = {**rec, "status": status or "unknown", "detail": payload.get("detail", "")}
+            if payload.get("target"):
+                failure["target"] = payload["target"]
+            if payload.get("next_action"):
+                failure["next_action"] = payload["next_action"]
+            result.failures.append(failure)
     return result
 
 

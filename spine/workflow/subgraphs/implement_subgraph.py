@@ -1139,7 +1139,13 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
 
 
 def _placement_feedback(placement: Any) -> str:
-    """Render placement failures as compact feedback for the synthesis retry."""
+    """Render placement failures as compact feedback for the synthesis retry.
+
+    Includes ``target`` and ``next_action`` when the failure carries them —
+    the ast_edit creation-anchor guard builds these specifically so a retry
+    can self-correct in one step instead of re-emitting the same broken
+    anchor (019f1c10: dropping them cost two full implement/verify cycles).
+    """
     lines = []
     for f in placement.failures:
         loc = f.get("file", "?")
@@ -1147,7 +1153,12 @@ def _placement_feedback(placement: Any) -> str:
         if sym:
             loc += f" `{sym}`"
         detail = (f.get("detail", "") or "").strip().replace("\n", " ")
-        lines.append(f"- {loc} ({f.get('status', 'error')}): {detail[:300]}")
+        line = f"- {loc} ({f.get('status', 'error')}): {detail[:300]}"
+        if f.get("target"):
+            line += f" [target: {f['target']}]"
+        if f.get("next_action"):
+            line += f" [DO THIS: {f['next_action']}]"
+        lines.append(line)
     return "\n".join(lines)
 
 
