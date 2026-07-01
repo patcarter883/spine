@@ -43,6 +43,11 @@ dependencies = [
     "tree-sitter-cpp>=0.23",
 ]
 
+[project.optional-dependencies]
+# Ephemeral GPU pods (spine.infra.ephemeral_pod). Only needed when
+# ephemeral_pod.enabled is true in .spine/config.yaml.
+runpod = ["runpod>=1.6"]
+
 [project.scripts]
 spine = "spine.cli:main"
 
@@ -61,6 +66,11 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10",
 ]
+
+[[tool.mypy.overrides]]
+# Optional dependency — not installed unless ephemeral_pod is used.
+module = ["runpod", "runpod.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py311"

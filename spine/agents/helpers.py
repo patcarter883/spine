@@ -914,6 +914,29 @@ def _build_openrouter_model(
     return ChatOpenRouter(**model_kwargs)
 
 
+def _expand_env_ref(value: Any) -> Any:
+    """Resolve an ``env:VARNAME`` provider value from the environment.
+
+    Lets a provider field carry a value only known at runtime — notably an
+    ephemeral pod's ``base_url`` (``env:SPINE_POD_BASE_URL``), which
+    :mod:`spine.infra.ephemeral_pod` publishes once the pod is live. A plain
+    string passes through unchanged. Raises a clear error if the referenced
+    variable is unset (e.g. the pod never came up), rather than handing
+    ``ChatOpenAI`` an empty base_url that fails opaquely later.
+    """
+    if isinstance(value, str) and value.startswith("env:"):
+        var = value[len("env:") :]
+        resolved = os.environ.get(var)
+        if not resolved:
+            raise ValueError(
+                f"Provider value references env var '{var}' (via '{value}') "
+                f"but it is unset. If this is an ephemeral pod, the pod did not "
+                f"come up; check ephemeral_pod config and RunPod capacity."
+            )
+        return resolved
+    return value
+
+
 def _build_local_model(
     model_spec: str,
     provider_cfg: dict[str, Any],
@@ -945,11 +968,13 @@ def _build_local_model(
 
     kwargs: dict[str, Any] = {
         "model": model_name,
-        "base_url": provider_cfg["base_url"],
+        # ``env:VARNAME`` resolves at build time — e.g. an ephemeral pod URL
+        # published into the environment once the pod is live.
+        "base_url": _expand_env_ref(provider_cfg["base_url"]),
     }
 
     # api_key is required by ChatOpenAI even for local servers that ignore it
-    if api_key := provider_cfg.get("api_key"):
+    if api_key := _expand_env_ref(provider_cfg.get("api_key")):
         kwargs["api_key"] = api_key
 
     # Pass through optional tuning fields if present (native ChatOpenAI kwargs).

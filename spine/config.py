@@ -586,6 +586,14 @@ class SpineConfig:
     # configured once by name regardless of which phase/provider routes to it.
     model_profiles: dict = field(default_factory=dict)
 
+    # Ephemeral GPU pod for the run. When ``ephemeral_pod.enabled`` is true, a
+    # remote vLLM pod is brought up at the start of a run and torn down at the
+    # end (see spine.infra.ephemeral_pod). Stored verbatim as a raw dict and
+    # parsed by EphemeralPodConfig.from_config(). The pod backs a
+    # ``providers.llm[]`` entry whose ``base_url`` is ``env:SPINE_POD_BASE_URL``;
+    # which phases use it is the existing ``providers.phases`` routing.
+    ephemeral_pod: dict = field(default_factory=dict)
+
     @staticmethod
     def _find_workspace_root() -> str:
         """Auto-detect workspace root by searching upward for ``.spine/``.
@@ -974,6 +982,7 @@ class SpineConfig:
                 spine.get("token_compaction", {})
             ),
             model_profiles=spine.get("model_profiles", {}) or {},
+            ephemeral_pod=config.get("ephemeral_pod", {}) or {},
         )
 
     def resolve_model(self, phase: str | None = None, escalation_level: int = 0) -> str:

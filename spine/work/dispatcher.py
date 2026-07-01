@@ -25,6 +25,7 @@ from typing import Any
 import sqlite_utils
 
 from spine.config import SpineConfig
+from spine.infra.ephemeral_pod import with_ephemeral_pod
 from spine.models.enums import PhaseName, TaskStatus, WorkType
 from spine.observability import traced_astream
 from spine.persistence.artifacts import ArtifactStore
@@ -265,6 +266,9 @@ def _completion_result_payload(
 # ── Submit work ──
 
 
+@with_ephemeral_pod(
+    skip=lambda a: a.get("start") is False or a.get("work_type") == "onboarding"
+)
 async def submit_work(
     description: str,
     work_type: str = "spec",
@@ -844,6 +848,7 @@ def _preflight_worktree_clean(config: SpineConfig, work_type: str) -> None:
     WorktreeSandbox(config, work_type).preflight()
 
 
+@with_ephemeral_pod()
 async def resume_work(
     work_id: str,
     human_feedback: str,
@@ -1319,6 +1324,7 @@ async def _resume_flagged_without_interrupt(
     return await restart_from_phase(work_id, target_phase, config)
 
 
+@with_ephemeral_pod()
 async def resume_interrupted_work(
     work_id: str,
     action: str,
@@ -1887,6 +1893,7 @@ async def restart_from_phase(
 # ── Shared workflow execution logic (used by submit_work, resume_work, restart_work) ──
 
 
+@with_ephemeral_pod()
 async def _run_workflow_graph(
     *,
     work_id: str,

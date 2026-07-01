@@ -487,3 +487,52 @@ providers:
       provider: example-local
     onboarding:
       provider: example-local
+
+# ── Ephemeral GPU pod (optional) ───────────────────────────────────────────
+# Brings a remote vLLM pod up at the START of a run and tears it down at the
+# END — on success, on error, and on Ctrl-C — so you only pay for GPU while
+# the run executes. Requires the optional `runpod` extra: pip install runpod
+# (and RUNPOD_API_KEY in the environment).
+#
+# HOW it works:
+#   * This block says HOW to bring the pod up (GPU, image, vLLM args, policy).
+#   * `binds_provider` names a providers.llm[] entry whose `base_url` is
+#     `env:SPINE_POD_BASE_URL`. Once the pod is live, that env var is set to
+#     the pod's OpenAI URL and resolves at model-build time.
+#   * WHICH phases use the pod is the ordinary providers.phases routing — point
+#     `implement` / `verify` (etc.) at `binds_provider`, exactly like any other
+#     provider. Leave the cheap lanes (plan-manager, embeddings, reranker) on
+#     your local provider.
+#
+# Example provider the pod backs (add under providers.llm[]):
+#   - name: runpod-pod
+#     model: openai:Qwen/Qwen3.6-35B-A3B-FP8   # also feeds vLLM --model
+#     base_url: env:SPINE_POD_BASE_URL          # resolved after the pod boots
+#     api_key: vllm
+#     enabled: true
+#     context_window: 60000
+#     max_concurrent_calls: 4
+#
+# ephemeral_pod:
+#   enabled: true
+#   binds_provider: runpod-pod        # providers.llm[] entry this pod backs
+#   api_key_env: RUNPOD_API_KEY       # env var holding the RunPod API key
+#   image: vllm/vllm-openai:latest
+#   gpu_type_id: "NVIDIA A40"         # see runpod.get_gpus() for ids
+#   gpu_count: 2                      # vLLM --tensor-parallel-size = gpu_count
+#   cloud_type: SECURE               # SECURE | COMMUNITY | ALL
+#   container_disk_gb: 20
+#   network_volume_id: ""            # optional: persists the HF cache across runs
+#   volume_mount_path: /root/.cache/huggingface
+#   port: 8000
+#   model: ""                        # optional; defaults to binds_provider's model
+#   vllm_args: "--max-model-len 60000 --gpu-memory-utilization 0.92 --kv-cache-dtype fp8"
+#   hf_token_env: HF_TOKEN           # for gated models
+#   startup_timeout_s: 900           # max wait for the vLLM endpoint to answer
+#   poll_interval_s: 10
+#   max_lifetime_s: 7200             # hard watchdog: force-terminate after N s (0 = off)
+#   on_failure: abort                # abort | local_fallback
+#   fallback_base_url: ""            # required when on_failure: local_fallback
+#   name_prefix: spine               # pods are named <prefix>-pod-<work_id>
+#   gpu_fallback:                    # tried in order on a capacity error
+#     - { gpu_type_id: "NVIDIA RTX A6000", gpu_count: 2 }
