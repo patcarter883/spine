@@ -218,6 +218,18 @@ spine:
   # Default: 30  | Env: SPINE_IMPLEMENT_MAX_TURNS
   implement_max_turns: 30
 
+  # Soft turn budget for the tool-using slice-verifier ReAct fallback (used when
+  # the evidence-then-judge path — verify_evidence_then_judge — is off). That
+  # verifier reads files and runs checks in a loop; nothing bounded its turn
+  # count, so a healthy sandbox (where the env/sticky short-circuits never fire)
+  # could probe indefinitely and grind to the token budget (trace 019f16cf). Past
+  # this budget the TurnBudgetGuard nudges it to stop probing and return its
+  # verdict from evidence in hand — tools stay bound. Pairs with the run_checks
+  # call-wall (a hard tool-level cap). A healthy verify is only a few turns; this
+  # is a backstop. 0 disables the guard.
+  # Default: 20  | Env: SPINE_VERIFY_MAX_TURNS
+  verify_max_turns: 20
+
   # Hard super-step ceiling for phase subgraphs (LangGraph recursion_limit).
   # The IMPLEMENT dispatch loop re-dispatches one Send per pending/failed slice;
   # a non-converging slice or a 0-token server-crash spin (which the token-budget

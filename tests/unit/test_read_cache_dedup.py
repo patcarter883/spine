@@ -220,3 +220,22 @@ class TestTurnBudgetGuard:
     def test_invalid_threshold(self):
         with pytest.raises(ValueError):
             TurnBudgetGuard(threshold=0)
+
+    @pytest.mark.asyncio
+    async def test_verify_kind_directive(self):
+        """The verify-kind guard nudges toward a verdict, not toward edits."""
+        mw = TurnBudgetGuard(threshold=3, kind="verify")
+        msgs = [HumanMessage(content="go"), *[AIMessage(content=str(i)) for i in range(3)]]
+        out = await mw.awrap_model_call(self._Req(messages=msgs), self._identity)
+        content = out.messages[-1].content
+        assert "TURN BUDGET GUARD" in content
+        assert "verdict" in content
+        # It must not tell a report-only verifier to make edits.
+        assert "edit" not in content.lower()
+
+    @pytest.mark.asyncio
+    async def test_default_kind_is_implement(self):
+        mw = TurnBudgetGuard(threshold=3)
+        msgs = [HumanMessage(content="go"), *[AIMessage(content=str(i)) for i in range(3)]]
+        out = await mw.awrap_model_call(self._Req(messages=msgs), self._identity)
+        assert "edits" in out.messages[-1].content

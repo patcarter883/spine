@@ -68,6 +68,17 @@ _FILE_READ_CAP = 5
 # only a handful of files; this wall is the backstop, not the budget.
 _READ_WALL = 16
 
+# Global run_checks wall — total backend-reaching check runs before every
+# further run is refused. The read-side has ``_READ_WALL``; run_checks had no
+# equivalent, so a verifier in a healthy sandbox (checks DO run, so the
+# env/sticky short-circuits never fire) could loop py_compile/pytest/ruff probes
+# indefinitely — the exact spiral behind trace 019f16cf (2.75M tok / 0 verdicts).
+# A healthy pass runs only a handful of checks (a py_compile + a lint + maybe a
+# targeted pytest); this wall is the backstop, not the budget. Rejected
+# exploration commands and env/sticky short-circuits do NOT count — they never
+# reach the backend and already return a firm directive.
+_RUN_CHECKS_WALL = 12
+
 # Execution-environment failure handling. The slice-verifier runs in a sandbox
 # worktree whose shell PATH lacks the test runner and whose interpreter cannot
 # ``import`` the project package — trace 019f10bf: every ``pytest`` returned
@@ -387,6 +398,11 @@ class RunChecksTool(BaseTool):
     # sandbox — trace 019f10bf).
     workspace_root: str = ""
 
+    # Cumulative backend-reaching check runs before the wall refuses further
+    # runs. Defaults to the verifier's tight backstop; a caller that legitimately
+    # needs a wider check budget can raise it.
+    run_checks_wall: int = _RUN_CHECKS_WALL
+
     # The sandbox backend (SandboxBackendProtocol / CompositeBackend), injected
     # at build time. ``run_checks`` is a policy wrapper around backend.execute.
     _backend: Any = PrivateAttr(default=None)
@@ -395,6 +411,10 @@ class RunChecksTool(BaseTool):
     # can't reset a dead runner back to "available" (trace 019f111e). Drives the
     # per-tool and whole-environment static-fallback directives.
     _unavailable_runners: set = PrivateAttr(default_factory=set)
+    # Backend-reaching check runs this session (drives the global run_checks wall).
+    # Only real backend round-trips increment it — rejected/short-circuited calls
+    # never reach the backend, so they are not counted.
+    _run_count: int = PrivateAttr(default=0)
     # Cached ``export PATH=…; export PYTHONPATH=…;`` prefix (computed once).
     _prefix_cache: Optional[str] = PrivateAttr(default=None)
 
@@ -498,6 +518,19 @@ class RunChecksTool(BaseTool):
             "that checks could not be executed." + tail
         )
 
+    def _wall_reached(self) -> str:
+        """Terminal directive: the check-run budget is spent; finalize now."""
+        return (
+            f"status=run_checks_wall: you have already run {self._run_count} "
+            "checks this verification (budget "
+            f"{self.run_checks_wall}) — that is the backstop, not a per-slice "
+            "quota, and further runs will be refused. STOP calling run_checks. "
+            "You have enough evidence: judge each acceptance criterion from the "
+            "check output you already have plus the worktree diff and pre-loaded "
+            "target source, and return your verdict now. Re-running the same or "
+            "near-identical checks will not change the result."
+        )
+
     def _runner_unavailable(self, tool: str, last: str = "") -> str:
         """Per-tool directive: this runner can't run; don't retry it."""
         tail = f"\n\nLast error:\n{self._cap(last)}" if last else ""
@@ -583,9 +616,12 @@ class RunChecksTool(BaseTool):
         short = self._short_circuit(lead)
         if short is not None:
             return short
+        if self._run_count >= self.run_checks_wall:
+            return self._wall_reached()
         if self._backend is None:
             return "status=error: no execute backend available for run_checks."
         cmd = self._normalize(command)
+        self._run_count += 1
         result = (
             self._backend.execute(cmd, timeout=timeout)
             if timeout is not None
@@ -598,9 +634,12 @@ class RunChecksTool(BaseTool):
         short = self._short_circuit(lead)
         if short is not None:
             return short
+        if self._run_count >= self.run_checks_wall:
+            return self._wall_reached()
         if self._backend is None:
             return "status=error: no execute backend available for run_checks."
         cmd = self._normalize(command)
+        self._run_count += 1
         result = (
             await self._backend.aexecute(cmd, timeout=timeout)
             if timeout is not None

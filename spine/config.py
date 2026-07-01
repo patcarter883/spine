@@ -413,6 +413,14 @@ class SpineConfig:
     # The guard only nudges — tools stay bound — so legitimate long slices can
     # still finish; 0 disables it.
     implement_max_turns: int = 30
+    # Soft turn budget for the (tool-using) slice-verifier ReAct fallback — the
+    # verify-side analogue of ``implement_max_turns``. When the evidence-then-judge
+    # path is off, the verifier reads files + runs checks in a loop; nothing
+    # bounded its turn count, so a healthy-sandbox probe loop could grind to the
+    # token budget (trace 019f16cf). Past this many turns the TurnBudgetGuard
+    # nudges it to stop probing and return its verdict from evidence in hand. A
+    # healthy verify is only a handful of turns; this is a backstop. 0 disables it.
+    verify_max_turns: int = 20
     # ── Synthesis + placement editor (two pure nodes, no tool loop) ────────
     # When True, ``_route_slices`` sends each pending slice to the synthesis
     # implementer (spine.agents.synthesis_implementer) instead of the tool-using
@@ -897,6 +905,12 @@ class SpineConfig:
                 os.getenv(
                     "SPINE_IMPLEMENT_MAX_TURNS",
                     spine.get("implement_max_turns", 30),
+                )
+            ),
+            verify_max_turns=int(
+                os.getenv(
+                    "SPINE_VERIFY_MAX_TURNS",
+                    spine.get("verify_max_turns", 20),
                 )
             ),
             implement_synthesis_placement=bool(

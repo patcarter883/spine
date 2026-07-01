@@ -812,6 +812,17 @@ def _add_spine_middleware(
 
         middleware.append(TurnBudgetGuard(threshold=_spine_cfg.implement_max_turns))
 
+    # The verify-side analogue: the tool-using slice-verifier ReAct fallback (when
+    # the evidence-then-judge path is off) reads files + runs checks in a loop with
+    # no turn bound — a healthy-sandbox probe loop could grind to the token budget
+    # (trace 019f16cf). The guard nudges it to stop probing and judge from evidence.
+    if phase == PhaseName.VERIFY and _spine_cfg.verify_max_turns > 0:
+        from spine.agents.context_editing import TurnBudgetGuard
+
+        middleware.append(
+            TurnBudgetGuard(threshold=_spine_cfg.verify_max_turns, kind="verify")
+        )
+
     try:
         _provider_cfg = _spine_cfg.resolve_provider_config(
             phase=phase.value, escalation_level=escalation_level

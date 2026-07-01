@@ -209,6 +209,41 @@ def test_run_checks_caps_output():
     assert len(out) < 100_000
 
 
+def test_run_checks_wall_refuses_further_runs():
+    """After the run budget is spent, further checks are refused (backstop)."""
+    be = _FakeBackend(output="ok")
+    tool = RunChecksTool(backend=be, run_checks_wall=3)
+    for _ in range(3):
+        assert "run_checks_wall" not in tool._run("pytest -q")
+    # The 4th backend-reaching run is refused before it hits the backend.
+    refused = tool._run("pytest -q")
+    assert "run_checks_wall" in refused
+    assert len(be.calls) == 3  # the refused run never reached the backend
+
+
+def test_run_checks_wall_ignores_rejected_calls():
+    """Rejected exploration commands never reach the backend, so they don't
+    burn the run budget — only real check runs count toward the wall."""
+    be = _FakeBackend(output="ok")
+    tool = RunChecksTool(backend=be, run_checks_wall=2)
+    for _ in range(5):
+        assert "rejected" in tool._run("grep -rn foo spine/")
+    # Budget is untouched: two real runs still succeed before the wall trips.
+    assert "run_checks_wall" not in tool._run("pytest -q")
+    assert "run_checks_wall" not in tool._run("ruff check spine/")
+    assert "run_checks_wall" in tool._run("pytest -q")
+
+
+def test_run_checks_wall_async_path():
+    import asyncio
+
+    be = _FakeBackend(output="ok")
+    tool = RunChecksTool(backend=be, run_checks_wall=1)
+    assert "run_checks_wall" not in asyncio.run(tool._arun("pytest -q"))
+    assert "run_checks_wall" in asyncio.run(tool._arun("pytest -q"))
+    assert len(be.calls) == 1
+
+
 def test_run_checks_without_backend_reports_error():
     tool = RunChecksTool(backend=None)
     assert "no execute backend" in tool._run("pytest -q")

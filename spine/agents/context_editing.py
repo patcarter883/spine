@@ -1156,22 +1156,32 @@ class TurnBudgetGuard(AgentMiddleware):
     limit remains the ultimate backstop.
     """
 
-    def __init__(self, threshold: int = 30) -> None:
+    def __init__(self, threshold: int = 30, kind: str = "implement") -> None:
         if threshold < 1:
             raise ValueError("threshold must be >= 1")
         self.threshold = threshold
+        # Which convergence directive to emit. ``implement`` nudges the editor to
+        # finish edits; ``verify`` nudges the report-only judge to stop running
+        # checks and return its verdict from the evidence already gathered.
+        self.kind = kind
 
     @staticmethod
     def _count_model_turns(messages: list) -> int:
         """Count assistant turns already taken in this invocation."""
         return sum(1 for m in messages if isinstance(m, AIMessage))
 
-    async def awrap_model_call(self, request, handler):
-        turns = self._count_model_turns(request.messages)
-        if turns < self.threshold:
-            return await handler(request)
-        over = turns - self.threshold + 1
-        reminder = (
+    def _directive(self, turns: int) -> str:
+        if self.kind == "verify":
+            return (
+                f"[TURN BUDGET GUARD] You have taken {turns} turns verifying this "
+                f"slice (soft budget {self.threshold}). Converge NOW: STOP running "
+                f"more checks and reading more files — you have enough evidence. "
+                f"Judge each acceptance criterion from the check output, worktree "
+                f"diff, and pre-loaded target source you already have, and return "
+                f"your verdict. If a check could not be run, say so in the report "
+                f"and judge statically rather than retrying it."
+            )
+        return (
             f"[TURN BUDGET GUARD] You have taken {turns} turns on this task "
             f"(soft budget {self.threshold}). Converge NOW: make the remaining "
             f"edits you are confident about, then return your final result with "
@@ -1180,6 +1190,13 @@ class TurnBudgetGuard(AgentMiddleware):
             f"blocks completion, report it as blocked rather than continuing to "
             f"loop."
         )
+
+    async def awrap_model_call(self, request, handler):
+        turns = self._count_model_turns(request.messages)
+        if turns < self.threshold:
+            return await handler(request)
+        over = turns - self.threshold + 1
+        reminder = self._directive(turns)
         if over > 1:
             reminder += (
                 f" This is reminder #{over}; further looping is wasting tokens "
