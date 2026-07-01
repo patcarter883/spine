@@ -180,7 +180,16 @@ _FALLBACK_PROMPT = (
         "be reminded of the parent id below).\n"
         "- Do NOT propose work outside the parent slice's scope; if the "
         "failure hints at a missing dependency, report it inside an "
-        "acceptance criterion rather than creating a slice for it.",
+        "acceptance criterion rather than creating a slice for it.\n"
+        "- If you populate a micro-slice's edit_plan: a symbol that does not "
+        "exist yet is being CREATED, not edited — never anchor a NEW method "
+        "with action='replace' on a DIFFERENT, already-existing method just "
+        "because it's a convenient sibling (that deletes the existing method "
+        "and replaces it with the new one — 019f1c10: this destroyed "
+        "UIApi.add_llm_provider while adding UIApi.add_embedding_provider). "
+        "To ADD a new method, anchor on the last existing method of that "
+        "class with action='insert_after'. Only use action='replace' when "
+        "the anchor symbol IS the exact thing you are rewriting.",
     )
 )
 

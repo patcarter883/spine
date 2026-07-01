@@ -54,6 +54,35 @@ def test_syntax_error_reverts_and_fails(workspace: Path) -> None:
     assert (workspace / "mod.py").read_text() == _ORIG
 
 
+def test_creation_anchor_failure_preserves_target_and_next_action(tmp_path: Path) -> None:
+    # trace 019f1c10: the synthesizer anchored a NEW method on itself
+    # (action='replace' on a symbol that doesn't exist yet, so the code
+    # defining it is a CREATE, not an edit). The read_edit_lint guard for
+    # this returns a concrete `target` (existing sibling to anchor on
+    # instead) and `next_action` (the exact corrective call) — but
+    # apply_synthesized used to collapse those into `detail`-or-nothing,
+    # so the retry synthesis call never saw the fix-it instruction and
+    # re-emitted the same broken anchor for two full cycles.
+    (tmp_path / "svc.py").write_text(
+        "class UIApi:\n"
+        "    def add_llm_provider(self, name, cfg):\n"
+        "        return True\n"
+    )
+    cand = SynthesizedSlice(edits=[SynthesizedEdit(
+        file="svc.py",
+        symbol="UIApi.add_embedding_provider",
+        action="replace",
+        code="def add_embedding_provider(self, name):\n    return True\n",
+    )])
+    res = apply_synthesized(cand, workspace_root=str(tmp_path), target_files=["svc.py"])
+    assert res.n_failures == 1
+    failure = res.failures[0]
+    assert failure["status"] == "no_match"
+    assert failure.get("target") == "UIApi.add_llm_provider"
+    assert "insert_after" in failure.get("next_action", "")
+    assert "UIApi.add_llm_provider" in failure["next_action"]
+
+
 def test_out_of_scope_file_rejected_locally(workspace: Path) -> None:
     cand = SynthesizedSlice(
         edits=[SynthesizedEdit(file="elsewhere.py", symbol="x", action="replace", code="x = 1\n")]
