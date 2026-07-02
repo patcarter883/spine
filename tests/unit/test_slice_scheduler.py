@@ -426,6 +426,85 @@ def test_same_file_chain_respects_existing_dep_direction() -> None:
         ),
     ]
     # Must not raise CycleError, and must order the dependency root first.
-    waves = compute_execution_waves(slices)
+    waves = compute_execution_waves(slices, same_file_strategy="chain")
     ids = [sorted(s.id for s in wave) for wave in waves]
     assert ids == [["api_specialized"], ["api_phase_timeout"]]
+
+
+# ── Same-file strategy: merge for the synthesis editor (run 019f214f) ──
+
+
+def _samefile_slices() -> list[FeatureSlice]:
+    return [
+        FeatureSlice(
+            id="ui-provider-structure",
+            title="Provider structure",
+            target_files=["spine/ui/_pages/config_view.py"],
+            execution_requirements=["add three expanders"],
+            acceptance_criteria=["three expander groups render"],
+            provides=["ConfigProviderSection"],
+            reference_symbols=["UIApi.get_providers"],
+        ),
+        FeatureSlice(
+            id="ui-phase-config",
+            title="Phase config",
+            target_files=["spine/ui/_pages/config_view.py"],
+            execution_requirements=["add phase forms"],
+            dependencies=["ui-provider-structure"],
+            acceptance_criteria=["phase forms render"],
+            provides=["ConfigViewPhaseEditor"],
+            reference_symbols=["SpineConfig.load"],
+            complexity="medium",
+        ),
+        FeatureSlice(
+            id="other-file",
+            title="Other file",
+            target_files=["spine/config.py"],
+            execution_requirements=["tweak config"],
+            acceptance_criteria=["config tweak lands"],
+        ),
+    ]
+
+
+def test_merge_strategy_unions_samefile_slices_into_one() -> None:
+    """Chained same-file slices each wholesale-replace the shared symbol to
+    satisfy only their own criteria — last writer wins and verify fails every
+    slice (run 019f214f). Merge hands ONE editor pass the full criteria set."""
+    waves = compute_execution_waves(_samefile_slices(), same_file_strategy="merge")
+    all_slices = [s for wave in waves for s in wave]
+    assert len(all_slices) == 2  # 2 same-file slices merged + 1 independent
+    merged = next(s for s in all_slices if s.target_files == ["spine/ui/_pages/config_view.py"])
+    assert set(merged.acceptance_criteria) == {
+        "three expander groups render",
+        "phase forms render",
+    }
+    assert set(merged.provides) == {"ConfigProviderSection", "ConfigViewPhaseEditor"}
+    assert set(merged.reference_symbols) == {"UIApi.get_providers", "SpineConfig.load"}
+    # Both members' requirements survive, labeled by title.
+    assert "add three expanders" in str(merged.execution_requirements)
+    assert "add phase forms" in str(merged.execution_requirements)
+    # No dangling dependency references to merged-away ids.
+    valid_ids = {s.id for s in all_slices}
+    for s in all_slices:
+        for d in s.dependencies or []:
+            assert d in valid_ids
+    assert merged.complexity == "medium"  # max of small/medium
+
+
+def test_chain_strategy_keeps_samefile_slices_separate() -> None:
+    waves = compute_execution_waves(_samefile_slices(), same_file_strategy="chain")
+    all_ids = {s.id for wave in waves for s in wave}
+    assert all_ids == {"ui-provider-structure", "ui-phase-config", "other-file"}
+
+
+def test_default_strategy_follows_synthesis_flag(monkeypatch) -> None:
+    class _Cfg:
+        implement_synthesis_placement = True
+
+    monkeypatch.setattr(
+        "spine.config.SpineConfig.load", classmethod(lambda cls, *a, **k: _Cfg())
+    )
+    assert len([s for w in compute_execution_waves(_samefile_slices()) for s in w]) == 2
+
+    _Cfg.implement_synthesis_placement = False
+    assert len([s for w in compute_execution_waves(_samefile_slices()) for s in w]) == 3

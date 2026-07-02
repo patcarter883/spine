@@ -106,6 +106,15 @@ def merge_file_overlapping_slices(slices: list[FeatureSlice]) -> list[FeatureSli
     tokens). Slices touching a shared file cannot run in parallel anyway, so
     union them (transitively) and combine their fields into a single slice.
     Fully defensive: any failure returns the input unchanged.
+
+    This is the strategy for the no-tool SYNTHESIS editor (run 019f214f:
+    chained same-file slices each wholesale-replaced ``render`` to satisfy
+    only their own criteria — last writer wins, verify failed every slice,
+    and gap feedback cannot converge a tug-of-war). The merged slice hands
+    ONE editor pass the full criteria set with the live file inlined. The
+    tool-using ReAct editor keeps the chaining strategy instead — a merged
+    27-reference slice made it read 24 symbols and never edit (trace
+    019ede24); see ``compute_execution_waves``.
     """
     try:
         if len(slices) < 2:
@@ -139,12 +148,25 @@ def merge_file_overlapping_slices(slices: list[FeatureSlice]) -> list[FeatureSli
                 merged.append(members[0])
                 remap[members[0].id] = members[0].id
                 continue
-            members = sorted(members, key=lambda s: s.id)
-            new_id = members[0].id
+            # Order members by their intra-group dependencies (stable-tied by
+            # id) so the concatenated execution_requirements read causally —
+            # "create the structure" before "add forms inside it". Falls back
+            # to id order on an authored cycle.
             member_ids = {m.id for m in members}
+            by_id = {m.id: m for m in members}
+            ts: TopologicalSorter[str] = TopologicalSorter()
+            for m in sorted(members, key=lambda s: s.id):
+                ts.add(m.id, *[d for d in (m.dependencies or []) if d in member_ids])
+            try:
+                members = [by_id[i] for i in ts.static_order()]
+            except CycleError:
+                members = sorted(members, key=lambda s: s.id)
+            new_id = members[0].id
             tf: list[str] = []
             ac: list[str] = []
             rs: list[str] = []
+            pv: list[str] = []
+            rof: list[str] = []
             ep: list = []
             er: list[str] = []
             deps: set[str] = set()
@@ -159,6 +181,12 @@ def merge_file_overlapping_slices(slices: list[FeatureSlice]) -> list[FeatureSli
                 for r in m.reference_symbols or []:
                     if r not in rs:
                         rs.append(r)
+                for p in m.provides or []:
+                    if p not in pv:
+                        pv.append(p)
+                for f in getattr(m, "reference_only_files", None) or []:
+                    if f not in rof:
+                        rof.append(f)
                 ep.extend(m.edit_plan or [])
                 er.append(f"[{m.title}]\n{_as_text(m.execution_requirements)}".strip())
                 deps |= set(m.dependencies or [])
@@ -174,7 +202,9 @@ def merge_file_overlapping_slices(slices: list[FeatureSlice]) -> list[FeatureSli
                 acceptance_criteria=ac,
                 complexity=next(k for k, v in _COMPLEXITY_ORDER.items() if v == comp),
                 reference_symbols=rs,
+                provides=pv,
                 edit_plan=ep,
+                reference_only_files=rof,
             ))
         # Remap any dependency references to the merged representative ids.
         for s in merged:
@@ -258,6 +288,8 @@ def serialize_file_overlapping_slices(slices: list[FeatureSlice]) -> list[Featur
 
 def compute_execution_waves(
     feature_slices: list[FeatureSlice],
+    *,
+    same_file_strategy: str | None = None,
 ) -> list[list[FeatureSlice]]:
     """Group feature slices into parallel execution waves.
 
@@ -268,6 +300,10 @@ def compute_execution_waves(
     Args:
         feature_slices: The slices to schedule. Must pass
             ``validate_feature_slices()`` first.
+        same_file_strategy: How to resolve slices sharing a target file —
+            ``"merge"`` or ``"chain"``. None (production default) selects by
+            the active IMPLEMENT editor: merge when
+            ``implement_synthesis_placement`` is on, chain otherwise.
 
     Returns:
         Ordered list of waves, where each wave is a list of slices
@@ -278,13 +314,35 @@ def compute_execution_waves(
         ValueError: If slices are invalid (empty, duplicates, bad
             references, or cycles).
     """
-    # Serialize slices that share a target file BEFORE scheduling — they cannot
-    # run in parallel (same-file edit conflict), but MERGING them into one big
-    # slice overwhelms the implementer (trace 019ede24: a merged 27-reference
-    # slice → the model read 24 symbols and never edited). Instead chain them
-    # with dependencies so they run in separate waves, each small and
-    # actionable, with the sandbox carrying earlier edits forward.
-    feature_slices = serialize_file_overlapping_slices(feature_slices)
+    # Same-file slices cannot run in parallel (edit conflict). The resolution
+    # strategy depends on which IMPLEMENT editor is active:
+    #
+    # - Synthesis editor (implement_synthesis_placement): MERGE the group into
+    #   ONE slice. Chaining lets each editor wholesale-rewrite the shared
+    #   symbol to satisfy only its own criteria — last writer wins, verify
+    #   fails every slice, and gap feedback cannot converge the tug-of-war
+    #   (run 019f214f: three chained slices each replacing `render`). The
+    #   no-tool editor gets the live file and all criteria inlined, so the
+    #   old merged-slice objection does not apply to it.
+    # - Tool-using ReAct editor: CHAIN the group into consecutive waves — a
+    #   merged 27-reference slice made it read 24 symbols and never edit
+    #   (trace 019ede24). Small sequential slices keep it actionable.
+    strategy = same_file_strategy
+    if strategy is None:
+        try:
+            from spine.config import SpineConfig
+
+            strategy = (
+                "merge"
+                if SpineConfig.load().implement_synthesis_placement
+                else "chain"
+            )
+        except Exception:  # noqa: BLE001 — config unavailable ⇒ legacy chaining
+            strategy = "chain"
+    if strategy == "merge":
+        feature_slices = merge_file_overlapping_slices(feature_slices)
+    else:
+        feature_slices = serialize_file_overlapping_slices(feature_slices)
     validate_feature_slices(feature_slices)
 
     # Build lookup from ID -> FeatureSlice for wave assembly.
