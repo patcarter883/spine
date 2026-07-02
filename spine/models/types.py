@@ -78,6 +78,12 @@ class FeatureSlice:
     # this slice (the code it calls/extends/mimics). Lets the implementer
     # read_symbol them directly instead of surveying files. Empty on older plans.
     reference_symbols: list[str] = field(default_factory=list)
+    # Qualified names of NEW symbols this slice CREATES that other slices depend
+    # on (its public contract). A consumer slice's reference_symbols entry for a
+    # not-yet-existing symbol must match a producer slice's `provides` entry, so
+    # the plan's producer/consumer API stays consistent (trace 019f2040). Empty
+    # on older plans and on slices nothing else consumes.
+    provides: list[str] = field(default_factory=list)
     # Optional planner-provided targeted edits (file/symbol/mode/intent dicts)
     # that let a lightweight implementer apply changes without re-discovering
     # where to work. Empty on older plans — the implementer falls back to the

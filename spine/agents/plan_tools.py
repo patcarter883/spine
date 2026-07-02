@@ -524,6 +524,15 @@ class _FeatureSliceInput(BaseModel):
             "Names only — no source."
         ),
     )
+    provides: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Qualified names of NEW symbols THIS slice creates that other slices "
+            "depend on (e.g. 'UIApi.add_provider'). A sibling that calls one of "
+            "these must reference the EXACT name listed here — keeps the plan's "
+            "producer/consumer API contract consistent. Names only."
+        ),
+    )
     dependencies: list[str] = Field(
         description="IDs of other slices this depends on (empty if none).",
         default_factory=list,
@@ -809,6 +818,11 @@ class StructuredWritePlanTool(BaseTool):
             if sl.reference_symbols:
                 lines.append(
                     f"**Reference symbols:** {', '.join(sl.reference_symbols)}\n\n"
+                )
+            if sl.provides:
+                lines.append(
+                    f"**Provides (new symbols for other slices):** "
+                    f"{', '.join(sl.provides)}\n\n"
                 )
             lines.append(f"{sl.execution_requirements.strip()}\n\n")
             lines.append("**Acceptance Criteria:**\n")
