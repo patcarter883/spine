@@ -205,6 +205,15 @@ _SYNTHESIS_SYSTEM_PROMPT = (
     "current source; do not invent symbols or files that are not shown. Emit one "
     "edit per change site. If the edit plan lists entries, produce exactly one "
     "edit per entry.\n\n"
+    "The target_files block shows the CURRENT content of each file you may edit "
+    "— the live file on disk, which MAY ALREADY CONTAIN edits from an earlier "
+    "slice of this same feature. It is authoritative: everything already in it "
+    "must survive your edit. Implement your slice by INSERTING new definitions "
+    "(insert_before/insert_after an existing anchor) or by REPLACING only the "
+    "specific definition your slice changes. Never regenerate a whole file, and "
+    "never replace or delete a definition your slice does not need to touch — "
+    "that clobbers the earlier slice's work. If a target file's current content "
+    "is not shown, it does not exist yet and you are creating it.\n\n"
     "Placement is purely textual: an 'insert_before'/'insert_after' edit lands "
     "your new definition as a SIBLING at the anchor's own nesting level — same "
     "indentation, same scope. It gets NO implicit access to another function's "
@@ -226,6 +235,7 @@ async def synthesize_slice_code(
     plan_body: str,
     config: RunnableConfig | None,
     session_id: str | None,
+    files_body: str = "",
     n: int = 1,
     feedback: str = "",
     escalation_level: int = 0,
@@ -233,8 +243,11 @@ async def synthesize_slice_code(
     """Generate ``n`` candidate edit-sets for a slice via a no-tool structured call.
 
     Takes the prompt blocks already built by ``implement_subgraph`` helpers
-    (``_reference_symbols_body`` / ``_edit_plan_body``) so this module never
-    imports the subgraph — no circular import. Candidates are generated
+    (``_target_files_body`` / ``_reference_symbols_body`` / ``_edit_plan_body``)
+    so this module never imports the subgraph — no circular import. ``files_body``
+    is the current on-disk content of the slice's target files; it is shown first
+    so a serialized same-file slice edits additively rather than clobbering the
+    prior slice's work. Candidates are generated
     sequentially (local providers cap ``max_concurrent_calls`` at 1–2, so
     parallel sampling buys no wall-clock); each is a self-contained
     :class:`SynthesizedSlice`. ``feedback`` (lint errors from a prior placement)
@@ -264,8 +277,13 @@ async def synthesize_slice_code(
     except Exception:  # noqa: BLE001
         window = 0
 
-    block_pairs = [
-        (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
+    block_pairs = [(Tag.FINDINGS, f"```json\n{slice_json}\n```")]
+    if files_body:
+        # Current on-disk content of the slice's target files — shown FIRST so
+        # the synthesizer edits additively on top of any earlier same-file
+        # slice's work instead of regenerating the file from scratch.
+        block_pairs.append((Tag.TARGET_FILES, files_body))
+    block_pairs += [
         (Tag.REFERENCE_SYMBOLS, refs_body),
         (Tag.EDIT_PLAN, plan_body),
     ]

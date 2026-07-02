@@ -21,6 +21,7 @@ single state update, so the loop actually terminates.
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 from typing import Any, Literal
@@ -485,6 +486,95 @@ def _inline_symbol_source(db_path: str | None, workspace_root: str, symbol: str)
             f"\n# … truncated — read_symbol '{symbol}' for the full body."
         )
     return f"```python\n{src}\n```"
+
+
+_MAX_INLINE_FILE_LINES = 500
+_MAX_INLINE_FILE_CHARS = 28000
+
+
+def _file_top_level_outline(text: str) -> str:
+    """Top-level ``def``/``class`` anchors of a python file, one per line.
+
+    Used when a target file is too large to inline whole: the synthesizer still
+    needs to know which definitions ALREADY exist so it inserts against them
+    instead of recreating (and clobbering) the file. '' for non-python or
+    unparseable source.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return ""
+    out: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            out.append(f"class {node.name}  # line {node.lineno}")
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append(f"    {node.name}.{sub.name}  # line {sub.lineno}")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append(f"def {node.name}  # line {node.lineno}")
+    return "\n".join(out)
+
+
+def _target_files_body(target_files: list[str], workspace_root: str) -> str:
+    """Fenced CURRENT content of each target file, read live from the sandbox.
+
+    The synthesis editor has no filesystem access, so unless the current file is
+    put in front of it, it cannot see what the file already contains — including
+    edits an EARLIER same-file slice in this feature just wrote. Same-file slices
+    are serialized into consecutive waves (``serialize_file_overlapping_slices``)
+    sharing one sandbox, so this happens routinely. Blind, the synthesizer
+    regenerates the whole file and drops the prior slice's work: trace 019f2005
+    had three ``config_view.py`` slices each rewrite the file — the embedding
+    section came back as a reranker section, the phase-subagent section vanished,
+    and one pass replaced the file with an unrelated page. Inlining the live
+    content makes each serialized slice edit ADDITIVELY.
+
+    Files under the cap are inlined whole; larger files degrade to a top-level
+    symbol outline (existing anchors to insert against, never recreate) so a
+    god-class cannot blow the token budget (memory: implement-godclass-*).
+    Fully defensive: any read failure is reported as a to-be-created file.
+    """
+    from pathlib import Path
+
+    files = [str(f).strip() for f in (target_files or []) if str(f).strip()]
+    if not files:
+        return ""
+    root = Path(workspace_root or ".")
+    blocks: list[str] = []
+    for rel in files:
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            blocks.append(
+                f"### `{rel}`\n(does not exist yet — this slice creates it; "
+                f"synthesize the new file's full content)"
+            )
+            continue
+        if not text.strip():
+            blocks.append(f"### `{rel}`\n(exists but is empty)")
+            continue
+        lines = text.splitlines()
+        if len(text) <= _MAX_INLINE_FILE_CHARS and len(lines) <= _MAX_INLINE_FILE_LINES:
+            blocks.append(
+                f"### `{rel}` — current content ({len(lines)} lines); "
+                f"PRESERVE it, edit in place\n```python\n{text}\n```"
+            )
+            continue
+        outline = _file_top_level_outline(text)
+        if outline:
+            blocks.append(
+                f"### `{rel}` — {len(lines)} lines, too large to inline. These "
+                f"top-level definitions ALREADY EXIST; do NOT recreate them, "
+                f"insert_after / replace them by name:\n```\n{outline}\n```"
+            )
+        else:
+            head = "\n".join(lines[:_MAX_INLINE_FILE_LINES])
+            blocks.append(
+                f"### `{rel}` — head of {len(lines)}-line file (rest omitted; "
+                f"PRESERVE it):\n```python\n{head}\n# … truncated\n```"
+            )
+    return "\n\n".join(blocks)
 
 
 def _edit_plan_body(active_slice: dict, db_path: str | None, workspace_root: str) -> str:
@@ -1252,11 +1342,18 @@ async def _synthesis_implementer_node(
         refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
         plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
         target_files = [f for f in (active_slice.get("target_files") or []) if f]
+        # Inline the CURRENT (live) content of every target file so a serialized
+        # same-file slice edits ADDITIVELY on top of the prior slice's work
+        # instead of blindly regenerating the file and clobbering it (trace
+        # 019f2005). Without this the no-tool synthesizer cannot see what the
+        # file already holds.
+        files_body = _target_files_body(target_files, workspace_root)
 
         candidates = await synthesize_slice_code(
             slice_json=slice_json,
             refs_body=refs_body,
             plan_body=plan_body,
+            files_body=files_body,
             config=config,
             session_id=work_id,
             n=variants,
@@ -1273,6 +1370,7 @@ async def _synthesis_implementer_node(
                 slice_json=slice_json,
                 refs_body=refs_body,
                 plan_body=plan_body,
+                files_body=files_body,
                 config=config,
                 session_id=work_id,
                 n=1,
