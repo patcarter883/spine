@@ -58,10 +58,19 @@ def index(monkeypatch: pytest.MonkeyPatch):
             )
 
         def find_files(db_path, name):
+            # Mirrors the real index's _NAME_MATCH: exact symbol_name OR a
+            # dotted-suffix match (find_symbol('get_providers') hits
+            # 'UIApi.get_providers'), plus owner-class matching for near-miss
+            # candidate discovery.
             return [
                 fp
                 for fp, syms in symbols.items()
-                if any(c == name or c.split(".")[0] == name for c in syms)
+                if any(
+                    c == name
+                    or c.endswith("." + name)
+                    or c.split(".")[0] == name
+                    for c in syms
+                )
             ]
 
         monkeypatch.setattr(
@@ -193,6 +202,55 @@ def test_persistence_without_exclusion_stays_revision(index) -> None:
     # No scope_exclusions implicates the spec → generic non-convergence is the
     # stagnation detector's job, not a SPECIFY amendment.
     assert second["status"] == ReviewStatus.NEEDS_REVISION.value
+
+
+# ── Format normalization + provides-of-existing (run 019f20e0) ───────────────
+
+
+def test_colon_format_refs_resolve_after_normalization(index) -> None:
+    index({UIAPI_FILE: UIAPI_SYMS})
+    # Run 019f20e0 emitted 'file.py:symbol' — the part after ':' is the symbol.
+    plan = _plan(
+        {"id": "a", "reference_symbols": ["spine/ui_api/api.py:UIApi.get_providers"]}
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_colon_format_mispathed_ref_still_dangles(index) -> None:
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {"id": "a", "reference_symbols": ["spine/ui/api/api.py:UIApi.get_llm_providers"]}
+    )
+    result = check_reference_symbols(plan, _spec(), None, db_path=DB)
+    assert result is not None
+    assert result["status"] == ReviewStatus.NEEDS_REVISION.value
+
+
+def test_provides_existing_symbol_flagged(index) -> None:
+    index({UIAPI_FILE: UIAPI_SYMS})
+    # Run 019f20e0: the plan "provided" UIApi.get_providers, which already
+    # exists — its workers then invented acceptance criteria contradicting the
+    # live implementation. provides is for NEW symbols only.
+    plan = _plan(
+        {"id": "api-slice", "provides": ["spine/ui_api/api.py:get_providers"]}
+    )
+    result = check_reference_symbols(plan, _spec(), None, db_path=DB)
+    assert result is not None
+    assert result["status"] == ReviewStatus.NEEDS_REVISION.value
+    assert "ALREADY EXISTS" in result["reason"]
+    assert UIAPI_FILE in result["reason"]
+    assert any("reference_symbols" in s for s in result["suggestions"])
+
+
+def test_provides_genuinely_new_symbol_not_flagged(index) -> None:
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {
+            "id": "api-slice",
+            "provides": ["UIApi.add_embedding_provider", "render_new_form"],
+        }
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
 
 
 # ── Subgraph fold: validation verdict overrides the agent vote ───────────────

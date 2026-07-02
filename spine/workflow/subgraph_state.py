@@ -191,6 +191,14 @@ class VerifySubgraphState(BaseSubgraphState, total=False):
     # Accumulated per-slice verdicts from parallel Send dispatch (operator.add)
     verification_results: Annotated[list[dict], _op_add]
 
+    # Per-slice convergence inputs (gap-fix cycles only, forwarded by
+    # _verify_state_mapper): last cycle's verdicts + the files the rework
+    # rewrote. seed_prior_results carries forward VERIFIED verdicts for
+    # untouched slices and records their ids so _verify_router skips them.
+    prior_verification_findings: list[dict]
+    files_written: list[str]
+    reverify_skipped_ids: list[str]
+
     # ── Phase Completion Invariants ──
     verification_attempted: bool  # True when verify agent ran (vs. skipped)
     verification_passed: bool  # True when verification confirmed passing

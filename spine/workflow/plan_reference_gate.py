@@ -24,6 +24,15 @@ This gate closes both holes at critic_plan time, with no LLM call:
   escalates NEEDS_REVIEW with ``blocker_category='spec_contradiction'``, which
   the critic result mapper already routes to a SPECIFY amendment instead of
   another futile plan rework.
+* ``provides`` entries must be NEW symbols (the field's documented contract).
+  A slice that "provides" a symbol already in the codebase is respecifying
+  live code — run 019f20e0 provided the existing ``UIApi.get_config`` and its
+  workers then invented exception-raising acceptance criteria the existing
+  fail-safe convention contradicts, deadlocking implement/verify. Flagged as
+  NEEDS_REVISION with the real definition's location.
+
+Symbol names are normalized before matching: planners have emitted
+``file.py:symbol`` / ``slice-id:symbol`` forms instead of dotted names.
 
 The gate fails open on every lookup problem (no index, no db, query error):
 a missing index must never manufacture a violation.
@@ -53,6 +62,20 @@ _NEAR_MISS_CUTOFF = 0.6
 # At most this many indexed files are scanned for near-miss candidates per
 # dangling symbol (the owner class's file(s) plus the slice's target files).
 _MAX_CANDIDATE_FILES = 4
+
+
+def _normalize_symbol(sym: str) -> str:
+    """Strip planner format drift from a symbol name.
+
+    Plans have emitted ``spine/ui_api/api.py:get_config`` and
+    ``slice-id:render_form`` instead of dotted qualified names (run 019f20e0).
+    The part after the last ``:`` is the actual symbol; call parens are
+    dropped. Plain dotted names pass through unchanged.
+    """
+    s = (sym or "").strip().split("(", 1)[0].strip()
+    if ":" in s:
+        s = s.rsplit(":", 1)[-1].strip()
+    return s
 
 
 def _owner_segments(sym: str) -> list[str]:
@@ -193,7 +216,7 @@ def check_reference_symbols(
     for s in slices:
         if isinstance(s, dict):
             for p in s.get("provides") or []:
-                leaf = _leaf(str(p))
+                leaf = _leaf(_normalize_symbol(str(p)))
                 if leaf:
                     provided_leafs.add(leaf)
 
@@ -201,16 +224,17 @@ def check_reference_symbols(
     prior_leafs = set((prior_gate or {}).get("dangling_leafs") or [])
 
     dangling: list[dict[str, Any]] = []
+    redefined: list[dict[str, Any]] = []
     for s in slices:
         if not isinstance(s, dict):
             continue
         sid = s.get("id", "?")
         target_files = [f for f in (s.get("target_files") or []) if f]
         for ref in s.get("reference_symbols") or []:
-            ref = str(ref).strip()
+            ref = _normalize_symbol(str(ref))
             if not ref:
                 continue
-            root = ref.split("(", 1)[0].split(".", 1)[0].strip()
+            root = ref.split(".", 1)[0].strip()
             if root in _EXTERNAL_ROOTS:
                 continue
             if _symbol_exists_in_index(db_path, ref):
@@ -227,8 +251,26 @@ def check_reference_symbols(
                     "exclusion": _matching_exclusion(ref, exclusions),
                 }
             )
+        # `provides` must name NEW symbols — that is the field's documented
+        # contract. A slice that "provides" something already in the codebase
+        # is respecifying live code: run 019f20e0 provided UIApi.get_config /
+        # get_providers (which exist) and its workers then wrote acceptance
+        # criteria inventing exception semantics the existing fail-safe
+        # convention contradicts — an unimplementable deadlock the editor can
+        # never satisfy. Flag it so the planner either names the new symbol
+        # distinctly or declares a modification of the existing one via
+        # reference_symbols. Uses an exact/qualified index lookup (no leaf
+        # fallback) so a new method that merely shares a short name with some
+        # unrelated existing symbol is not misflagged.
+        for p in s.get("provides") or []:
+            sym = _normalize_symbol(str(p))
+            if not sym:
+                continue
+            files = _find_symbol_files(db_path, sym)
+            if files:
+                redefined.append({"slice": sid, "symbol": sym, "file": files[0]})
 
-    if not dangling:
+    if not dangling and not redefined:
         return None
 
     # A contradiction is a dangling symbol the plan cannot legally acquire:
@@ -261,6 +303,19 @@ def check_reference_symbols(
                 f"depend on that slice."
             )
         lines.append(msg)
+    for r in redefined:
+        lines.append(
+            f"slice '{r['slice']}' declares '{r['symbol']}' in `provides`, but "
+            f"that symbol ALREADY EXISTS in the codebase ({r['file']}) — "
+            f"`provides` is only for NEW symbols"
+        )
+        suggestions.append(
+            f"In slice '{r['slice']}': if the slice MODIFIES the existing "
+            f"'{r['symbol']}', move it to `reference_symbols` and state the "
+            f"modification (matching the existing signature and error-handling "
+            f"convention) in execution_requirements; if it creates something "
+            f"new, give it a name that does not collide with {r['file']}."
+        )
 
     if contradictions:
         cited = sorted({d["exclusion"] for d in contradictions})
@@ -283,11 +338,11 @@ def check_reference_symbols(
             "cited_exclusions": cited,
         }
     else:
-        n = len(dangling)
+        n = len(dangling) + len(redefined)
         reason = (
             "Deterministic reference-symbol gate: "
-            f"{n} reference_symbols entr{'y does' if n == 1 else 'ies do'} "
-            "not resolve:\n" + "\n".join(f"- {ln}" for ln in lines)
+            f"{n} symbol contract violation{'' if n == 1 else 's'}:\n"
+            + "\n".join(f"- {ln}" for ln in lines)
         )
         result = {
             "status": ReviewStatus.NEEDS_REVISION.value,
@@ -300,9 +355,10 @@ def check_reference_symbols(
 
     result["dangling_leafs"] = sorted({d["leaf"] for d in dangling})
     logger.warning(
-        "plan reference-symbol gate: %d dangling symbol(s), %d spec "
-        "contradiction(s) → %s",
+        "plan reference-symbol gate: %d dangling symbol(s), %d redefined "
+        "provides, %d spec contradiction(s) → %s",
         len(dangling),
+        len(redefined),
         len(contradictions),
         result["status"],
     )

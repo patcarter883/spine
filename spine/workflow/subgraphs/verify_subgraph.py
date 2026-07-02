@@ -63,6 +63,64 @@ _MAX_ARTIFACT_STATE_CHARS = 500
 # ── Router: START → run_slice_verifier (Send) or synthesize ─────────────
 
 
+async def _seed_prior_results_node(
+    state: VerifySubgraphState,
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Carry forward last cycle's VERIFIED verdicts for untouched slices.
+
+    Per-slice convergence (run 019f20e0: with gap feedback flowing, one slice
+    reached 1 remaining gap while the other was re-verified from scratch every
+    cycle): a slice that was VERIFIED last cycle and whose ``target_files``
+    were NOT rewritten by the rework keeps its verdict — its prior finding is
+    seeded into ``verification_results`` (marked reused) and its id recorded
+    in ``reverify_skipped_ids`` so the router does not dispatch a verifier for
+    it. A verified slice whose files WERE touched since is re-verified — that
+    is exactly the regression case (trace 019f2040) skipping must not mask.
+    """
+    prior = state.get("prior_verification_findings") or []
+    if not prior:
+        return {}
+    verified_by_id = {
+        f.get("slice_name"): f
+        for f in prior
+        if isinstance(f, dict) and f.get("verdict") == "VERIFIED" and f.get("slice_name")
+    }
+    if not verified_by_id:
+        return {}
+    rewritten = {str(p) for p in (state.get("files_written") or []) if p}
+
+    seeded: list[dict] = []
+    skipped_ids: list[str] = []
+    for wave in state.get("execution_waves") or []:
+        if not isinstance(wave, list):
+            continue
+        for sl in wave:
+            if not isinstance(sl, dict):
+                continue
+            sid = sl.get("id")
+            finding = verified_by_id.get(sid)
+            if finding is None:
+                continue
+            targets = {str(t) for t in (sl.get("target_files") or []) if t}
+            if targets & rewritten:
+                continue  # touched since it passed — re-verify for regressions
+            seeded.append({**finding, "reused_from_prior_cycle": True})
+            skipped_ids.append(sid)
+    if not seeded:
+        return {}
+    logger.info(
+        "VERIFY seed: carrying forward %d VERIFIED verdict(s) for untouched "
+        "slice(s): %s",
+        len(seeded),
+        skipped_ids,
+    )
+    return {
+        "verification_results": seeded,
+        "reverify_skipped_ids": skipped_ids,
+    }
+
+
 def _verify_router(
     state: VerifySubgraphState,
 ) -> list[Send] | Literal["synthesize_verification"]:
@@ -70,6 +128,9 @@ def _verify_router(
 
     Reads ``execution_waves`` from state, flattens all waves into a single
     dispatch list (dependencies resolved by the scheduler during PLAN).
+    Slices whose prior VERIFIED verdict was carried forward by
+    ``seed_prior_results`` are not re-dispatched; when every slice is covered
+    by a carried-forward verdict the router goes straight to synthesis.
 
     Raises ``CriticalContractFailure`` if ``execution_waves`` is missing
     or empty — this is a structural invariant violation.
@@ -100,10 +161,22 @@ def _verify_router(
                    "malformed structured data.",
         )
 
+    skipped = set(state.get("reverify_skipped_ids") or [])
+    if skipped:
+        all_slices = [s for s in all_slices if s.get("id") not in skipped]
+        if not all_slices:
+            # Every slice's verdict was carried forward — nothing to re-run.
+            logger.info(
+                "VERIFY router: all slices covered by carried-forward "
+                "verdicts (%s) — skipping dispatch", sorted(skipped),
+            )
+            return "synthesize_verification"
+
     logger.info(
-        "VERIFY router: dispatching %d slice-verifier(s): %s",
+        "VERIFY router: dispatching %d slice-verifier(s): %s%s",
         len(all_slices),
         [s.get("id", "?") for s in all_slices],
+        f" (carried forward: {sorted(skipped)})" if skipped else "",
     )
 
     base_state = {
@@ -845,23 +918,30 @@ async def _save_verify_artifacts(
 def build_verify_subgraph() -> Any:
     """Build the VERIFY phase subgraph with Send API dispatch.
 
-    Returns a compiled StateGraph with five nodes:
-    1. verify_router — conditional edge dispatching Send objects
-    2. run_slice_verifier — per-slice subagent invocation (parallel)
-    3. aggregate_verification — fan-in checkpoint
-    4. synthesize_verification — writes verification artifacts
-    5. save_artifacts — scans disk, materializes to state
+    Returns a compiled StateGraph with six nodes:
+    1. seed_prior_results — carries forward VERIFIED verdicts for slices
+       untouched since the last cycle (per-slice convergence)
+    2. verify_router — conditional edge dispatching Send objects
+    3. run_slice_verifier — per-slice subagent invocation (parallel)
+    4. aggregate_verification — fan-in checkpoint
+    5. synthesize_verification — writes verification artifacts
+    6. save_artifacts — scans disk, materializes to state
     """
     builder = StateGraph(VerifySubgraphState)
 
+    builder.add_node("seed_prior_results", _seed_prior_results_node)
     builder.add_node("plan_slice_verifier", _plan_slice_verifier_node)
     builder.add_node("run_slice_verifier", _run_slice_verifier_node)
     builder.add_node("aggregate_verification", _aggregate_verification_node)
     builder.add_node("synthesize_verification", _synthesize_verification_node)
     builder.add_node("save_artifacts", _save_verify_artifacts)
 
+    # seed_prior_results runs before the router so carried-forward VERIFIED
+    # verdicts are in verification_results (and their ids in
+    # reverify_skipped_ids) before dispatch decisions are made.
+    builder.add_edge(START, "seed_prior_results")
     builder.add_conditional_edges(
-        START,
+        "seed_prior_results",
         _verify_router,
         {
             # Send targets dispatch to plan_slice_verifier; each parallel

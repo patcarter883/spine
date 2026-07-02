@@ -276,6 +276,29 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
             for sl in wave:
                 if isinstance(sl, dict) and sl.get("id"):
                     pending.append(sl)
+    # Per-slice convergence: on a gap-fix rework, re-dispatch ONLY the slices
+    # verification failed. Re-implementing already-VERIFIED slices wastes the
+    # cycle budget and risks regressing them (trace 019f2040 regressed a
+    # passing slice; run 019f20e0 re-edited both slices every cycle when one
+    # was a single gap from converging). Slices with no verdict at all stay in
+    # (unknown ≠ passed); if filtering would empty the list, keep it
+    # unfiltered — an empty IMPLEMENT dispatch is a contract violation.
+    if verify_attempts > 0:
+        findings = parent_state.get("verification_findings") or []
+        verified_ids = {
+            f.get("slice_name")
+            for f in findings
+            if isinstance(f, dict) and f.get("verdict") == "VERIFIED"
+        }
+        kept = [s for s in pending if s.get("id") not in verified_ids]
+        if verified_ids and kept and len(kept) < len(pending):
+            logger.info(
+                "[%s] implement rework: re-dispatching %d/%d slice(s); "
+                "already VERIFIED: %s",
+                work_id, len(kept), len(pending),
+                sorted(verified_ids & {s.get("id") for s in pending}),
+            )
+            pending = kept
     return {
         **_base_state_mapper(parent_state, config),
         "phase": PhaseName.IMPLEMENT.value,
@@ -291,6 +314,7 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
 def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
     """Map parent WorkflowState to VerifySubgraphState."""
     work_id = parent_state.get("work_id", "")
+    verify_attempts = parent_state.get("verify_attempts", 0)
     # All work types now run specify, so has_spec is always True
     return {
         **_base_state_mapper(parent_state, config),
@@ -299,6 +323,16 @@ def _verify_state_mapper(parent_state: WorkflowState, config) -> dict:
         "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
         "spec_path": artifact_path(work_id, PhaseName.SPECIFY.value),
         "execution_waves": parent_state.get("execution_waves", []),
+        # Per-slice convergence inputs (gap-fix cycles only): the previous
+        # cycle's verdicts plus the files the rework actually rewrote. A slice
+        # that was VERIFIED last cycle and whose targets were not touched
+        # since keeps its verdict without a re-verification round trip.
+        "prior_verification_findings": (
+            parent_state.get("verification_findings") or []
+            if verify_attempts > 0
+            else []
+        ),
+        "files_written": parent_state.get("files_written", []),
     }
 
 
