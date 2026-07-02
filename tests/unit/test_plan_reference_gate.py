@@ -140,11 +140,13 @@ def test_dangling_symbol_needs_revision_with_near_miss(index) -> None:
     assert any("UIApi.get_" in s for s in result["suggestions"])
 
 
-def test_exclusion_protected_no_near_miss_escalates_spec_contradiction(
-    index,
-) -> None:
+def test_exclusion_protected_escalates_only_after_persisting(index) -> None:
     # Owner class exists but nothing similar to the needed method does, and
-    # the spec forbids changing UIApi — unresolvable by plan rework.
+    # the spec forbids changing UIApi — unresolvable by plan rework. Round 1
+    # is still a revision (with an explicit escalation warning): a single
+    # round's exclusion match is not enough evidence to park the run (run
+    # 019f2104's false positive). Round 2, same symbol still dangling →
+    # spec contradiction.
     index({UIAPI_FILE: ["UIApi", "UIApi.run_project_verify"]})
     exclusion = "Changes to SpineConfig or UIApi schemas."
     plan = _plan(
@@ -152,10 +154,46 @@ def test_exclusion_protected_no_near_miss_escalates_spec_contradiction(
     )
     result = check_reference_symbols(plan, _spec([exclusion]), None, db_path=DB)
     assert result is not None
-    assert result["status"] == ReviewStatus.NEEDS_REVIEW.value
-    assert result["blocker_category"] == "spec_contradiction"
-    assert result["cited_exclusions"] == [exclusion]
-    assert "amend" in result["reason"].lower()
+    assert result["status"] == ReviewStatus.NEEDS_REVISION.value
+    assert result["blocker_category"] is None
+    assert "will escalate a spec contradiction" in result["reason"]
+
+    result2 = check_reference_symbols(plan, _spec([exclusion]), result, db_path=DB)
+    assert result2 is not None
+    assert result2["status"] == ReviewStatus.NEEDS_REVIEW.value
+    assert result2["blocker_category"] == "spec_contradiction"
+    assert result2["cited_exclusions"] == [exclusion]
+    assert "amend" in result2["reason"].lower()
+
+
+def test_module_qualified_external_alias_is_skipped(index) -> None:
+    # Run 019f2104: 'spine.ui._pages.config_view.st' is a reference to the
+    # streamlit import alias inside config_view — an external-library name,
+    # not a code contract. Must not be treated as dangling at all.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {"id": "s1", "reference_symbols": ["spine.ui._pages.config_view.st"]}
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_generic_package_prefix_never_matches_exclusion(index) -> None:
+    # Run 019f2104: the exclusion "Core spine settings (checkpoint_path, ...)"
+    # matched the 'spine' package prefix of every module path. Only the
+    # DIRECT owner segment may match, and even persistent dangling must not
+    # escalate on an intermediate-segment match.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    exclusion = "Core spine settings (checkpoint_path, artifact_path, etc.)."
+    plan = _plan(
+        {"id": "s1", "reference_symbols": ["spine.ui.widgets.render_all_panels"]}
+    )
+    first = check_reference_symbols(plan, _spec([exclusion]), None, db_path=DB)
+    assert first is not None
+    assert first["status"] == ReviewStatus.NEEDS_REVISION.value
+    second = check_reference_symbols(plan, _spec([exclusion]), first, db_path=DB)
+    assert second is not None
+    assert second["status"] == ReviewStatus.NEEDS_REVISION.value
+    assert second["blocker_category"] is None
 
 
 def test_exclusion_with_near_miss_gets_one_revision_round_first(index) -> None:

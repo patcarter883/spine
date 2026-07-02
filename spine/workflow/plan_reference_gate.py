@@ -16,14 +16,16 @@ This gate closes both holes at critic_plan time, with no LLM call:
   deterministic NEEDS_REVISION naming the exact symbol, with a "did you mean"
   suggestion fuzzy-matched from the real symbols of the same owner class and
   the slice's target files.
-* A dangling symbol whose owner is protected by a spec ``scope_exclusions``
-  bullet (e.g. ``UIApi.add_embedding_provider`` under "No changes to
-  SpineConfig or UIApi schemas") cannot be fixed by reworking the plan —
-  creating it is excluded. When such a symbol has no near-equivalent, or stays
-  dangling on a second consecutive round despite gate feedback, the gate
+* A dangling symbol whose DIRECT owner is protected by a spec
+  ``scope_exclusions`` bullet (e.g. ``UIApi.add_embedding_provider`` under "No
+  changes to SpineConfig or UIApi schemas") cannot be fixed by reworking the
+  plan — creating it is excluded. When such a symbol stays dangling on a
+  SECOND consecutive round despite the gate naming it exactly, the gate
   escalates NEEDS_REVIEW with ``blocker_category='spec_contradiction'``, which
   the critic result mapper already routes to a SPECIFY amendment instead of
-  another futile plan rework.
+  another futile plan rework. Persistence is required and only the final
+  owner segment is exclusion-matched — a single round's fuzzy match on a
+  generic package prefix parked run 019f2104 on a fabricated contradiction.
 * ``provides`` entries must be NEW symbols (the field's documented contract).
   A slice that "provides" a symbol already in the codebase is respecifying
   live code — run 019f20e0 provided the existing ``UIApi.get_config`` and its
@@ -160,18 +162,24 @@ def _near_miss(
 
 
 def _matching_exclusion(ref: str, exclusions: list[str]) -> str | None:
-    """The scope_exclusions bullet protecting *ref*'s owner, or None.
+    """The scope_exclusions bullet protecting *ref*'s DIRECT owner, or None.
 
     A dangling ``UIApi.add_embedding_provider`` matches "No changes to
-    SpineConfig or UIApi schemas" because the owner segment ``UIApi`` appears
-    (as a token) in the bullet. Unqualified refs never match — a bare name
-    carries too little signal to pin a contradiction on the spec.
+    SpineConfig or UIApi schemas" because the direct owner ``UIApi`` appears
+    (as a token) in the bullet. Only the FINAL owner segment is matched:
+    intermediate package segments are far too generic — run 019f2104 falsely
+    matched the ``spine`` package prefix of
+    ``spine.ui._pages.config_view.st`` against an exclusion that merely
+    contained the word "spine", parking the whole run on a fabricated
+    contradiction. Unqualified refs never match — a bare name carries too
+    little signal to pin a contradiction on the spec.
     """
-    segs = {s.lower() for s in _owner_segments(ref) if len(s) > 2}
-    if not segs:
+    owner = _owner_segments(ref)
+    if not owner or len(owner[-1]) <= 2:
         return None
+    direct = owner[-1].lower()
     for ex in exclusions:
-        if segs & _norm_tokens(ex):
+        if direct in _norm_tokens(ex):
             return ex
     return None
 
@@ -235,11 +243,15 @@ def check_reference_symbols(
             if not ref:
                 continue
             root = ref.split(".", 1)[0].strip()
-            if root in _EXTERNAL_ROOTS:
+            leaf = _leaf(ref)
+            # External-library names are not contracts — whether written as
+            # the bare alias ('st.form' → root) or module-qualified
+            # ('spine.ui._pages.config_view.st' → leaf, run 019f2104's false
+            # positive: a reference to config_view's streamlit import).
+            if root in _EXTERNAL_ROOTS or leaf in _EXTERNAL_ROOTS:
                 continue
             if _symbol_exists_in_index(db_path, ref):
                 continue
-            leaf = _leaf(ref)
             if leaf in provided_leafs:
                 continue  # cross-slice contract — synthesis validation owns it
             dangling.append(
@@ -274,12 +286,15 @@ def check_reference_symbols(
         return None
 
     # A contradiction is a dangling symbol the plan cannot legally acquire:
-    # its owner is exclusion-protected AND either nothing similar exists to
-    # rename to, or it already survived a full rework round that named it.
+    # its owner is exclusion-protected AND it already survived a full rework
+    # round in which the gate named it exactly. Persistence is REQUIRED — a
+    # single round's fuzzy exclusion match is not enough evidence to park the
+    # whole run (run 019f2104: a first-round false positive escalated a
+    # fabricated contradiction straight to human review). A true
+    # contradiction costs one extra ~2-minute round; a false park costs the
+    # run.
     contradictions = [
-        d
-        for d in dangling
-        if d["exclusion"] and (d["near_miss"] is None or d["leaf"] in prior_leafs)
+        d for d in dangling if d["exclusion"] and d["leaf"] in prior_leafs
     ]
 
     lines: list[str] = []
@@ -301,6 +316,13 @@ def check_reference_symbols(
                 f"Reference only existing symbols in slice '{d['slice']}', or "
                 f"add '{d['symbol']}' to a producer slice's `provides` and "
                 f"depend on that slice."
+            )
+        if d["exclusion"] and d["leaf"] not in prior_leafs:
+            msg += (
+                f" NOTE: creating '{d['symbol']}' appears to be excluded by "
+                f"scope_exclusions ('{d['exclusion']}') — if this reference "
+                "persists unresolved next round, the gate will escalate a "
+                "spec contradiction."
             )
         lines.append(msg)
     for r in redefined:
