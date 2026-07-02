@@ -897,6 +897,109 @@ def _edit_feedback(
     return fb
 
 
+def _resolve_conflicting_inserts(
+    current: str,
+    code: str,
+    symbols: list,
+    anchor: Any,
+    action: str,
+) -> Optional[str]:
+    """Convert an insert that re-defines existing symbols into replaces+insert.
+
+    ``code`` is split into top-level definition chunks (defs sharing the FIRST
+    def's indentation — nested helpers stay attached to their parent chunk).
+    A chunk whose def name matches exactly one existing symbol becomes a
+    REPLACE of that symbol in place; the remaining chunks are inserted at the
+    ``anchor`` per ``action``. Name matching prefers the anchor's own scope
+    (``Cls.name`` when the anchor is ``Cls.other``) so a method name shared
+    across classes resolves to the class being edited.
+
+    Returns the fully-edited content, or None when any conflicting name is
+    ambiguous or the batch cannot be split cleanly — the caller then keeps the
+    hard conflict_error so nothing is silently mangled.
+    """
+    import re as _re
+
+    matches = list(_re.finditer(r"(?m)^([ \t]*)(?:async\s+)?def\s+\w+", code))
+    if not matches:
+        return None
+    base_indent = matches[0].group(1)
+    tops = [m for m in matches if m.group(1) == base_indent]
+    name_re = _re.compile(r"def\s+(\w+)")
+
+    starts = [m.start() for m in tops]
+    preamble = code[: starts[0]]
+    if preamble.strip():
+        # Non-definition preamble (imports, module docstring) — attaching it
+        # to a replace would corrupt the target; bail to the hard error.
+        return None
+    chunks: list[tuple[str, str]] = []
+    for i, m in enumerate(tops):
+        end = starts[i + 1] if i + 1 < len(tops) else len(code)
+        name = name_re.search(code, m.start()).group(1)  # type: ignore[union-attr]
+        chunks.append((name, code[m.start() : end].rstrip("\n")))
+
+    by_leaf: dict[str, list[Any]] = {}
+    for s in symbols:
+        by_leaf.setdefault(s.qualified_name.split(".")[-1], []).append(s)
+    anchor_parent = (
+        anchor.qualified_name.rsplit(".", 1)[0]
+        if "." in anchor.qualified_name
+        else ""
+    )
+
+    replaces: list[tuple[Any, str]] = []
+    inserts: list[str] = []
+    for name, chunk in chunks:
+        cands = by_leaf.get(name) or []
+        if not cands:
+            inserts.append(chunk)
+            continue
+        if len(cands) > 1 and anchor_parent:
+            scoped = [
+                s for s in cands if s.qualified_name == f"{anchor_parent}.{name}"
+            ]
+            cands = scoped or cands
+        if len(cands) != 1:
+            return None  # ambiguous target — keep the hard error
+        replaces.append((cands[0], chunk))
+    if not replaces:
+        return None  # nothing to convert — should not happen, fail safe
+
+    buf = current.encode("utf-8")
+    # (start, end, replacement_bytes) spans, applied back-to-front so earlier
+    # byte offsets stay valid. A pure insert is a zero-width span.
+    ops: list[tuple[int, int, bytes]] = []
+    for target, chunk in replaces:
+        line_start = buf.rfind(b"\n", 0, target.start_byte) + 1
+        indent = buf[line_start : target.start_byte].decode("utf-8", errors="replace")
+        ops.append(
+            (line_start, target.end_byte, _reindent(chunk, base_indent, indent).encode("utf-8"))
+        )
+    if inserts:
+        a_line_start = buf.rfind(b"\n", 0, anchor.start_byte) + 1
+        a_indent = buf[a_line_start : anchor.start_byte].decode("utf-8", errors="replace")
+        joined = "\n\n".join(_reindent(c, base_indent, a_indent) for c in inserts)
+        if action == "insert_before":
+            ops.append((a_line_start, a_line_start, joined.encode("utf-8") + b"\n\n"))
+        else:
+            tail = buf[anchor.end_byte :]
+            sep = b"\n\n" if not tail.startswith(b"\n\n") else b""
+            ops.append((anchor.end_byte, anchor.end_byte, sep + joined.encode("utf-8")))
+
+    # Overlapping replace spans would mangle the file — bail (distinct symbols
+    # can still overlap if tree-sitter nests them, e.g. a decorated def).
+    spans = sorted((s, e) for s, e, _ in ops)
+    for (s1, e1), (s2, _e2) in zip(spans, spans[1:]):
+        if s2 < e1:
+            return None
+
+    out = buf
+    for start, end, repl in sorted(ops, key=lambda o: o[0], reverse=True):
+        out = out[:start] + repl + out[end:]
+    return out.decode("utf-8")
+
+
 def _apply_ast_edit(
     current: str,
     file_path: str,
@@ -1010,6 +1113,20 @@ def _apply_ast_edit(
             existing_simple = {s.qualified_name.split(".")[-1] for s in symbols}
             conflicts = sorted(inserted_defs & existing_simple)
             if conflicts:
+                # Idempotence recovery: rework editors bundle every definition
+                # a slice needs into ONE insert — including definitions an
+                # earlier cycle already landed — and rejecting the whole batch
+                # left the slice partial (run 019f2194: 'Inserted code
+                # re-defines [get_embedding_provider] which already exists').
+                # Deterministically split the batch: chunks re-defining an
+                # existing symbol REPLACE it in place, the rest insert at the
+                # anchor as requested. Only unambiguous cases resolve; anything
+                # else keeps the hard error below.
+                resolved = _resolve_conflicting_inserts(
+                    current, code, symbols, sym, action
+                )
+                if resolved is not None:
+                    return resolved, None
                 return None, _edit_feedback(
                     "conflict_error",
                     (

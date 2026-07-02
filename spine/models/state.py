@@ -174,7 +174,13 @@ class WorkflowState(TypedDict, total=False):
     # Each inner list is one wave of independent slices that can run concurrently.
     verify_attempts: int  # How many gap-fix cycles attempted (starts at 0).
     # Incremented by the verify result mapper when verification fails.
-    # After 2 cycles (3 total verify runs), the 3rd failure routes to human_review.
+    # The first _VERIFY_MIN_CYCLES cycles are unconditional; beyond that a
+    # cycle is granted only while the total gap count strictly decreases
+    # (progress-based budget, ceiling _VERIFY_MAX_CYCLES — run 019f2194 was
+    # cut off at 3 verify passes while converging 18→12→8).
+    verify_gap_totals: list[int]  # Total open-gap count per verify pass, in
+    # order. Written whole by the verify result mapper (last-write-wins);
+    # consecutive entries drive the strictly-decreasing progress check.
 
     # ── Phase Completion Invariants (prevent rework misinterpretation) ──
     # These boolean flags track whether critical phase operations completed

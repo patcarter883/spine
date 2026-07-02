@@ -416,18 +416,68 @@ def _verify_failure_suggestions(subgraph_result: dict) -> list[str]:
     return suggestions[:10]
 
 
+# Gap-fix cycle budget. The first _VERIFY_MIN_CYCLES gap-fix cycles are
+# unconditional (the pre-existing behavior); beyond that, further cycles are
+# granted ONLY while the total gap count strictly decreases, up to
+# _VERIFY_MAX_CYCLES. A trajectory-blind cap cut off run 019f2194 at 3 verify
+# passes while gaps were converging 18→12→8; a plateau or increase still stops
+# immediately after the floor, so a stuck loop costs no more than before.
+_VERIFY_MIN_CYCLES = 2
+_VERIFY_MAX_CYCLES = 6
+
+
+def _total_gap_count(findings: Any) -> int | None:
+    """Total open gaps across slice findings, or None when uncountable."""
+    if not isinstance(findings, list) or not findings:
+        return None
+    total = 0
+    for f in findings:
+        if not isinstance(f, dict):
+            return None
+        if f.get("verdict") == "VERIFIED":
+            continue
+        gaps = f.get("gaps")
+        # A failing slice with no itemized gaps still counts as one open gap
+        # so a degenerate finding can't fake convergence to zero.
+        total += len(gaps) if isinstance(gaps, list) and gaps else 1
+    return total
+
+
 def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
     """Map VerifySubgraphState output back to parent WorkflowState.
 
-    When verification fails (phase_status="needs_review"), checks
-    ``verify_attempts`` to decide between a gap-fix cycle and human review.
-    Up to 2 gap-fix cycles are attempted before escalating to human review.
+    When verification fails (phase_status="needs_review"), decides between a
+    gap-fix cycle and human review: the first ``_VERIFY_MIN_CYCLES`` cycles are
+    unconditional, then further cycles are granted only while the total gap
+    count strictly decreases (progress-based budget, ceiling
+    ``_VERIFY_MAX_CYCLES``).
     """
     base = make_success_result_mapper(PhaseName.VERIFY.value)(subgraph_result, parent_state)
     phase_status = subgraph_result.get("phase_status", "")
     if phase_status == "needs_review":
         verify_attempts = parent_state.get("verify_attempts", 0)
-        if verify_attempts < 2:
+        totals = list(parent_state.get("verify_gap_totals") or [])
+        current_total = _total_gap_count(subgraph_result.get("verification_findings"))
+        if current_total is not None:
+            totals.append(current_total)
+            base["verify_gap_totals"] = totals
+        # Strict decrease, and ONLY judged on a total from THIS round — an
+        # uncountable round must not ride on stale history.
+        improving = (
+            current_total is not None and len(totals) >= 2 and totals[-1] < totals[-2]
+        )
+        if verify_attempts < _VERIFY_MIN_CYCLES or (
+            improving and verify_attempts < _VERIFY_MAX_CYCLES
+        ):
+            if verify_attempts >= _VERIFY_MIN_CYCLES:
+                logger.info(
+                    "[%s] verify: gap total still decreasing (%s) — granting "
+                    "extra gap-fix cycle %d/%d",
+                    parent_state.get("work_id", "?"),
+                    totals[-4:],
+                    verify_attempts + 1,
+                    _VERIFY_MAX_CYCLES,
+                )
             base["status"] = "needs_gap_fix"
             base["verify_attempts"] = verify_attempts + 1
         else:

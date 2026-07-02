@@ -708,7 +708,11 @@ def test_ast_edit_ambiguous_match_carries_target_and_next_action(workspace: Path
     assert "retry ast_edit" in out["next_action"]
 
 
-def test_ast_edit_conflict_error_carries_next_action(workspace: Path) -> None:
+def test_ast_edit_conflicting_insert_recovers_as_replace(workspace: Path) -> None:
+    """An insert that re-defines an existing symbol used to hard-fail with
+    conflict_error; it now deterministically converts to a replace of that
+    symbol (duplicate-insert idempotence, run 019f2194). Ambiguous cases still
+    hard-fail - see test_insert_conflict_recovery.py."""
     (workspace / "src" / "conf.py").write_text(
         "class C:\n    def a(self):\n        return 1\n"
     )
@@ -722,6 +726,8 @@ def test_ast_edit_conflict_error_carries_next_action(workspace: Path) -> None:
             },
         )
     )
-    assert out["status"] == "conflict_error"
-    assert "a" in out["target"]
-    assert "replace" in out["next_action"]
+    assert out["status"] == "ok"
+    text = (workspace / "src" / "conf.py").read_text()
+    assert text.count("def a(") == 1
+    assert "return 2" in text
+    assert "return 1" not in text
