@@ -64,6 +64,9 @@ class Tag(str, Enum):
             implementer never surveys to find them.
         EDIT_PLAN: implement-phase — the planner's ordered targeted edits, each
             with the current source of the symbol it changes inlined.
+        TARGET_FILES: implement-phase synthesis — the current on-disk content of
+            the slice's target files, so a serialized same-file slice edits
+            additively instead of regenerating (and clobbering) the file.
 
     Role / system blocks (used in system prompts):
         ROLE: agent identity / mission paragraph.
@@ -96,6 +99,10 @@ class Tag(str, Enum):
     # extends (with their source inlined), and the planner's targeted edits.
     REFERENCE_SYMBOLS = "reference_symbols"
     EDIT_PLAN = "edit_plan"
+    # Implement-phase synthesis: the CURRENT on-disk content of the slice's
+    # target files, so a serialized same-file slice edits additively instead of
+    # regenerating the file and clobbering an earlier slice's work.
+    TARGET_FILES = "target_files"
 
     # Role / system
     ROLE = "role"

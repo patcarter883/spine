@@ -119,6 +119,54 @@ def test_edit_plan_body_inlines_source(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "edit this with ast_edit replace" in body  # replace gets the strong label
 
 
+# ── Anti-clobber: inline the live target file so serialized same-file slices
+#    build on the prior slice's edits instead of regenerating (trace 019f2005) ──
+
+
+def test_target_files_body_inlines_current_content(tmp_path: Path) -> None:
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    # config_view.py AFTER an earlier slice already added an embedding section.
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "ui" / "config_view.py").write_text(
+        "def render_llm_providers():\n    ...\n\n"
+        "def render_embedding_providers():\n    ...\n",
+        encoding="utf-8",
+    )
+    body = impl._target_files_body(["ui/config_view.py"], str(tmp_path))
+    # The next same-file slice sees the prior slice's work and is told to keep it.
+    assert "render_embedding_providers" in body
+    assert "PRESERVE it" in body
+    assert "```python" in body
+
+
+def test_target_files_body_flags_missing_file_as_create(tmp_path: Path) -> None:
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    body = impl._target_files_body(["ui/new_page.py"], str(tmp_path))
+    assert "does not exist yet" in body
+    assert "```python" not in body  # nothing to inline for a to-be-created file
+
+
+def test_target_files_body_outlines_oversized_file(tmp_path: Path) -> None:
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    # Larger than the inline cap → outline of existing anchors, not the body.
+    big = "\n\n".join(f"def f{i}():\n    return {i}" for i in range(600))
+    (tmp_path / "big.py").write_text(big, encoding="utf-8")
+    body = impl._target_files_body(["big.py"], str(tmp_path))
+    assert "too large to inline" in body
+    assert "do NOT recreate" in body
+    assert "def f0" in body and "def f599" in body  # anchors listed
+    assert "return 0" not in body  # bodies NOT dumped (token guard)
+
+
+def test_target_files_body_empty_without_targets() -> None:
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    assert impl._target_files_body([], "/tmp") == ""
+
+
 def test_reference_symbols_body_degrades_without_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
