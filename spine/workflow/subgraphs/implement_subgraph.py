@@ -138,6 +138,72 @@ def _slice_marker_ids(slices: list[dict]) -> set[str]:
     return ids
 
 
+# Bound on the rendered gap-remediation block. A gap plan covers every failed
+# slice; the per-slice extract is small, but a degenerate gap plan must not
+# blow the editor's prompt.
+_GAP_BODY_CHAR_CAP = 4000
+
+
+def _gap_fixes_body(state: ImplementSubgraphState, active_slice: dict) -> str:
+    """This slice's verify-gap remediation, rendered for the editor prompt.
+
+    On a gap-fix rework (verify failed → gap_plan → implement) the gap plan's
+    per-slice fixes are the ONLY channel telling the editor what its previous
+    output got wrong. Nothing consumed ``gap_plan_path`` before this: the
+    no-tool synthesis editor cannot read gap_plan.json from disk, so it
+    regenerated the exact failing code every cycle (run 019f20a5 — three
+    byte-identical wrong attempts → needs_review). Matching uses
+    ``_slice_marker_ids`` so a split sub-slice still collects its parent's
+    fixes. Returns '' outside gap reworks or on any load/shape problem.
+    """
+    gap_dir = state.get("gap_plan_path")
+    if not gap_dir:
+        return ""
+    from pathlib import Path
+
+    path = Path(state.get("workspace_root", ".")) / gap_dir / "gap_plan.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    items = data.get("remediation_items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return ""
+
+    ids = _slice_marker_ids([active_slice])
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("slice_id") not in ids:
+            continue
+        lines.append(
+            f"A previous implementation of slice '{item.get('slice_id')}' "
+            f"FAILED verification (priority: {item.get('priority', 'medium')})."
+        )
+        for failure in item.get("failures") or []:
+            lines.append(f"- FAILED: {failure}")
+        root_cause = str(item.get("root_cause") or "").strip()
+        if root_cause:
+            lines.append(f"Root cause: {root_cause}")
+        for fix in item.get("fixes") or []:
+            if not isinstance(fix, dict):
+                continue
+            lines.append(f"Required fix in {fix.get('file_path', '?')}:")
+            issue = str(fix.get("issue_description") or "").strip()
+            if issue:
+                lines.append(f"  Issue: {issue}")
+            suggested = str(fix.get("suggested_fix") or "").strip()
+            if suggested:
+                lines.append(f"  Fix: {suggested}")
+            for ac in fix.get("acceptance_criteria") or []:
+                lines.append(f"  Must satisfy: {ac}")
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    if len(body) > _GAP_BODY_CHAR_CAP:
+        body = body[:_GAP_BODY_CHAR_CAP].rstrip() + " … [gap plan truncated]"
+    return body
+
+
 def _ready_slices(pending: list[dict], completed: list[dict]) -> list[dict]:
     """Pending slices whose declared ``dependencies`` have all completed.
 
@@ -1016,6 +1082,11 @@ async def _slice_implementer_node(
             compact=True,
         )
 
+        # On a gap-fix rework, the slice's verify-gap remediation rides along —
+        # same channel as the synthesis path (run 019f20a5: without it the
+        # rework regenerates the code that already failed verification).
+        gaps_body = _gap_fixes_body(state, active_slice)
+
         # Hostage layout: data blocks first, plain-text instruction at the tail.
         objective = f"Implement slice: {slice_id} — {title}" if title else f"Implement slice: {slice_id}"
         blocks = xml_blocks(
@@ -1023,6 +1094,7 @@ async def _slice_implementer_node(
             (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
             (Tag.REFERENCE_SYMBOLS, refs_body),
             (Tag.EDIT_PLAN, plan_body),
+            (Tag.CRITIC_FEEDBACK, gaps_body),
         ) + ("\n\n" + directive_block if directive_block else "")
 
         if plan_body:
@@ -1043,6 +1115,12 @@ async def _slice_implementer_node(
                 "(ast_edit / patch / full_replace); make only the changes the "
                 'slice describes, and you are NOT done until each edit returns '
                 'status="ok".'
+            )
+        if gaps_body:
+            instruction += (
+                " This is a VERIFICATION REWORK: a previous implementation of "
+                "this slice failed the checks in <critic_feedback> — your "
+                "edits MUST resolve exactly those failures."
             )
         instruction += _subslice_context(active_slice)
         instruction += _large_file_directive(active_slice, workspace_root)
@@ -1348,12 +1426,17 @@ async def _synthesis_implementer_node(
         # 019f2005). Without this the no-tool synthesizer cannot see what the
         # file already holds.
         files_body = _target_files_body(target_files, workspace_root)
+        # On a gap-fix rework, inline this slice's verify-gap remediation —
+        # the no-tool editor cannot read gap_plan.json, and without the gaps
+        # in-prompt it regenerates the exact failing code (run 019f20a5).
+        gaps_body = _gap_fixes_body(state, active_slice)
 
         candidates = await synthesize_slice_code(
             slice_json=slice_json,
             refs_body=refs_body,
             plan_body=plan_body,
             files_body=files_body,
+            gaps_body=gaps_body,
             config=config,
             session_id=work_id,
             n=variants,
@@ -1371,6 +1454,7 @@ async def _synthesis_implementer_node(
                 refs_body=refs_body,
                 plan_body=plan_body,
                 files_body=files_body,
+                gaps_body=gaps_body,
                 config=config,
                 session_id=work_id,
                 n=1,

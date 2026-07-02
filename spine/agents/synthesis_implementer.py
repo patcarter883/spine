@@ -228,6 +228,61 @@ _SYNTHESIS_SYSTEM_PROMPT = (
 )
 
 
+def build_synthesis_prompt(
+    *,
+    slice_json: str,
+    refs_body: str,
+    plan_body: str,
+    files_body: str = "",
+    feedback: str = "",
+    gaps_body: str = "",
+) -> str:
+    """Assemble the synthesis user prompt (hostage layout, data blocks first).
+
+    ``gaps_body`` is the slice-scoped verify-gap remediation from
+    gap_plan.json — the editor's only channel for learning what its previous
+    output got wrong (run 019f20a5: without it, a gap-fix rework regenerated
+    the exact failing code every cycle). ``feedback`` is lint/placement errors
+    from THIS round's failed placement; it takes tail priority because those
+    edits never landed at all.
+    """
+    block_pairs = [(Tag.FINDINGS, f"```json\n{slice_json}\n```")]
+    if files_body:
+        # Current on-disk content of the slice's target files — shown FIRST so
+        # the synthesizer edits additively on top of any earlier same-file
+        # slice's work instead of regenerating the file from scratch.
+        block_pairs.append((Tag.TARGET_FILES, files_body))
+    block_pairs += [
+        (Tag.REFERENCE_SYMBOLS, refs_body),
+        (Tag.EDIT_PLAN, plan_body),
+    ]
+    if gaps_body:
+        # Near the tail so small-model attention lands on the failures right
+        # before the instruction that demands they be fixed.
+        block_pairs.append((Tag.CRITIC_FEEDBACK, gaps_body))
+    if feedback:
+        block_pairs.append((Tag.ERRORS, f"```\n{feedback}\n```"))
+        tail = (
+            "Your previous edits FAILED to place (errors above). Return a "
+            "corrected SynthesizedSlice that fixes exactly those failures — keep "
+            "the edits that were fine, repair the ones the linter rejected."
+        )
+    elif gaps_body:
+        tail = (
+            "This is a VERIFICATION REWORK: a previous implementation of this "
+            "slice failed the checks in <critic_feedback> above. Return a "
+            "SynthesizedSlice whose edits resolve exactly those failures — "
+            "apply each required fix as stated instead of regenerating the "
+            "approach that already failed."
+        )
+    else:
+        tail = (
+            "Return a SynthesizedSlice implementing the slice above. Write "
+            "complete definitions; do not survey, you have everything you need."
+        )
+    return hostage_layout(xml_blocks(*block_pairs), tail)
+
+
 async def synthesize_slice_code(
     *,
     slice_json: str,
@@ -238,6 +293,7 @@ async def synthesize_slice_code(
     files_body: str = "",
     n: int = 1,
     feedback: str = "",
+    gaps_body: str = "",
     escalation_level: int = 0,
 ) -> list[SynthesizedSlice]:
     """Generate ``n`` candidate edit-sets for a slice via a no-tool structured call.
@@ -251,7 +307,10 @@ async def synthesize_slice_code(
     sequentially (local providers cap ``max_concurrent_calls`` at 1–2, so
     parallel sampling buys no wall-clock); each is a self-contained
     :class:`SynthesizedSlice`. ``feedback`` (lint errors from a prior placement)
-    is injected so the retry pass corrects exactly what failed.
+    is injected so the retry pass corrects exactly what failed. ``gaps_body``
+    (this slice's verify-gap remediation, built by the subgraph's
+    ``_gap_fixes_body``) is injected on gap-fix reworks so the editor fixes
+    what verification rejected instead of regenerating it (run 019f20a5).
 
     Returns the list of successfully-synthesized candidates (may be shorter than
     ``n`` if some calls error — callers place whatever came back).
@@ -277,29 +336,14 @@ async def synthesize_slice_code(
     except Exception:  # noqa: BLE001
         window = 0
 
-    block_pairs = [(Tag.FINDINGS, f"```json\n{slice_json}\n```")]
-    if files_body:
-        # Current on-disk content of the slice's target files — shown FIRST so
-        # the synthesizer edits additively on top of any earlier same-file
-        # slice's work instead of regenerating the file from scratch.
-        block_pairs.append((Tag.TARGET_FILES, files_body))
-    block_pairs += [
-        (Tag.REFERENCE_SYMBOLS, refs_body),
-        (Tag.EDIT_PLAN, plan_body),
-    ]
-    if feedback:
-        block_pairs.append((Tag.ERRORS, f"```\n{feedback}\n```"))
-        tail = (
-            "Your previous edits FAILED to place (errors above). Return a "
-            "corrected SynthesizedSlice that fixes exactly those failures — keep "
-            "the edits that were fine, repair the ones the linter rejected."
-        )
-    else:
-        tail = (
-            "Return a SynthesizedSlice implementing the slice above. Write "
-            "complete definitions; do not survey, you have everything you need."
-        )
-    human_content = hostage_layout(xml_blocks(*block_pairs), tail)
+    human_content = build_synthesis_prompt(
+        slice_json=slice_json,
+        refs_body=refs_body,
+        plan_body=plan_body,
+        files_body=files_body,
+        feedback=feedback,
+        gaps_body=gaps_body,
+    )
     messages = [
         SystemMessage(content=_SYNTHESIS_SYSTEM_PROMPT),
         HumanMessage(content=human_content),
