@@ -23,47 +23,20 @@ from spine.config import SpineConfig
 from spine.models.enums import PhaseName, ReviewStatus
 from spine.workflow.subgraph_state import CriticSubgraphState
 from spine.workflow.critic_review import structural_critic_check, agent_critic_check
-from spine.agents.plan_do import run_plan_node
-from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
-
 logger = logging.getLogger(__name__)
 
 
-async def _critic_directive_node(
-    state: CriticSubgraphState,
-    config: RunnableConfig | None = None,
-) -> dict[str, Any]:
-    """No-tool planning step before the critic's agent_check.
-
-    Gives the planner the reviewed phase and a short task framing; the
-    do node then runs the full critic agent with the directive
-    prepended to its prompt.
-    """
-    work_id = state.get("work_id", "unknown")
-    reviewed_phase = state.get("reviewed_phase", "unknown")
-    description = state.get("description", "")
-    task = hostage_layout(
-        xml_blocks((Tag.OBJECTIVE, description)),
-        (
-            f"Plan a code review of the {reviewed_phase!r} phase output. The "
-            "do node will inspect the structured artifact "
-            "(specification.json / plan.json / etc.) and return a verdict "
-            "(PASSED / NEEDS_REVISION / NEEDS_REVIEW). Identify what to focus on."
-        ),
-    )
-    directive = await run_plan_node(
-        state=dict(state),
-        config=config,
-        phase_path=PhaseName.CRITIC.value,
-        task_description=task,
-        role_hint=f"critic for the {reviewed_phase!r} phase",
-        workspace_root=state.get("workspace_root", "."),
-    )
-    logger.info(
-        "[%s] CRITIC plan-directive: approach=%r",
-        work_id, directive.approach[:80],
-    )
-    return {"critic_directive": directive.model_dump()}
+# NOTE: the critic deliberately has NO plan-before-do directive step. The
+# directive planner is a no-tool call that cannot see the artifact, and its
+# output twice poisoned production reviews: trace 019f1204 (invented "Tkinter"
+# stack in notes, cited as fact) and trace 019f2131 (invented a 'config_page'
+# plan.json node + 'config.ui.tsx' target files in approach/acceptance, which
+# the critic adopted as its review rubric and blocked three rounds on a
+# requirement no plan can satisfy). The critic's review standard comes from
+# the structured payload, the specification, and its own prior verdict — a
+# speculative focus hint adds nothing those don't, and the "directive may be
+# wrong" preamble demonstrably does not stop a weak model from treating it as
+# the rubric.
 
 
 async def _structural_check_node(
@@ -276,9 +249,6 @@ async def _agent_check_node(
         "max_retries": SpineConfig.load().max_critic_retries,
         "specification_json": state.get("specification_json"),
         "plan_json": state.get("plan_json"),
-        # Forward the directive from the plan-before-do split so
-        # agent_critic_check can prepend it to the critic's prompt.
-        "critic_directive": state.get("critic_directive"),
         # The critic's own prior verdict — agent_critic_check renders it into
         # the REWORK prompt so round N confirms round N-1's asks were met
         # instead of shifting the goalposts. Without this key the anti-churn
@@ -379,24 +349,22 @@ def build_critic_subgraph(reviewed_phase: str) -> Any:
     builder = StateGraph(CriticSubgraphState)
 
     builder.add_node("structural_check", _structural_check_node)
-    # No-tool planning step inserted before agent_check (plan→do split).
-    builder.add_node("plan_directive", _critic_directive_node)
     builder.add_node("agent_check", _agent_check_node)
 
     if PhaseName(reviewed_phase) == PhaseName.PLAN:
         builder.add_node("plan_validation", _plan_validation_node)
 
     builder.add_edge(START, "structural_check")
-    # Route to plan_validation (PLAN reviews) or plan_directive (others).
-    # plan_validation is its own router target so it can also funnel into
-    # plan_directive before the agent runs.
+    # Route to plan_validation (PLAN reviews) or straight to agent_check.
+    # There is deliberately no directive step in between — see the note above
+    # _structural_check_node (traces 019f1204, 019f2131).
     builder.add_conditional_edges(
         "structural_check",
         _critic_subgraph_router,
         {
-            "passed": "plan_directive" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
-            "needs_revision": "plan_directive" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
-            "needs_review": "plan_directive" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "passed": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "needs_revision": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
+            "needs_review": "agent_check" if PhaseName(reviewed_phase) != PhaseName.PLAN else "plan_validation",
         },
     )
 
@@ -405,13 +373,12 @@ def build_critic_subgraph(reviewed_phase: str) -> Any:
             "plan_validation",
             _plan_validation_router,
             {
-                "passed": "plan_directive",
-                "needs_revision": "plan_directive",
-                "needs_review": "plan_directive",
+                "passed": "agent_check",
+                "needs_revision": "agent_check",
+                "needs_review": "agent_check",
             },
         )
 
-    builder.add_edge("plan_directive", "agent_check")
     builder.add_edge("agent_check", END)
 
     return builder

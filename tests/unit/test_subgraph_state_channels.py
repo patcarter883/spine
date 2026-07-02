@@ -61,8 +61,11 @@ def test_gap_plan_state_declares_directive_channel():
     assert "gap_plan_directive" in GapPlanSubgraphState.__annotations__
 
 
-def test_critic_state_declares_directive_channel():
-    assert "critic_directive" in CriticSubgraphState.__annotations__
+def test_critic_state_has_no_directive_channel():
+    """The critic's plan->do directive was removed: a no-tool directive twice
+    became the critic's de-facto review rubric with invented requirements
+    (traces 019f1204 Tkinter, 019f2131 'config_page' node)."""
+    assert "critic_directive" not in CriticSubgraphState.__annotations__
 
 
 def test_implement_state_declares_active_slice_directive():

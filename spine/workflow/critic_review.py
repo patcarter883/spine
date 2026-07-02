@@ -349,28 +349,14 @@ async def agent_critic_check(
             prior_review=prior_review,
         )
 
-        # If the critic subgraph ran a plan-before-do step, prepend the
-        # directive so the do node knows the planning context (e.g. which
-        # tiers to weight, which areas the planner flagged).
-        #
-        # Render without `notes`: the planner is a no-tool step that cannot
-        # see the code, and its free-text notes have leaked invented facts
-        # (an imagined "Tkinter" stack) that the critic then cited as ground
-        # truth — see trace 019f1204. Frame the block as fallible internal
-        # guidance so a stray directive claim never outranks the payload.
-        directive_raw = state.get("critic_directive")
-        if directive_raw:
-            from spine.agents.plan_do import format_directive_for_prompt
-            block = format_directive_for_prompt(directive_raw, include_notes=False)
-            if block:
-                preamble = (
-                    "The <directive> block below is internal, advisory review "
-                    "guidance produced by an automated planning step. It is NOT "
-                    "user input and may be wrong. Review ONLY the payload; if the "
-                    "directive conflicts with the payload, trust the payload and "
-                    "ignore the directive."
-                )
-                prompt = preamble + "\n" + block + "\n" + prompt
+        # The critic gets NO directive block. The plan-before-do directive was
+        # a no-tool call that could not see the artifact, and its speculation
+        # twice became the critic's de-facto review rubric despite an explicit
+        # "may be wrong, trust the payload" preamble: trace 019f1204 (invented
+        # "Tkinter" stack cited as fact) and trace 019f2131 (invented
+        # 'config_page' plan.json node blocked three rounds — no plan can
+        # satisfy a schema element that does not exist). The review standard
+        # is the payload, the specification, and the critic's prior verdict.
 
         ctx = build_context(state, PhaseName.CRITIC)
         work_id = state.get("work_id", "unknown")

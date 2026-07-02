@@ -224,7 +224,9 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     structural_result: dict | None
     agent_result: dict | None
     validation_result: dict | None
-    critic_directive: dict  # SubagentDirective for the agent-check plan→do split
+    # NOTE: no critic_directive channel — the critic's plan→do directive step
+    # was removed after twice poisoning reviews with invented requirements
+    # (traces 019f1204, 019f2131).
     # The critic's own prior verdict, forwarded from the parent's
     # last_critic_review — feeds the REWORK prompt (goalpost pinning) and the
     # reference-symbol gate's cross-round persistence check.
