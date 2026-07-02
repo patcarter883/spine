@@ -217,6 +217,14 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     agent_result: dict | None
     validation_result: dict | None
     critic_directive: dict  # SubagentDirective for the agent-check plan→do split
+    # The critic's own prior verdict, forwarded from the parent's
+    # last_critic_review — feeds the REWORK prompt (goalpost pinning) and the
+    # reference-symbol gate's cross-round persistence check.
+    last_critic_review: dict | None
+    # Reference-symbol gate outcome for THIS round ({} when the gate passed).
+    # The result mapper stashes it under last_critic_review["reference_gate"]
+    # so the next round can see which symbols were already flagged.
+    reference_gate_result: dict | None
 
 
 class AdversarialSubgraphState(BaseSubgraphState, total=False):

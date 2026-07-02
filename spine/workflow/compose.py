@@ -318,6 +318,12 @@ def _critic_state_mapper(reviewed_phase: str):
             # the critic subgraph state, not get re-read from disk.
             "specification_json": parent_state.get("specification_json"),
             "plan_json": parent_state.get("plan_json"),
+            # The critic's own prior verdict. agent_critic_check needs it to
+            # render the REWORK prompt (confirm prior asks, don't shift
+            # goalposts) and the reference-symbol gate needs its
+            # "reference_gate" entry to spot symbols that stayed dangling
+            # across rounds. Without this key both features silently no-op.
+            "last_critic_review": parent_state.get("last_critic_review"),
         }
 
     return mapper
@@ -627,6 +633,11 @@ def _critic_result_mapper(reviewed_phase: str):
             "blocker_category": blocker_category,
             "escalate": escalate,
             "escalation_kind": escalation_kind,
+            # This round's reference-symbol gate outcome ({} when it passed,
+            # absent for non-PLAN critics). Round-trips through the critic
+            # state mapper so the next round's gate can escalate symbols that
+            # stayed dangling despite this round's exact feedback.
+            "reference_gate": subgraph_result.get("reference_gate_result") or {},
         }
 
         # Rework of a workspace-mutating phase invalidates the per-work_id

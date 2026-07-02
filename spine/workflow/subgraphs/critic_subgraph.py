@@ -220,7 +220,40 @@ async def _plan_validation_node(
             },
         }
 
-    return {"phase_status": "passed"}
+    # Reference-symbol gate (deterministic, no LLM): every slice
+    # reference_symbols entry must resolve — in the codebase index, in a
+    # sibling slice's `provides`, or as an external-library name. Dangling
+    # entries get a precise revision message ("did you mean ...?"); a dangling
+    # symbol whose owner a scope_exclusions bullet protects escalates as a
+    # spec_contradiction the plan cannot rework its way out of (trace
+    # 019f2077: UIApi.get_llm_providers, 4 wasted critic rounds). Fully
+    # defensive — a gate crash must never take the critic down.
+    try:
+        from spine.workflow.plan_reference_gate import check_reference_symbols
+
+        prior_lcr = state.get("last_critic_review") or {}
+        prior_gate = (
+            prior_lcr.get("reference_gate")
+            if prior_lcr.get("phase") == PhaseName.PLAN.value
+            else None
+        )
+        gate = check_reference_symbols(
+            plan_data,
+            state.get("specification_json"),
+            prior_gate,
+            db_path=SpineConfig.load().checkpoint_path,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[{work_id}] reference-symbol gate skipped: {e}")
+        gate = None
+    if gate:
+        return {
+            "phase_status": gate["status"],
+            "validation_result": gate,
+            "reference_gate_result": gate,
+        }
+
+    return {"phase_status": "passed", "reference_gate_result": {}}
 
 
 async def _agent_check_node(
@@ -246,6 +279,12 @@ async def _agent_check_node(
         # Forward the directive from the plan-before-do split so
         # agent_critic_check can prepend it to the critic's prompt.
         "critic_directive": state.get("critic_directive"),
+        # The critic's own prior verdict — agent_critic_check renders it into
+        # the REWORK prompt so round N confirms round N-1's asks were met
+        # instead of shifting the goalposts. Without this key the anti-churn
+        # prompt never fired in production (trace 019f2077: four rounds, four
+        # unrelated objection sets).
+        "last_critic_review": state.get("last_critic_review"),
     }
     result = await agent_critic_check(pseudo_state, reviewed_phase, config)
     logger.info(
@@ -255,11 +294,20 @@ async def _agent_check_node(
 
     # Deterministic plan-validation is a HARD FLOOR: the LLM's verdict may not
     # upgrade a structural failure (dependency cycle, dangling dep, missing
-    # target_files/acceptance_criteria) into a PASS. The validation reason is
-    # folded into the agent result so the rework prompt actually sees it.
+    # target_files/acceptance_criteria, dangling reference_symbols) into a
+    # PASS. The validation reason is folded into the agent result so the
+    # rework prompt actually sees it. A NEEDS_REVIEW validation verdict (the
+    # reference-symbol gate's spec_contradiction) escalates as-is — its
+    # blocker_category rides along so the result mapper routes the review to
+    # SPECIFY. Deterministic verdicts deliberately bypass the LLM
+    # corroboration pass: they are checkable facts, not agent opinions.
     validation = state.get("validation_result") or {}
     if validation.get("status") and validation["status"] != ReviewStatus.PASSED.value:
-        effective_status = ReviewStatus.NEEDS_REVISION.value
+        effective_status = (
+            ReviewStatus.NEEDS_REVIEW.value
+            if validation["status"] == ReviewStatus.NEEDS_REVIEW.value
+            else ReviewStatus.NEEDS_REVISION.value
+        )
         if result.get("status") != effective_status:
             logger.info(
                 "[%s] Critic agent voted %s but deterministic validation failed "
@@ -269,6 +317,9 @@ async def _agent_check_node(
             )
         merged = dict(result)
         merged["status"] = effective_status
+        if validation.get("blocker_category"):
+            merged["blocker_category"] = validation["blocker_category"]
+            merged["cited_exclusions"] = validation.get("cited_exclusions") or []
         val_reason = validation.get("reason")
         if val_reason:
             existing = merged.get("reason") or ""
