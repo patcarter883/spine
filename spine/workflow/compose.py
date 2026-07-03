@@ -426,10 +426,13 @@ def _verify_failure_suggestions(subgraph_result: dict) -> list[str]:
 
 # Gap-fix cycle budget. The first _VERIFY_MIN_CYCLES gap-fix cycles are
 # unconditional (the pre-existing behavior); beyond that, further cycles are
-# granted ONLY while the total gap count strictly decreases, up to
-# _VERIFY_MAX_CYCLES. A trajectory-blind cap cut off run 019f2194 at 3 verify
-# passes while gaps were converging 18→12→8; a plateau or increase still stops
-# immediately after the floor, so a stuck loop costs no more than before.
+# granted while the run keeps setting new BEST (lowest) failed-criteria
+# totals, with a patience of one non-improving cycle (the verifier is an LLM
+# judge with per-cycle noise — run 019f25b8's checklist fails went 50→28→30→17
+# and a strict-decrease rule would have stopped at the 30). Two consecutive
+# cycles without a new best stop the run; _VERIFY_MAX_CYCLES bounds the total.
+# The best-state ratchet makes patience safe: a regressed cycle is restored
+# before the next one runs.
 _VERIFY_MIN_CYCLES = 2
 _VERIFY_MAX_CYCLES = 6
 
@@ -456,20 +459,48 @@ def _ratchet_files(parent_state: WorkflowState) -> list[str]:
 
 
 def _total_gap_count(findings: Any) -> int | None:
-    """Total open gaps across slice findings, or None when uncountable."""
+    """Total FAILED acceptance criteria across slice findings, or None.
+
+    Counts checklist entries with ``passed=False`` when a checklist is
+    present — the ``gaps`` list is free-text itemization whose granularity
+    varies per verifier call (run 019f25b8: checklist fails were flat at 17
+    for four cycles while gap-entry totals bounced 17→24→13→19, burning the
+    regression retry on phantom noise). Falls back to gap entries for
+    findings without a checklist; a failing finding with neither still
+    counts as one so a degenerate finding can't fake convergence to zero.
+    """
     if not isinstance(findings, list) or not findings:
         return None
     total = 0
     for f in findings:
         if not isinstance(f, dict):
             return None
+        checklist = f.get("checklist")
+        if isinstance(checklist, list) and checklist:
+            total += sum(
+                1
+                for it in checklist
+                if isinstance(it, dict) and not it.get("passed")
+            )
+            continue
         if f.get("verdict") == "VERIFIED":
             continue
         gaps = f.get("gaps")
-        # A failing slice with no itemized gaps still counts as one open gap
-        # so a degenerate finding can't fake convergence to zero.
         total += len(gaps) if isinstance(gaps, list) and gaps else 1
     return total
+
+
+def _cycles_since_best(totals: list[int]) -> int:
+    """Consecutive trailing cycles without a new best (lowest) total."""
+    best = None
+    since = 0
+    for t in totals:
+        if best is None or t < best:
+            best = t
+            since = 0
+        else:
+            since += 1
+    return since
 
 
 def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) -> dict[str, Any]:
@@ -477,9 +508,10 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
 
     When verification fails (phase_status="needs_review"), decides between a
     gap-fix cycle and human review: the first ``_VERIFY_MIN_CYCLES`` cycles are
-    unconditional, then further cycles are granted only while the total gap
-    count strictly decreases (progress-based budget, ceiling
-    ``_VERIFY_MAX_CYCLES``).
+    unconditional, then further cycles are granted while the run keeps setting
+    new best failed-criteria totals, tolerating one non-improving cycle
+    (verifier noise; the ratchet restores regressed cycles first), ceiling
+    ``_VERIFY_MAX_CYCLES``.
     """
     base = make_success_result_mapper(PhaseName.VERIFY.value)(subgraph_result, parent_state)
     phase_status = subgraph_result.get("phase_status", "")
@@ -492,11 +524,14 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
         if current_total is not None:
             totals.append(current_total)
             base["verify_gap_totals"] = totals
-        # Strict decrease, and ONLY judged on a total from THIS round — an
+        # Progress = a new BEST total, with patience: the verifier is an LLM
+        # judge with per-cycle noise, so a single non-improving cycle must not
+        # kill a converging run (run 019f25b8: checklist fails went 50→28→30→
+        # 17… — a strict-decrease rule would have stopped at the 30 and lost
+        # the drop to 17). Judged only on a total from THIS round — an
         # uncountable round must not ride on stale history.
-        improving = (
-            current_total is not None and len(totals) >= 2 and totals[-1] < totals[-2]
-        )
+        stall = _cycles_since_best(totals) if current_total is not None else 99
+        improving = current_total is not None and stall < 2
 
         # ── Best-state ratchet ──
         # The editor re-synthesizes from scratch each cycle, so a rework is a
@@ -531,24 +566,23 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
                     f"and the findings below describe the restored state."
                 )
 
-        # One retry from the restored best state — the regression proved the
-        # draw was bad, not the trajectory. A second regression stops the run
-        # (restored again, so the final state is still the best).
-        retries = parent_state.get("verify_regression_retries", 0)
-        retry_grant = regression_restored and retries < 1 and not improving
+        # A regressed cycle was already restored to the best state above, so
+        # granting the patience cycle retries from the BEST code, not the
+        # regression — patience subsumes the old one-shot regression retry.
         if verify_attempts < _VERIFY_MIN_CYCLES or (
-            (improving or retry_grant) and verify_attempts < _VERIFY_MAX_CYCLES
+            improving and verify_attempts < _VERIFY_MAX_CYCLES
         ):
             if verify_attempts >= _VERIFY_MIN_CYCLES:
                 logger.info(
-                    "[%s] verify: granting extra gap-fix cycle %d/%d (%s)",
+                    "[%s] verify: granting extra gap-fix cycle %d/%d "
+                    "(totals=%s stall=%d%s)",
                     parent_state.get("work_id", "?"),
                     verify_attempts + 1,
                     _VERIFY_MAX_CYCLES,
-                    "retry from restored best" if retry_grant else f"decreasing {totals[-4:]}",
+                    totals[-4:],
+                    stall,
+                    ", retrying from restored best" if regression_restored else "",
                 )
-            if retry_grant:
-                base["verify_regression_retries"] = retries + 1
             base["status"] = "needs_gap_fix"
             base["verify_attempts"] = verify_attempts + 1
         else:

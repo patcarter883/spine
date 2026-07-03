@@ -288,14 +288,33 @@ def _result(status: str, **fields: Any) -> str:
 
 
 def _check_python(source: str) -> Optional[str]:
-    """Return a syntax-error description, or None if the source parses."""
+    """Return a syntax-error description, or None if the source parses.
+
+    The description includes the offending source region: a bare
+    "invalid syntax (line 918, offset 29)" is useless to a no-tool retry
+    editor that cannot read the file, so the same broken edit re-failed
+    identically every gap cycle (run 019f25b8: the remove-method inserts
+    died on the same line/offset three cycles running with nothing to
+    steer the correction).
+    """
     import ast
 
     try:
         ast.parse(source)
         return None
     except SyntaxError as exc:
-        return f"SyntaxError: {exc.msg} (line {exc.lineno}, offset {exc.offset})"
+        msg = f"SyntaxError: {exc.msg} (line {exc.lineno}, offset {exc.offset})"
+        if exc.lineno:
+            lines = source.splitlines()
+            lo = max(0, exc.lineno - 3)
+            hi = min(len(lines), exc.lineno + 2)
+            region = "\n".join(
+                f"{'>>' if i + 1 == exc.lineno else '  '} {i + 1}: {lines[i]}"
+                for i in range(lo, hi)
+            )
+            if region:
+                msg += f"\nOffending region:\n{region}"
+        return msg
 
 
 def _check_php(source: str) -> Optional[str]:

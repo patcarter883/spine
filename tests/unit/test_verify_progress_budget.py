@@ -2,9 +2,11 @@
 
 The fixed 2-gap-cycle cap cut off a run whose total gap count was converging
 18→12→8. The first _VERIFY_MIN_CYCLES cycles stay unconditional (pre-existing
-behavior); beyond that a cycle is granted only while the total strictly
-decreases, up to _VERIFY_MAX_CYCLES. Plateau or increase stops immediately, so
-a stuck loop costs no more than before.
+behavior); beyond that a cycle is granted while the run keeps setting new BEST
+totals, with a patience of one non-improving cycle (verifier noise — run
+019f25b8), up to _VERIFY_MAX_CYCLES. Two consecutive cycles without a new
+best stop the run. Totals count FAILED CHECKLIST CRITERIA (stable) rather
+than free-text gap entries (itemization noise).
 """
 
 from __future__ import annotations
@@ -49,6 +51,30 @@ def test_total_gap_count():
     assert _total_gap_count(None) is None
 
 
+def test_total_gap_count_prefers_checklist_fails():
+    # gap entries are free-text itemization noise (run 019f25b8: 13 gap
+    # entries vs 17 checklist fails on the same state) — the checklist wins.
+    finding = {
+        "verdict": "NOT_VERIFIED",
+        "gaps": ["a", "b"],  # 2 entries...
+        "checklist": [
+            {"criterion": "c1", "passed": False},
+            {"criterion": "c2", "passed": False},
+            {"criterion": "c3", "passed": False},
+            {"criterion": "c4", "passed": True},
+        ],  # ...but 3 real fails
+    }
+    assert _total_gap_count([finding]) == 3
+
+
+def test_one_stall_cycle_is_tolerated_then_stops():
+    # Patience: one non-improving cycle continues (judge noise), two stop.
+    out = _run_mapper(2, totals=[28], gaps_now=_findings(15, 15))  # 30 > 28
+    assert out["status"] == "needs_gap_fix"
+    out = _run_mapper(3, totals=[28, 30], gaps_now=_findings(15, 14))  # 29, still no best
+    assert out["status"] == "needs_review"
+
+
 def test_floor_cycles_granted_unconditionally():
     for attempts in range(_VERIFY_MIN_CYCLES):
         out = _run_mapper(attempts, totals=[], gaps_now=_findings(5))
@@ -56,20 +82,20 @@ def test_floor_cycles_granted_unconditionally():
         assert out["verify_attempts"] == attempts + 1
 
 
-def test_extra_cycle_granted_while_strictly_decreasing():
+def test_extra_cycle_granted_while_improving():
     out = _run_mapper(_VERIFY_MIN_CYCLES, totals=[18, 12], gaps_now=_findings(4, 4))
     assert out["status"] == "needs_gap_fix"
     assert out["verify_gap_totals"] == [18, 12, 8]
 
 
-def test_plateau_stops_after_floor():
-    out = _run_mapper(_VERIFY_MIN_CYCLES, totals=[12, 8], gaps_now=_findings(4, 4))
+def test_two_cycle_plateau_stops_after_floor():
+    out = _run_mapper(3, totals=[12, 8, 8], gaps_now=_findings(4, 4))
     assert out["status"] == "needs_review"
     assert out["needs_review_phase"] == "verify"
 
 
-def test_increase_stops_after_floor():
-    out = _run_mapper(_VERIFY_MIN_CYCLES, totals=[12, 8], gaps_now=_findings(9))
+def test_two_nonimproving_cycles_stop_after_floor():
+    out = _run_mapper(3, totals=[12, 8, 9], gaps_now=_findings(9))
     assert out["status"] == "needs_review"
 
 
@@ -135,7 +161,7 @@ def test_new_best_is_snapshotted(monkeypatch):
     assert out["status"] == "needs_gap_fix"
 
 
-def test_regression_restores_and_grants_one_retry(monkeypatch):
+def test_regression_restores_and_patience_grants_retry(monkeypatch):
     best_findings = _findings(4, 5)
     spy = _SnapSpy()
     spy.install(monkeypatch, best_findings=best_findings)
@@ -144,7 +170,8 @@ def test_regression_restores_and_grants_one_retry(monkeypatch):
     assert spy.snapshots == []
     # Findings handed downstream describe the RESTORED state, not the regression.
     assert out["verification_findings"] == best_findings
-    assert out["verify_regression_retries"] == 1
+    # First non-improving cycle → patience grants the next one, retried from
+    # the restored best state.
     assert out["status"] == "needs_gap_fix"
     assert "RESTORED" in out["feedback"][-1]["reason"]
 
@@ -155,6 +182,8 @@ def test_second_regression_stops_but_still_restores(monkeypatch):
     spy.install(monkeypatch, best_findings=best_findings)
     out = _run_ratchet(6, [43, 22, 11, 9, 23], _findings(25), best={"total": 9}, retries=1)
     assert spy.restores == 1
+    # Two consecutive non-improving cycles exhaust the patience → stop, with
+    # the workspace restored to (and findings describing) the best state.
     assert out["status"] == "needs_review"
     assert out["verification_findings"] == best_findings
 
@@ -164,4 +193,5 @@ def test_plateau_neither_snapshots_nor_restores(monkeypatch):
     spy.install(monkeypatch)
     out = _run_ratchet(3, [12, 12], _findings(12), best={"total": 12})
     assert spy.snapshots == [] and spy.restores == 0
+    # Third identical total = two trailing stall cycles → stop.
     assert out["status"] == "needs_review"

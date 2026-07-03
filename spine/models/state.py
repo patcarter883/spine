@@ -185,8 +185,10 @@ class WorkflowState(TypedDict, total=False):
     # the lowest gap total achieved; the snapshot itself lives on disk under
     # the verify artifact dir (run 019f2579: a late regressed cycle must not
     # leave worse code on disk than the best cycle produced).
-    verify_regression_retries: int  # Gap-fix cycles granted as a retry from a
-    # restored best state (capped at 1 per run).
+    verify_regression_retries: int  # LEGACY (kept so resumed checkpoints
+    # deserialize): the one-shot regression retry was subsumed by the
+    # patience-based budget — a restored regression is just a stall cycle,
+    # and patience grants the next cycle from the restored best state.
 
     # ── Phase Completion Invariants (prevent rework misinterpretation) ──
     # These boolean flags track whether critical phase operations completed

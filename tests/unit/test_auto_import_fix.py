@@ -64,3 +64,18 @@ def test_clean_write_untouched(tmp_path):
     out = _tool(tmp_path)._run("mod.py", full_replace=code)
     assert "auto_imports_added" not in out
     assert (tmp_path / "mod.py").read_text() == code
+
+
+def test_syntax_error_feedback_includes_offending_region(tmp_path):
+    """A bare 'invalid syntax (line N, offset M)' is useless to a no-tool
+    retry editor (run 019f25b8: the same broken insert re-failed identically
+    three cycles running). The error now carries the offending source lines."""
+    (tmp_path / "mod.py").write_text("def ok():\n    return 1\n")
+    tool = ReadEditLintTool(workspace_root=str(tmp_path), target_files=["mod.py"])
+    out = tool._run(
+        "mod.py",
+        full_replace="def ok():\n    return 1\n\ndef broken(:\n    return 2\n",
+    )
+    assert "syntax_error" in out
+    assert "Offending region" in out
+    assert "def broken(:" in out
