@@ -361,6 +361,91 @@ _RUFF_MAX_ISSUES = 10
 _RUFF_TIMEOUT_S = 10
 
 
+def _auto_import_fix(
+    path: Path, workspace_root: str, ruff_summary: str
+) -> Optional[tuple[str, list[str]]]:
+    """Deterministically add missing top-level imports flagged as F821.
+
+    Run 019f253c: every gap-fix cycle plateaued (totals 12/12/12) because the
+    synthesis editor's methods used ``yaml`` without importing it — the edit
+    schema only speaks whole def/class constructs, so the editor could not
+    express "add import yaml" even when the gap feedback named it, and the
+    advisory ruff report never blocks a write. For each F821 undefined name
+    that resolves to an importable module and is not already imported, insert
+    ``import <name>`` after the last top-level import (or the module
+    docstring), syntax-check, rewrite, and re-run ruff. Names that do not
+    resolve to modules (typo'd variables) are left for the model. Returns
+    ``(new_ruff_summary, added_names)`` or None (nothing fixable / any
+    error — fail-open, the original advisory summary stands).
+    """
+    import ast as _ast
+    import importlib.util
+    import re as _re
+
+    names = sorted(
+        set(_re.findall(r"F821 [Uu]ndefined name [`'\"]?(\w+)", ruff_summary))
+    )
+    if not names:
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+        tree = _ast.parse(content)
+    except Exception:  # noqa: BLE001 — unreadable/unparseable ⇒ leave as-is
+        return None
+
+    already: set[str] = set()
+    last_import_end = 0
+    for node in tree.body:
+        if isinstance(node, _ast.Import):
+            for a in node.names:
+                already.add((a.asname or a.name).split(".")[0])
+            last_import_end = max(last_import_end, node.end_lineno or 0)
+        elif isinstance(node, _ast.ImportFrom):
+            for a in node.names:
+                already.add(a.asname or a.name)
+            last_import_end = max(last_import_end, node.end_lineno or 0)
+
+    addable: list[str] = []
+    for name in names:
+        if name in already:
+            continue  # imported yet still F821 — a scope problem, not ours
+        try:
+            if importlib.util.find_spec(name) is None:
+                continue
+        except Exception:  # noqa: BLE001 — not an importable module name
+            continue
+        addable.append(name)
+    if not addable:
+        return None
+
+    if last_import_end:
+        at = last_import_end
+    elif (
+        tree.body
+        and isinstance(tree.body[0], _ast.Expr)
+        and isinstance(getattr(tree.body[0], "value", None), _ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        at = tree.body[0].end_lineno or 0  # after the module docstring
+    else:
+        at = 0
+    lines = content.splitlines(keepends=True)
+    if at > len(lines):
+        return None
+    new_content = "".join(
+        lines[:at] + [f"import {n}\n" for n in addable] + lines[at:]
+    )
+    try:
+        _ast.parse(new_content)
+    except SyntaxError:
+        return None
+    try:
+        _atomic_write(path, new_content)
+    except OSError:
+        return None
+    return (_ruff_report(path, workspace_root) or "clean", addable)
+
+
 def _ruff_report(path: Path, workspace_root: str) -> Optional[str]:
     """Run ``ruff check`` on the written file; return a bounded summary.
 
@@ -1737,6 +1822,14 @@ class ReadEditLintTool(BaseTool):
         if redirect_note:
             ok_fields["note"] = redirect_note.strip().strip("[]")
         ruff = _ruff_report(path, self.workspace_root)
+        if ruff is not None and ruff != "clean":
+            # Deterministic repair for missing module imports (F821): the
+            # synthesis editor's schema cannot express "add import yaml", so
+            # left alone the defect plateaus every gap cycle (run 019f253c).
+            fixed = _auto_import_fix(path, self.workspace_root, ruff)
+            if fixed is not None:
+                ruff, added = fixed
+                ok_fields["auto_imports_added"] = added
         if ruff is not None:
             ok_fields["ruff"] = ruff
         # A successful write changes the file → bump its epoch so cached reads of
