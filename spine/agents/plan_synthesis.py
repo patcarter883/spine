@@ -372,7 +372,18 @@ _WORKER_ROLE = (
     "The other slices listed own their own files — do NOT re-describe their "
     "work, and do NOT implement anything outside your target_files. If your "
     "slice depends on a sibling slice's output, reference it by id; don't "
-    "restate its implementation."
+    "restate its implementation.\n"
+    "ACCEPTANCE CRITERIA RULES: every criterion states OBSERVABLE BEHAVIOR — "
+    "what the code does (inputs accepted, effects produced, values returned) — "
+    "never implementation prescriptions. Do NOT prescribe parameter names, "
+    "exact signatures, private-helper choices, import style, or internal "
+    "idioms unless the specification itself dictates them (run 019f25b8: "
+    "criteria demanding 'individual params' AND 'mirrors add_llm_provider' "
+    "were unsatisfiable together and blocked a working implementation for "
+    "seven cycles). When the slice extends an existing class or file, every "
+    "criterion must be satisfiable by code that follows that file's existing "
+    "conventions; a behavior an implementer could deliver in several "
+    "reasonable shapes must be stated so ALL of them pass."
 )
 
 

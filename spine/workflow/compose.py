@@ -434,7 +434,9 @@ def _verify_failure_suggestions(subgraph_result: dict) -> list[str]:
 # The best-state ratchet makes patience safe: a regressed cycle is restored
 # before the next one runs.
 _VERIFY_MIN_CYCLES = 2
-_VERIFY_MAX_CYCLES = 6
+# 8 gives the final-mile mode runway: cycles are ~2 min, the ratchet makes
+# each one safe, and patience-2 stops genuinely stuck runs long before this.
+_VERIFY_MAX_CYCLES = 8
 
 
 def _ratchet_files(parent_state: WorkflowState) -> list[str]:

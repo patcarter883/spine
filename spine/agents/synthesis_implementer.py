@@ -236,6 +236,7 @@ def build_synthesis_prompt(
     files_body: str = "",
     feedback: str = "",
     gaps_body: str = "",
+    final_mile_fails: list[str] | None = None,
 ) -> str:
     """Assemble the synthesis user prompt (hostage layout, data blocks first).
 
@@ -267,6 +268,17 @@ def build_synthesis_prompt(
             "corrected SynthesizedSlice that fixes exactly those failures — keep "
             "the edits that were fine, repair the ones the linter rejected."
         )
+    elif final_mile_fails:
+        crit_lines = "\n".join(f"- {c}" for c in final_mile_fails)
+        tail = (
+            f"FINAL MILE: only {len(final_mile_fails)} acceptance criteria "
+            "remain failing (listed below); everything else already passes "
+            "verification. Return the SMALLEST possible edit set that fixes "
+            "EXACTLY these failures: edit only the specific function(s) each "
+            "criterion names, emit NO other definitions, and do NOT rewrite "
+            "or re-emit anything that currently passes.\n"
+            f"{crit_lines}"
+        )
     elif gaps_body:
         tail = (
             "This is a VERIFICATION REWORK: a previous implementation of this "
@@ -294,6 +306,7 @@ async def synthesize_slice_code(
     n: int = 1,
     feedback: str = "",
     gaps_body: str = "",
+    final_mile_fails: list[str] | None = None,
     escalation_level: int = 0,
 ) -> list[SynthesizedSlice]:
     """Generate ``n`` candidate edit-sets for a slice via a no-tool structured call.
@@ -343,6 +356,7 @@ async def synthesize_slice_code(
         files_body=files_body,
         feedback=feedback,
         gaps_body=gaps_body,
+        final_mile_fails=final_mile_fails,
     )
     messages = [
         SystemMessage(content=_SYNTHESIS_SYSTEM_PROMPT),
@@ -524,6 +538,7 @@ def place_best_candidate(
     workspace_root: str,
     target_files: list[str],
     reference_only_files: list[str] | None = None,
+    prefer_minimal: bool = False,
 ) -> tuple[SynthesizedSlice | None, PlacementResult]:
     """Score + KeepBest over synthesized candidates, with the linter as scorer.
 
@@ -553,7 +568,7 @@ def place_best_candidate(
         )
 
     best: SynthesizedSlice | None = None
-    best_key: tuple[int, int, int] | None = None
+    best_key: tuple | None = None
     for i, cand in enumerate(real):
         files = sorted({e.file for e in cand.edits if e.file})
         staging = _stage_files(workspace_root, files)
@@ -566,7 +581,14 @@ def place_best_candidate(
             )
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-        key = res.score()
+        # Final-mile mode inverts the size bias: the normal score rewards
+        # MORE applied edits (bigger candidates win), which is exactly wrong
+        # when only a couple of criteria remain — prefer the smallest clean
+        # candidate, then fall back to the normal score as tiebreak.
+        if prefer_minimal:
+            key = (1 if res.clean else 0, -len(cand.edits)) + res.score()
+        else:
+            key = res.score()
         logger.info(
             "synthesis best-of-%d: candidate %d/%d applied=%d failed=%d ruff=%d",
             len(real), i + 1, len(real), res.n_applied, res.n_failures, res.ruff_issues,

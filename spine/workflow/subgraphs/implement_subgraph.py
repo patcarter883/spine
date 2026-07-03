@@ -139,6 +139,46 @@ def _slice_marker_ids(slices: list[dict]) -> set[str]:
     return ids
 
 
+# Final-mile mode: when a slice is down to a HANDFUL of failing criteria
+# (with a substantial passing majority), wholesale re-synthesis risks more
+# than it fixes — run 019f25f5 reached 3/25 failing and then two full
+# regenerations scored worse (6, 9) until the budget expired. Below this
+# threshold the editor is constrained to the smallest edit set that fixes
+# exactly the failing criteria, and placement prefers the smallest clean
+# candidate.
+_FINAL_MILE_MAX_FAILS = 5
+
+
+def _final_mile_fails(state: ImplementSubgraphState, active_slice: dict) -> list[str]:
+    """This slice's failing criteria when it qualifies for final-mile mode.
+
+    Qualifies when the last verification shows 1..=_FINAL_MILE_MAX_FAILS
+    failing checklist criteria AND more passing than failing (real progress
+    to protect). Returns the failing criterion texts, or [] (not a rework,
+    no findings, too many fails, or no passing majority).
+    """
+    ids = _slice_marker_ids([active_slice])
+    fails: list[str] = []
+    passing = 0
+    seen_any = False
+    for f in state.get("verification_findings") or []:
+        if not isinstance(f, dict) or f.get("slice_name") not in ids:
+            continue
+        for item in f.get("checklist") or []:
+            if not isinstance(item, dict) or not item.get("criterion"):
+                continue
+            seen_any = True
+            if item.get("passed"):
+                passing += 1
+            else:
+                fails.append(str(item["criterion"]))
+    if not seen_any or not fails:
+        return []
+    if len(fails) > _FINAL_MILE_MAX_FAILS or passing <= len(fails):
+        return []
+    return fails
+
+
 # Bound on the rendered gap-remediation block. A gap plan covers every failed
 # slice; the per-slice extract is small, but a degenerate gap plan must not
 # blow the editor's prompt.
@@ -1456,8 +1496,20 @@ async def _synthesis_implementer_node(
         # the no-tool editor cannot read gap_plan.json, and without the gaps
         # in-prompt it regenerates the exact failing code (run 019f20a5).
         gaps_body = _gap_fixes_body(state, active_slice)
+        # Final mile: a handful of failing criteria on a mostly-green slice ->
+        # smallest-possible edits only, and placement prefers the smallest
+        # clean candidate (run 019f25f5: wholesale regeneration at 3/25
+        # failing scored worse twice and the budget expired).
+        final_mile = _final_mile_fails(state, active_slice)
+        if final_mile:
+            logger.info(
+                "[%s] synthesis_implementer: FINAL MILE for %r - %d failing "
+                "criteria, minimal-edit mode",
+                work_id, slice_id, len(final_mile),
+            )
 
         candidates = await synthesize_slice_code(
+            final_mile_fails=final_mile,
             slice_json=slice_json,
             refs_body=refs_body,
             plan_body=plan_body,
@@ -1469,13 +1521,17 @@ async def _synthesis_implementer_node(
             escalation_level=escalation_level,
         )
         winner, placement = place_best_candidate(
-            candidates, workspace_root=workspace_root, target_files=target_files
+            candidates,
+            workspace_root=workspace_root,
+            target_files=target_files,
+            prefer_minimal=bool(final_mile),
         )
 
         # One corrective retry: feed the exact lint failures back to synthesis so
         # it repairs them, then re-place. Keep whichever attempt placed cleaner.
         if placement.n_failures:
             retry = await synthesize_slice_code(
+                final_mile_fails=final_mile,
                 slice_json=slice_json,
                 refs_body=refs_body,
                 plan_body=plan_body,
