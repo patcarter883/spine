@@ -82,3 +82,86 @@ def test_hard_ceiling_stops_even_while_decreasing():
 def test_uncountable_findings_stop_after_floor():
     out = _run_mapper(_VERIFY_MIN_CYCLES, totals=[9, 5], gaps_now=[])
     assert out["status"] == "needs_review"
+
+
+# ── Best-state ratchet (run 019f2579: 43→22→11→9 then a regression to 23) ──
+
+
+class _SnapSpy:
+    def __init__(self):
+        self.snapshots: list[int] = []
+        self.restores = 0
+
+    def install(self, monkeypatch, best_findings=None):
+        import spine.workflow.verify_snapshot as vs
+
+        monkeypatch.setattr(
+            vs, "snapshot_best",
+            lambda ws, wid, files, findings, total: self.snapshots.append(total) or True,
+        )
+        monkeypatch.setattr(
+            vs, "restore_best",
+            lambda ws, wid: (setattr(self, "restores", self.restores + 1) or True),
+        )
+        monkeypatch.setattr(
+            vs, "load_best_findings", lambda ws, wid: best_findings
+        )
+
+
+def _run_ratchet(attempts, totals, gaps_now, best=None, retries=0, monkeypatch=None, spy=None):
+    subgraph_result = {
+        "phase_status": "needs_review",
+        "verification_findings": gaps_now,
+    }
+    parent = {
+        "work_id": "w",
+        "workspace_root": "/tmp/x",
+        "verify_attempts": attempts,
+        "verify_gap_totals": totals,
+        "verify_best": best,
+        "verify_regression_retries": retries,
+        "retry_count": {},
+        "execution_waves": [[{"id": "s0", "target_files": ["a.py"]}]],
+    }
+    return _verify_result_mapper(subgraph_result, parent)
+
+
+def test_new_best_is_snapshotted(monkeypatch):
+    spy = _SnapSpy()
+    spy.install(monkeypatch)
+    out = _run_ratchet(3, [43, 22], _findings(11), best={"total": 22}, monkeypatch=monkeypatch, spy=spy)
+    assert spy.snapshots == [11]
+    assert out["verify_best"] == {"total": 11}
+    assert out["status"] == "needs_gap_fix"
+
+
+def test_regression_restores_and_grants_one_retry(monkeypatch):
+    best_findings = _findings(4, 5)
+    spy = _SnapSpy()
+    spy.install(monkeypatch, best_findings=best_findings)
+    out = _run_ratchet(5, [43, 22, 11, 9], _findings(23), best={"total": 9})
+    assert spy.restores == 1
+    assert spy.snapshots == []
+    # Findings handed downstream describe the RESTORED state, not the regression.
+    assert out["verification_findings"] == best_findings
+    assert out["verify_regression_retries"] == 1
+    assert out["status"] == "needs_gap_fix"
+    assert "RESTORED" in out["feedback"][-1]["reason"]
+
+
+def test_second_regression_stops_but_still_restores(monkeypatch):
+    best_findings = _findings(9)
+    spy = _SnapSpy()
+    spy.install(monkeypatch, best_findings=best_findings)
+    out = _run_ratchet(6, [43, 22, 11, 9, 23], _findings(25), best={"total": 9}, retries=1)
+    assert spy.restores == 1
+    assert out["status"] == "needs_review"
+    assert out["verification_findings"] == best_findings
+
+
+def test_plateau_neither_snapshots_nor_restores(monkeypatch):
+    spy = _SnapSpy()
+    spy.install(monkeypatch)
+    out = _run_ratchet(3, [12, 12], _findings(12), best={"total": 12})
+    assert spy.snapshots == [] and spy.restores == 0
+    assert out["status"] == "needs_review"

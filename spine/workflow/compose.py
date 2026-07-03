@@ -305,6 +305,14 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
         "retry_count": parent_state.get("retry_count", {}).get(PhaseName.IMPLEMENT.value, 0),
         "plan_path": artifact_path(work_id, PhaseName.PLAN.value),
         "gap_plan_path": artifact_path(work_id, PhaseName.GAP_PLAN.value) if verify_attempts > 0 else None,
+        # On gap reworks the editors render each slice's PASSING checklist
+        # criteria as a do-not-break block (run 019f2579: a wholesale
+        # re-synthesis regressed 9→23 open gaps late in the run).
+        "verification_findings": (
+            parent_state.get("verification_findings") or []
+            if verify_attempts > 0
+            else []
+        ),
         "pending_slices": pending,
         "completed_slices": [],
         "failed_slices": [],
@@ -426,6 +434,27 @@ _VERIFY_MIN_CYCLES = 2
 _VERIFY_MAX_CYCLES = 6
 
 
+def _ratchet_files(parent_state: WorkflowState) -> list[str]:
+    """Workspace-relative files the best-state ratchet snapshots/restores.
+
+    The implementation files (every slice's target_files plus whatever the
+    implementer reported writing) and the verify artifacts describing them —
+    restoring code without its matching verification.json would hand gap_plan
+    findings for the wrong state.
+    """
+    work_id = parent_state.get("work_id", "")
+    files: set[str] = {str(f) for f in (parent_state.get("files_written") or []) if f}
+    for wave in parent_state.get("execution_waves") or []:
+        if isinstance(wave, list):
+            for s in wave:
+                if isinstance(s, dict):
+                    files |= {str(f) for f in (s.get("target_files") or []) if f}
+    vdir = artifact_path(work_id, PhaseName.VERIFY.value)
+    files.add(f"{vdir}/verification.json")
+    files.add(f"{vdir}/verification.md")
+    return sorted(files)
+
+
 def _total_gap_count(findings: Any) -> int | None:
     """Total open gaps across slice findings, or None when uncountable."""
     if not isinstance(findings, list) or not findings:
@@ -454,6 +483,8 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
     """
     base = make_success_result_mapper(PhaseName.VERIFY.value)(subgraph_result, parent_state)
     phase_status = subgraph_result.get("phase_status", "")
+    findings_override: list[dict] | None = None
+    ratchet_note = ""
     if phase_status == "needs_review":
         verify_attempts = parent_state.get("verify_attempts", 0)
         totals = list(parent_state.get("verify_gap_totals") or [])
@@ -466,18 +497,58 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
         improving = (
             current_total is not None and len(totals) >= 2 and totals[-1] < totals[-2]
         )
+
+        # ── Best-state ratchet ──
+        # The editor re-synthesizes from scratch each cycle, so a rework is a
+        # variance draw; run 019f2579 converged 43→22→11→9 then a bad draw
+        # regressed to 23 and the loop stopped with the WORSE code on disk.
+        # Snapshot each new best (lowest total); on a regression, restore it —
+        # code, verification artifacts, and state findings together — so the
+        # loop's floor is monotone and the final state is always the best one.
+        regression_restored = False
+        if current_total is not None:
+            from spine.workflow import verify_snapshot as _snap
+
+            work_id = parent_state.get("work_id", "")
+            ws_root = parent_state.get("workspace_root", ".")
+            best_total = (parent_state.get("verify_best") or {}).get("total")
+            if best_total is None or current_total < best_total:
+                if _snap.snapshot_best(
+                    ws_root,
+                    work_id,
+                    _ratchet_files(parent_state),
+                    subgraph_result.get("verification_findings") or [],
+                    current_total,
+                ):
+                    base["verify_best"] = {"total": current_total}
+            elif current_total > best_total and _snap.restore_best(ws_root, work_id):
+                regression_restored = True
+                findings_override = _snap.load_best_findings(ws_root, work_id)
+                ratchet_note = (
+                    f" | NOTE: this cycle REGRESSED the implementation "
+                    f"({best_total}→{current_total} open gaps); the workspace "
+                    f"has been RESTORED to the best state ({best_total} gaps) "
+                    f"and the findings below describe the restored state."
+                )
+
+        # One retry from the restored best state — the regression proved the
+        # draw was bad, not the trajectory. A second regression stops the run
+        # (restored again, so the final state is still the best).
+        retries = parent_state.get("verify_regression_retries", 0)
+        retry_grant = regression_restored and retries < 1 and not improving
         if verify_attempts < _VERIFY_MIN_CYCLES or (
-            improving and verify_attempts < _VERIFY_MAX_CYCLES
+            (improving or retry_grant) and verify_attempts < _VERIFY_MAX_CYCLES
         ):
             if verify_attempts >= _VERIFY_MIN_CYCLES:
                 logger.info(
-                    "[%s] verify: gap total still decreasing (%s) — granting "
-                    "extra gap-fix cycle %d/%d",
+                    "[%s] verify: granting extra gap-fix cycle %d/%d (%s)",
                     parent_state.get("work_id", "?"),
-                    totals[-4:],
                     verify_attempts + 1,
                     _VERIFY_MAX_CYCLES,
+                    "retry from restored best" if retry_grant else f"decreasing {totals[-4:]}",
                 )
+            if retry_grant:
+                base["verify_regression_retries"] = retries + 1
             base["status"] = "needs_gap_fix"
             base["verify_attempts"] = verify_attempts + 1
         else:
@@ -487,7 +558,7 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
             {
                 "status": "needs_review",
                 "tier": "verify",
-                "reason": _verify_failure_reason(subgraph_result),
+                "reason": _verify_failure_reason(subgraph_result) + ratchet_note,
                 "suggestions": _verify_failure_suggestions(subgraph_result),
             }
         ]
@@ -500,6 +571,11 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
     vf = subgraph_result.get("verification_findings", [])
     if vf:
         base["verification_findings"] = vf
+    if findings_override:
+        # A restored regression must hand downstream consumers (gap_plan, the
+        # implement rework, per-slice convergence) the findings that match the
+        # RESTORED code, not the regressed cycle's.
+        base["verification_findings"] = findings_override
     return base
 
 

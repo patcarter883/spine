@@ -117,6 +117,7 @@ def _base_send_payload(state: ImplementSubgraphState) -> dict[str, Any]:
         "workspace_root": state.get("workspace_root", "."),
         "plan_path": state.get("plan_path", ""),
         "gap_plan_path": state.get("gap_plan_path"),
+        "verification_findings": state.get("verification_findings") or [],
     }
 
 
@@ -141,7 +142,11 @@ def _slice_marker_ids(slices: list[dict]) -> set[str]:
 # Bound on the rendered gap-remediation block. A gap plan covers every failed
 # slice; the per-slice extract is small, but a degenerate gap plan must not
 # blow the editor's prompt.
-_GAP_BODY_CHAR_CAP = 4000
+_GAP_BODY_CHAR_CAP = 7000
+
+# Bound on the do-not-break (currently passing criteria) block within the
+# gap body — large merged slices carry 40+ criteria.
+_GAP_PASSING_CHAR_CAP = 2500
 
 
 def _gap_fixes_body(state: ImplementSubgraphState, active_slice: dict) -> str:
@@ -198,6 +203,27 @@ def _gap_fixes_body(state: ImplementSubgraphState, active_slice: dict) -> str:
                 lines.append(f"  Must satisfy: {ac}")
     if not lines:
         return ""
+    # Criteria this slice ALREADY satisfies, from last cycle's verification
+    # checklist. The no-tool editor re-synthesizes wholesale, so without an
+    # explicit do-not-break list a rework is free to trade passing criteria
+    # for failing ones (run 019f2579: cycle 6 regressed 9→23 open gaps).
+    passing: list[str] = []
+    for f in state.get("verification_findings") or []:
+        if not isinstance(f, dict) or f.get("slice_name") not in ids:
+            continue
+        for item in f.get("checklist") or []:
+            if isinstance(item, dict) and item.get("passed") and item.get("criterion"):
+                passing.append(str(item["criterion"]))
+    if passing:
+        block = ["", "CURRENTLY PASSING — your edits MUST NOT break these behaviors:"]
+        block.extend(f"  [pass] {p}" for p in passing)
+        passing_body = "\n".join(block)
+        if len(passing_body) > _GAP_PASSING_CHAR_CAP:
+            passing_body = (
+                passing_body[:_GAP_PASSING_CHAR_CAP].rstrip()
+                + f" … [+{len(passing)} passing criteria total — preserve ALL current behavior you are not explicitly fixing]"
+            )
+        lines.append(passing_body)
     body = "\n".join(lines)
     if len(body) > _GAP_BODY_CHAR_CAP:
         body = body[:_GAP_BODY_CHAR_CAP].rstrip() + " … [gap plan truncated]"

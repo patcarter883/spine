@@ -142,6 +142,11 @@ class ImplementSubgraphState(BaseSubgraphState, total=False):
 
     plan_path: str
     gap_plan_path: str | None  # Set when re-running for a gap fix
+    # Last cycle's verification findings (forwarded on gap reworks) — the
+    # editors render each slice's PASSING checklist criteria as a
+    # do-not-break block, countering wholesale-regeneration regressions
+    # (run 019f2579: cycle 6 regressed 9→23 open gaps).
+    verification_findings: list[dict]
 
     # Transient — populated per-Send by ``_route_slices``.
     active_slice: dict

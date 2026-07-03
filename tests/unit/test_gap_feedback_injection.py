@@ -124,8 +124,10 @@ def test_degenerate_gap_plan_is_capped(tmp_path: Path) -> None:
     d.mkdir()
     (d / "gap_plan.json").write_text(json.dumps(huge), encoding="utf-8")
     state = {"workspace_root": str(tmp_path), "gap_plan_path": "gaps"}
+    from spine.workflow.subgraphs.implement_subgraph import _GAP_BODY_CHAR_CAP
+
     body = _gap_fixes_body(state, {"id": "s"})
-    assert len(body) < 4200
+    assert len(body) < _GAP_BODY_CHAR_CAP + 200
     assert "truncated" in body
 
 
@@ -165,3 +167,28 @@ def test_lint_feedback_keeps_tail_priority_over_gaps() -> None:
     assert "E999 SyntaxError" in p
     assert "FAILED to place" in p
     assert "VERIFICATION REWORK" not in p
+
+
+def test_passing_criteria_render_as_do_not_break_block(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["verification_findings"] = [
+        {
+            "slice_name": "ui-provider-config",
+            "verdict": "NOT_VERIFIED",
+            "checklist": [
+                {"criterion": "dropdown renders", "passed": True},
+                {"criterion": "save persists", "passed": False},
+            ],
+            "gaps": ["save persists"],
+        }
+    ]
+    body = _gap_fixes_body(state, {"id": "ui-provider-config"})
+    assert "CURRENTLY PASSING" in body
+    assert "[pass] dropdown renders" in body
+    assert "[pass] save persists" not in body
+
+
+def test_no_findings_no_do_not_break_block(tmp_path: Path) -> None:
+    body = _gap_fixes_body(_state(tmp_path), {"id": "ui-provider-config"})
+    assert "CURRENTLY PASSING" not in body
+    assert "FAILED verification" in body
