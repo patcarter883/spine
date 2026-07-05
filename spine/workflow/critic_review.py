@@ -483,6 +483,10 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
         return {
             "status": ReviewStatus.NEEDS_REVISION.value,
             "tier": "agent",
+            # "guard": harness noise, not a real ask-set — convergence streak
+            # accounting must skip it (see critic_convergence.compute_streaks;
+            # trace 019f260c counted a truncation round as two goalpost shifts).
+            "verdict_source": "guard",
             "reason": (
                 "Critic response was truncated at the token limit "
                 "(finish_reason=length) without a structured verdict — treating "

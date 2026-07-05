@@ -287,6 +287,12 @@ async def _agent_check_node(
             )
         merged = dict(result)
         merged["status"] = effective_status
+        # "gate": deterministic findings dominate this verdict — streak
+        # accounting compares it gate-vs-gate, and agent_status lets the
+        # mapper drop the agent baseline when the agent chain converged
+        # (voted PASSED) under a gate override.
+        merged["verdict_source"] = "gate"
+        merged["agent_status"] = result.get("status")
         if validation.get("blocker_category"):
             merged["blocker_category"] = validation["blocker_category"]
             merged["cited_exclusions"] = validation.get("cited_exclusions") or []

@@ -733,11 +733,14 @@ def _critic_result_mapper(reviewed_phase: str):
         if agent_result:
             effective_result = agent_result
         elif structural_result:
-            effective_result = structural_result
+            # Deterministic tier standing in for the whole review — mark it
+            # gate-sourced so streak accounting compares like with like.
+            effective_result = {"verdict_source": "gate", **structural_result}
         else:
             effective_result = {
                 "status": "passed",
                 "tier": "structural",
+                "verdict_source": "guard",
                 "reason": "No review performed",
                 "suggestions": [],
             }
@@ -767,20 +770,26 @@ def _critic_result_mapper(reviewed_phase: str):
         # verdict (stagnation), or shifting the goalposts to wholly new asks
         # (churn)? Both are non-convergence; together they cap the loop well
         # short of the full retry budget. ``unaddressed`` lists the prior asks
-        # that still recur, for the rework prompt's "STILL NOT ADDRESSED" block.
+        # that still recur, for the rework prompt's "STILL NOT ADDRESSED"
+        # block. Accounting is verdict-source-aware: guard verdicts freeze the
+        # streaks, gate verdicts compare gate-vs-gate, agent verdicts compare
+        # against the carried agent baseline (trace 019f260c: cross-source
+        # comparison scored a truncation round as two goalpost shifts and
+        # parked a converging plan).
         unaddressed: list[str] = []
         stagnation_streak = 0
         churn_streak = 0
-        if phase_status == ReviewStatus.NEEDS_REVISION.value and prior_for_phase:
-            unaddressed = critic_convergence.unaddressed_points(
-                prior_for_phase, effective_result
+        streak_baseline: dict[str, Any] = {}
+        if phase_status == ReviewStatus.NEEDS_REVISION.value:
+            streaks = critic_convergence.compute_streaks(
+                prior_for_phase,
+                effective_result,
+                current_gate=subgraph_result.get("reference_gate_result"),
             )
-            stagnation_streak = critic_convergence.next_stagnation_streak(
-                prior_for_phase, effective_result
-            )
-            churn_streak = critic_convergence.next_churn_streak(
-                prior_for_phase, effective_result
-            )
+            unaddressed = streaks["unaddressed_points"]
+            stagnation_streak = streaks["stagnation_streak"]
+            churn_streak = streaks["churn_streak"]
+            streak_baseline = streaks["streak_baseline"]
 
         # Escalation decision — collapse every "stop reworking" condition into a
         # single flag so the mapper (state) and critic_router (edge) agree.
@@ -820,6 +829,11 @@ def _critic_result_mapper(reviewed_phase: str):
             "phase": reviewed_phase,
             "status": phase_status,
             "tier": effective_result.get("tier", "unknown"),
+            # Which chain produced this verdict (agent | guard | gate) and the
+            # last real agent ask-set carried through non-agent rounds — both
+            # consumed by critic_convergence.compute_streaks next round.
+            "verdict_source": effective_result.get("verdict_source", "agent"),
+            "streak_baseline": streak_baseline,
             "reason": effective_result.get("reason", ""),
             "suggestions": effective_result.get("suggestions", []),
             "attempt": new_attempt,

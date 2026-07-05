@@ -162,3 +162,143 @@ class TestTokenization:
         b = {"suggestions": ["it must be in the config and on the page"]}
         # No shared content words → not a repeat.
         assert cc.is_repeat_verdict(a, b) is False
+
+
+# Verdicts modelled on trace 019f260c: agent asks → truncation-guard notice →
+# reference-gate findings, three sources in three consecutive rounds.
+_GUARD = {
+    "status": "needs_revision",
+    "verdict_source": "guard",
+    "reason": (
+        "Critic response was truncated at the token limit (finish_reason="
+        "length) without a structured verdict — treating as NEEDS_REVISION"
+    ),
+    "suggestions": [],
+}
+_GATE_FINDINGS = {
+    "status": "needs_revision",
+    "reason": (
+        "Deterministic reference-symbol gate: 2 symbol contract violations: "
+        "slice declares 'SpineConfig.resolve_embedding_provider' in provides, "
+        "but that symbol ALREADY EXISTS"
+    ),
+    "suggestions": [
+        "Move SpineConfig.resolve_embedding_provider to reference_symbols",
+        "Move SpineConfig.resolve_reranker_provider to reference_symbols",
+    ],
+}
+_GATE_VERDICT = {
+    **_GATE_FINDINGS,
+    "verdict_source": "gate",
+    "agent_status": "passed",
+}
+
+
+class TestComputeStreaksSourceAware:
+    def test_first_agent_round_sets_baseline(self):
+        out = cc.compute_streaks({}, {**_PRIOR, "status": "needs_revision"})
+        assert out["stagnation_streak"] == 0
+        assert out["churn_streak"] == 0
+        assert out["streak_baseline"]["suggestions"] == _PRIOR["suggestions"]
+
+    def test_guard_round_freezes_streaks_and_carries_baseline(self):
+        prior = {
+            **_PRIOR,
+            "status": "needs_revision",
+            "stagnation_streak": 0,
+            "churn_streak": 1,
+        }
+        out = cc.compute_streaks(prior, _GUARD)
+        assert out["churn_streak"] == 1  # frozen, NOT incremented to 2
+        assert out["stagnation_streak"] == 0
+        assert out["unaddressed_points"] == []
+        assert out["streak_baseline"]["suggestions"] == _PRIOR["suggestions"]
+
+    def test_first_time_gate_finding_freezes_streaks(self):
+        prior_guard_lcr = {
+            **_GUARD,
+            "stagnation_streak": 0,
+            "churn_streak": 0,
+            "streak_baseline": {"reason": _PRIOR["reason"], "suggestions": _PRIOR["suggestions"]},
+            "reference_gate": {},
+        }
+        out = cc.compute_streaks(prior_guard_lcr, _GATE_VERDICT, current_gate=_GATE_FINDINGS)
+        assert out["churn_streak"] == 0
+        assert out["stagnation_streak"] == 0
+
+    def test_trace_019f260c_sequence_does_not_escalate(self):
+        # Round 1: agent asks. Round 2: truncation guard. Round 3: gate.
+        # Under cross-source comparison this hit CHURN_LIMIT=2 and parked a
+        # converging plan; source-aware accounting must keep both streaks at 0.
+        r1 = cc.compute_streaks({}, {**_PRIOR, "status": "needs_revision"})
+        lcr1 = {**_PRIOR, "status": "needs_revision", **r1}
+        r2 = cc.compute_streaks(lcr1, _GUARD)
+        lcr2 = {**_GUARD, **r2, "reference_gate": {}}
+        r3 = cc.compute_streaks(lcr2, _GATE_VERDICT, current_gate=_GATE_FINDINGS)
+        assert r3["churn_streak"] < cc.CHURN_LIMIT
+        assert r3["stagnation_streak"] < cc.STAGNATION_LIMIT
+
+    def test_recurring_gate_violations_stagnate(self):
+        prior_gate_lcr = {
+            **_GATE_VERDICT,
+            "stagnation_streak": 0,
+            "churn_streak": 0,
+            "streak_baseline": {},
+            "reference_gate": _GATE_FINDINGS,
+        }
+        out = cc.compute_streaks(prior_gate_lcr, _GATE_VERDICT, current_gate=_GATE_FINDINGS)
+        assert out["stagnation_streak"] == 1
+        assert out["churn_streak"] == 0
+
+    def test_shifting_gate_violations_churn(self):
+        prior_gate_lcr = {
+            **_GATE_VERDICT,
+            "stagnation_streak": 0,
+            "churn_streak": 0,
+            "streak_baseline": {},
+            "reference_gate": _GATE_FINDINGS,
+        }
+        other_gate = {
+            "status": "needs_revision",
+            "reason": "Dependency cycle detected among feature slices",
+            "suggestions": ["Reorder slices into a proper DAG"],
+        }
+        out = cc.compute_streaks(
+            prior_gate_lcr,
+            {**other_gate, "verdict_source": "gate"},
+            current_gate=other_gate,
+        )
+        assert out["churn_streak"] == 1
+
+    def test_agent_chain_resumes_across_guard_round(self):
+        # agent asks → guard round → agent repeats the same asks: the repeat
+        # must be detected against the ROUND-1 baseline, not the guard notice.
+        r1 = cc.compute_streaks({}, {**_PRIOR, "status": "needs_revision"})
+        lcr1 = {**_PRIOR, "status": "needs_revision", **r1}
+        r2 = cc.compute_streaks(lcr1, _GUARD)
+        lcr2 = {**_GUARD, **r2, "reference_gate": {}}
+        r3 = cc.compute_streaks(lcr2, {**_REPEAT, "status": "needs_revision"})
+        assert r3["stagnation_streak"] == 1
+        assert r3["unaddressed_points"] == _PRIOR["suggestions"]
+
+    def test_gate_override_of_agent_pass_clears_baseline(self):
+        prior = {
+            **_PRIOR,
+            "status": "needs_revision",
+            "stagnation_streak": 0,
+            "churn_streak": 0,
+        }
+        out = cc.compute_streaks(prior, _GATE_VERDICT, current_gate=_GATE_FINDINGS)
+        # agent_status == "passed" → the agent ask-chain converged.
+        assert out["streak_baseline"] == {}
+
+    def test_plain_agent_rounds_unchanged(self):
+        # Legacy verdicts without verdict_source behave exactly as before.
+        prior = {
+            **_PRIOR,
+            "status": "needs_revision",
+            "stagnation_streak": 0,
+            "churn_streak": 0,
+        }
+        assert cc.compute_streaks(prior, _REPEAT)["stagnation_streak"] == 1
+        assert cc.compute_streaks(prior, _DIFFERENT)["churn_streak"] == 1

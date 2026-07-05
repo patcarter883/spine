@@ -236,3 +236,119 @@ def next_churn_streak(
     if is_goalpost_shift(prior_review, current_review):
         return int((prior_review or {}).get("churn_streak", 0) or 0) + 1
     return 0
+
+
+def compute_streaks(
+    prior_review: dict[str, Any] | None,
+    current_review: dict[str, Any] | None,
+    current_gate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Source-aware convergence accounting for one NEEDS_REVISION round.
+
+    Verdicts reach the critic loop from three sources — the LLM agent critic
+    (``verdict_source`` absent or ``"agent"``), harness guards like the
+    truncation fallback (``"guard"``), and the deterministic plan validators
+    (``"gate"``). Comparing verdicts ACROSS sources manufactures goalpost
+    shifts: a guard notice shares no asks with the agent verdict before it,
+    nor with the gate findings after it, so both transitions score as churn
+    (trace 019f260c: agent → truncation guard → reference gate hit
+    CHURN_LIMIT and parked a converging plan while the agent critic voted
+    PASSED). Streaks therefore only advance within a single source chain:
+
+    * ``guard`` verdicts freeze both streaks and carry the last real agent
+      baseline through untouched — harness noise is not evidence either way;
+    * ``gate`` verdicts compare against the prior round's deterministic
+      outcome (``prior_review['reference_gate']``, falling back to the prior
+      verdict itself when that round was gate-sourced). A first-time gate
+      finding freezes the streaks; recurring violations stagnate; shifting
+      violations churn;
+    * ``agent`` verdicts compare against the last agent-sourced revision ask
+      (``streak_baseline``), carried through intervening guard/gate rounds.
+
+    Returns the new ``stagnation_streak``, ``churn_streak``,
+    ``unaddressed_points``, and the ``streak_baseline`` dict to store on the
+    round's ``last_critic_review``.
+    """
+    cur = current_review or {}
+    prior = prior_review or {}
+    cur_source = cur.get("verdict_source") or "agent"
+    prior_source = prior.get("verdict_source") or "agent"
+    prior_stag = int(prior.get("stagnation_streak", 0) or 0)
+    prior_churn = int(prior.get("churn_streak", 0) or 0)
+
+    # The last real agent ask-set as of the prior round: the prior verdict
+    # itself when it was an agent revision ask, else whatever baseline it
+    # carried forward. Status literals match ReviewStatus values; kept as
+    # strings so this module stays import-free.
+    if prior_source == "agent":
+        if prior.get("status") in ("needs_revision", "needs_review") and review_points(prior):
+            agent_baseline: dict[str, Any] = {
+                "reason": prior.get("reason", ""),
+                "suggestions": list(prior.get("suggestions") or []),
+            }
+        else:
+            agent_baseline = {}
+    else:
+        agent_baseline = prior.get("streak_baseline") or {}
+
+    frozen = {
+        "stagnation_streak": prior_stag,
+        "churn_streak": prior_churn,
+        "unaddressed_points": [],
+    }
+
+    if cur_source == "guard":
+        return {**frozen, "streak_baseline": agent_baseline}
+
+    if cur_source == "gate":
+        # An agent PASS overridden by the gate means the agent ask-chain
+        # converged — drop the stale baseline so a later agent revision is a
+        # fresh round, not a phantom goalpost shift off long-addressed asks.
+        baseline = {} if cur.get("agent_status") == "passed" else agent_baseline
+        prior_gate = prior.get("reference_gate") or {}
+        if review_points(prior_gate):
+            cmp_prior = prior_gate
+        elif prior_source == "gate":
+            # Deterministic verdict without a gate record (e.g. the
+            # structural validator): its findings ARE the prior lcr points.
+            cmp_prior = {
+                "reason": prior.get("reason", ""),
+                "suggestions": list(prior.get("suggestions") or []),
+            }
+        else:
+            # First-time deterministic finding: not evidence the loop is
+            # stagnating or churning.
+            return {**frozen, "streak_baseline": baseline}
+        cmp_prior = {
+            **cmp_prior,
+            "stagnation_streak": prior_stag,
+            "churn_streak": prior_churn,
+        }
+        cmp_cur = current_gate if review_points(current_gate) else cur
+        return {
+            "stagnation_streak": next_stagnation_streak(cmp_prior, cmp_cur),
+            "churn_streak": next_churn_streak(cmp_prior, cmp_cur),
+            "unaddressed_points": unaddressed_points(cmp_prior, cmp_cur),
+            "streak_baseline": baseline,
+        }
+
+    # Agent verdict: compare against the carried agent baseline, resuming the
+    # streak values from wherever the chain left off.
+    cmp_prior = (
+        {
+            **agent_baseline,
+            "stagnation_streak": prior_stag,
+            "churn_streak": prior_churn,
+        }
+        if review_points(agent_baseline)
+        else {}
+    )
+    return {
+        "stagnation_streak": next_stagnation_streak(cmp_prior, cur),
+        "churn_streak": next_churn_streak(cmp_prior, cur),
+        "unaddressed_points": unaddressed_points(cmp_prior, cur),
+        "streak_baseline": {
+            "reason": cur.get("reason", ""),
+            "suggestions": list(cur.get("suggestions") or []),
+        },
+    }
