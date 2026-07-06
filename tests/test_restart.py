@@ -18,16 +18,38 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+@pytest.fixture(autouse=True)
+def _reset_worker_singleton():
+    """Reset the RalphLoopWorker singleton so each test gets a worker bound
+    to its own tmp config rather than one cached by an earlier test."""
+    import spine.work.ralph_worker as rw_mod
+
+    rw_mod._WORKER_INSTANCE = None
+    yield
+    rw_mod._WORKER_INSTANCE = None
+
+
 @pytest.fixture
 def tmp_config(tmp_path):
-    """Create a minimal SpineConfig for testing."""
+    """Create a minimal SpineConfig for testing.
+
+    ``workspace_root`` is a freshly-initialised (clean) git repo so the
+    code-producing restart path's worktree preflight passes. The stores live
+    outside that repo so they don't dirty it.
+    """
+    import subprocess
+
     from spine.config import SpineConfig
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
 
     config = SpineConfig(
         checkpoint_path=str(tmp_path / "spine.db"),
         artifact_path=str(tmp_path / "artifacts"),
         queue_path=str(tmp_path / "queue.db"),
-        workspace_root=str(tmp_path),
+        workspace_root=str(repo),
         max_critic_retries=3,
     )
     config.ensure_dirs()
@@ -243,6 +265,42 @@ class TestRestartWork:
 
         assert result["status"] == "completed"
 
+    def test_restart_accepts_cancelled_work(self, tmp_config, work_db):
+        """restart_work accepts items stopped via the queue UI's Stop Work."""
+        work_db["work_entries"].insert(
+            {
+                "id": "stop123",
+                "description": "stopped work",
+                "work_type": "task",
+                "status": "cancelled",
+                "current_phase": "implement",
+                "created_at": "2025-01-01T00:00:00",
+                "updated_at": "2025-01-01T00:00:00",
+                "result": json.dumps({"artifacts": {"plan": {"plan.md": "content"}}}),
+            }
+        )
+
+        from spine.work.dispatcher import restart_work
+
+        mock_result = {
+            "work_id": "stop123",
+            "status": "completed",
+            "work_type": "task",
+            "restarted": True,
+        }
+
+        with patch(
+            "spine.work.dispatcher._run_workflow_graph",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ):
+            import asyncio
+
+            result = asyncio.run(restart_work("stop123", tmp_config))
+
+        assert result["status"] == "completed"
+        assert result["restarted"] is True
+
     def test_restart_nonexistent_work(self, tmp_config, work_db):
         """restart_work raises ValueError for non-existent work items."""
         from spine.work.dispatcher import restart_work
@@ -252,7 +310,7 @@ class TestRestartWork:
 
             asyncio.run(restart_work("nonexistent", tmp_config))
 
-    def test_restart_preserves_artifacts_by_default(self, tmp_config, work_db):
+    def test_restart_preserves_artifacts_by_default(self, tmp_config, work_db, tmp_path):
         """By default, restart preserves on-disk artifacts (clear_artifacts=False)."""
         artifact_path = tmp_path / "artifacts" / "run123" / "tasks"
         artifact_path.mkdir(parents=True)
@@ -295,9 +353,10 @@ class TestRestartWork:
 
             result = asyncio.run(restart_work("run123", tmp_config, clear_artifacts=False))
 
+        assert result["status"] == "completed"
         assert (artifact_path / "tasks.md").exists()
 
-    def test_restart_clears_artifacts_when_flagged(self, tmp_config, work_db):
+    def test_restart_clears_artifacts_when_flagged(self, tmp_config, work_db, tmp_path):
         """clear_artifacts=True removes on-disk files before re-running."""
         artifact_path = tmp_path / "artifacts" / "run123" / "tasks"
         artifact_path.mkdir(parents=True)
@@ -439,7 +498,7 @@ class TestUIApiRestart:
         # Need a work entry for the restart to find
         import sqlite_utils
 
-        db_path = tmp_config.queue_path.parent / "work_entries.db"
+        db_path = Path(tmp_config.queue_path).parent / "work_entries.db"
         db = sqlite_utils.Database(str(db_path))
         if "work_entries" not in db.table_names():
             db["work_entries"].create(
@@ -495,6 +554,8 @@ class TestUIApiResetStuck:
 
     def test_reset_stuck_items_delegates(self, tmp_config, queue_db):
         """UIApi.reset_stuck_items delegates to worker."""
+        from spine.ui_api import UIApi
+
         queue_db["queue"].insert(
             {
                 "id": 1,

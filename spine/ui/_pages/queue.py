@@ -315,11 +315,34 @@ def _render_recent(api: UIApi) -> None:
             display_status = inner_status or queue_status
 
             with st.container(border=True):
-                rc1, rc2, rc3 = st.columns([4, 1, 2])
+                rc1, rc2, rc3, rc4 = st.columns([4, 1, 2, 1])
                 rc1.markdown(f"{icon} **{item.get('description', '')[:100]}**")
                 rc2.write(display_status)
                 elapsed = format_duration(item.get("started_at"), item.get("completed_at"))
                 rc3.caption(f"Finished {item.get('completed_at', '')[:10]} · Took {elapsed}")
+                # Restart button for jobs stopped via Stop Work. Gate on the
+                # queue lifecycle status (authoritative), not display_status
+                # (which prefers the run's inner result payload).
+                work_id = item.get("work_id")
+                if queue_status == "cancelled" and work_id:
+                    if rc4.button("↻ Restart", key=f"restart_recent_{item.get('id')}"):
+                        # restart_work runs in a background executor where a
+                        # validation error is invisible — check the work entry
+                        # exists up front so the toast never lies.
+                        if api.get_work(work_id) is None:
+                            st.toast(
+                                f"Cannot restart `{work_id}` — no work entry "
+                                "found for it.",
+                                icon="⚠️",
+                            )
+                        else:
+                            api.restart_work(work_id)
+                            st.toast(
+                                f"↻ Restart requested for `{work_id}` — "
+                                "re-running from phase 0.",
+                                icon="🔄",
+                            )
+                            st.rerun()
 
 
 # ── Page ──

@@ -499,6 +499,29 @@ def render(api: UIApi) -> None:
                 )
                 st.rerun()
 
+    elif status == "cancelled":
+        st.warning("This work item was stopped via Stop Work.")
+
+        st.subheader("Restart Options")
+        st.caption(
+            "Restart from a specific phase to reuse the artifacts produced "
+            "before the stop, or restart from phase 0 to re-run the entire "
+            "workflow."
+        )
+        _render_restart_from_phase(work_id, work_type, current_phase)
+
+        st.divider()
+        if st.button("🔄 Restart from phase 0", key=f"restart_{work_id}"):
+            clear = st.checkbox(
+                "Clear all artifacts (force full regeneration)", key=f"clear_artifacts_{work_id}"
+            )
+            result = api.restart_work(work_id, clear_artifacts=clear)
+            st.success(
+                f"Restarted! Status: {result['status']} | Action: {result['action']}. "
+                "The workflow will re-run from the beginning."
+            )
+            st.rerun()
+
     elif status == "stalled":
         st.warning("This work item has stalled (no progress within the timeout).")
 
