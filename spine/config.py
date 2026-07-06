@@ -594,13 +594,19 @@ class SpineConfig:
     # configured once by name regardless of which phase/provider routes to it.
     model_profiles: dict = field(default_factory=dict)
 
-    # Ephemeral GPU pod for the run. When ``ephemeral_pod.enabled`` is true, a
-    # remote vLLM pod is brought up at the start of a run and torn down at the
-    # end (see spine.infra.ephemeral_pod). Stored verbatim as a raw dict and
-    # parsed by EphemeralPodConfig.from_config(). The pod backs a
-    # ``providers.llm[]`` entry whose ``base_url`` is ``env:SPINE_POD_BASE_URL``;
-    # which phases use it is the existing ``providers.phases`` routing.
+    # Ephemeral GPU pod(s) for the run (see spine.infra.ephemeral_pod). A run
+    # boots only the pods whose ``phases`` intersect the phases it will execute,
+    # and tears them down at the end. Two shapes, mutually exclusive:
+    #   * ``ephemeral_pods`` — a LIST of named pods, each with a ``phases`` list.
+    #     A run boots only the pod(s) its lane needs (e.g. reasoner for
+    #     specify/plan, coder for implement/verify).
+    #   * ``ephemeral_pod`` — the legacy SINGLE unnamed pod (always boots when
+    #     enabled). Kept for back-compat.
+    # Each pod backs a ``providers.llm[]`` entry whose ``base_url`` is
+    # ``env:<pod url_env>``; which phases route to it stays the existing
+    # ``providers.phases`` routing. Stored verbatim; parsed by parse_pods().
     ephemeral_pod: dict = field(default_factory=dict)
+    ephemeral_pods: list = field(default_factory=list)
 
     @staticmethod
     def _find_workspace_root() -> str:
@@ -997,6 +1003,7 @@ class SpineConfig:
             ),
             model_profiles=spine.get("model_profiles", {}) or {},
             ephemeral_pod=config.get("ephemeral_pod", {}) or {},
+            ephemeral_pods=config.get("ephemeral_pods", []) or [],
         )
 
     def resolve_model(self, phase: str | None = None, escalation_level: int = 0) -> str:

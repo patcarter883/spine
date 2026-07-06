@@ -27,10 +27,16 @@ from spine.infra.ephemeral_pod import (
 
 
 class FakeConfig:
-    """Minimal stand-in for SpineConfig (acquire reads only these two attrs)."""
+    """Minimal stand-in for SpineConfig (parse_pods reads only these attrs)."""
 
-    def __init__(self, ephemeral_pod: dict | None = None, providers: dict | None = None):
+    def __init__(
+        self,
+        ephemeral_pod: dict | None = None,
+        providers: dict | None = None,
+        ephemeral_pods: list | None = None,
+    ):
         self.ephemeral_pod = ephemeral_pod or {}
+        self.ephemeral_pods = ephemeral_pods or []
         self.providers = providers or {}
 
 
@@ -44,23 +50,33 @@ class FakeRunpod:
 
 @pytest.fixture(autouse=True)
 def _reset_singleton():
-    """Reset the module-level pod singleton + env var around every test."""
-    ep._POD = None
-    ep._REFCOUNT = 0
-    os.environ.pop(POD_BASE_URL_ENV, None)
+    """Reset the module-level pod registry + env vars around every test."""
+
+    def _clear():
+        ep._PODS.clear()
+        ep._FALLBACKS.clear()
+        ep._REFCOUNT = 0
+        for k in [k for k in os.environ if k.startswith("SPINE_POD_URL__")]:
+            os.environ.pop(k, None)
+        os.environ.pop(POD_BASE_URL_ENV, None)
+
+    _clear()
     yield
-    ep._POD = None
-    ep._REFCOUNT = 0
-    os.environ.pop(POD_BASE_URL_ENV, None)
+    _clear()
 
 
 def _patch_boot(monkeypatch, runpod: FakeRunpod, pod_id: str = "pod123", events=None):
+    """Patch the real boot with one that publishes the pod's own url_env and
+    returns a lease keyed to that env var, per-pod-name aware."""
+
     async def fake_boot(pod_cfg, work_id):  # noqa: ANN001
-        url = f"https://{pod_id}-8000.proxy.runpod.net/v1"
-        os.environ[POD_BASE_URL_ENV] = url
+        # Give each named pod a distinct pod_id so terminations are attributable.
+        pid = f"{pod_id}-{pod_cfg.name}" if pod_cfg.name else pod_id
+        url = f"https://{pid}-8000.proxy.runpod.net/v1"
+        os.environ[pod_cfg.url_env] = url
         if events is not None:
-            events.append("boot")
-        return ep._RunPodLease(runpod, pod_id, url)
+            events.append(f"boot:{pod_cfg.name or 'default'}")
+        return ep._RunPodLease(runpod, pid, url, url_env=pod_cfg.url_env)
 
     monkeypatch.setattr(ep, "_boot_runpod", fake_boot)
 
@@ -139,7 +155,9 @@ async def test_refcount_single_pod_and_teardown(monkeypatch):
 
     l2 = await acquire(cfg, "w1")  # nested entry point → same pod
     assert ep._REFCOUNT == 2
-    assert ep._POD is not None and ep._POD.pod_id == "pod123"
+    # Legacy single pod keeps an empty name (so its url_env stays
+    # SPINE_POD_BASE_URL); it is registered under that empty key.
+    assert "" in ep._PODS and ep._PODS[""].pod_id == "pod123"
 
     await release(l2)
     assert ep._REFCOUNT == 1
@@ -203,7 +221,7 @@ async def test_decorator_brings_up_and_tears_down(monkeypatch):
         return "ok"
 
     assert await run("w1", config=cfg) == "ok"
-    assert events == ["boot", "body"]
+    assert events == ["boot:default", "body"]
     assert rp.terminated == ["podX"]
     assert POD_BASE_URL_ENV not in os.environ
 
@@ -257,3 +275,159 @@ def test_expand_env_ref_unset_raises(monkeypatch):
     monkeypatch.delenv("SPINE_POD_BASE_URL", raising=False)
     with pytest.raises(ValueError, match="unset"):
         _expand_env_ref("env:SPINE_POD_BASE_URL")
+
+
+# ── Multi-pod: parsing, selection, per-lane boot ────────────────────────────
+
+from spine.infra.ephemeral_pod import (  # noqa: E402
+    EXECUTION_PHASES,
+    PLANNING_PHASES,
+    executed_phases_for_run,
+    lane_phase_set,
+    parse_pods,
+    select_pods,
+)
+
+_TWO_POD_CFG = FakeConfig(
+    ephemeral_pods=[
+        {
+            "name": "reasoner",
+            "enabled": True,
+            "model": "openai:GLM-Air",
+            "phases": ["specify", "plan", "critic", "gap_plan"],
+        },
+        {
+            "name": "coder",
+            "enabled": True,
+            "model": "openai:Qwen3.6-35B-A3B-FP8",
+            "phases": ["implement", "verify"],
+        },
+    ]
+)
+
+
+def test_lane_phase_set():
+    assert lane_phase_set("plan") == set(PLANNING_PHASES)
+    assert lane_phase_set("critic/plan") == set(PLANNING_PHASES)  # sub-phase path
+    assert lane_phase_set("implement") == set(EXECUTION_PHASES)
+    assert lane_phase_set("verify") == set(EXECUTION_PHASES)
+    assert lane_phase_set("") is None
+    assert lane_phase_set("onboarding") is None
+
+
+def test_executed_phases_for_run():
+    # reviewed task ENDs at the approval gate → planning lane only
+    assert executed_phases_for_run(work_type="reviewed_task") == set(PLANNING_PHASES)
+    # autonomous task spans both lanes
+    both = executed_phases_for_run(work_type="task")
+    assert both == set(PLANNING_PHASES) | set(EXECUTION_PHASES)
+    # seed phase pins the lane regardless of work_type (approve→implement)
+    assert executed_phases_for_run(work_type="task", seed_phase="implement") == set(
+        EXECUTION_PHASES
+    )
+
+
+def test_parse_pods_multi():
+    pods = parse_pods(_TWO_POD_CFG)
+    assert [p.name for p in pods] == ["reasoner", "coder"]
+    assert pods[0].url_env == "SPINE_POD_URL__REASONER"
+    assert pods[1].url_env == "SPINE_POD_URL__CODER"
+    assert pods[1].model == "Qwen3.6-35B-A3B-FP8"  # openai: stripped
+
+
+def test_parse_pods_skips_disabled():
+    cfg = FakeConfig(
+        ephemeral_pods=[
+            {"name": "a", "enabled": True, "model": "m", "phases": ["plan"]},
+            {"name": "b", "enabled": False, "model": "m", "phases": ["verify"]},
+        ]
+    )
+    assert [p.name for p in parse_pods(cfg)] == ["a"]
+
+
+def test_select_pods_by_lane():
+    plan_sel = select_pods(_TWO_POD_CFG, set(PLANNING_PHASES))
+    assert [p.name for p in plan_sel] == ["reasoner"]
+    exec_sel = select_pods(_TWO_POD_CFG, set(EXECUTION_PHASES))
+    assert [p.name for p in exec_sel] == ["coder"]
+    # None (undeterminable) → conservative: every pod
+    assert {p.name for p in select_pods(_TWO_POD_CFG, None)} == {"reasoner", "coder"}
+
+
+def test_list_form_wins_over_singular(caplog):
+    cfg = FakeConfig(
+        ephemeral_pod={"enabled": True, "model": "legacy"},
+        ephemeral_pods=[{"name": "r", "enabled": True, "model": "m", "phases": ["plan"]}],
+    )
+    pods = parse_pods(cfg)
+    assert [p.name for p in pods] == ["r"]  # singular ignored
+
+
+@pytest.mark.asyncio
+async def test_planning_run_boots_only_reasoner(monkeypatch):
+    rp = FakeRunpod()
+    _patch_boot(monkeypatch, rp)
+
+    lease = await acquire(_TWO_POD_CFG, "w1", set(PLANNING_PHASES))
+    assert os.environ["SPINE_POD_URL__REASONER"].endswith("/v1")
+    assert "SPINE_POD_URL__CODER" not in os.environ  # coder NOT booted
+    assert set(ep._PODS) == {"reasoner"}
+
+    await release(lease)
+    assert rp.terminated == ["pod123-reasoner"]
+    assert "SPINE_POD_URL__REASONER" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_execution_run_boots_only_coder(monkeypatch):
+    rp = FakeRunpod()
+    _patch_boot(monkeypatch, rp)
+
+    lease = await acquire(_TWO_POD_CFG, "w1", set(EXECUTION_PHASES))
+    assert os.environ["SPINE_POD_URL__CODER"].endswith("/v1")
+    assert "SPINE_POD_URL__REASONER" not in os.environ
+    assert set(ep._PODS) == {"coder"}
+
+    await release(lease)
+    assert rp.terminated == ["pod123-coder"]
+
+
+@pytest.mark.asyncio
+async def test_conservative_boots_both_when_phases_none(monkeypatch):
+    rp = FakeRunpod()
+    _patch_boot(monkeypatch, rp)
+
+    lease = await acquire(_TWO_POD_CFG, "w1", None)  # undeterminable → both
+    assert set(ep._PODS) == {"reasoner", "coder"}
+
+    await release(lease)
+    assert sorted(rp.terminated) == ["pod123-coder", "pod123-reasoner"]
+    assert "SPINE_POD_URL__REASONER" not in os.environ
+    assert "SPINE_POD_URL__CODER" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_abort_rolls_back_pods_booted_this_call(monkeypatch):
+    """If the second pod fails to boot under on_failure=abort, the first
+    (booted in the same acquire) is rolled back and the error propagates."""
+    rp = FakeRunpod()
+    boots: list[str] = []
+
+    async def flaky_boot(pod_cfg, work_id):  # noqa: ANN001
+        if pod_cfg.name == "coder":
+            raise PodStartupError("no capacity")
+        boots.append(pod_cfg.name)
+        url = f"https://x-{pod_cfg.name}/v1"
+        os.environ[pod_cfg.url_env] = url
+        return ep._RunPodLease(rp, f"pid-{pod_cfg.name}", url, url_env=pod_cfg.url_env)
+
+    monkeypatch.setattr(ep, "_boot_runpod", flaky_boot)
+
+    with pytest.raises(PodStartupError):
+        await acquire(_TWO_POD_CFG, "w1", None)  # both selected; coder fails
+
+    assert boots == ["reasoner"]  # reasoner booted first
+    assert rp.terminated == ["pid-reasoner"]  # …then rolled back
+    assert ep._PODS == {}
+    assert ep._REFCOUNT == 0
+    assert "SPINE_POD_URL__REASONER" not in os.environ
