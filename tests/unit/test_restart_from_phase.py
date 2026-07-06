@@ -134,6 +134,39 @@ class TestRestartFromPhaseActiveTaskCheck:
             # Should not be skipped - different task is active
             assert result["status"] != "skipped"
 
+    def test_cancelled_work_proceeds(self, tmp_config, work_db):
+        """A work item stopped via Stop Work (cancelled) can restart from a phase."""
+        work_db["work_entries"].insert(
+            {
+                "id": "test-work-1",
+                "description": "stopped work",
+                "work_type": "task",
+                "status": "cancelled",
+                "current_phase": "implement",
+                "created_at": "2024-06-15T12:00:00",
+                "updated_at": "2024-06-15T13:00:00",
+                "result": "",
+            }
+        )
+
+        with patch("spine.work.ralph_worker.get_worker") as mock_get_worker:
+            mock_worker = MagicMock()
+            mock_worker.get_active.return_value = None
+            mock_get_worker.return_value = mock_worker
+
+            from spine.work.dispatcher import restart_from_phase
+
+            with patch(
+                "spine.work.dispatcher._run_workflow_graph",
+                return_value={"work_id": "test-work-1", "status": "completed", "work_type": "task"},
+            ):
+                import asyncio
+
+                result = asyncio.run(restart_from_phase("test-work-1", "implement", tmp_config))
+
+            assert result["status"] != "skipped"
+            assert result["status"] == "completed"
+
     def test_same_active_task_returns_skipped(self, tmp_config, work_db):
         """When active task matches work_id, restart_from_phase should return skipped."""
         self._setup_work_entry(work_db, "test-work-1")

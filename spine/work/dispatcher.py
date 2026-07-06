@@ -1547,13 +1547,15 @@ async def restart_work(
     *,
     clear_artifacts: bool = False,
 ) -> dict[str, Any]:
-    """Restart a work item that is pending, running, stalled, or needs_review.
+    """Restart a work item that is pending, running, stalled, needs_review,
+    or cancelled.
 
     Unlike ``resume_work`` (which continues from a checkpoint with human
     feedback), ``restart_work`` re-runs the workflow from phase 0.  It
-    is intended for items whose worker or UI died mid-execution, and to
+    is intended for items whose worker or UI died mid-execution, to
     launch a ``pending`` item that was created (e.g. ``spine run --project``)
-    but never started.
+    but never started, and to rerun a job the user stopped with the
+    queue UI's Stop Work button (``cancelled``).
 
     Steps:
       1. Validates the work item exists and is in a restartable status.
@@ -1592,6 +1594,10 @@ async def restart_work(
         TaskStatus.RUNNING.value,
         TaskStatus.STALLED.value,
         TaskStatus.NEEDS_REVIEW.value,
+        # A Stop Work click marks the entry cancelled; restarting flips it
+        # back to running, which also clears the cooperative-cancel signal
+        # the (by now halted) old run was polling.
+        TaskStatus.CANCELLED.value,
     )
     if status not in restartable:
         raise ValueError(
@@ -1633,6 +1639,11 @@ async def restart_work(
 
     checkpoint_store = CheckpointStore(db_path=config.checkpoint_path)
     saver = await checkpoint_store.get_checkpointer()
+    # ``adelete_thread`` does not lazily create the checkpoint tables the way
+    # the read/write paths do, so ensure they exist first — restarting an item
+    # that never ran (e.g. launching a ``pending`` project task on a fresh
+    # install) would otherwise die on "no such table: checkpoints".
+    await saver.setup()
     await saver.adelete_thread(work_id)
     logger.info(f"[{work_id}] Purged checkpoint")
 
@@ -1745,6 +1756,9 @@ async def restart_from_phase(
         TaskStatus.STALLED.value,
         TaskStatus.NEEDS_REVIEW.value,
         TaskStatus.FAILED.value,
+        # Stopped via the queue UI's Stop Work button — earlier phases'
+        # artifacts survive the stop, so phase-targeted restart is valid.
+        TaskStatus.CANCELLED.value,
     )
     if status not in restartable:
         raise ValueError(

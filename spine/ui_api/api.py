@@ -1157,7 +1157,7 @@ class UIApi:
         work_id: str,
         clear_artifacts: bool = False,
     ) -> dict[str, Any]:
-        """Restart a pending, running, stalled, or needs_review work item from phase 0.
+        """Restart a pending, running, stalled, needs_review, or cancelled work item from phase 0.
 
         Non-blocking: runs the restart in the background via
         RalphLoopWorker's executor and returns immediately. The work_detail
