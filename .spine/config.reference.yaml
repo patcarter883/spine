@@ -537,7 +537,7 @@ providers:
 #     enabled: true
 #     binds_provider: reasoner-pod    # derives --model from this provider
 #     phases: [specify, plan, critic, gap_plan]   # boot gate (this lane)
-#     gpu_type_id: "NVIDIA H100 PRO"
+#     gpu_type_id: "NVIDIA H100 PCIe"   # exact id from runpod.get_gpus()
 #     gpu_count: 1
 #     vllm_args: "--max-model-len 60000 --gpu-memory-utilization 0.9"
 #     max_lifetime_s: 5400
