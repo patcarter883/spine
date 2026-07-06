@@ -231,27 +231,27 @@ providers:
     # plan never converged, trace 019efc66). GLM does plan + critic = one model,
     # ZERO intra-phase swaps across the whole specify/plan/critic tree.
     specify:
-      provider: local-glm
+      provider: local-qwen
     specify/subagents/researcher:
-      provider: local-glm
+      provider: local-qwen
     specify/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: local-qwen
     plan:
-      provider: local-glm
+      provider: local-qwen
     plan/subagents/researcher:
-      provider: local-glm
+      provider: local-qwen
     plan/subagents/researcher/supervisor:
-      provider: local-glm
+      provider: local-qwen
     critic:
-      provider: local-glm
+      provider: local-qwen
     critic/specify:
-      provider: local-glm
+      provider: local-qwen
     critic/plan:
-      provider: local-glm
+      provider: local-qwen
     gap_plan:
-      provider: local-glm
+      provider: local-qwen
     exploration/manager:
-      provider: local-glm
+      provider: local-qwen
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
@@ -264,7 +264,7 @@ providers:
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
     implement:
-      provider: local-qwen-coder
+      provider: local-north-code
       # Failure-driven escalation (LOCAL — stays true to local-first). When a
       # slice survives a FALLBACK re-decomposition (_decompose_depth ≥ 1), the
       # editor escalates from the coder model to the reasoning model, which
@@ -272,38 +272,38 @@ providers:
       # synthesis via prefix resolution. Reachable depth is bounded by
       # implement_max_decompose_depth (default 1), so only rung 1 fires today.
       escalation:
-        - provider: local-qwen-coder
+        - provider: local-north-code
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-qwen-coder
+      provider: local-north-code
     implement/subagents/slice-implementer:
-      provider: local-qwen-coder
+      provider: local-north-code
     verify:
-      provider: local-qwen-coder
+      provider: local-north-code
     verify/subagents/slice-verifier:
-      provider: local-qwen-coder
+      provider: local-north-code
     classification:
-      provider: local-qwen-coder
+      provider: local-north-code
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-qwen-coder
+      provider: local-north-code
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-glm
+      provider: local-qwen
     onboarding/doc-manager:
-      provider: local-glm
+      provider: local-qwen
     onboarding/section-worker:
-      provider: local-glm
+      provider: local-qwen
     # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
     # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
     # actually fail. error_diagnosis is enabled in the spine: block above.
     error_diagnosis:
-      provider: local-glm
+      provider: local-qwen
       max_completion_tokens: 256
       temperature: 0
       reasoning: false
