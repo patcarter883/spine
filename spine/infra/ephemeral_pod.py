@@ -41,9 +41,77 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Environment variable the bound provider's ``base_url: env:SPINE_POD_BASE_URL``
-#: resolves against. Set when the pod is live, unset on teardown.
+#: Env var the *legacy single-pod* provider ``base_url: env:SPINE_POD_BASE_URL``
+#: resolves against. A named multi-pod publishes ``SPINE_POD_URL__<NAME>``
+#: instead (see :attr:`EphemeralPodConfig.url_env`).
 POD_BASE_URL_ENV = "SPINE_POD_BASE_URL"
+
+
+# ── Lane / phase-set helpers (pure) ─────────────────────────────────────────
+# A pod declares the phases it serves (``phases:``). A run boots a pod iff the
+# pod's phases intersect the set of phases the run will actually execute. With
+# the Specify/Plan and Implement/Verify lanes always run as SEPARATE spine runs
+# (human approval gate between them), each run touches exactly one lane, so this
+# selection boots exactly one pod per run — phase-scoped economics without any
+# mid-run boot/teardown. Names use the canonical PhaseName values plus the
+# ``critic``/``critic_plan``/``critic_specify`` aliases the workflow emits.
+PLANNING_PHASES: frozenset[str] = frozenset(
+    {
+        "specify",
+        "plan",
+        "tasks",
+        "critic",
+        "critic_plan",
+        "critic_specify",
+        "adversarial",
+        "adversarial_plan",
+        "gap_plan",
+    }
+)
+EXECUTION_PHASES: frozenset[str] = frozenset({"implement", "verify"})
+
+
+def lane_phase_set(phase: str | None) -> set[str] | None:
+    """The full phase set of the lane ``phase`` belongs to, or ``None``.
+
+    Used by resume/restart paths: given the phase a run resumes at, boot the
+    pod(s) for that whole lane (a resume never crosses the human-review gate,
+    so it stays within one lane).
+    """
+    if not phase:
+        return None
+    base = phase.split("/")[0]
+    if phase in EXECUTION_PHASES or base in EXECUTION_PHASES:
+        return set(EXECUTION_PHASES)
+    if phase in PLANNING_PHASES or base in PLANNING_PHASES:
+        return set(PLANNING_PHASES)
+    return None
+
+
+def executed_phases_for_run(
+    work_type: str | None = None, seed_phase: str | None = None
+) -> set[str] | None:
+    """Phases a run will execute, for pod selection.
+
+    ``seed_phase`` (the phase a run starts/resumes at) wins when it pins a lane.
+    Otherwise the phase set is derived from ``work_type``:
+
+    * reviewed_task / critical_reviewed_task → planning lane only (ENDs at the
+      human-approval gate).
+    * task / critical_task → both lanes (a fully autonomous run spans them).
+
+    Returns ``None`` (→ boot every configured pod, conservative) when neither
+    input determines the set.
+    """
+    if seed_phase:
+        lane = lane_phase_set(seed_phase)
+        if lane is not None:
+            return lane
+    if work_type in ("reviewed_task", "critical_reviewed_task"):
+        return set(PLANNING_PHASES)
+    if work_type in ("task", "critical_task"):
+        return set(PLANNING_PHASES) | set(EXECUTION_PHASES)
+    return None
 
 
 class PodStartupError(RuntimeError):
@@ -59,9 +127,17 @@ class EphemeralPodConfig:
 
     enabled: bool = False
     backend: str = "runpod"
+    # Distinguishes pods in a multi-pod (``ephemeral_pods:``) config and derives
+    # this pod's URL env var (see ``url_env``). Empty for the legacy single-pod
+    # (``ephemeral_pod:``) form, which uses SPINE_POD_BASE_URL.
+    name: str = ""
+    # Phases this pod serves. A run boots the pod iff this intersects the phases
+    # the run will execute (see ``executed_phases_for_run``). Empty = always boot
+    # when enabled (the legacy single-pod behaviour).
+    phases: list = field(default_factory=list)
     # Name of the providers.llm[] entry this pod backs. Its ``model`` (minus the
     # ``openai:`` prefix) is used as the vLLM ``--model`` unless ``model`` below
-    # is set explicitly, and its ``base_url`` must be ``env:SPINE_POD_BASE_URL``.
+    # is set explicitly, and its ``base_url`` must be ``env:<url_env>``.
     binds_provider: str = ""
     api_key_env: str = "RUNPOD_API_KEY"
     image: str = "vllm/vllm-openai:latest"
@@ -91,22 +167,93 @@ class EphemeralPodConfig:
     # gpu_type_id / gpu_count / cloud_type.
     gpu_fallback: list = field(default_factory=list)
 
+    @property
+    def url_env(self) -> str:
+        """Env var this pod publishes its live OpenAI URL to. A named pod uses
+        ``SPINE_POD_URL__<NAME>``; the legacy unnamed pod uses
+        ``SPINE_POD_BASE_URL``. The bound provider's ``base_url`` must be
+        ``env:<this value>``."""
+        if self.name:
+            return f"SPINE_POD_URL__{self.name.upper()}"
+        return POD_BASE_URL_ENV
+
+    @classmethod
+    def _from_raw(cls, raw: dict, providers: dict) -> "EphemeralPodConfig":
+        """Build one pod from a raw dict, deriving ``model`` from its bound
+        provider when not set explicitly."""
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        pod = cls(**{k: v for k, v in raw.items() if k in known})
+        if not pod.model and pod.binds_provider:
+            for prov in (providers or {}).get("llm", []):
+                if prov.get("name") == pod.binds_provider:
+                    pod.model = str(prov.get("model", ""))
+                    break
+        # vLLM's --model needs the bare HF repo, never the ``openai:`` spec
+        # prefix — strip it whether the model was set explicitly or derived.
+        pod.model = pod.model.removeprefix("openai:")
+        return pod
+
     @classmethod
     def from_config(cls, config: "SpineConfig") -> "EphemeralPodConfig":
-        """Build from a :class:`SpineConfig`, deriving ``model`` from the
-        bound provider when not set explicitly."""
-        raw = getattr(config, "ephemeral_pod", {}) or {}
-        if not isinstance(raw, dict):
-            return cls()
-        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        kwargs = {k: v for k, v in raw.items() if k in known}
-        pod = cls(**kwargs)
-        if not pod.model and pod.binds_provider:
-            for prov in (config.providers or {}).get("llm", []):
-                if prov.get("name") == pod.binds_provider:
-                    pod.model = str(prov.get("model", "")).removeprefix("openai:")
-                    break
-        return pod
+        """Back-compat single-pod accessor: the first pod of :func:`parse_pods`,
+        or a disabled default. Prefer :func:`parse_pods` for multi-pod configs."""
+        pods = parse_pods(config)
+        return pods[0] if pods else cls()
+
+
+def parse_pods(config: "SpineConfig") -> list["EphemeralPodConfig"]:
+    """All configured pods, from either config shape.
+
+    * ``ephemeral_pods:`` (list) — the multi-pod form; each entry needs a
+      ``name`` and a ``phases`` list.
+    * ``ephemeral_pod:`` (dict) — the legacy single-pod form (unnamed, always
+      boots when enabled).
+
+    Returns only enabled pods. The two forms are mutually exclusive; if both are
+    present the list form wins and the singular is ignored (logged).
+    """
+    providers = getattr(config, "providers", {}) or {}
+    multi = getattr(config, "ephemeral_pods", None)
+    single = getattr(config, "ephemeral_pod", None)
+    pods: list[EphemeralPodConfig] = []
+    if isinstance(multi, list) and multi:
+        if single:
+            logger.warning(
+                "Both 'ephemeral_pods' and 'ephemeral_pod' are set; using the "
+                "'ephemeral_pods' list and ignoring the singular block."
+            )
+        for i, raw in enumerate(multi):
+            if not isinstance(raw, dict):
+                continue
+            pod = EphemeralPodConfig._from_raw(raw, providers)
+            if not pod.name:
+                pod.name = f"pod{i}"
+            if pod.enabled:
+                pods.append(pod)
+    elif isinstance(single, dict) and single:
+        pod = EphemeralPodConfig._from_raw(single, providers)
+        if pod.enabled:
+            pods.append(pod)
+    return pods
+
+
+def select_pods(
+    config: "SpineConfig", executed_phases: set[str] | None
+) -> list["EphemeralPodConfig"]:
+    """Pods a run needs: those whose ``phases`` intersect ``executed_phases``.
+
+    A pod with an empty ``phases`` list always qualifies (legacy always-on). When
+    ``executed_phases`` is ``None`` (the run's phase set couldn't be determined)
+    every enabled pod is returned — the safe superset.
+    """
+    pods = parse_pods(config)
+    if executed_phases is None:
+        return pods
+    selected: list[EphemeralPodConfig] = []
+    for pod in pods:
+        if not pod.phases or (set(pod.phases) & executed_phases):
+            selected.append(pod)
+    return selected
 
 
 # ── RunPod backend (lazy SDK import; only needed when enabled) ──────────────
@@ -172,10 +319,13 @@ def _http_ok(url: str, timeout: float = 5.0) -> bool:
 class _RunPodLease:
     """A booted RunPod pod plus its teardown. ``terminate`` is idempotent."""
 
-    def __init__(self, runpod: Any, pod_id: str, base_url: str) -> None:
+    def __init__(
+        self, runpod: Any, pod_id: str, base_url: str, url_env: str = POD_BASE_URL_ENV
+    ) -> None:
         self._runpod = runpod
         self.pod_id = pod_id
         self.base_url = base_url
+        self.url_env = url_env
         self._watchdog: asyncio.Task | None = None
         self._terminated = False
 
@@ -208,8 +358,8 @@ class _RunPodLease:
             logger.info("ephemeral_pod %s terminated", self.pod_id)
         except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
             logger.warning("ephemeral_pod %s terminate failed: %s", self.pod_id, exc)
-        if os.environ.get(POD_BASE_URL_ENV) == self.base_url:
-            os.environ.pop(POD_BASE_URL_ENV, None)
+        if os.environ.get(self.url_env) == self.base_url:
+            os.environ.pop(self.url_env, None)
 
 
 def _gpu_attempts(pod: EphemeralPodConfig) -> list[EphemeralPodConfig]:
@@ -296,7 +446,7 @@ async def _boot_runpod(pod: EphemeralPodConfig, work_id: str | None) -> _RunPodL
     if not pod_id:
         raise PodStartupError(f"ephemeral_pod: create returned no id: {created!r}")
     base_url = f"https://{pod_id}-{pod.port}.proxy.runpod.net/v1"
-    lease = _RunPodLease(runpod, pod_id, base_url)
+    lease = _RunPodLease(runpod, pod_id, base_url, url_env=pod.url_env)
 
     # Wait for the vLLM OpenAI server to actually answer (the pod reaching
     # RUNNING only means the container started; weights still have to load).
@@ -318,19 +468,21 @@ async def _boot_runpod(pod: EphemeralPodConfig, work_id: str | None) -> _RunPodL
         await lease.terminate()
         raise
 
-    os.environ[POD_BASE_URL_ENV] = base_url
+    os.environ[pod.url_env] = base_url
     lease.start_watchdog(pod.max_lifetime_s)
     logger.info(
-        "ephemeral_pod %s ready after ~%ss → %s (model=%s)",
+        "ephemeral_pod '%s' %s ready after ~%ss → %s=%s (model=%s)",
+        pod.name or "default",
         pod_id,
         waited,
+        pod.url_env,
         base_url,
         pod.model,
     )
     return lease
 
 
-# ── Reference-counted process singleton ─────────────────────────────────────
+# ── Reference-counted, multi-pod process registry ───────────────────────────
 
 
 @dataclass
@@ -341,69 +493,112 @@ class _Lease:
 
 
 _LOCK = asyncio.Lock()
-_POD: _RunPodLease | None = None
+#: name → live pod lease, for every pod currently booted this run.
+_PODS: dict[str, _RunPodLease] = {}
+#: fallback env vars published this run (name → url_env), cleared on teardown.
+_FALLBACKS: dict[str, str] = {}
 _REFCOUNT = 0
 
 
-async def acquire(config: "SpineConfig", work_id: str | None) -> _Lease:
-    """Ensure the pod is up (booting it on the first lease) and return a lease.
+async def _boot_or_fallback(pod: "EphemeralPodConfig", work_id: str | None) -> None:
+    """Boot one pod into the registry, or apply its failure policy (caller holds
+    ``_LOCK``). Raises :class:`PodStartupError` under ``on_failure: abort``."""
+    try:
+        _PODS[pod.name] = await _boot_runpod(pod, work_id)
+    except BaseException as exc:
+        if pod.on_failure == "local_fallback" and pod.fallback_base_url:
+            logger.warning(
+                "ephemeral_pod '%s' boot failed (%s); falling back to %s",
+                pod.name or "default",
+                exc,
+                pod.fallback_base_url,
+            )
+            os.environ[pod.url_env] = pod.fallback_base_url
+            _FALLBACKS[pod.name] = pod.url_env
+            return
+        raise
 
-    No-op (returns an inactive lease) when ``ephemeral_pod.enabled`` is false.
-    On boot failure: raises :class:`PodStartupError` under ``on_failure: abort``;
-    under ``local_fallback`` publishes ``fallback_base_url`` and continues.
+
+async def _terminate_all_locked() -> None:
+    """Terminate every booted pod and clear published env vars (holds ``_LOCK``)."""
+    for lease in list(_PODS.values()):
+        await lease.terminate()
+    _PODS.clear()
+    for url_env in _FALLBACKS.values():
+        os.environ.pop(url_env, None)
+    _FALLBACKS.clear()
+
+
+async def acquire(
+    config: "SpineConfig",
+    work_id: str | None,
+    executed_phases: set[str] | None = None,
+) -> _Lease:
+    """Ensure the pods this run needs are up, and return a lease.
+
+    Selection: boots the pods whose ``phases`` intersect ``executed_phases``
+    (``None`` → every configured pod). Returns an inactive lease when no pod is
+    configured/selected. Already-booted pods (a nested entry point in the same
+    run) are reused, not re-booted. On boot failure: raises under
+    ``on_failure: abort`` (rolling back anything booted in this call);
+    ``local_fallback`` publishes ``fallback_base_url`` and continues.
     """
-    pod_cfg = EphemeralPodConfig.from_config(config)
-    if not pod_cfg.enabled:
+    selected = select_pods(config, executed_phases)
+    if not selected:
         return _Lease(active=False)
 
-    global _POD, _REFCOUNT
+    global _REFCOUNT
     async with _LOCK:
-        if _POD is None and _REFCOUNT == 0:
-            try:
-                _POD = await _boot_runpod(pod_cfg, work_id)
-            except BaseException as exc:
-                if pod_cfg.on_failure == "local_fallback" and pod_cfg.fallback_base_url:
-                    logger.warning(
-                        "ephemeral_pod boot failed (%s); falling back to %s",
-                        exc,
-                        pod_cfg.fallback_base_url,
-                    )
-                    os.environ[POD_BASE_URL_ENV] = pod_cfg.fallback_base_url
-                    # _POD stays None; refcount still tracks the run so we don't
-                    # re-attempt a boot on every nested entry point.
-                    _REFCOUNT += 1
-                    return _Lease(active=True)
-                raise
+        booted_here: list[str] = []
+        try:
+            for pod in selected:
+                if pod.name in _PODS or pod.name in _FALLBACKS:
+                    continue  # already up for this run
+                await _boot_or_fallback(pod, work_id)
+                booted_here.append(pod.name)
+        except BaseException:
+            # Roll back only what THIS call booted; leave any pods a parent
+            # entry point already holds intact (its finally will release them).
+            for name in booted_here:
+                lease = _PODS.pop(name, None)
+                if lease is not None:
+                    await lease.terminate()
+                _FALLBACKS.pop(name, None)
+            raise
         _REFCOUNT += 1
         return _Lease(active=True)
 
 
 async def release(lease: _Lease | None) -> None:
-    """Release a lease; tear the pod down when the last lease is released."""
+    """Release a lease; tear every pod down when the last lease is released."""
     if lease is None or not lease.active:
         return
-    global _POD, _REFCOUNT
+    global _REFCOUNT
     async with _LOCK:
         _REFCOUNT = max(0, _REFCOUNT - 1)
         if _REFCOUNT == 0:
-            if _POD is not None:
-                await _POD.terminate()
-                _POD = None
-            os.environ.pop(POD_BASE_URL_ENV, None)
+            await _terminate_all_locked()
 
 
 # ── Decorator for dispatcher entry points ───────────────────────────────────
 
 
 def with_ephemeral_pod(
-    *, skip: Callable[[dict[str, Any]], bool] | None = None
+    *,
+    skip: Callable[[dict[str, Any]], bool] | None = None,
+    phases: Callable[[dict[str, Any]], set[str] | None] | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Wrap an async dispatcher entry point so a configured pod is live for the
-    whole call and torn down in a ``finally`` (covers success, ``Exception``,
+    """Wrap an async dispatcher entry point so the pod(s) it needs are live for
+    the whole call and torn down in a ``finally`` (covers success, ``Exception``,
     and ``KeyboardInterrupt``).
 
-    ``skip(bound_args)`` lets a caller suppress bring-up for cheap paths that
-    never run the graph (e.g. ``submit_work(start=False)``).
+    ``skip(bound_args)`` suppresses bring-up for cheap paths that never run the
+    graph (e.g. ``submit_work(start=False)``).
+
+    ``phases(bound_args) -> set[str] | None`` returns the phases this call will
+    execute, used to select which pods to boot (see :func:`select_pods`). Return
+    ``None`` to boot every configured pod (the conservative default when the
+    phase set can't be determined).
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -424,7 +619,8 @@ def with_ephemeral_pod(
                 from spine.config import SpineConfig
 
                 config = SpineConfig.load()
-            lease = await acquire(config, argmap.get("work_id"))
+            executed = phases(argmap) if phases is not None else None
+            lease = await acquire(config, argmap.get("work_id"), executed)
             try:
                 return await fn(*args, **kwargs)
             finally:

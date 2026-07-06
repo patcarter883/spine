@@ -500,6 +500,64 @@ providers:
     onboarding:
       provider: example-local
 
+
+# ── Multiple ephemeral pods, phase-scoped (recommended) ────────────────────
+# `ephemeral_pods:` is a LIST of named pods. A run boots ONLY the pods whose
+# `phases:` intersect the phases that run will execute, and tears them down at
+# the end. Because Specify/Plan and Implement/Verify run as SEPARATE spine runs
+# (human-approval gate between them), each run boots exactly one pod:
+#   * a planning run (reviewed_task) → the reasoner pod
+#   * an execution run (implement/verify, spawned on approval) → the coder pod
+# Resume/restart pick the pod from the run's current phase (same lane rule).
+#
+# Each pod publishes its live URL to SPINE_POD_URL__<NAME> (uppercased). Point
+# the backing provider's base_url at it; routing stays in providers.phases.
+#
+# providers:
+#   llm:
+#     - name: reasoner-pod
+#       model: openai:zai-org/GLM-4.5-Air-FP8
+#       base_url: env:SPINE_POD_URL__REASONER   # published when the pod is live
+#       api_key: vllm
+#       enabled: true
+#     - name: coder-pod
+#       model: openai:Qwen/Qwen3.6-35B-A3B-FP8
+#       base_url: env:SPINE_POD_URL__CODER
+#       api_key: vllm
+#       enabled: true
+#   phases:
+#     specify: { provider: reasoner-pod }
+#     plan:    { provider: reasoner-pod }
+#     critic:  { provider: reasoner-pod }
+#     implement: { provider: coder-pod }
+#     verify:    { provider: coder-pod }
+#
+# ephemeral_pods:
+#   - name: reasoner
+#     enabled: true
+#     binds_provider: reasoner-pod    # derives --model from this provider
+#     phases: [specify, plan, critic, gap_plan]   # boot gate (this lane)
+#     gpu_type_id: "NVIDIA H100 PRO"
+#     gpu_count: 1
+#     vllm_args: "--max-model-len 60000 --gpu-memory-utilization 0.9"
+#     max_lifetime_s: 5400
+#     on_failure: abort
+#   - name: coder
+#     enabled: true
+#     binds_provider: coder-pod
+#     phases: [implement, verify]     # boot gate (this lane)
+#     gpu_type_id: "NVIDIA A40"
+#     gpu_count: 2                     # vLLM --tensor-parallel-size = gpu_count
+#     vllm_args: "--max-model-len 60000 --gpu-memory-utilization 0.92 --kv-cache-dtype fp8"
+#     max_lifetime_s: 7200
+#     on_failure: abort
+#     gpu_fallback:
+#       - { gpu_type_id: "NVIDIA RTX A6000", gpu_count: 2 }
+#
+# All the single-pod fields below apply per-list-entry too. The singular
+# `ephemeral_pod:` block below is the legacy single-pod form (always boots when
+# enabled); if both are present, the list wins.
+
 # ── Ephemeral GPU pod (optional) ───────────────────────────────────────────
 # Brings a remote vLLM pod up at the START of a run and tears it down at the
 # END — on success, on error, and on Ctrl-C — so you only pay for GPU while

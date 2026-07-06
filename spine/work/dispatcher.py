@@ -25,7 +25,12 @@ from typing import Any
 import sqlite_utils
 
 from spine.config import SpineConfig
-from spine.infra.ephemeral_pod import with_ephemeral_pod
+from spine.infra.ephemeral_pod import (
+    PLANNING_PHASES,
+    executed_phases_for_run,
+    lane_phase_set,
+    with_ephemeral_pod,
+)
 from spine.models.enums import PhaseName, TaskStatus, WorkType
 from spine.observability import traced_astream
 from spine.persistence.artifacts import ArtifactStore
@@ -70,6 +75,29 @@ def _get_work_db(config: SpineConfig) -> sqlite_utils.Database:
         )
 
     return db
+
+
+def _resume_pod_phases(argmap: dict[str, Any]) -> set[str] | None:
+    """Pod-selection phase set for the resume entry points.
+
+    A resume re-enters a paused run at its current phase; because the
+    Specify/Plan and Implement/Verify lanes are always separate runs with the
+    human-approval gate between them, the current phase pins the lane. Look up
+    the work entry's ``current_phase`` and return that lane's phase set so only
+    the pod serving that lane boots. Falls back to ``None`` (boot every pod) if
+    the entry or phase can't be read.
+    """
+    work_id = argmap.get("work_id")
+    if not work_id:
+        return None
+    config = argmap.get("config")
+    try:
+        if config is None:
+            config = SpineConfig.load()
+        entry = _get_work_db(config)["work_entries"].get(work_id)  # type: ignore[union-attr]
+        return lane_phase_set(entry.get("current_phase", ""))
+    except Exception:  # noqa: BLE001 - never block a run on pod-selection lookup
+        return None
 
 
 def _update_work_progress(
@@ -267,7 +295,9 @@ def _completion_result_payload(
 
 
 @with_ephemeral_pod(
-    skip=lambda a: a.get("start") is False or a.get("work_type") == "onboarding"
+    skip=lambda a: a.get("start") is False or a.get("work_type") == "onboarding",
+    # A fresh submit starts at specify; the work_type decides the lane(s).
+    phases=lambda a: executed_phases_for_run(work_type=a.get("work_type")),
 )
 async def submit_work(
     description: str,
@@ -848,7 +878,7 @@ def _preflight_worktree_clean(config: SpineConfig, work_type: str) -> None:
     WorktreeSandbox(config, work_type).preflight()
 
 
-@with_ephemeral_pod()
+@with_ephemeral_pod(phases=_resume_pod_phases)
 async def resume_work(
     work_id: str,
     human_feedback: str,
@@ -1324,7 +1354,7 @@ async def _resume_flagged_without_interrupt(
     return await restart_from_phase(work_id, target_phase, config)
 
 
-@with_ephemeral_pod()
+@with_ephemeral_pod(phases=_resume_pod_phases)
 async def resume_interrupted_work(
     work_id: str,
     action: str,
@@ -1911,7 +1941,13 @@ async def restart_from_phase(
 # ── Shared workflow execution logic (used by submit_work, resume_work, restart_work) ──
 
 
-@with_ephemeral_pod()
+@with_ephemeral_pod(
+    # restart / restart-from-phase / approved-plan execution: the start phase
+    # (when given) pins the lane, else the work_type decides.
+    phases=lambda a: executed_phases_for_run(
+        work_type=a.get("work_type"), seed_phase=a.get("start_from_phase")
+    )
+)
 async def _run_workflow_graph(
     *,
     work_id: str,
@@ -2501,6 +2537,14 @@ def list_plans(
 # ── Plan Approval & Spawning ──
 
 
+# Only the "request_revision" action re-runs the PLAN graph *directly* here and
+# needs the pod; "approve" delegates to the pod-wrapped _run_workflow_graph, and
+# "reject" (plus the validation-error paths) run no graph at all. Revision re-runs
+# the planning lane, so select the planning pod(s).
+@with_ephemeral_pod(
+    skip=lambda a: a.get("action") != "request_revision",
+    phases=lambda a: set(PLANNING_PHASES),
+)
 async def approve_and_spawn(
     plan_id: str,
     action: str = "approve",
