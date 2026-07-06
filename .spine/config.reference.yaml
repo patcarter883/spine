@@ -554,6 +554,21 @@ providers:
 #     gpu_fallback:
 #       - { gpu_type_id: "NVIDIA RTX A6000", gpu_count: 2 }
 #
+# Serving engine (per pod): `engine: vllm` (default) or `engine: sglang`. Both
+# expose an OpenAI /v1 API (readiness = poll /v1/models). SGLang enables
+# speculative decoders vLLM doesn't yet ship (e.g. DFlash):
+#   - name: coder
+#     engine: sglang                       # image defaults to lmsysorg/sglang:latest
+#     binds_provider: coder-pod            # -> --model-path <model>
+#     phases: [implement, verify]
+#     gpu_type_id: "NVIDIA A40"
+#     gpu_count: 1                         # -> --tp 1
+#     speculative_algorithm: DFLASH        # -> --speculative-algorithm DFLASH
+#     draft_model: poolside/Laguna-XS-2.1-DFlash  # -> --speculative-draft-model-path
+#     sglang_args: "--kv-cache-dtype fp8_e5m2 --mem-fraction-static 0.9"
+# For vLLM pods, express speculative decoding via vllm_args (--speculative-config)
+# instead. `image:` empty picks the engine default; set it to pin a version.
+#
 # All the single-pod fields below apply per-list-entry too. The singular
 # `ephemeral_pod:` block below is the legacy single-pod form (always boots when
 # enabled); if both are present, the list wins.

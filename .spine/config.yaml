@@ -207,6 +207,34 @@ providers:
     stream_usage: true
     max_concurrent_calls: 10  # Lemonade @ localhost:8010 is single-stream
     context_window: 16384
+  # ── Ephemeral RunPod pods (defined in the ephemeral_pods: block at EOF) ──
+  # base_url resolves to the live pod URL once the pod boots (env:SPINE_POD_URL__*).
+  # Reasoner: Nemotron-3-Super-120B-A12B-NVFP4 (+MTP) on 4× RTX PRO 4500 Blackwell.
+  - name: reasoner-pod
+    type: deepagents-model
+    model: openai:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+    base_url: env:SPINE_POD_URL__REASONER
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 4
+    context_window: 60000
+  # Coder: Laguna-XS-2.1-FP8 + DFlash speculative decoding on 1× A40 (SGLang).
+  - name: coder-pod
+    type: deepagents-model
+    model: openai:poolside/Laguna-XS-2.1-FP8
+    base_url: env:SPINE_POD_URL__CODER
+    api_key: vllm
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    max_concurrent_calls: 4
+    context_window: 60000
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    repeat_penalty: 1.05
   embedding:
   - name: local-embeddings
     type: openai-embedding
@@ -230,28 +258,29 @@ providers:
     # from gemma-12b to GLM-4.7-Flash (gemma planner kept scope-creeping and the
     # plan never converged, trace 019efc66). GLM does plan + critic = one model,
     # ZERO intra-phase swaps across the whole specify/plan/critic tree.
+    # ═══ PLANNING lane -> reasoner-pod (Nemotron NVFP4, boots the RTX PRO 4500 pod) ═══
     specify:
-      provider: local-qwen
+      provider: reasoner-pod
     specify/subagents/researcher:
-      provider: local-qwen
+      provider: reasoner-pod
     specify/subagents/researcher/supervisor:
-      provider: local-qwen
+      provider: reasoner-pod
     plan:
-      provider: local-qwen
+      provider: reasoner-pod
     plan/subagents/researcher:
-      provider: local-qwen
+      provider: reasoner-pod
     plan/subagents/researcher/supervisor:
-      provider: local-qwen
+      provider: reasoner-pod
     critic:
-      provider: local-qwen
+      provider: reasoner-pod
     critic/specify:
-      provider: local-qwen
+      provider: reasoner-pod
     critic/plan:
-      provider: local-qwen
+      provider: reasoner-pod
     gap_plan:
-      provider: local-qwen
+      provider: reasoner-pod
     exploration/manager:
-      provider: local-qwen
+      provider: reasoner-pod
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
@@ -263,33 +292,30 @@ providers:
     # Decompose/enrich stays on local-mellum (its strength per the bench, and far
     # faster than North on structured output). Laguna and Mellum are on DIFFERENT
     # servers, so this cross-model split costs no model reload.
+    # ═══ EXECUTION lane -> coder-pod (Laguna+DFlash, boots the A40 SGLang pod) ═══
     implement:
-      provider: local-north-code
-      # Failure-driven escalation (LOCAL — stays true to local-first). When a
-      # slice survives a FALLBACK re-decomposition (_decompose_depth ≥ 1), the
-      # editor escalates from the coder model to the reasoning model, which
-      # tends to land edits the coder couldn't. Covers slice-implementer and
-      # synthesis via prefix resolution. Reachable depth is bounded by
-      # implement_max_decompose_depth (default 1), so only rung 1 fires today.
+      provider: coder-pod
+      # Escalation stays on coder-pod: an execution run only boots the coder
+      # pod, so escalating to reasoner-pod (not booted) would fail to resolve.
       escalation:
-        - provider: local-north-code
+        - provider: coder-pod
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: local-north-code
+      provider: coder-pod
     implement/subagents/slice-implementer:
-      provider: local-north-code
+      provider: coder-pod
     verify:
-      provider: local-north-code
+      provider: coder-pod
     verify/subagents/slice-verifier:
-      provider: local-north-code
+      provider: coder-pod
     classification:
-      provider: local-north-code
+      provider: local-qwen
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
     summarization:
-      provider: local-north-code
+      provider: local-qwen
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
@@ -307,3 +333,78 @@ providers:
       max_completion_tokens: 256
       temperature: 0
       reasoning: false
+
+# ════════════════════════════════════════════════════════════════════════════
+# Ephemeral GPU pods (spine.infra.ephemeral_pod). A planning run boots ONLY the
+# reasoner pod; an execution run boots ONLY the coder pod (phase-scoped: the two
+# lanes are separate runs with the human-approval gate between them). Utility
+# phases (classification/summarization/onboarding/error_diagnosis) stay on
+# local-qwen so they never depend on whichever pod is booted.
+#
+# Requires: RUNPOD_API_KEY and HF_TOKEN in .env; `uv pip install runpod`.
+#
+# ⚠ UNVERIFIED — validate with a boot test before trusting a real run:
+#   [reasoner] NVFP4 on RTX PRO 4500 (workstation Blackwell sm_120): native
+#     NVFP4 kernels target datacenter Blackwell (B200/sm_100); VLLM_NVFP4_GEMM_
+#     BACKEND=marlin is the portable hedge. Also the MTP --speculative_config
+#     JSON quoting through RunPod docker_args, and image v0.20.0 compatibility.
+#   [coder] SGLang image entrypoint (does docker_args need the `python3 -m
+#     sglang.launch_server` prefix, or does the image prepend it?), DFlash
+#     support status in the image, and FP8-KV correctness on the A40 (Ampere).
+# ════════════════════════════════════════════════════════════════════════════
+ephemeral_pods:
+  # ── Reasoner: Nemotron-3-Super-120B-A12B-NVFP4 (+MTP) — 4× RTX PRO 4500 ──
+  - name: reasoner
+    enabled: true
+    engine: vllm
+    binds_provider: reasoner-pod          # → --model nvidia/...Nemotron...NVFP4
+    phases: [specify, plan, critic, gap_plan]   # boot gate: the planning lane
+    gpu_type_id: "NVIDIA RTX PRO 4500 Blackwell"
+    gpu_count: 4                          # 128GB total, TP=4; weights ~80.3GB
+    cloud_type: SECURE
+    image: "vllm/vllm-openai:v0.20.0"     # NVFP4 requires this version per NVIDIA
+    container_disk_gb: 40
+    volume_gb: 120                        # persist the ~80GB checkpoint across runs
+    startup_timeout_s: 1200               # first-boot download+load of 80GB is slow
+    max_lifetime_s: 5400
+    on_failure: abort
+    env:
+      VLLM_NVFP4_GEMM_BACKEND: marlin     # portable FP4 path for non-sm_100 Blackwell
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+    # --model / --tensor-parallel-size / --host / --port are auto-prepended.
+    # reasoning-parser dropped (needs a plugin file the stock image lacks;
+    # reasoning stays inline in content, which spine tolerates).
+    #
+    # MTP DROPPED: the runpod SDK interpolates docker_args into its GraphQL
+    # mutation UNESCAPED, so the --speculative_config {"method":"mtp",...} JSON
+    # (quotes/braces/colons) breaks create_pod with a GraphQL syntax error
+    # (confirmed 2026-07-06). MTP needs a RunPod template or a mounted config
+    # file, not inline JSON in docker_args — tracked as a follow-up. The model
+    # runs fine without MTP (it's a decode-throughput optimization, not required).
+    vllm_args: >-
+      --async-scheduling --trust-remote-code --max-model-len 65536
+      --kv-cache-dtype fp8 --gpu-memory-utilization 0.9 --enable-chunked-prefill
+      --mamba-ssm-cache-dtype float16 --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+
+  # ── Coder: Laguna-XS-2.1-FP8 + DFlash speculative decoding — 1× A40 (SGLang) ──
+  - name: coder
+    enabled: true
+    engine: "vllm/vllm-openai:latest"
+    binds_provider: coder-pod             # → --model-path poolside/Laguna-XS-2.1-FP8
+    phases: [implement, verify]           # boot gate: the execution lane
+    gpu_type_id: "NVIDIA A40"
+    gpu_count: 1
+    cloud_type: SECURE
+    container_disk_gb: 40
+    volume_gb: 60
+    startup_timeout_s: 900
+    max_lifetime_s: 7200
+    on_failure: abort
+    speculative_algorithm: DFLASH         # → --speculative-algorithm DFLASH
+    draft_model: poolside/Laguna-XS-2.1-DFlash  # → --speculative-draft-model-path
+    # --model-path / --tp / --host / --port are auto-prepended.
+    env:
+      VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: 0
+    vllm_args: >-
+      --kv-cache-dtype fp8_e5m2 --mem-fraction-static 0.9 --trust-remote-code

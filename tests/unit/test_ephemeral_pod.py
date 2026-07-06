@@ -132,6 +132,51 @@ def test_create_kwargs_shape():
     assert ck["volume_mount_path"] == "/root/.cache/huggingface"
 
 
+def test_resolved_image_by_engine():
+    assert EphemeralPodConfig(engine="vllm").resolved_image == "vllm/vllm-openai:latest"
+    assert EphemeralPodConfig(engine="sglang").resolved_image == "lmsysorg/sglang:latest"
+    # explicit image always wins
+    assert (
+        EphemeralPodConfig(engine="sglang", image="vllm/vllm-openai:v0.20.0").resolved_image
+        == "vllm/vllm-openai:v0.20.0"
+    )
+
+
+def test_docker_args_sglang_with_dflash():
+    pod = EphemeralPodConfig(
+        engine="sglang",
+        model="poolside/Laguna-XS-2.1",
+        gpu_count=1,
+        port=8000,
+        speculative_algorithm="DFLASH",
+        draft_model="poolside/Laguna-XS-2.1-DFlash",
+        sglang_args="--kv-cache-dtype fp8_e5m2 --mem-fraction-static 0.9",
+    )
+    da = _docker_args(pod)
+    assert da.startswith("python3 -m sglang.launch_server")
+    assert "--model-path poolside/Laguna-XS-2.1" in da
+    assert "--tp 1" in da
+    assert "--host 0.0.0.0" in da and "--port 8000" in da
+    assert "--speculative-algorithm DFLASH" in da
+    assert "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash" in da
+    assert "--mem-fraction-static 0.9" in da
+
+
+def test_docker_args_vllm_unchanged_by_engine_default():
+    # engine defaults to vllm → no sglang prefix, vLLM flag form
+    da = _docker_args(EphemeralPodConfig(model="M", gpu_count=4, vllm_args="--kv-cache-dtype fp8"))
+    assert "sglang" not in da
+    assert da.startswith("--model M")
+    assert "--tensor-parallel-size 4" in da
+
+
+def test_create_kwargs_sglang_image():
+    pod = EphemeralPodConfig(engine="sglang", model="poolside/Laguna-XS-2.1", gpu_count=1)
+    ck = _create_kwargs(pod, "spine-pod-coder")
+    assert ck["image_name"] == "lmsysorg/sglang:latest"
+    assert ck["docker_args"].startswith("python3 -m sglang.launch_server")
+
+
 # ── Reference-counted singleton ─────────────────────────────────────────────
 
 

@@ -140,7 +140,12 @@ class EphemeralPodConfig:
     # is set explicitly, and its ``base_url`` must be ``env:<url_env>``.
     binds_provider: str = ""
     api_key_env: str = "RUNPOD_API_KEY"
-    image: str = "vllm/vllm-openai:latest"
+    # Serving engine: "vllm" (default) or "sglang". Determines the container
+    # launch command and default image. Both expose an OpenAI-compatible
+    # /v1 API, so readiness (poll /v1/models) is identical.
+    engine: str = "vllm"
+    # Container image. Empty → the engine's default (see ``resolved_image``).
+    image: str = ""
     gpu_type_id: str = ""
     gpu_count: int = 1
     cloud_type: str = "SECURE"
@@ -150,7 +155,14 @@ class EphemeralPodConfig:
     volume_mount_path: str = "/root/.cache/huggingface"
     port: int = 8000
     model: str = ""
+    # Free-form extra launch flags for the engine (appended verbatim).
     vllm_args: str = ""
+    sglang_args: str = ""
+    # Speculative decoding (e.g. DFlash on SGLang): the draft/speculator model
+    # and, for SGLang, the algorithm name (``DFLASH``). On vLLM, express
+    # speculation via ``vllm_args`` (--speculative-config) instead.
+    draft_model: str = ""
+    speculative_algorithm: str = ""
     hf_token_env: str = "HF_TOKEN"
     env: dict = field(default_factory=dict)
     startup_timeout_s: int = 900
@@ -176,6 +188,17 @@ class EphemeralPodConfig:
         if self.name:
             return f"SPINE_POD_URL__{self.name.upper()}"
         return POD_BASE_URL_ENV
+
+    @property
+    def resolved_image(self) -> str:
+        """Container image — explicit ``image`` if set, else the engine default."""
+        if self.image:
+            return self.image
+        return (
+            "lmsysorg/sglang:latest"
+            if self.engine == "sglang"
+            else "vllm/vllm-openai:latest"
+        )
 
     @classmethod
     def _from_raw(cls, raw: dict, providers: dict) -> "EphemeralPodConfig":
@@ -271,7 +294,33 @@ def _import_runpod() -> Any:
 
 
 def _docker_args(pod: EphemeralPodConfig) -> str:
-    """vLLM OpenAI-server flags. TP size must equal the GPU count."""
+    """Container launch command/flags for the pod's serving engine.
+
+    * vLLM — the ``vllm/vllm-openai`` image ENTRYPOINT is the OpenAI api_server,
+      so these are appended as its args (no ``vllm serve`` prefix).
+    * SGLang — the ``lmsysorg/sglang`` image does not auto-start a server, so
+      the full ``python3 -m sglang.launch_server …`` command is provided.
+
+    TP size always equals ``gpu_count``. Both engines bind 0.0.0.0:port and
+    serve an OpenAI-compatible /v1 API.
+    """
+    if pod.engine == "sglang":
+        parts = [
+            "python3 -m sglang.launch_server",
+            f"--model-path {pod.model}",
+            f"--tp {pod.gpu_count}",
+            "--host 0.0.0.0",
+            f"--port {pod.port}",
+        ]
+        if pod.speculative_algorithm:
+            parts.append(f"--speculative-algorithm {pod.speculative_algorithm}")
+        if pod.draft_model:
+            parts.append(f"--speculative-draft-model-path {pod.draft_model}")
+        if pod.sglang_args:
+            parts.append(pod.sglang_args)
+        return " ".join(parts)
+
+    # Default: vLLM OpenAI server args.
     parts = [
         f"--model {pod.model}",
         f"--tensor-parallel-size {pod.gpu_count}",
@@ -290,7 +339,7 @@ def _create_kwargs(pod: EphemeralPodConfig, name: str) -> dict[str, Any]:
         env.setdefault("HF_TOKEN", hf_token)
     kwargs: dict[str, Any] = {
         "name": name,
-        "image_name": pod.image,
+        "image_name": pod.resolved_image,
         "gpu_type_id": pod.gpu_type_id,
         "gpu_count": pod.gpu_count,
         "cloud_type": pod.cloud_type,
