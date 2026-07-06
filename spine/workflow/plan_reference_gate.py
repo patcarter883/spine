@@ -48,7 +48,7 @@ import logging
 from typing import Any
 
 from spine.agents.plan_synthesis import (
-    _EXTERNAL_ROOTS,
+    _is_external_reference,
     _leaf,
     _symbol_exists_in_index,
 )
@@ -242,13 +242,13 @@ def check_reference_symbols(
             ref = _normalize_symbol(str(ref))
             if not ref:
                 continue
-            root = ref.split(".", 1)[0].strip()
             leaf = _leaf(ref)
-            # External-library names are not contracts — whether written as
-            # the bare alias ('st.form' → root) or module-qualified
-            # ('spine.ui._pages.config_view.st' → leaf, run 019f2104's false
-            # positive: a reference to config_view's streamlit import).
-            if root in _EXTERNAL_ROOTS or leaf in _EXTERNAL_ROOTS:
+            # External-library names and Python builtins are not contracts —
+            # bare aliases ('st.form'), module-qualified imports
+            # ('spine.ui._pages.config_view.st', run 019f2104), and research
+            # "Calls:" artifacts like 'open' / 'logger.exception' (run
+            # 019f34b7: two rework rounds burned on those two names).
+            if _is_external_reference(ref):
                 continue
             if _symbol_exists_in_index(db_path, ref):
                 continue

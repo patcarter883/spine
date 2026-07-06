@@ -177,6 +177,27 @@ def test_module_qualified_external_alias_is_skipped(index) -> None:
     assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
 
 
+def test_builtins_and_logger_refs_are_skipped(index) -> None:
+    # Run 019f34b7: planners copy research "Calls:" lists ('open',
+    # 'logger.exception') into reference_symbols; the gate flagged both as
+    # dangling for two consecutive rounds, driving the stagnation streak
+    # toward a park on a false-positive class.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {
+            "id": "s1",
+            "reference_symbols": [
+                "open",
+                "logger.exception",
+                "logging.getLogger",
+                "print",
+                "dict.setdefault",
+            ],
+        }
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
 def test_generic_package_prefix_never_matches_exclusion(index) -> None:
     # Run 019f2104: the exclusion "Core spine settings (checkpoint_path, ...)"
     # matched the 'spine' package prefix of every module path. Only the

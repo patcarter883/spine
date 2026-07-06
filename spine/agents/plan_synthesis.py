@@ -26,6 +26,7 @@ whole plan*.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import logging
 from typing import Any, Optional
 
@@ -153,10 +154,33 @@ def _phase(sub: str) -> str:
 # it must never be flagged as "no slice creates it".
 _EXTERNAL_ROOTS = frozenset({
     "st", "yaml", "json", "os", "sys", "re", "asyncio", "pathlib", "typing",
-    "logging", "datetime", "collections", "itertools", "functools", "math",
-    "np", "numpy", "pd", "pandas", "plt", "torch", "requests", "httpx",
+    "logging", "logger", "datetime", "collections", "itertools", "functools",
+    "math", "np", "numpy", "pd", "pandas", "plt", "torch", "requests", "httpx",
     "pydantic", "dataclasses", "abc", "enum", "contextlib", "shutil", "subprocess",
 })
+
+# Python builtins ('open', 'print', 'dict', …) are never cross-slice contracts
+# either, but planners copy them out of research "Calls:" lists into
+# reference_symbols (run 019f34b7: 'open' and 'logger.exception' flagged as
+# dangling references, burning two rework rounds toward a stagnation park).
+_BUILTIN_NAMES = frozenset(dir(builtins))
+
+
+def _is_external_reference(sym: str) -> bool:
+    """True when *sym* names an external library or a Python builtin.
+
+    Checks the root ('st.form', bare 'open'), the leaf (a module-qualified
+    import like 'spine.ui._pages.config_view.st' — run 019f2104's false
+    positive), and bare builtin names. Such references are facts about code
+    the plan calls, never contracts a slice must produce.
+    """
+    root = _root(sym)
+    if not root:
+        return False
+    leaf = _leaf(sym)
+    if root in _EXTERNAL_ROOTS or leaf in _EXTERNAL_ROOTS:
+        return True
+    return root in _BUILTIN_NAMES
 
 
 def _leaf(sym: str) -> str:
@@ -273,8 +297,8 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
                                 f"form a cycle — reorder these slices."
                             )
                     continue
-                # No producer. Skip obvious external-library references.
-                if _root(ref) in _EXTERNAL_ROOTS:
+                # No producer. Skip external-library and builtin references.
+                if _is_external_reference(ref):
                     continue
                 violations.append(
                     f"slice '{s.id}' references '{ref}', which does not exist in "
