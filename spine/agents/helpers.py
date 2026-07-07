@@ -247,7 +247,7 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
 
 
 def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
-    """Return a model_copy with thinking disabled — no-op for non-local models.
+    """Return a model_copy with thinking disabled — no-op for unrecognised models.
 
     Mechanical structured-output calls (supervisor directives, findings
     extraction) gain nothing from chain-of-thought, but on local thinking
@@ -259,13 +259,48 @@ def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
     0`` for budget-honouring models and ``enable_thinking: false`` for
     template-gated ones.
 
-    Scoped to ``ChatOpenAI`` instances pointing at a non-OpenAI ``base_url``
-    (local/OpenAI-compatible servers). ChatOpenRouter is not a ChatOpenAI
-    subclass and real OpenAI endpoints reject unknown extra_body keys —
-    both pass through unchanged. Merges into any existing ``extra_body``
-    rather than replacing it, so a provider-level ``reasoning: false``
-    config stays intact (idempotent). Fails open on any error.
+    ``ChatOpenRouter`` gets the equivalent OpenRouter-native lever instead —
+    ``reasoning: {"effort": "minimal"}`` — since it isn't a ``ChatOpenAI``
+    subclass and doesn't accept ``extra_body``. This is the same failure
+    class on the cloud side (trace 019f3a1d: a section_worker call against
+    ``moonshotai/kimi-k2.7-code`` spent its entire completion budget on
+    reasoning and left ``content`` empty, or — worse — emitted its raw
+    chain-of-thought as the final answer, which then passed schema
+    validation and was published verbatim into a doc).
+
+    Deliberately ``"minimal"``, not ``"none"``: some OpenRouter endpoints
+    (confirmed live for ``moonshotai/kimi-k2.7-code``) reject
+    ``effort: "none"`` outright with a 400 ("Reasoning is mandatory for this
+    endpoint and cannot be disabled") rather than silently ignoring it —
+    unlike the local-model levers below, which fail open. That 400 isn't
+    caught anywhere in the structured-output retry ladder, so picking
+    ``"none"`` would turn an intermittent failure into a 100% one. Not every
+    OpenRouter model honors ``"minimal"`` either (matching the local-model
+    comment that GLM reasons past its cap regardless) — this is a
+    mitigation, not a guarantee — but it's the lowest value confirmed
+    accepted rather than rejected.
+
+    For a plain ``ChatOpenAI``, scoped to instances pointing at a non-OpenAI
+    ``base_url`` (local/OpenAI-compatible servers) — real OpenAI endpoints
+    reject unknown ``extra_body`` keys. Merges into any existing
+    ``extra_body``/``reasoning`` rather than replacing it, so a
+    provider-level override stays intact (idempotent). Fails open on any
+    error.
     """
+    try:
+        from langchain_openrouter import ChatOpenRouter
+
+        if isinstance(model, ChatOpenRouter):
+            reasoning = dict(getattr(model, "reasoning", None) or {})
+            reasoning.setdefault("effort", "minimal")
+            return model.model_copy(update={"reasoning": reasoning})
+    except Exception:
+        logger.debug(
+            "suppress_reasoning: ChatOpenRouter copy failed — using model as-is",
+            exc_info=True,
+        )
+        return model
+
     try:
         from langchain_openai import ChatOpenAI
 

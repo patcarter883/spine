@@ -65,6 +65,7 @@ from spine.agents.helpers import (
     coerce_structured_output,
     resolve_chat_model,
     suppress_parsed_serializer_warning,
+    suppress_reasoning,
 )
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.work.onboarding.manifest import RepoManifest
@@ -558,7 +559,10 @@ _RETRY_NUDGE = (
     "Your previous response did not contain usable section content. Return a "
     "JSON object matching the schema exactly: 'overview' MUST hold 1-3 "
     "non-empty paragraphs of prose for this section. Do not return an empty "
-    "or metadata-only object."
+    "or metadata-only object. Do not include your reasoning, chain-of-thought, "
+    "or any meta-commentary about how you're formatting the JSON — 'overview' "
+    "is published verbatim as documentation prose, so it must contain ONLY "
+    "the section content itself."
 )
 
 
@@ -569,6 +573,43 @@ def _coerce_section_content(response: Any) -> SectionContent | None:
     same instance / ``.parsed`` / dict-validate handling the doc manager uses).
     """
     return coerce_structured_output(response, SectionContent)
+
+
+# Chain-of-thought / self-narration phrases that occasionally leak into an
+# otherwise schema-valid ``overview`` (trace 019f3a1d: ARCHITECTURE_MAP.md and
+# PROJECT_DEFINITION.md sections were published containing the model's raw
+# deliberation about how to format the JSON — hundreds of words of "Let's
+# craft...", "wait, the user did not mention notes?", "the JSON begins now" —
+# instead of section prose). Pydantic only checks ``overview`` is a non-empty
+# string, which a leaked-reasoning blob satisfies just fine. Not
+# prefix-anchored like :func:`spine.agents.helpers._looks_like_leaked_reasoning`
+# — these leaks land anywhere in the text, often after a clean opening
+# paragraph, so this scans the whole string. A false positive here just costs
+# one retry attempt (unlike that helper, which discards a whole phase output),
+# so the bar for inclusion is "would never appear in real documentation
+# prose", not "impossible to coincidentally match".
+_LEAKED_REASONING_MARKERS = (
+    "</think>",
+    "```",
+    "<|tool_call",
+    "let's craft",
+    "let me craft",
+    "i must not invent",
+    "no extra text outside",
+    "the json begins now",
+    "the final json is",
+    "json final",
+    "wait, the user",
+    "final answer is the json",
+    "no additional commentary outside",
+    "json_pseudofunction",
+)
+
+
+def _looks_like_leaked_content(overview: str) -> bool:
+    """True if ``overview`` contains a chain-of-thought/self-narration leak."""
+    lowered = overview.lower()
+    return any(marker in lowered for marker in _LEAKED_REASONING_MARKERS)
 
 
 async def _section_worker_node(
@@ -609,7 +650,7 @@ async def _section_worker_node(
             config, session_id=work_id, phase="onboarding/section-worker"
         )
         comp_cap = _section_max_completion_tokens(config)
-        model = cap_completion_tokens(model, comp_cap)
+        model = suppress_reasoning(cap_completion_tokens(model, comp_cap))
 
         prompt = _worker_prompt(active, voice)
         structured = bind_structured_output(model, SectionContent)
@@ -658,17 +699,27 @@ async def _section_worker_node(
                 continue
 
             if content is not None and content.overview.strip():
-                markdown = render_section_markdown(active.get("title", ""), content)
-                return {
-                    "section_results": [
-                        {
-                            "doc_id": doc_id,
-                            "order": order,
-                            "markdown": markdown,
-                            "status": "ok",
-                        }
-                    ]
-                }
+                if _looks_like_leaked_content(content.overview):
+                    logger.warning(
+                        "[%s] section_worker: section %s#%d attempt %d produced "
+                        "leaked-reasoning content — discarding and retrying",
+                        work_id,
+                        doc_id,
+                        order,
+                        attempt + 1,
+                    )
+                else:
+                    markdown = render_section_markdown(active.get("title", ""), content)
+                    return {
+                        "section_results": [
+                            {
+                                "doc_id": doc_id,
+                                "order": order,
+                                "markdown": markdown,
+                                "status": "ok",
+                            }
+                        ]
+                    }
 
             if attempt >= _SECTION_MAX_RETRIES:
                 logger.warning(

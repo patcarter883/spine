@@ -21,6 +21,7 @@ make no LLM/tool calls, and do no I/O. Token metering uses
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from spine.agents._tokens import count_tokens
@@ -72,8 +73,29 @@ def _is_path_artifact(name: str) -> bool:
     return first in _FILESYSTEM_ARTIFACT_PREFIXES
 
 
+_ROLE_SYMBOL_COUNT_RE = re.compile(r":\s*(\d+)\s*symbols\b")
+
+
 def _module_symbol_count(boundary: dict[str, Any]) -> int:
-    """Number of key symbols recorded for a serialised module boundary."""
+    """Total symbol count for a serialised module boundary.
+
+    Parses the real count out of ``role`` (deterministically formatted by
+    :meth:`RepoAnalyzer._describe_module` as ``"{name}: {N} symbols (...)"``),
+    NOT ``len(key_symbols)`` — ``key_symbols`` is truncated to a handful of
+    representative entries per module (see :func:`resolve_fragment`'s token
+    cap), so every module's ``key_symbols`` length converges on the same
+    small number regardless of the module's actual size. That bug made
+    ``largest_modules`` (SPINE_ASSISTANCE_REQUIREMENTS' hot-spot ranking)
+    report every module at the same tiny "symbol count" sorted alphabetically
+    instead of by real size (trace 019f3a1d: ARCHITECTURE_MAP.md shows
+    ``spine.agents`` at 651 symbols, but the hot-spot section it fed into
+    claimed "ten modules each report 8 symbols" and never flagged
+    ``spine.agents`` as disproportionately large). Falls back to
+    ``len(key_symbols)`` if ``role`` doesn't match the expected shape.
+    """
+    match = _ROLE_SYMBOL_COUNT_RE.search(boundary.get("role", "") or "")
+    if match:
+        return int(match.group(1))
     return len(boundary.get("key_symbols", []) or [])
 
 
