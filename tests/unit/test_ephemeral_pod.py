@@ -451,6 +451,75 @@ async def test_conservative_boots_both_when_phases_none(monkeypatch):
     assert "SPINE_POD_URL__CODER" not in os.environ
 
 
+# ── Hardening: pod skipped once providers.phases stops routing to it ───────
+
+
+def test_select_pods_skips_when_provider_unreferenced():
+    """A pod stays 'enabled' with a matching 'phases' gate, but
+    providers.phases has been rewired away from its binds_provider — the
+    real-world case where reasoner-pod/coder-pod were dropped in favor of a
+    single 'pat' provider but the ephemeral_pods block was left enabled."""
+    cfg = FakeConfig(
+        ephemeral_pods=[
+            {
+                "name": "reasoner",
+                "enabled": True,
+                "model": "openai:GLM-Air",
+                "binds_provider": "reasoner-pod",
+                "phases": ["specify", "plan"],
+            },
+        ],
+        providers={"phases": {"specify": {"provider": "pat"}, "plan": {"provider": "pat"}}},
+    )
+    assert select_pods(cfg, {"specify"}) == []
+    assert select_pods(cfg, None) == []  # conservative superset still filters
+
+
+def test_select_pods_keeps_pod_when_provider_referenced_directly():
+    cfg = FakeConfig(
+        ephemeral_pods=[
+            {
+                "name": "reasoner",
+                "enabled": True,
+                "model": "openai:GLM-Air",
+                "binds_provider": "reasoner-pod",
+                "phases": ["specify", "plan"],
+            },
+        ],
+        providers={"phases": {"specify": {"provider": "reasoner-pod"}}},
+    )
+    assert [p.name for p in select_pods(cfg, {"specify"})] == ["reasoner"]
+
+
+def test_select_pods_keeps_pod_when_provider_referenced_via_escalation():
+    cfg = FakeConfig(
+        ephemeral_pods=[
+            {
+                "name": "coder",
+                "enabled": True,
+                "model": "openai:Qwen",
+                "binds_provider": "coder-pod",
+                "phases": ["implement"],
+            },
+        ],
+        providers={
+            "phases": {
+                "implement": {
+                    "provider": "pat",
+                    "escalation": [{"provider": "coder-pod"}],
+                }
+            }
+        },
+    )
+    assert [p.name for p in select_pods(cfg, {"implement"})] == ["coder"]
+
+
+def test_select_pods_no_binds_provider_is_unaffected():
+    """Pods without a declared binds_provider (e.g. legacy configs that set
+    model: directly) can't be checked, so they're never dropped by this."""
+    assert [p.name for p in select_pods(_TWO_POD_CFG, {"plan"})] == ["reasoner"]
+
+
 @pytest.mark.asyncio
 async def test_abort_rolls_back_pods_booted_this_call(monkeypatch):
     """If the second pod fails to boot under on_failure=abort, the first

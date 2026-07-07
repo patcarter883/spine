@@ -260,6 +260,30 @@ def parse_pods(config: "SpineConfig") -> list["EphemeralPodConfig"]:
     return pods
 
 
+def _provider_referenced_in_phases(config: "SpineConfig", provider_name: str) -> bool:
+    """True iff some ``providers.phases`` entry (base or escalation ladder)
+    has ``provider: <provider_name>`` — i.e. some phase actually routes to it.
+
+    Guards against a stale ``ephemeral_pods`` entry left ``enabled: true``
+    after ``providers.phases`` was rewired to a different provider: the pod's
+    own ``phases:`` list (the boot gate) can go on matching the run's phase
+    set indefinitely even though nothing consumes it anymore, booting an
+    expensive GPU pod for nothing every run.
+    """
+    if not provider_name:
+        return True  # no bound provider to check against; don't block
+    phases = (getattr(config, "providers", {}) or {}).get("phases", {})
+    for phase_cfg in phases.values():
+        if not isinstance(phase_cfg, dict):
+            continue
+        if phase_cfg.get("provider") == provider_name:
+            return True
+        for entry in phase_cfg.get("escalation", []) or []:
+            if isinstance(entry, dict) and entry.get("provider") == provider_name:
+                return True
+    return False
+
+
 def select_pods(
     config: "SpineConfig", executed_phases: set[str] | None
 ) -> list["EphemeralPodConfig"]:
@@ -268,14 +292,36 @@ def select_pods(
     A pod with an empty ``phases`` list always qualifies (legacy always-on). When
     ``executed_phases`` is ``None`` (the run's phase set couldn't be determined)
     every enabled pod is returned — the safe superset.
+
+    Either way, a pod with a ``binds_provider`` that no ``providers.phases``
+    entry actually references is dropped and a warning logged — see
+    :func:`_provider_referenced_in_phases`.
     """
     pods = parse_pods(config)
     if executed_phases is None:
-        return pods
+        candidates = pods
+    else:
+        candidates = [
+            pod
+            for pod in pods
+            if not pod.phases or (set(pod.phases) & executed_phases)
+        ]
     selected: list[EphemeralPodConfig] = []
-    for pod in pods:
-        if not pod.phases or (set(pod.phases) & executed_phases):
-            selected.append(pod)
+    for pod in candidates:
+        if pod.binds_provider and not _provider_referenced_in_phases(
+            config, pod.binds_provider
+        ):
+            logger.warning(
+                "ephemeral_pod '%s' (binds_provider=%s) is enabled and its "
+                "phases gate matches this run, but no providers.phases entry "
+                "routes to '%s' — skipping boot. Set enabled: false in "
+                "ephemeral_pods to silence this warning.",
+                pod.name or "default",
+                pod.binds_provider,
+                pod.binds_provider,
+            )
+            continue
+        selected.append(pod)
     return selected
 
 

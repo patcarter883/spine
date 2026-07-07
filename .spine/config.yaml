@@ -90,10 +90,14 @@ mcp_servers:
     args: []
 providers:
   llm:
-  - name: openrouter-glm
+  - name: openrouter
     type: deepagents-model
-    model: openrouter:z-ai/glm-5.2
+    model: openrouter:moonshotai/kimi-k2.7-code
     enabled: true
+    guided_decoding: true
+    enabled: true
+    stream_usage: true
+    context_window: 100000
   # - name: pat
   #   type: deepagents-model
   #   model: openai:model
@@ -114,19 +118,23 @@ providers:
     stream_usage: true
     max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
     context_window: 60000
-  - name: pat-glm
+  - name: pat
     type: deepagents-model
-    model: openai:QuantTrio/GLM-4.7-Flash-AWQ
-    base_url: http://localhost:1919/v1
+    # Verified live 2026-07-07 (vLLM 0.22.69, tp2): the server serves
+    # Qwen3.6-27B-AWQ-INT4 (not the 35B-A3B id), max_model_len 50000.
+    # json_schema guided decoding, native tool_calls, and the reasoning
+    # parser (thinking in `reasoning`, not content) all work; ~9-10 tok/s.
+    model: openai:cyankiwi/Qwen3.6-27B-AWQ-INT4
+    base_url: http://10.50.1.51:8000/v1
     api_key: vllm
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 2  # Lemonade @ localhost:8010 is single-stream
-    context_window: 40000
+    max_concurrent_calls: 4
+    context_window: 50000              # = server max_model_len
   - name: local-qwen
     type: deepagents-model
-    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
+    model: openai:Agents-A1-Q4_K_M-GGUF-Q4_K_M
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
@@ -195,6 +203,46 @@ providers:
     top_p: 0.8
     top_k: 20
     repeat_penalty: 1.05
+  # ── Zaya RSA @ 10.50.1.51:1919 (MiniSGL server, recursive self-aggregation) ──
+  # Endpoint verified live 2026-07-07: MiniSGL API server, `rsa` is a native
+  # request field (bool|dict), responses carry an `rsa` metadata block. The
+  # server fans each request out to n rollouts + aggregation rounds and returns
+  # only the final selected answer; spine auto-switches active-RSA calls to the
+  # non-streaming endpoint and defaults the request timeout to 1800s.
+  # Live-test findings (n=2,k=1,t=1, 256-tok caps ≈ 28s):
+  #  • temperature MUST be set INSIDE the rsa dict — the server default (1.0)
+  #    produces pure garbage from this model; 0.3 gave correct output.
+  #  • Token caps must also go in the rsa dict (top-level max_tokens does not
+  #    govern rollouts); with server-default caps even n=2 exceeded 300s.
+  #  • ⚠ usage is ZEROED on RSA responses (prompt/completion_tokens: 0) —
+  #    spine's token accounting/budget tracker will be blind on this lane.
+  #  • Output has heavy whitespace padding (TiDAR-style quirk).
+  # ⚠ context_window still unverified — not exposed by the server.
+  - name: zaya
+    type: deepagents-model
+    model: openai:/big/zaya1-tidar-opd-fp8   # from /v1/models
+    base_url: http://10.50.1.51:1919/v1
+    api_key: vllm
+    enabled: true
+    guided_decoding: false           # /v1/chat/completions schema has response_format; untested through RSA
+    max_concurrent_calls: 1          # each call is already n rollouts + agg rounds server-side
+    context_window: 60000            # ⚠ confirm against the backing model
+    # Sampling: applies to plain (rsa: false) calls via the request top-level
+    # fields; RSA rollouts sample from the copies inside the rsa dict below.
+    temperature: 0.6
+    top_p: 0.9
+    top_k: 40
+    rsa:
+      n: 16
+      k: 4
+      t: 2
+      selection: auto
+      temperature: 0.6               # REQUIRED in rsa dict: server default 1.0 → garbage output
+      top_p: 0.9
+      top_k: 40
+      max_tokens: 8192               # per-rollout cap; n=16,t=2 at this size is a LONG run
+      agg_max_tokens: 8192
+      tail_tokens: 4096
   # Reasoning lane (PLAN synthesis, critic): bench winner — perfect on the hard
   # reasoning bench at ~1/3 the Qwens' reasoning cost; 6.7GB = fast GPU swap.
   - name: local-qwen-small
@@ -260,27 +308,27 @@ providers:
     # ZERO intra-phase swaps across the whole specify/plan/critic tree.
     # ═══ PLANNING lane -> reasoner-pod (Nemotron NVFP4, boots the RTX PRO 4500 pod) ═══
     specify:
-      provider: reasoner-pod
+      provider: pat
     specify/subagents/researcher:
-      provider: reasoner-pod
+      provider: pat
     specify/subagents/researcher/supervisor:
-      provider: reasoner-pod
+      provider: pat
     plan:
-      provider: reasoner-pod
+      provider: pat
     plan/subagents/researcher:
-      provider: reasoner-pod
+      provider: pat
     plan/subagents/researcher/supervisor:
-      provider: reasoner-pod
+      provider: pat
     critic:
-      provider: reasoner-pod
+      provider: pat
     critic/specify:
-      provider: reasoner-pod
+      provider: pat
     critic/plan:
-      provider: reasoner-pod
+      provider: pat
     gap_plan:
-      provider: reasoner-pod
+      provider: pat
     exploration/manager:
-      provider: reasoner-pod
+      provider: pat
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
@@ -294,23 +342,23 @@ providers:
     # servers, so this cross-model split costs no model reload.
     # ═══ EXECUTION lane -> coder-pod (Laguna+DFlash, boots the A40 SGLang pod) ═══
     implement:
-      provider: coder-pod
+      provider: pat
       # Escalation stays on coder-pod: an execution run only boots the coder
       # pod, so escalating to reasoner-pod (not booted) would fail to resolve.
       escalation:
-        - provider: coder-pod
+        - provider: pat
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: coder-pod
+      provider: pat
     implement/subagents/slice-implementer:
-      provider: coder-pod
+      provider: pat
     verify:
-      provider: coder-pod
+      provider: pat
     verify/subagents/slice-verifier:
-      provider: coder-pod
+      provider: pat
     classification:
-      provider: local-qwen
+      provider: pat
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
@@ -320,11 +368,11 @@ providers:
       temperature: 0
       reasoning: false
     onboarding:
-      provider: local-qwen
+      provider: openrouter
     onboarding/doc-manager:
-      provider: local-qwen
+      provider: openrouter
     onboarding/section-worker:
-      provider: local-qwen
+      provider: openrouter
     # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
     # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
     # actually fail. error_diagnosis is enabled in the spine: block above.
@@ -355,7 +403,7 @@ providers:
 ephemeral_pods:
   # ── Reasoner: Nemotron-3-Super-120B-A12B-NVFP4 (+MTP) — 4× RTX PRO 4500 ──
   - name: reasoner
-    enabled: true
+    enabled: false   # no phase in providers.phases routes to reasoner-pod anymore (all → pat)
     engine: vllm
     binds_provider: reasoner-pod          # → --model nvidia/...Nemotron...NVFP4
     phases: [specify, plan, critic, gap_plan]   # boot gate: the planning lane
@@ -389,7 +437,7 @@ ephemeral_pods:
 
   # ── Coder: Laguna-XS-2.1-FP8 + DFlash speculative decoding — 1× A40 (SGLang) ──
   - name: coder
-    enabled: true
+    enabled: false   # no phase in providers.phases routes to coder-pod anymore (all → pat)
     engine: "vllm/vllm-openai:latest"
     binds_provider: coder-pod             # → --model-path poolside/Laguna-XS-2.1-FP8
     phases: [implement, verify]           # boot gate: the execution lane
