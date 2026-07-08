@@ -1,4 +1,3 @@
-import pytest
 from spine.ui.utils import format_bytes
 
 
