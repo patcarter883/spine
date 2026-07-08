@@ -1878,6 +1878,14 @@ def _build_implementation_summary(slice_results: list[dict]) -> str:
 
 # ── save_artifacts node ─────────────────────────────────────────────────
 
+# The implementation report must cross the sandbox→durable boundary whole:
+# gap_plan reads implementation.md, restart/UI read both files, and the sandbox
+# worktree holding the full copy is torn down at finalize. A 500-char preview
+# leaves the persisted report truncated mid-record. The mapper's
+# _FULL_PERSIST_ARTIFACTS keeps these untruncated through parent state.
+_FULL_REPORT_FILES = ("implementation.md", "implementation.json")
+_MAX_FULL_REPORT_CHARS = 200_000
+
 
 async def _save_implement_artifacts(
     state: ImplementSubgraphState,
@@ -1900,6 +1908,8 @@ async def _save_implement_artifacts(
         work_id,
         PhaseName.IMPLEMENT.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        full_fidelity=_FULL_REPORT_FILES,
+        max_full_chars=_MAX_FULL_REPORT_CHARS,
     )
 
     if not disk_artifacts and agent_response.strip():
