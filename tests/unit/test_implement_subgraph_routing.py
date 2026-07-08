@@ -15,6 +15,7 @@ from spine.workflow.subgraphs.implement_subgraph import (
     _dispatch_gate_node,
     _fallback_decomposer_node,
     _placement_feedback,
+    _placement_to_slice_result,
     _plan_slice_implementer_node,
     _route_slices,
     _slice_result_to_update,
@@ -382,3 +383,55 @@ class TestPlacementFeedback:
         text = _placement_feedback(placement)
         assert "[DO THIS:" not in text
         assert "[target:" not in text
+
+
+class TestPlacementToSliceResultIssues:
+    """019f3f7d: the anchor guard's target/next_action reached the same-cycle
+    synthesis retry (_placement_feedback) but were dropped from the ``issues``
+    persisted into implementation.json — the channel later rework cycles read
+    via gap_plan. A phantom-anchor mistake on render_phase_provider_section
+    (anchoring insert_after to itself instead of the existing `render` symbol)
+    recurred identically across 3 verify/gap_plan cycles because of this."""
+
+    def _placement(self, failures, applied=None):
+        class _FakePlacement:
+            pass
+
+        p = _FakePlacement()
+        p.failures = failures
+        p.applied = applied or []
+        p.n_applied = len(p.applied)
+        p.n_failures = len(failures)
+        return p
+
+    def test_issues_include_target_and_next_action(self):
+        placement = self._placement([{
+            "file": "config_view.py",
+            "symbol": "render_phase_provider_section",
+            "status": "no_match",
+            "detail": (
+                "symbol 'render_phase_provider_section' does not exist in "
+                "config_view.py yet — your code defines it, so you are "
+                "CREATING it, not editing it."
+            ),
+            "target": "render",
+            "next_action": (
+                "Call ast_edit with action='insert_after' anchored to "
+                "'render' (the last existing symbol)."
+            ),
+        }])
+        slice_result = _placement_to_slice_result("slice_01", placement)
+        assert len(slice_result["issues"]) == 1
+        issue = slice_result["issues"][0]
+        assert "[target: render]" in issue
+        assert "[DO THIS:" in issue
+        assert "insert_after" in issue
+
+    def test_issues_omit_target_next_action_when_absent(self):
+        placement = self._placement([{
+            "file": "svc.py", "symbol": "x", "status": "syntax_error", "detail": "bad code",
+        }])
+        slice_result = _placement_to_slice_result("slice_01", placement)
+        issue = slice_result["issues"][0]
+        assert "[DO THIS:" not in issue
+        assert "[target:" not in issue
