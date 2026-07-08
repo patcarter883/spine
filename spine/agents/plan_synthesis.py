@@ -27,7 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import importlib.util
 import logging
+import sys
+from functools import lru_cache
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -167,20 +170,61 @@ _BUILTIN_NAMES = frozenset(dir(builtins))
 
 
 def _is_external_reference(sym: str) -> bool:
-    """True when *sym* names an external library or a Python builtin.
+    """True when *sym* is not a cross-slice symbol contract at all.
 
-    Checks the root ('st.form', bare 'open'), the leaf (a module-qualified
-    import like 'spine.ui._pages.config_view.st' — run 019f2104's false
-    positive), and bare builtin names. Such references are facts about code
-    the plan calls, never contracts a slice must produce.
+    Covers external libraries and Python builtins — checking the root
+    ('st.form', bare 'open'), the leaf (a module-qualified import like
+    'spine.ui._pages.config_view.st' — run 019f2104's false positive), and
+    bare builtin names — plus two planner-noise shapes (run 019f40e0 parked
+    a healthy plan on both):
+
+    - FILE PATHS ('spine/ui/utils.py'): a path is a fact about where code
+      lives, never a symbol a producer slice must create.
+    - IMPORTABLE PACKAGE ROOTS ('pytest.mark.parametrize'): resolved
+      dynamically against the running environment, so the static
+      _EXTERNAL_ROOTS list doesn't have to enumerate every library a plan
+      might mention. Project-internal packages resolve to code inside the
+      workspace and stay flaggable.
     """
+    s = (sym or "").strip()
+    if "/" in s or "\\" in s or s.endswith(".py"):
+        return True
     root = _root(sym)
     if not root:
         return False
     leaf = _leaf(sym)
     if root in _EXTERNAL_ROOTS or leaf in _EXTERNAL_ROOTS:
         return True
-    return root in _BUILTIN_NAMES
+    if root in _BUILTIN_NAMES:
+        return True
+    return _importable_external_root(root)
+
+
+@lru_cache(maxsize=512)
+def _importable_external_root(root: str) -> bool:
+    """True when *root* imports from OUTSIDE the project tree (stdlib or
+    site-packages). The project's own package (editable-installed, origin
+    inside the working tree) returns False so genuinely dangling internal
+    references stay flaggable. Any resolution failure returns False —
+    a broken import must never silence the gate.
+    """
+    if not root.isidentifier():
+        return False
+    try:
+        spec = importlib.util.find_spec(root)
+    except (ImportError, ValueError, ModuleNotFoundError):
+        return False
+    if spec is None:
+        return False
+    origin = spec.origin or ""
+    if origin in ("built-in", "frozen"):
+        return True
+    if "site-packages" in origin or "dist-packages" in origin:
+        return True
+    # Stdlib modules live under the interpreter prefix (outside any repo).
+    if origin.startswith(sys.base_prefix):
+        return True
+    return False
 
 
 def _leaf(sym: str) -> str:

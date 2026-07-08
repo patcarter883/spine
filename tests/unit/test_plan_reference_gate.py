@@ -442,3 +442,35 @@ def test_critic_result_mapper_routes_spec_contradiction_to_specify() -> None:
     assert result["needs_review_phase"] == PhaseName.SPECIFY.value
     assert result["needs_review_kind"] == "spec_amendment"
     assert result["last_critic_review"]["escalate"] is True
+
+
+class TestExternalReferenceClassification:
+    """Planner-noise shapes must never count as cross-slice contract violations.
+
+    Regression (run 019f40e0): the gate rejected a healthy 2-slice plan five
+    rounds running because reference_symbols contained a FILE PATH
+    ('spine/ui/utils.py') and an external test-framework attribute
+    ('pytest.mark.parametrize'), parking the run on stagnation.
+    """
+
+    def test_file_paths_are_never_contracts(self) -> None:
+        from spine.agents.plan_synthesis import _is_external_reference
+
+        assert _is_external_reference("spine/ui/utils.py")
+        assert _is_external_reference("tests/unit/test_ui_utils.py")
+        assert _is_external_reference("some\\windows\\path.py")
+
+    def test_importable_third_party_and_stdlib_roots_are_external(self) -> None:
+        from spine.agents.plan_synthesis import _is_external_reference
+
+        assert _is_external_reference("pytest.mark.parametrize")
+        assert _is_external_reference("unittest.mock.patch")
+
+    def test_project_and_unknown_symbols_stay_flaggable(self) -> None:
+        from spine.agents.plan_synthesis import _is_external_reference
+
+        # The project package is editable-installed (origin inside the repo):
+        # module-qualified internal refs must remain subject to the gate.
+        assert not _is_external_reference("spine.ui.utils.format_duration")
+        assert not _is_external_reference("UIApi.get_providers")
+        assert not _is_external_reference("nonexistent_pkg.thing")
