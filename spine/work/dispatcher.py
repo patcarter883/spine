@@ -50,6 +50,38 @@ logger = logging.getLogger(__name__)
 _STALL_TIMEOUT_SECONDS = int(__import__("os").environ.get("SPINE_STALL_TIMEOUT", "120"))
 
 
+def _persist_state_artifacts(
+    store: ArtifactStore, work_id: str, artifacts_by_phase: Any
+) -> None:
+    """Persist state-carried artifacts to the durable store.
+
+    Full-fidelity report artifacts (``_FULL_PERSIST_ARTIFACTS``) carry their
+    complete content through parent state, so they are authoritative and must
+    overwrite whatever is on disk — including a LONGER report from a previous
+    cycle or run.  ``save_artifact``'s shorter-content guard exists to stop
+    500-char state previews clobbering full files; left on for these names it
+    instead pins the durable copy to a stale longer version (work 06c2d55c:
+    the resume's fresh gap_plan.json was skipped because the original run's
+    report happened to be longer).  Preview-only names keep the guard.
+    """
+    from spine.workflow.subgraph_wrapper import _FULL_PERSIST_ARTIFACTS
+
+    if not artifacts_by_phase or not isinstance(artifacts_by_phase, dict):
+        return
+    for art_phase, phase_arts in artifacts_by_phase.items():
+        if not isinstance(phase_arts, dict):
+            continue
+        for art_name, art_content in phase_arts.items():
+            if art_content is not None:
+                store.save_artifact(
+                    work_id,
+                    art_phase,
+                    art_name,
+                    str(art_content),
+                    overwrite_shorter=art_name in _FULL_PERSIST_ARTIFACTS,
+                )
+
+
 # ── Work entries database ──
 
 
@@ -711,16 +743,7 @@ async def submit_work(
                 # the entire workflow to finish.  We use ArtifactStore (with
                 # work_id) and also materialize to the agent-readable path.
                 node_artifacts = node_output.get("artifacts")
-                if node_artifacts and isinstance(node_artifacts, dict):
-                    for art_phase, phase_arts in node_artifacts.items():
-                        if not isinstance(phase_arts, dict):
-                            continue
-                        for art_name, art_content in phase_arts.items():
-                            if art_content is not None:
-                                artifacts.save_artifact(
-                                    work_id, art_phase, art_name, str(art_content)
-                                )
-                                logger.debug(f"[{work_id}] Saved artifact {art_phase}/{art_name}")
+                _persist_state_artifacts(artifacts, work_id, node_artifacts)
 
         # Close the stream generator so the LangSmith trace tears down now.
         # On natural completion it's already exhausted (no-op); on a cancel or
@@ -754,10 +777,7 @@ async def submit_work(
         )
 
         # Save artifacts to disk
-        for phase, phase_artifacts in result_artifacts.items():
-            for name, content in phase_artifacts.items():
-                if content is not None:
-                    artifacts.save_artifact(work_id, phase, name, str(content))
+        _persist_state_artifacts(artifacts, work_id, result_artifacts)
 
         db["work_entries"].update(
             work_id,
@@ -1197,16 +1217,9 @@ async def resume_work(
                         )
 
                     # Persist artifacts
-                    node_artifacts = node_output.get("artifacts")
-                    if node_artifacts and isinstance(node_artifacts, dict):
-                        for art_phase, phase_arts in node_artifacts.items():
-                            if not isinstance(phase_arts, dict):
-                                continue
-                            for art_name, art_content in phase_arts.items():
-                                if art_content is not None:
-                                    artifacts.save_artifact(
-                                        work_id, art_phase, art_name, str(art_content)
-                                    )
+                    _persist_state_artifacts(
+                        artifacts, work_id, node_output.get("artifacts")
+                    )
 
         # Derive final status (resume has no stall tracking).
         final_phase = result.get("current_phase", "")
@@ -2231,15 +2244,7 @@ async def _run_workflow_graph_inner(
                 )
 
             node_artifacts = node_output.get("artifacts")
-            if node_artifacts and isinstance(node_artifacts, dict):
-                for art_phase, phase_arts in node_artifacts.items():
-                    if not isinstance(phase_arts, dict):
-                        continue
-                    for art_name, art_content in phase_arts.items():
-                        if art_content is not None:
-                            artifact_store.save_artifact(
-                                work_id, art_phase, art_name, str(art_content)
-                            )
+            _persist_state_artifacts(artifact_store, work_id, node_artifacts)
 
     # Close the stream generator so the LangSmith trace tears down now (no-op
     # on natural exhaustion; runs teardown promptly on a cancel/stall break).
@@ -2797,15 +2802,7 @@ async def approve_and_spawn(
                         node_name,
                         {"phase": phase, "status": status},
                     )
-                if node_artifacts and isinstance(node_artifacts, dict):
-                    for art_phase, phase_arts in node_artifacts.items():
-                        if not isinstance(phase_arts, dict):
-                            continue
-                        for art_name, art_content in phase_arts.items():
-                            if art_content is not None:
-                                artifacts_store.save_artifact(
-                                    plan_id, art_phase, art_name, str(art_content)
-                                )
+                _persist_state_artifacts(artifacts_store, plan_id, node_artifacts)
 
         if stalled:
             db["work_entries"].update(
