@@ -227,6 +227,32 @@ class SpineGitOrchestrator:
 
         self.patch_branch = branch
         self.sandbox_dir = sandbox_dir
+
+        # ── Sandbox setup hooks (spine-gate.yaml: sandbox_setup) ──
+        # A fresh worktree contains only TRACKED files; projects whose build
+        # or test tooling needs untracked state get it seeded here. The
+        # motivating case is a Laravel Sail project (agripath clone): pest
+        # inside the Sail container needs the project's .env and the
+        # gitignored storage/oauth-*.key files copied into every sandbox —
+        # without them the whole suite fails before testing anything. Hooks
+        # run IN the sandbox, in order; a failing hook aborts the run before
+        # any tokens are spent, exactly like a dirty tree.
+        for hook in self.gate_config.get("sandbox_setup") or []:
+            command = (hook or {}).get("command", "")
+            if not command:
+                continue
+            timeout = int((hook or {}).get("timeout_seconds", 120))
+            logger.info("Sandbox setup hook: %s", command)
+            ok, stdout, stderr = self._execute_shell(
+                command, cwd=sandbox_dir, timeout=timeout
+            )
+            if not ok:
+                self.rollback_workspace()
+                raise SandboxPreparationError(
+                    f"Sandbox setup hook failed: {command!r}: "
+                    f"{(stdout + stderr).strip()[:500]}"
+                )
+
         logger.info(
             "Prepared sandbox (strategy=%s, branch=%s, dir=%s)",
             self.strategy,

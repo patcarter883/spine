@@ -207,3 +207,43 @@ def test_merge_conflict_with_advanced_main_raises(git_repo, tmp_path):
 
     with pytest.raises(MergeError):
         orch.commit_and_merge()
+
+
+def test_sandbox_setup_hooks_seed_untracked_state(git_repo, tmp_path):
+    """sandbox_setup hooks run in the fresh worktree before the workflow.
+
+    A worktree contains only tracked files; projects whose tooling needs
+    untracked state (a Laravel .env, storage/oauth keys, a vendor overlay)
+    seed it here. A failing hook must abort like a dirty tree — before any
+    tokens are spent — and roll the sandbox back.
+    """
+    repo, config = git_repo
+    orch = _build_orchestrator(repo, config, tmp_path)
+    orch.gate_config["sandbox_setup"] = [
+        {"command": "cp ../repo-secrets/.env .env"},
+        {"command": "mkdir -p storage && echo key > storage/oauth-private.key"},
+    ]
+    secrets = tmp_path / "repo-secrets"
+    secrets.mkdir()
+    (secrets / ".env").write_text("APP_KEY=abc\n", encoding="utf-8")
+    # The hook uses a path relative to the sandbox; anchor it absolutely.
+    orch.gate_config["sandbox_setup"][0]["command"] = f"cp {secrets}/.env .env"
+
+    sandbox = Path(orch.prepare_sandbox())
+    assert (sandbox / ".env").read_text(encoding="utf-8") == "APP_KEY=abc\n"
+    assert (sandbox / "storage" / "oauth-private.key").is_file()
+    orch.rollback_workspace()
+
+
+def test_failing_sandbox_setup_hook_aborts_preparation(git_repo, tmp_path):
+    from spine.git.orchestrator import SandboxPreparationError
+
+    repo, config = git_repo
+    orch = _build_orchestrator(repo, config, tmp_path)
+    orch.gate_config["sandbox_setup"] = [
+        {"command": "cp /does/not/exist/.env .env"},
+    ]
+    with pytest.raises(SandboxPreparationError, match="Sandbox setup hook failed"):
+        orch.prepare_sandbox()
+    # The half-prepared sandbox was rolled back.
+    assert not Path(orch.sandbox_dir).exists()
