@@ -535,3 +535,84 @@ class TestReconcileVerdict:
         r = self._result("NOT_VERIFIED", [])
         _reconcile_verdict(r, [], "w", "s")
         assert r["verdict"] == "NOT_VERIFIED"
+
+
+class TestCustomVerifyChecks:
+    """spine-gate.yaml verify_checks give non-Python stacks executed
+    evidence — PHP through the Sail stack for the agripath clone, and
+    TypeScript next. Without real check output the judge is
+    evidence-starved for those slices and the pre-2a2d9a2 failure modes
+    (verifying broken files, contentless parks) return."""
+
+    def _gate(self, tmp_path, monkeypatch, specs):
+        import yaml
+
+        (tmp_path / "spine-gate.yaml").write_text(
+            yaml.safe_dump({"verify_checks": specs}), encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+
+    def test_matching_files_run_the_command(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        ws = tmp_path / "ws"
+        (ws / "app").mkdir(parents=True)
+        (ws / "app" / "Thing.php").write_text("<?php\n", encoding="utf-8")
+        self._gate(tmp_path, monkeypatch, [
+            {"name": "php_lint", "files": ["*.php"], "command": "echo linted {files}"},
+        ])
+        block, failures = _automated_checks(str(ws), ["app/Thing.php"])
+        assert "$ [php_lint]" in block
+        assert "linted" in block and "app/Thing.php" in block
+        assert failures == []
+
+    def test_hard_failure_is_reported(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "x.php").write_text("<?php\n", encoding="utf-8")
+        self._gate(tmp_path, monkeypatch, [
+            {"name": "pest", "files": ["*.php"],
+             "command": "echo 1 test failed; false"},
+        ])
+        block, failures = _automated_checks(str(ws), ["x.php"])
+        assert failures and "pest failed" in failures[0]
+        assert "1 test failed" in failures[0]
+
+    def test_advisory_failure_is_shown_but_not_hard(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "x.php").write_text("<?php\n", encoding="utf-8")
+        self._gate(tmp_path, monkeypatch, [
+            {"name": "style", "files": ["*.php"], "hard": False,
+             "command": "echo style nit; false"},
+        ])
+        block, failures = _automated_checks(str(ws), ["x.php"])
+        assert "style nit" in block
+        assert failures == []
+
+    def test_unmatched_patterns_skip_the_command(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "x.ts").write_text("export {}\n", encoding="utf-8")
+        self._gate(tmp_path, monkeypatch, [
+            {"name": "pest", "files": ["*.php"], "command": "echo nope"},
+        ])
+        block, failures = _automated_checks(str(ws), ["x.ts"])
+        assert "nope" not in block
+        assert failures == []
+
+    def test_no_gate_file_means_no_custom_checks(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)  # no spine-gate.yaml here
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "x.php").write_text("<?php\n", encoding="utf-8")
+        block, failures = _automated_checks(str(ws), ["x.php"])
+        assert block == "" and failures == []

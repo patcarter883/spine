@@ -295,33 +295,83 @@ def _worktree_diff(workspace_root: str, paths: list[str] | None) -> str:
 _CHECKS_MAX_CHARS = 8000
 
 
+# Per-section budgets. A single global cap let one verbose check starve
+# the rest: run 0eabad7d's ruff output (full code-frame format) consumed
+# the whole 8000-char budget and the pytest section — carrying the
+# decisive ModuleNotFoundError — was truncated away, so the judge
+# VERIFIED a test file the landing gate then rejected. Each section is
+# bounded on its own; test runners keep their TAIL because they print the
+# failure summary last.
+def _clip_head(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    return text[:cap] + "\n…[output truncated]"
+
+
+def _clip_tail(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    return "…[output truncated]…\n" + text[-cap:]
+
+
+def _custom_check_specs() -> list[dict]:
+    """``verify_checks`` entries from ./spine-gate.yaml, ``[]`` on any failure.
+
+    The built-in checks below know Python; other stacks declare their
+    evidence commands per target repo (the file is read from the dispatcher
+    process CWD, the same convention the landing-gate config uses). Each
+    entry: ``name``, ``files`` (fnmatch patterns over changed paths),
+    ``command`` (shell line; ``{files}`` expands to the quoted matches),
+    optional ``hard`` (default true — failure forces NOT_VERIFIED),
+    ``timeout_seconds`` (default 300). Loaded directly rather than via
+    spine.git.orchestrator.load_gate_config to avoid an import cycle
+    (orchestrator imports the dispatcher at module level).
+    """
+    try:
+        import yaml
+
+        path = Path("spine-gate.yaml")
+        if not path.is_file():
+            return []
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        specs = cfg.get("verify_checks") or []
+        return [
+            s for s in specs
+            if isinstance(s, dict) and s.get("command") and s.get("files")
+        ]
+    except Exception:  # noqa: BLE001 — evidence config is best-effort
+        return []
+
+
 def _automated_checks(
     workspace_root: str, target_files: list[str] | None
 ) -> tuple[str, list[str]]:
-    """Run a deterministic py_compile + ruff + pytest pass over changed files.
+    """Run deterministic checks over changed files as verifier evidence.
 
     This is the evidence-then-judge counterpart of ``_worktree_diff``: instead
     of letting the verifier spend an unbounded ReAct loop shelling ``py_compile``
     / ``ruff`` / ``inspect.signature`` probes (trace 019f16cf: the loop never
     converged and crashed on the token budget), we run the checks that
-    actually matter ONCE, here, and hand the verifier the results. Best-effort:
+    actually matter ONCE, here, and hand the verifier the results. Python
+    checks (py_compile + ruff + pytest) are built in; other stacks declare
+    theirs via ``verify_checks`` in spine-gate.yaml (PHP/pest through the
+    Sail stack for the agripath clone; TypeScript next). Best-effort:
     a missing runner or a subprocess error is reported as such, never raised —
     the verifier still has the diff and source to judge from.
 
     Returns ``(rendered_block, hard_failures)``. ``hard_failures`` lists
-    HARD check failures (py_compile / pytest — ruff stays advisory for the
-    judge to weigh) so the caller can OVERRIDE a VERIFIED verdict: run
-    e95c1bc4's judge was handed a pytest collection ImportError in its
-    prompt and still verified the slice with zero gaps — an LLM verdict
-    that contradicts deterministic ground truth is corrected mechanically,
-    not argued with.
+    HARD check failures (py_compile / pytest / hard custom checks — ruff
+    stays advisory for the judge to weigh) so the caller can OVERRIDE a
+    VERIFIED verdict: run e95c1bc4's judge was handed a pytest collection
+    ImportError in its prompt and still verified the slice with zero gaps —
+    an LLM verdict that contradicts deterministic ground truth is corrected
+    mechanically, not argued with.
     """
-    py_files = [
+    existing_files = [
         f for f in (target_files or [])
-        if f and f.endswith(".py") and (Path(workspace_root) / f).exists()
+        if f and (Path(workspace_root) / f).exists()
     ]
-    if not py_files:
-        return "", []
+    py_files = [f for f in existing_files if f.endswith(".py")]
 
     def _run(args: list[str]) -> tuple[int, str]:
         try:
@@ -335,71 +385,104 @@ def _automated_checks(
         except Exception as exc:  # noqa: BLE001 — checks are best-effort evidence
             return 1, f"{args[0]} could not run: {exc}"
 
-    # Per-section budgets. A single global cap let one verbose check starve
-    # the rest: run 0eabad7d's ruff output (full code-frame format) consumed
-    # the whole 8000-char budget and the pytest section — carrying the
-    # decisive ModuleNotFoundError — was truncated away, so the judge
-    # VERIFIED a test file the landing gate then rejected. Each section is
-    # bounded on its own; pytest keeps its TAIL because pytest prints the
-    # failure summary last.
-    def _clip_head(text: str, cap: int) -> str:
-        if len(text) <= cap:
-            return text
-        return text[:cap] + "\n…[output truncated]"
-
-    def _clip_tail(text: str, cap: int) -> str:
-        if len(text) <= cap:
-            return text
-        return "…[output truncated]…\n" + text[-cap:]
+    def _run_shell(command: str, timeout: int) -> tuple[int, str]:
+        try:
+            proc = subprocess.run(
+                command, shell=True, cwd=workspace_root,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return proc.returncode, (proc.stdout + proc.stderr).strip()
+        except Exception as exc:  # noqa: BLE001 — checks are best-effort evidence
+            return 1, f"check could not run: {exc}"
 
     sections: list[str] = []
     hard_failures: list[str] = []
-    compile_rc, compile_out = _run([sys.executable, "-m", "py_compile", *py_files])
-    sections.append(
-        f"$ python -m py_compile {' '.join(py_files)}\n"
-        + ("OK — all target files compile." if compile_rc == 0
-           else _clip_head(compile_out, 1500) or f"FAILED (exit {compile_rc})")
-    )
-    if compile_rc != 0:
-        hard_failures.append(
-            f"py_compile failed (exit {compile_rc}): "
-            + _clip_head(compile_out, 400)
-        )
-    ruff_rc, ruff_out = _run(
-        [sys.executable, "-m", "ruff", "check", "--output-format=concise", *py_files]
-    )
-    sections.append(
-        f"$ ruff check {' '.join(py_files)}\n"
-        + ("OK — no lint findings." if ruff_rc == 0
-           else _clip_head(ruff_out, 2500) or f"exit {ruff_rc}")
-    )
-    # Slices that author tests get their tests EXECUTED, not just read.
-    # Evidence-only judging cannot ground criteria like "pytest exits 0" —
-    # run 019f40e0/ce6f887d parked on exactly that gap ("no pytest run was
-    # performed or its results provided") — and a real run also surfaces
-    # collection errors (duplicate defs, broken fixtures) that reading the
-    # source misses (545264cc landed 9 collection-erroring tests as
-    # VERIFIED). The sandbox worktree's code wins imports over the editable
-    # install (pytest prepends the rootdir; the .pth path comes later), so
-    # the results reflect the patch under verification.
-    test_files = [
-        f for f in py_files
-        if Path(f).name.startswith("test_") or f.split("/", 1)[0] == "tests"
-    ]
-    if test_files:
-        pytest_rc, pytest_out = _run(
-            [sys.executable, "-m", "pytest", "-q", "--no-header", *test_files]
+    if py_files:
+        compile_rc, compile_out = _run(
+            [sys.executable, "-m", "py_compile", *py_files]
         )
         sections.append(
-            f"$ pytest -q {' '.join(test_files)}\n"
-            + ("OK — all tests pass." if pytest_rc == 0
-               else _clip_tail(pytest_out, 3500) or f"exit {pytest_rc}")
+            f"$ python -m py_compile {' '.join(py_files)}\n"
+            + ("OK — all target files compile." if compile_rc == 0
+               else _clip_head(compile_out, 1500) or f"FAILED (exit {compile_rc})")
         )
-        if pytest_rc != 0:
+        if compile_rc != 0:
             hard_failures.append(
-                f"pytest failed (exit {pytest_rc}): "
-                + _clip_tail(pytest_out, 600)
+                f"py_compile failed (exit {compile_rc}): "
+                + _clip_head(compile_out, 400)
             )
+        ruff_rc, ruff_out = _run(
+            [sys.executable, "-m", "ruff", "check",
+             "--output-format=concise", *py_files]
+        )
+        sections.append(
+            f"$ ruff check {' '.join(py_files)}\n"
+            + ("OK — no lint findings." if ruff_rc == 0
+               else _clip_head(ruff_out, 2500) or f"exit {ruff_rc}")
+        )
+        # Slices that author tests get their tests EXECUTED, not just read.
+        # Evidence-only judging cannot ground criteria like "pytest exits 0"
+        # — run 019f40e0/ce6f887d parked on exactly that gap ("no pytest run
+        # was performed or its results provided") — and a real run also
+        # surfaces collection errors (duplicate defs, broken fixtures) that
+        # reading the source misses (545264cc landed 9 collection-erroring
+        # tests as VERIFIED). The sandbox worktree's code wins imports over
+        # the editable install (pytest prepends the rootdir; the .pth path
+        # comes later), so the results reflect the patch under verification.
+        test_files = [
+            f for f in py_files
+            if Path(f).name.startswith("test_") or f.split("/", 1)[0] == "tests"
+        ]
+        if test_files:
+            pytest_rc, pytest_out = _run(
+                [sys.executable, "-m", "pytest", "-q", "--no-header", *test_files]
+            )
+            sections.append(
+                f"$ pytest -q {' '.join(test_files)}\n"
+                + ("OK — all tests pass." if pytest_rc == 0
+                   else _clip_tail(pytest_out, 3500) or f"exit {pytest_rc}")
+            )
+            if pytest_rc != 0:
+                hard_failures.append(
+                    f"pytest failed (exit {pytest_rc}): "
+                    + _clip_tail(pytest_out, 600)
+                )
+
+    # Project-declared checks (spine-gate.yaml verify_checks) — how non-Python
+    # stacks get executed evidence in front of the judge. Same lesson as the
+    # Python path: without real check output, PHP/TS slices would be judged
+    # evidence-starved and the pre-2a2d9a2 failure modes return.
+    import fnmatch
+    import shlex
+
+    for spec in _custom_check_specs():
+        patterns = spec.get("files") or []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        matched = [
+            f for f in existing_files
+            if any(fnmatch.fnmatch(f, p) for p in patterns)
+        ]
+        if not matched:
+            continue
+        name = str(spec.get("name") or "custom_check")
+        command = str(spec["command"]).replace(
+            "{files}", " ".join(shlex.quote(f) for f in matched)
+        )
+        timeout = int(spec.get("timeout_seconds", 300))
+        rc, out = _run_shell(command, timeout)
+        sections.append(
+            f"$ [{name}] {command}\n"
+            + (f"OK — {name} passed." if rc == 0
+               else _clip_tail(out, 3500) or f"exit {rc}")
+        )
+        if rc != 0 and spec.get("hard", True):
+            hard_failures.append(
+                f"{name} failed (exit {rc}): " + _clip_tail(out, 600)
+            )
+
+    if not sections:
+        return "", []
     body = "\n\n".join(sections)
     if len(body) > _CHECKS_MAX_CHARS:
         body = body[:_CHECKS_MAX_CHARS] + "\n…[checks output truncated]"
