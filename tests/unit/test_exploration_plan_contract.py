@@ -493,3 +493,41 @@ async def test_carried_escalation_flag_starts_synthesizer_at_raised_cap(
 
     assert result.get("plan_json")
     assert build_overrides[-1] == 16000
+
+
+@pytest.mark.asyncio
+async def test_save_artifacts_carries_plan_json_at_full_fidelity(tmp_path):
+    """The save node must carry plan.json/plan.md WHOLE through state.
+
+    Regression (work ad28d82e and every 2026-07-08 run): the exploration
+    subgraph is the production PLAN builder, but its save node scanned
+    artifacts at 500-char preview length — the sandbox worktree holding the
+    full files is torn down at finalize, so every durable plan.json landed
+    truncated to exactly 500 bytes. (The legacy plan_subgraph was patched
+    first, but it never runs.)
+    """
+    path = _plan_json_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    big_plan = json.dumps(
+        {
+            "architecture_overview": "x" * 2000,
+            "feature_slices": [{"id": "s1", "title": "slice one"}],
+        }
+    )
+    path.write_text(big_plan, encoding="utf-8")
+    (path.parent / "plan.md").write_text("# Plan\n" + "y" * 3000, encoding="utf-8")
+
+    state = {
+        "phase": "plan",
+        "work_id": "wk-explan",
+        "workspace_root": str(tmp_path),
+        "agent_response": "",
+        "phase_status": "",
+        "plan_json": big_plan,
+        "execution_waves": [],
+    }
+    out = await es._save_exploration_artifacts(state, None)
+    arts = out["artifacts_output"]
+    assert len(arts["plan.json"]) == len(big_plan)
+    assert json.loads(arts["plan.json"])  # intact, parseable JSON
+    assert len(arts["plan.md"]) > 3000

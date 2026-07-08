@@ -59,6 +59,23 @@ from langchain_core.messages import AIMessage
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+# The exploration subgraph is the PRODUCTION specify/plan builder (the
+# compose.py exploration override replaces the legacy linear subgraphs), and
+# code-producing runs execute it inside a sandbox worktree torn down at
+# finalize — so the only copy of specification.*/plan.* that reaches the
+# durable .spine is what this save node carries through parent state. A
+# 500-char preview leaves the persisted spec/plan truncated mid-record
+# (work ad28d82e and every 2026-07-08 run: durable plan.json exactly 500B
+# while the legacy plan_subgraph, patched first, never runs). The wrapper's
+# _FULL_PERSIST_ARTIFACTS already whitelists these names; this save node
+# must carry them whole too.
+_FULL_REPORT_FILES = (
+    "specification.json",
+    "specification.md",
+    "plan.json",
+    "plan.md",
+)
+_MAX_FULL_REPORT_CHARS = 200_000
 _DEFAULT_MAX_ROUNDS = 3
 # The per-round cap on concurrent Send("explore", …) dispatches now lives in
 # config (``research_max_parallel_explores`` / ``research_lean_*``) and is
@@ -1977,6 +1994,8 @@ async def _save_exploration_artifacts(
         work_id,
         phase,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        full_fidelity=_FULL_REPORT_FILES,
+        max_full_chars=_MAX_FULL_REPORT_CHARS,
     )
 
     if not disk_artifacts and agent_response.strip():
@@ -1987,7 +2006,7 @@ async def _save_exploration_artifacts(
             workspace_root,
             work_id=work_id,
         )
-        disk_artifacts = {artifact_name: agent_response[:_MAX_ARTIFACT_STATE_CHARS]}
+        disk_artifacts = {artifact_name: agent_response[:_MAX_FULL_REPORT_CHARS]}
 
     # PLAN-specific: merge plan.json into disk_artifacts if not already present
     plan_json_str = state.get("plan_json")
@@ -1998,7 +2017,7 @@ async def _save_exploration_artifacts(
             Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
         )
         if plan_json_path.exists() and plan_json_str:
-            disk_artifacts["plan.json"] = plan_json_str[:_MAX_ARTIFACT_STATE_CHARS]
+            disk_artifacts["plan.json"] = plan_json_str[:_MAX_FULL_REPORT_CHARS]
 
     # SPECIFY-specific: merge specification.json into disk_artifacts
     spec_json_str = state.get("specification_json")
@@ -2007,7 +2026,7 @@ async def _save_exploration_artifacts(
             Path(workspace_root) / ".spine" / "artifacts" / work_id / "specify" / "specification.json"
         )
         if spec_json_path.exists() and spec_json_str:
-            disk_artifacts["specification.json"] = spec_json_str[:_MAX_ARTIFACT_STATE_CHARS]
+            disk_artifacts["specification.json"] = spec_json_str[:_MAX_FULL_REPORT_CHARS]
 
     # ── Persist research log as artifact ───────────────────────────────
     topics: list[str] = state.get("topics", [])
