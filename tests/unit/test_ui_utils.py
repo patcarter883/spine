@@ -1,5 +1,4 @@
 from spine.ui.utils import format_bytes
-import pytest
 from spine.ui.utils import truncate_middle
 
 
