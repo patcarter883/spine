@@ -253,7 +253,6 @@ def _derive_final_status(
     result: dict[str, Any],
     *,
     stalled: bool,
-    feedback: list[Any],
     work_type: str,
 ) -> str:
     """Derive the terminal work status from a completed graph result.
@@ -261,6 +260,17 @@ def _derive_final_status(
     Shared by ``submit_work``, ``resume_interrupted_work``, and
     ``_run_workflow_graph_inner`` so reviewed-plan types consistently end at
     ``awaiting_approval`` regardless of which entry point ran the graph.
+
+    The graph's terminal ``status`` is authoritative: every park path routes
+    through a node that sets it explicitly (``flag_needs_review`` for
+    autonomous types, the ``human_review`` interrupt for reviewed types, and
+    the phase/critic result mappers for in-phase escalations). Do NOT infer
+    needs_review from the append-only ``feedback`` list — verify cycles that
+    failed and were then FIXED by the gap-fix loop leave stale needs_review
+    entries behind, and the old feedback scan mislabelled every recovered run:
+    work 06c2d55c converged (final verify passed, 0 gaps) yet finalized as
+    needs_review off cycle-1..3 feedback, so the sandbox rolled back a fully
+    verified patch.
     """
     if stalled:
         return "stalled"
@@ -268,10 +278,6 @@ def _derive_final_status(
     # A graph that ends normally leaves status "running" — treat as completed.
     if status == "running":
         status = "completed"
-    # The critic router sends to END with a needs_review feedback entry when
-    # max retries are exceeded.
-    if any(isinstance(f, dict) and f.get("status") == "needs_review" for f in feedback):
-        status = "needs_review"
     # Planning work types must end as "awaiting_approval" so users can review
     # before execution tasks are spawned.
     if work_type in PLAN_TYPES and status == "completed":
@@ -771,9 +777,7 @@ async def submit_work(
         final_status = (
             TaskStatus.CANCELLED.value
             if cancelled
-            else _derive_final_status(
-                result, stalled=stalled, feedback=feedback, work_type=work_type
-            )
+            else _derive_final_status(result, stalled=stalled, work_type=work_type)
         )
 
         # Save artifacts to disk
@@ -1224,9 +1228,7 @@ async def resume_work(
         # Derive final status (resume has no stall tracking).
         final_phase = result.get("current_phase", "")
         feedback = result.get("feedback", [])
-        final_status = _derive_final_status(
-            result, stalled=False, feedback=feedback, work_type=work_type
-        )
+        final_status = _derive_final_status(result, stalled=False, work_type=work_type)
 
         db["work_entries"].update(
             work_id,
@@ -1572,9 +1574,7 @@ async def resume_interrupted_work(
         }
 
     final_phase = result.get("current_phase", "")
-    final_status = _derive_final_status(
-        result, stalled=False, feedback=result.get("feedback", []), work_type=work_type
-    )
+    final_status = _derive_final_status(result, stalled=False, work_type=work_type)
 
     # Persist the full result blob — feedback + last_critic_review — like every
     # other finalize path. Without this, an interrupt resume that re-pauses at
@@ -2257,13 +2257,10 @@ async def _run_workflow_graph_inner(
     # A user-requested cancel is terminal — it must not be overwritten by the
     # graph-state derivation.
     final_phase = result.get("current_phase", "")
-    feedback = result.get("feedback", [])
     final_status = (
         TaskStatus.CANCELLED.value
         if cancelled
-        else _derive_final_status(
-            result, stalled=stalled, feedback=feedback, work_type=work_type
-        )
+        else _derive_final_status(result, stalled=stalled, work_type=work_type)
     )
 
     result_payload = _completion_result_payload(
@@ -2833,9 +2830,7 @@ async def approve_and_spawn(
 
         final_phase = result.get("current_phase", "")
         feedback = result.get("feedback", [])
-        final_status = _derive_final_status(
-            result, stalled=False, feedback=feedback, work_type=work_type
-        )
+        final_status = _derive_final_status(result, stalled=False, work_type=work_type)
 
         db["work_entries"].update(
             plan_id,
