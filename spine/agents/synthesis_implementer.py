@@ -437,14 +437,23 @@ def apply_synthesized(
             )
             continue
         try:
-            raw = tool._run(
-                file_path=edit.file,
-                ast_edit={
-                    "symbol": edit.symbol,
-                    "action": edit.action or "replace",
-                    "code": edit.code,
-                },
-            )
+            if not (Path(workspace_root) / edit.file).exists():
+                # A brand-new file has no symbol anchors, so ast_edit bounces
+                # not_found and the slice fails identically every cycle (run
+                # 019f40ac: a new test file was synthesized three times and
+                # never written). full_replace is the tool's creation mode —
+                # the edit's code becomes the file's initial content, and any
+                # later edits in this candidate see the file as existing.
+                raw = tool._run(file_path=edit.file, full_replace=edit.code)
+            else:
+                raw = tool._run(
+                    file_path=edit.file,
+                    ast_edit={
+                        "symbol": edit.symbol,
+                        "action": edit.action or "replace",
+                        "code": edit.code,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 — a tool crash is a placement failure
             result.failures.append({**rec, "status": "tool_error", "detail": str(exc)})
             continue

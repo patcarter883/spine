@@ -218,3 +218,41 @@ def test_stub_body_places_but_counts_against_score(workspace: Path) -> None:
     assert res.failures[0]["status"] == "stub_body"
     assert not res.clean
     assert "pass" in (workspace / "mod.py").read_text()
+
+
+def test_new_target_file_is_created_via_full_replace(tmp_path: Path) -> None:
+    """A synthesized edit whose target file doesn't exist yet must CREATE it.
+
+    Regression (run 019f40ac): a new test-file slice synthesized correct
+    content three cycles in a row, but placement always routed through
+    ast_edit, which bounces not_found on a nonexistent file — the slice
+    failed identically every cycle and the run parked with an empty diff.
+    """
+    cand = SynthesizedSlice(edits=[SynthesizedEdit(
+        file="tests/test_new.py",
+        symbol="<module>",
+        action="replace",
+        code="def test_truth():\n    assert True\n",
+    )])
+    res = apply_synthesized(
+        cand, workspace_root=str(tmp_path), target_files=["tests/test_new.py"]
+    )
+    assert res.n_applied == 1 and res.n_failures == 0
+    created = tmp_path / "tests" / "test_new.py"
+    assert created.is_file()
+    assert "def test_truth" in created.read_text(encoding="utf-8")
+
+
+def test_new_target_file_with_syntax_error_is_not_created(tmp_path: Path) -> None:
+    """Creation still goes through the linter: broken content is refused."""
+    cand = SynthesizedSlice(edits=[SynthesizedEdit(
+        file="tests/test_new.py",
+        symbol="<module>",
+        action="replace",
+        code="def test_truth(  oops\n",
+    )])
+    res = apply_synthesized(
+        cand, workspace_root=str(tmp_path), target_files=["tests/test_new.py"]
+    )
+    assert res.n_applied == 0 and res.n_failures == 1
+    assert not (tmp_path / "tests" / "test_new.py").exists()
