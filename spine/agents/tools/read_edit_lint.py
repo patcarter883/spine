@@ -1263,9 +1263,26 @@ def _apply_ast_edit(
     elif action == "insert_before":
         new_bytes = buf[:line_start] + code_bytes + b"\n\n" + buf[line_start:]
     else:  # insert_after
-        tail = buf[sym.end_byte :]
-        sep = b"\n\n" if not tail.startswith(b"\n\n") else b""
-        new_bytes = buf[: sym.end_byte] + sep + code_bytes + tail
+        # Always splice exactly two newlines on BOTH sides of the inserted
+        # code, unconditionally — mirroring insert_before's unconditional
+        # `code_bytes + b"\n\n"`. The old `sep = "\n\n" if not tail.startswith
+        # ("\n\n") else ""` only guarded the boundary BEFORE code_bytes, and
+        # inferred that guard from whatever already followed the anchor.
+        # That inference goes stale the moment a second insert_after lands
+        # on the SAME anchor (e.g. several sibling functions all anchored to
+        # `render`): by then `tail` already starts with the blank-line
+        # separator the FIRST insert added for ITS OWN boundary, so `sep`
+        # comes back empty and the anchor's last line gets glued directly
+        # onto the second insert's `def` with no newline between them —
+        # `st.write(...)def render_classification_provider_section(...)` —
+        # a SyntaxError that silently discarded the whole batch (019f3f95).
+        # Stripping tail's leading newlines before re-adding our own fixed
+        # separator makes each insert_after idempotent regardless of what a
+        # prior insert at the same anchor left behind.
+        tail = buf[sym.end_byte :].lstrip(b"\n")
+        new_bytes = (
+            buf[: sym.end_byte] + b"\n\n" + code_bytes.rstrip(b"\n") + b"\n\n" + tail
+        )
     return new_bytes.decode("utf-8"), None
 
 

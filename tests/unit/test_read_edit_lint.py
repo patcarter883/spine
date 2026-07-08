@@ -547,6 +547,69 @@ def test_ast_edit_insert_after_symbol(workspace: Path) -> None:
     assert text.index("def a()") < text.index("def b()")
 
 
+def test_ast_edit_insert_after_no_trailing_newline_stays_valid(workspace: Path) -> None:
+    # code with NO trailing newline, anchor immediately followed by more
+    # top-level code in the original file (not EOF) — the exact shape that
+    # glued the anchor's last line onto the inserted `def` with no
+    # separating newline (019f3f95: `st.write(...)`# def render_x(...)).
+    (workspace / "src" / "p.py").write_text(
+        "def a():\n    return 1\n\n\ndef z():\n    return 9\n"
+    )
+    out = _decode(
+        _tool(workspace)._run(
+            file_path="src/p.py",
+            ast_edit={"symbol": "a", "action": "insert_after", "code": "def b():\n    return 2"},
+        )
+    )
+    assert out["status"] == "ok"
+    import ast
+
+    text = (workspace / "src" / "p.py").read_text()
+    ast.parse(text)
+    assert "return 1def b()" not in text
+    assert "return 2def z()" not in text
+
+
+def test_ast_edit_insert_after_same_anchor_twice_stays_valid(workspace: Path) -> None:
+    # Sequential insert_after calls anchored on the SAME symbol (how the
+    # synthesizer anchors several sibling helper functions to one existing
+    # `render`-style anchor) must not glue the anchor's tail onto the
+    # second insert just because the first insert already added its own
+    # leading separator (019f3f95: this silently corrupted every multi-
+    # function batch and the model abandoned the approach after 3 cycles).
+    (workspace / "src" / "q.py").write_text("def render():\n    return 1\n")
+    tool = _tool(workspace)
+    first = _decode(
+        tool._run(
+            file_path="src/q.py",
+            ast_edit={
+                "symbol": "render",
+                "action": "insert_after",
+                "code": "def section_one():\n    return 2",
+            },
+        )
+    )
+    assert first["status"] == "ok"
+    second = _decode(
+        tool._run(
+            file_path="src/q.py",
+            ast_edit={
+                "symbol": "render",
+                "action": "insert_after",
+                "code": "def section_two():\n    return 3",
+            },
+        )
+    )
+    assert second["status"] == "ok"
+    import ast
+
+    text = (workspace / "src" / "q.py").read_text()
+    ast.parse(text)
+    assert "def render():" in text
+    assert "def section_one():" in text
+    assert "def section_two():" in text
+
+
 def test_ast_edit_unknown_symbol_lists_available(workspace: Path) -> None:
     (workspace / "src" / "o.py").write_text("def alpha():\n    return 1\n")
     out = _decode(
