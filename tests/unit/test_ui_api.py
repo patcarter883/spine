@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -29,9 +30,6 @@ def _init_queue_db(config: SpineConfig) -> RalphLoopWorker:
     # _get_db() creates the table if it doesn't exist
     worker._get_db()
     return worker
-
-from unittest.mock import patch, MagicMock
-import unittest
 
 class TestUIApiStopWork:
     """Stop Work must take effect — mark the work entry cancelled so the job
@@ -885,101 +883,91 @@ class TestUIApiProjects:
             assert api.get_project("proj5") is None
             assert "error" in api.delete_project("proj5")
 
-from spine.ui_api.api import UIApi
-from unittest.mock import patch
-
-
 class TestUIApiGetProviderSummary:
     """Unit tests for UIApi.get_provider_summary()."""
 
-    @classmethod
-    def setup_class(cls):
-        cls.api = UIApi()
-        cls.api._init_queue_db()  # Initialize the DB for these tests
+    def _api(self, tmpdir: str) -> UIApi:
+        config = SpineConfig()
+        config.queue_path = str(Path(tmpdir) / "queue.db")
+        config.checkpoint_path = str(Path(tmpdir) / "spine.db")
+        config.artifact_path = str(Path(tmpdir) / "artifacts")
+        config.ensure_dirs()
+        return UIApi(config)
 
     def test_get_provider_summary_with_none_return(self):
-        """Test when get_providers returns None."""
-        with patch.object(self.api, 'get_providers', return_value=None):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary == {'llm_count': 0, 'embedding_count': 0, 'reranker_count': 0}
+        """get_providers() returning None yields all-zero counts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = self._api(tmpdir)
+            with patch.object(api, "get_providers", return_value=None):
+                summary = api.get_provider_summary()
+            assert summary == {"llm_count": 0, "embedding_count": 0, "reranker_count": 0}
 
     def test_get_provider_summary_with_only_llm(self):
-        """Test when get_providers returns a dict with only llm key."""
-        providers_data = {'llm': ['provider1', 'provider2']}
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary == {'llm_count': 2, 'embedding_count': 0, 'reranker_count': 0}
+        """A dict with only the llm key counts llm and zeroes the rest."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = self._api(tmpdir)
+            with patch.object(
+                api, "get_providers", return_value={"llm": ["provider1", "provider2"]}
+            ):
+                summary = api.get_provider_summary()
+            assert summary == {"llm_count": 2, "embedding_count": 0, "reranker_count": 0}
 
     def test_get_provider_summary_with_all_keys(self):
-        """Test when get_providers returns a dict with all keys."""
+        """All three provider lists are counted independently."""
         providers_data = {
-            'llm': ['llm1', 'llm2'],
-            'embedding': ['emb1'],
-            'reranker': ['rr1', 'rr2', 'rr3']
+            "llm": ["llm1", "llm2"],
+            "embedding": ["emb1"],
+            "reranker": ["rr1", "rr2", "rr3"],
         }
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary == {'llm_count': 2, 'embedding_count': 1, 'reranker_count': 3}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = self._api(tmpdir)
+            with patch.object(api, "get_providers", return_value=providers_data):
+                summary = api.get_provider_summary()
+            assert summary == {"llm_count": 2, "embedding_count": 1, "reranker_count": 3}
 
-    def test_get_provider_summary_missing_llm_key(self):
-        """Test when get_providers returns a dict missing the llm key."""
-        providers_data = {
-            'embedding': ['emb1', 'emb2'],
-            'reranker': ['rr1']
-        }
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary == {'llm_count': 0, 'embedding_count': 2, 'reranker_count': 1}
+    def test_get_provider_summary_missing_keys_count_zero(self):
+        """Each missing provider key contributes a count of 0."""
+        cases = [
+            ({"embedding": ["e1", "e2"], "reranker": ["r1"]}, (0, 2, 1)),
+            ({"llm": ["l1"], "reranker": ["r1", "r2"]}, (1, 0, 2)),
+            ({"llm": ["l1", "l2"], "embedding": ["e1"]}, (2, 1, 0)),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = self._api(tmpdir)
+            for providers_data, (llm, emb, rr) in cases:
+                with patch.object(api, "get_providers", return_value=providers_data):
+                    summary = api.get_provider_summary()
+                assert summary == {
+                    "llm_count": llm,
+                    "embedding_count": emb,
+                    "reranker_count": rr,
+                }, providers_data
 
-    def test_get_provider_summary_missing_embedding_key(self):
-        """Test when get_providers returns a dict missing the embedding key."""
-        providers_data = {
-            'llm': ['llm1'],
-            'reranker': ['rr1', 'rr2']
-        }
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary == {'llm_count': 1, 'embedding_count': 0, 'reranker_count': 2}
+    def test_get_provider_summary_non_list_values_count_zero(self):
+        """Non-list provider values (None, str, dict) count as 0."""
+        providers_data = {"llm": None, "embedding": "oops", "reranker": {"a": 1}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = self._api(tmpdir)
+            with patch.object(api, "get_providers", return_value=providers_data):
+                summary = api.get_provider_summary()
+            assert summary == {"llm_count": 0, "embedding_count": 0, "reranker_count": 0}
 
-    def test_get_provider_summary_missing_reranker_key(self):
-        """Test when get_providers returns a dict missing the reranker key."""
-        providers_data = {
-            'llm': ['llm1', 'llm2'],
-            'embedding': ['emb1']
-        }
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary == {'llm_count': 2, 'embedding_count': 1, 'reranker_count': 0}
-
-    def test_get_provider_summary_counts(self):
-        """Test that counts are correctly derived from provider lists."""
-        providers_data = {
-            'llm': ['a', 'b', 'c'],
-            'embedding': ['d', 'e'],
-            'reranker': ['f']
-        }
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("some_work_id")
-            assert summary['llm_count'] == 3
-            assert summary['embedding_count'] == 2
-            assert summary['reranker_count'] == 1
-
-    def test_get_provider_summary_returns_summary_for_work(self):
-        """Test that get_provider_summary returns a summary for a valid work ID."""
-        providers_data = {
-            'llm': ['llm1'],
-            'embedding': ['emb1'],
-            'reranker': ['rr1']
-        }
-        with patch.object(self.api, 'get_providers', return_value=providers_data):
-            summary = self.api.get_provider_summary("work_123")
-            assert summary == {'llm_count': 1, 'embedding_count': 1, 'reranker_count': 1}
-
-    def test_get_provider_summary_returns_none_for_missing_work(self):
-        """Test that get_provider_summary returns None for a missing work ID."""
-        with patch.object(self.api, 'get_providers', return_value=None):
-            summary = self.api.get_provider_summary("missing_work_id")
-            assert summary is None
+    def test_get_provider_summary_does_not_modify_state(self):
+        """The summary is read-only: get_providers is called, nothing mutated."""
+        providers_data = {"llm": ["a", "b", "c"], "embedding": ["d", "e"], "reranker": ["f"]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = self._api(tmpdir)
+            with patch.object(
+                api, "get_providers", return_value=providers_data
+            ) as mock_get:
+                summary = api.get_provider_summary()
+            mock_get.assert_called_once_with()
+            assert summary == {"llm_count": 3, "embedding_count": 2, "reranker_count": 1}
+            assert providers_data == {
+                "llm": ["a", "b", "c"],
+                "embedding": ["d", "e"],
+                "reranker": ["f"],
+            }
 
 
 
