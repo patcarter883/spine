@@ -407,7 +407,18 @@ _WORKER_ROLE = (
     "seven cycles). When the slice extends an existing class or file, every "
     "criterion must be satisfiable by code that follows that file's existing "
     "conventions; a behavior an implementer could deliver in several "
-    "reasonable shapes must be stated so ALL of them pass."
+    "reasonable shapes must be stated so ALL of them pass.\n"
+    "GROUNDING RULE: every criterion must trace to the specification or the "
+    "task description. Do NOT invent edge-case semantics the spec never asks "
+    "for — exception handling, None/type coercion, input validation, "
+    "thread-safety (run 019f4077: an invented criterion 'returns None if "
+    "get_providers() raises (no internal exception handling)' was "
+    "self-contradictory and parked an otherwise-converged run). If the spec "
+    "is silent on an edge case, leave it out of the criteria.\n"
+    "JOINT SATISFIABILITY: one implementation must be able to satisfy ALL "
+    "criteria simultaneously — never pair a required outcome with a "
+    "prohibition on the only mechanism that can produce it (e.g. 'returns "
+    "None on exception' + 'no internal exception handling')."
 )
 
 

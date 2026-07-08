@@ -134,6 +134,17 @@ def _build_review_prompt(
             "scope), respond NEEDS_REVIEW and set blocker_category to "
             "'spec_contradiction' — do NOT respond NEEDS_REVISION, because "
             "reworking the plan cannot resolve a spec gap."
+            " AUDIT the acceptance criteria: (1) GROUNDING — a criterion "
+            "demanding edge-case semantics (exception handling, None/type "
+            "coercion, input validation) that neither the <objective> nor the "
+            "<specification> asks for is a BLOCKING plan defect, fixed by "
+            "deleting the criterion; (2) JOINT SATISFIABILITY — a criterion "
+            "set that no single implementation can satisfy simultaneously "
+            "(e.g. 'returns None on exception' + 'no internal exception "
+            "handling', run 019f4077) is a BLOCKING plan defect, fixed by "
+            "rewording or deleting the contradictory criterion. VERIFY will "
+            "enforce every criterion literally, so an ungrounded or "
+            "contradictory criterion strands the run."
         )
 
     if prior_block:
