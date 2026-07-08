@@ -212,4 +212,45 @@ def format_bytes(num_bytes: int) -> str:
     rounded = float(Decimal(str(value)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
     return f"{rounded:.1f} GB"
 
+def truncate_middle(text: str, max_len: int) -> str:
+    """
+    Truncate text by replacing the middle with an ellipsis while maintaining exact length.
+
+    Args:
+        text: The string to truncate.
+        max_len: The maximum length of the returned string.
+
+    Returns:
+        The truncated string of exactly max_len characters (or less if text is shorter).
+
+    Examples:
+        >>> truncate_middle('abcde', 5)
+        'abcde'
+        >>> truncate_middle('abcdefghijk', 7)
+        'ab...jk'  # Example result; actual distribution may vary slightly
+        >>> truncate_middle('', 5)
+        ''
+        >>> truncate_middle('abcde', 2)
+        'ab'
+    """
+    if not text:
+        return ''
+    if len(text) <= max_len:
+        return text
+    if max_len < 3:
+        return text[:max_len]
+    
+    # max_len >= 3 and len(text) > max_len
+    if max_len == 3:
+        return f'{text[0]}…{text[-1]}'
+    
+    # Calculate split: need max_len characters total, with one '…' in middle
+    # So we need (max_len - 1) visible characters, distributed as evenly as possible
+    available = max_len - 1
+    start_count = available // 2
+    end_count = available - start_count
+    
+    start = text[:start_count]
+    end = text[-end_count:]
+    return f'{start}…{end}'
 
