@@ -345,7 +345,43 @@ def _symbol_exists_in_index(db_path: str | None, sym: str) -> bool:
                 return True
         except Exception:  # noqa: BLE001 — lookup failure ⇒ be permissive
             return True
-    return False
+    return _owner_declares_attribute(db_path, sym)
+
+
+def _owner_declares_attribute(db_path: str, sym: str) -> bool:
+    """True when *sym* is an ``Owner.attr`` whose owner's source assigns it.
+
+    The symbol index catalogs classes/methods/functions — instance and class
+    ATTRIBUTES are invisible to it, so a reference like 'ArtifactStore._base'
+    (a real attribute set in ``__init__``; run 1ed302ca) was flagged dangling
+    and, paired with a scope exclusion, escalated a fabricated spec_amendment
+    park. Resolve the owner's indexed source and look for an assignment of
+    the leaf (``self.attr = …`` in a method, or a class-level ``attr = …``).
+    Fail-closed to False on any error — the caller's permissive paths handle
+    infra failure.
+    """
+    import re as _re
+
+    leaf = _leaf(sym)
+    owner = _owner(sym)
+    if not leaf or not owner or owner == leaf:
+        return False
+    try:
+        from spine.agents.tools.codebase_query import get_symbol_source
+
+        # workspace_root "" degrades the fresh-read path to the indexed
+        # raw_code, which is fine for an existence check.
+        source = get_symbol_source(db_path, "", owner)
+    except Exception:  # noqa: BLE001
+        return False
+    if not source:
+        return False
+    esc = _re.escape(leaf)
+    pat = _re.compile(
+        rf"(?:self\.{esc}\s*(?::[^=\n]+)?=[^=])|(?:^\s*{esc}\s*(?::[^=\n]+)?=[^=])",
+        _re.MULTILINE,
+    )
+    return pat.search(source) is not None
 
 
 def _reaches(graph: dict[str, set[str]], src: str, dst: str) -> bool:

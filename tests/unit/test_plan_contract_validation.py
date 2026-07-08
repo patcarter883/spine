@@ -205,3 +205,56 @@ class TestInferMissingProvides:
         repair_and_validate_contracts(skel, "w")
         impl = next(s for s in skel.slices if s.id == "impl")
         assert impl.provides == []
+
+
+class TestOwnerDeclaresAttribute:
+    """Instance/class attributes are invisible to the symbol index; a
+    reference like 'ArtifactStore._base' (assigned in __init__) must resolve
+    against the owner's source instead of being flagged dangling (run
+    1ed302ca: the false dangling paired with a scope exclusion and escalated
+    a fabricated spec_amendment park)."""
+
+    _OWNER_SRC = (
+        "class Store:\n"
+        "    LIMIT = 10\n"
+        "    def __init__(self, base):\n"
+        "        self._base = base\n"
+        "    def load(self):\n"
+        "        return self._base\n"
+    )
+
+    def _install(self, monkeypatch):
+        monkeypatch.setattr(
+            "spine.agents.tools.codebase_query.get_symbol_source",
+            lambda db, root, name: self._OWNER_SRC if name == "Store" else None,
+        )
+
+    def test_instance_attribute_resolves(self, monkeypatch):
+        from spine.agents.plan_synthesis import _owner_declares_attribute
+
+        self._install(monkeypatch)
+        assert _owner_declares_attribute("db", "Store._base")
+        assert _owner_declares_attribute("db", "pkg.mod.Store._base")
+
+    def test_class_attribute_resolves(self, monkeypatch):
+        from spine.agents.plan_synthesis import _owner_declares_attribute
+
+        self._install(monkeypatch)
+        assert _owner_declares_attribute("db", "Store.LIMIT")
+
+    def test_phantom_attribute_stays_dangling(self, monkeypatch):
+        from spine.agents.plan_synthesis import _owner_declares_attribute
+
+        self._install(monkeypatch)
+        assert not _owner_declares_attribute("db", "Store.ghost")
+        assert not _owner_declares_attribute("db", "Unknown._base")
+
+    def test_usage_without_assignment_does_not_resolve(self, monkeypatch):
+        # `return self._base` alone must not count — only assignments declare.
+        from spine.agents.plan_synthesis import _owner_declares_attribute
+
+        monkeypatch.setattr(
+            "spine.agents.tools.codebase_query.get_symbol_source",
+            lambda db, root, name: "class S:\n    def g(self):\n        return self.x\n",
+        )
+        assert not _owner_declares_attribute("db", "S.x")
