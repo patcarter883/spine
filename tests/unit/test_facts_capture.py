@@ -74,16 +74,22 @@ def test_store_delete_and_clear(tmp_path):
 class _FakeCAMClient:
     """Scripted /cam/* client standing in for CAMClient."""
 
-    def __init__(self, remember_responses, stats=None, facts=None):
+    def __init__(self, remember_responses, stats=None, facts=None, ask_text="ok"):
         self.remember_responses = list(remember_responses)
         self._stats = stats
         self._facts = facts
+        self._ask_text = ask_text
         self.remember_calls: list[tuple] = []
+        self.ask_calls: list[tuple] = []
         self.saved = False
 
     async def remember(self, subject, prompt, object_):
         self.remember_calls.append((subject, prompt, object_))
         return self.remember_responses.pop(0) if self.remember_responses else None
+
+    async def ask(self, prompt, subject, max_tokens=32):
+        self.ask_calls.append((prompt, subject))
+        return self._ask_text
 
     async def stats(self):
         return self._stats
@@ -150,6 +156,7 @@ async def test_capture_records_accepted_and_gate_skipped(tmp_path, monkeypatch):
             {"stored": False, "base_p": 0.91},
         ],
         stats={"total_facts": 3},
+        ask_text="It is main, of course.",
     )
     _install_fake_client(monkeypatch, fake)
     _install_candidates(monkeypatch, _CANDS)
@@ -160,12 +167,33 @@ async def test_capture_records_accepted_and_gate_skipped(tmp_path, monkeypatch):
     assert stored == 1
     assert len(fake.remember_calls) == 2
     assert fake.saved is True  # /cam/save after an accepted write
+    # Readback probe runs only for the accepted write.
+    assert len(fake.ask_calls) == 1
     records = FactsStore(str(tmp_path)).all()
     assert len(records) == 2  # gate-skip is recorded too (stored=False)
     by_subject = {r.subject: r for r in records}
     assert by_subject["default branch"].stored is True
+    assert by_subject["default branch"].verified is True  # "main" in ask text
     assert by_subject["test runner"].stored is False
+    assert by_subject["test runner"].verified is None
     assert by_subject["test runner"].base_p == 0.91
+
+
+@pytest.mark.asyncio
+async def test_capture_flags_failed_readback_probe(tmp_path, monkeypatch):
+    fake = _FakeCAMClient(
+        remember_responses=[{"stored": True, "base_p": 0.02}],
+        stats={"total_facts": 3},
+        ask_text="something unrelated",  # store did not deliver the object
+    )
+    _install_fake_client(monkeypatch, fake)
+    _install_candidates(monkeypatch, _CANDS[:1])
+    cfg = _config(tmp_path, cam={"namespace": "p"})
+
+    await capture_run_facts({"work_id": "w1"}, cfg, "completed")
+
+    records = FactsStore(str(tmp_path)).all()
+    assert records[0].verified is False
 
 
 @pytest.mark.asyncio
@@ -206,3 +234,32 @@ def test_candidate_validation_rejects_long_objects():
     assert facts_mod._valid_candidate(long_obj) is False
     ok = _FactCandidate(subject="s", probe_prompt="p", object="main")
     assert facts_mod._valid_candidate(ok) is True
+
+
+# ── known-facts prompt block (F1.3) ──────────────────────────────────────────
+def test_known_facts_block_renders_stored_facts_for_namespace(tmp_path):
+    FactsStore(str(tmp_path)).add_many(
+        [
+            _fact("default branch", "main", ns="p"),
+            _fact("gate skipped", "x", ns="p", stored=False),  # never injected
+            _fact("other project", "y", ns="q"),  # wrong namespace
+        ]
+    )
+    cfg = _config(tmp_path, cam={"namespace": "p", "read": "facts_block"})
+    block = facts_mod.resolve_known_facts_block(cfg)
+    assert "<known_facts>" in block
+    assert "default branch: main" in block
+    assert "gate skipped" not in block
+    assert "other project" not in block
+
+
+def test_known_facts_block_empty_unless_facts_block_mode(tmp_path):
+    FactsStore(str(tmp_path)).add_many([_fact("default branch", "main", ns="p")])
+    # transparent mode: delivery is in-forward, no prompt block.
+    cfg = _config(tmp_path, cam={"namespace": "p", "read": "transparent"})
+    assert facts_mod.resolve_known_facts_block(cfg) == ""
+    # no cam at all
+    assert facts_mod.resolve_known_facts_block(_config(tmp_path)) == ""
+    # `both` injects the deterministic block alongside transparent delivery.
+    cfg = _config(tmp_path, cam={"namespace": "p", "read": "both"})
+    assert "default branch: main" in facts_mod.resolve_known_facts_block(cfg)

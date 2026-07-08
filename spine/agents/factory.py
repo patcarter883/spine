@@ -506,17 +506,25 @@ def build_phase_agent(
     # Resolved against the main repo root, not the run's worktree
     # (see spine.agents.experience).
     experience_block = ""
+    known_facts_block = ""
     if is_subagent == (phase in _DELEGATED_WORK_PHASES):
         from spine.agents.experience import resolve_experience_block
 
         experience_block = resolve_experience_block(
             phase.value, category=state.get("task_category")
         )
+        # Durable project facts pinned in the CAM memory organ, rendered
+        # deterministically from the local side index (cam.read: facts_block
+        # or both). "" unless the active provider carries that config.
+        from spine.agents.facts import resolve_known_facts_block
+
+        known_facts_block = resolve_known_facts_block()
 
     # ── Assemble final system prompt ─────────────────────────────────
     # Assembly order: user system_prompt → onboarding references → experience →
-    # base prompt. Dynamic blocks sit before the base prompt so the base prompt
-    # stays the trailing static chunk the StaticPrefixCacheMiddleware stamps.
+    # known facts → base prompt. Dynamic blocks sit before the base prompt so
+    # the base prompt stays the trailing static chunk the
+    # StaticPrefixCacheMiddleware stamps.
     prompt_parts: list[str] = []
     if system_prompt is not None:
         prompt_parts.append(system_prompt)
@@ -524,6 +532,8 @@ def build_phase_agent(
         prompt_parts.append(onboarding_ref_block)
     if experience_block:
         prompt_parts.append(experience_block)
+    if known_facts_block:
+        prompt_parts.append(known_facts_block)
     prompt_parts.append(base_prompt)
     final_system_prompt: str = "\n\n".join(prompt_parts)
 

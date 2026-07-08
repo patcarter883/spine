@@ -95,6 +95,9 @@ class Tag(str, Enum):
     # Distilled lessons from prior runs' critic feedback for this phase —
     # cross-run "experience" injected so the agent avoids repeat defects.
     LEARNED_EXPERIENCE = "learned_experience"
+    # Durable project facts pinned in the CAM memory organ — the deterministic
+    # prompt-side rendering (cam.read: facts_block) of the served memory.
+    KNOWN_FACTS = "known_facts"
     # Implement-phase slice payload: existing definitions the slice's code
     # extends (with their source inlined), and the planner's targeted edits.
     REFERENCE_SYMBOLS = "reference_symbols"

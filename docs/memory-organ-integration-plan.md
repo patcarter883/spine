@@ -230,6 +230,21 @@ namespace evicted) replay the side index via `rebuild`. Model on the fail-open
 Phase 0 + F1.1/F1.2 (one PR: config key, client, namespace header, cam_write=false) →
 F2.1–F2.4 (fact distillation + side index) → F3.1/F3.3 (CLI + verify) → F1.3, F3.2, Phase 4.
 
+**Implementation status (2026-07-08):**
+- ✅ Phase 0 (F0.1 `cam` provider key; F0.2 `spine/services/cam_client.py`)
+- ✅ F1.1/F1.2 (namespace header + `cam_write` pinning in `_build_local_model`)
+- ✅ F1.3 (`<known_facts>` block — rendered from the local side index, not a live
+  fetch, so the agent-build path never touches the network)
+- ✅ F2.1–F2.4 (`spine/agents/facts.py`, `ProjectFact`,
+  `spine/persistence/facts_store.py`, wired at all four dispatcher finalize sites)
+- ✅ F3.1 (`spine facts` CLI: list/--server drift check, add, delete, sync,
+  stats, audit, freeze) — `sync` is the eviction-recovery replay
+- ✅ F3.3 (post-write `/cam/ask` readback probe recorded as `verified`)
+- ⬜ F3.2 (UI panel + run-start stats observation)
+- ⬜ Phase 4 (ephemeral work namespaces, resume reconciliation)
+- ⬜ End-to-end validation against a live CAM serve stack (`MINISGL_CAM=1` +
+  trained checkpoint) — required before relying on it in real runs
+
 Prereq on the serving side: `cam-production` running with `MINISGL_CAM=1`, a trained checkpoint
 dir, and namespaces enabled — plus the parity spike (`memory-organ/docs/serving/parity_spike.md`)
 green if the tap checkpoint predates the current engine build.

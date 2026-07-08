@@ -268,6 +268,20 @@ async def capture_run_facts(
                 break
             stored = bool(resp.get("stored"))
             accepted += int(stored)
+            # F3.3 readback probe: /cam/ask is the only ground-truth check that
+            # the store actually delivers the fact (a crowded bank degrades
+            # silently). One short generation per accepted write.
+            verified: bool | None = None
+            if stored:
+                text = await client.ask(cand.probe_prompt, cand.subject)
+                if text is not None:
+                    verified = cand.object.strip().lower() in text.lower()
+                    if not verified:
+                        logger.warning(
+                            "CAM readback probe failed for %r — store may be "
+                            "crowded (check /cam/stats)",
+                            cand.subject,
+                        )
             records.append(
                 ProjectFact(
                     id=uuid.uuid4().hex[:12],
@@ -278,6 +292,7 @@ async def capture_run_facts(
                     namespace=settings.namespace,
                     stored=stored,
                     base_p=resp.get("base_p"),
+                    verified=verified,
                     source="distilled",
                     created_at=created,
                 )
@@ -302,3 +317,57 @@ async def capture_run_facts(
                 await client.aclose()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ── Read path (F1.3: deterministic prompt-side rendering) ────────────────────
+# How many facts to inject — the store itself is capped (~128/namespace) but a
+# prompt block should stay small; injection favours the most recent records.
+_INJECT_FACTS_LIMIT = 20
+
+
+def format_known_facts_block(facts: list[ProjectFact]) -> str:
+    """Render stored facts as a ``<known_facts>`` system-prompt block."""
+    if not facts:
+        return ""
+    from spine.agents.prompt_format import Tag, xml_block
+
+    lines = ["Established facts about this project (treat as ground truth):"]
+    lines.extend(f"- {f.subject}: {f.object}" for f in facts)
+    return xml_block(Tag.KNOWN_FACTS, "\n".join(lines))
+
+
+def resolve_known_facts_block(config: Any | None = None) -> str:
+    """Return the injectable ``<known_facts>`` block (best-effort).
+
+    Active only when the provider's ``cam.read`` mode is ``facts_block`` or
+    ``both``. Renders from the LOCAL side index (gate-accepted facts for the
+    resolved namespace), not a live ``/cam/facts`` call: the agent-build path
+    must not block on the network, and the side index is spine's authoritative
+    record of what it wrote. Under ``both`` this coexists with the in-forward
+    transparent delivery — the block is the deterministic fallback for
+    subjects the transparent read's extraction misses (server issue #10).
+    Returns ``""`` when CAM is off, the mode doesn't inject, or anything fails.
+    """
+    try:
+        if config is None:
+            from spine.config import SpineConfig
+
+            config = SpineConfig.load()
+        resolver = getattr(config, "resolve_active_provider", None)
+        provider_cfg = resolver() if callable(resolver) else None
+        if not provider_cfg or not provider_cfg.get("cam"):
+            return ""
+
+        from spine.services.cam_client import resolve_cam_settings
+
+        settings = resolve_cam_settings(
+            provider_cfg, workspace_root=getattr(config, "workspace_root", None)
+        )
+        if settings is None or settings.read not in ("facts_block", "both"):
+            return ""
+        facts = facts_store_for(config).stored(namespace=settings.namespace)
+        facts.sort(key=lambda f: f.created_at or "", reverse=True)
+        return format_known_facts_block(facts[:_INJECT_FACTS_LIMIT])
+    except Exception:  # noqa: BLE001 — injection is best-effort
+        logger.debug("known-facts injection failed (non-fatal)", exc_info=True)
+        return ""

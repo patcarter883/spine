@@ -1015,3 +1015,258 @@ def experience_clear(
 
     removed = store.clear(phase=phase)
     console.print(f"[green]Removed {removed} lesson(s) for {target}.[/green]")
+
+
+# ── Facts (CAM memory organ) ─────────────────────────────────────────────────
+
+
+def _cam_client_or_exit(config: SpineConfig):
+    """Build a CAMClient from the active provider's `cam:` block, or exit."""
+    from spine.services.cam_client import cam_client_for
+
+    provider = config.resolve_active_provider() or {}
+    client = cam_client_for(provider, workspace_root=config.workspace_root)
+    if client is None:
+        console.print(
+            "[red]No CAM memory configured — add a `cam:` block to the active "
+            "LLM provider (see .spine/config.reference.yaml).[/red]"
+        )
+        raise SystemExit(1)
+    return client
+
+
+def _run_cam(client, coro):
+    """Drive one client coroutine to completion, closing the client after."""
+
+    async def _wrapped():
+        try:
+            return await coro
+        finally:
+            await client.aclose()
+
+    return asyncio.run(_wrapped())
+
+
+@main.group()
+def facts() -> None:
+    """Inspect and manage the CAM memory-organ project facts."""
+
+
+@facts.command(name="list")
+@click.option("--server", "from_server", is_flag=True, help="Also fetch the live /cam/facts and flag drift.")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of a table.")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_list(from_server: bool, as_json: bool, config_path: str) -> None:
+    """List recorded facts (side index), newest first; --server checks drift."""
+    from spine.agents.facts import facts_store_for
+
+    config = SpineConfig.load(path=config_path)
+    records = facts_store_for(config).all()
+    records.sort(key=lambda f: f.created_at or "", reverse=True)
+
+    server_subjects: set[str] | None = None
+    if from_server:
+        client = _cam_client_or_exit(config)
+        live = _run_cam(client, client.facts())
+        if live is None:
+            console.print("[yellow]Server unreachable or CAM not loaded — drift check skipped.[/yellow]")
+        else:
+            server_subjects = {str(f.get("subject", "")).strip().lower() for f in live}
+
+    if as_json:
+        import json
+
+        console.print_json(json.dumps([f.model_dump() for f in records]))
+        return
+    if not records:
+        console.print("[yellow]No recorded facts.[/yellow]")
+        return
+
+    table = Table(title=f"Project Facts ({len(records)})")
+    table.add_column("Subject", style="bold")
+    table.add_column("Object")
+    table.add_column("NS")
+    table.add_column("Gate")
+    table.add_column("base_p", justify="right")
+    table.add_column("Probe")
+    if server_subjects is not None:
+        table.add_column("Server")
+    for f in records:
+        row = [
+            f.subject,
+            f.object,
+            f.namespace or "—",
+            "stored" if f.stored else "skipped",
+            "—" if f.base_p is None else f"{f.base_p:.3f}",
+            {True: "ok", False: "FAIL", None: "—"}[f.verified],
+        ]
+        if server_subjects is not None:
+            on_server = f.subject.strip().lower() in server_subjects
+            row.append("yes" if on_server else ("[red]MISSING[/red]" if f.stored else "—"))
+        table.add_row(*row)
+    console.print(table)
+    if server_subjects is not None:
+        missing = [
+            f.subject
+            for f in records
+            if f.stored and f.subject.strip().lower() not in server_subjects
+        ]
+        if missing:
+            console.print(
+                f"[red]{len(missing)} stored fact(s) missing on the server "
+                f"(evicted or reset) — run `spine facts sync` to replay.[/red]"
+            )
+
+
+@facts.command(name="add")
+@click.argument("subject")
+@click.argument("object_", metavar="OBJECT")
+@click.option("--prompt", "probe_prompt", default=None, help="Cloze probe prompt (default: 'The <subject> is').")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_add(subject: str, object_: str, probe_prompt: str | None, config_path: str) -> None:
+    """Write one fact through the server's write gate and record it."""
+    import uuid
+    from datetime import datetime
+
+    from spine.agents.facts import facts_store_for
+    from spine.models.types import ProjectFact
+
+    config = SpineConfig.load(path=config_path)
+    client = _cam_client_or_exit(config)
+    prompt = probe_prompt or f"The {subject} is"
+
+    async def _add():
+        resp = await client.remember(subject, prompt, object_)
+        if resp is None:
+            return None
+        if resp.get("stored"):
+            await client.save()
+        return resp
+
+    resp = _run_cam(client, _add())
+    if resp is None:
+        console.print("[red]Server unreachable or CAM not loaded — nothing written.[/red]")
+        raise SystemExit(1)
+    stored = bool(resp.get("stored"))
+    facts_store_for(config).add_many(
+        [
+            ProjectFact(
+                id=uuid.uuid4().hex[:12],
+                subject=subject,
+                probe_prompt=prompt,
+                object=object_,
+                namespace=client.settings.namespace,
+                stored=stored,
+                base_p=resp.get("base_p"),
+                source="manual",
+                created_at=datetime.now().isoformat(),
+            )
+        ]
+    )
+    verdict = "[green]stored[/green]" if stored else "[yellow]skipped (base already recalls it)[/yellow]"
+    console.print(f"{verdict}  base_p={resp.get('base_p')}")
+
+
+@facts.command(name="delete")
+@click.argument("subject")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_delete(subject: str, yes: bool, config_path: str) -> None:
+    """Tombstone a fact on the server and drop it from the side index."""
+    from spine.agents.facts import facts_store_for
+
+    config = SpineConfig.load(path=config_path)
+    if not yes and not click.confirm(f"Delete fact for subject '{subject}'?"):
+        console.print("Aborted.")
+        return
+    client = _cam_client_or_exit(config)
+    deleted = _run_cam(client, client.delete_fact(subject))
+    facts_store_for(config).delete(subject, namespace=client.settings.namespace)
+    if deleted:
+        console.print(f"[green]Deleted '{subject}' (server + side index).[/green]")
+    else:
+        console.print(
+            "[yellow]Server delete not confirmed (unreachable or unknown subject); "
+            "side-index record removed.[/yellow]"
+        )
+
+
+@facts.command(name="sync")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_sync(config_path: str) -> None:
+    """Replay side-index facts missing on the server (eviction/reset recovery)."""
+    from spine.agents.facts import facts_store_for
+
+    config = SpineConfig.load(path=config_path)
+    client = _cam_client_or_exit(config)
+    stored = facts_store_for(config).stored(namespace=client.settings.namespace)
+    if not stored:
+        console.print("No stored facts in the side index — nothing to sync.")
+        return
+
+    async def _sync():
+        live = await client.facts()
+        if live is None:
+            return None
+        have = {str(f.get("subject", "")).strip().lower() for f in live}
+        replayed = 0
+        for f in stored:
+            if f.subject.strip().lower() in have:
+                continue
+            resp = await client.remember(f.subject, f.probe_prompt, f.object)
+            if resp is None:
+                break
+            replayed += int(bool(resp.get("stored")))
+        if replayed:
+            await client.save()
+        return replayed
+
+    replayed = _run_cam(client, _sync())
+    if replayed is None:
+        console.print("[red]Server unreachable or CAM not loaded.[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]Replayed {replayed} fact(s) to the server.[/green]")
+
+
+@facts.command(name="stats")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_stats(config_path: str) -> None:
+    """Show the live /cam/stats (occupancy, crowding, evictions)."""
+    import json
+
+    config = SpineConfig.load(path=config_path)
+    client = _cam_client_or_exit(config)
+    stats = _run_cam(client, client.stats())
+    if stats is None:
+        console.print("[red]Server unreachable or CAM not loaded.[/red]")
+        raise SystemExit(1)
+    console.print_json(json.dumps(stats))
+
+
+@facts.command(name="audit")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_audit(config_path: str) -> None:
+    """Show the server's append-only CAM write/delivery audit log."""
+    import json
+
+    config = SpineConfig.load(path=config_path)
+    client = _cam_client_or_exit(config)
+    audit = _run_cam(client, client.audit())
+    if audit is None:
+        console.print("[red]Server unreachable or CAM not loaded.[/red]")
+        raise SystemExit(1)
+    console.print_json(json.dumps(audit))
+
+
+@facts.command(name="freeze")
+@click.option("--off", is_flag=True, help="Unfreeze (allow writes) instead.")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_freeze(off: bool, config_path: str) -> None:
+    """Freeze the namespace's store (protect curated facts from writes)."""
+    config = SpineConfig.load(path=config_path)
+    client = _cam_client_or_exit(config)
+    out = _run_cam(client, client.freeze(not off))
+    if out is None:
+        console.print("[red]Server unreachable or CAM not loaded.[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]{'Unfroze' if off else 'Froze'} the store.[/green]")
