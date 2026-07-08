@@ -159,6 +159,31 @@ class WorktreeSandbox:
         if self._orch is None:
             return
         if status in _MERGE_STATUSES:
+            # Gate the landing on the validation pipeline (spine-gate.yaml).
+            # Slice verification is evidence-based — it reads code, it does
+            # not execute it — so a "completed" run can still carry tests
+            # that error at collection (work 545264cc landed a test class
+            # whose setup called a nonexistent method; 9 tests errored on
+            # main). Never merge a patch the pipeline can't green-light.
+            # Raising (instead of silently rolling back) routes through the
+            # dispatcher's error path, which aborts the sandbox and records
+            # the gate output on the work entry.
+            validation = self._orch.run_validation_pipeline()  # type: ignore[attr-defined]
+            if not validation.get("success", False):
+                from spine.git.orchestrator import MergeError
+
+                gate = validation.get("gate", "?")
+                output = (validation.get("output") or "").strip()[-2000:]
+                logger.error(
+                    "Validation gate '%s' failed — refusing to merge sandbox patch:\n%s",
+                    gate,
+                    output,
+                )
+                raise MergeError(
+                    f"Validation gate '{gate}' blocked the merge "
+                    f"({validation.get('failure_message') or 'gate failed'}). "
+                    f"Output tail:\n{output}"
+                )
             logger.info(
                 "Run completed (status=%s) — merging sandbox patch to main", status
             )

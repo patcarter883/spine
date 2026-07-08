@@ -44,6 +44,10 @@ class _FakeOrchestrator:
         self.calls.append("prepare")
         return "/tmp/spine-sandbox-test"
 
+    def run_validation_pipeline(self) -> dict:
+        self.calls.append("validate")
+        return {"success": True}
+
     def commit_and_merge(self) -> dict:
         self.calls.append("merge")
         return {"success": True, "merged": True}
@@ -108,7 +112,7 @@ def test_active_finalize_merges_on_completed(fake_orch):
     sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
     sandbox.enter()
     sandbox.finalize("completed")
-    assert fake_orch[0].calls == ["prepare", "merge"]
+    assert fake_orch[0].calls == ["prepare", "validate", "merge"]
 
 
 @pytest.mark.parametrize("status", ["needs_review", "stalled", "failed", "error", ""])
@@ -134,7 +138,38 @@ def test_finalize_is_idempotent_after_completion(fake_orch):
     # Sandbox consumed — further calls do nothing.
     sandbox.finalize("completed")
     sandbox.abort()
-    assert fake_orch[0].calls == ["prepare", "merge"]
+    assert fake_orch[0].calls == ["prepare", "validate", "merge"]
+
+
+def test_finalize_blocks_merge_when_validation_fails(fake_orch, monkeypatch):
+    """A red validation gate must block the merge, not land broken code.
+
+    Regression: work 545264cc was verified and completed, but its test
+    slice errored at collection — slice verification reads code as
+    evidence without executing it, and finalize merged the patch anyway,
+    leaving 9 erroring tests on main.
+    """
+    from spine.git.orchestrator import MergeError
+
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    monkeypatch.setattr(
+        fake_orch[0],
+        "run_validation_pipeline",
+        lambda: {
+            "success": False,
+            "gate": "unit_tests",
+            "output": "9 errors",
+            "failure_message": "Unit tests failed",
+        },
+    )
+    with pytest.raises(MergeError):
+        sandbox.finalize("completed")
+    assert "merge" not in fake_orch[0].calls
+    # The orchestrator is still attached, so the dispatcher's abort path
+    # can roll the un-merged sandbox back.
+    sandbox.abort()
+    assert fake_orch[0].calls[-1] == "rollback"
 
 
 def test_abort_never_raises_even_if_rollback_fails(fake_orch, monkeypatch):
