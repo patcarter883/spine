@@ -1372,28 +1372,36 @@ def _extract_slice_result(result: dict, slice_id: str) -> dict:
 # ── synthesis_implementer node (no tools: synthesize → place) ───────────
 
 
-def _placement_feedback(placement: Any) -> str:
-    """Render placement failures as compact feedback for the synthesis retry.
+def _format_placement_failure(f: dict) -> str:
+    """Render one placement failure, preserving ``target``/``next_action``.
 
-    Includes ``target`` and ``next_action`` when the failure carries them —
-    the ast_edit creation-anchor guard builds these specifically so a retry
-    can self-correct in one step instead of re-emitting the same broken
-    anchor (019f1c10: dropping them cost two full implement/verify cycles).
+    The ast_edit creation-anchor guard builds these fields so a weak model can
+    self-correct in one step instead of re-emitting the same broken anchor.
+    Both consumers of failure text — the same-cycle synthesis retry
+    (``_placement_feedback``) and the persisted slice ``issues`` that reach
+    later rework cycles via implementation.md/gap_plan (``_placement_to_slice_result``)
+    — must go through this one formatter, or the two drift: 019f1c10 fixed the
+    retry path, but 019f3f7d showed the SAME anchor mistake recur across three
+    rework cycles because ``_placement_to_slice_result`` had its own separate
+    (and older) format that silently dropped target/next_action, leaving later
+    cycles no way to learn the fix.
     """
-    lines = []
-    for f in placement.failures:
-        loc = f.get("file", "?")
-        sym = f.get("symbol", "")
-        if sym:
-            loc += f" `{sym}`"
-        detail = (f.get("detail", "") or "").strip().replace("\n", " ")
-        line = f"- {loc} ({f.get('status', 'error')}): {detail[:300]}"
-        if f.get("target"):
-            line += f" [target: {f['target']}]"
-        if f.get("next_action"):
-            line += f" [DO THIS: {f['next_action']}]"
-        lines.append(line)
-    return "\n".join(lines)
+    loc = f.get("file", "?")
+    sym = f.get("symbol", "")
+    if sym:
+        loc += f" `{sym}`"
+    detail = (f.get("detail", "") or "").strip().replace("\n", " ")
+    line = f"{loc} ({f.get('status', 'error')}): {detail[:300]}"
+    if f.get("target"):
+        line += f" [target: {f['target']}]"
+    if f.get("next_action"):
+        line += f" [DO THIS: {f['next_action']}]"
+    return line
+
+
+def _placement_feedback(placement: Any) -> str:
+    """Render placement failures as compact feedback for the synthesis retry."""
+    return "\n".join(f"- {_format_placement_failure(f)}" for f in placement.failures)
 
 
 def _placement_to_slice_result(
@@ -1404,7 +1412,9 @@ def _placement_to_slice_result(
     ``implemented`` when every edit placed, ``partial`` when some did and some
     failed, ``blocked`` when nothing placed. Files touched come from the applied
     edits; failures become ``issues`` so synthesis (and any fallback decompose)
-    can see exactly what the linter rejected.
+    can see exactly what the linter rejected — including the anchor guard's
+    ``target``/``next_action`` (via ``_format_placement_failure``), so a later
+    rework cycle can learn the fix instead of repeating the same broken anchor.
     """
     n_ok = placement.n_applied
     n_fail = placement.n_failures
@@ -1415,11 +1425,7 @@ def _placement_to_slice_result(
     else:
         status = "blocked"
     files = sorted({a.get("file") for a in placement.applied if a.get("file")})
-    issues = [
-        f"{f.get('file', '?')} {f.get('symbol', '')} — {f.get('status', 'error')}: "
-        f"{(f.get('detail', '') or '')[:300]}"
-        for f in placement.failures
-    ]
+    issues = [_format_placement_failure(f) for f in placement.failures]
     return {
         "slice_name": slice_id,
         "status": status,
