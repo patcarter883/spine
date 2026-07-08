@@ -1052,8 +1052,19 @@ async def resume_work(
         # instead of restoring the previous checkpoint state
         await checkpoint_store.delete_state(work_id)
 
-        # Seed the new run with all prior state plus the human feedback
+        # Seed the new run with the FULL saved checkpoint state, then overlay
+        # only what resume legitimately changes. Previously this hand-picked
+        # artifacts/feedback/retry_count and dropped everything else the
+        # checkpoint held — including structural channels like
+        # ``execution_waves`` that PLAN produces and VERIFY's router requires
+        # unconditionally (a CriticalContractFailure, not a soft skip). Any
+        # resume whose needs_review_phase was verify/gap_plan/implement hit
+        # this every time: 019f3f95's resume re-entered verify with
+        # execution_waves silently absent. Spreading saved_state first means
+        # every channel a later phase might structurally need survives by
+        # default, instead of requiring this dict to enumerate them all.
         resume_state: dict[str, Any] = {
+            **(saved_state or {}),
             "work_id": work_id,
             "work_type": work_type,
             "description": description,

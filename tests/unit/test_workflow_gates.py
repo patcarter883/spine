@@ -390,6 +390,81 @@ class TestResumeWork:
                 await resume_work("abc", "fix it", action="rework")
                 mock_cp.delete_state.assert_called_once_with("abc")
 
+    @pytest.mark.asyncio
+    async def test_resume_preserves_structural_channels_from_checkpoint(
+        self, monkeypatch
+    ):
+        """019f3f95: resuming a needs_review at verify hand-picked only
+        artifacts/feedback/retry_count into resume_state, silently dropping
+        ``execution_waves`` — a channel PLAN produces that VERIFY's router
+        requires unconditionally (CriticalContractFailure, not a soft skip).
+        Any other saved_state-only channel (e.g. plan_json) must survive too."""
+        from spine.work.dispatcher import resume_work
+
+        mock_sandbox = MagicMock()
+        mock_sandbox.enter.return_value = SimpleNamespace(workspace_root="/tmp/sbx")
+        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn, patch(
+            "spine.git.WorktreeSandbox", return_value=mock_sandbox
+        ):
+            mock_db = MagicMock()
+            mock_table = MagicMock()
+            mock_table.get.return_value = {
+                "id": "abc",
+                "status": "needs_review",
+                "work_type": "task",
+                "description": "test task",
+                "result": "",
+            }
+            mock_db.__getitem__ = lambda s, k: mock_table
+            mock_db_fn.return_value = mock_db
+
+            saved_state = {
+                "needs_review_phase": "verify",
+                "artifacts": {"verify": {"verification.md": "content"}},
+                "feedback": [],
+                "retry_count": {},
+                "execution_waves": [[{"id": "slice_01", "target_files": ["x.py"]}]],
+                "plan_json": '{"architecture_overview": "..."}',
+            }
+
+            captured: dict[str, object] = {}
+
+            async def mock_astream(state, *args, **kwargs):
+                captured["resume_state"] = state
+                yield {
+                    "type": "updates",
+                    "ns": (),
+                    "data": {"some_node": {"current_phase": "verify", "status": "running", "artifacts": {}}},
+                }
+
+            mock_graph = MagicMock()
+            mock_graph.astream = mock_astream
+
+            mock_compose = MagicMock()
+            mock_compose.WORKFLOW_SEQUENCES = {
+                "task": [("specify", None), ("plan", None), ("implement", None), ("verify", None)]
+            }
+            mock_compose.build_workflow_graph.return_value = mock_graph
+
+            mock_cp_mod = MagicMock()
+            mock_cp = MagicMock()
+            mock_cp_mod.CheckpointStore = MagicMock(return_value=mock_cp)
+            mock_cp.get_checkpointer = AsyncMock()
+            mock_cp.get_state = AsyncMock(return_value=saved_state)
+            mock_cp.delete_state = AsyncMock(return_value=True)
+
+            monkeypatch.setitem(sys.modules, "spine.workflow.compose", mock_compose)
+            monkeypatch.setitem(
+                sys.modules, "spine.persistence.checkpoint", mock_cp_mod
+            )
+
+            with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
+                await resume_work("abc", "fix it", action="rework")
+
+            seeded = captured["resume_state"]
+            assert seeded["execution_waves"] == saved_state["execution_waves"]
+            assert seeded["plan_json"] == saved_state["plan_json"]
+
 
 # ── Critic router tests ──
 
