@@ -315,3 +315,66 @@ class TestReworkDelta:
         out = _render_rework_feedback(lcr, [])
         assert "STILL NOT ADDRESSED" not in out
         assert "do x" in out
+
+
+class TestGuardVerdictAttemptAccounting:
+    """A truncated-critic guard verdict must not consume a retry attempt.
+
+    Regression: trace 019f404a (work 06c2d55c resume) — the critic's own
+    response truncated at its token cap, the guard verdict routed the plan
+    into a ~6-minute regeneration AND pushed retry_count to 5-of-5, so the
+    next real critic round escalated. Attempt accounting is now verdict-
+    source-aware like the streaks: the first guard round is free, but
+    consecutive guard rounds count so a critic that always truncates still
+    exhausts the budget instead of looping forever.
+    """
+
+    def _guard_result(self):
+        return {
+            "agent_result": {
+                "status": ReviewStatus.NEEDS_REVISION.value,
+                "tier": "agent",
+                "verdict_source": "guard",
+                "reason": "Critic response was truncated at the token limit",
+                "suggestions": [],
+            },
+            "phase_status": ReviewStatus.NEEDS_REVISION.value,
+        }
+
+    def test_first_guard_round_is_free(self):
+        # At attempt 4-of-5 a guard verdict must not reach the threshold.
+        parent = {
+            "max_retries": 5,
+            "retry_count": {PLAN: 4},
+            "last_critic_review": {
+                "phase": PLAN,
+                "status": ReviewStatus.NEEDS_REVISION.value,
+                "verdict_source": "agent",
+                "suggestions": _ASKS,
+            },
+        }
+        base, state, route = _run(parent, self._guard_result())
+        assert route == "needs_revision"
+        assert base["status"] == "running"
+        assert base["last_critic_review"]["attempt"] == 4
+        assert state["retry_count"][PLAN] == 4
+        assert "needs_review_phase" not in base
+
+    def test_consecutive_guard_rounds_still_count(self):
+        # Two guard rounds in a row: the second consumes an attempt, so a
+        # critic that always truncates cannot loop indefinitely.
+        parent = {
+            "max_retries": 5,
+            "retry_count": {PLAN: 4},
+            "last_critic_review": {
+                "phase": PLAN,
+                "status": ReviewStatus.NEEDS_REVISION.value,
+                "verdict_source": "guard",
+                "suggestions": [],
+            },
+        }
+        base, state, route = _run(parent, self._guard_result())
+        assert base["last_critic_review"]["attempt"] == 5
+        assert base["status"] == "needs_review"
+        assert base["needs_review_kind"] == "retries_exhausted"
+        assert route == "needs_review"

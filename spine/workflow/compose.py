@@ -754,7 +754,6 @@ def _critic_result_mapper(reviewed_phase: str):
 
         phase_status = subgraph_result.get("phase_status", "")
         prior_attempts = parent_state.get("retry_count", {}).get(reviewed_phase, 0)
-        new_attempt = prior_attempts + 1
         max_retries = parent_state.get("max_retries", 3)
 
         # The prior verdict for THIS phase (last-write-wins). Only meaningful
@@ -765,6 +764,21 @@ def _critic_result_mapper(reviewed_phase: str):
         prior_for_phase = (
             prior_lcr if prior_lcr.get("phase") == reviewed_phase else {}
         )
+
+        # Attempt accounting is verdict-source-aware, like the streaks below:
+        # a guard verdict (the critic's own response was truncated — already
+        # retried once inside the critic node) is harness noise, and charging
+        # it a retry attempt pushes a healthy rework loop toward escalation
+        # (trace 019f404a: a guard round consumed attempt 4-of-5). The FIRST
+        # guard round for a phase is free; consecutive guard rounds DO count,
+        # so a critic that always truncates still exhausts the budget instead
+        # of looping forever.
+        is_guard_verdict = effective_result.get("verdict_source") == "guard"
+        prior_was_guard = prior_for_phase.get("verdict_source") == "guard"
+        if is_guard_verdict and not prior_was_guard:
+            new_attempt = prior_attempts
+        else:
+            new_attempt = prior_attempts + 1
 
         # Convergence detection: is this rework round repeating the previous
         # verdict (stagnation), or shifting the goalposts to wholly new asks
