@@ -325,18 +325,37 @@ def _automated_checks(workspace_root: str, target_files: list[str] | None) -> st
         except Exception as exc:  # noqa: BLE001 — checks are best-effort evidence
             return 1, f"{args[0]} could not run: {exc}"
 
+    # Per-section budgets. A single global cap let one verbose check starve
+    # the rest: run 0eabad7d's ruff output (full code-frame format) consumed
+    # the whole 8000-char budget and the pytest section — carrying the
+    # decisive ModuleNotFoundError — was truncated away, so the judge
+    # VERIFIED a test file the landing gate then rejected. Each section is
+    # bounded on its own; pytest keeps its TAIL because pytest prints the
+    # failure summary last.
+    def _clip_head(text: str, cap: int) -> str:
+        if len(text) <= cap:
+            return text
+        return text[:cap] + "\n…[output truncated]"
+
+    def _clip_tail(text: str, cap: int) -> str:
+        if len(text) <= cap:
+            return text
+        return "…[output truncated]…\n" + text[-cap:]
+
     sections: list[str] = []
     compile_rc, compile_out = _run([sys.executable, "-m", "py_compile", *py_files])
     sections.append(
         f"$ python -m py_compile {' '.join(py_files)}\n"
         + ("OK — all target files compile." if compile_rc == 0
-           else compile_out or f"FAILED (exit {compile_rc})")
+           else _clip_head(compile_out, 1500) or f"FAILED (exit {compile_rc})")
     )
-    ruff_rc, ruff_out = _run([sys.executable, "-m", "ruff", "check", *py_files])
+    ruff_rc, ruff_out = _run(
+        [sys.executable, "-m", "ruff", "check", "--output-format=concise", *py_files]
+    )
     sections.append(
         f"$ ruff check {' '.join(py_files)}\n"
         + ("OK — no lint findings." if ruff_rc == 0
-           else ruff_out or f"exit {ruff_rc}")
+           else _clip_head(ruff_out, 2500) or f"exit {ruff_rc}")
     )
     # Slices that author tests get their tests EXECUTED, not just read.
     # Evidence-only judging cannot ground criteria like "pytest exits 0" —
@@ -358,7 +377,7 @@ def _automated_checks(workspace_root: str, target_files: list[str] | None) -> st
         sections.append(
             f"$ pytest -q {' '.join(test_files)}\n"
             + ("OK — all tests pass." if pytest_rc == 0
-               else pytest_out or f"exit {pytest_rc}")
+               else _clip_tail(pytest_out, 3500) or f"exit {pytest_rc}")
         )
     body = "\n\n".join(sections)
     if len(body) > _CHECKS_MAX_CHARS:

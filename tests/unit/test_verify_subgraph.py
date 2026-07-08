@@ -446,3 +446,21 @@ class TestAutomatedChecksRunTests:
         (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
         out = _automated_checks(str(tmp_path), ["mod.py"])
         assert "pytest" not in out
+
+    def test_pytest_evidence_survives_verbose_ruff_output(self, tmp_path):
+        """One noisy check must not starve the others (run 0eabad7d: ruff's
+        code-frame output ate the whole budget and the pytest section
+        carrying the decisive ModuleNotFoundError was truncated away)."""
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        # A file that is syntactically valid, drowning in lint findings, and
+        # broken at import time — the exact 0eabad7d shape.
+        lines = ["import nonexistent_module_xyz_abc\n"]
+        lines += [f"import os as unused_alias_{i}\n" for i in range(200)]
+        lines += ["def test_x():\n", "    assert True\n"]
+        (tests_dir / "test_noisy.py").write_text("".join(lines), encoding="utf-8")
+        out = _automated_checks(str(tmp_path), ["tests/test_noisy.py"])
+        assert "$ pytest -q tests/test_noisy.py" in out
+        assert "nonexistent_module_xyz_abc" in out.split("$ pytest")[1]
