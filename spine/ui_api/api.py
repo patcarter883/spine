@@ -560,6 +560,75 @@ class UIApi:
         """Delete all lessons (or all for ``phase``). Returns the count removed."""
         return self._experience_store().clear(phase=phase)
 
+    # ── Project facts (CAM memory organ) ──
+
+    def _facts_store(self) -> Any:
+        """Build the facts side-index store anchored at the main repo root."""
+        from spine.agents.facts import facts_store_for
+
+        return facts_store_for(self._config)
+
+    def list_facts(self) -> list[dict[str, Any]]:
+        """Return all recorded project facts as dicts, newest first.
+
+        Each dict carries the :class:`ProjectFact` fields (subject, object,
+        probe_prompt, namespace, stored, base_p, verified, source, work_id).
+        """
+        facts = self._facts_store().all()
+        facts.sort(key=lambda f: f.created_at or "", reverse=True)
+        return [f.model_dump() for f in facts]
+
+    def facts_stats(self) -> dict[str, Any]:
+        """Summarise the side index: totals, gate acceptance, probe failures."""
+        facts = self._facts_store().all()
+        stored = [f for f in facts if f.stored]
+        return {
+            "total": len(facts),
+            "stored": len(stored),
+            "gate_skipped": len(facts) - len(stored),
+            "probe_failed": sum(1 for f in stored if f.verified is False),
+            "by_namespace": {
+                ns: sum(1 for f in facts if (f.namespace or "—") == ns)
+                for ns in {(f.namespace or "—") for f in facts}
+            },
+        }
+
+    def cam_server_stats(self) -> dict[str, Any] | None:
+        """Fetch the live ``/cam/stats`` (occupancy/crowding/evictions).
+
+        Fail-open: returns ``None`` when no CAM provider is configured or the
+        server is unreachable — the UI shows the side index regardless.
+        """
+        try:
+            import asyncio
+
+            from spine.services.cam_client import cam_client_for
+
+            provider = self._config.resolve_active_provider() or {}
+            client = cam_client_for(
+                provider, workspace_root=self._config.workspace_root
+            )
+            if client is None:
+                return None
+
+            async def _stats():
+                try:
+                    return await client.stats()
+                finally:
+                    await client.aclose()
+
+            return asyncio.run(_stats())
+        except Exception:  # noqa: BLE001 — the panel must render without a server
+            return None
+
+    def delete_fact(self, subject: str, namespace: str | None = None) -> bool:
+        """Drop a fact from the side index (server tombstone is CLI's job).
+
+        Returns True if a record was removed. Use ``spine facts delete`` for a
+        coupled server + side-index delete.
+        """
+        return self._facts_store().delete(subject, namespace=namespace)
+
     # ── Config ──
 
     def get_config(self) -> dict[str, Any]:

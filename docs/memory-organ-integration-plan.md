@@ -240,7 +240,12 @@ F2.1–F2.4 (fact distillation + side index) → F3.1/F3.3 (CLI + verify) → F1
 - ✅ F3.1 (`spine facts` CLI: list/--server drift check, add, delete, sync,
   stats, audit, freeze) — `sync` is the eviction-recovery replay
 - ✅ F3.3 (post-write `/cam/ask` readback probe recorded as `verified`)
-- ⬜ F3.2 (UI panel + run-start stats observation)
+- ✅ F3.2 UI panel ("Project Facts" page: side-index metrics, probe-failure
+  alert, live `/cam/stats` expander, per-fact inspector) + `UIApi`
+  list/stats/delete/server-stats methods. *Skipped:* the run-start `cam_stats`
+  observation — `spine/observability.py` is LangSmith tracing only (no event
+  API); the capacity guard and readback-probe warnings at write time cover the
+  alerting need.
 - ⬜ Phase 4 (ephemeral work namespaces, resume reconciliation)
 - ⬜ End-to-end validation against a live CAM serve stack (`MINISGL_CAM=1` +
   trained checkpoint) — required before relying on it in real runs
