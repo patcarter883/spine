@@ -191,3 +191,18 @@ class ArtifactStore:
             meta_path.unlink()
 
         return deleted
+
+    def artifact_exists(self, work_id: str, phase: str, name: str) -> bool:
+        """Check if an artifact exists on disk.
+
+        Args:
+            work_id: The work item ID.
+            phase: The phase that produced the artifact.
+            name: The artifact filename.
+
+        Returns:
+            True if the artifact file exists, False otherwise.
+        """
+        artifact_path = self._base / work_id / phase / name
+        return artifact_path.exists()
+
