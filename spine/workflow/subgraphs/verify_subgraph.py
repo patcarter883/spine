@@ -411,6 +411,61 @@ def _automated_checks(
     return block, hard_failures
 
 
+def _reconcile_verdict(
+    verification_result: dict,
+    checks_failures: list[str],
+    work_id: str,
+    slice_id: str,
+) -> None:
+    """Derive the slice verdict from ground truth instead of trusting it.
+
+    The judge's verdict field has now been wrong in BOTH directions:
+
+    * run e95c1bc4 — VERIFIED over a pytest collection ImportError sitting
+      in its own prompt (broken file reached the landing gate);
+    * run 28b62d1e — NOT_VERIFIED with every checklist item passed, zero
+      gaps and green checks: an inconsistent verdict the gap-fix loop can
+      do nothing with, so the run parked contentlessly.
+
+    Rules, in order: any HARD check failure ⇒ NOT_VERIFIED (failures
+    appended as checklist entries + gaps); else a non-empty all-passed
+    checklist with no gaps ⇒ VERIFIED. Mutates in place.
+    """
+    verdict = verification_result.get("verdict")
+    if checks_failures:
+        if verdict == "VERIFIED":
+            logger.warning(
+                "[%s] Slice-verifier %r: judge said VERIFIED but %d hard "
+                "check(s) failed — overriding to NOT_VERIFIED",
+                work_id, slice_id, len(checks_failures),
+            )
+        verification_result["verdict"] = "NOT_VERIFIED"
+        checklist = verification_result.setdefault("checklist", [])
+        gaps = verification_result.setdefault("gaps", [])
+        for failure in checks_failures:
+            entry = f"Automated check failed: {failure}"
+            if entry not in gaps:
+                checklist.append({
+                    "criterion": "Automated checks pass (deterministic)",
+                    "passed": False,
+                    "detail": failure,
+                })
+                gaps.append(entry)
+        return
+
+    checklist = verification_result.get("checklist") or []
+    all_passed = bool(checklist) and all(
+        c.get("passed") for c in checklist if isinstance(c, dict)
+    )
+    if all_passed and not verification_result.get("gaps") and verdict != "VERIFIED":
+        logger.warning(
+            "[%s] Slice-verifier %r: judge said %r but every checklist item "
+            "passed, no gaps, checks clean — overriding to VERIFIED",
+            work_id, slice_id, verdict,
+        )
+        verification_result["verdict"] = "VERIFIED"
+
+
 # Pre-loaded source bounds. The verifier reads its target files to check them
 # against the criteria; handing the current source up-front means it starts
 # grounded at ZERO reads instead of paging each file in (trace 019f10bf read
@@ -591,32 +646,10 @@ async def _run_slice_verifier_node(
         )
 
         verification_result = _extract_verification_result(result, slice_id)
-
-        # Deterministic override: a slice whose HARD checks failed cannot be
-        # VERIFIED, whatever the judge said. Run e95c1bc4: the judge was
-        # handed a pytest collection ImportError in <automated_checks> and
-        # still verified with zero gaps — the broken file sailed to the
-        # landing gate as a terminal failure instead of an in-loop gap.
-        if (
-            checks_failures
-            and isinstance(verification_result, dict)
-            and verification_result.get("verdict") == "VERIFIED"
-        ):
-            logger.warning(
-                "[%s] Slice-verifier %r: judge said VERIFIED but %d hard "
-                "check(s) failed — overriding to NOT_VERIFIED",
-                work_id, slice_id, len(checks_failures),
+        if isinstance(verification_result, dict):
+            _reconcile_verdict(
+                verification_result, checks_failures, work_id, slice_id
             )
-            verification_result["verdict"] = "NOT_VERIFIED"
-            checklist = verification_result.setdefault("checklist", [])
-            gaps = verification_result.setdefault("gaps", [])
-            for failure in checks_failures:
-                checklist.append({
-                    "criterion": "Automated checks pass (deterministic)",
-                    "passed": False,
-                    "detail": failure,
-                })
-                gaps.append(f"Automated check failed: {failure}")
 
     except MaxTokenBudgetExceeded as budget_exc:
         # The judge's one-shot call already produced a verdict before the

@@ -469,3 +469,69 @@ class TestAutomatedChecksRunTests:
         out, _failures = _automated_checks(str(tmp_path), ["tests/test_noisy.py"])
         assert "$ pytest -q tests/test_noisy.py" in out
         assert "nonexistent_module_xyz_abc" in out.split("$ pytest")[1]
+
+
+class TestReconcileVerdict:
+    """The judge's verdict field is derived from ground truth, not trusted —
+    it has been wrong in BOTH directions (e95c1bc4: VERIFIED over a pytest
+    ImportError; 28b62d1e: NOT_VERIFIED with an all-passed checklist, zero
+    gaps, and green checks — a contentless park)."""
+
+    def _result(self, verdict, checklist, gaps=None):
+        return {
+            "slice_name": "s",
+            "verdict": verdict,
+            "checklist": checklist,
+            "gaps": gaps or [],
+        }
+
+    def test_hard_failure_forces_not_verified(self):
+        from spine.workflow.subgraphs.verify_subgraph import _reconcile_verdict
+
+        r = self._result("VERIFIED", [{"criterion": "c", "passed": True, "detail": ""}])
+        _reconcile_verdict(r, ["pytest failed (exit 2): ImportError"], "w", "s")
+        assert r["verdict"] == "NOT_VERIFIED"
+        assert any("pytest failed" in g for g in r["gaps"])
+
+    def test_all_passed_checklist_forces_verified(self):
+        from spine.workflow.subgraphs.verify_subgraph import _reconcile_verdict
+
+        r = self._result(
+            "NOT_VERIFIED",
+            [{"criterion": "c1", "passed": True, "detail": ""},
+             {"criterion": "c2", "passed": True, "detail": ""}],
+        )
+        _reconcile_verdict(r, [], "w", "s")
+        assert r["verdict"] == "VERIFIED"
+
+    def test_failed_item_keeps_not_verified(self):
+        from spine.workflow.subgraphs.verify_subgraph import _reconcile_verdict
+
+        r = self._result(
+            "NOT_VERIFIED",
+            [{"criterion": "c1", "passed": True, "detail": ""},
+             {"criterion": "c2", "passed": False, "detail": "missing"}],
+            gaps=["c2 missing"],
+        )
+        _reconcile_verdict(r, [], "w", "s")
+        assert r["verdict"] == "NOT_VERIFIED"
+
+    def test_gaps_block_the_upgrade(self):
+        # All-passed checklist but gaps present: contradictory, keep the
+        # failure verdict — the gaps at least give the loop something to do.
+        from spine.workflow.subgraphs.verify_subgraph import _reconcile_verdict
+
+        r = self._result(
+            "NOT_VERIFIED",
+            [{"criterion": "c1", "passed": True, "detail": ""}],
+            gaps=["something is off"],
+        )
+        _reconcile_verdict(r, [], "w", "s")
+        assert r["verdict"] == "NOT_VERIFIED"
+
+    def test_empty_checklist_never_upgrades(self):
+        from spine.workflow.subgraphs.verify_subgraph import _reconcile_verdict
+
+        r = self._result("NOT_VERIFIED", [])
+        _reconcile_verdict(r, [], "w", "s")
+        assert r["verdict"] == "NOT_VERIFIED"
