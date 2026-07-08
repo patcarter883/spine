@@ -356,3 +356,52 @@ def test_reference_signatures_block_empty_when_no_refs() -> None:
     from spine.agents import decomposer as dc
 
     assert dc._build_reference_signatures_block("db", ".", []) == ""
+
+
+def test_reference_symbols_body_inlines_constructor_of_referenced_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slice referencing Class.method must also see Class.__init__.
+
+    Regression (run 86a3ab17): the test slice referenced
+    ArtifactStore.save_artifact / artifact_exists, so only those methods'
+    source was inlined — the editor then invented constructor kwargs
+    (root_dir / base_dir / root; the real parameter is base_path) across
+    three verify cycles.
+    """
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    sources = {
+        "Store.save": "def save(self, name):\n    ...\n",
+        "Store.__init__": "def __init__(self, base_path: str = '.x'):\n    ...\n",
+    }
+    monkeypatch.setattr(
+        "spine.agents.tools.codebase_query.get_symbol_source",
+        lambda db, root, name: sources.get(name),
+    )
+    body = impl._reference_symbols_body(
+        {"reference_symbols": ["Store.save"]}, db_path="db", workspace_root="."
+    )
+    assert "Store.__init__" in body
+    assert "base_path" in body
+    assert "EXACTLY these" in body
+
+
+def test_constructor_not_duplicated_when_class_itself_referenced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spine.workflow.subgraphs import implement_subgraph as impl
+
+    sources = {
+        "Store": "class Store:\n    def __init__(self, base_path):\n        ...\n",
+        "Store.__init__": "def __init__(self, base_path):\n    ...\n",
+    }
+    monkeypatch.setattr(
+        "spine.agents.tools.codebase_query.get_symbol_source",
+        lambda db, root, name: sources.get(name),
+    )
+    body = impl._reference_symbols_body(
+        {"reference_symbols": ["Store"]}, db_path="db", workspace_root="."
+    )
+    # The whole class (constructor included) is already inlined — no extra block.
+    assert body.count("__init__") == 1
