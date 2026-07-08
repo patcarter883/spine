@@ -1,5 +1,6 @@
 from spine.ui.utils import format_bytes
 from spine.ui.utils import truncate_middle
+from spine.ui.utils import slugify
 
 
 def test_format_bytes_zero():
@@ -92,4 +93,44 @@ def test_truncate_middle():
     assert result.startswith('a')
     assert result.endswith('z')
 
+
+
+def test_slugify_normal_text():
+    assert slugify('Hello World') == 'hello-world'
+
+
+def test_slugify_multiple_spaces_and_punctuation():
+    assert slugify('Hello!!!   World') == 'hello-world'
+
+
+def test_slugify_leading_non_alphanumeric():
+    assert slugify('!Hello') == 'hello'
+
+
+def test_slugify_trailing_non_alphanumeric():
+    assert slugify('World!') == 'world'
+
+
+def test_slugify_empty_string():
+    assert slugify('') == ''
+
+
+def test_slugify_only_non_alphanumeric():
+    assert slugify('!!!???') == ''
+
+
+def test_slugify_returns_string_type():
+    inputs = [
+        'Hello World',
+        'Hello!!!   World',
+        '!Hello',
+        'World!',
+        '',
+        '!!!???',
+        'Some text with 123 numbers',
+        'All---punctuation---marks'
+    ]
+    for inp in inputs:
+        result = slugify(inp)
+        assert isinstance(result, str)
 

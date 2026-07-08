@@ -69,6 +69,36 @@ def truncate(text: str, max_len: int = 100) -> str:
     return text[: max_len - 3] + "..."
 
 
+__all__ = [
+    'create_work_link',
+    'format_duration',
+    'format_timestamp',
+    'navigate_to_work',
+    'normalize_artifacts',
+    'slugify',
+    'status_color',
+    'status_color_css',
+    'status_icon',
+    'truncate',
+]
+
+
+def slugify(text: str) -> str:
+    """Convert text to a URL-friendly slug.
+
+    The input is converted to lowercase, every contiguous run of non-alphanumeric
+    characters is replaced by a single hyphen, and any leading or trailing
+    hyphens are stripped.
+
+    Args:
+        text: The string to slugify.
+
+    Returns:
+        A hyphen-separated slug derived from the input text.
+    """
+    import re
+    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
 def normalize_artifacts(artifacts: object) -> list[tuple[str, str]]:
     """Normalize a persisted ``result["artifacts"]`` value into display rows.
 
