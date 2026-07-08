@@ -380,6 +380,161 @@ _RUFF_MAX_ISSUES = 10
 _RUFF_TIMEOUT_S = 10
 
 
+def _index_db_path() -> Optional[str]:
+    """Checkpoint DB path for codebase-index lookups, None when unavailable."""
+    try:
+        from spine.config import SpineConfig
+
+        return SpineConfig.load().checkpoint_path
+    except Exception:  # noqa: BLE001 — no config ⇒ no index-backed repairs
+        return None
+
+
+def _module_resolves(mod: str, workspace_root: str) -> bool:
+    """Best-effort: does ``import mod`` stand a chance of working?
+
+    Checks the workspace tree first (mod as a .py file or package dir), then
+    the running environment via ``find_spec`` on the ROOT segment plus a
+    filesystem walk for the submodule remainder — find_spec on the full
+    dotted path would import parent packages (side effects in the target
+    repo's code). Fail-open to True on any error: a repair must never fire
+    on an import we merely failed to analyse.
+    """
+    import importlib.util
+
+    rel = mod.replace(".", "/")
+    ws = Path(workspace_root or ".")
+    if (ws / f"{rel}.py").exists() or (ws / rel / "__init__.py").exists():
+        return True
+    root, _, remainder = mod.partition(".")
+    try:
+        spec = importlib.util.find_spec(root)
+    except Exception:  # noqa: BLE001
+        return True
+    if spec is None:
+        return False
+    if not remainder:
+        return True
+    search = list(spec.submodule_search_locations or [])
+    if not search:
+        return True  # a plain module can't have submodules, but stay safe
+    sub = remainder.replace(".", "/")
+    for base in search:
+        b = Path(base)
+        if (b / f"{sub}.py").exists() or (b / sub / "__init__.py").exists():
+            return True
+    return False
+
+
+def _rewrite_unresolvable_imports(
+    path: Path, workspace_root: str
+) -> Optional[list[str]]:
+    """Rewrite ``from X import Y`` lines whose module X cannot resolve.
+
+    The dominant editor authoring failure across the artifact_exists runs
+    (3 of 7 attempts) was a hallucinated module path for a REAL symbol:
+    ``from spine.artifacts import ArtifactStore`` (0eabad7d), ``from
+    artifact_store import ArtifactStore`` (7cb8dd73). The codebase index
+    knows exactly which file exports the symbol, so the module path is
+    machine-derivable: for each name in an unresolvable from-import that
+    the index maps to exactly one file, rewrite the import to that file's
+    module path. Names the index doesn't know stay put (their import will
+    fail loudly in the pytest evidence). Returns the rewritten statements,
+    or None when nothing changed / any error (fail-open).
+    """
+    import ast as _ast
+
+    db_path = _index_db_path()
+    if not db_path:
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+        tree = _ast.parse(content)
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        from spine.agents.tools.codebase_query import find_symbol
+    except Exception:  # noqa: BLE001
+        return None
+
+    def _module_for_name(name: str) -> Optional[str]:
+        try:
+            raw = find_symbol(db_path, name)
+        except Exception:  # noqa: BLE001
+            return None
+        if not raw:
+            return None
+        try:
+            matches = json.loads(raw).get("matches") or []
+        except (ValueError, AttributeError):
+            return None
+        files = {
+            m.get("file_path")
+            for m in matches
+            if m.get("file_path")
+            and str(m.get("symbol_name", "")).split(".")[-1] == name
+        }
+        files = {f for f in files if f and f.endswith(".py")}
+        if len(files) != 1:
+            return None
+        rel = next(iter(files))[: -len(".py")]
+        if rel.endswith("/__init__"):
+            rel = rel[: -len("/__init__")]
+        return rel.replace("/", ".")
+
+    lines = content.splitlines(keepends=True)
+    remove: set[int] = set()
+    insert_map: dict[int, list[str]] = {}
+    rewritten: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, _ast.ImportFrom) or node.level:
+            continue
+        mod = node.module or ""
+        if not mod or _module_resolves(mod, workspace_root):
+            continue
+        by_module: dict[str, list[str]] = {}
+        unmapped: list[str] = []
+        for alias in node.names:
+            target = _module_for_name(alias.name)
+            entry = alias.name + (f" as {alias.asname}" if alias.asname else "")
+            if target and target != mod:
+                by_module.setdefault(target, []).append(entry)
+            else:
+                unmapped.append(entry)
+        if not by_module:
+            continue  # nothing mappable — leave the import for pytest to flag
+        new_stmts = [
+            f"from {m} import {', '.join(names)}\n"
+            for m, names in sorted(by_module.items())
+        ]
+        rewritten.extend(s.strip() for s in new_stmts)
+        if unmapped:
+            new_stmts.append(f"from {mod} import {', '.join(unmapped)}\n")
+        remove.update(range(node.lineno - 1, node.end_lineno or node.lineno))
+        insert_map[node.lineno - 1] = new_stmts
+
+    if not insert_map:
+        return None
+
+    new_lines: list[str] = []
+    for i, line in enumerate(lines):
+        if i in insert_map:
+            new_lines.extend(insert_map[i])
+        if i not in remove:
+            new_lines.append(line)
+    new_content = "".join(new_lines)
+    try:
+        _ast.parse(new_content)
+    except SyntaxError:
+        return None
+    try:
+        _atomic_write(path, new_content)
+    except OSError:
+        return None
+    return rewritten
+
+
 def _auto_import_fix(
     path: Path, workspace_root: str, ruff_summary: str
 ) -> Optional[tuple[str, list[str]]]:
@@ -1961,6 +2116,14 @@ class ReadEditLintTool(BaseTool):
         }
         if redirect_note:
             ok_fields["note"] = redirect_note.strip().strip("[]")
+        # Deterministic repair for hallucinated module paths in imports of
+        # REAL symbols ('from artifact_store import ArtifactStore') — the
+        # index knows the actual module; runs before the ruff report so the
+        # advisory summary reflects the repaired file.
+        if path.suffix.lower() == ".py":
+            rewritten = _rewrite_unresolvable_imports(path, self.workspace_root)
+            if rewritten:
+                ok_fields["imports_rewritten"] = rewritten
         ruff = _ruff_report(path, self.workspace_root)
         if ruff is not None and ruff != "clean":
             # Deterministic repair for missing module imports (F821): the
