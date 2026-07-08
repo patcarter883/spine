@@ -247,8 +247,28 @@ F2.1–F2.4 (fact distillation + side index) → F3.1/F3.3 (CLI + verify) → F1
   API); the capacity guard and readback-probe warnings at write time cover the
   alerting need.
 - ⬜ Phase 4 (ephemeral work namespaces, resume reconciliation)
-- ⬜ End-to-end validation against a live CAM serve stack (`MINISGL_CAM=1` +
-  trained checkpoint) — required before relying on it in real runs
+- ✅ End-to-end validated against the live CAM serve stack (2026-07-08):
+  Qwen3.5-4B on minisgl `cam-production` via the compose overlay
+  `minisgl-rdna4-prod/docker-compose.cam.yml` (launch:
+  `MINISGL_MODEL=Qwen/Qwen3.5-4B MINISGL_TP=1 MINISGL_ATTN_BACKEND=hip
+  MINISGL_EXTRA_ARGS="--max-running-requests 16" gpu-lease -n 1 --detach
+  --name cam-serve -- docker compose -f docker-compose.yml -f
+  docker-compose.cam.yml --profile serve up -d`). Verified: gated write via
+  `spine facts add` (novel "capital of Zorbia→Flumevale" **stored**, base-known
+  "capital of France→Paris" **skipped**), `/cam/ask` readback delivers
+  Flumevale, transparent read injects the fact into a plain `/v1/chat` request
+  under the namespace header, store survives a server restart (load-on-boot),
+  and `spine facts list --server` drift-checks correctly per namespace.
+  **Server env findings** (now baked into the overlay): the full server needs
+  `MINISGL_CAM_FRONTEND=1` (routes `/cam/*` to the backend store; without it
+  the API process tries to load its own HF base and 503s),
+  `MINISGL_CAM_WRITE_GATE=1` (the base-uncertainty gate is OPT-IN in frontend
+  mode — default `/cam/remember` force-writes), and `MINISGL_CAM_AUTO=1` for
+  transparent read. In frontend mode `base_p` is not computed (always 0.0) —
+  the gate is a "does the base emit the object" generation probe, so treat the
+  recorded `base_p` as informational only on this deployment mode. The 4B on a
+  16 GB card also needs `--max-running-requests 16` (the default 256 GDN
+  recurrent-state slots reserve 12.7 GiB and starve the KV pool).
 
 Prereq on the serving side: `cam-production` running with `MINISGL_CAM=1`, a trained checkpoint
 dir, and namespaces enabled — plus the parity spike (`memory-organ/docs/serving/parity_spike.md`)

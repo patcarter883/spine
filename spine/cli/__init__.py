@@ -1064,9 +1064,14 @@ def facts_list(from_server: bool, as_json: bool, config_path: str) -> None:
     records = facts_store_for(config).all()
     records.sort(key=lambda f: f.created_at or "", reverse=True)
 
+    # The live fetch is scoped to the client's namespace, so the drift check
+    # must only judge records from that namespace — a record written under a
+    # different namespace is legitimately absent from this fetch.
     server_subjects: set[str] | None = None
+    server_namespace: str | None = None
     if from_server:
         client = _cam_client_or_exit(config)
+        server_namespace = client.settings.namespace
         live = _run_cam(client, client.facts())
         if live is None:
             console.print("[yellow]Server unreachable or CAM not loaded — drift check skipped.[/yellow]")
@@ -1101,15 +1106,21 @@ def facts_list(from_server: bool, as_json: bool, config_path: str) -> None:
             {True: "ok", False: "FAIL", None: "—"}[f.verified],
         ]
         if server_subjects is not None:
-            on_server = f.subject.strip().lower() in server_subjects
-            row.append("yes" if on_server else ("[red]MISSING[/red]" if f.stored else "—"))
+            if f.namespace != server_namespace:
+                row.append("—")  # different namespace: not in this fetch's scope
+            elif f.subject.strip().lower() in server_subjects:
+                row.append("yes")
+            else:
+                row.append("[red]MISSING[/red]" if f.stored else "—")
         table.add_row(*row)
     console.print(table)
     if server_subjects is not None:
         missing = [
             f.subject
             for f in records
-            if f.stored and f.subject.strip().lower() not in server_subjects
+            if f.stored
+            and f.namespace == server_namespace
+            and f.subject.strip().lower() not in server_subjects
         ]
         if missing:
             console.print(
