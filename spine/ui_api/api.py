@@ -730,6 +730,33 @@ class UIApi:
         """
         return self._config.providers
 
+    def get_provider_summary(self) -> dict:
+        """Return a summary of the current provider counts.
+
+        Returns:
+            Dict with keys ``llm_count``, ``embedding_count``, and ``reranker_count``.
+            Each count is 0 if the corresponding provider list is missing, None, or not a list.
+        """
+        providers_data = self.get_providers()
+        if providers_data is None:
+            return {
+                'llm_count': 0,
+                'embedding_count': 0,
+                'reranker_count': 0,
+            }
+
+        def count_if_valid(key: str) -> int:
+            value = providers_data.get(key)
+            if isinstance(value, list):
+                return len(value)
+            return 0
+
+        return {
+            'llm_count': count_if_valid('llm'),
+            'embedding_count': count_if_valid('embedding'),
+            'reranker_count': count_if_valid('reranker'),
+        }
+
     def add_llm_provider(self, name: str, provider_config: dict) -> bool:
         """Add a new LLM provider to the configuration.
 
