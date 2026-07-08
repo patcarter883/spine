@@ -120,18 +120,22 @@ providers:
     context_window: 60000
   - name: pat
     type: deepagents-model
-    # Verified live 2026-07-07 (vLLM 0.22.69, tp2): the server serves
-    # Qwen3.6-27B-AWQ-INT4 (not the 35B-A3B id), max_model_len 50000.
-    # json_schema guided decoding, native tool_calls, and the reasoning
-    # parser (thinking in `reasoning`, not content) all work; ~9-10 tok/s.
-    model: openai:cyankiwi/Qwen3.6-27B-AWQ-INT4
-    base_url: http://10.50.1.51:8000/v1
+    # ⚠ BROKEN as served (verified 2026-07-07): MiniSGL @ 1919 emits degenerate
+    # loops with <|user|>/</think> special-token leakage on this model — the
+    # third model to garble on MiniSGL, while the same GLM-4.7-Flash works on
+    # Lemonade and Qwen worked on vLLM @ 8000. Server-side issue (chat template
+    # / stop tokens / AWQ path), not the model. Also: MiniSGL has no `tools`
+    # request field (native tool calling impossible) and a json_schema
+    # response_format request crashed an earlier build. Do NOT route phases
+    # here until the server is fixed or swapped to vLLM.
+    model: openai:QuantTrio/GLM-4.7-Flash-AWQ
+    base_url: http://10.50.1.51:1919/v1
     api_key: vllm
     guided_decoding: true
     enabled: true
     stream_usage: true
     max_concurrent_calls: 4
-    context_window: 50000              # = server max_model_len
+    context_window: 50000              # ⚠ unverified — MiniSGL doesn't expose max_model_len
   - name: local-qwen
     type: deepagents-model
     model: openai:Agents-A1-Q4_K_M-GGUF-Q4_K_M
@@ -308,27 +312,27 @@ providers:
     # ZERO intra-phase swaps across the whole specify/plan/critic tree.
     # ═══ PLANNING lane -> reasoner-pod (Nemotron NVFP4, boots the RTX PRO 4500 pod) ═══
     specify:
-      provider: pat
+      provider: local-qwen
     specify/subagents/researcher:
-      provider: pat
+      provider: local-qwen
     specify/subagents/researcher/supervisor:
-      provider: pat
+      provider: local-qwen
     plan:
-      provider: pat
+      provider: local-qwen
     plan/subagents/researcher:
-      provider: pat
+      provider: local-qwen
     plan/subagents/researcher/supervisor:
-      provider: pat
+      provider: local-qwen
     critic:
-      provider: pat
+      provider: local-qwen
     critic/specify:
-      provider: pat
+      provider: local-qwen
     critic/plan:
-      provider: pat
+      provider: local-qwen
     gap_plan:
-      provider: pat
+      provider: local-qwen
     exploration/manager:
-      provider: pat
+      provider: local-qwen
     # ═══ INSTRUCT lane -> local-mellum (structured + simple) ═══
     # Guided-decoding bench: instruct wins enrich/decompose/classify at ZERO
     # reasoning cost; reasoning models cap-blow these (fin=length) and emit empty
@@ -342,23 +346,23 @@ providers:
     # servers, so this cross-model split costs no model reload.
     # ═══ EXECUTION lane -> coder-pod (Laguna+DFlash, boots the A40 SGLang pod) ═══
     implement:
-      provider: pat
+      provider: local-qwen
       # Escalation stays on coder-pod: an execution run only boots the coder
       # pod, so escalating to reasoner-pod (not booted) would fail to resolve.
       escalation:
-        - provider: pat
+        - provider: local-qwen
     # 'implement/decomposer' covers all decomposer modes (plan/fallback/per_file)
     # AND the enrich pass via prefix resolution.
     implement/decomposer:
-      provider: pat
+      provider: local-qwen
     implement/subagents/slice-implementer:
-      provider: pat
+      provider: local-qwen
     verify:
-      provider: pat
+      provider: local-qwen
     verify/subagents/slice-verifier:
-      provider: pat
+      provider: local-qwen
     classification:
-      provider: pat
+      provider: local-qwen
       max_completion_tokens: 2048
       temperature: 0
       reasoning: false
