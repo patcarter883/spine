@@ -404,3 +404,45 @@ class TestTargetSourcePreload:
         from spine.workflow.subgraphs.verify_subgraph import _target_source_block
 
         assert _target_source_block(str(tmp_path), ["ghost.py"]) == ""
+
+
+class TestAutomatedChecksRunTests:
+    """Slices that author tests must have those tests EXECUTED as evidence.
+
+    Regression (runs ce6f887d / 545264cc): the evidence-only judge cannot
+    ground "pytest exits 0" criteria by reading source, and collection
+    errors (duplicate defs, nonexistent fixtures) are invisible to it —
+    broken tests were landed as VERIFIED.
+    """
+
+    def test_passing_test_file_is_executed_and_reported(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_ok.py").write_text(
+            "def test_truth():\n    assert True\n", encoding="utf-8"
+        )
+        out = _automated_checks(str(tmp_path), ["tests/test_ok.py"])
+        assert "$ pytest -q tests/test_ok.py" in out
+        assert "OK — all tests pass." in out
+
+    def test_failing_test_file_output_is_evidence(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_bad.py").write_text(
+            "def test_lie():\n    assert False\n", encoding="utf-8"
+        )
+        out = _automated_checks(str(tmp_path), ["tests/test_bad.py"])
+        assert "$ pytest -q tests/test_bad.py" in out
+        assert "OK — all tests pass." not in out
+        assert "test_lie" in out  # the failure detail reaches the judge
+
+    def test_non_test_files_do_not_trigger_pytest(self, tmp_path):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        out = _automated_checks(str(tmp_path), ["mod.py"])
+        assert "pytest" not in out

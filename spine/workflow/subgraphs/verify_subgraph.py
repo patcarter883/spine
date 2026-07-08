@@ -338,6 +338,28 @@ def _automated_checks(workspace_root: str, target_files: list[str] | None) -> st
         + ("OK — no lint findings." if ruff_rc == 0
            else ruff_out or f"exit {ruff_rc}")
     )
+    # Slices that author tests get their tests EXECUTED, not just read.
+    # Evidence-only judging cannot ground criteria like "pytest exits 0" —
+    # run 019f40e0/ce6f887d parked on exactly that gap ("no pytest run was
+    # performed or its results provided") — and a real run also surfaces
+    # collection errors (duplicate defs, broken fixtures) that reading the
+    # source misses (545264cc landed 9 collection-erroring tests as
+    # VERIFIED). The sandbox worktree's code wins imports over the editable
+    # install (pytest prepends the rootdir; the .pth path comes later), so
+    # the results reflect the patch under verification.
+    test_files = [
+        f for f in py_files
+        if Path(f).name.startswith("test_") or f.split("/", 1)[0] == "tests"
+    ]
+    if test_files:
+        pytest_rc, pytest_out = _run(
+            [sys.executable, "-m", "pytest", "-q", "--no-header", *test_files]
+        )
+        sections.append(
+            f"$ pytest -q {' '.join(test_files)}\n"
+            + ("OK — all tests pass." if pytest_rc == 0
+               else pytest_out or f"exit {pytest_rc}")
+        )
     body = "\n\n".join(sections)
     if len(body) > _CHECKS_MAX_CHARS:
         body = body[:_CHECKS_MAX_CHARS] + "\n…[checks output truncated]"
