@@ -508,12 +508,26 @@ def _hoist_late_imports(
     late = [
         n for n in body[idx:] if isinstance(n, (_ast.Import, _ast.ImportFrom))
     ]
-    if not late:
-        return None
 
-    seen = {_ast.unparse(n) for n in head_imports}
     lines = content.splitlines(keepends=True)
     remove: set[int] = set()
+
+    # Exact duplicates WITHIN the head block are the same editor defect in a
+    # different position (run 883f889b: pytest/Path/ArtifactStore imported
+    # twice in the first eight lines — no late imports, so the hoist never
+    # fired and the F811s plateaued). Keep the first occurrence of each
+    # canonical statement, drop the rest in place.
+    seen: set[str] = set()
+    for n in head_imports:
+        text = _ast.unparse(n)
+        if text in seen:
+            remove.update(range(n.lineno - 1, n.end_lineno or n.lineno))
+        else:
+            seen.add(text)
+
+    if not late and not remove:
+        return None
+
     hoist: list[str] = []
     for n in late:
         remove.update(range(n.lineno - 1, n.end_lineno or n.lineno))
@@ -530,12 +544,17 @@ def _hoist_late_imports(
     if insert_at > len(lines):
         return None
 
+    kept = [
+        line
+        for i, line in enumerate(lines[:insert_at])
+        if i not in remove
+    ]
     kept_tail = [
         line
         for i, line in enumerate(lines[insert_at:], start=insert_at)
         if i not in remove
     ]
-    new_content = "".join(lines[:insert_at] + hoist + kept_tail)
+    new_content = "".join(kept + hoist + kept_tail)
     try:
         _ast.parse(new_content)
     except SyntaxError:
@@ -544,7 +563,9 @@ def _hoist_late_imports(
         _atomic_write(path, new_content)
     except OSError:
         return None
-    moved = [_ast.unparse(n) for n in late]
+    moved = [_ast.unparse(n) for n in late] + [
+        _ast.unparse(n) for n in head_imports if (n.lineno - 1) in remove
+    ]
     return (_ruff_report(path, workspace_root) or "clean", moved)
 
 

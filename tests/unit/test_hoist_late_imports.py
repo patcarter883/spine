@@ -85,3 +85,33 @@ def test_clean_file_untouched(tmp_path):
     out = _tool(tmp_path)._run("mod.py", full_replace=code)
     assert "imports_hoisted" not in out
     assert (tmp_path / "mod.py").read_text() == code
+
+
+def test_duplicate_head_imports_are_deduped(tmp_path):
+    """Exact duplicates INSIDE the head block are dropped in place.
+
+    Regression (run 883f889b): pytest/Path/ArtifactStore each imported twice
+    within the first lines — no LATE imports, so the hoist never fired and
+    the F811s plateaued across gap cycles.
+    """
+    code = (
+        "import pytest\n"
+        "from pathlib import Path\n"
+        "import textwrap\n"
+        "import pytest\n"
+        "from pathlib import Path\n"
+        "\n"
+        "\n"
+        "def test_x():\n"
+        "    assert pytest and Path and textwrap\n"
+    )
+    out = _tool(tmp_path)._run("mod.py", full_replace=code)
+    text = (tmp_path / "mod.py").read_text()
+    assert text.count("import pytest") == 1
+    assert text.count("from pathlib import Path") == 1
+    assert "import textwrap" in text
+    assert "imports_hoisted" in out
+    compile(text, "mod.py", "exec")
+    import json as _json
+
+    assert "F811" not in str(_json.loads(out).get("ruff", ""))
