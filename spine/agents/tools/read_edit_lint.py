@@ -465,6 +465,89 @@ def _auto_import_fix(
     return (_ruff_report(path, workspace_root) or "clean", addable)
 
 
+def _hoist_late_imports(
+    path: Path, workspace_root: str, ruff_summary: str
+) -> Optional[tuple[str, list[str]]]:
+    """Deterministically move late module-level imports into the head block.
+
+    Appending code to an existing file lands the appended block's imports
+    mid-file: E402 (import not at top) plus F811 duplicates of imports the
+    head already has — and the synthesis editor regenerates the same shape
+    every gap cycle, so the lint gaps plateau (runs ce6f887d and 717fda0e
+    both parked on exactly this). For every top-level Import/ImportFrom that
+    appears after the first non-import statement: remove it in place and
+    re-insert it after the head import block, dropping any whose canonical
+    form (``ast.unparse``) the file already has. Imports nested in try/if
+    blocks are not module-level ``body`` entries and are never touched.
+    Returns ``(new_ruff_summary, hoisted_statements)`` or None (nothing to
+    do / any error — fail-open, the original advisory summary stands).
+    """
+    import ast as _ast
+
+    if "E402" not in ruff_summary and "F811" not in ruff_summary:
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+        tree = _ast.parse(content)
+    except Exception:  # noqa: BLE001 — unreadable/unparseable ⇒ leave as-is
+        return None
+
+    body = tree.body
+    idx = 0
+    if (
+        body
+        and isinstance(body[0], _ast.Expr)
+        and isinstance(getattr(body[0], "value", None), _ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        idx = 1  # module docstring
+    head_imports: list[_ast.stmt] = []
+    while idx < len(body) and isinstance(body[idx], (_ast.Import, _ast.ImportFrom)):
+        head_imports.append(body[idx])
+        idx += 1
+    late = [
+        n for n in body[idx:] if isinstance(n, (_ast.Import, _ast.ImportFrom))
+    ]
+    if not late:
+        return None
+
+    seen = {_ast.unparse(n) for n in head_imports}
+    lines = content.splitlines(keepends=True)
+    remove: set[int] = set()
+    hoist: list[str] = []
+    for n in late:
+        remove.update(range(n.lineno - 1, n.end_lineno or n.lineno))
+        text = _ast.unparse(n)
+        if text not in seen:
+            seen.add(text)
+            hoist.append(text + "\n")
+    if head_imports:
+        insert_at = head_imports[-1].end_lineno or 0
+    elif idx == 1:
+        insert_at = body[0].end_lineno or 0
+    else:
+        insert_at = 0
+    if insert_at > len(lines):
+        return None
+
+    kept_tail = [
+        line
+        for i, line in enumerate(lines[insert_at:], start=insert_at)
+        if i not in remove
+    ]
+    new_content = "".join(lines[:insert_at] + hoist + kept_tail)
+    try:
+        _ast.parse(new_content)
+    except SyntaxError:
+        return None
+    try:
+        _atomic_write(path, new_content)
+    except OSError:
+        return None
+    moved = [_ast.unparse(n) for n in late]
+    return (_ruff_report(path, workspace_root) or "clean", moved)
+
+
 def _ruff_report(path: Path, workspace_root: str) -> Optional[str]:
     """Run ``ruff check`` on the written file; return a bounded summary.
 
@@ -1866,6 +1949,15 @@ class ReadEditLintTool(BaseTool):
             if fixed is not None:
                 ruff, added = fixed
                 ok_fields["auto_imports_added"] = added
+        if ruff is not None and ruff != "clean":
+            # Deterministic repair for appended-block imports (E402/F811):
+            # code added to an existing file carries its imports mid-file and
+            # duplicates the head block — the editor regenerates the same
+            # shape every cycle (runs ce6f887d, 717fda0e).
+            hoisted = _hoist_late_imports(path, self.workspace_root, ruff)
+            if hoisted is not None:
+                ruff, moved = hoisted
+                ok_fields["imports_hoisted"] = moved
         if ruff is not None:
             ok_fields["ruff"] = ruff
         # A successful write changes the file → bump its epoch so cached reads of
