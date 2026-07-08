@@ -1,6 +1,4 @@
 import tempfile
-from pathlib import Path
-import pytest
 
 from spine.persistence.artifacts import ArtifactStore
 
