@@ -375,6 +375,28 @@ async def agent_critic_check(
 
         parsed = await run_once(prompt)
 
+        # A truncation guard verdict is harness noise, not a review: the
+        # critic rambled past its completion cap without emitting a verdict.
+        # Retrying the CRITIC with a brevity nudge is strictly cheaper than
+        # accepting the guard verdict, which routes back to the reviewed
+        # phase, spends minutes regenerating an artifact nobody faulted, and
+        # feeds the truncated blob in as rework feedback (trace 019f404a: a
+        # guard round triggered a ~6-min plan regeneration and pushed the
+        # attempt counter to the escalation threshold).
+        if parsed.get("verdict_source") == "guard":
+            logger.warning(
+                "[%s] Critic verdict for phase '%s' was a truncation guard — "
+                "retrying the critic once with a brevity nudge",
+                work_id, reviewed_phase,
+            )
+            nudged = prompt + (
+                "\n\nIMPORTANT: your previous review attempt exceeded the "
+                "response length limit and was discarded. Respond with the "
+                "structured verdict ONLY — keep `reason` under 200 words and "
+                "list at most 5 suggestions."
+            )
+            parsed = await run_once(nudged)
+
         # Rec 1 — deterministically refute an uncited scope-exclusion rejection
         # (cheap; may demote a terminal NEEDS_REVIEW before corroboration).
         parsed = _validate_scope_claim(parsed, spec_payload, reviewed_phase, work_id)
