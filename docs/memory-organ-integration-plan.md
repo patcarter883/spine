@@ -259,6 +259,23 @@ F2.1–F2.4 (fact distillation + side index) → F3.1/F3.3 (CLI + verify) → F1
   Flumevale, transparent read injects the fact into a plain `/v1/chat` request
   under the namespace header, store survives a server restart (load-on-boot),
   and `spine facts list --server` drift-checks correctly per namespace.
+  **Workflow-level validation (2026-07-09, spine-sandbox):** a real `spine run`
+  exercised the finalize hook end-to-end — `capture_run_facts` distilled
+  exactly the durable facts from the run ("project codename → Brindlewharf",
+  "codename marker filename → CODENAME.md"), both passed the server write gate
+  into the `wf-e2e` namespace, and a `failed`-status run correctly skipped
+  capture. Caveats from the exercise: (a) the CAM base (Qwen3.5-4B) cannot
+  itself drive spine's structured phases — production shape is hybrid routing
+  (capable model for phases, CAM hooks keyed off the active provider);
+  (b) `spine run --config` is not honored by code paths that call
+  `SpineConfig.load()` bare — the provider must be in `.spine/config.yaml`;
+  (c) a full green run was blocked by a **pre-existing, CAM-unrelated**
+  OpenRouter failure: agent-stack requests 404 "No endpoints found that can
+  handle the requested parameters" on glm/deepseek/kimi alike under
+  `require_parameters=true`, while every standalone repro (structured bind,
+  tools, tools+response_format+tool_choice=required, streamed) succeeds —
+  the offending parameter is added inside the deepagents middleware stack;
+  needs its own investigation.
   **Server env findings** (now baked into the overlay): the full server needs
   `MINISGL_CAM_FRONTEND=1` (routes `/cam/*` to the backend store; without it
   the API process tries to load its own HF base and 503s),
