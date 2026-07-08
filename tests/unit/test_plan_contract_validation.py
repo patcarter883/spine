@@ -128,3 +128,80 @@ def test_contract_block_lists_dependency_provides() -> None:
     assert "UIApi.add_provider" in block and "UIApi.remove_provider" in block
     # A slice with no producer dependencies gets no block.
     assert _contract_block(api, [api, ui]) == ""
+
+
+class TestInferMissingProvides:
+    """A forgotten `provides` declaration is inferred, not parked on.
+
+    Regression (run ad28d82e): the impl slice created
+    ArtifactStore.artifact_exists with provides=[], the test slice referenced
+    it with a full module-qualified name and depended on the impl slice —
+    and the reference gate still rejected the plan two rounds running,
+    escalating a spec_amendment park. The dependency edge plus the owner
+    class's file make the producer unambiguous.
+    """
+
+    def _install_index(self, monkeypatch, *, existing_leaves, owner_files):
+        monkeypatch.setattr(
+            "spine.agents.plan_synthesis._symbol_exists_in_index",
+            lambda db_path, sym: _leaf(sym) in existing_leaves,
+        )
+        monkeypatch.setattr(
+            "spine.agents.plan_synthesis._symbol_files",
+            lambda db_path, name: owner_files.get(name, []),
+        )
+
+    def test_provides_inferred_from_dependency_and_owner_file(self, monkeypatch):
+        self._install_index(
+            monkeypatch,
+            existing_leaves={"ArtifactStore", "save_artifact"},
+            owner_files={"ArtifactStore": ["spine/persistence/artifacts.py"]},
+        )
+        skel = PlanSkeleton(slices=[
+            _stub("impl", target_files=["spine/persistence/artifacts.py"], provides=[]),
+            _stub(
+                "tests",
+                target_files=["tests/unit/test_artifact_store_exists.py"],
+                reference_symbols=[
+                    "spine.persistence.artifacts.ArtifactStore.artifact_exists",
+                    "spine.persistence.artifacts.ArtifactStore.save_artifact",
+                ],
+                dependencies=["impl"],
+            ),
+        ])
+        violations = repair_and_validate_contracts(skel, "w")
+        impl = next(s for s in skel.slices if s.id == "impl")
+        assert impl.provides == ["ArtifactStore.artifact_exists"]
+        assert violations == []
+
+    def test_no_inference_without_dependency_edge(self, monkeypatch):
+        self._install_index(
+            monkeypatch,
+            existing_leaves={"ArtifactStore"},
+            owner_files={"ArtifactStore": ["spine/persistence/artifacts.py"]},
+        )
+        skel = PlanSkeleton(slices=[
+            _stub("impl", target_files=["spine/persistence/artifacts.py"], provides=[]),
+            _stub(
+                "tests",
+                reference_symbols=["ArtifactStore.artifact_exists"],
+                dependencies=[],  # no declared edge — intent is ambiguous
+            ),
+        ])
+        repair_and_validate_contracts(skel, "w")
+        impl = next(s for s in skel.slices if s.id == "impl")
+        assert impl.provides == []
+
+    def test_no_inference_when_owner_unknown(self, monkeypatch):
+        self._install_index(monkeypatch, existing_leaves=set(), owner_files={})
+        skel = PlanSkeleton(slices=[
+            _stub("impl", target_files=["spine/persistence/artifacts.py"], provides=[]),
+            _stub(
+                "tests",
+                reference_symbols=["Ghost.method"],
+                dependencies=["impl"],
+            ),
+        ])
+        repair_and_validate_contracts(skel, "w")
+        impl = next(s for s in skel.slices if s.id == "impl")
+        assert impl.provides == []

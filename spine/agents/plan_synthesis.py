@@ -233,6 +233,91 @@ def _leaf(sym: str) -> str:
     return s.rsplit(".", 1)[-1] if s else ""
 
 
+def _owner(sym: str) -> str:
+    """Owner qualifier of a symbol: 'a.b.Class.method' -> 'Class'."""
+    s = (sym or "").strip().split("(", 1)[0].strip()
+    parts = s.split(".")
+    return parts[-2] if len(parts) >= 2 else ""
+
+
+def _symbol_files(db_path: str | None, name: str) -> list[str]:
+    """File paths the index lists for *name*, ``[]`` on any failure."""
+    if not db_path or not name:
+        return []
+    try:
+        from spine.agents.tools.codebase_query import find_symbol
+
+        raw = find_symbol(db_path, name)
+    except Exception:  # noqa: BLE001 — index unavailable ⇒ no candidates
+        return []
+    if not raw:
+        return []
+    try:
+        import json as _json
+
+        matches = _json.loads(raw).get("matches") or []
+    except (ValueError, AttributeError):
+        return []
+    out: list[str] = []
+    for m in matches:
+        fp = m.get("file_path")
+        if fp and fp not in out:
+            out.append(fp)
+    return out
+
+
+def _infer_missing_provides(
+    stubs: list[SliceStub], db_path: str | None, work_id: str
+) -> None:
+    """Deterministically declare provides the planner forgot.
+
+    When a consumer slice references a symbol that is NOT in the codebase
+    index, no slice provides, and whose OWNER class lives in a file targeted
+    by exactly one of the consumer's declared dependencies, that dependency
+    is the producer — the planner simply omitted the ``provides`` entry.
+    Run ad28d82e: the impl slice created ArtifactStore.artifact_exists with
+    ``provides: []``; the test slice referenced it and depended correctly,
+    and the reference gate still parked the plan after two rounds. Repairing
+    the declaration is strictly better than asking the planner to — the
+    dependency edge and target file make the intent unambiguous.
+    """
+    by_id = {s.id: s for s in stubs}
+    for s in stubs:
+        for ref in s.reference_symbols or []:
+            if _is_external_reference(ref):
+                continue
+            if _symbol_exists_in_index(db_path, ref):
+                continue
+            leaf = _leaf(ref)
+            owner = _owner(ref)
+            if not leaf or not owner or owner == leaf:
+                continue
+            if any(
+                _leaf(p) == leaf for t in stubs for p in (t.provides or [])
+            ):
+                continue  # someone already declares it
+            owner_files = set(_symbol_files(db_path, owner))
+            if not owner_files:
+                continue  # owner class itself unknown — leave for the gate
+            candidates = [
+                by_id[d]
+                for d in (s.dependencies or [])
+                if d in by_id
+                and d != s.id
+                and owner_files & set(by_id[d].target_files or [])
+            ]
+            if len(candidates) == 1:
+                producer = candidates[0]
+                declared = f"{owner}.{leaf}"
+                producer.provides = sorted(set(producer.provides or []) | {declared})
+                logger.info(
+                    "[%s] contract repair: inferred provides %r on slice %r "
+                    "(referenced by %r, owner file %s)",
+                    work_id, declared, producer.id, s.id,
+                    sorted(owner_files)[0],
+                )
+
+
 def _root(sym: str) -> str:
     """Leading identifier of a qualified symbol: 'st.form' -> 'st'."""
     s = (sym or "").strip().split("(", 1)[0].strip()
@@ -295,14 +380,19 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
     """
     try:
         stubs = skeleton.slices
-        if not any(s.provides for s in stubs):
-            return []  # contract info absent — nothing to reconcile
-
         try:
             from spine.config import SpineConfig
             db_path = SpineConfig.load().checkpoint_path
         except Exception:  # noqa: BLE001
             db_path = None
+
+        # Declare provides the planner forgot BEFORE the presence check —
+        # a plan whose slices all have empty provides (run ad28d82e) is
+        # exactly the shape that needs the inference.
+        _infer_missing_provides(stubs, db_path, work_id)
+
+        if not any(s.provides for s in stubs):
+            return []  # contract info absent — nothing to reconcile
 
         provider_by_leaf: dict[str, set[str]] = {}
         for s in stubs:
