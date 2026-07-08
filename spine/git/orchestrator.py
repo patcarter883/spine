@@ -316,6 +316,23 @@ class SpineGitOrchestrator:
         if not commit_ok and "nothing to commit" not in (commit_out + commit_err):
             logger.warning("Commit reported non-zero: %s", commit_out + commit_err)
 
+        # Bring the patch branch up to date with any commits that landed on
+        # main while the run was in flight (another work item, a human push).
+        # Without this the --ff-only merge below fails for every run that
+        # isn't the sole writer to the repo, discarding a verified patch. A
+        # rebase conflict means the patch genuinely overlaps the new main
+        # state — surface it as a MergeError rather than guessing.
+        rebase_ok, _rebase_out, rebase_err = self._execute_shell(
+            f"git rebase {self.main_branch}", cwd=self.sandbox_dir
+        )
+        if not rebase_ok:
+            self._execute_shell("git rebase --abort", cwd=self.sandbox_dir)
+            raise MergeError(
+                f"Rebase of '{branch}' onto {self.main_branch} failed "
+                f"(main advanced during the run and the patch conflicts): "
+                f"{rebase_err}"
+            )
+
         self._execute_shell(
             f"git checkout {self.main_branch}", cwd=self.master_dir
         )
