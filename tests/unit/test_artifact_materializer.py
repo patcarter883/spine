@@ -369,6 +369,45 @@ class TestScanArtifactDir:
             result = scan_artifact_dir(tmpdir, "w1", "tasks")
             assert result == {}
 
+    def test_full_fidelity_names_carried_whole(self):
+        """Report files listed in full_fidelity bypass preview truncation."""
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            impl_dir = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "implement"
+            impl_dir.mkdir(parents=True)
+            long_content = "x" * 2000
+            (impl_dir / "implementation.md").write_text(long_content, encoding="utf-8")
+            (impl_dir / "notes.md").write_text(long_content, encoding="utf-8")
+
+            result = scan_artifact_dir(
+                tmpdir,
+                "w1",
+                "implement",
+                max_preview_chars=100,
+                full_fidelity=("implementation.md",),
+            )
+            assert result["implementation.md"] == long_content
+            assert len(result["notes.md"]) == 100
+
+    def test_full_fidelity_bounded_by_max_full_chars(self):
+        from spine.agents.artifacts import scan_artifact_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            impl_dir = Path(tmpdir) / ".spine" / "artifacts" / "w1" / "implement"
+            impl_dir.mkdir(parents=True)
+            (impl_dir / "implementation.md").write_text("x" * 2000, encoding="utf-8")
+
+            result = scan_artifact_dir(
+                tmpdir,
+                "w1",
+                "implement",
+                max_preview_chars=100,
+                full_fidelity=("implementation.md",),
+                max_full_chars=500,
+            )
+            assert len(result["implementation.md"]) == 500
+
     def test_returns_empty_for_empty_dir(self):
         from spine.agents.artifacts import scan_artifact_dir
 

@@ -201,13 +201,40 @@ class TestMakeSuccessResultMapper:
         mapper = make_success_result_mapper("implement")
         long_content = "x" * 10000
         subgraph_result = {
-            "artifacts_output": {"implementation.md": long_content},
+            "artifacts_output": {"notes.md": long_content},
             "phase_status": "success",
         }
         result = mapper(subgraph_result, {})
 
-        preview = result["artifacts"]["implement"]["implementation.md"]
+        preview = result["artifacts"]["implement"]["notes.md"]
         assert len(preview) == 500
+
+    def test_report_artifacts_persist_whole(self):
+        """Phase report files must NOT be truncated to the state preview.
+
+        Their only copy after sandbox teardown is what the mapper carries —
+        a 500-char preview leaves the durable file truncated mid-record.
+        """
+        from spine.workflow.subgraph_wrapper import make_success_result_mapper
+
+        long_content = "x" * 10000
+        for phase, name in [
+            ("implement", "implementation.md"),
+            ("implement", "implementation.json"),
+            ("gap_plan", "gap_plan.md"),
+            ("gap_plan", "gap_plan.json"),
+            ("verify", "verification.md"),
+            ("verify", "verification.json"),
+        ]:
+            mapper = make_success_result_mapper(phase)
+            result = mapper(
+                {
+                    "artifacts_output": {name: long_content},
+                    "phase_status": "success",
+                },
+                {},
+            )
+            assert result["artifacts"][phase][name] == long_content
 
     def test_handles_empty_artifacts(self):
         from spine.workflow.subgraph_wrapper import make_success_result_mapper

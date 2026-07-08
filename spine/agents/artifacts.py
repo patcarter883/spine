@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from spine.models.enums import PhaseName
 
@@ -159,6 +159,8 @@ def scan_artifact_dir(
     work_id: str,
     phase: str,
     max_preview_chars: int = 500,
+    full_fidelity: Collection[str] = (),
+    max_full_chars: int = 200_000,
 ) -> dict[str, str]:
     """Scan a phase artifact directory for files the agent wrote to disk.
 
@@ -168,14 +170,24 @@ def scan_artifact_dir(
     artifact directory and returns truncated previews suitable for storing in
     ``WorkflowState`` (full content lives on disk).
 
+    Phase report files (e.g. ``implementation.md``, ``gap_plan.json``) must
+    cross the sandbox→durable boundary whole: the sandbox worktree holding the
+    full file is torn down at finalize, so the copy carried through state is
+    the only one that survives.  Names listed in ``full_fidelity`` are returned
+    at full content (bounded by ``max_full_chars``) instead of preview length.
+
     Args:
         workspace_root: Absolute path to the project workspace.
         work_id: Work item identifier for path scoping.
         phase: The phase name (e.g. ``"tasks"``).
         max_preview_chars: Maximum characters per file for state previews.
+        full_fidelity: Filenames to carry at full content, not preview length.
+        max_full_chars: Bound on full-fidelity content so a pathological
+            report can't blow up state.
 
     Returns:
-        Dict of ``{filename: truncated_preview}`` for each discovered file.
+        Dict of ``{filename: content}`` for each discovered file — previews
+        for incidental files, full content for ``full_fidelity`` names.
         Returns empty dict if the directory doesn't exist.
     """
     root = Path(workspace_root)
@@ -188,7 +200,8 @@ def scan_artifact_dir(
         if path.is_file() and not path.name.endswith(".meta.json"):
             try:
                 content = path.read_text(encoding="utf-8")
-                artifacts[path.name] = content[:max_preview_chars]
+                cap = max_full_chars if path.name in full_fidelity else max_preview_chars
+                artifacts[path.name] = content[:cap]
             except OSError:
                 logger.warning("Could not read artifact file: %s", path)
     return artifacts

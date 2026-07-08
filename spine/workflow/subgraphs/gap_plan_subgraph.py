@@ -34,6 +34,14 @@ from spine.agents.artifacts import (
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
+# The gap plan must cross the sandbox→durable boundary whole: the rework
+# implement cycle reads it, restart/UI read both files, and the sandbox
+# worktree holding the full copy is torn down at finalize. A 500-char preview
+# leaves the persisted plan truncated mid-record. The mapper's
+# _FULL_PERSIST_ARTIFACTS keeps these untruncated through parent state.
+_FULL_REPORT_FILES = ("gap_plan.md", "gap_plan.json")
+_MAX_FULL_REPORT_CHARS = 200_000
+
 
 async def _gap_plan_directive_node(
     state: GapPlanSubgraphState,
@@ -157,6 +165,8 @@ async def _save_gap_plan_artifacts(
         work_id,
         PhaseName.GAP_PLAN.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        full_fidelity=_FULL_REPORT_FILES,
+        max_full_chars=_MAX_FULL_REPORT_CHARS,
     )
 
     return {

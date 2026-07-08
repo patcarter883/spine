@@ -824,24 +824,15 @@ _MAX_FULL_REPORT_CHARS = 200_000
 def _verify_artifacts_for_state(workspace_root: str, work_id: str) -> dict[str, str]:
     """Scan the verify artifact dir, but carry the report files at full fidelity.
 
-    ``scan_artifact_dir`` truncates every file to a state-preview length; that is
-    right for incidental files but loses the verification report, whose only copy
-    after sandbox teardown is what we return here. Read verification.json/.md
-    whole (bounded) and let the previews stand for anything else.
+    Preview truncation is right for incidental files but loses the verification
+    report, whose only copy after sandbox teardown is what we return here.
     """
-    artifacts = scan_artifact_dir(
+    return scan_artifact_dir(
         workspace_root, work_id, PhaseName.VERIFY.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        full_fidelity=_FULL_REPORT_FILES,
+        max_full_chars=_MAX_FULL_REPORT_CHARS,
     )
-    verify_dir = Path(workspace_root) / artifact_path(work_id, PhaseName.VERIFY.value)
-    for name in _FULL_REPORT_FILES:
-        fp = verify_dir / name
-        if fp.exists():
-            try:
-                artifacts[name] = fp.read_text(encoding="utf-8")[:_MAX_FULL_REPORT_CHARS]
-            except OSError:
-                pass  # keep the truncated preview scan_artifact_dir already returned
-    return artifacts
 
 
 async def _save_verify_artifacts(
