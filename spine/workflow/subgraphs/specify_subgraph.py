@@ -38,6 +38,13 @@ from spine.exceptions import CriticalContractFailure
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
+# specification.json/.md are written inside the run's sandbox worktree, so the
+# durable .spine only receives what the result mapper carries through parent
+# state. A 500-char preview leaves the persisted spec truncated mid-record.
+# _FULL_PERSIST_ARTIFACTS keeps these untruncated through parent state.
+_FULL_REPORT_FILES = ("specification.json", "specification.md")
+_MAX_FULL_REPORT_CHARS = 200_000
+
 
 async def _early_commitment(
     description: str,
@@ -275,6 +282,8 @@ async def _save_specify_artifacts(
         work_id,
         PhaseName.SPECIFY.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        full_fidelity=_FULL_REPORT_FILES,
+        max_full_chars=_MAX_FULL_REPORT_CHARS,
     )
 
     if not disk_artifacts and agent_response.strip():
@@ -284,7 +293,7 @@ async def _save_specify_artifacts(
             workspace_root,
             work_id=work_id,
         )
-        disk_artifacts = {"specification.md": agent_response[:_MAX_ARTIFACT_STATE_CHARS]}
+        disk_artifacts = {"specification.md": agent_response[:_MAX_FULL_REPORT_CHARS]}
 
     return {
         "artifacts_output": disk_artifacts,
