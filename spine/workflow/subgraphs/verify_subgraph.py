@@ -295,23 +295,33 @@ def _worktree_diff(workspace_root: str, paths: list[str] | None) -> str:
 _CHECKS_MAX_CHARS = 8000
 
 
-def _automated_checks(workspace_root: str, target_files: list[str] | None) -> str:
-    """Run a deterministic py_compile + ruff pass over the changed Python files.
+def _automated_checks(
+    workspace_root: str, target_files: list[str] | None
+) -> tuple[str, list[str]]:
+    """Run a deterministic py_compile + ruff + pytest pass over changed files.
 
     This is the evidence-then-judge counterpart of ``_worktree_diff``: instead
     of letting the verifier spend an unbounded ReAct loop shelling ``py_compile``
     / ``ruff`` / ``inspect.signature`` probes (trace 019f16cf: the loop never
-    converged and crashed on the token budget), we run the two checks that
+    converged and crashed on the token budget), we run the checks that
     actually matter ONCE, here, and hand the verifier the results. Best-effort:
     a missing runner or a subprocess error is reported as such, never raised —
     the verifier still has the diff and source to judge from.
+
+    Returns ``(rendered_block, hard_failures)``. ``hard_failures`` lists
+    HARD check failures (py_compile / pytest — ruff stays advisory for the
+    judge to weigh) so the caller can OVERRIDE a VERIFIED verdict: run
+    e95c1bc4's judge was handed a pytest collection ImportError in its
+    prompt and still verified the slice with zero gaps — an LLM verdict
+    that contradicts deterministic ground truth is corrected mechanically,
+    not argued with.
     """
     py_files = [
         f for f in (target_files or [])
         if f and f.endswith(".py") and (Path(workspace_root) / f).exists()
     ]
     if not py_files:
-        return ""
+        return "", []
 
     def _run(args: list[str]) -> tuple[int, str]:
         try:
@@ -343,12 +353,18 @@ def _automated_checks(workspace_root: str, target_files: list[str] | None) -> st
         return "…[output truncated]…\n" + text[-cap:]
 
     sections: list[str] = []
+    hard_failures: list[str] = []
     compile_rc, compile_out = _run([sys.executable, "-m", "py_compile", *py_files])
     sections.append(
         f"$ python -m py_compile {' '.join(py_files)}\n"
         + ("OK — all target files compile." if compile_rc == 0
            else _clip_head(compile_out, 1500) or f"FAILED (exit {compile_rc})")
     )
+    if compile_rc != 0:
+        hard_failures.append(
+            f"py_compile failed (exit {compile_rc}): "
+            + _clip_head(compile_out, 400)
+        )
     ruff_rc, ruff_out = _run(
         [sys.executable, "-m", "ruff", "check", "--output-format=concise", *py_files]
     )
@@ -379,14 +395,20 @@ def _automated_checks(workspace_root: str, target_files: list[str] | None) -> st
             + ("OK — all tests pass." if pytest_rc == 0
                else _clip_tail(pytest_out, 3500) or f"exit {pytest_rc}")
         )
+        if pytest_rc != 0:
+            hard_failures.append(
+                f"pytest failed (exit {pytest_rc}): "
+                + _clip_tail(pytest_out, 600)
+            )
     body = "\n\n".join(sections)
     if len(body) > _CHECKS_MAX_CHARS:
         body = body[:_CHECKS_MAX_CHARS] + "\n…[checks output truncated]"
-    return (
+    block = (
         "<automated_checks>\nDeterministic checks already run for you over the "
         "changed files (you have no tools — judge from these, do not ask to "
         "re-run them):\n\n" + body + "\n</automated_checks>"
     )
+    return block, hard_failures
 
 
 # Pre-loaded source bounds. The verifier reads its target files to check them
@@ -518,12 +540,12 @@ async def _run_slice_verifier_node(
         from spine.config import SpineConfig
 
         judge_mode = SpineConfig.load().verify_evidence_then_judge
-        checks_block = (
+        checks_block, checks_failures = (
             _automated_checks(
                 state.get("workspace_root", "."), slice_data.get("target_files")
             )
             if judge_mode
-            else ""
+            else ("", [])
         )
         # Hostage layout: data blocks first, plain-text directive at the
         # absolute tail. The directive_block from format_directive_for_prompt
@@ -569,6 +591,32 @@ async def _run_slice_verifier_node(
         )
 
         verification_result = _extract_verification_result(result, slice_id)
+
+        # Deterministic override: a slice whose HARD checks failed cannot be
+        # VERIFIED, whatever the judge said. Run e95c1bc4: the judge was
+        # handed a pytest collection ImportError in <automated_checks> and
+        # still verified with zero gaps — the broken file sailed to the
+        # landing gate as a terminal failure instead of an in-loop gap.
+        if (
+            checks_failures
+            and isinstance(verification_result, dict)
+            and verification_result.get("verdict") == "VERIFIED"
+        ):
+            logger.warning(
+                "[%s] Slice-verifier %r: judge said VERIFIED but %d hard "
+                "check(s) failed — overriding to NOT_VERIFIED",
+                work_id, slice_id, len(checks_failures),
+            )
+            verification_result["verdict"] = "NOT_VERIFIED"
+            checklist = verification_result.setdefault("checklist", [])
+            gaps = verification_result.setdefault("gaps", [])
+            for failure in checks_failures:
+                checklist.append({
+                    "criterion": "Automated checks pass (deterministic)",
+                    "passed": False,
+                    "detail": failure,
+                })
+                gaps.append(f"Automated check failed: {failure}")
 
     except MaxTokenBudgetExceeded as budget_exc:
         # The judge's one-shot call already produced a verdict before the

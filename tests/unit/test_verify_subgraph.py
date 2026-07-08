@@ -423,9 +423,10 @@ class TestAutomatedChecksRunTests:
         (tests_dir / "test_ok.py").write_text(
             "def test_truth():\n    assert True\n", encoding="utf-8"
         )
-        out = _automated_checks(str(tmp_path), ["tests/test_ok.py"])
+        out, failures = _automated_checks(str(tmp_path), ["tests/test_ok.py"])
         assert "$ pytest -q tests/test_ok.py" in out
         assert "OK — all tests pass." in out
+        assert failures == []
 
     def test_failing_test_file_output_is_evidence(self, tmp_path):
         from spine.workflow.subgraphs.verify_subgraph import _automated_checks
@@ -435,17 +436,21 @@ class TestAutomatedChecksRunTests:
         (tests_dir / "test_bad.py").write_text(
             "def test_lie():\n    assert False\n", encoding="utf-8"
         )
-        out = _automated_checks(str(tmp_path), ["tests/test_bad.py"])
+        out, failures = _automated_checks(str(tmp_path), ["tests/test_bad.py"])
         assert "$ pytest -q tests/test_bad.py" in out
         assert "OK — all tests pass." not in out
         assert "test_lie" in out  # the failure detail reaches the judge
+        # ...and the failure is reported structurally so the caller can
+        # OVERRIDE a judge that verifies over it (run e95c1bc4).
+        assert failures and "pytest failed" in failures[0]
 
     def test_non_test_files_do_not_trigger_pytest(self, tmp_path):
         from spine.workflow.subgraphs.verify_subgraph import _automated_checks
 
         (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
-        out = _automated_checks(str(tmp_path), ["mod.py"])
+        out, failures = _automated_checks(str(tmp_path), ["mod.py"])
         assert "pytest" not in out
+        assert failures == []
 
     def test_pytest_evidence_survives_verbose_ruff_output(self, tmp_path):
         """One noisy check must not starve the others (run 0eabad7d: ruff's
@@ -461,6 +466,6 @@ class TestAutomatedChecksRunTests:
         lines += [f"import os as unused_alias_{i}\n" for i in range(200)]
         lines += ["def test_x():\n", "    assert True\n"]
         (tests_dir / "test_noisy.py").write_text("".join(lines), encoding="utf-8")
-        out = _automated_checks(str(tmp_path), ["tests/test_noisy.py"])
+        out, _failures = _automated_checks(str(tmp_path), ["tests/test_noisy.py"])
         assert "$ pytest -q tests/test_noisy.py" in out
         assert "nonexistent_module_xyz_abc" in out.split("$ pytest")[1]
