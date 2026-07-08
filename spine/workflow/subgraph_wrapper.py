@@ -191,18 +191,24 @@ def _resolve_timeout(phase: str, config: RunnableConfig | None = None) -> int:
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 # Artifacts that must survive at FULL fidelity, not as a truncated state preview.
-# Implement, verify, and gap_plan run in a sandbox worktree that is torn down at
-# finalize, so the only copy that reaches the durable .spine is whatever the
+# Code-producing work types run the ENTIRE graph (specify through gap_plan) in
+# a sandbox worktree that is torn down at finalize, so the
+# only copy that reaches the durable .spine is whatever the
 # result mapper puts in parent state (later materialized to disk). A 500-char
 # preview leaves the persisted report truncated mid-record — useless to the
 # phases that read it (gap_plan reads verification.md and implementation.md,
-# rework implement reads gap_plan.md/.json) and to post-run/restart inspection.
+# rework implement reads gap_plan.md/.json, resume re-seeds from plan.json and
+# specification.json) and to post-run/restart inspection.
 # These names carry their full content through the mapper instead. Bounded by
 # _MAX_FULL_PERSIST_CHARS so a pathological report still can't blow up state.
 # The subgraph save nodes must ALSO carry them whole (scan_artifact_dir's
 # full_fidelity parameter) — this set only stops the mapper re-truncating.
 _FULL_PERSIST_ARTIFACTS = frozenset(
     {
+        "specification.json",
+        "specification.md",
+        "plan.json",
+        "plan.md",
         "verification.json",
         "verification.md",
         "implementation.json",

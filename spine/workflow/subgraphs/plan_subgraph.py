@@ -42,6 +42,14 @@ from spine.agents.artifacts import (
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
+# plan.json/.md are written inside the run's sandbox worktree, so the durable
+# .spine only receives what the result mapper carries through parent state. A
+# 500-char preview leaves the persisted plan truncated mid-record — useless to
+# resume, rework, and post-run inspection. _FULL_PERSIST_ARTIFACTS keeps these
+# untruncated through parent state.
+_FULL_REPORT_FILES = ("plan.json", "plan.md")
+_MAX_FULL_REPORT_CHARS = 200_000
+
 
 async def _plan_directive_node(
     state: PlanSubgraphState,
@@ -319,6 +327,8 @@ async def _save_plan_artifacts(
         work_id,
         PhaseName.PLAN.value,
         max_preview_chars=_MAX_ARTIFACT_STATE_CHARS,
+        full_fidelity=_FULL_REPORT_FILES,
+        max_full_chars=_MAX_FULL_REPORT_CHARS,
     )
 
     if not disk_artifacts and agent_response.strip():
@@ -337,10 +347,10 @@ async def _save_plan_artifacts(
             work_id=work_id,
         )
         disk_artifacts = {
-            "plan.md": agent_response[:_MAX_ARTIFACT_STATE_CHARS],
+            "plan.md": agent_response[:_MAX_FULL_REPORT_CHARS],
         }
         if plan_json_str:
-            disk_artifacts["plan.json"] = plan_json_str[:_MAX_ARTIFACT_STATE_CHARS]
+            disk_artifacts["plan.json"] = plan_json_str[:_MAX_FULL_REPORT_CHARS]
 
     # Merge plan.json into disk_artifacts if it exists on disk but wasn't
     # picked up by scan_artifact_dir (e.g. binary/JSON file filtering).
@@ -349,7 +359,7 @@ async def _save_plan_artifacts(
             Path(workspace_root) / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
         )
         if plan_json_path.exists() and plan_json_str:
-            disk_artifacts["plan.json"] = plan_json_str[:_MAX_ARTIFACT_STATE_CHARS]
+            disk_artifacts["plan.json"] = plan_json_str[:_MAX_FULL_REPORT_CHARS]
 
     return {
         "artifacts_output": disk_artifacts,
