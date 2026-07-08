@@ -170,3 +170,46 @@ def navigate_to_work(work_id: str) -> None:
         # Fallback: set query param and switch by URL path
         st.query_params["work_id"] = work_id
         st.switch_page(get_page("dashboard"))
+
+
+def format_bytes(num_bytes: int) -> str:
+    """Format a byte count as a human-readable string.
+
+    Args:
+        num_bytes: Number of bytes to format.
+
+    Returns:
+        A string representation with appropriate unit (B, KB, MB, GB).
+        For values >= 1024, uses one decimal place and round-half-up.
+
+    Examples:
+        >>> format_bytes(0)
+        '0 B'
+        >>> format_bytes(512)
+        '512 B'
+        >>> format_bytes(1024)
+        '1.0 KB'
+        >>> format_bytes(1536)
+        '1.5 KB'
+        >>> format_bytes(1048576)
+        '1.0 MB'
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+
+    # Scale to appropriate unit
+    for unit in ["KB", "MB", "GB"]:
+        if num_bytes < 1024 ** (list(["B", "KB", "MB", "GB"]).index(unit) + 1):
+            value = num_bytes / (1024 ** (list(["B", "KB", "MB", "GB"]).index(unit)))
+            # Round half-up to one decimal place
+            rounded = float(Decimal(str(value)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
+            return f"{rounded:.1f} {unit}"
+
+    # Fallback for very large numbers (>= 1TB)
+    value = num_bytes / (1024 ** 3)
+    rounded = float(Decimal(str(value)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
+    return f"{rounded:.1f} GB"
+
+
