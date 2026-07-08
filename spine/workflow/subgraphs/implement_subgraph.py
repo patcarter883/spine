@@ -762,12 +762,41 @@ def _reference_symbols_body(
     if not refs:
         return ""
     blocks: list[str] = []
+    rendered: set[str] = set()
     for r in refs:
+        if r in rendered:
+            continue
+        rendered.add(r)
         src = _inline_symbol_source(db_path, workspace_root, r)
         if src:
             blocks.append(f"### `{r}`\n{src}")
         else:
             blocks.append(f"### `{r}`\n(source unavailable — read_symbol it if needed)")
+    # Inline the constructor of every referenced CLASS as well. A slice that
+    # references `Class.method` almost always has to INSTANTIATE the class
+    # (tests especially), and with only the method's source in the prompt the
+    # editor guesses constructor kwargs — run 86a3ab17 burned three verify
+    # cycles inventing root_dir/base_dir/root for ArtifactStore(base_path).
+    owners: dict[str, str] = {}
+    for r in refs:
+        parts = (r or "").strip().split("(", 1)[0].split(".")
+        for i, seg in enumerate(parts):
+            if seg and seg[0].isupper():
+                owners.setdefault(".".join(parts[: i + 1]), seg)
+                break
+    for owner, bare in owners.items():
+        init_sym = f"{bare}.__init__"
+        if init_sym in rendered or owner in rendered or bare in rendered:
+            continue
+        src = _inline_symbol_source(
+            db_path, workspace_root, f"{owner}.__init__"
+        ) or _inline_symbol_source(db_path, workspace_root, init_sym)
+        if src:
+            rendered.add(init_sym)
+            blocks.append(
+                f"### `{init_sym}` (constructor — call it with EXACTLY these "
+                f"parameters)\n{src}"
+            )
     return "\n\n".join(blocks)
 
 
