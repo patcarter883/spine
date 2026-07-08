@@ -810,6 +810,12 @@ async def submit_work(
 
         await capture_run_experience(result, config, final_status)
 
+        # Distil durable project facts into the CAM memory organ (no-op unless
+        # the provider carries a `cam:` block with write: distill). Best-effort.
+        from spine.agents.facts import capture_run_facts
+
+        await capture_run_facts(result, config, final_status)
+
         # ── Land or discard the sandbox patch ──
         # Code-producing work ran against an isolated worktree; merge it to
         # main on success, roll it back on any other terminal status. No-op
@@ -1254,6 +1260,11 @@ async def resume_work(
 
         await capture_run_experience(result, config, final_status)
 
+        # Distil durable project facts into the CAM memory organ (best-effort).
+        from spine.agents.facts import capture_run_facts
+
+        await capture_run_facts(result, config, final_status)
+
         # Land or discard the worktree patch based on the resumed outcome.
         sandbox.finalize(final_status)
 
@@ -1608,6 +1619,11 @@ async def resume_interrupted_work(
     from spine.agents.experience import capture_run_experience
 
     await capture_run_experience(result, config, final_status)
+
+    # Distil durable project facts into the CAM memory organ (best-effort).
+    from spine.agents.facts import capture_run_facts
+
+    await capture_run_facts(result, config, final_status)
 
     return {
         "work_id": work_id,
@@ -2288,6 +2304,11 @@ async def _run_workflow_graph_inner(
     from spine.agents.experience import capture_run_experience
 
     await capture_run_experience(result, config, final_status)
+
+    # Distil durable project facts into the CAM memory organ (best-effort).
+    from spine.agents.facts import capture_run_facts
+
+    await capture_run_facts(result, config, final_status)
 
     try:
         from spine.ui.ws_bus import get_bus

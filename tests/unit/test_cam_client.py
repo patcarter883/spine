@@ -1,0 +1,182 @@
+"""CAM memory-organ client: settings resolution + fail-open transport.
+
+The /cam/* edit plane is best-effort infrastructure — every client method must
+degrade to None (CAM not loaded, unreachable host, auth rejection) rather than
+raise into the workflow. Settings resolution mirrors the rsa-field conventions
+(true = defaults, dict enabled unless enabled: false).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import httpx
+import pytest
+
+from spine.services.cam_client import (
+    CAMClient,
+    CamSettings,
+    resolve_cam_settings,
+)
+
+
+# ── settings resolution ──────────────────────────────────────────────────────
+def test_absent_or_disabled_cam_resolves_none():
+    assert resolve_cam_settings({"base_url": "http://h:1919/v1"}) is None
+    assert resolve_cam_settings({"base_url": "http://h:1919/v1", "cam": False}) is None
+    assert (
+        resolve_cam_settings(
+            {"base_url": "http://h:1919/v1", "cam": {"enabled": False}}
+        )
+        is None
+    )
+
+
+def test_cam_true_enables_with_defaults():
+    s = resolve_cam_settings({"base_url": "http://h:1919/v1", "cam": True})
+    assert s is not None
+    assert s.server_root == "http://h:1919"  # /v1 stripped
+    assert s.write == "distill"
+    assert s.read == "transparent"
+    assert s.namespace is None  # auto with no workspace root -> server default
+
+
+def test_namespace_auto_slugs_workspace_root():
+    s = resolve_cam_settings(
+        {"base_url": "http://h:1919/v1", "cam": {}},
+        workspace_root="/home/pat/Projects/My Repo",
+    )
+    assert s is not None
+    assert s.namespace == "my-repo"
+
+
+def test_explicit_namespace_and_base_url_override():
+    s = resolve_cam_settings(
+        {
+            "base_url": "http://h:1919/v1",
+            "cam": {"namespace": "teamstore", "base_url": "http://cam-host:2020"},
+        },
+        workspace_root="/x/spine",
+    )
+    assert s is not None
+    assert s.namespace == "teamstore"
+    assert s.server_root == "http://cam-host:2020"
+
+
+def test_api_token_env_indirection_fail_open(monkeypatch):
+    monkeypatch.delenv("CAM_TOK", raising=False)
+    monkeypatch.delenv("MINISGL_CAM_API_TOKEN", raising=False)
+    s = resolve_cam_settings(
+        {"base_url": "http://h:1919/v1", "cam": {"api_token": "env:CAM_TOK"}}
+    )
+    assert s is not None and s.api_token is None  # unset env never raises
+
+    monkeypatch.setenv("CAM_TOK", "sekrit")
+    s = resolve_cam_settings(
+        {"base_url": "http://h:1919/v1", "cam": {"api_token": "env:CAM_TOK"}}
+    )
+    assert s is not None and s.api_token == "sekrit"
+
+
+def test_api_token_falls_back_to_minisgl_env(monkeypatch):
+    monkeypatch.setenv("MINISGL_CAM_API_TOKEN", "from-env")
+    s = resolve_cam_settings({"base_url": "http://h:1919/v1", "cam": {}})
+    assert s is not None and s.api_token == "from-env"
+
+
+def test_unknown_write_read_modes_fall_back():
+    s = resolve_cam_settings(
+        {"base_url": "http://h:1919/v1", "cam": {"write": "yolo", "read": "psychic"}}
+    )
+    assert s is not None
+    assert s.write == "distill"
+    assert s.read == "transparent"
+
+
+# ── transport (httpx.MockTransport) ──────────────────────────────────────────
+def _client_with(handler) -> CAMClient:
+    settings = CamSettings(
+        server_root="http://h:1919", api_token="tok", namespace="proj"
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return CAMClient(settings, client=http)
+
+
+@pytest.mark.asyncio
+async def test_remember_sends_auth_and_namespace_headers():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["ns"] = request.headers.get("x-cam-namespace")
+        return httpx.Response(200, json={"stored": True, "base_p": 0.12})
+
+    out = await _client_with(handler).remember(
+        "spine default branch", "The default branch of spine is", "main"
+    )
+    assert out == {"stored": True, "base_p": 0.12}
+    assert seen["url"] == "http://h:1919/cam/remember"
+    assert seen["auth"] == "Bearer tok"
+    assert seen["ns"] == "proj"
+
+
+@pytest.mark.asyncio
+async def test_503_cam_not_loaded_is_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "CAM not loaded"})
+
+    assert await _client_with(handler).stats() is None
+
+
+@pytest.mark.asyncio
+async def test_connection_error_is_none_after_retry():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("refused")
+
+    assert await _client_with(handler).facts() is None
+    assert calls["n"] == 2  # one retry on transport errors
+
+
+@pytest.mark.asyncio
+async def test_auth_rejection_is_none_not_raise():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "invalid or missing CAM API token"})
+
+    assert await _client_with(handler).save() is None
+
+
+@pytest.mark.asyncio
+async def test_ask_extracts_text():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"text": " Tokyo."})
+
+    assert await _client_with(handler).ask("Capital of France is", "France") == " Tokyo."
+
+
+@pytest.mark.asyncio
+async def test_freeze_uses_query_param():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"frozen": True})
+
+    await _client_with(handler).freeze(True)
+    assert seen["url"] == "http://h:1919/cam/freeze?frozen=true"
+
+
+@pytest.mark.asyncio
+async def test_delete_fact_parses_deleted():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert str(request.url).endswith("/cam/facts/France")
+        return httpx.Response(200, json={"deleted": True})
+
+    assert await _client_with(handler).delete_fact("France") is True

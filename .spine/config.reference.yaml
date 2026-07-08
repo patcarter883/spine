@@ -433,6 +433,28 @@ providers:
       #          agg_max_tokens: null, temperature: 0.8, selection: auto,
       #          max_concurrency: 16, request_timeout: 1800, max_retries: 1,
       #          enabled: true }          # override only the keys you set
+      # ── CAM memory organ (minisgl cam-serving), optional ──
+      # For a minisgl server with the CAM editable memory: scopes requests to
+      # a per-project memory namespace (X-CAM-Namespace header) and pins the
+      # ambient auto-write gate per request (`cam_write` body field; True only
+      # under `write: ambient` — agent prompts are not conversational turns).
+      # Fail-open: a server without CAM ignores/503s and spine carries on.
+      # See docs/memory-organ-integration-plan.md.
+      #   cam: true                       # enabled, all defaults
+      #   cam:
+      #     enabled: true                 # dict form is enabled unless false
+      #     base_url: null                # server origin; default: provider
+      #                                   # base_url with the /v1 suffix removed
+      #     api_token: env:MINISGL_CAM_API_TOKEN  # bearer for /cam/* (optional)
+      #     namespace: auto               # auto = slug of the project root dir;
+      #                                   # or an explicit string; omit -> server default
+      #     write: distill                # off | distill (explicit edit-plane
+      #                                   # writes only) | ambient (server
+      #                                   # auto-extracts from prompts — not
+      #                                   # recommended for agent traffic)
+      #     read: transparent             # off | transparent (in-forward
+      #                                   # delivery) | facts_block | both
+      #     capacity_alert: 100           # warn threshold (store knee ~128)
 
   # ── Embedding providers ───────────────────────────────────────────────
   # Selected by the top-level `spine.embedding_provider` name. The embedding
@@ -465,7 +487,7 @@ providers:
   # directly, plus any of these inline overrides (most specific wins):
   #   base_url, api_key, temperature, max_tokens, max_completion_tokens,
   #   request_timeout, max_retries, guided_decoding, max_concurrent_calls,
-  #   stream_usage, rsa
+  #   stream_usage, rsa, cam
   #
   # Known phase keys: specify, plan, critic, exploration, implement, verify,
   #   gap_plan, classification, summarization, onboarding.

@@ -360,3 +360,55 @@ class ExperienceLesson(BaseModel):
         """
         norm = " ".join((self.dedup_basis or self.lesson or "").lower().split())
         return f"{self.phase}::{norm}"
+
+
+class ProjectFact(BaseModel):
+    """A subject→object fact written to (or attempted on) the CAM memory organ.
+
+    The CAM store itself is a delta-compressed tensor that cannot be
+    enumerated or exactly diffed — this record is the authoritative *intent
+    log* kept on spine's side (``.spine/experience/facts.jsonl``). It is what
+    makes reconciliation (was a fact evicted?), rebuild (replay after a server
+    reset), and audit possible. See docs/memory-organ-integration-plan.md §F2.2.
+    """
+
+    id: str = Field(description="Short unique id for this record")
+    work_id: str = Field(
+        default="", description="Work item the fact was distilled from ('' = manual)"
+    )
+    subject: str = Field(description="Subject key the CAM store is addressed by")
+    probe_prompt: str = Field(
+        description=(
+            "Cloze prompt eliciting the fact (e.g. 'The default branch of "
+            "spine is') — used by the write gate and as the readback probe"
+        )
+    )
+    object: str = Field(description="The short answer the memory should deliver")
+    namespace: str | None = Field(
+        default=None, description="CAM namespace the write was scoped to"
+    )
+    stored: bool = Field(
+        description=(
+            "True when the server's base-uncertainty write gate accepted the "
+            "write; False when it skipped (the base already recalls the fact)"
+        )
+    )
+    base_p: float | None = Field(
+        default=None,
+        description="Gate probe: base model's probability of the object, memory off",
+    )
+    verified: bool | None = Field(
+        default=None,
+        description="Readback probe result (/cam/ask contains the object), if run",
+    )
+    source: str = Field(
+        default="distilled", description="Provenance: distilled | manual"
+    )
+    created_at: str = Field(
+        default="", description="ISO timestamp when the write was attempted"
+    )
+
+    def dedup_key(self) -> str:
+        """Facts are one-value-per-subject (the store's own semantics)."""
+        ns = self.namespace or ""
+        return f"{ns}::{' '.join(self.subject.lower().split())}"

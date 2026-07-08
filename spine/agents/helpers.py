@@ -1277,6 +1277,34 @@ def _build_local_model(
     if rsa is not None:
         extra_body["rsa"] = rsa
 
+    # ── CAM memory organ (minisgl cam-serving) ────────────────────────
+    # When the provider is a minisgl server with the CAM editable memory
+    # (`cam:` block on the provider), scope every request to the project's
+    # memory namespace via the X-CAM-Namespace header and pin the ambient
+    # auto-write gate per request. `cam_write` is sent explicitly (True only
+    # under `write: ambient`) because spine's agent prompts are not
+    # conversational turns — server-side fact extraction from them is noise,
+    # and an explicit False overrides a server booted with
+    # MINISGL_CAM_AUTO_WRITE=1. The transparent read path is server-side and
+    # needs no request field. Edit-plane writes go through
+    # spine.services.cam_client, not this builder.
+    if provider_cfg.get("cam"):
+        from spine.services.cam_client import resolve_cam_settings
+
+        try:
+            from spine.config import SpineConfig as _SpineConfig
+
+            _cam_root = _SpineConfig.load().workspace_root
+        except Exception:  # noqa: BLE001 — namespace resolution is best-effort
+            _cam_root = None
+        cam_settings = resolve_cam_settings(provider_cfg, workspace_root=_cam_root)
+        if cam_settings is not None:
+            if cam_settings.namespace:
+                headers = dict(kwargs.get("default_headers") or {})
+                headers["X-CAM-Namespace"] = cam_settings.namespace
+                kwargs["default_headers"] = headers
+            extra_body["cam_write"] = cam_settings.write == "ambient"
+
     if extra_body:
         kwargs["extra_body"] = extra_body
 

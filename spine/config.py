@@ -1118,6 +1118,7 @@ class SpineConfig:
         "reasoning",
         "context_window",
         "rsa",
+        "cam",
     )
 
     def _resolve_model_profile(
