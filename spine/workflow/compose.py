@@ -34,6 +34,7 @@ would defeat the entire purpose of the human-review gate.
 """
 
 import logging
+import re
 from typing import Any, Callable, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -809,6 +810,48 @@ def _critic_result_mapper(reviewed_phase: str):
         # single flag so the mapper (state) and critic_router (edge) agree.
         blocker_category = effective_result.get("blocker_category")
         spec_contradiction = blocker_category == "spec_contradiction"
+
+        # Symbol existence is OWNED by the deterministic reference gate
+        # (attribute-aware since e1d7f71). An agent-tier spec_contradiction
+        # whose evidence is "symbol X does not exist / is not defined" while
+        # the gate PASSED this round is the critic re-litigating stale
+        # prior-round feedback with no ground truth — run a24d4fca parked on
+        # 'self._base is not defined' one round after the gate started
+        # resolving that exact attribute. Demote to a normal revision round;
+        # if the objection is real the gate will flag it itself next round.
+        gate_clean = not subgraph_result.get("reference_gate_result")
+        if (
+            spec_contradiction
+            and gate_clean
+            and effective_result.get("verdict_source", "agent") == "agent"
+            and re.search(
+                r"(?:does not exist|not defined|not present|not provided|"
+                r"missing (?:from|in) the codebase|not in the codebase)",
+                effective_result.get("reason", ""),
+                re.IGNORECASE,
+            )
+        ):
+            logger.warning(
+                "[%s] critic spec_contradiction demoted: evidence is symbol "
+                "non-existence but the reference gate passed this round",
+                parent_state.get("work_id", "?"),
+            )
+            spec_contradiction = False
+            blocker_category = None
+            effective_result = {
+                **effective_result,
+                "blocker_category": None,
+                "reason": effective_result.get("reason", "")
+                + " [DEMOTED: the deterministic reference gate validated every "
+                "referenced symbol this round — including instance attributes "
+                "— so the non-existence claim above is refuted. Address any "
+                "other points and drop this objection.]",
+            }
+            if phase_status == ReviewStatus.NEEDS_REVIEW.value:
+                phase_status = ReviewStatus.NEEDS_REVISION.value
+            # The un-demoted dict was already stamped into feedback above —
+            # refresh it so state carries the demotion note, not the claim.
+            base["feedback"] = [effective_result]
         stagnated = stagnation_streak >= critic_convergence.STAGNATION_LIMIT
         churning = churn_streak >= critic_convergence.CHURN_LIMIT
         retries_exhausted = (

@@ -145,6 +145,11 @@ def _build_review_prompt(
             "rewording or deleting the contradictory criterion. VERIFY will "
             "enforce every criterion literally, so an ungrounded or "
             "contradictory criterion strands the run."
+            " Symbol existence is owned by a deterministic gate that has "
+            "ALREADY validated every reference_symbol — including instance "
+            "attributes — before you run. NEVER base a verdict on a claim "
+            "that a referenced symbol, method, or attribute does not exist "
+            "in the codebase; if the gate passed it, it exists."
         )
 
     if prior_block:

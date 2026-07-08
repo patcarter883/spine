@@ -378,3 +378,68 @@ class TestGuardVerdictAttemptAccounting:
         assert base["status"] == "needs_review"
         assert base["needs_review_kind"] == "retries_exhausted"
         assert route == "needs_review"
+
+
+class TestSymbolNonexistenceDemotion:
+    """An agent-tier spec_contradiction alleging a symbol doesn't exist,
+    while the deterministic gate PASSED the round, is stale-feedback
+    re-litigation, not ground truth (run a24d4fca: 'self._base is not
+    defined' parked the run one round after the gate began resolving that
+    exact attribute). It must demote to a normal revision round.
+    """
+
+    def _contradiction(self, reason):
+        return {
+            "agent_result": {
+                "status": ReviewStatus.NEEDS_REVIEW.value,
+                "tier": "agent",
+                "reason": reason,
+                "suggestions": [],
+                "blocker_category": "spec_contradiction",
+            },
+            "phase_status": ReviewStatus.NEEDS_REVIEW.value,
+            # gate passed this round
+            "reference_gate_result": None,
+        }
+
+    def test_nonexistence_claim_with_clean_gate_demotes(self):
+        parent = {"max_retries": 5, "retry_count": {}}
+        base, state, route = _run(
+            parent,
+            self._contradiction(
+                "The plan references `self._base`, but this attribute is "
+                "not defined in the codebase and scope exclusions prevent "
+                "adding it."
+            ),
+        )
+        assert route == "needs_revision"
+        assert base["status"] == "running"
+        assert base["last_critic_review"]["blocker_category"] is None
+        assert base["last_critic_review"]["escalate"] is False
+        assert "DEMOTED" in base["feedback"][0]["reason"]
+
+    def test_contradiction_without_nonexistence_claim_still_escalates(self):
+        parent = {"max_retries": 5, "retry_count": {}}
+        base, state, route = _run(
+            parent,
+            self._contradiction(
+                "The spec's scope_exclusions forbid backend changes, but the "
+                "requirement demands a new API endpoint."
+            ),
+        )
+        assert route == "needs_review"
+        assert base["status"] == "needs_review"
+        assert base["needs_review_kind"] == "spec_amendment"
+
+    def test_nonexistence_claim_with_gate_findings_still_escalates(self):
+        # When the gate ITSELF flagged symbols this round, the claim has
+        # ground truth behind it — escalation stands.
+        parent = {"max_retries": 5, "retry_count": {}}
+        sub = self._contradiction(
+            "Symbol `Ghost.method` does not exist in the codebase and the "
+            "spec forbids creating it."
+        )
+        sub["reference_gate_result"] = {"dangling_leafs": ["method"]}
+        base, state, route = _run(parent, sub)
+        assert base["status"] == "needs_review"
+        assert base["needs_review_kind"] == "spec_amendment"
