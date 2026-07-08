@@ -992,6 +992,61 @@ async def resume_work(
     }
     all_feedback = list(prior_feedback) + [human_review_entry]
 
+    # Determine the starting phase based on action and prior state.
+    #   rework  → restart from the reviewed phase itself.
+    #   approve → continue from the phase *after* the reviewed one.
+    # Computed here — before the checkpoint is touched or the work entry is
+    # marked running — so the execution_waves preflight below can veto a
+    # doomed resume while the item is still safely 'needs_review'.
+    from spine.workflow.compose import WORKFLOW_SEQUENCES
+
+    phase_seq = WORKFLOW_SEQUENCES.get(work_type, [])
+    phase_index = 0
+    current_phase = ""
+    start_from_phase: str | None = None
+
+    reviewed_phase = saved_state.get("needs_review_phase", "") if saved_state else ""
+    if reviewed_phase:
+        for idx, (name, _) in enumerate(phase_seq):
+            if name == reviewed_phase:
+                if action == "rework":
+                    phase_index = idx
+                else:  # approve: advance past the approved phase
+                    if idx + 1 >= len(phase_seq):
+                        logger.warning(
+                            "[%s] approve resume on final phase '%s'; "
+                            "re-running it as no later phase exists",
+                            work_id,
+                            reviewed_phase,
+                        )
+                    phase_index = min(idx + 1, len(phase_seq) - 1)
+                current_phase = phase_seq[phase_index][0]
+                start_from_phase = current_phase
+                break
+
+    # Preflight: VERIFY's router raises a hard CriticalContractFailure if
+    # execution_waves is missing (spine/workflow/subgraphs/verify_subgraph.py
+    # _verify_router) — it has no soft-skip path. A resume whose checkpoint
+    # lacks execution_waves (e.g. an EARLIER resume attempt already deleted
+    # the last-good checkpoint before crashing the same way — 019f3f95,
+    # work_id 48a0bc28) would otherwise delete the checkpoint, burn a full
+    # graph invocation on a doomed run, and land back on the identical
+    # needs_review with no actionable signal. Catch it here, before anything
+    # is mutated, with a message that names the actual fix (restart, which
+    # regenerates execution_waves from PLAN instead of trusting the checkpoint).
+    _PHASES_REQUIRING_EXECUTION_WAVES = {"verify"}
+    if current_phase in _PHASES_REQUIRING_EXECUTION_WAVES and not (
+        saved_state or {}
+    ).get("execution_waves"):
+        raise RuntimeError(
+            f"Cannot resume '{work_id}' into phase '{current_phase}': the "
+            "saved checkpoint has no execution_waves (the structured slice "
+            "data PLAN produces), so verify would fail immediately. The item "
+            f"remains 'needs_review'; run `spine restart {work_id}` instead — "
+            "it regenerates execution_waves from PLAN rather than trusting "
+            "the checkpoint."
+        )
+
     # Mark the work entry as running again
     db["work_entries"].update(
         work_id,
@@ -1004,39 +1059,8 @@ async def resume_work(
 
     # ── Rebuild and re-run the workflow graph ──
     try:
-        from spine.workflow.compose import WORKFLOW_SEQUENCES, build_workflow_graph
+        from spine.workflow.compose import build_workflow_graph
         from spine.git import WorktreeSandbox
-
-        # Determine the starting phase based on action and prior state.
-        #   rework  → restart from the reviewed phase itself.
-        #   approve → continue from the phase *after* the reviewed one.
-        # This must be threaded into build_workflow_graph as start_from_phase:
-        # the graph's START edge is wired at build time, and seeding phase_index
-        # in resume_state alone does NOT move the entry point — without it an
-        # approve resume re-runs the whole sequence from the first phase.
-        phase_seq = WORKFLOW_SEQUENCES.get(work_type, [])
-        phase_index = 0
-        current_phase = ""
-        start_from_phase: str | None = None
-
-        reviewed_phase = saved_state.get("needs_review_phase", "") if saved_state else ""
-        if reviewed_phase:
-            for idx, (name, _) in enumerate(phase_seq):
-                if name == reviewed_phase:
-                    if action == "rework":
-                        phase_index = idx
-                    else:  # approve: advance past the approved phase
-                        if idx + 1 >= len(phase_seq):
-                            logger.warning(
-                                "[%s] approve resume on final phase '%s'; "
-                                "re-running it as no later phase exists",
-                                work_id,
-                                reviewed_phase,
-                            )
-                        phase_index = min(idx + 1, len(phase_seq) - 1)
-                    current_phase = phase_seq[phase_index][0]
-                    start_from_phase = current_phase
-                    break
 
         checkpointer = await checkpoint_store.get_checkpointer()
         graph = build_workflow_graph(

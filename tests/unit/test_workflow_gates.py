@@ -465,6 +465,69 @@ class TestResumeWork:
             assert seeded["execution_waves"] == saved_state["execution_waves"]
             assert seeded["plan_json"] == saved_state["plan_json"]
 
+    @pytest.mark.asyncio
+    async def test_resume_into_verify_without_execution_waves_raises_before_mutating(
+        self, monkeypatch
+    ):
+        """A checkpoint missing execution_waves (e.g. corrupted by an earlier
+        resume attempt that hit this same gap before it was fixed) must be
+        rejected BEFORE the checkpoint is deleted or the work entry is marked
+        running — otherwise resume burns a full graph run on a guaranteed
+        CriticalContractFailure and lands back on an identical needs_review
+        with no actionable signal (019f3f95, work_id 48a0bc28: this happened
+        twice in a row). The error must name `spine restart` as the fix."""
+        from spine.work.dispatcher import resume_work
+
+        mock_sandbox = MagicMock()
+        mock_sandbox.enter.return_value = SimpleNamespace(workspace_root="/tmp/sbx")
+        with patch("spine.work.dispatcher._get_work_db") as mock_db_fn, patch(
+            "spine.git.WorktreeSandbox", return_value=mock_sandbox
+        ):
+            mock_db = MagicMock()
+            mock_table = MagicMock()
+            mock_table.get.return_value = {
+                "id": "abc",
+                "status": "needs_review",
+                "work_type": "task",
+                "description": "test task",
+                "result": "",
+            }
+            mock_db.__getitem__ = lambda s, k: mock_table
+            mock_db_fn.return_value = mock_db
+
+            # No execution_waves — the exact shape of a checkpoint an earlier
+            # buggy resume already overwrote.
+            saved_state = {
+                "needs_review_phase": "verify",
+                "artifacts": {"verify": {"verification.md": "content"}},
+                "feedback": [],
+                "retry_count": {},
+            }
+
+            mock_compose = MagicMock()
+            mock_compose.WORKFLOW_SEQUENCES = {
+                "task": [("specify", None), ("plan", None), ("implement", None), ("verify", None)]
+            }
+
+            mock_cp_mod = MagicMock()
+            mock_cp = MagicMock()
+            mock_cp_mod.CheckpointStore = MagicMock(return_value=mock_cp)
+            mock_cp.get_checkpointer = AsyncMock()
+            mock_cp.get_state = AsyncMock(return_value=saved_state)
+            mock_cp.delete_state = AsyncMock(return_value=True)
+
+            monkeypatch.setitem(sys.modules, "spine.workflow.compose", mock_compose)
+            monkeypatch.setitem(
+                sys.modules, "spine.persistence.checkpoint", mock_cp_mod
+            )
+
+            with patch("spine.work.dispatcher.ArtifactStore", MagicMock()):
+                with pytest.raises(RuntimeError, match="spine restart"):
+                    await resume_work("abc", "fix it", action="rework")
+
+            mock_cp.delete_state.assert_not_called()
+            mock_table.update.assert_not_called()
+
 
 # ── Critic router tests ──
 
