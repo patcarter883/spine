@@ -138,14 +138,20 @@ providers:
     context_window: 50000              # ⚠ unverified — MiniSGL doesn't expose max_model_len
   - name: local-qwen
     type: deepagents-model
-    model: openai:Agents-A1-Q4_K_M-GGUF-Q4_K_M
-    base_url: http://localhost:8010/v1
+    # 2026-07-09 (Pat): the designated new model — Qwen3.6-35B-A3B MXFP4 on
+    # the remote 1919 endpoint (server swapped since the old GLM-AWQ warning
+    # era). 3 concurrent requests, 50K context window. Judge lanes stay on
+    # local-glm (probe 11: zero judge noise). NOTE the provider NAME is
+    # legacy — every phase lane references it, kept to avoid churn.
+    # History: Agents-A1 35B-A4B MoE → (briefly, my error) Ornith-1.0-35B.
+    model: openai:pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4
+    base_url: http://10.50.1.51:1919/v1
     api_key: vllm
     guided_decoding: true
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
-    context_window: 60000
+    max_concurrent_calls: 3
+    context_window: 50000
     # Qwen-Coder model-card sampling: curbs the repeated-survey / re-read loops
     # a tool-using agent falls into (trace 019ef2ae: one file read 89×).
     # repeat_penalty is the key anti-loop lever (llama.cpp's native name —
@@ -357,10 +363,14 @@ providers:
       provider: local-qwen
     implement/subagents/slice-implementer:
       provider: local-qwen
+    # Judge lanes stay on local GLM per Pat (probe 11: 3/4 slices verified,
+    # zero judge noise — judge quality was the binding constraint). GLM is
+    # local @8010; everything else runs on the remote Qwen, so the two never
+    # contend for the same server.
     verify:
-      provider: local-qwen
+      provider: local-glm
     verify/subagents/slice-verifier:
-      provider: local-qwen
+      provider: local-glm
     classification:
       provider: local-qwen
       max_completion_tokens: 2048

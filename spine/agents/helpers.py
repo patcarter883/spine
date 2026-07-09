@@ -421,7 +421,16 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
         if model_name:
             method = _openrouter_structured_method(model_name)
             return _SelfHealingStructured(model, schema, method)
-    return model.with_structured_output(schema, method="json_schema")
+    # Providers can pin a method via `structured_method` in config (seeded
+    # into the cache by _build_local_model). Thinking models whose serve
+    # applies the json_schema grammar from the first token never get to
+    # reason: the grammar suppresses the thinking phase and the model emits
+    # truncated or CoT-polluted JSON with finish_reason=stop. The same serve
+    # handles a forced named tool call correctly (reasoning routed to
+    # reasoning_content, arguments schema-clean), so such providers set
+    # `structured_method: function_calling`.
+    method = _structured_method_cache.get(_extract_model_name(model), "json_schema")
+    return model.with_structured_output(schema, method=method)
 
 
 # Structured-output methods in order of preference. Demotion on a routing
@@ -1030,6 +1039,24 @@ def _build_local_model(
     from langchain_openai import ChatOpenAI
 
     model_name = model_spec.removeprefix("openai:")
+
+    # ── Per-provider structured-output method pin ─────────────────────
+    # `structured_method: function_calling` steers bind_structured_output
+    # away from response_format json_schema for every schema bound to this
+    # model. Needed when the backend composes guided decoding and reasoning
+    # badly: the grammar clamps from token 0, the thinking phase never runs,
+    # and structured replies come back truncated mid-string or with
+    # chain-of-thought leaked into the JSON fields. Seeded here (build time
+    # is the only point that sees provider config) and consumed in
+    # bind_structured_output via the shared method cache.
+    structured_method = provider_cfg.get("structured_method")
+    if structured_method:
+        if structured_method not in _STRUCTURED_METHOD_LADDER:
+            raise ValueError(
+                "structured_method must be one of "
+                f"{_STRUCTURED_METHOD_LADDER}, got {structured_method!r}"
+            )
+        _structured_method_cache[_extract_model_name(model_name)] = structured_method
 
     kwargs: dict[str, Any] = {
         "model": model_name,

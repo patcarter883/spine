@@ -1110,6 +1110,7 @@ class SpineConfig:
         "stream_chunk_timeout",
         "max_retries",
         "guided_decoding",
+        "structured_method",
         "max_concurrent_calls",
         "stream_usage",
         "reasoning",
