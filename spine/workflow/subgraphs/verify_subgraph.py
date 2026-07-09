@@ -343,8 +343,15 @@ def _custom_check_specs() -> list[dict]:
         return []
 
 
+def _is_test_path(f: str) -> bool:
+    """Test-shaped path: under a tests root or a test_-prefixed filename."""
+    return Path(f).name.startswith("test_") or f.split("/", 1)[0] == "tests"
+
+
 def _automated_checks(
-    workspace_root: str, target_files: list[str] | None
+    workspace_root: str,
+    target_files: list[str] | None,
+    feature_test_files: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Run deterministic checks over changed files as verifier evidence.
 
@@ -529,6 +536,54 @@ def _automated_checks(
         if rc != 0 and spec.get("hard", True):
             hard_failures.append(
                 f"{name} failed (exit {rc}): " + _clip_tail(out, 600)
+            )
+
+    # Feature-wide test evidence (ADVISORY). A slice's defect often only
+    # surfaces when the FEATURE's tests run: probe 12 (ed2c9f85) verified
+    # the migration slice clean while its TypeError exploded in the test
+    # slice's pest run — the gap landed on the wrong slice and the fix loop
+    # would have reworked correct test code. Run the sibling slices' test
+    # files as evidence for THIS slice too, advisory rather than hard: the
+    # judge attributes failures ('migration TypeError at line 15' → the
+    # migration slice's criterion fails), while a merely-broken sibling
+    # test file cannot hard-fail an implementation slice.
+    own = set(target_files or [])
+    sibling_tests = [
+        f for f in (feature_test_files or [])
+        if f not in own and (Path(workspace_root) / f).exists()
+    ]
+    if sibling_tests:
+        py_sibs = [f for f in sibling_tests if f.endswith(".py")]
+        if py_sibs:
+            rc, out = _run(
+                [sys.executable, "-m", "pytest", "-q", "--no-header", *py_sibs]
+            )
+            sections.append(
+                f"$ [feature tests — ADVISORY: attribute any failure to the "
+                f"slice whose FILES cause it] pytest -q {' '.join(py_sibs)}\n"
+                + ("OK — the feature's tests pass." if rc == 0
+                   else _clip_tail(out, 3000) or f"exit {rc}")
+            )
+        for spec in _custom_check_specs():
+            patterns = spec.get("files") or []
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            matched = [
+                f for f in sibling_tests
+                if any(fnmatch.fnmatch(f, p) for p in patterns)
+            ]
+            if not matched:
+                continue
+            name = str(spec.get("name") or "custom_check")
+            command = str(spec["command"]).replace(
+                "{files}", " ".join(shlex.quote(f) for f in matched)
+            )
+            rc, out = _run_shell(command, int(spec.get("timeout_seconds", 300)))
+            sections.append(
+                f"$ [feature tests via {name} — ADVISORY: attribute any "
+                f"failure to the slice whose FILES cause it] {command}\n"
+                + ("OK — the feature's tests pass." if rc == 0
+                   else _clip_tail(out, 3000) or f"exit {rc}")
             )
 
     if not sections:
@@ -728,9 +783,23 @@ async def _run_slice_verifier_node(
         from spine.config import SpineConfig
 
         judge_mode = SpineConfig.load().verify_evidence_then_judge
+        # The feature's test files (from every slice's target_files) run as
+        # ADVISORY evidence for this slice — a migration/model defect often
+        # only surfaces in the sibling test slice's run (probe 12).
+        feature_tests = [
+            f
+            for wave in (state.get("execution_waves") or [])
+            if isinstance(wave, list)
+            for sl in wave
+            if isinstance(sl, dict)
+            for f in (sl.get("target_files") or [])
+            if f and _is_test_path(f)
+        ]
         checks_block, checks_failures = (
             _automated_checks(
-                state.get("workspace_root", "."), slice_data.get("target_files")
+                state.get("workspace_root", "."),
+                slice_data.get("target_files"),
+                feature_test_files=feature_tests,
             )
             if judge_mode
             else ("", [])
