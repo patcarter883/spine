@@ -681,6 +681,50 @@ def _contract_block(stub: SliceStub, all_stubs: list[SliceStub]) -> str:
     )
 
 
+_REF_SOURCE_MAX_SYMBOLS = 3
+_REF_SOURCE_MAX_CHARS = 3000
+
+
+def _reference_source_block(stub: SliceStub) -> str:
+    """Bounded CURRENT source of the stub's reference symbols, or ''.
+
+    Acceptance criteria keep embedding framework falsehoods when the author
+    writes them from memory: runs 984f9c8e and e4f4941d both demanded
+    ``$keyType = 'uuid'`` on a Laravel model — invalid; uuid keys use
+    ``$keyType = 'string'``, exactly what the repo's own Farm.php (the
+    stub's declared reference) does. The worker never SAW Farm.php. Inline
+    the reference symbols' real source so criteria are authored against
+    ground truth, the same cure as the editor's sibling-test exemplar.
+    """
+    try:
+        from spine.config import SpineConfig
+        from spine.agents.tools.codebase_query import get_symbol_source
+
+        db_path = SpineConfig.load().checkpoint_path
+    except Exception:  # noqa: BLE001 — no index ⇒ no exemplars
+        return ""
+    blocks: list[str] = []
+    budget = _REF_SOURCE_MAX_CHARS
+    for sym in (stub.reference_symbols or [])[:_REF_SOURCE_MAX_SYMBOLS]:
+        if budget <= 0:
+            break
+        try:
+            src = get_symbol_source(db_path, "", sym)
+        except Exception:  # noqa: BLE001
+            continue
+        if not src:
+            continue
+        src = src[: min(budget, 1500)]
+        budget -= len(src)
+        blocks.append(f"### `{sym}` (CURRENT source — criteria must fit it)\n```\n{src}\n```")
+    if not blocks:
+        return ""
+    return (
+        "\n\nCURRENT SOURCE of this slice's reference symbols — author "
+        "criteria consistent with these real conventions:\n" + "\n\n".join(blocks)
+    )
+
+
 async def _run_slice_worker(
     stub: SliceStub,
     all_stubs: list[SliceStub],
@@ -705,12 +749,13 @@ async def _run_slice_worker(
     contract = _contract_block(stub, all_stubs)
     if contract:
         constraints += "\n\n" + contract
+    exemplars = _reference_source_block(stub)
     human = hostage_layout(
         xml_blocks(
             (Tag.OBJECTIVE, f"YOUR slice (detail ONLY this one):\n```json\n{stub_json}\n```"),
             (Tag.CONSTRAINTS, constraints),
             (Tag.SPECIFICATION, spec_md.strip()[:6000]),
-            (Tag.FINDINGS, research or "(no research context)"),
+            (Tag.FINDINGS, (research or "(no research context)") + exemplars),
         ),
         f"Return a SliceDetail for slice '{stub.id}': execution_requirements + "
         f"acceptance_criteria for ONLY the changes to {', '.join(stub.target_files) or 'its target_files'}. "
