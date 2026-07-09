@@ -1223,7 +1223,16 @@ def _build_local_model(
     # per-chunk watchdog and can't yield meaningfully anyway. Force the
     # non-streaming completions endpoint for active RSA — token usage still
     # rides on the final response, so accounting is intact.
-    if rsa_active:
+    # Providers can also opt out explicitly with ``streaming: false`` — for
+    # backends whose tool-call parser only runs on the COMPLETE response
+    # (mini-sglang: streamed replies leak raw <tool_call>/<function=...>
+    # markup into content deltas and never emit tool_calls, so every
+    # tool-bound call and function_calling structured output silently
+    # returns no calls — probe 13, run eb0aacc8). Non-streaming trades
+    # token-level stall detection for a working tool parser; the HTTP
+    # request_timeout still bounds silent hangs, and the dispatcher stall
+    # window must cover the longest single generation (SPINE_STALL_TIMEOUT).
+    if rsa_active or provider_cfg.get("streaming") is False:
         kwargs["streaming"] = False
     else:
         kwargs.setdefault("streaming", True)
@@ -1237,7 +1246,11 @@ def _build_local_model(
     # providers.llm[].stream_usage: false for that provider. Skipped for active
     # RSA — the call is non-streaming, so stream_options would be inert (or
     # rejected) and usage already arrives on the non-streamed response.
-    if not rsa_active and provider_cfg.get("stream_usage") is not False:
+    if (
+        not rsa_active
+        and kwargs.get("streaming") is not False
+        and provider_cfg.get("stream_usage") is not False
+    ):
         kwargs.setdefault("stream_usage", True)
 
     _apply_concurrency_cap(kwargs, provider_cfg)
