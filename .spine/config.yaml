@@ -151,9 +151,19 @@ providers:
     # This serve composes json_schema + reasoning badly: the grammar clamps
     # from token 0, the thinking phase never runs, and structured replies
     # arrive truncated mid-string or with CoT leaked into JSON fields
-    # (probe 13, run ceb08d51). A forced named tool call works perfectly
-    # (reasoning → reasoning_content, args schema-clean), so pin it.
+    # (probe 13, run ceb08d51). Pat's serve fix (2026-07-09) stopped the
+    # truncation, but the grammar still suppresses the thinking phase
+    # (reasoning_content empty) — a forced named tool call is the one path
+    # where the model reasons first AND returns schema-clean args, so keep it.
     structured_method: function_calling
+    # mini-sglang parses tool calls only on the COMPLETE response: streamed
+    # replies leak raw <function=...> markup into content and never emit
+    # tool_calls deltas (probe 13 attempt 2, run eb0aacc8) — every agent-loop
+    # tool call silently dies. Non-streaming is required; request_timeout
+    # bounds hangs instead of the per-chunk watchdog, sized for a full
+    # 25K-token thinking generation. Run with SPINE_STALL_TIMEOUT ≥ 900.
+    streaming: false
+    request_timeout: 600
     enabled: true
     stream_usage: true
     max_concurrent_calls: 3
