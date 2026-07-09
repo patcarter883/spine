@@ -167,6 +167,33 @@ def test_local_rsa_dict_enabled_false_keeps_streaming(monkeypatch):
     assert captured.get("streaming") is True
 
 
+def test_local_streaming_false_opts_out(monkeypatch):
+    """`streaming: false` in provider config forces the non-streaming endpoint.
+
+    Needed for backends whose tool-call parser only runs on the complete
+    response (mini-sglang): streamed replies leak raw tool-call markup into
+    content and never emit tool_calls (probe 13, run eb0aacc8).
+    """
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Remote",
+        {"base_url": "http://10.50.1.51:1919/v1", "streaming": False},
+    )
+    assert captured.get("streaming") is False
+    # Non-streaming: usage arrives on the response body, stream_options inert.
+    assert "stream_usage" not in captured
+
+
+def test_local_streaming_unset_defaults_on(monkeypatch):
+    """Without the key, streaming stays on (stall-detector default)."""
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local", {"base_url": "http://localhost:8010/v1"}
+    )
+    assert captured.get("streaming") is True
+    assert captured.get("stream_usage") is True
+
+
 def _capture_init_chat_model(monkeypatch):
     captured: dict = {}
 

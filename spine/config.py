@@ -1111,6 +1111,7 @@ class SpineConfig:
         "max_retries",
         "guided_decoding",
         "structured_method",
+        "streaming",
         "max_concurrent_calls",
         "stream_usage",
         "reasoning",
