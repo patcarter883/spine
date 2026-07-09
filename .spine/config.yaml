@@ -148,6 +148,12 @@ providers:
     base_url: http://10.50.1.51:1919/v1
     api_key: vllm
     guided_decoding: true
+    # This serve composes json_schema + reasoning badly: the grammar clamps
+    # from token 0, the thinking phase never runs, and structured replies
+    # arrive truncated mid-string or with CoT leaked into JSON fields
+    # (probe 13, run ceb08d51). A forced named tool call works perfectly
+    # (reasoning → reasoning_content, args schema-clean), so pin it.
+    structured_method: function_calling
     enabled: true
     stream_usage: true
     max_concurrent_calls: 3
