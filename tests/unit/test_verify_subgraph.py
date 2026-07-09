@@ -616,3 +616,49 @@ class TestCustomVerifyChecks:
         (ws / "x.php").write_text("<?php\n", encoding="utf-8")
         block, failures = _automated_checks(str(ws), ["x.php"])
         assert block == "" and failures == []
+
+
+class TestPsr4Evidence:
+    """PSR-4 ground truth as judge evidence (probe 9: the judge disputed a
+    compliant namespace, demanding an invented one)."""
+
+    def _ws(self, tmp_path):
+        import json as _json
+
+        (tmp_path / "composer.json").write_text(_json.dumps({
+            "autoload": {"psr-4": {"Database\\Factories\\": "database/factories/"}},
+        }), encoding="utf-8")
+        d = tmp_path / "database" / "factories"
+        d.mkdir(parents=True)
+        return d
+
+    def test_compliant_namespace_shows_ok(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)  # no spine-gate.yaml → no custom checks
+        d = self._ws(tmp_path)
+        (d / "XFactory.php").write_text(
+            "<?php\n\nnamespace Database\\Factories;\n\nclass XFactory {}\n",
+            encoding="utf-8",
+        )
+        block, failures = _automated_checks(
+            str(tmp_path), ["database/factories/XFactory.php"]
+        )
+        assert "$ [psr4]" in block
+        assert "OK database/factories/XFactory.php" in block
+        assert failures == []
+
+    def test_mismatch_is_a_hard_failure(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)
+        d = self._ws(tmp_path)
+        (d / "YFactory.php").write_text(
+            "<?php\n\nnamespace App\\Wrong;\n\nclass YFactory {}\n",
+            encoding="utf-8",
+        )
+        block, failures = _automated_checks(
+            str(tmp_path), ["database/factories/YFactory.php"]
+        )
+        assert "MISMATCH" in block
+        assert failures and "PSR-4 namespace mismatch" in failures[0]

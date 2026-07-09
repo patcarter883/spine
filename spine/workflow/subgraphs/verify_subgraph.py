@@ -448,6 +448,56 @@ def _automated_checks(
                     + _clip_tail(pytest_out, 600)
                 )
 
+    # PHP: PSR-4 ground truth as evidence. The judge hallucinated a wrong
+    # "correct" namespace against a PSR-4-compliant file (probe 9: flagged
+    # Database\Factories — exactly what composer.json dictates for
+    # database/factories/ — demanding App\Database\Factories). Print the
+    # expectation per changed file so the judge anchors on computed truth,
+    # and make a real mismatch (one the write-exit repair could not fix) a
+    # hard failure.
+    php_files = [f for f in existing_files if f.endswith(".php")]
+    if php_files:
+        try:
+            from spine.agents.tools.read_edit_lint import (
+                _psr4_map,
+                _psr4_namespace_for,
+            )
+            import re as _re
+
+            psr4 = _psr4_map(workspace_root)
+        except Exception:  # noqa: BLE001 — evidence is best-effort
+            psr4 = {}
+        if psr4:
+            lines: list[str] = []
+            for f in php_files:
+                expected = _psr4_namespace_for(f, psr4)
+                if not expected:
+                    continue
+                try:
+                    src = (Path(workspace_root) / f).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                m = _re.search(
+                    r"^namespace\s+([A-Za-z0-9_\\]+)\s*;", src, _re.MULTILINE
+                )
+                declared = m.group(1) if m else "(none)"
+                ok = declared == expected
+                lines.append(
+                    f"{'OK ' if ok else 'MISMATCH '}{f}: declared "
+                    f"`{declared}` — PSR-4 (composer.json) dictates `{expected}`"
+                )
+                if not ok:
+                    hard_failures.append(
+                        f"PSR-4 namespace mismatch in {f}: declared "
+                        f"{declared!r}, composer.json dictates {expected!r}"
+                    )
+            if lines:
+                sections.append(
+                    "$ [psr4] namespace ground truth (computed from "
+                    "composer.json autoload maps — these ARE the correct "
+                    "namespaces; do not dispute them):\n" + "\n".join(lines)
+                )
+
     # Project-declared checks (spine-gate.yaml verify_checks) — how non-Python
     # stacks get executed evidence in front of the judge. Same lesson as the
     # Python path: without real check output, PHP/TS slices would be judged
