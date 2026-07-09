@@ -449,3 +449,32 @@ class TestSiblingTestExemplar:
         )
         out = impl._target_files_body(["tests/test_new.py"], str(tmp_path))
         assert "EXISTING PASSING test" not in out
+
+    def test_non_test_new_file_gets_same_directory_exemplar(self, tmp_path):
+        # Run 3313775a: a new Laravel factory declared `static $model` three
+        # identical gap cycles running while sibling factories showed the
+        # correct shape — non-test files now get a same-directory exemplar.
+        from spine.workflow.subgraphs import implement_subgraph as impl
+
+        d = tmp_path / "database" / "factories"
+        d.mkdir(parents=True)
+        (d / "ExistingFactory.php").write_text(
+            "<?php\nclass ExistingFactory extends Factory {\n"
+            "    protected $model = Existing::class;\n}\n",
+            encoding="utf-8",
+        )
+        out = impl._target_files_body(
+            ["database/factories/NewFactory.php"], str(tmp_path)
+        )
+        assert "EXISTING file from this directory" in out
+        assert "protected $model" in out
+
+    def test_non_test_exemplar_stays_in_its_directory(self, tmp_path):
+        # No cross-directory bleed: a new file in an empty dir gets nothing.
+        from spine.workflow.subgraphs import implement_subgraph as impl
+
+        (tmp_path / "app").mkdir()
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "Thing.php").write_text("<?php\n", encoding="utf-8")
+        out = impl._target_files_body(["app/New.php"], str(tmp_path))
+        assert "EXISTING file" not in out

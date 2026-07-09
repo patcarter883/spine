@@ -668,32 +668,45 @@ def _looks_like_test_file(rel: str) -> bool:
     )
 
 
-def _test_exemplar_block(root, rel: str) -> str:
-    """An EXISTING sibling test inlined as a style exemplar, or ''.
+def _sibling_exemplar_block(root, rel: str) -> str:
+    """An EXISTING sibling file inlined as a style exemplar, or ''.
 
-    When a slice CREATES a test file, the editor has nothing concrete to
-    imitate and local models hallucinate the framework's API — run 984f9c8e
+    When a slice CREATES a file, the editor has nothing concrete to imitate
+    and local models hallucinate framework API shapes — run 984f9c8e
     invented `use Pest\\Pest; Pest::test(...)` (Pest tests are global
-    ``test()`` calls) and the gap loop could not talk it out of the shape.
-    The repo's own passing tests are the ground truth for test style;
-    inline the nearest same-suffix sibling (smallest first — the most
-    readable exemplar), bounded. Language-agnostic: works for pytest,
-    Pest, and vitest/jest suites alike.
+    ``test()`` calls); run 3313775a declared ``static $model`` on a Laravel
+    factory (fatal redeclaration against the parent class) three identical
+    gap cycles running, with sibling factories showing the correct shape
+    two files away. The repo's own files are the ground truth for style:
+    inline the smallest non-empty same-suffix sibling, bounded. Test files
+    search up the whole test root; other files stay in their own directory
+    (a factory mimics a factory, a migration a migration).
     """
     target = root / rel
     suffix = target.suffix
     if not suffix:
         return ""
-    for directory in [target.parent, *target.parent.parents]:
+    is_test = _looks_like_test_file(rel)
+    directories = (
+        [target.parent, *target.parent.parents] if is_test else [target.parent]
+    )
+    for directory in directories:
         try:
             if not directory.is_dir() or not directory.is_relative_to(root):
                 break
+            pool = (
+                directory.rglob(f"*{suffix}") if is_test
+                else directory.glob(f"*{suffix}")
+            )
             candidates = sorted(
                 (
-                    f for f in directory.rglob(f"*{suffix}")
+                    f for f in pool
                     if f.is_file()
                     and f != target
-                    and _looks_like_test_file(str(f.relative_to(root)))
+                    and (
+                        not is_test
+                        or _looks_like_test_file(str(f.relative_to(root)))
+                    )
                 ),
                 key=lambda f: f.stat().st_size,
             )
@@ -709,12 +722,16 @@ def _test_exemplar_block(root, rel: str) -> str:
                 continue
             if not text.strip():
                 continue
+            kind = (
+                "PASSING test from this suite" if is_test
+                else "file from this directory"
+            )
             return (
-                f"\nAn EXISTING PASSING test from this suite — mimic its "
-                f"imports, structure, and framework idioms EXACTLY "
+                f"\nAn EXISTING {kind} — mimic its imports, structure, and "
+                f"framework idioms EXACTLY "
                 f"(`{cand.relative_to(root)}`):\n```\n{text}\n```"
             )
-        if directory.name in _TEST_PATH_SEGMENTS:
+        if is_test and directory.name in _TEST_PATH_SEGMENTS:
             break  # searched the whole test root — stop walking up
     return ""
 
@@ -749,9 +766,7 @@ def _target_files_body(target_files: list[str], workspace_root: str) -> str:
         try:
             text = (root / rel).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            exemplar = (
-                _test_exemplar_block(root, rel) if _looks_like_test_file(rel) else ""
-            )
+            exemplar = _sibling_exemplar_block(root, rel)
             blocks.append(
                 f"### `{rel}`\n(does not exist yet — this slice creates it; "
                 f"synthesize the new file's full content)" + exemplar
