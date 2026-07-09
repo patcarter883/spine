@@ -622,6 +622,35 @@ def _retryable_api_error(exc: BaseException) -> bool:
     return True
 
 
+# Prompt-crowding telemetry: every inlined block (target files, reference
+# source, exemplars, gap fixes, checks output) is individually capped, but no
+# assembly point asserts the SUM — overflow currently degrades silently into
+# a squeezed completion caught by the truncation guards. Warn when any
+# one-shot prompt crosses ~70% of the smallest live window (60K) so stacking
+# creep shows up in logs before it shows up as guards firing.
+_PROMPT_WARN_TOKENS = int(os.environ.get("SPINE_PROMPT_WARN_TOKENS", "42000"))
+
+
+def warn_if_prompt_crowds_window(messages: list[Any], *, label: str) -> int:
+    """Log a warning when *messages* approach the context window; returns
+    the estimated prompt tokens (0 on any estimation failure — fail-open)."""
+    try:
+        from spine.agents._tokens import count_tokens
+
+        est = sum(
+            count_tokens(str(getattr(m, "content", m))) for m in messages
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break a call
+        return 0
+    if est >= _PROMPT_WARN_TOKENS:
+        logger.warning(
+            "prompt-crowding: %s prompt≈%d tok ≥ warn threshold %d — "
+            "inlined blocks may be stacking toward the context window",
+            label, est, _PROMPT_WARN_TOKENS,
+        )
+    return est
+
+
 async def ainvoke_structured_with_retry(
     structured_model: Any,
     messages: list[Any],
@@ -665,6 +694,7 @@ async def ainvoke_structured_with_retry(
     Returns:
         Whatever ``structured_model.ainvoke`` returns on the first success.
     """
+    warn_if_prompt_crowds_window(messages, label=label)
     nudge = HumanMessage(
         content=(
             "Your previous response was empty. Respond with ONLY the JSON "
