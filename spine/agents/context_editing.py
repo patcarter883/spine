@@ -948,6 +948,21 @@ class DynamicCompletionCapMiddleware(AgentMiddleware):
         prompt_tokens = _estimate_message_tokens(messages)
         prompt_tokens += _estimate_tools_tokens(getattr(request, "tools", None))
 
+        # Same crowding telemetry as the one-shot structured calls
+        # (helpers.warn_if_prompt_crowds_window): surface stacking creep in
+        # logs before it degrades into squeezed completions.
+        try:
+            from spine.agents.helpers import _PROMPT_WARN_TOKENS
+
+            if prompt_tokens >= _PROMPT_WARN_TOKENS:
+                logger.warning(
+                    "prompt-crowding: agent turn prompt≈%d tok (incl tools) "
+                    "≥ warn threshold %d (window %d)",
+                    prompt_tokens, _PROMPT_WARN_TOKENS, self.window,
+                )
+        except Exception:  # noqa: BLE001 — telemetry must never break a call
+            pass
+
         current = self._bound_cap(request.model)
         # When the model is uncapped, the window itself is the ceiling.
         base_cap = current if current else self.window
