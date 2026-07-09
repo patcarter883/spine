@@ -1011,6 +1011,34 @@ def _expand_env_ref(value: Any) -> Any:
     return value
 
 
+def _flatten_text_block_content(payload: dict[str, Any]) -> dict[str, Any]:
+    """Flatten all-text content-block lists to plain strings, in place.
+
+    Middleware (prompt caching, memory injection) can rewrite a message's
+    content from a string to the OpenAI array-of-parts form
+    (``[{"type": "text", "text": ...}, ...]``). Minimal local backends
+    (mini-sglang) 422 on that form with "Input should be a valid string"
+    (probe 17, run a3f963b9: the plan critic died on it). Text-only block
+    lists carry no information a joined string doesn't — non-text parts
+    (images) are left untouched so a genuinely multimodal request still
+    fails loudly rather than silently dropping content.
+    """
+    for msg in payload.get("messages", []):
+        content = msg.get("content")
+        if (
+            isinstance(content, list)
+            and content
+            and all(
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                for part in content
+            )
+        ):
+            msg["content"] = "\n".join(part["text"] for part in content)
+    return payload
+
+
 def _build_local_model(
     model_spec: str,
     provider_cfg: dict[str, Any],
@@ -1255,7 +1283,15 @@ def _build_local_model(
 
     _apply_concurrency_cap(kwargs, provider_cfg)
 
-    return ChatOpenAI(**kwargs)
+    class _LocalChatOpenAI(ChatOpenAI):
+        """ChatOpenAI speaking the most compatible dialect to local servers."""
+
+        def _get_request_payload(self, input_: Any, *, stop: Any = None, **kw: Any) -> dict:
+            return _flatten_text_block_content(
+                super()._get_request_payload(input_, stop=stop, **kw)
+            )
+
+    return _LocalChatOpenAI(**kwargs)
 
 
 def _apply_concurrency_cap(

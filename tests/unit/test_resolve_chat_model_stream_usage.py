@@ -194,6 +194,58 @@ def test_local_streaming_unset_defaults_on(monkeypatch):
     assert captured.get("stream_usage") is True
 
 
+class TestFlattenTextBlockContent:
+    """Local models flatten all-text content-block lists to plain strings.
+
+    Middleware can rewrite message content into the OpenAI array-of-parts
+    form; minimal local backends (mini-sglang) 422 on it (probe 17, run
+    a3f963b9 — the plan critic died with "Input should be a valid string").
+    """
+
+    def test_all_text_blocks_joined(self):
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "You are a reviewer."},
+                        {
+                            "type": "text",
+                            "text": "Static prefix.",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
+                {"role": "user", "content": "plain string untouched"},
+            ]
+        }
+        out = helpers._flatten_text_block_content(payload)
+        assert out["messages"][0]["content"] == "You are a reviewer.\nStatic prefix."
+        assert out["messages"][1]["content"] == "plain string untouched"
+
+    def test_non_text_parts_left_alone(self):
+        blocks = [
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+        ]
+        payload = {"messages": [{"role": "user", "content": list(blocks)}]}
+        out = helpers._flatten_text_block_content(payload)
+        assert out["messages"][0]["content"] == blocks
+
+    def test_built_local_model_flattens_at_the_wire(self):
+        """The built model's request payload flattens block content end-to-end."""
+        from langchain_core.messages import SystemMessage
+
+        model = helpers._build_local_model(
+            "openai:Qwen-Remote",
+            {"base_url": "http://10.50.1.51:1919/v1", "api_key": "vllm"},
+        )
+        payload = model._get_request_payload(
+            [SystemMessage(content=[{"type": "text", "text": "hello"}])]
+        )
+        assert payload["messages"][0]["content"] == "hello"
+
+
 def _capture_init_chat_model(monkeypatch):
     captured: dict = {}
 
