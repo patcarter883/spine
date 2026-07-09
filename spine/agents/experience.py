@@ -362,6 +362,37 @@ async def generalize_lessons(
         return lessons
 
 
+def _run_specific_markers(result: dict[str, Any]) -> set[str]:
+    """Concrete identifiers belonging to THIS run's plan.
+
+    The generalisation pass is *instructed* to strip run-specific
+    identifiers, but the local model lets them through: the agripath clone's
+    store accumulated 'lessons' literally prescribing UnitOfMeasure-specific
+    factory criteria, injected into every later plan as noise. A lesson that
+    still names one of this run's slice ids, provides symbols, or target
+    file stems is not a generalised rule — reject it mechanically.
+    """
+    markers: set[str] = set()
+    for wave in result.get("execution_waves") or []:
+        if not isinstance(wave, list):
+            continue
+        for sl in wave:
+            if not isinstance(sl, dict):
+                continue
+            sid = sl.get("id")
+            if sid:
+                markers.add(str(sid))
+            for p in sl.get("provides") or []:
+                leaf = str(p).split("(")[0].rsplit(".", 1)[-1].strip()
+                if len(leaf) >= 4:
+                    markers.add(leaf)
+            for f in sl.get("target_files") or []:
+                stem = Path(str(f)).stem
+                if len(stem) >= 4:
+                    markers.add(stem)
+    return markers
+
+
 async def capture_run_experience(
     result: dict[str, Any],
     config: Any,
@@ -383,6 +414,21 @@ async def capture_run_experience(
             return 0
         if getattr(config, "experience_generalize", True):
             lessons = await generalize_lessons(lessons, config)
+            if not lessons:
+                return 0
+        markers = _run_specific_markers(result)
+        if markers:
+            kept = [
+                le for le in lessons
+                if not any(m in le.lesson for m in markers)
+            ]
+            if len(kept) < len(lessons):
+                logger.info(
+                    "[%s] dropped %d ungeneralised lesson(s) naming this "
+                    "run's own identifiers",
+                    result.get("work_id", "?"), len(lessons) - len(kept),
+                )
+            lessons = kept
             if not lessons:
                 return 0
         added = experience_store_for(config).add_many(lessons)

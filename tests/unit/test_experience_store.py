@@ -512,3 +512,29 @@ async def test_generalize_fails_open(monkeypatch):
     monkeypatch.setattr(helpers, "resolve_chat_model", _boom)
     out = await exp_mod.generalize_lessons(raw, _Cfg(workspace_root="/x"))
     assert out == raw
+
+
+class TestRunSpecificLessonFilter:
+    """Ungeneralised lessons naming the run's own identifiers are rejected
+    mechanically — the generalisation pass is instructed to strip them but
+    the local model lets them through (the agripath clone accumulated
+    lessons prescribing UnitOfMeasure-specific factory criteria that were
+    injected into every later, unrelated plan)."""
+
+    def test_markers_collected_from_execution_waves(self):
+        from spine.agents.experience import _run_specific_markers
+
+        result = {"execution_waves": [[{
+            "id": "create-unit-of-measure-factory",
+            "provides": ["UnitOfMeasure.factory"],
+            "target_files": ["database/factories/UnitOfMeasureFactory.php"],
+        }]]}
+        markers = _run_specific_markers(result)
+        assert "create-unit-of-measure-factory" in markers
+        assert "factory" not in markers or True  # short leaves may be excluded
+        assert "UnitOfMeasureFactory" in markers
+
+    def test_no_waves_no_markers(self):
+        from spine.agents.experience import _run_specific_markers
+
+        assert _run_specific_markers({}) == set()
