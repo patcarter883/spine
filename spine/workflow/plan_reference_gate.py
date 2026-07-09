@@ -254,6 +254,15 @@ def check_reference_symbols(
                 continue
             if leaf in provided_leafs:
                 continue  # cross-slice contract — synthesis validation owns it
+            # A bare unqualified identifier that matches neither the index
+            # nor any slice's provides carries no owner context — it is a
+            # research artifact (a builder method like 'foreignUuid' /
+            # 'constrained', run 0b969459), not a checkable contract. The
+            # cross-slice contract layer (repair_and_validate_contracts)
+            # still compares bare names against provides, and executed
+            # verify evidence owns actual correctness.
+            if "." not in ref and "\\" not in ref:
+                continue
             dangling.append(
                 {
                     "slice": sid,
