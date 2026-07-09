@@ -662,3 +662,50 @@ class TestPsr4Evidence:
         )
         assert "MISMATCH" in block
         assert failures and "PSR-4 namespace mismatch" in failures[0]
+
+
+class TestFeatureWideTestEvidence:
+    """Sibling slices' tests run as ADVISORY evidence (probe 12/ed2c9f85:
+    the migration slice verified clean while its TypeError only surfaced in
+    the test slice's run — the gap landed on the wrong slice)."""
+
+    def test_sibling_test_failure_is_advisory_not_hard(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)  # no gate file → no custom checks
+        ws = tmp_path / "ws"
+        (ws / "app").mkdir(parents=True)
+        (ws / "tests").mkdir()
+        (ws / "app" / "mod.py").write_text("BROKEN = 1/0\n", encoding="utf-8")
+        (ws / "tests" / "test_feature.py").write_text(
+            "import sys; sys.path.insert(0, 'app')\n"
+            "def test_mod():\n    import mod\n    assert mod.BROKEN\n",
+            encoding="utf-8",
+        )
+        # Verifying the NON-test slice (app/mod.py): the sibling test run
+        # shows the failure, but only as advisory evidence.
+        block, failures = _automated_checks(
+            str(ws), ["app/mod.py"],
+            feature_test_files=["tests/test_feature.py"],
+        )
+        assert "feature tests" in block and "ADVISORY" in block
+        assert "ZeroDivisionError" in block
+        assert not any("feature" in f for f in failures)
+
+    def test_own_test_files_are_not_double_run(self, tmp_path, monkeypatch):
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)
+        ws = tmp_path / "ws"
+        (ws / "tests").mkdir(parents=True)
+        (ws / "tests" / "test_ok.py").write_text(
+            "def test_ok():\n    assert True\n", encoding="utf-8"
+        )
+        block, failures = _automated_checks(
+            str(ws), ["tests/test_ok.py"],
+            feature_test_files=["tests/test_ok.py"],
+        )
+        # Own file runs as the HARD pytest section only — no advisory dup.
+        assert block.count("test_ok.py") >= 1
+        assert "ADVISORY" not in block
+        assert failures == []
