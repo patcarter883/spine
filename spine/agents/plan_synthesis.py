@@ -30,6 +30,7 @@ import builtins
 import importlib.util
 import logging
 import sys
+from pathlib import Path
 from functools import lru_cache
 from typing import Any, Optional
 
@@ -211,7 +212,41 @@ def _is_external_reference(sym: str) -> bool:
         return True
     if root in _BUILTIN_NAMES:
         return True
-    return _importable_external_root(root)
+    if _importable_external_root(root):
+        return True
+    return _composer_class(root) or _composer_class(leaf)
+
+
+@lru_cache(maxsize=4)
+def _composer_class_basenames(classmap_path: str) -> frozenset[str]:
+    """Class basenames from a composer autoload classmap, empty on failure.
+
+    PHP repos: framework/vendor classes (Illuminate facades like 'Schema' /
+    'DB', 'Blueprint', …) are not in the codebase index and mean nothing to
+    Python's find_spec, so plans referencing them were flagged as contract
+    violations (run 0b969459: 13 false violations parked a healthy Laravel
+    plan on stagnation). vendor/composer/autoload_classmap.php is composer's
+    own ground truth for every loadable class.
+    """
+    try:
+        text = Path(classmap_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return frozenset()
+    import re as _re
+
+    names = _re.findall(r"'([A-Za-z0-9_\\\\]+)'\s*=>", text)
+    return frozenset(n.split("\\")[-1] for n in names if n)
+
+
+def _composer_class(name: str) -> bool:
+    """True when *name* is a class basename in the target repo's composer
+    classmap (resolved CWD-relative, the same convention as spine-gate.yaml)."""
+    if not name or not name[0].isupper():
+        return False
+    classmap = Path("vendor/composer/autoload_classmap.php")
+    if not classmap.is_file():
+        return False
+    return name in _composer_class_basenames(str(classmap.resolve()))
 
 
 @lru_cache(maxsize=512)

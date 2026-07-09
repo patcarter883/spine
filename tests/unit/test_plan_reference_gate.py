@@ -240,15 +240,21 @@ def test_exclusion_with_near_miss_gets_one_revision_round_first(index) -> None:
     assert result2["cited_exclusions"] == [exclusion]
 
 
-def test_unqualified_dangling_never_matches_exclusion(index) -> None:
+def test_unqualified_dangling_is_not_gate_business(index) -> None:
+    # CONTRACT CHANGE (run 0b969459): a bare unqualified identifier that
+    # matches neither the index nor any slice's provides carries no owner
+    # context — it is research noise ('foreignUuid', 'constrained'), not a
+    # checkable contract, and flagging it parked a healthy Laravel plan.
+    # Bare-name-vs-provides mismatches (trace 019f2040's
+    # add_embedding_provider) are still caught by the synthesis contract
+    # layer (repair_and_validate_contracts); actual correctness is owned by
+    # executed verify evidence.
     index({UIAPI_FILE: UIAPI_SYMS})
     plan = _plan({"id": "a", "reference_symbols": ["add_embedding_provider"]})
     result = check_reference_symbols(
         plan, _spec(["Changes to SpineConfig or UIApi schemas."]), None, db_path=DB
     )
-    assert result is not None
-    assert result["status"] == ReviewStatus.NEEDS_REVISION.value
-    assert result["blocker_category"] is None
+    assert result is None
 
 
 def test_persistence_without_exclusion_stays_revision(index) -> None:
@@ -474,3 +480,84 @@ class TestExternalReferenceClassification:
         assert not _is_external_reference("spine.ui.utils.format_duration")
         assert not _is_external_reference("UIApi.get_providers")
         assert not _is_external_reference("nonexistent_pkg.thing")
+
+
+class TestPhpVendorSymbols:
+    """PHP repos: framework classes and bare builder-method names are not
+    contract violations (run 0b969459: 'Schema', 'Blueprint', 'DB',
+    'foreignUuid', 'constrained' produced 13 false violations and a
+    stagnation park on a healthy Laravel plan)."""
+
+    _CLASSMAP = (
+        "<?php\n"
+        "return array(\n"
+        "    'Illuminate\\\\Support\\\\Facades\\\\Schema' => $vendorDir . '/x.php',\n"
+        "    'Illuminate\\\\Database\\\\Schema\\\\Blueprint' => $vendorDir . '/y.php',\n"
+        "    'App\\\\Domain\\\\Farm\\\\Models\\\\Farm' => $baseDir . '/z.php',\n"
+        ");\n"
+    )
+
+    def _chdir_with_classmap(self, tmp_path, monkeypatch):
+        (tmp_path / "vendor" / "composer").mkdir(parents=True)
+        (tmp_path / "vendor" / "composer" / "autoload_classmap.php").write_text(
+            self._CLASSMAP, encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+
+    def test_classmap_classes_are_external(self, tmp_path, monkeypatch):
+        from spine.agents.plan_synthesis import (
+            _composer_class_basenames,
+            _is_external_reference,
+        )
+
+        _composer_class_basenames.cache_clear()
+        self._chdir_with_classmap(tmp_path, monkeypatch)
+        assert _is_external_reference("Schema")
+        assert _is_external_reference("Blueprint")
+        assert _is_external_reference("Farm")  # exists (app classmap entry)
+        assert not _is_external_reference("UnitOfMeasure")  # genuinely new
+
+    def test_no_classmap_changes_nothing(self, tmp_path, monkeypatch):
+        from spine.agents.plan_synthesis import (
+            _composer_class_basenames,
+            _is_external_reference,
+        )
+
+        _composer_class_basenames.cache_clear()
+        monkeypatch.chdir(tmp_path)  # no vendor/ here
+        assert not _is_external_reference("Schema")
+
+    def test_bare_identifiers_are_not_flagged_by_the_gate(self, tmp_path, monkeypatch):
+        from spine.workflow.plan_reference_gate import check_reference_symbols
+
+        monkeypatch.chdir(tmp_path)  # no classmap, no index
+        monkeypatch.setattr(
+            "spine.workflow.plan_reference_gate._symbol_exists_in_index",
+            lambda db, sym: False,
+        )
+        plan = {"feature_slices": [{
+            "id": "migration",
+            "target_files": ["database/migrations/x.php"],
+            "reference_symbols": ["foreignUuid", "constrained", "uuid"],
+            "provides": ["units_of_measure table"],
+        }]}
+        out = check_reference_symbols(plan, None, None, db_path="db")
+        assert out is None  # bare names carry no owner context — not contracts
+
+    def test_qualified_internal_refs_still_flag(self, tmp_path, monkeypatch):
+        from spine.workflow.plan_reference_gate import check_reference_symbols
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "spine.workflow.plan_reference_gate._symbol_exists_in_index",
+            lambda db, sym: False,
+        )
+        plan = {"feature_slices": [{
+            "id": "s",
+            "target_files": ["a.py"],
+            "reference_symbols": ["UIApi.get_ghost_method"],
+            "provides": ["something new"],
+        }]}
+        out = check_reference_symbols(plan, None, None, db_path="db")
+        assert out is not None
+        assert "UIApi.get_ghost_method" in out["reason"]
