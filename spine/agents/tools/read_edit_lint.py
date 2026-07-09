@@ -535,6 +535,110 @@ def _rewrite_unresolvable_imports(
     return rewritten
 
 
+def _psr4_map(workspace_root: str) -> dict[str, str]:
+    """PSR-4 prefix->dir mapping from the workspace composer.json, {} on failure."""
+    try:
+        cfg = json.loads(
+            (Path(workspace_root) / "composer.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, str] = {}
+    for section in ("autoload", "autoload-dev"):
+        for prefix, rel in ((cfg.get(section) or {}).get("psr-4") or {}).items():
+            if isinstance(prefix, str) and isinstance(rel, str):
+                out[prefix] = rel
+    return out
+
+
+def _psr4_namespace_for(rel_path: str, psr4: dict[str, str]) -> Optional[str]:
+    """The namespace PSR-4 dictates for *rel_path*, None when unmapped."""
+    posix = rel_path.replace("\\", "/")
+    for prefix, base in sorted(psr4.items(), key=lambda kv: -len(kv[1])):
+        base = base.rstrip("/") + "/"
+        if posix.startswith(base):
+            parts = posix[len(base):].split("/")[:-1]  # drop the filename
+            ns = prefix.rstrip("\\")
+            if parts:
+                ns += "\\" + "\\".join(parts)
+            return ns
+    return None
+
+
+def _fix_php_namespaces(path: Path, workspace_root: str) -> Optional[list[str]]:
+    """Repair PSR-4 namespace declarations and dangling class imports.
+
+    PHP slices invent namespaces per slice (agripath probe 7): the model
+    lived in App\\Domain\\Farm\\Models, the factory generated
+    App\\Domain\\Project\\Models\\UnitOfMeasure, and the test imported
+    App\\Models\\UnitOfMeasure - three inventions for one class. PSR-4
+    makes both directions mechanical: the FILE PATH dictates this file's
+    namespace, and an imported class's real FQCN is derivable from wherever
+    its file actually lives. Rewrites (1) the ``namespace`` line when it
+    disagrees with the path, and (2) any ``use`` whose FQCN has no file on
+    disk but whose class BASENAME exists at exactly one PSR-4 location.
+    Returns the rewritten lines, or None (no change / any error - fail-open).
+    """
+    ws = Path(workspace_root or ".")
+    psr4 = _psr4_map(workspace_root)
+    if not psr4:
+        return None
+    try:
+        rel = str(path.resolve().relative_to(ws.resolve()))
+        content = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+
+    import re as _re
+
+    changed: list[str] = []
+    expected_ns = _psr4_namespace_for(rel, psr4)
+    if expected_ns:
+        m = _re.search(r"^namespace\s+([A-Za-z0-9_\\\\]+)\s*;", content, _re.MULTILINE)
+        if m and m.group(1) != expected_ns:
+            content = content.replace(m.group(0), f"namespace {expected_ns};", 1)
+            changed.append(f"namespace {expected_ns};")
+
+    def _fqcn_file(fqcn: str) -> Optional[Path]:
+        for prefix, base in psr4.items():
+            if fqcn.startswith(prefix):
+                sub = fqcn[len(prefix):].replace("\\", "/")
+                return ws / (base.rstrip("/") + "/" + sub + ".php")
+        return None
+
+    def _find_class(basename: str) -> Optional[str]:
+        hits: set[str] = set()
+        for prefix, base in psr4.items():
+            root = ws / base.rstrip("/")
+            if not root.is_dir():
+                continue
+            for f in root.rglob(f"{basename}.php"):
+                frel = str(f.relative_to(ws))
+                ns = _psr4_namespace_for(frel, psr4)
+                if ns:
+                    hits.add(f"{ns}\\{basename}")
+        return next(iter(hits)) if len(hits) == 1 else None
+
+    for m in list(_re.finditer(r"^use\s+([A-Za-z0-9_\\\\]+)\s*;", content, _re.MULTILINE)):
+        fqcn = m.group(1)
+        target = _fqcn_file(fqcn)
+        if target is None or target.exists():
+            continue  # unmapped (vendor/framework) or genuinely present
+        basename = fqcn.rsplit("\\", 1)[-1]
+        real = _find_class(basename)
+        if real and real != fqcn:
+            content = content.replace(m.group(0), f"use {real};", 1)
+            changed.append(f"use {real};")
+
+    if not changed:
+        return None
+    try:
+        _atomic_write(path, content)
+    except OSError:
+        return None
+    return changed
+
+
 def _auto_import_fix(
     path: Path, workspace_root: str, ruff_summary: str
 ) -> Optional[tuple[str, list[str]]]:
@@ -2124,6 +2228,12 @@ class ReadEditLintTool(BaseTool):
             rewritten = _rewrite_unresolvable_imports(path, self.workspace_root)
             if rewritten:
                 ok_fields["imports_rewritten"] = rewritten
+        # PHP: PSR-4 dictates the namespace from the file path, and dangling
+        # class imports are resolved to where the class actually lives.
+        if path.suffix.lower() == ".php":
+            ns_fixed = _fix_php_namespaces(path, self.workspace_root)
+            if ns_fixed:
+                ok_fields["namespaces_fixed"] = ns_fixed
         ruff = _ruff_report(path, self.workspace_root)
         if ruff is not None and ruff != "clean":
             # Deterministic repair for missing module imports (F821): the
