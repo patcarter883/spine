@@ -405,3 +405,47 @@ def test_constructor_not_duplicated_when_class_itself_referenced(
     )
     # The whole class (constructor included) is already inlined — no extra block.
     assert body.count("__init__") == 1
+
+
+class TestSiblingTestExemplar:
+    """A slice that CREATES a test file gets an existing sibling test
+    inlined as a style exemplar — run 984f9c8e hallucinated
+    `use Pest\\Pest; Pest::test(...)` with nothing concrete to imitate,
+    and the gap loop couldn't talk it out of the shape."""
+
+    def test_new_test_file_gets_sibling_exemplar(self, tmp_path):
+        from spine.workflow.subgraphs import implement_subgraph as impl
+
+        d = tmp_path / "tests" / "Unit"
+        d.mkdir(parents=True)
+        (d / "ExistingTest.php").write_text(
+            "<?php\n\ntest('it works', function () {\n    expect(true)->toBeTrue();\n});\n",
+            encoding="utf-8",
+        )
+        out = impl._target_files_body(
+            ["tests/Unit/NewThingTest.php"], str(tmp_path)
+        )
+        assert "does not exist yet" in out
+        assert "EXISTING PASSING test" in out
+        assert "expect(true)->toBeTrue()" in out
+
+    def test_non_test_new_file_gets_no_exemplar(self, tmp_path):
+        from spine.workflow.subgraphs import implement_subgraph as impl
+
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text(
+            "def test_x():\n    assert True\n", encoding="utf-8"
+        )
+        out = impl._target_files_body(["app/Service.php"], str(tmp_path))
+        assert "EXISTING PASSING test" not in out
+
+    def test_oversized_siblings_are_skipped(self, tmp_path):
+        from spine.workflow.subgraphs import implement_subgraph as impl
+
+        d = tmp_path / "tests"
+        d.mkdir()
+        (d / "test_huge.py").write_text(
+            "\n".join(f"x{i} = {i}" for i in range(500)), encoding="utf-8"
+        )
+        out = impl._target_files_body(["tests/test_new.py"], str(tmp_path))
+        assert "EXISTING PASSING test" not in out

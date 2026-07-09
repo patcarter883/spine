@@ -648,6 +648,77 @@ def _file_top_level_outline(text: str) -> str:
     return "\n".join(out)
 
 
+_EXEMPLAR_MAX_LINES = 120
+_EXEMPLAR_MAX_CHARS = 4500
+
+_TEST_PATH_SEGMENTS = {"tests", "test", "__tests__"}
+
+
+def _looks_like_test_file(rel: str) -> bool:
+    parts = rel.replace("\\", "/").split("/")
+    if any(p in _TEST_PATH_SEGMENTS for p in parts[:-1]):
+        return True
+    name = parts[-1]
+    stem = name.rsplit(".", 1)[0]
+    return (
+        name.startswith("test_")
+        or stem.endswith("Test")
+        or stem.endswith(".test")
+        or stem.endswith(".spec")
+    )
+
+
+def _test_exemplar_block(root, rel: str) -> str:
+    """An EXISTING sibling test inlined as a style exemplar, or ''.
+
+    When a slice CREATES a test file, the editor has nothing concrete to
+    imitate and local models hallucinate the framework's API — run 984f9c8e
+    invented `use Pest\\Pest; Pest::test(...)` (Pest tests are global
+    ``test()`` calls) and the gap loop could not talk it out of the shape.
+    The repo's own passing tests are the ground truth for test style;
+    inline the nearest same-suffix sibling (smallest first — the most
+    readable exemplar), bounded. Language-agnostic: works for pytest,
+    Pest, and vitest/jest suites alike.
+    """
+    target = root / rel
+    suffix = target.suffix
+    if not suffix:
+        return ""
+    for directory in [target.parent, *target.parent.parents]:
+        try:
+            if not directory.is_dir() or not directory.is_relative_to(root):
+                break
+            candidates = sorted(
+                (
+                    f for f in directory.rglob(f"*{suffix}")
+                    if f.is_file()
+                    and f != target
+                    and _looks_like_test_file(str(f.relative_to(root)))
+                ),
+                key=lambda f: f.stat().st_size,
+            )
+        except (OSError, ValueError):
+            return ""
+        for cand in candidates:
+            try:
+                text = cand.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            lines = text.splitlines()
+            if len(lines) > _EXEMPLAR_MAX_LINES or len(text) > _EXEMPLAR_MAX_CHARS:
+                continue
+            if not text.strip():
+                continue
+            return (
+                f"\nAn EXISTING PASSING test from this suite — mimic its "
+                f"imports, structure, and framework idioms EXACTLY "
+                f"(`{cand.relative_to(root)}`):\n```\n{text}\n```"
+            )
+        if directory.name in _TEST_PATH_SEGMENTS:
+            break  # searched the whole test root — stop walking up
+    return ""
+
+
 def _target_files_body(target_files: list[str], workspace_root: str) -> str:
     """Fenced CURRENT content of each target file, read live from the sandbox.
 
@@ -678,9 +749,12 @@ def _target_files_body(target_files: list[str], workspace_root: str) -> str:
         try:
             text = (root / rel).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            exemplar = (
+                _test_exemplar_block(root, rel) if _looks_like_test_file(rel) else ""
+            )
             blocks.append(
                 f"### `{rel}`\n(does not exist yet — this slice creates it; "
-                f"synthesize the new file's full content)"
+                f"synthesize the new file's full content)" + exemplar
             )
             continue
         if not text.strip():
