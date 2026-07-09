@@ -117,9 +117,23 @@ class SliceDetail(BaseModel):
     execution_requirements: str = Field(
         description="Detailed, step-by-step instructions to implement THIS slice."
     )
+    # The constraints live in the FIELD description (not only the system
+    # prompt) because guided decoding re-reads the schema at generation time —
+    # prompt-prose versions of these rules were ignored twice by the local
+    # planner (runs a56e89a6 / 2257cd64: 'binds the model via a model()
+    # method' re-emitted after the rule was added to the prompt).
     acceptance_criteria: list[str] = Field(
         min_length=1,
-        description="Measurable checks that prove this slice is complete.",
+        description=(
+            "Measurable checks that prove this slice is complete. Each "
+            "criterion states an OBSERVABLE OUTCOME of running or reading "
+            "THIS slice's files ('creating a UnitOfMeasure via the factory "
+            "persists name and abbreviation'), NEVER a required mechanism, "
+            "method name, property, or idiom — if the framework's standard "
+            "convention delivers the behavior, the criterion must pass. No "
+            "edge-case semantics the task didn't ask for. Every criterion "
+            "must be checkable from this slice's own files/diff/test run."
+        ),
     )
 
 
