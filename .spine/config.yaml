@@ -163,6 +163,10 @@ providers:
     stream_usage: true
     max_concurrent_calls: 3
     context_window: 50000
+    # Locks reasoning ON: the serve routes thinking to reasoning_content
+    # cleanly, and callsite suppress_reasoning() backfires (batch 1: workers
+    # thought inside JSON fields, blew caps mid-string). See fix/reasoning-lock.
+    reasoning: true
     # Qwen-Coder model-card sampling: curbs the repeated-survey / re-read loops
     # a tool-using agent falls into (trace 019ef2ae: one file read 89×).
     # repeat_penalty is the key anti-loop lever (llama.cpp's native name —
