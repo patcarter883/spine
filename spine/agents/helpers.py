@@ -232,6 +232,15 @@ def resolve_chat_model(
     return model
 
 
+# Extra completion budget for reasoning-locked models: their thinking tokens
+# count against max_completion_tokens (OpenAI semantics), so a cap sized for
+# the ANSWER alone truncates it once the model has thought (batch 1 rerun:
+# the decomposer's coherent JSON cut mid-key at ~3100 tokens under its 4K
+# cap — the thinking consumed the difference). Sized above every thinking
+# burst measured on this serve (probe replies reasoned 500–1400 tokens).
+_REASONING_CAP_ALLOWANCE = 4096
+
+
 def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
     """Return a model_copy with the completion-token cap on the correct field.
 
@@ -241,7 +250,14 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
     call still uses the original value.  We detect which field is actually set
     and update that one — matching the defensive pattern already used in
     ``exploration_agents._cap_findings_model``.
+
+    Reasoning-locked models (``reasoning: true`` providers) get
+    ``_REASONING_CAP_ALLOWANCE`` on top of the requested cap so their
+    thinking doesn't eat the answer's budget. The window-clamp in
+    ``_build_local_model``/DynamicCompletionCap still bounds the total.
     """
+    if _REASONING_LOCK_TAG in (getattr(model, "tags", None) or []):
+        cap = cap + _REASONING_CAP_ALLOWANCE
     if getattr(model, "max_tokens", None) is not None:
         return model.model_copy(update={"max_tokens": cap})
     return model.model_copy(update={"max_completion_tokens": cap})
