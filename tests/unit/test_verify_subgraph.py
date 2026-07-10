@@ -663,6 +663,43 @@ class TestPsr4Evidence:
         assert "MISMATCH" in block
         assert failures and "PSR-4 namespace mismatch" in failures[0]
 
+    def test_classless_pest_file_is_not_a_mismatch(self, tmp_path, monkeypatch):
+        """Procedural Pest files declare no autoloadable type, so a missing
+        namespace is NOT a PSR-4 violation (probe 20/8eaa5887: a correct
+        test file hard-failed on declared '(none)')."""
+        import json as _json
+
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "composer.json").write_text(_json.dumps({
+            "autoload-dev": {"psr-4": {"Tests\\": "tests/"}},
+        }), encoding="utf-8")
+        d = tmp_path / "tests" / "Unit"
+        d.mkdir(parents=True)
+        (d / "ZTest.php").write_text(
+            "<?php\n\ndeclare(strict_types=1);\n\n"
+            "it('works', function () { expect(true)->toBeTrue(); });\n",
+            encoding="utf-8",
+        )
+        block, failures = _automated_checks(str(tmp_path), ["tests/Unit/ZTest.php"])
+        assert "PSR-4 not applicable" in block
+        assert failures == []
+
+    def test_classful_file_missing_namespace_still_fails(self, tmp_path, monkeypatch):
+        """A file that DOES declare a class must still declare the namespace."""
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        monkeypatch.chdir(tmp_path)
+        d = self._ws(tmp_path)
+        (d / "WFactory.php").write_text(
+            "<?php\n\nclass WFactory {}\n", encoding="utf-8",
+        )
+        block, failures = _automated_checks(
+            str(tmp_path), ["database/factories/WFactory.php"]
+        )
+        assert failures and "PSR-4 namespace mismatch" in failures[0]
+
 
 class TestFeatureWideTestEvidence:
     """Sibling slices' tests run as ADVISORY evidence (probe 12/ed2c9f85:

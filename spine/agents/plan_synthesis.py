@@ -725,6 +725,50 @@ def _reference_source_block(stub: SliceStub) -> str:
     )
 
 
+def _new_file_convention_block(stub: SliceStub, workspace_root: str) -> str:
+    """Sibling-convention ground truth for target files the slice CREATES.
+
+    The editor already receives the nearest same-suffix sibling as an
+    exemplar, so its output follows the repo's conventions — but the AC
+    author did not, and wrote criteria against framework defaults instead.
+    Probe 20 (run 8eaa5887): the generated factory correctly matched the
+    repo's ``extends BaseFactory`` convention, while the criterion demanded
+    ``Illuminate\\Database\\Factories\\Factory`` — a correct implementation
+    failed verification three cycles running. Author and editor must see
+    the SAME ground truth.
+    """
+    if not workspace_root:
+        return ""
+    from pathlib import Path
+
+    try:
+        from spine.workflow.subgraphs.implement_subgraph import (
+            _sibling_exemplar_block,
+        )
+    except Exception:  # noqa: BLE001 — grounding is best-effort
+        return ""
+    root = Path(workspace_root)
+    parts: list[str] = []
+    for rel in stub.target_files or []:
+        rel = str(rel).strip()
+        if not rel or (root / rel).exists():
+            continue  # existing files: reference-source inlining covers them
+        try:
+            block = _sibling_exemplar_block(root, rel)
+        except Exception:  # noqa: BLE001
+            continue
+        if block:
+            parts.append(block)
+    if not parts:
+        return ""
+    return (
+        "\n\nConvention ground truth for files this slice CREATES — author "
+        "acceptance criteria CONSISTENT with these existing siblings; do NOT "
+        "prescribe framework defaults (base classes, binding mechanisms, "
+        "import styles) that contradict them:" + "".join(parts)
+    )
+
+
 async def _run_slice_worker(
     stub: SliceStub,
     all_stubs: list[SliceStub],
@@ -732,6 +776,7 @@ async def _run_slice_worker(
     research: str,
     config: RunnableConfig | None,
     work_id: str,
+    workspace_root: str = "",
 ) -> SliceDetail:
     """One small structured call → this slice's execution detail.
 
@@ -749,7 +794,9 @@ async def _run_slice_worker(
     contract = _contract_block(stub, all_stubs)
     if contract:
         constraints += "\n\n" + contract
-    exemplars = _reference_source_block(stub)
+    exemplars = _reference_source_block(stub) + _new_file_convention_block(
+        stub, workspace_root
+    )
     human = hostage_layout(
         xml_blocks(
             (Tag.OBJECTIVE, f"YOUR slice (detail ONLY this one):\n```json\n{stub_json}\n```"),
@@ -843,7 +890,10 @@ async def synthesize_plan(
 
     details = await asyncio.gather(
         *(
-            _run_slice_worker(stub, skeleton.slices, spec_md, research, config, work_id)
+            _run_slice_worker(
+                stub, skeleton.slices, spec_md, research, config, work_id,
+                workspace_root=workspace_root,
+            )
             for stub in skeleton.slices
         )
     )

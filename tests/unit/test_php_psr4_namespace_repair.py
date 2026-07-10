@@ -97,3 +97,41 @@ def test_ambiguous_basename_is_not_rewritten(tmp_path):
     changed = _fix_php_namespaces(f, str(ws)) or []
     # Two candidates exist — ambiguity means no import rewrite.
     assert not any("use " in c for c in changed)
+
+
+def test_missing_namespace_inserted_for_class_file(tmp_path):
+    """A class file with NO namespace gets the PSR-4 one inserted (probe 20:
+    only wrong-and-present declarations were repaired; absent ones slipped
+    through to a verify hard failure)."""
+    ws = _ws(tmp_path)
+    fdir = ws / "database/factories"
+    fdir.mkdir(parents=True)
+    f = fdir / "UnitOfMeasureFactory.php"
+    f.write_text(
+        "<?php\n\ndeclare(strict_types=1);\n\nclass UnitOfMeasureFactory {}\n",
+        encoding="utf-8",
+    )
+    changed = _fix_php_namespaces(f, str(ws))
+    text = f.read_text(encoding="utf-8")
+    assert "namespace Database\\Factories;" in text
+    # Inserted after the declare() header, before the class.
+    assert text.index("declare(") < text.index("namespace Database") < text.index("class ")
+    assert changed and any("inserted" in c for c in changed)
+
+
+def test_procedural_pest_file_left_without_namespace(tmp_path):
+    """Files declaring no type (procedural Pest tests) are NOT given a
+    namespace — PSR-4 governs autoloadable types only, and the repo's own
+    tests omit the declaration."""
+    ws = _ws(tmp_path)
+    tdir = ws / "tests/Unit"
+    tdir.mkdir(parents=True)
+    f = tdir / "UnitOfMeasureTest.php"
+    original = (
+        "<?php\n\ndeclare(strict_types=1);\n\n"
+        "it('round trips', function () {\n    expect(true)->toBeTrue();\n});\n"
+    )
+    f.write_text(original, encoding="utf-8")
+    changed = _fix_php_namespaces(f, str(ws))
+    assert f.read_text(encoding="utf-8") == original
+    assert changed is None
