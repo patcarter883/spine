@@ -72,6 +72,22 @@ class TestIsTransientError:
         )
         assert _is_transient_error(exc) is True
 
+    def test_remote_protocol_error_is_transient(self):
+        """Mid-stream drops retry now: the dominant cause is a crashed
+        backend, and the phase retry that follows a transient exhaustion
+        rebuilds the model through the fallback_provider health check
+        (batch 1, run d8bc459c: the permanent classification FAILED a run
+        at specify while a healthy standby sat idle)."""
+        import httpx
+
+        from spine.agents.retry import _is_transient_error
+
+        exc = httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+        assert _is_transient_error(exc) is True
+
     def test_authentication_error_not_transient(self):
         """401 Authentication errors are permanent, not transient."""
         from openai import AuthenticationError

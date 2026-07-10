@@ -342,18 +342,20 @@ def _is_transient_error(exc: Exception) -> bool:
         return True
 
     # ── httpx transport errors ────────────────────────────────────────
-    # Distinguish between transient errors (connection refused, timeout)
-    # and mid-stream drops (server started responding then disconnected).
-    #
-    # RemoteProtocolError with "peer closed connection" means the server
-    # sent a partial response then dropped — retrying re-sends the same
-    # prompt for zero or marginal benefit and wastes tokens.  Mark as
-    # permanent so we fail fast instead of burning retries on a hung
-    # stream.
+    # Mid-stream drops (RemoteProtocolError, "peer closed connection") were
+    # classified PERMANENT when the likely cause was a healthy-but-hung
+    # stream — retrying just re-sent the same prompt. Since the
+    # fallback_provider feature, the dominant cause is a CRASHED backend
+    # (mini-sglang dies under concurrent load: batch 1, run d8bc459c FAILED
+    # outright at specify on this classification while a healthy Lemonade
+    # standby sat idle). Transient is now strictly better: in-call retries
+    # may waste a couple of attempts against the dead endpoint, but the
+    # phase-level retry that follows REBUILDS the model — the health check
+    # sees the endpoint down and the standby takes over.
     if "httpx" in exc_module:
         exc_type_lower = exc_type_name.lower()
         if "remoteprotocolerror" in exc_type_lower:
-            return False
+            return True
         if "transport" in exc_type_lower:
             return True
 
