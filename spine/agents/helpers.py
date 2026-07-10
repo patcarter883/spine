@@ -1025,13 +1025,46 @@ _ENDPOINT_HEALTH: dict[str, tuple[bool, float]] = {}
 _HEALTH_TTL_SECONDS = 20.0
 
 
-def _endpoint_healthy(base_url: str) -> bool:
-    """TCP-connect health check for an OpenAI-compatible endpoint, TTL-cached.
+def _endpoint_ready(base_url: str, model: str | None) -> bool:
+    """Prove the backend actually SERVES with a 1-token completion.
 
-    Connect-level only (no HTTP round trip): the outage mode this guards
-    against is a crashed/restarting server process, which refuses the TCP
-    connection within milliseconds. A hung-but-listening server is NOT
-    detected here — that is what request timeouts are for.
+    A server coming up accepts TCP (and even answers /v1/models) before the
+    model is loaded — chat completions get an empty reply or a mid-stream
+    close. Probe 24 (run 67056e02): the TCP check flipped healthy during
+    mini-sglang's warmup window and gap_plan died on the half-up serve.
+    Any failure here keeps the endpoint marked down; the next TTL
+    re-checks. When no model name is available, TCP is the best we can do.
+    """
+    if not model:
+        return True
+    import json as _json
+    import urllib.request
+
+    body = _json.dumps({
+        "model": str(model).removeprefix("openai:"),
+        "messages": [{"role": "user", "content": "ok"}],
+        "max_tokens": 1,
+    }).encode()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return 200 <= resp.status < 300
+    except Exception:  # noqa: BLE001 — any failure means not ready
+        return False
+
+
+def _endpoint_healthy(base_url: str, model: str | None = None) -> bool:
+    """Health check for an OpenAI-compatible endpoint, TTL-cached.
+
+    Steady state (last check healthy) is a cheap TCP connect — the outage
+    mode it guards against is a crashed server process, which refuses the
+    connection within milliseconds. A transition TO healthy (first check,
+    or recovering from down) additionally requires :func:`_endpoint_ready`,
+    because a warming server listens before it serves.
     """
     import socket
     import time
@@ -1052,6 +1085,8 @@ def _endpoint_healthy(base_url: str) -> bool:
                 healthy = True
         except OSError:
             healthy = False
+    if healthy and not (cached and cached[0]):
+        healthy = _endpoint_ready(base_url, model)
     _ENDPOINT_HEALTH[base_url] = (healthy, now)
     return healthy
 
@@ -1069,7 +1104,9 @@ def _apply_provider_fallback(
     """
     if not provider_cfg.get("fallback_provider"):
         return provider_cfg, model_spec
-    if _endpoint_healthy(_expand_env_ref(provider_cfg["base_url"])):
+    if _endpoint_healthy(
+        _expand_env_ref(provider_cfg["base_url"]), provider_cfg.get("model")
+    ):
         return provider_cfg, model_spec
 
     from spine.config import SpineConfig
@@ -1093,7 +1130,7 @@ def _apply_provider_fallback(
                 fb_name, provider_cfg.get("name"),
             )
             break
-        if _endpoint_healthy(_expand_env_ref(fb["base_url"])):
+        if _endpoint_healthy(_expand_env_ref(fb["base_url"]), fb.get("model")):
             logger.warning(
                 "provider %r endpoint %s is DOWN — falling back to provider %r (%s @ %s)",
                 provider_cfg.get("name"), provider_cfg.get("base_url"),
