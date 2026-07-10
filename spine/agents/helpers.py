@@ -247,6 +247,11 @@ def cap_completion_tokens(model: BaseChatModel, cap: int) -> BaseChatModel:
     return model.model_copy(update={"max_completion_tokens": cap})
 
 
+# Tag stamped by _build_local_model when the provider declares
+# `reasoning: true` — suppress_reasoning treats it as a no-op lock.
+_REASONING_LOCK_TAG = "spine:reasoning-locked"
+
+
 def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
     """Return a model_copy with thinking disabled — no-op for unrecognised models.
 
@@ -288,6 +293,16 @@ def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
     provider-level override stays intact (idempotent). Fails open on any
     error.
     """
+    # Provider-level lock: `reasoning: true` in config declares the model
+    # reasons WELL — its serve routes thinking to reasoning_content and the
+    # answer stays clean — so callsite suppression must not strip that.
+    # Suppressing such a model makes it think INSIDE the structured output
+    # instead (batch 1, run b15cee51: slice workers rambled ~30K chars into
+    # execution_requirements, blew the completion cap mid-string, and
+    # degraded to stub-fallback detail, three times in one run).
+    if _REASONING_LOCK_TAG in (getattr(model, "tags", None) or []):
+        return model
+
     try:
         from langchain_openrouter import ChatOpenRouter
 
@@ -1297,6 +1312,11 @@ def _build_local_model(
     if provider_cfg.get("reasoning") is False:
         extra_body["reasoning_budget"] = 0
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    elif provider_cfg.get("reasoning") is True:
+        # Explicit `reasoning: true` locks reasoning ON: callsite
+        # suppress_reasoning() becomes a no-op for this model (see
+        # _REASONING_LOCK_TAG). Tags stay client-side — nothing on the wire.
+        kwargs.setdefault("tags", []).append(_REASONING_LOCK_TAG)
 
     # ── Zaya RSA (recursive self-aggregation) passthrough ─────────────
     # Zaya's OpenAI-compatible shim reads a top-level `rsa` field to control

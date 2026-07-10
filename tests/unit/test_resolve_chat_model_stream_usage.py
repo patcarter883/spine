@@ -307,3 +307,51 @@ def test_base_url_and_api_key_forwarded_for_local_provider(monkeypatch):
 
     assert captured["kwargs"].get("base_url") == "http://localhost:8010/v1"
     assert captured["kwargs"].get("api_key") == "vllm"
+
+
+class TestReasoningLock:
+    """`reasoning: true` locks reasoning on: suppress_reasoning is a no-op.
+
+    Batch 1 (run b15cee51): slice workers suppressed reasoning on a serve
+    that separates channels correctly — the model thought INSIDE the JSON
+    string fields instead, rambling ~30K chars past the completion cap and
+    degrading to stub-fallback detail three times in one run."""
+
+    def test_reasoning_true_stamps_lock_tag(self, monkeypatch):
+        captured = _capture_chat_openai(monkeypatch)
+        helpers._build_local_model(
+            "openai:Qwen-Remote",
+            {"base_url": "http://10.50.1.51:1919/v1", "reasoning": True},
+        )
+        assert helpers._REASONING_LOCK_TAG in captured.get("tags", [])
+        # No suppression levers on the wire.
+        assert "reasoning_budget" not in (captured.get("extra_body") or {})
+
+    def test_suppress_reasoning_noops_on_locked_model(self):
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(
+            model="m", api_key="x", base_url="http://local:1919/v1",
+            tags=[helpers._REASONING_LOCK_TAG],
+        )
+        out = helpers.suppress_reasoning(model)
+        assert (getattr(out, "extra_body", None) or {}).get("reasoning_budget") is None
+
+    def test_suppress_reasoning_still_works_unlocked(self):
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(model="m", api_key="x", base_url="http://local:1919/v1")
+        out = helpers.suppress_reasoning(model)
+        extra = getattr(out, "extra_body", None) or {}
+        assert extra.get("reasoning_budget") == 0
+        assert extra.get("chat_template_kwargs", {}).get("enable_thinking") is False
+
+    def test_reasoning_false_still_injects_levers(self, monkeypatch):
+        captured = _capture_chat_openai(monkeypatch)
+        helpers._build_local_model(
+            "openai:Qwen-Local",
+            {"base_url": "http://localhost:8010/v1", "reasoning": False},
+        )
+        extra = captured.get("extra_body") or {}
+        assert extra.get("reasoning_budget") == 0
+        assert helpers._REASONING_LOCK_TAG not in (captured.get("tags") or [])
