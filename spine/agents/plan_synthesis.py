@@ -211,10 +211,19 @@ def _is_external_reference(sym: str) -> bool:
     s = (sym or "").strip()
     if "/" in s or "\\" in s or s.endswith(".py"):
         return True
-    root = _root(sym)
+    # PHP expression forms are never cross-slice contracts: '$table->uuid'
+    # is a fluent call on a local variable, not a symbol a producer creates
+    # (run b15cee51: 21 builder-method "violations" burned three manager
+    # rounds on a healthy Laravel plan).
+    if s.startswith("$") or "->" in s:
+        return True
+    # 'Schema::create' / 'Gate::authorize' — PHP static-call form. Normalize
+    # to dot form so the facade alias resolves through the classmap checks.
+    norm = s.replace("::", ".")
+    root = _root(norm)
     if not root:
         return False
-    leaf = _leaf(sym)
+    leaf = _leaf(norm)
     if root in _EXTERNAL_ROOTS or leaf in _EXTERNAL_ROOTS:
         return True
     if root in _BUILTIN_NAMES:
@@ -489,6 +498,13 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
         provider_by_leaf: dict[str, set[str]] = {}
         for s in stubs:
             for p in s.provides or []:
+                # A slice cannot "provide" a framework/vendor symbol — the
+                # planner listing 'Gate::authorize' or 'Storage::fake' in
+                # provides manufactured phantom producers and cycle
+                # violations (run b15cee51: 'depending on it would form a
+                # cycle — reorder these slices' for framework facades).
+                if _is_external_reference(p):
+                    continue
                 leaf = _leaf(p)
                 if leaf:
                     provider_by_leaf.setdefault(leaf, set()).add(s.id)
@@ -525,6 +541,14 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
                     continue
                 # No producer. Skip external-library and builtin references.
                 if _is_external_reference(ref):
+                    continue
+                # A BARE unqualified identifier with no producer is not a
+                # contract: no owner context means nothing to resolve
+                # against — same policy the reference gate adopted in
+                # 0ef69a4 ('constrained', 'nullable', 'config', 'response'
+                # burned three manager rounds in run b15cee51). Provided
+                # bare symbols still get dependency edges above.
+                if "." not in ref and "::" not in ref and "\\" not in ref:
                     continue
                 violations.append(
                     f"slice '{s.id}' references '{ref}', which does not exist in "
