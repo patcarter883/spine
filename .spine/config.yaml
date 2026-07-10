@@ -155,6 +155,10 @@ providers:
     # streaming tool_calls deltas parse). If structured output regresses, the
     # spine-side levers are `structured_method: function_calling` and
     # `streaming: false` (+ SPINE_STALL_TIMEOUT ≥ 900).
+    # The serve crashes under concurrent large-prompt load (probes 18/19) —
+    # when its endpoint is down, model builds reroute to the Lemonade standby
+    # below and return here automatically once it is back (20s health TTL).
+    fallback_provider: local-qwen-fallback
     enabled: true
     stream_usage: true
     max_concurrent_calls: 3
@@ -166,6 +170,25 @@ providers:
     # supported by _build_local_model for portability). top_k/repeat_penalty
     # ride extra_body to the server (no ChatOpenAI field); top_p/temperature
     # are native — see _build_local_model.
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    repeat_penalty: 1.05
+  - name: local-qwen-fallback
+    type: deepagents-model
+    # Standby for local-qwen (referenced by its fallback_provider) — the same
+    # Qwen3.6-35B family as an MTP GGUF on the local Lemonade server. Never
+    # the default provider (enabled: false); only built when the 1919 serve's
+    # endpoint is down. Single-stream and slower than the remote serve, but
+    # keeps runs alive through mini-sglang crashes.
+    model: openai:Qwen3.6-35B-A3B-MTP-GGUF
+    base_url: http://localhost:8010/v1
+    api_key: vllm
+    guided_decoding: true
+    enabled: false
+    stream_usage: true
+    max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
+    context_window: 60000
     temperature: 0.7
     top_p: 0.8
     top_k: 20
