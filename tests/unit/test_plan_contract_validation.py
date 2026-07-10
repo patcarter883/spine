@@ -258,3 +258,89 @@ class TestOwnerDeclaresAttribute:
             lambda db, root, name: "class S:\n    def g(self):\n        return self.x\n",
         )
         assert not _owner_declares_attribute("db", "S.x")
+
+
+# ── PHP symbol forms (run b15cee51: 21 framework false-violations × 3 rounds) ──
+
+
+@pytest.fixture()
+def php_classmap(tmp_path, monkeypatch):
+    """A fake composer classmap in CWD with Laravel facade classes."""
+    vend = tmp_path / "vendor" / "composer"
+    vend.mkdir(parents=True)
+    (vend / "autoload_classmap.php").write_text(
+        "<?php return array(\n"
+        "  'Illuminate\\\\Support\\\\Facades\\\\Schema' => '',\n"
+        "  'Illuminate\\\\Support\\\\Facades\\\\DB' => '',\n"
+        "  'Illuminate\\\\Support\\\\Facades\\\\Gate' => '',\n"
+        "  'Illuminate\\\\Support\\\\Facades\\\\Storage' => '',\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    # The classmap-basenames cache keys on the resolved path, so a fresh
+    # tmp_path never collides — but clear defensively.
+    from spine.agents.plan_synthesis import _composer_class_basenames
+    _composer_class_basenames.cache_clear()
+
+
+def test_facade_static_calls_never_flagged(no_index, php_classmap) -> None:
+    no_index(set())
+    sk = PlanSkeleton(
+        architecture_overview="a", testing_strategy="t",
+        slices=[
+            _stub("mig", target_files=["database/migrations/x.php"],
+                  provides=["files table"],
+                  reference_symbols=["Schema::create", "DB::raw", "$table->uuid"]),
+        ],
+    )
+    assert repair_and_validate_contracts(sk, "w") == []
+
+
+def test_bare_unprovided_identifiers_never_flagged(no_index) -> None:
+    no_index(set())
+    sk = PlanSkeleton(
+        architecture_overview="a", testing_strategy="t",
+        slices=[
+            _stub("mig", target_files=["x.php"], provides=["files.table"],
+                  reference_symbols=["constrained", "nullable", "config"]),
+        ],
+    )
+    assert repair_and_validate_contracts(sk, "w") == []
+
+
+def test_provided_bare_symbol_still_gets_dependency_edge(no_index) -> None:
+    no_index(set())
+    sk = PlanSkeleton(
+        architecture_overview="a", testing_strategy="t",
+        slices=[
+            _stub("api", target_files=["api.py"], provides=["format_bytes"]),
+            _stub("ui", target_files=["ui.py"], provides=["render"],
+                  reference_symbols=["format_bytes"]),
+        ],
+    )
+    assert repair_and_validate_contracts(sk, "w") == []
+    ui = next(s for s in sk.slices if s.id == "ui")
+    assert "api" in (ui.dependencies or [])
+
+
+def test_framework_provides_do_not_create_phantom_producers(
+    no_index, php_classmap
+) -> None:
+    """A slice listing 'Gate::authorize' in provides must not become a
+    producer other slices are forced to depend on (run b15cee51: phantom
+    cycle violations against test slices)."""
+    no_index(set())
+    sk = PlanSkeleton(
+        architecture_overview="a", testing_strategy="t",
+        slices=[
+            _stub("test-a", target_files=["tests/a.php"],
+                  provides=["Gate::authorize"],
+                  reference_symbols=[]),
+            _stub("ctrl", target_files=["app/Ctrl.php"], provides=["Ctrl.store"],
+                  reference_symbols=["Gate::authorize"]),
+        ],
+    )
+    assert repair_and_validate_contracts(sk, "w") == []
+    ctrl = next(s for s in sk.slices if s.id == "ctrl")
+    assert not ctrl.dependencies  # no phantom edge onto the test slice
