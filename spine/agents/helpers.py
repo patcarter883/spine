@@ -1122,33 +1122,17 @@ def _endpoint_healthy(base_url: str, model: str | None = None) -> bool:
     return healthy
 
 
-def _apply_provider_fallback(
-    provider_cfg: dict[str, Any], model_spec: str
-) -> tuple[dict[str, Any], str]:
-    """Reroute to the configured standby provider when the primary is down.
+def _healthy_fallback_of(
+    start_cfg: dict[str, Any], spine_config: Any
+) -> tuple[dict[str, Any], str] | None:
+    """First provider with a healthy endpoint on *start_cfg*'s fallback chain.
 
-    Follows ``fallback_provider`` references (cycle-guarded, max 3 hops)
-    until a provider with a healthy endpoint is found. When every endpoint
-    in the chain is down — or the fallback entry is missing/unusable — the
-    original provider is returned so the failure surfaces through the
-    normal connection-error path instead of being masked here.
+    Cycle-guarded, max 3 hops; entries that are missing, have no base_url,
+    or are not local ``openai:`` providers stop the walk. ``None`` when no
+    healthy fallback exists.
     """
-    if not provider_cfg.get("fallback_provider"):
-        return provider_cfg, model_spec
-    if _endpoint_healthy(
-        _expand_env_ref(provider_cfg["base_url"]), provider_cfg.get("model")
-    ):
-        return provider_cfg, model_spec
-
-    from spine.config import SpineConfig
-
-    try:
-        spine_config = SpineConfig.load()
-    except Exception:  # noqa: BLE001 — config trouble must not mask the outage
-        return provider_cfg, model_spec
-
-    visited = {provider_cfg.get("name")}
-    current = provider_cfg
+    visited = {start_cfg.get("name")}
+    current = start_cfg
     for _ in range(3):
         fb_name = current.get("fallback_provider")
         if not fb_name or fb_name in visited:
@@ -1158,17 +1142,85 @@ def _apply_provider_fallback(
         if not fb or not fb.get("base_url") or not str(fb.get("model", "")).startswith("openai:"):
             logger.warning(
                 "fallback_provider %r is missing or not a local openai: provider — staying on %r",
-                fb_name, provider_cfg.get("name"),
+                fb_name, start_cfg.get("name"),
             )
             break
         if _endpoint_healthy(_expand_env_ref(fb["base_url"]), fb.get("model")):
-            logger.warning(
-                "provider %r endpoint %s is DOWN — falling back to provider %r (%s @ %s)",
-                provider_cfg.get("name"), provider_cfg.get("base_url"),
-                fb_name, fb.get("model"), fb.get("base_url"),
-            )
             return dict(fb), str(fb["model"])
         current = fb
+    return None
+
+
+def _apply_provider_fallback(
+    provider_cfg: dict[str, Any], model_spec: str
+) -> tuple[dict[str, Any], str]:
+    """Reroute to a standby provider when the primary — or a peer — is down.
+
+    Two triggers:
+
+    * ``fallback_provider`` — this provider's own endpoint is unreachable:
+      walk its fallback chain to the first healthy standby.
+    * ``degrade_with: <peer>`` — DEGRADED-MODE CO-ROUTING. When the named
+      peer's endpoint is down, the fleet has consolidated onto the shared
+      standby box; this provider serves from the PEER's healthy fallback
+      instead of its own model, so a single-stream server holds ONE
+      resident model. Batch 1 (runs d8bc459c ×2): with the 1919 primary
+      down, the Qwen fallback and the GLM judge alternated on single-stream
+      Lemonade, and requests around each model swap were dropped — the
+      connection errors landed precisely on gap_plan both times, robbing
+      the recovery loop. When the peer's endpoint recovers, this provider
+      routes back to its own model automatically (same health TTL).
+
+    When every endpoint in a chain is down — or entries are unusable — the
+    original provider is returned so the failure surfaces through the
+    normal connection-error path instead of being masked here.
+    """
+    if not (provider_cfg.get("fallback_provider") or provider_cfg.get("degrade_with")):
+        return provider_cfg, model_spec
+
+    from spine.config import SpineConfig
+
+    try:
+        spine_config = SpineConfig.load()
+    except Exception:  # noqa: BLE001 — config trouble must not mask the outage
+        return provider_cfg, model_spec
+
+    # ── Degraded-mode co-routing (peer outage) ─────────────────────────
+    peer_name = provider_cfg.get("degrade_with")
+    if peer_name:
+        peer = spine_config._lookup_provider_by_name(peer_name)
+        if (
+            peer
+            and peer.get("base_url")
+            and not _endpoint_healthy(_expand_env_ref(peer["base_url"]), peer.get("model"))
+        ):
+            routed = _healthy_fallback_of(peer, spine_config)
+            if routed:
+                fb, spec = routed
+                logger.warning(
+                    "provider %r co-routing to %r (%s): peer %r is DOWN — "
+                    "consolidating onto its standby to avoid model swaps",
+                    provider_cfg.get("name"), fb.get("name"), spec, peer_name,
+                )
+                return fb, spec
+
+    # ── Own-endpoint fallback ──────────────────────────────────────────
+    if not provider_cfg.get("fallback_provider"):
+        return provider_cfg, model_spec
+    if _endpoint_healthy(
+        _expand_env_ref(provider_cfg["base_url"]), provider_cfg.get("model")
+    ):
+        return provider_cfg, model_spec
+
+    routed = _healthy_fallback_of(provider_cfg, spine_config)
+    if routed:
+        fb, spec = routed
+        logger.warning(
+            "provider %r endpoint %s is DOWN — falling back to provider %r (%s @ %s)",
+            provider_cfg.get("name"), provider_cfg.get("base_url"),
+            fb.get("name"), fb.get("model"), fb.get("base_url"),
+        )
+        return fb, spec
 
     logger.warning(
         "provider %r endpoint is DOWN and no healthy fallback found — proceeding with primary",
