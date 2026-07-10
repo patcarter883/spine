@@ -162,6 +162,7 @@ def resolve_model(
             and provider_cfg.get("base_url")
             and provider_cfg.get("model") == model_spec
         ):
+            provider_cfg, model_spec = _apply_provider_fallback(provider_cfg, model_spec)
             return _build_local_model(model_spec, provider_cfg)
 
     return model_spec
@@ -1009,6 +1010,103 @@ def _expand_env_ref(value: Any) -> Any:
             )
         return resolved
     return value
+
+
+# ── Provider fallback on endpoint outage ────────────────────────────────
+# A provider entry can name a standby with ``fallback_provider: <name>``.
+# At model-build time the primary's endpoint gets a cheap TCP health check
+# (TTL-cached); if it is unreachable the named fallback provider's config is
+# built instead. Health re-checks every _HEALTH_TTL seconds, so when the
+# primary comes back new model builds return to it automatically — in-flight
+# calls on a crashed endpoint still fail through their normal retry paths,
+# and the NEXT build (phase retry, next node) lands on the standby.
+
+_ENDPOINT_HEALTH: dict[str, tuple[bool, float]] = {}
+_HEALTH_TTL_SECONDS = 20.0
+
+
+def _endpoint_healthy(base_url: str) -> bool:
+    """TCP-connect health check for an OpenAI-compatible endpoint, TTL-cached.
+
+    Connect-level only (no HTTP round trip): the outage mode this guards
+    against is a crashed/restarting server process, which refuses the TCP
+    connection within milliseconds. A hung-but-listening server is NOT
+    detected here — that is what request timeouts are for.
+    """
+    import socket
+    import time
+    from urllib.parse import urlparse
+
+    cached = _ENDPOINT_HEALTH.get(base_url)
+    now = time.monotonic()
+    if cached and now - cached[1] < _HEALTH_TTL_SECONDS:
+        return cached[0]
+
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    healthy = False
+    if host:
+        try:
+            with socket.create_connection((host, port), timeout=1.5):
+                healthy = True
+        except OSError:
+            healthy = False
+    _ENDPOINT_HEALTH[base_url] = (healthy, now)
+    return healthy
+
+
+def _apply_provider_fallback(
+    provider_cfg: dict[str, Any], model_spec: str
+) -> tuple[dict[str, Any], str]:
+    """Reroute to the configured standby provider when the primary is down.
+
+    Follows ``fallback_provider`` references (cycle-guarded, max 3 hops)
+    until a provider with a healthy endpoint is found. When every endpoint
+    in the chain is down — or the fallback entry is missing/unusable — the
+    original provider is returned so the failure surfaces through the
+    normal connection-error path instead of being masked here.
+    """
+    if not provider_cfg.get("fallback_provider"):
+        return provider_cfg, model_spec
+    if _endpoint_healthy(_expand_env_ref(provider_cfg["base_url"])):
+        return provider_cfg, model_spec
+
+    from spine.config import SpineConfig
+
+    try:
+        spine_config = SpineConfig.load()
+    except Exception:  # noqa: BLE001 — config trouble must not mask the outage
+        return provider_cfg, model_spec
+
+    visited = {provider_cfg.get("name")}
+    current = provider_cfg
+    for _ in range(3):
+        fb_name = current.get("fallback_provider")
+        if not fb_name or fb_name in visited:
+            break
+        visited.add(fb_name)
+        fb = spine_config._lookup_provider_by_name(fb_name)
+        if not fb or not fb.get("base_url") or not str(fb.get("model", "")).startswith("openai:"):
+            logger.warning(
+                "fallback_provider %r is missing or not a local openai: provider — staying on %r",
+                fb_name, provider_cfg.get("name"),
+            )
+            break
+        if _endpoint_healthy(_expand_env_ref(fb["base_url"])):
+            logger.warning(
+                "provider %r endpoint %s is DOWN — falling back to provider %r (%s @ %s)",
+                provider_cfg.get("name"), provider_cfg.get("base_url"),
+                fb_name, fb.get("model"), fb.get("base_url"),
+            )
+            return dict(fb), str(fb["model"])
+        current = fb
+
+    logger.warning(
+        "provider %r endpoint is DOWN and no healthy fallback found — proceeding with primary",
+        provider_cfg.get("name"),
+    )
+    return provider_cfg, model_spec
 
 
 def _flatten_text_block_content(payload: dict[str, Any]) -> dict[str, Any]:
