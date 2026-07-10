@@ -192,3 +192,52 @@ def test_no_findings_no_do_not_break_block(tmp_path: Path) -> None:
     body = _gap_fixes_body(_state(tmp_path), {"id": "ui-provider-config"})
     assert "CURRENTLY PASSING" not in body
     assert "FAILED verification" in body
+
+
+def test_cross_attributed_fix_renders_for_owning_slice(tmp_path: Path) -> None:
+    """A remediation item keyed to the SURFACING slice still renders — with
+    only the matching fix — for the slice that OWNS the fix's file
+    (probe 21: the table-name fix belonged in the VERIFIED model slice but
+    the item named the crashing test slice)."""
+    d = tmp_path / "gaps"
+    d.mkdir()
+    (d / "gap_plan.json").write_text(json.dumps({
+        "remediation_items": [{
+            "slice_id": "test-slice",
+            "failures": ["Undefined table unit_of_measures"],
+            "root_cause": "model lacks $table override",
+            "fixes": [
+                {"file_path": "app/Models/UnitOfMeasure.php",
+                 "issue_description": "missing $table",
+                 "suggested_fix": "add protected $table = 'units_of_measure';"},
+                {"file_path": "tests/Unit/UnitOfMeasureTest.php",
+                 "issue_description": "weak assertions",
+                 "suggested_fix": "assert exact values"},
+            ],
+        }],
+    }), encoding="utf-8")
+    state = {"workspace_root": str(tmp_path), "gap_plan_path": "gaps"}
+    model_slice = {
+        "id": "model-slice",
+        "target_files": ["app/Models/UnitOfMeasure.php"],
+    }
+    body = _gap_fixes_body(state, model_slice)
+    assert "missing $table" in body
+    assert "add protected $table" in body
+    # The other file's fix belongs to a different slice — not rendered here.
+    assert "weak assertions" not in body
+
+
+def test_unrelated_slice_still_gets_nothing_from_cross_items(tmp_path: Path) -> None:
+    d = tmp_path / "gaps"
+    d.mkdir()
+    (d / "gap_plan.json").write_text(json.dumps({
+        "remediation_items": [{
+            "slice_id": "test-slice",
+            "fixes": [{"file_path": "app/Models/UnitOfMeasure.php",
+                       "issue_description": "missing $table"}],
+        }],
+    }), encoding="utf-8")
+    state = {"workspace_root": str(tmp_path), "gap_plan_path": "gaps"}
+    other = {"id": "migration-slice", "target_files": ["database/migrations/x.php"]}
+    assert _gap_fixes_body(state, other) == ""

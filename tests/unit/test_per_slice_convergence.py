@@ -191,3 +191,78 @@ def test_router_synthesizes_when_all_carried_forward() -> None:
         }
     )
     assert result == "synthesize_verification"
+
+
+# ── cross-slice reattribution (probe 21 / run ad237d70) ───────────────────────
+
+
+def _write_gap_plan(tmp_path, items):
+    import json as _json
+    from pathlib import Path as _Path
+
+    d = _Path(tmp_path) / ".spine" / "artifacts" / "w" / "gap_plan"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "gap_plan.json").write_text(
+        _json.dumps({"remediation_items": items}), encoding="utf-8"
+    )
+
+
+def test_gap_rework_reopens_verified_slice_implicated_by_id(tmp_path) -> None:
+    """A VERIFIED slice the gap plan names by slice_id is re-dispatched."""
+    _write_gap_plan(tmp_path, [{"slice_id": "view-slice", "fixes": []}])
+    mapped = _implement_state_mapper(
+        {
+            "work_id": "w",
+            "workspace_root": str(tmp_path),
+            "execution_waves": WAVES,
+            "verify_attempts": 1,
+            "retry_count": {},
+            "verification_findings": _findings(
+                **{"api-slice": "NOT_VERIFIED", "view-slice": "VERIFIED"}
+            ),
+        },
+        None,
+    )
+    assert [s["id"] for s in mapped["pending_slices"]] == ["api-slice", "view-slice"]
+
+
+def test_gap_rework_reopens_verified_slice_implicated_by_file(tmp_path) -> None:
+    """A VERIFIED slice is re-opened when a fix names ITS file even though the
+    remediation item is keyed to the slice where the failure surfaced."""
+    _write_gap_plan(tmp_path, [{
+        "slice_id": "api-slice",
+        "fixes": [{"file_path": "spine/ui/_pages/config_view.py",
+                   "issue_description": "table name mismatch"}],
+    }])
+    mapped = _implement_state_mapper(
+        {
+            "work_id": "w",
+            "workspace_root": str(tmp_path),
+            "execution_waves": WAVES,
+            "verify_attempts": 1,
+            "retry_count": {},
+            "verification_findings": _findings(
+                **{"api-slice": "NOT_VERIFIED", "view-slice": "VERIFIED"}
+            ),
+        },
+        None,
+    )
+    assert [s["id"] for s in mapped["pending_slices"]] == ["api-slice", "view-slice"]
+
+
+def test_gap_rework_without_gap_plan_filters_as_before(tmp_path) -> None:
+    """No gap_plan.json on disk → the convergence filter is unchanged."""
+    mapped = _implement_state_mapper(
+        {
+            "work_id": "w",
+            "workspace_root": str(tmp_path),
+            "execution_waves": WAVES,
+            "verify_attempts": 1,
+            "retry_count": {},
+            "verification_findings": _findings(
+                **{"api-slice": "NOT_VERIFIED", "view-slice": "VERIFIED"}
+            ),
+        },
+        None,
+    )
+    assert [s["id"] for s in mapped["pending_slices"]] == ["api-slice"]

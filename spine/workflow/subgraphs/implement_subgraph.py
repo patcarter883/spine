@@ -216,10 +216,23 @@ def _gap_fixes_body(state: ImplementSubgraphState, active_slice: dict) -> str:
         return ""
 
     ids = _slice_marker_ids([active_slice])
+    own_files = {str(t) for t in (active_slice.get("target_files") or []) if t}
     lines: list[str] = []
     for item in items:
-        if not isinstance(item, dict) or item.get("slice_id") not in ids:
+        if not isinstance(item, dict):
             continue
+        own_item = item.get("slice_id") in ids
+        fixes = [fx for fx in item.get("fixes") or [] if isinstance(fx, dict)]
+        if not own_item:
+            # Cross-slice reattribution: a fix can target THIS slice's file
+            # while the remediation item is keyed to the slice where the
+            # failure SURFACED (probe 21: the table-name fix belonged in the
+            # model slice but the item named the crashing test slice). A
+            # reopened slice must still see the fix meant for its file —
+            # and ONLY that fix; the item's other fixes belong elsewhere.
+            fixes = [fx for fx in fixes if str(fx.get("file_path")) in own_files]
+            if not fixes:
+                continue
         lines.append(
             f"A previous implementation of slice '{item.get('slice_id')}' "
             f"FAILED verification (priority: {item.get('priority', 'medium')})."
@@ -229,9 +242,7 @@ def _gap_fixes_body(state: ImplementSubgraphState, active_slice: dict) -> str:
         root_cause = str(item.get("root_cause") or "").strip()
         if root_cause:
             lines.append(f"Root cause: {root_cause}")
-        for fix in item.get("fixes") or []:
-            if not isinstance(fix, dict):
-                continue
+        for fix in fixes:
             lines.append(f"Required fix in {fix.get('file_path', '?')}:")
             issue = str(fix.get("issue_description") or "").strip()
             if issue:

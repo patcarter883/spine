@@ -659,3 +659,59 @@ class TestBuildGapPlanTools:
             summary="Fix after verification failure.",
         )
         assert "Gap plan artifacts written" in write_result
+
+class TestTargetFileSources:
+    """Live target-file source in the gap planner's payload (probe 21:
+    diagnosing from prose reports alone made the planner cross-slice blind —
+    the table-name mismatch was visible only in sibling files it never saw)."""
+
+    def _tool(self, tmp_path: Path) -> ReadVerificationFindingsTool:
+        return ReadVerificationFindingsTool(
+            workspace_root=str(tmp_path),
+            verify_dir=".spine/artifacts/w/verify",
+            plan_dir=".spine/artifacts/w/plan",
+            tasks_dir=".spine/artifacts/w/tasks",
+            impl_dir=".spine/artifacts/w/implement",
+        )
+
+    def _plan(self, tmp_path: Path, slices: list) -> None:
+        d = tmp_path / ".spine" / "artifacts" / "w" / "plan"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "plan.json").write_text(
+            json.dumps({"feature_slices": slices}), encoding="utf-8"
+        )
+
+    def test_sources_include_live_content_and_missing_marker(self, tmp_path: Path):
+        self._plan(tmp_path, [
+            {"id": "model", "target_files": ["app/UnitOfMeasure.php"]},
+            {"id": "test", "target_files": ["tests/UnitOfMeasureTest.php"]},
+        ])
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "UnitOfMeasure.php").write_text(
+            "<?php\nclass UnitOfMeasure {}\n", encoding="utf-8"
+        )
+        out = json.loads(self._tool(tmp_path)._run())
+        sources = out["target_file_sources"]
+        assert "class UnitOfMeasure" in sources["app/UnitOfMeasure.php"]
+        assert sources["tests/UnitOfMeasureTest.php"] == "(file does not exist)"
+
+    def test_oversized_file_truncated(self, tmp_path: Path):
+        self._plan(tmp_path, [{"id": "big", "target_files": ["big.php"]}])
+        (tmp_path / "big.php").write_text("x" * 10_000, encoding="utf-8")
+        out = json.loads(self._tool(tmp_path)._run())
+        src = out["target_file_sources"]["big.php"]
+        assert len(src) < 7000 and src.endswith("… (truncated)")
+
+    def test_no_plan_json_is_empty(self, tmp_path: Path):
+        out = json.loads(self._tool(tmp_path)._run())
+        assert out["target_file_sources"] == {}
+
+    def test_file_cap_noted(self, tmp_path: Path):
+        files = [f"f{i}.php" for i in range(15)]
+        self._plan(tmp_path, [{"id": "many", "target_files": files}])
+        for f in files:
+            (tmp_path / f).write_text("<?php\n", encoding="utf-8")
+        out = json.loads(self._tool(tmp_path)._run())
+        sources = out["target_file_sources"]
+        assert len([k for k in sources if k.endswith(".php")]) == 12
+        assert "omitted" in sources["(note)"]
