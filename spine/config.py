@@ -1112,6 +1112,7 @@ class SpineConfig:
         "guided_decoding",
         "structured_method",
         "streaming",
+        "fallback_provider",
         "max_concurrent_calls",
         "stream_usage",
         "reasoning",
