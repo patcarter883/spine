@@ -488,6 +488,21 @@ def _automated_checks(
                     r"^namespace\s+([A-Za-z0-9_\\]+)\s*;", src, _re.MULTILINE
                 )
                 declared = m.group(1) if m else "(none)"
+                if m is None and not _re.search(
+                    r"^\s*(?:final\s+|abstract\s+|readonly\s+)*"
+                    r"(?:class|interface|trait|enum)\s+\w+",
+                    src,
+                    _re.MULTILINE,
+                ):
+                    # PSR-4 governs autoloadable TYPES; a file that declares
+                    # none (procedural Pest tests — this repo's own tests/Unit
+                    # files all omit the namespace) has nothing to autoload.
+                    # Probe 20 hard-failed a correct test file on '(none)'.
+                    lines.append(
+                        f"OK {f}: no class declared — PSR-4 not applicable "
+                        "(procedural file)"
+                    )
+                    continue
                 ok = declared == expected
                 lines.append(
                     f"{'OK ' if ok else 'MISMATCH '}{f}: declared "

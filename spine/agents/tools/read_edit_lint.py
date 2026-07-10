@@ -598,6 +598,28 @@ def _fix_php_namespaces(path: Path, workspace_root: str) -> Optional[list[str]]:
         if m and m.group(1) != expected_ns:
             content = content.replace(m.group(0), f"namespace {expected_ns};", 1)
             changed.append(f"namespace {expected_ns};")
+        elif m is None and _re.search(
+            r"^\s*(?:final\s+|abstract\s+|readonly\s+)*"
+            r"(?:class|interface|trait|enum)\s+\w+",
+            content,
+            _re.MULTILINE,
+        ):
+            # A file that DECLARES a type but no namespace cannot autoload —
+            # insert the one PSR-4 dictates, after the <?php header and any
+            # declare() statements. Files with no type declaration
+            # (procedural Pest tests) are left alone: PSR-4 does not apply
+            # to them and this repo's own tests omit the namespace.
+            header = _re.match(
+                r"<\?php\s*\n(?:\s*declare\([^)]*\);\s*\n)*", content
+            )
+            if header:
+                pos = header.end()
+                content = (
+                    content[:pos]
+                    + f"\nnamespace {expected_ns};\n"
+                    + content[pos:]
+                )
+                changed.append(f"namespace {expected_ns}; (inserted)")
 
     def _fqcn_file(fqcn: str) -> Optional[Path]:
         for prefix, base in psr4.items():
