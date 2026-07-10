@@ -51,12 +51,15 @@ class TestApplyProviderFallback:
             cfg, spec = helpers._apply_provider_fallback(dict(PRIMARY), PRIMARY["model"])
         assert cfg["name"] == "remote-qwen"
         assert spec == "openai:remote/Qwen-Big"
-        hc.assert_called_once_with("http://10.0.0.1:1919/v1")
+        hc.assert_called_once_with("http://10.0.0.1:1919/v1", "openai:remote/Qwen-Big")
 
     def test_dead_primary_reroutes_to_standby(self, monkeypatch):
         _with_lookup(monkeypatch, [PRIMARY, STANDBY])
         health = {"http://10.0.0.1:1919/v1": False, "http://localhost:8010/v1": True}
-        with patch.object(helpers, "_endpoint_healthy", side_effect=health.__getitem__):
+        with patch.object(
+            helpers, "_endpoint_healthy",
+            side_effect=lambda url, model=None: health[url],
+        ):
             cfg, spec = helpers._apply_provider_fallback(dict(PRIMARY), PRIMARY["model"])
         assert cfg["name"] == "local-standby"
         assert spec == "openai:Qwen-Local-GGUF"
@@ -150,6 +153,7 @@ class TestResolveModelFallbackIntegration:
         )
         health = {"http://10.0.0.1:1919/v1": False, "http://localhost:8010/v1": True}
         built = {}
+        health_fn = lambda url, model=None: health[url]  # noqa: E731
 
         def fake_build(model_spec, provider_cfg):
             built["spec"] = model_spec
@@ -157,8 +161,57 @@ class TestResolveModelFallbackIntegration:
             return "model-instance"
 
         monkeypatch.setattr(helpers, "_build_local_model", fake_build)
-        with patch.object(helpers, "_endpoint_healthy", side_effect=health.__getitem__):
+        with patch.object(helpers, "_endpoint_healthy", side_effect=health_fn):
             result = helpers.resolve_model(None, phase="implement")
         assert result == "model-instance"
         assert built["spec"] == "openai:Qwen-Local-GGUF"
         assert built["cfg"]["name"] == "local-standby"
+
+
+class TestReadinessGate:
+    """A warming server listens before it serves (probe 24/67056e02: the TCP
+    check flipped healthy during mini-sglang's warmup and gap_plan died on
+    the half-up serve). Transitions TO healthy require a 1-token completion."""
+
+    def _tcp_ok(self, monkeypatch):
+        import socket as socket_mod
+
+        class FakeSock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(
+            socket_mod, "create_connection", lambda addr, timeout: FakeSock()
+        )
+
+    def test_recovery_requires_readiness(self, monkeypatch):
+        self._tcp_ok(monkeypatch)
+        with patch.object(helpers, "_endpoint_ready", return_value=False) as ready:
+            assert helpers._endpoint_healthy("http://u:1/v1", "openai:M") is False
+        ready.assert_called_once_with("http://u:1/v1", "openai:M")
+
+    def test_recovery_with_ready_backend_is_healthy(self, monkeypatch):
+        self._tcp_ok(monkeypatch)
+        with patch.object(helpers, "_endpoint_ready", return_value=True):
+            assert helpers._endpoint_healthy("http://u:1/v1", "openai:M") is True
+
+    def test_steady_state_healthy_skips_readiness(self, monkeypatch):
+        import time
+
+        self._tcp_ok(monkeypatch)
+        # Seed known-healthy with an EXPIRED timestamp so the TTL cache
+        # misses and the TCP probe re-runs, but the prior state is healthy.
+        helpers._ENDPOINT_HEALTH["http://u:1/v1"] = (
+            True, time.monotonic() - helpers._HEALTH_TTL_SECONDS - 1,
+        )
+        with patch.object(helpers, "_endpoint_ready") as ready:
+            assert helpers._endpoint_healthy("http://u:1/v1", "openai:M") is True
+        ready.assert_not_called()
+
+    def test_no_model_falls_back_to_tcp_only(self, monkeypatch):
+        self._tcp_ok(monkeypatch)
+        # _endpoint_ready returns True when it has no model to probe with.
+        assert helpers._endpoint_healthy("http://u:1/v1") is True
