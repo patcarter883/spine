@@ -133,7 +133,14 @@ class SliceDetail(BaseModel):
             "method name, property, or idiom — if the framework's standard "
             "convention delivers the behavior, the criterion must pass. No "
             "edge-case semantics the task didn't ask for. Every criterion "
-            "must be checkable from this slice's own files/diff/test run."
+            "must be checkable from this slice's own files/diff/test run. "
+            "NEVER WEAKEN a behavior the task/spec states: when it demands a "
+            "test assert a specific behavior, the criterion must encode that "
+            "EXACT observable ('asserts the persisted model's name and "
+            "abbreviation EQUAL the factory-generated values after a "
+            "database round-trip'), not a weaker stand-in — type checks, "
+            "non-empty checks, or unpersisted construction do NOT satisfy a "
+            "demanded persistence/equality behavior."
         ),
     )
 
