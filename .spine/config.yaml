@@ -114,6 +114,12 @@ providers:
     base_url: http://localhost:8010/v1
     api_key: vllm
     guided_decoding: true
+    # Degraded-mode co-routing: when the 1919 primary is down, the whole
+    # fleet consolidates onto single-stream Lemonade — judge lanes then use
+    # the SAME model as everything else so Lemonade never swaps models
+    # (batch 1: swap-window connection drops killed gap_plan twice). Snaps
+    # back to GLM automatically when the primary recovers.
+    degrade_with: local-qwen
     enabled: true
     stream_usage: true
     max_concurrent_calls: 1  # Lemonade @ localhost:8010 is single-stream
