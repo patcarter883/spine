@@ -1113,6 +1113,7 @@ class SpineConfig:
         "structured_method",
         "streaming",
         "fallback_provider",
+        "degrade_with",
         "max_concurrent_calls",
         "stream_usage",
         "reasoning",

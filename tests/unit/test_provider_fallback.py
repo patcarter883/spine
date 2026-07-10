@@ -215,3 +215,54 @@ class TestReadinessGate:
         self._tcp_ok(monkeypatch)
         # _endpoint_ready returns True when it has no model to probe with.
         assert helpers._endpoint_healthy("http://u:1/v1") is True
+
+
+class TestDegradedModeCoRouting:
+    """`degrade_with: <peer>` — when the peer's endpoint is down, this
+    provider serves from the peer's fallback so a single-stream standby
+    holds ONE resident model (batch 1: Qwen fallback + GLM judge swapped
+    on Lemonade and requests around each swap dropped, killing gap_plan
+    twice)."""
+
+    GLM = {
+        "name": "local-glm",
+        "model": "openai:GLM-Local",
+        "base_url": "http://localhost:8010/v1",
+        "degrade_with": "remote-qwen",
+    }
+
+    def _lookup(self, monkeypatch):
+        _with_lookup(monkeypatch, [self.GLM, PRIMARY, STANDBY])
+
+    def test_peer_down_coroutes_to_peer_fallback(self, monkeypatch):
+        self._lookup(monkeypatch)
+        health = {
+            "http://10.0.0.1:1919/v1": False,   # peer (primary) down
+            "http://localhost:8010/v1": True,   # standby healthy
+        }
+        with patch.object(
+            helpers, "_endpoint_healthy",
+            side_effect=lambda url, model=None: health[url],
+        ):
+            cfg, spec = helpers._apply_provider_fallback(dict(self.GLM), self.GLM["model"])
+        assert cfg["name"] == "local-standby"
+        assert spec == "openai:Qwen-Local-GGUF"
+
+    def test_peer_healthy_keeps_own_model(self, monkeypatch):
+        self._lookup(monkeypatch)
+        with patch.object(helpers, "_endpoint_healthy", return_value=True):
+            cfg, spec = helpers._apply_provider_fallback(dict(self.GLM), self.GLM["model"])
+        assert cfg["name"] == "local-glm"
+        assert spec == "openai:GLM-Local"
+
+    def test_peer_down_but_no_healthy_standby_keeps_own_model(self, monkeypatch):
+        self._lookup(monkeypatch)
+        with patch.object(helpers, "_endpoint_healthy", return_value=False):
+            cfg, spec = helpers._apply_provider_fallback(dict(self.GLM), self.GLM["model"])
+        assert cfg["name"] == "local-glm"
+
+    def test_missing_peer_entry_keeps_own_model(self, monkeypatch):
+        _with_lookup(monkeypatch, [self.GLM])  # peer not in providers
+        with patch.object(helpers, "_endpoint_healthy", return_value=False):
+            cfg, spec = helpers._apply_provider_fallback(dict(self.GLM), self.GLM["model"])
+        assert cfg["name"] == "local-glm"
