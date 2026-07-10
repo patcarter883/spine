@@ -594,6 +594,31 @@ class TestCustomVerifyChecks:
         assert "style nit" in block
         assert failures == []
 
+    def test_failing_check_keeps_exception_head_and_summary_tail(
+        self, tmp_path, monkeypatch
+    ):
+        """Head+tail clipping: the exception line prints near the HEAD of a
+        pest failure and the summary at the TAIL; tail-only clipping erased
+        the decisive SQLSTATE line (probe 23, run f788042e)."""
+        from spine.workflow.subgraphs.verify_subgraph import _automated_checks
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "x.php").write_text("<?php\n", encoding="utf-8")
+        self._gate(tmp_path, monkeypatch, [
+            {"name": "pest", "files": ["*.php"],
+             "command": (
+                 "echo 'SQLSTATE[23502]: Not null violation: column x'; "
+                 "for i in $(seq 400); do echo \"  at vendor/frame_$i.php:10\"; done; "
+                 "echo 'Tests: 1 failed'; false"
+             )},
+        ])
+        block, failures = _automated_checks(str(ws), ["x.php"])
+        assert "SQLSTATE[23502]" in block          # head survived
+        assert "Tests: 1 failed" in block          # tail survived
+        assert "[middle truncated]" in block
+        assert failures and "SQLSTATE[23502]" in failures[0]
+
     def test_unmatched_patterns_skip_the_command(self, tmp_path, monkeypatch):
         from spine.workflow.subgraphs.verify_subgraph import _automated_checks
 

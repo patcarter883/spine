@@ -314,6 +314,24 @@ def _clip_tail(text: str, cap: int) -> str:
     return "…[output truncated]…\n" + text[-cap:]
 
 
+def _clip_ends(text: str, head_cap: int, tail_cap: int) -> str:
+    """Keep the head AND tail, dropping the middle.
+
+    Failing test runners split the signal: the exception line prints near
+    the HEAD of the failure block, the summary at the TAIL, and vendor
+    stack frames pad the middle. Tail-only clipping erased the decisive
+    SQLSTATE line from probe 23's pest output (run f788042e) — the judge,
+    the gap planner, and the operator all saw nothing but stack frames.
+    """
+    if len(text) <= head_cap + tail_cap:
+        return text
+    return (
+        text[:head_cap]
+        + "\n…[middle truncated]…\n"
+        + text[-tail_cap:]
+    )
+
+
 def _custom_check_specs() -> list[dict]:
     """``verify_checks`` entries from ./spine-gate.yaml, ``[]`` on any failure.
 
@@ -544,13 +562,13 @@ def _automated_checks(
         timeout = int(spec.get("timeout_seconds", 300))
         rc, out = _run_shell(command, timeout)
         sections.append(
-            f"$ [{name}] {command}\n"
+            f"$ [{name}] {_clip_head(command, 300)}\n"
             + (f"OK — {name} passed." if rc == 0
-               else _clip_tail(out, 3500) or f"exit {rc}")
+               else _clip_ends(out, 1500, 2000) or f"exit {rc}")
         )
         if rc != 0 and spec.get("hard", True):
             hard_failures.append(
-                f"{name} failed (exit {rc}): " + _clip_tail(out, 600)
+                f"{name} failed (exit {rc}): " + _clip_ends(out, 350, 250)
             )
 
     # Feature-wide test evidence (ADVISORY). A slice's defect often only
@@ -577,7 +595,7 @@ def _automated_checks(
                 f"$ [feature tests — ADVISORY: attribute any failure to the "
                 f"slice whose FILES cause it] pytest -q {' '.join(py_sibs)}\n"
                 + ("OK — the feature's tests pass." if rc == 0
-                   else _clip_tail(out, 3000) or f"exit {rc}")
+                   else _clip_ends(out, 1200, 1800) or f"exit {rc}")
             )
         for spec in _custom_check_specs():
             patterns = spec.get("files") or []
@@ -598,7 +616,7 @@ def _automated_checks(
                 f"$ [feature tests via {name} — ADVISORY: attribute any "
                 f"failure to the slice whose FILES cause it] {command}\n"
                 + ("OK — the feature's tests pass." if rc == 0
-                   else _clip_tail(out, 3000) or f"exit {rc}")
+                   else _clip_ends(out, 1200, 1800) or f"exit {rc}")
             )
 
     if not sections:
