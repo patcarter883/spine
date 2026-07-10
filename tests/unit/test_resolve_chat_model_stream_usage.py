@@ -355,3 +355,23 @@ class TestReasoningLock:
         extra = captured.get("extra_body") or {}
         assert extra.get("reasoning_budget") == 0
         assert helpers._REASONING_LOCK_TAG not in (captured.get("tags") or [])
+
+    def test_cap_gets_reasoning_allowance_on_locked_model(self):
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(
+            model="m", api_key="x", base_url="http://local:1919/v1",
+            max_tokens=100, tags=[helpers._REASONING_LOCK_TAG],
+        )
+        out = helpers.cap_completion_tokens(model, 4096)
+        assert out.max_tokens == 4096 + helpers._REASONING_CAP_ALLOWANCE
+
+    def test_cap_unchanged_on_unlocked_model(self):
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(
+            model="m", api_key="x", base_url="http://local:1919/v1",
+            max_tokens=100,
+        )
+        out = helpers.cap_completion_tokens(model, 4096)
+        assert out.max_tokens == 4096
