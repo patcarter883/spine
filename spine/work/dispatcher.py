@@ -1692,6 +1692,10 @@ async def restart_work(
         # back to running, which also clears the cooperative-cancel signal
         # the (by now halted) old run was polling.
         TaskStatus.CANCELLED.value,
+        # A failed run (endpoint outage, circuit breaker) is precisely what
+        # an operator wants to restart once the cause is resolved — batch 1
+        # needed manual DB status flips twice to relaunch failed runs.
+        TaskStatus.FAILED.value,
     )
     if status not in restartable:
         raise ValueError(
