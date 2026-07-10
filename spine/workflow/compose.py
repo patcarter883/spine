@@ -267,6 +267,41 @@ def _plan_state_mapper(parent_state: WorkflowState, config) -> dict:
     }
 
 
+def _gap_plan_implicated(workspace_root: str, work_id: str) -> tuple[set, set]:
+    """(slice_ids, file_paths) the current gap plan's remediations implicate.
+
+    Read from gap_plan.json on disk (the same artifact ``_gap_fixes_body``
+    renders for the editors). Empty sets on any load/shape problem — the
+    per-slice convergence filter then behaves exactly as before.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from spine.agents.artifacts import artifact_path as _artifact_path
+
+    try:
+        gap_dir = _artifact_path(work_id, PhaseName.GAP_PLAN.value)
+        data = _json.loads(
+            (_Path(workspace_root) / gap_dir / "gap_plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return set(), set()
+    ids: set = set()
+    files: set = set()
+    items = data.get("remediation_items") if isinstance(data, dict) else None
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("slice_id"):
+            ids.add(str(item["slice_id"]))
+        for fix in item.get("fixes") or []:
+            if isinstance(fix, dict) and fix.get("file_path"):
+                files.add(str(fix["file_path"]))
+    return ids, files
+
+
 def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
     work_id = parent_state.get("work_id", "")
     verify_attempts = parent_state.get("verify_attempts", 0)
@@ -291,6 +326,25 @@ def _implement_state_mapper(parent_state: WorkflowState, config) -> dict:
             for f in findings
             if isinstance(f, dict) and f.get("verdict") == "VERIFIED"
         }
+        # Cross-slice reattribution: a VERIFIED slice is REOPENED when the
+        # gap plan implicates it — by slice_id or by naming one of its files
+        # in a fix. Probe 21 (run ad237d70): the test slice crashed on a
+        # table-name mismatch whose fix belonged in the VERIFIED model
+        # slice; the filter below locked that slice out and the loop
+        # re-edited the one slice that could not fix it until the cap.
+        reopened_ids, implicated_files = _gap_plan_implicated(
+            parent_state.get("workspace_root", "."), work_id
+        )
+        verified_ids -= reopened_ids
+        if implicated_files:
+            verified_ids = {
+                sid for sid in verified_ids
+                if not any(
+                    str(t) in implicated_files
+                    for s in pending if s.get("id") == sid
+                    for t in (s.get("target_files") or [])
+                )
+            }
         kept = [s for s in pending if s.get("id") not in verified_ids]
         if verified_ids and kept and len(kept) < len(pending):
             logger.info(

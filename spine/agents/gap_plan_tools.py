@@ -124,7 +124,50 @@ class ReadVerificationFindingsTool(BaseTool):
             except OSError as exc:
                 result["impl_error"] = f"Could not read implementation.md: {exc}"
 
+        # Live CURRENT source of every feature target file. The reports above
+        # are prose ABOUT the code; diagnosing from prose alone made the
+        # planner cross-slice blind: probe 21 (run ad237d70) prescribed a
+        # RefreshDatabase trait for an Undefined-table crash whose actual
+        # cause — the model missing a $table override for the migration's
+        # table name — was plainly visible in two sibling files it never saw.
+        result["target_file_sources"] = self._target_file_sources(workspace)
+
         return json.dumps(result, ensure_ascii=False)
+
+    _MAX_SOURCE_FILES = 12
+    _MAX_FILE_CHARS = 6000
+
+    def _target_file_sources(self, workspace: Path) -> dict[str, str]:
+        """{rel_path: current content} for the plan's target files, bounded."""
+        plan_json = workspace / self.plan_dir / "plan.json"
+        try:
+            plan = json.loads(plan_json.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        files: list[str] = []
+        for sl in plan.get("feature_slices") or []:
+            if not isinstance(sl, dict):
+                continue
+            for f in sl.get("target_files") or []:
+                f = str(f).strip()
+                if f and f not in files:
+                    files.append(f)
+        sources: dict[str, str] = {}
+        for rel in files[: self._MAX_SOURCE_FILES]:
+            path = workspace / rel
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                sources[rel] = "(file does not exist)"
+                continue
+            if len(text) > self._MAX_FILE_CHARS:
+                text = text[: self._MAX_FILE_CHARS] + "\n… (truncated)"
+            sources[rel] = text
+        if len(files) > self._MAX_SOURCE_FILES:
+            sources["(note)"] = (
+                f"{len(files) - self._MAX_SOURCE_FILES} more target file(s) omitted"
+            )
+        return sources
 
     async def _arun(self, **kwargs: Any) -> str:
         return self._run(**kwargs)
