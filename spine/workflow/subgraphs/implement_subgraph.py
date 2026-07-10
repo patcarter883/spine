@@ -900,6 +900,65 @@ def _reference_symbols_body(
     return "\n\n".join(blocks)
 
 
+_DEP_FILES_MAX = 3
+_DEP_FILE_MAX_CHARS = 4000
+
+
+def _dependency_files_body(
+    state: ImplementSubgraphState, active_slice: dict, workspace_root: str
+) -> str:
+    """LIVE source of files created by the slices this slice depends on.
+
+    Files a sibling slice created THIS RUN are not in the codebase index, so
+    their reference_symbols are scrubbed as phantoms and nothing inlines
+    their real API — the editor invents one instead (probe 22/f9aac445: the
+    test called generateName()/generateUuid() on a factory, two waves
+    earlier, that defines neither; probe 21's model/migration table mismatch
+    is the same blindness). Waves are dependency-ordered, so a dependency's
+    files exist on disk by the time this slice runs — inline them, bounded.
+    Returns '' when the slice has no dependencies or on any load problem.
+    """
+    dep_ids = {str(d) for d in (active_slice.get("dependencies") or []) if d}
+    if not dep_ids:
+        return ""
+    from pathlib import Path
+
+    plan_dir = state.get("plan_path")
+    if not plan_dir:
+        return ""
+    try:
+        plan = json.loads(
+            (Path(workspace_root) / plan_dir / "plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return ""
+    own_files = {str(t) for t in (active_slice.get("target_files") or []) if t}
+    blocks: list[str] = []
+    for sl in plan.get("feature_slices") or []:
+        if not isinstance(sl, dict) or str(sl.get("id")) not in dep_ids:
+            continue
+        for rel in sl.get("target_files") or []:
+            rel = str(rel).strip()
+            if not rel or rel in own_files:
+                continue  # own target files are inlined by _target_files_body
+            try:
+                text = (Path(workspace_root) / rel).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if len(text) > _DEP_FILE_MAX_CHARS:
+                text = text[:_DEP_FILE_MAX_CHARS] + "\n… (truncated)"
+            blocks.append(
+                f"### `{rel}` (created by dependency slice '{sl.get('id')}' "
+                "THIS RUN — call EXACTLY the API defined here; do NOT invent "
+                f"methods on it)\n```\n{text}\n```"
+            )
+            if len(blocks) >= _DEP_FILES_MAX:
+                return "\n\n".join(blocks)
+    return "\n\n".join(blocks)
+
+
 def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
     """Return a copy of *active_slice* with non-existent reference_symbols removed.
 
@@ -1267,6 +1326,9 @@ async def _slice_implementer_node(
 
         db_path, workspace_root = _index_ctx(state)
         refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
+        dep_body = _dependency_files_body(state, active_slice, workspace_root)
+        if dep_body:
+            refs_body = (refs_body + "\n\n" + dep_body) if refs_body else dep_body
         plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
 
         # Directive: approach + notes only — target_files / acceptance / tool
@@ -1619,6 +1681,9 @@ async def _synthesis_implementer_node(
         }
         slice_json = json.dumps(public_slice, indent=2, ensure_ascii=False, default=str)
         refs_body = _reference_symbols_body(active_slice, db_path, workspace_root)
+        dep_body = _dependency_files_body(state, active_slice, workspace_root)
+        if dep_body:
+            refs_body = (refs_body + "\n\n" + dep_body) if refs_body else dep_body
         plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
         target_files = [f for f in (active_slice.get("target_files") or []) if f]
         # Inline the CURRENT (live) content of every target file so a serialized
