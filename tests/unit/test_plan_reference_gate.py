@@ -561,3 +561,33 @@ class TestPhpVendorSymbols:
         out = check_reference_symbols(plan, None, None, db_path="db")
         assert out is not None
         assert "UIApi.get_ghost_method" in out["reason"]
+
+
+# ── PHP :: provides normalization (run b15cee51, stagnation-parked twice) ─────
+
+
+def test_php_provides_new_controller_method_not_flagged(index) -> None:
+    """'FileController::store' is a NEW method on a NEW class — rsplit(':')
+    was eating the owner and flagging bare 'store' against any existing
+    controller's store (universal Laravel verbs made every new controller
+    'already exist')."""
+    index({"app/Invite.php": ["InvitationController", "InvitationController.store"]})
+    plan = _plan(
+        {
+            "id": "ctrl",
+            "provides": [
+                "App\\Http\\Controllers\\Api\\V1\\Farm\\FileController::store"
+            ],
+        }
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_php_provides_genuinely_existing_method_still_flagged(index) -> None:
+    index({"app/Invite.php": ["InvitationController", "InvitationController.store"]})
+    plan = _plan(
+        {"id": "ctrl", "provides": ["InvitationController::store"]}
+    )
+    result = check_reference_symbols(plan, _spec(), None, db_path=DB)
+    assert result is not None
+    assert "ALREADY EXISTS" in result["reason"]
