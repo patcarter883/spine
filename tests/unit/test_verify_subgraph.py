@@ -771,3 +771,46 @@ class TestFeatureWideTestEvidence:
         assert block.count("test_ok.py") >= 1
         assert "ADVISORY" not in block
         assert failures == []
+
+
+class TestJudgeJsonSalvage:
+    """Prose-wrapped verdicts are salvaged, not auto-failed (batch 1: five
+    slices failed with 'Unstructured output from subagent' because the
+    degraded-mode judge's backend ignored response_format and wrapped its
+    verdict JSON in thinking prose)."""
+
+    def test_verdict_object_inside_prose_is_salvaged(self):
+        from spine.workflow.subgraphs.verify_subgraph import _extract_json_object
+
+        content = (
+            "Let me assess the slice. The checks look clean overall.\n"
+            'Here is my verdict: {"verdict": "VERIFIED", "checklist": '
+            '[{"criterion": "x", "passed": true}], "gaps": []} — done.'
+        )
+        parsed = _extract_json_object(content)
+        assert parsed and parsed["verdict"] == "VERIFIED"
+
+    def test_prefers_object_with_verdict_key(self):
+        from spine.workflow.subgraphs.verify_subgraph import _extract_json_object
+
+        content = (
+            'First, some data: {"note": "irrelevant"}. '
+            'Then: {"verdict": "NOT_VERIFIED", "gaps": ["g"]}'
+        )
+        parsed = _extract_json_object(content)
+        assert parsed and parsed["verdict"] == "NOT_VERIFIED"
+
+    def test_no_object_returns_none(self):
+        from spine.workflow.subgraphs.verify_subgraph import _extract_json_object
+
+        assert _extract_json_object("no json here at all") is None
+
+    def test_nested_and_string_braces_handled(self):
+        from spine.workflow.subgraphs.verify_subgraph import _extract_json_object
+
+        content = (
+            'x {"verdict": "VERIFIED", "detail": "brace } in string", '
+            '"nested": {"a": 1}} y'
+        )
+        parsed = _extract_json_object(content)
+        assert parsed and parsed["nested"] == {"a": 1}
