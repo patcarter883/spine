@@ -945,6 +945,59 @@ async def _run_slice_verifier_node(
     return {"verification_results": [verification_result]}
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """Salvage the first balanced JSON object embedded in prose, or None.
+
+    Under degraded-mode co-routing the judge lane's backend can ignore the
+    spec-level response_format entirely — the model then wraps its verdict
+    JSON in thinking prose, json.loads fails on the full content, and the
+    slice is auto-failed with 'Unstructured output from subagent' (batch 1:
+    five slices across b15cee51/d8bc459c failed on parse, not on code).
+    Scan for balanced top-level objects and return the first that parses
+    to a dict containing a 'verdict' key (any dict as a last resort).
+    """
+    best_any: dict | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        start = text.find("{", i)
+        if start == -1:
+            break
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, n):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : j + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        if "verdict" in parsed:
+                            return parsed
+                        if best_any is None:
+                            best_any = parsed
+                    break
+        i = start + 1
+    return best_any
+
+
 def _strip_json_fence(text: str) -> str:
     """Strip a leading/trailing Markdown code fence around a JSON payload.
 
@@ -997,6 +1050,10 @@ def _extract_verification_result(result: dict, slice_id: str) -> dict:
                     return parsed
             except (json.JSONDecodeError, TypeError):
                 pass
+            salvaged = _extract_json_object(content)
+            if salvaged is not None:
+                salvaged["slice_name"] = slice_id
+                return salvaged
             return {
                 "slice_name": slice_id,
                 "verdict": "NOT_VERIFIED",
