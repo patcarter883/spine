@@ -75,6 +75,14 @@ def _normalize_symbol(sym: str) -> str:
     dropped. Plain dotted names pass through unchanged.
     """
     s = (sym or "").strip().split("(", 1)[0].strip()
+    # PHP static/method form FIRST: 'FileController::store' is an OWNER
+    # qualifier, not format drift — rsplit(':') was eating the class and
+    # reducing the provides to bare 'store', which then matched ANY
+    # controller's store in the index (run b15cee51: three universal
+    # Laravel verbs flagged as "already exists" against
+    # InvitationController, an unsatisfiable verdict the planner chased
+    # to a stagnation park TWICE).
+    s = s.replace("::", ".")
     if ":" in s:
         s = s.rsplit(":", 1)[-1].strip()
     return s
