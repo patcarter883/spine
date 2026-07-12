@@ -873,7 +873,8 @@ async def _try_decomposed_plan(
         if retry_count > 0:
             fb = _render_rework_feedback(last_critic_review, feedback) or ""
         syn = await synthesize_plan(
-            dict(state), config, spec_md, workspace_root, plan_dir, feedback=fb
+            dict(state), config, spec_md, workspace_root, plan_dir, feedback=fb,
+            escalation_level=int(retry_count or 0),
         )
         if not syn.startswith(("ERROR", "VALIDATION_ERROR")):
             logger.info("[%s] PLAN: decomposed synthesis succeeded — %s", work_id, syn[:100])

@@ -375,3 +375,44 @@ class TestReasoningLock:
         )
         out = helpers.cap_completion_tokens(model, 4096)
         assert out.max_tokens == 4096
+
+
+class TestApplyRsa:
+    """Per-call RSA effort patches — the dynamic test-time-compute lever."""
+
+    def _model(self, **kw):
+        from langchain_openai import ChatOpenAI
+
+        kw.setdefault("model", "m")
+        kw.setdefault("api_key", "x")
+        kw.setdefault("base_url", "http://local:1919/v1")
+        return ChatOpenAI(**kw)
+
+    def test_patch_merges_over_provider_base(self):
+        model = self._model(extra_body={"rsa": {"n": 16, "t": 2, "temperature": 0.6}})
+        out = helpers.apply_rsa(model, {"n": 8, "t": 1})
+        rsa = out.extra_body["rsa"]
+        assert rsa["n"] == 8 and rsa["t"] == 1
+        assert rsa["temperature"] == 0.6  # provider template preserved
+
+    def test_activation_flips_streaming_and_timeout(self):
+        """The RSA shim emits nothing until the final aggregated answer — a
+        streaming call would hang the per-chunk watchdog."""
+        model = self._model(streaming=True, request_timeout=300)
+        out = helpers.apply_rsa(model, {"n": 4, "k": 2, "t": 1, "temperature": 0.5})
+        assert out.streaming is False
+        assert out.request_timeout == 1800
+
+    def test_disabling_patch_keeps_streaming(self):
+        model = self._model(streaming=True, extra_body={"rsa": {"n": 16}})
+        out = helpers.apply_rsa(model, {"enabled": False})
+        assert out.streaming is True
+        assert out.extra_body["rsa"]["enabled"] is False
+
+    def test_none_patch_is_noop(self):
+        model = self._model()
+        assert helpers.apply_rsa(model, None) is model
+
+    def test_non_openai_model_returned_unchanged(self):
+        sentinel = object()
+        assert helpers.apply_rsa(sentinel, {"n": 4}) is sentinel

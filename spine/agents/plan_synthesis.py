@@ -604,9 +604,13 @@ async def _run_manager(
     config: RunnableConfig | None,
     work_id: str,
     feedback: str = "",
+    escalation_level: int = 0,
 ) -> PlanSkeleton:
     """One small structured call → the plan skeleton (stubs)."""
-    model = resolve_chat_model(config, session_id=work_id, phase=_phase("manager"))
+    model = resolve_chat_model(
+        config, session_id=work_id, phase=_phase("manager"),
+        escalation_level=escalation_level,
+    )
     model = suppress_reasoning(cap_completion_tokens(model, _MANAGER_MAX_COMPLETION_TOKENS))
     structured = bind_structured_output(model, PlanSkeleton)
     blocks = [
@@ -886,6 +890,7 @@ async def synthesize_plan(
     workspace_root: str,
     plan_dir: str,
     feedback: str = "",
+    escalation_level: int = 0,
 ) -> str:
     """Run the decomposed synthesis and write plan.md/plan.json.
 
@@ -896,7 +901,14 @@ async def synthesize_plan(
     work_id = state.get("work_id", "unknown")
     research = _research_text(state)
 
-    skeleton = await _run_manager(spec_md, research, config, work_id, feedback=feedback)
+    # Critic-retry rounds climb the escalation ladder: a rung under
+    # `providers.phases.plan.escalation` can carry a bigger `rsa` effort
+    # dict (or a stronger provider), so the rounds the critic keeps
+    # bouncing get more test-time compute instead of the same attempt again.
+    skeleton = await _run_manager(
+        spec_md, research, config, work_id, feedback=feedback,
+        escalation_level=escalation_level,
+    )
 
     # Reconcile the cross-slice API contract BEFORE the per-slice workers run:
     # auto-inject producer→consumer dependency edges, and if a consumer still
@@ -910,7 +922,10 @@ async def synthesize_plan(
             + "CROSS-SLICE CONTRACT ERRORS — fix these so the plan is internally "
             "consistent:\n" + "\n".join(f"- {v}" for v in violations)
         )
-        skeleton = await _run_manager(spec_md, research, config, work_id, feedback=contract_fb)
+        skeleton = await _run_manager(
+            spec_md, research, config, work_id, feedback=contract_fb,
+            escalation_level=escalation_level,
+        )
         residual = repair_and_validate_contracts(skeleton, work_id)
         if residual:
             logger.warning(
