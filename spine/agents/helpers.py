@@ -352,6 +352,48 @@ def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
         return model
 
 
+def apply_rsa(model: BaseChatModel, patch: dict | None) -> BaseChatModel:
+    """Return a model_copy with a per-CALL RSA effort patch — the dynamic lever.
+
+    The provider's `rsa` config sets a lane's STATIC effort at build time;
+    this merges *patch* over that base for one call, so callsites can spend
+    test-time compute exactly where a runtime signal says it pays: a plan
+    round the critic keeps bouncing, a late gap cycle, a final-mile slice,
+    a judge tie-break. `{"enabled": False}` (or None patch) is a no-op copy.
+
+    Activating RSA on a model built for plain streaming would hang the
+    per-chunk watchdog (the shim emits nothing until the final aggregated
+    answer), so an ACTIVATING patch also flips the copy to non-streaming
+    and gives it the long RSA request timeout — mirroring what
+    _build_local_model does for statically-active RSA lanes.
+
+    ChatOpenAI-scoped (extra_body carrier); other model classes are
+    returned unchanged. Fails open on any copy error.
+    """
+    if not patch:
+        return model
+    try:
+        from langchain_openai import ChatOpenAI
+
+        if not isinstance(model, ChatOpenAI):
+            return model
+        extra = dict(getattr(model, "extra_body", None) or {})
+        base = extra.get("rsa")
+        base_dict = dict(base) if isinstance(base, dict) else {}
+        merged = {**base_dict, **patch}
+        extra["rsa"] = merged
+        updates: dict[str, Any] = {"extra_body": extra}
+        if merged.get("enabled") is not False:
+            updates["streaming"] = False
+            timeout = getattr(model, "request_timeout", None)
+            if not timeout or (isinstance(timeout, (int, float)) and timeout < 1800):
+                updates["request_timeout"] = 1800
+        return model.model_copy(update=updates)
+    except Exception:  # noqa: BLE001 — effort tuning must never break the call
+        logger.debug("apply_rsa: copy failed — using model as-is", exc_info=True)
+        return model
+
+
 def disable_streaming(model: BaseChatModel) -> BaseChatModel:
     """Return a model_copy with streaming off — for single-shot structured calls.
 
