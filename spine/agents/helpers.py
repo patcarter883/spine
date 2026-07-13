@@ -1113,8 +1113,34 @@ def _endpoint_ready(base_url: str, model: str | None) -> bool:
     import json as _json
     import urllib.request
 
+    model_id = str(model).removeprefix("openai:")
+
+    # IDENTITY first: a repurposed box answers completions for ANY model
+    # name (mini-sglang ignores the field), so a pulse alone proved nothing —
+    # when 1919 came back serving Zaya, the Qwen provider marked healthy and
+    # every main-lane call silently ran on the wrong 8B instead of falling
+    # back to the standby. /v1/models is the serve's own statement of what
+    # it hosts; the provider's model must be in it.
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/models", timeout=5
+        ) as resp:
+            listing = _json.load(resp)
+        served = {
+            str(m.get("id", "")) for m in (listing.get("data") or [])
+        }
+        if served and model_id not in served:
+            logger.warning(
+                "endpoint %s is up but serves %s, not %r — treating as DOWN "
+                "for this provider",
+                base_url, sorted(served)[:3], model_id,
+            )
+            return False
+    except Exception:  # noqa: BLE001 — no listing ⇒ fall through to the pulse
+        pass
+
     body = _json.dumps({
-        "model": str(model).removeprefix("openai:"),
+        "model": model_id,
         "messages": [{"role": "user", "content": "ok"}],
         "max_tokens": 1,
     }).encode()

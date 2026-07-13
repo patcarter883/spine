@@ -266,3 +266,73 @@ class TestDegradedModeCoRouting:
         with patch.object(helpers, "_endpoint_healthy", return_value=False):
             cfg, spec = helpers._apply_provider_fallback(dict(self.GLM), self.GLM["model"])
         assert cfg["name"] == "local-glm"
+
+
+class TestReadinessModelIdentity:
+    """A repurposed box answers completions for ANY model name — the pulse
+    alone proved nothing (1919 came back serving Zaya; the Qwen provider
+    marked healthy and every main-lane call ran on the wrong 8B). The
+    probe now checks /v1/models identity first."""
+
+    def _urlopen_factory(self, served_ids, pulse_ok=True):
+        import io, json
+
+        class FakeResp(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req_or_url, timeout=None):
+            url = req_or_url if isinstance(req_or_url, str) else req_or_url.full_url
+            if url.endswith("/models"):
+                return FakeResp(json.dumps(
+                    {"data": [{"id": i} for i in served_ids]}
+                ).encode())
+            if not pulse_ok:
+                raise OSError("refused")
+            return FakeResp(b'{"choices": []}')
+
+        return fake_urlopen
+
+    def test_wrong_served_model_is_not_ready(self, monkeypatch):
+        import urllib.request
+
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            self._urlopen_factory(["/models/ZAYA1-8B-fp8"]),
+        )
+        assert helpers._endpoint_ready(
+            "http://x:1919/v1", "openai:pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"
+        ) is False
+
+    def test_matching_model_passes_to_pulse(self, monkeypatch):
+        import urllib.request
+
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            self._urlopen_factory(["pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"]),
+        )
+        assert helpers._endpoint_ready(
+            "http://x:1919/v1", "openai:pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"
+        ) is True
+
+    def test_no_listing_falls_through_to_pulse(self, monkeypatch):
+        import urllib.request
+
+        def fake_urlopen(req_or_url, timeout=None):
+            url = req_or_url if isinstance(req_or_url, str) else req_or_url.full_url
+            if url.endswith("/models"):
+                raise OSError("no listing endpoint")
+            import io
+            class FakeResp(io.BytesIO):
+                status = 200
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            return FakeResp(b"{}")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        assert helpers._endpoint_ready("http://x:1919/v1", "openai:M") is True
