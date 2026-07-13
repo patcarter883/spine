@@ -43,7 +43,13 @@ logger = logging.getLogger(__name__)
 # Strict envelopes, tried in priority order. Hermes ``<tool_call>`` is the
 # strongest signal; fenced blocks and bare objects need an explicit args-like key
 # to qualify, so ordinary prose / example JSON is not mistaken for a call.
-_HERMES_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+# `<tool_call>` is the Hermes envelope; `<tools>`/`<tool>` is what the Zaya
+# RSA serve emits when tools are bound (aggregation does not parse calls
+# natively — smoke 2026-07-13: '<tools>\n{"name": "get_weather", …}\n</tools>'
+# in content with tool_calls empty). Same strict inner-payload rules apply.
+_HERMES_RE = re.compile(
+    r"<(tool_call|tools|tool)>\s*(.*?)\s*</\1>", re.DOTALL | re.IGNORECASE
+)
 _FENCED_RE = re.compile(
     r"```(?:json|yaml|yml|tool_call)?[ \t]*\r?\n(.*?)```",
     re.DOTALL | re.IGNORECASE,
@@ -160,7 +166,8 @@ def extract_tool_calls(text: str) -> tuple[list[dict[str, Any]], str]:
     if hermes:
         calls: list[dict[str, Any]] = []
         for m in hermes:
-            call = _obj_to_call(_parse_payload(m.group(1)), require_args_key=False)
+            # group(1) is the envelope tag (backreferenced); group(2) the payload.
+            call = _obj_to_call(_parse_payload(m.group(2)), require_args_key=False)
             if call:
                 calls.append(call)
         if calls:

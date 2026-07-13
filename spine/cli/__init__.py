@@ -106,7 +106,7 @@ def run(
     if start is None:
         start = project_id is None
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     verb = "Submitting" if start else "Creating"
     console.print(f"[bold blue]{verb} work:[/bold blue] {description[:100]}")
     console.print(f"[dim]Work type: {work_type}[/dim]")
@@ -176,7 +176,7 @@ def index(workspace_root: str | None, config_path: str, wipe: bool) -> None:
     Use ``--wipe`` to force a full rebuild (e.g. after an embedding-model
     swap or a change to how documents are built).
     """
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     if wipe:
         from spine.persistence.vector_store import VectorStore
@@ -219,7 +219,7 @@ def status_cmd(work_id: str, config_path: str) -> None:
 
     WORK_ID is the unique identifier for the work item.
     """
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     from spine.work.dispatcher import get_work_status
 
@@ -273,7 +273,7 @@ def status_cmd(work_id: str, config_path: str) -> None:
 )
 def list_cmd(status_filter: str | None, limit: int, config_path: str) -> None:
     """List work items."""
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     from spine.work.dispatcher import list_work
 
@@ -324,7 +324,7 @@ def resume(work_id: str, human_input: str | None, config_path: str) -> None:
 
     WORK_ID is the unique identifier for the paused work item.
     """
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     from spine.work.dispatcher import get_work_status
 
@@ -383,7 +383,7 @@ def restart(work_id: str, config_path: str, clear_artifacts: bool) -> None:
     """
     import asyncio
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     from spine.work.dispatcher import restart_work
 
@@ -415,7 +415,7 @@ def restart(work_id: str, config_path: str, clear_artifacts: bool) -> None:
 )
 def worker(config_path: str) -> None:
     """Start the RalphLoopWorker background processor."""
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     from spine.work.ralph_worker import get_worker
 
@@ -456,7 +456,7 @@ def ui(port: int, config_path: str, debug_llm: bool) -> None:
     import spine
     from spine.config import SpineConfig
 
-    SpineConfig.load(path=config_path)
+    SpineConfig.load_as_active(path=config_path)
 
     app_path = str(pathlib.Path(spine.__file__).parent / "ui" / "app.py")
     console.print(f"[bold blue]Starting SPINE UI on http://localhost:{port}[/bold blue]")
@@ -514,7 +514,7 @@ def export(work_id: str, output: str | None, output_format: str, config_path: st
     WORK_ID is the unique identifier for the work item.
     Outputs specification, plan, research data, and prompts.
     """
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
 
     from spine.work.dispatcher import get_work_status
 
@@ -573,7 +573,7 @@ def init(path: str, tech_stack: tuple[str, ...], force: bool) -> None:
     managed, preserved = init_workspace(path, list(tech_stack), force=force)
 
     config_path = f"{path.rstrip('/')}/.spine/config.yaml"
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     config.ensure_dirs()
 
     table = Table(title="Scaffolded files", show_header=True, header_style="bold")
@@ -625,7 +625,7 @@ def project_create(
     from spine.models.types import ProjectSpec
     from spine.persistence.project_store import ProjectStore
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = ProjectStore(base_path=config.project_path)
 
     if store.load_project(project_id) is not None:
@@ -668,7 +668,7 @@ def project_add(project_id: str, work_ids: tuple[str, ...], config_path: str) ->
     """Add one or more WORK_IDS to PROJECT_ID's membership."""
     from spine.persistence.project_store import ProjectStore
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = ProjectStore(base_path=config.project_path)
     try:
         spec = store.add_members(project_id, list(work_ids))
@@ -689,7 +689,7 @@ def project_show(project_id: str, config_path: str) -> None:
     from spine.persistence.project_store import ProjectStore
     from spine.project.aggregator import aggregate_project_coverage
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = ProjectStore(base_path=config.project_path)
     spec = store.load_project(project_id)
     if spec is None:
@@ -781,7 +781,7 @@ def project_list(config_path: str) -> None:
     """List all projects."""
     from spine.persistence.project_store import ProjectStore
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = ProjectStore(base_path=config.project_path)
     ids = store.list_projects()
     if not ids:
@@ -813,7 +813,7 @@ def project_verify(project_id: str, config_path: str) -> None:
     from spine.persistence.project_store import ProjectStore
     from spine.project.project_verifier import run_project_verify
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = ProjectStore(base_path=config.project_path)
 
     if store.load_project(project_id) is None:
@@ -876,7 +876,7 @@ def project_review(project_id: str, config_path: str) -> None:
     from spine.persistence.project_store import ProjectStore
     from spine.project.project_reviewer import run_project_review
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = ProjectStore(base_path=config.project_path)
 
     if store.load_project(project_id) is None:
@@ -951,7 +951,7 @@ def experience_list(phase: str | None, as_json: bool, config_path: str) -> None:
     """List distilled lessons, newest first (optionally filtered by --phase)."""
     from spine.agents.experience import experience_store_for
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     lessons = experience_store_for(config).all()
     lessons.sort(key=lambda le: (le.created_at or "", le.salience), reverse=True)
     if phase:
@@ -998,7 +998,7 @@ def experience_clear(
     """Delete lessons — a single --id, all of one --phase, or everything."""
     from spine.agents.experience import experience_store_for
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     store = experience_store_for(config)
 
     if lesson_id:
@@ -1060,7 +1060,7 @@ def facts_list(from_server: bool, as_json: bool, config_path: str) -> None:
     """List recorded facts (side index), newest first; --server checks drift."""
     from spine.agents.facts import facts_store_for
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     records = facts_store_for(config).all()
     records.sort(key=lambda f: f.created_at or "", reverse=True)
 
@@ -1142,7 +1142,7 @@ def facts_add(subject: str, object_: str, probe_prompt: str | None, config_path:
     from spine.agents.facts import facts_store_for
     from spine.models.types import ProjectFact
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     client = _cam_client_or_exit(config)
     prompt = probe_prompt or f"The {subject} is"
 
@@ -1186,7 +1186,7 @@ def facts_delete(subject: str, yes: bool, config_path: str) -> None:
     """Tombstone a fact on the server and drop it from the side index."""
     from spine.agents.facts import facts_store_for
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     if not yes and not click.confirm(f"Delete fact for subject '{subject}'?"):
         console.print("Aborted.")
         return
@@ -1208,7 +1208,7 @@ def facts_sync(config_path: str) -> None:
     """Replay side-index facts missing on the server (eviction/reset recovery)."""
     from spine.agents.facts import facts_store_for
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     client = _cam_client_or_exit(config)
     stored = facts_store_for(config).stored(namespace=client.settings.namespace)
     if not stored:
@@ -1245,7 +1245,7 @@ def facts_stats(config_path: str) -> None:
     """Show the live /cam/stats (occupancy, crowding, evictions)."""
     import json
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     client = _cam_client_or_exit(config)
     stats = _run_cam(client, client.stats())
     if stats is None:
@@ -1260,7 +1260,7 @@ def facts_audit(config_path: str) -> None:
     """Show the server's append-only CAM write/delivery audit log."""
     import json
 
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     client = _cam_client_or_exit(config)
     audit = _run_cam(client, client.audit())
     if audit is None:
@@ -1274,7 +1274,7 @@ def facts_audit(config_path: str) -> None:
 @click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
 def facts_freeze(off: bool, config_path: str) -> None:
     """Freeze the namespace's store (protect curated facts from writes)."""
-    config = SpineConfig.load(path=config_path)
+    config = SpineConfig.load_as_active(path=config_path)
     client = _cam_client_or_exit(config)
     out = _run_cam(client, client.freeze(not off))
     if out is None:
