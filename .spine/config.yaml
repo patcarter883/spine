@@ -275,7 +275,10 @@ providers:
     api_key: vllm
     enabled: true
     guided_decoding: false           # /v1/chat/completions schema has response_format; untested through RSA
-    max_concurrent_calls: 1          # each call is already n rollouts + agg rounds server-side
+    # Serve handles ~50 concurrent streams (Pat, 2026-07-13). Each spine call
+    # fans to n rollouts server-side, so 6 concurrent calls at judge-duty n=4
+    # ≈ 24-30 streams — headroom for the escalation rungs' bigger n too.
+    max_concurrent_calls: 6
     context_window: 60000            # ⚠ confirm against the backing model
     # Sampling: applies to plain (rsa: false) calls via the request top-level
     # fields; RSA rollouts sample from the copies inside the rsa dict below.
