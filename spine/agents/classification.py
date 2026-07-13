@@ -9,14 +9,13 @@ on every non-Generic classification.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from spine.agents.helpers import resolve_chat_model
+from spine.agents.helpers import bind_structured_output, resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_block, xml_blocks
 
 logger = logging.getLogger(__name__)
@@ -94,38 +93,19 @@ async def classify_task(description: str, config: dict | None = None) -> TaskCla
     )
 
     try:
-        response = await model.ainvoke(
+        # Schema-bound, not prose-JSON: a verbose reasoning model (ZAYA)
+        # won't reliably commit clean JSON from a prose instruction — its
+        # deliberation spills into content and the scrape finds no object
+        # (trace 019f5a37: two ~90s classification calls, zero parses,
+        # silent Generic fallback). The grammar constrains only the FINAL
+        # answer; RSA rollouts stay free-form for exploration.
+        structured = bind_structured_output(model, TaskClassificationResult)
+        result = await structured.ainvoke(
             [SystemMessage(content=_CLASSIFICATION_SYSTEM), HumanMessage(content=prompt)]
         )
-
-        content = response.content if hasattr(response, "content") else str(response)
-
-        if isinstance(content, str):
-            # Try direct JSON parse first (handles multi-line JSON with reasoning)
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                # Fall back for models that wrap JSON in markdown or prose.
-                # Grab the outermost {...} span and parse it — key order is
-                # NOT assumed here (reasoning is emitted before category, so
-                # the object no longer starts with the "category" key).
-                start = content.find("{")
-                end = content.rfind("}")
-                if start != -1 and end > start:
-                    try:
-                        result = json.loads(content[start : end + 1])
-                    except json.JSONDecodeError:
-                        raise ValueError(f"No valid JSON in response: {content[:200]}")
-                else:
-                    raise ValueError(f"No valid JSON in response: {content[:200]}")
-        else:
-            raise ValueError(f"Unexpected response type: {type(content)}")
-
-        return TaskClassificationResult(
-            category=result.get("category", "Generic"),  # type: ignore[arg-type]
-            confidence=float(result.get("confidence", 0.5)),
-            reasoning=result.get("reasoning", ""),
-        )
+        if not isinstance(result, TaskClassificationResult):
+            raise ValueError(f"Unexpected structured result type: {type(result)}")
+        return result
 
     except Exception as e:
         logger.warning("Classification failed: %s — defaulting to Generic", e)
