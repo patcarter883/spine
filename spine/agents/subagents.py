@@ -484,7 +484,13 @@ _VERIFY_JUDGE_PROMPT = (
         Tag.OUTPUT_SCHEMA,
         "Return a structured verification result with fields: verdict "
         "(VERIFIED|NOT_VERIFIED), checklist (one item per acceptance "
-        "criterion: criterion, passed, detail), gaps, recommendations.",
+        "criterion: criterion, passed, detail), gaps, recommendations.\n"
+        "Your final answer MUST be exactly one JSON object of this shape "
+        '(no prose after it): {"verdict": "VERIFIED"|"NOT_VERIFIED", '
+        '"checklist": [{"criterion": str, "passed": bool, "detail": str}], '
+        '"gaps": [str], "recommendations": [str]} — lanes without schema '
+        "enforcement (RSA aggregation ignores response_format) are parsed "
+        "from this object directly.",
     )
 )
 
@@ -624,6 +630,11 @@ _THINKING_MODEL_PATTERNS: tuple[str, ...] = (
     "qwen3",  # Qwen 3.x series (thinking mode enabled by default)
     "qwq",  # QwQ reasoning model
     "deepseek-r",  # DeepSeek-R1 reasoning
+    # Zaya RSA serve: rollout aggregation ignores response_format/tools
+    # entirely (smoke-tested 2026-07-13), so any schema BINDING would try
+    # to parse raw thinking as the schema and fail hard. Prompt-based
+    # output + the downstream JSON salvage is the working path.
+    "zaya",
 )
 
 
