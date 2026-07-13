@@ -1623,6 +1623,13 @@ def _apply_concurrency_cap(
     ``http_async_client``; using cached, connection-capped clients keyed
     by provider name caps concurrent in-flight requests globally across
     every agent that resolves to the same provider.
+
+    ``max_concurrent_streams`` (provider-level) additionally routes the
+    async client through a weighted budget where each request costs its
+    ``rsa.n`` (non-RSA requests cost 1), so total server-side decode
+    streams stay under the serve's capacity regardless of the per-lane
+    n mix. Server-wide by construction: every lane referencing the same
+    provider shares the one cached client.
     """
     raw = provider_cfg.get("max_concurrent_calls")
     if raw is None:
@@ -1636,8 +1643,17 @@ def _apply_concurrency_cap(
 
     from spine.agents.http_clients import get_async_http_client, get_sync_http_client
 
+    max_streams: int | None
+    try:
+        max_streams = int(provider_cfg.get("max_concurrent_streams") or 0) or None
+    except (TypeError, ValueError):
+        max_streams = None
+
     provider_name = provider_cfg.get("name") or "default"
-    kwargs.setdefault("http_async_client", get_async_http_client(provider_name, max_concurrent))
+    kwargs.setdefault(
+        "http_async_client",
+        get_async_http_client(provider_name, max_concurrent, max_streams=max_streams),
+    )
     kwargs.setdefault("http_client", get_sync_http_client(provider_name, max_concurrent))
 
 
