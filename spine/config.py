@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from typing import ClassVar
 
 
 # ── Load .env on import ──
@@ -638,6 +639,25 @@ class SpineConfig:
 
         return str(cwd)
 
+    # Path made authoritative for this process by load_as_active(). Bare
+    # load() callers (model-resolution helpers, gates, middleware) follow it.
+    _active_path: ClassVar[str | None] = None
+
+    @classmethod
+    def load_as_active(cls, path: str = ".spine/config.yaml") -> SpineConfig:
+        """Load *path* and make it this process's ACTIVE config.
+
+        Every later bare ``load()`` resolves against the same file. Without
+        this, a CLI ``--config`` override shaped the workflow but the model
+        layer re-read the default path on every build — the all-Zaya
+        experiment (run d8bc459c) routed every lane to 'zaya' in the
+        override file while _active_provider_config quietly rebuilt the
+        MAIN config's provider and ran the whole pipeline on the wrong
+        model. CLI entrypoints call this; nothing else should.
+        """
+        cls._active_path = path
+        return cls.load(path=path)
+
     @classmethod
     def load(cls, path: str = ".spine/config.yaml") -> SpineConfig:
         """Load configuration from a YAML file, falling back to defaults.
@@ -653,6 +673,8 @@ class SpineConfig:
         Returns:
             A SpineConfig instance with values from the file or defaults.
         """
+        if path == ".spine/config.yaml" and cls._active_path:
+            path = cls._active_path
         config = {}
         resolved_path = path
 

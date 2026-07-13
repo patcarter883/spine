@@ -217,3 +217,16 @@ async def async_test_config(temp_dir: Path) -> SpineConfig:
     config.workspace_root = str(temp_dir)
     config.ensure_dirs()
     return config
+
+
+@pytest.fixture(autouse=True)
+def _reset_spine_active_config_path():
+    """load_as_active() is process-sticky by design (CLI --config must govern
+    every bare load()); tests invoking CLI commands would otherwise leak the
+    active path into unrelated tests' bare SpineConfig.load() calls."""
+    from spine.config import SpineConfig
+
+    saved = SpineConfig._active_path
+    SpineConfig._active_path = None
+    yield
+    SpineConfig._active_path = saved
