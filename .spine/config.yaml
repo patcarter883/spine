@@ -275,11 +275,9 @@ providers:
     api_key: vllm
     enabled: true
     guided_decoding: false           # /v1/chat/completions schema has response_format; untested through RSA
-    # Serve handles ~50 concurrent streams TOTAL, rollouts included (Pat,
-    # 2026-07-13). A judge-duty call ≈ n=4 rollouts + k=2 aggregations ≈ 6
-    # streams; an n=16 escalation rung ≈ 20. 4 concurrent calls ≈ 24 streams
-    # keeps room for an escalated plan call running alongside the judges.
-    max_concurrent_calls: 4
+    # Serve handles ~50 concurrent streams total, rollouts included; Pat's
+    # call (2026-07-13): 25 concurrent spine calls is the right setting.
+    max_concurrent_calls: 25
     context_window: 60000            # ⚠ confirm against the backing model
     # Sampling: applies to plain (rsa: false) calls via the request top-level
     # fields; RSA rollouts sample from the copies inside the rsa dict below.
