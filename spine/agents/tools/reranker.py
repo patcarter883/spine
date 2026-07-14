@@ -117,7 +117,16 @@ async def rerank_hits(
 
     results = data.get("results")
     if not isinstance(results, list) or not results:
-        logger.warning("Rerank response had no results — using fused order")
+        # Direct probes of this endpoint (2–60 docs × 1200 chars) always
+        # return populated results, yet live runs hit this branch — log the
+        # actual body so the next occurrence identifies itself.
+        logger.warning(
+            "Rerank response had no results — using fused order "
+            "(model=%s docs=%d body=%.300s)",
+            model,
+            len(documents),
+            str(data),
+        )
         return hits[:top_k]
 
     # results: [{index, relevance_score}], sorted or not — sort by score desc.
