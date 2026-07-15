@@ -734,6 +734,35 @@ def warn_if_prompt_crowds_window(messages: list[Any], *, label: str) -> int:
     return est
 
 
+_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def _placeholder_string_fields(result: Any) -> list[str]:
+    """Names of top-level string fields holding placeholder filler.
+
+    A grammar-constrained local model whose thinking ran out pattern-fills
+    free-text fields with scaffold characters — observed shape (work
+    d8bc459c): ``{"reasoning": "...", "category": "Backend/API"}``. Only
+    whole-field junk is flagged: a non-empty string containing no
+    alphanumeric characters at all. Empty strings stay legal (optional
+    fields default to ``""``), and real prose that merely contains an
+    ellipsis passes.
+    """
+    obj = result
+    if not isinstance(obj, BaseModel):
+        obj = getattr(result, "parsed", None)
+        if not isinstance(obj, BaseModel):
+            return []
+    junk: list[str] = []
+    for name in type(obj).model_fields:
+        value = getattr(obj, name, None)
+        if isinstance(value, str):
+            v = value.strip()
+            if v and not _ALNUM_RE.search(v):
+                junk.append(name)
+    return junk
+
+
 async def ainvoke_structured_with_retry(
     structured_model: Any,
     messages: list[Any],
@@ -789,17 +818,47 @@ async def ainvoke_structured_with_retry(
 
     attempt = 0
     api_attempt = 0
+    placeholder_attempt = 0
+    pending_nudge: HumanMessage | None = None
     while True:
-        invoke_messages = messages if attempt == 0 else [*messages, nudge]
+        invoke_messages = messages if pending_nudge is None else [*messages, pending_nudge]
         try:
             result = await structured_model.ainvoke(invoke_messages)
             # Reachable endpoint → clear the connection-failure circuit breaker.
             _retry.reset_conn_breaker()
+            junk_fields = _placeholder_string_fields(result)
+            if junk_fields and placeholder_attempt < 1:
+                placeholder_attempt += 1
+                logger.warning(
+                    "%s: placeholder-only string field(s) %s — retrying (1/1)",
+                    label,
+                    junk_fields,
+                )
+                pending_nudge = HumanMessage(
+                    content=(
+                        "Your previous response filled these fields with "
+                        f"placeholder characters instead of content: {junk_fields}. "
+                        "Filler like '...' is not acceptable. Respond with the "
+                        "same JSON schema, writing real content for every "
+                        "field per its description."
+                    )
+                )
+                continue
+            if junk_fields:
+                # Shape-valid — accept rather than fail the phase, but leave
+                # the breadcrumb for trace audits.
+                logger.warning(
+                    "%s: placeholder-only field(s) %s persisted after retry — "
+                    "accepting response as-is",
+                    label,
+                    junk_fields,
+                )
             return result
         except ValueError as exc:
             if attempt >= retries or not is_empty_structured_parse(exc):
                 raise
             attempt += 1
+            pending_nudge = nudge
             logger.warning(
                 "%s: empty structured parse — retrying (%d/%d)",
                 label,

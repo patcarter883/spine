@@ -28,6 +28,31 @@ logger = logging.getLogger(__name__)
 # candidate text compact so the query half isn't crowded out.
 _MAX_DOC_CHARS = 1200
 
+# Hard ceiling for (query + document) TOKENS. The llama.cpp reranker rejects
+# any pair over its physical batch (n_ubatch, commonly 512) with a 500 that
+# llama-swap wraps in an HTTP-200 error envelope — surfacing here as an
+# empty-results fallback (work d8bc459c attempt 8: "input (596 tokens) is
+# too large to process"). A 1200-char code-dense doc can exceed 512 tokens,
+# so chars alone don't protect. Counted with cl100k, which undercounts vs
+# the reranker's own tokenizer on code — hence the wide margin below 512.
+_MAX_PAIR_TOKENS = 384
+
+
+def _trim_to_tokens(text: str, budget: int) -> str:
+    """Trim ``text`` to at most ``budget`` tokens (proportional chop loop)."""
+    from spine.agents._tokens import count_tokens
+
+    if budget <= 0:
+        return ""
+    tokens = count_tokens(text)
+    while tokens > budget and len(text) > 32:
+        new_len = max(32, int(len(text) * (budget / tokens) * 0.95))
+        if new_len >= len(text):
+            new_len = len(text) - 32
+        text = text[:new_len]
+        tokens = count_tokens(text)
+    return text
+
 # Rerank route differs by server: Cohere/Jina/vLLM use ``/rerank``,
 # llama.cpp uses ``/reranking``. Probed in order against ``base_url`` and the
 # first that answers (not 404) is cached per base_url so we probe only once.
@@ -97,7 +122,10 @@ async def rerank_hits(
         logger.warning("Reranker provider missing base_url/model — skipping rerank")
         return hits[:top_k]
 
-    documents = [candidate_text(h) for h in hits]
+    from spine.agents._tokens import count_tokens
+
+    doc_budget = max(64, _MAX_PAIR_TOKENS - count_tokens(query))
+    documents = [_trim_to_tokens(candidate_text(h), doc_budget) for h in hits]
     payload = {"model": model, "query": query, "documents": documents}
     headers = {}
     api_key = provider_cfg.get("api_key")
