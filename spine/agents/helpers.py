@@ -1665,11 +1665,44 @@ def _build_local_model(
         """ChatOpenAI speaking the most compatible dialect to local servers."""
 
         def _get_request_payload(self, input_: Any, *, stop: Any = None, **kw: Any) -> dict:
-            return _flatten_text_block_content(
-                super()._get_request_payload(input_, stop=stop, **kw)
+            return _gate_rsa_for_tool_calls(
+                _flatten_text_block_content(
+                    super()._get_request_payload(input_, stop=stop, **kw)
+                )
             )
 
     return _LocalChatOpenAI(**kwargs)
+
+
+def _gate_rsa_for_tool_calls(payload: dict[str, Any]) -> dict[str, Any]:
+    """Disable RSA on tool-bound requests (Zaya-serve guidance, 2026-07-15).
+
+    A tool call is a one-shot action — recursive self-aggregation adds
+    rollout latency and scaffold-copy pathologies (work d8bc459c: the
+    grammar-forced answer pattern-fills from its own rollout tails) without
+    improving it. Probe-verified on the serve: plain tools+required returns
+    a clean populated call in 10s vs 41s under rsa n=2.
+
+    Deliberately tools-only: the serve's directive also covered
+    ``response_format``, but plain (non-RSA) json_schema on the current
+    build is ~1-in-3 reliable (deranged grammar output, instruction echo,
+    literal '...' fills over 3 probes) while RSA+json_schema is
+    consistently clean — so schema-bound calls KEEP their configured rsa
+    until the plain path is fixed serve-side. ``rsa: false`` is sent
+    explicitly rather than stripped so the wire states intent and any
+    server-side default cannot re-enable it. The weighted stream budget
+    prices these requests at 1 automatically.
+    """
+    if not payload.get("tools"):
+        return payload
+    extra = payload.get("extra_body")
+    if not isinstance(extra, dict) or not extra.get("rsa"):
+        return payload
+    extra = dict(extra)
+    extra["rsa"] = False
+    payload = dict(payload)
+    payload["extra_body"] = extra
+    return payload
 
 
 def _apply_concurrency_cap(
