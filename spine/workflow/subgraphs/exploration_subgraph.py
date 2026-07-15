@@ -122,6 +122,126 @@ _MAX_SPEC_CHARS = 24_000
 # ── Node: pre_research_gate ─────────────────────────────────────────────
 
 
+# ── Recall query facets ─────────────────────────────────────────────────
+# The raw work description is a poor recall query on its own: schema-heavy
+# objectives ("uuid PK", "unique constraint", "decimal(8,2)") drag both BM25
+# and the cross-encoder toward whatever migrations share that vocabulary,
+# and the pattern exemplars the task actually needs (controllers, requests,
+# policies, routes, tests) never surface. Work d8bc459c: 6/10 retrieved
+# chunks were unrelated migrations/seeders; the same index queried with the
+# DDL noise stripped + structural terms appended returned the exact
+# farm-scoped nested-CRUD exemplar (FarmRoleAssignmentController.storeByFarm
+# et al.). Recall therefore runs TWO facets — structural (pattern to follow)
+# and raw (schema/data specifics) — merged with per-file/per-directory caps
+# so no single directory monopolizes the context.
+
+# Trailing (?!\w) instead of \b: alternatives can end in ')' (decimal(8,2))
+# where a word boundary never matches against the following punctuation.
+_DDL_NOISE_RE = re.compile(
+    r"(?i)\b(uuid|pk|primary key|foreign(?:uuid)?|nullable|"
+    r"decimal(?:\s*\([^)]*\))?|unique|constraints?|indexe?s?|migrations?|"
+    r"timestamps?|boolean|bool|not null|cascade|soft ?deletes?)(?!\w)"
+)
+
+_CATEGORY_STRUCTURAL_TERMS = {
+    "Backend/API": (
+        "controller request validation resource routes policy "
+        "authorization CRUD endpoint store update destroy"
+    ),
+    "Database": "model entity relationship repository factory seeder schema",
+    "Auth": "middleware guard gate policy authorization token",
+    "Testing": "feature test Pest factory assertion dataset",
+    "Frontend/UI": "component view page form table",
+    "Infrastructure": "config deployment provider service registration",
+}
+_DEFAULT_STRUCTURAL_TERMS = "controller request routes policy model feature test CRUD"
+
+# Diversity caps for the merged facet set (k is typically 10): at most 2
+# chunks per file (no more triple-FarmPolicy), at most 3 per directory (no
+# more database/migrations monopolies).
+_RECALL_PER_FILE_CAP = 2
+_RECALL_PER_DIR_CAP = 3
+
+
+def _structural_recall_query(description: str, category: str | None) -> str:
+    """The 'pattern to follow' facet: task intent + surface paths + category terms.
+
+    Token-stripping the whole objective is not enough — the column-name
+    enumerations ("farm_id, name, code, latitude/longitude…") still carry
+    the lexical mass back to migrations. Keep only (a) the first sentence
+    (the task intent, DDL-stripped), (b) any route/path mentions (they name
+    the surface being built), and (c) the category's structural exemplar
+    terms. Validated on the agripath index: this shape surfaces
+    FarmController/FarmRoleAssignmentController/RouteServiceProvider where
+    the raw objective returns migrations and seeders.
+    """
+    text = (description or "").strip()
+    first = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+    first = re.sub(r"\s+", " ", _DDL_NOISE_RE.sub(" ", first)).strip()
+    # Route/path mentions anywhere in the objective ("/farms/{farm_id}/…",
+    # "app/Domain/Farm") — deduped, order-preserving, bounded.
+    paths = re.findall(r"[\w.{}\-]*/[\w./{}\-]+", text)
+    path_str = " ".join(dict.fromkeys(paths))[:300]
+    terms = _CATEGORY_STRUCTURAL_TERMS.get(category or "", _DEFAULT_STRUCTURAL_TERMS)
+    return "\n".join(part for part in (first, path_str, terms) if part)
+
+
+def _merge_recall_facets(
+    primary: list[dict],
+    secondary: list[dict],
+    k: int,
+    per_file: int = _RECALL_PER_FILE_CAP,
+    per_dir: int = _RECALL_PER_DIR_CAP,
+) -> list[dict]:
+    """Interleave two recall facets into one diverse top-k.
+
+    Primary (structural) leads the interleave. Dedup on (file, symbol);
+    per-file and per-directory caps enforce breadth; a second uncapped
+    pass backfills if the caps starve the list below ``k``.
+    """
+    from collections import Counter
+    from posixpath import dirname
+
+    interleaved: list[dict] = []
+    for i in range(max(len(primary), len(secondary))):
+        if i < len(primary):
+            interleaved.append(primary[i])
+        if i < len(secondary):
+            interleaved.append(secondary[i])
+
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    file_counts: Counter = Counter()
+    dir_counts: Counter = Counter()
+    for h in interleaved:
+        if not isinstance(h, dict):
+            continue
+        key = (h.get("file_path"), h.get("symbol_name"))
+        if key in seen:
+            continue
+        f = h.get("file_path") or ""
+        d = dirname(f)
+        if file_counts[f] >= per_file or dir_counts[d] >= per_dir:
+            continue
+        seen.add(key)
+        out.append(h)
+        file_counts[f] += 1
+        dir_counts[d] += 1
+        if len(out) >= k:
+            return out
+    for h in interleaved:
+        if not isinstance(h, dict):
+            continue
+        key = (h.get("file_path"), h.get("symbol_name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+        if len(out) >= k:
+            break
+    return out
+
+
 async def _pre_research_gate(
     state: ExplorationSubgraphState,
     config: RunnableConfig | None = None,
@@ -179,16 +299,31 @@ async def _pre_research_gate(
         # PLAN we always re-run the exploration loop, so summaries are
         # plenty — the loop builds its own context.
         summaries_only = phase != PhaseName.SPECIFY.value
-        result_text = await recall._arun(
+        # Two facets (see _structural_recall_query): the structural facet
+        # surfaces the pattern to FOLLOW, the raw facet keeps schema/data
+        # specifics. Structural leads the merge.
+        structural_query = _structural_recall_query(description, task_category)
+        struct_text = await recall._arun(
+            query=structural_query,
+            k=cfg.recall_k,
+            max_tokens=cfg.specify_context_token_budget,
+            summaries_only=summaries_only,
+        )
+        struct_hits = json.loads(struct_text).get("results", [])
+        raw_text = await recall._arun(
             query=description,
             k=cfg.recall_k,
             max_tokens=cfg.specify_context_token_budget,
             summaries_only=summaries_only,
         )
-        retrieved = json.loads(result_text).get("results", [])
+        raw_hits = json.loads(raw_text).get("results", [])
+        retrieved = _merge_recall_facets(struct_hits, raw_hits, k=cfg.recall_k)
         logger.info(
-            "[%s] pre_research_gate: recall returned %d chunks (summaries_only=%s)",
-            work_id, len(retrieved), summaries_only,
+            "[%s] pre_research_gate: recall merged %d chunks "
+            "(structural=%d raw=%d summaries_only=%s) dirs=%s",
+            work_id, len(retrieved), len(struct_hits), len(raw_hits),
+            summaries_only,
+            sorted({(h.get("file_path") or "").rsplit("/", 1)[0] for h in retrieved}),
         )
     except Exception as exc:
         logger.warning("[%s] pre_research_gate: recall failed — %s", work_id, exc)
