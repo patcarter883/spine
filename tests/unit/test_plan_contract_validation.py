@@ -344,3 +344,29 @@ def test_framework_provides_do_not_create_phantom_producers(
     assert repair_and_validate_contracts(sk, "w") == []
     ctrl = next(s for s in sk.slices if s.id == "ctrl")
     assert not ctrl.dependencies  # no phantom edge onto the test slice
+
+
+def test_unprovable_references_never_flagged(no_index) -> None:
+    # Run 5646d24c: 'console.print' (module-level variable root, invisible
+    # to the index) and 'spine.cli' (importable internal module path) burned
+    # five plan-critic rounds as gate false positives.
+    no_index(set())
+    skel = PlanSkeleton(slices=[
+        _stub("api", provides=["UIApi.add_provider"]),
+        _stub(
+            "cli",
+            reference_symbols=["console.print", "spine.cli"],
+        ),
+    ])
+    assert repair_and_validate_contracts(skel, "w") == []
+
+
+def test_plan_internal_roots_still_flag(no_index) -> None:
+    # A root the plan itself defines (slice id) stays contract territory.
+    no_index(set())
+    skel = PlanSkeleton(slices=[
+        _stub("api", provides=["UIApi.add_provider"]),
+        _stub("ui", reference_symbols=["api.add_embedding_provider"]),
+    ])
+    violations = repair_and_validate_contracts(skel, "w")
+    assert len(violations) == 1 and "add_embedding_provider" in violations[0]
