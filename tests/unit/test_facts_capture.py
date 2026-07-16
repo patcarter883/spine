@@ -74,11 +74,19 @@ def test_store_delete_and_clear(tmp_path):
 class _FakeCAMClient:
     """Scripted /cam/* client standing in for CAMClient."""
 
-    def __init__(self, remember_responses, stats=None, facts=None, ask_text="ok"):
+    def __init__(
+        self,
+        remember_responses,
+        stats=None,
+        facts=None,
+        ask_text="ok",
+        ask_response=None,
+    ):
         self.remember_responses = list(remember_responses)
         self._stats = stats
         self._facts = facts
         self._ask_text = ask_text
+        self._ask_response = ask_response
         self.remember_calls: list[tuple] = []
         self.ask_calls: list[tuple] = []
         self.saved = False
@@ -89,6 +97,8 @@ class _FakeCAMClient:
 
     async def ask_full(self, prompt, subject, max_tokens=32, mode=None):
         self.ask_calls.append((prompt, subject, mode))
+        if self._ask_response is not None:
+            return dict(self._ask_response)
         return {"text": self._ask_text, "mode_served": mode}
 
     async def ask(self, prompt, subject, max_tokens=32, mode=None):
@@ -288,6 +298,49 @@ async def test_capture_pre_hybrid_sends_no_mode(tmp_path, monkeypatch):
     assert fake.remember_calls[0][3] is None
     assert seen["max_object_words"] == facts_mod._MAX_OBJECT_WORDS
     assert FactsStore(str(tmp_path)).all()[0].mode is None
+
+
+# ── serve rev 3e8c1b3 API: delivered verdict + gate_reason ───────────────────
+@pytest.mark.asyncio
+async def test_capture_uses_delivered_verdict_and_records_gate_reason(
+    tmp_path, monkeypatch
+):
+    # `delivered` + exact `object` from the serve beats substring guessing:
+    # the generation text here does NOT contain the object, but the store
+    # verdict says it delivers — verified must be True.
+    fake = _FakeCAMClient(
+        remember_responses=[{"stored": True, "base_p": 0.0, "gate_reason": "novel"}],
+        stats={"total_edits": 0},
+        ask_response={"text": "unrelated continuation", "delivered": True, "object": "main"},
+    )
+    _install_fake_client(monkeypatch, fake)
+    _install_candidates(monkeypatch, _CANDS[:1])  # object "main"
+    cfg = _config(tmp_path, cam={"namespace": "p"})
+
+    await capture_run_facts({"work_id": "w1"}, cfg, "completed")
+
+    rec = FactsStore(str(tmp_path)).all()[0]
+    assert rec.verified is True
+    assert rec.gate_reason == "novel"
+
+
+@pytest.mark.asyncio
+async def test_capture_delivered_wrong_object_fails_verification(
+    tmp_path, monkeypatch
+):
+    fake = _FakeCAMClient(
+        remember_responses=[{"stored": True, "base_p": 0.0}],
+        stats={"total_edits": 0},
+        # Store delivers, but a DIFFERENT object — crowding/collision signal.
+        ask_response={"text": "it is main", "delivered": True, "object": "develop"},
+    )
+    _install_fake_client(monkeypatch, fake)
+    _install_candidates(monkeypatch, _CANDS[:1])
+    cfg = _config(tmp_path, cam={"namespace": "p"})
+
+    await capture_run_facts({"work_id": "w1"}, cfg, "completed")
+
+    assert FactsStore(str(tmp_path)).all()[0].verified is False
 
 
 # ── subject canonicalization (plan §6.2) ─────────────────────────────────────

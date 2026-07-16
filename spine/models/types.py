@@ -397,6 +397,14 @@ class ProjectFact(BaseModel):
         default=None,
         description="Gate probe: base model's probability of the object, memory off",
     )
+    gate_reason: str | None = Field(
+        default=None,
+        description=(
+            "Server's write-gate verdict reason (e.g. 'novel', "
+            "'base_recalls') — meaningful where base_p is 0.0-noise in "
+            "frontend mode. Serve rev 3e8c1b3+."
+        ),
+    )
     verified: bool | None = Field(
         default=None,
         description="Readback probe result (/cam/ask contains the object), if run",

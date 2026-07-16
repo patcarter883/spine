@@ -194,6 +194,77 @@ async def test_seed_capacity_trim_blocks_over_headroom(tmp_path, monkeypatch):
     assert len(fake.remember_calls) == 1
 
 
+def test_is_alias_same_object_overlapping_subject():
+    from spine.agents.facts import _is_alias
+
+    cand = _FactCandidate(
+        subject="spine agents default checkpoint path",
+        probe_prompt="p",
+        object=".spine/spine.db",
+    )
+    # The live 2026-07-16 seed duplicate: same object, shared 'checkpoint'/'path'.
+    assert _is_alias(cand, [("spine checkpoint database path", ".spine/spine.db")])
+    # Same object but disjoint meaningful tokens: NOT an alias.
+    assert not _is_alias(cand, [("spine ui landing page", ".spine/spine.db")])
+    # Different object: never an alias.
+    assert not _is_alias(cand, [("spine checkpoint database path", "other.db")])
+
+
+@pytest.mark.asyncio
+async def test_seed_drops_near_alias_candidates(tmp_path, monkeypatch):
+    _write_docs(tmp_path, {"A.md": "alpha doc"})
+    fake = _FakeCAMClient(stats={"total_edits": 0})
+    aliases = [
+        _FactCandidate(
+            subject="spine checkpoint database path",
+            probe_prompt="The spine checkpoint db lives at",
+            object=".spine/spine.db",
+        ),
+        _FactCandidate(
+            subject="spine agents checkpoint file path",
+            probe_prompt="The agents checkpoint file path is",
+            object=".spine/spine.db",
+        ),
+    ]
+    _install(monkeypatch, fake, aliases)
+
+    summary = await seed_project_facts(_config(tmp_path))
+
+    assert [c.subject for c in summary["candidates"]] == [
+        "spine checkpoint database path"
+    ]
+    assert summary["aliases_dropped"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_seed_replays_cached_candidates_without_distilling(
+    tmp_path, monkeypatch
+):
+    _write_docs(tmp_path, {"A.md": "alpha doc"})
+    fake = _FakeCAMClient(stats={"total_edits": 0})
+    monkeypatch.setattr(
+        "spine.services.cam_client.CAMClient", lambda settings: fake
+    )
+
+    async def must_not_distill(*a, **k):
+        raise AssertionError("--from replay must not call the distiller")
+
+    monkeypatch.setattr(facts_mod, "_distill_material", must_not_distill)
+    lines: list[str] = []
+
+    summary = await seed_project_facts(
+        _config(tmp_path),
+        candidates_override=[
+            {"subject": "spine test runner", "probe_prompt": "Tests run with", "object": "pytest"}
+        ],
+        progress=lines.append,
+    )
+
+    assert summary["accepted"] == 1
+    assert summary["records"][0].source == "seeded"
+    assert any("replaying 1 cached" in ln for ln in lines)
+
+
 @pytest.mark.asyncio
 async def test_seed_without_cam_provider_raises(tmp_path):
     cfg = SimpleNamespace(

@@ -355,10 +355,20 @@ async def _gate_write_and_record(
             probe = await client.ask_full(
                 cand.probe_prompt, cand.subject, mode=write_mode
             )
-            text = probe.get("text") if isinstance(probe, dict) else None
-            if text is not None:
-                verified = cand.object.strip().lower() in text.lower()
-                if not verified:
+            if isinstance(probe, dict):
+                if "delivered" in probe:
+                    # Serve rev 3e8c1b3+: exact delivery verdict + the object
+                    # the store holds — no substring guessing.
+                    verified = bool(probe["delivered"]) and (
+                        probe.get("object", "").strip().lower()
+                        == cand.object.strip().lower()
+                    )
+                elif probe.get("text") is not None:
+                    # Older serves: substring check against the generation.
+                    verified = (
+                        cand.object.strip().lower() in probe["text"].lower()
+                    )
+                if verified is False:
                     logger.warning(
                         "CAM readback probe failed for %r — store may be "
                         "crowded (check /cam/stats)",
@@ -384,10 +394,11 @@ async def _gate_write_and_record(
                 namespace=settings.namespace,
                 stored=stored,
                 base_p=resp.get("base_p"),
+                gate_reason=resp.get("gate_reason"),
                 verified=verified,
                 source=source,
                 created_at=created,
-                mode=write_mode,
+                mode=resp.get("mode_served") or write_mode,
             )
         )
     return accepted, records
@@ -523,6 +534,35 @@ def _chunk_paragraphs(text: str, size: int = _MAX_MATERIAL_CHARS) -> list[str]:
     return chunks
 
 
+# Tokens too generic to signal that two subjects name the same entity (the
+# project noun prefixes every canonical subject, so it can't discriminate).
+_ALIAS_STOPWORDS = {"the", "a", "an", "of", "for", "in", "on", "to", "and", "spine", "default"}
+
+
+def _is_alias(
+    cand: _FactCandidate, existing: list[tuple[str, str]]
+) -> bool:
+    """Deterministic near-alias check: same object + overlapping subject tokens.
+
+    Catches what the prompt-side canonicalization rule can't (observed live:
+    'spine agents default checkpoint path' and 'spine checkpoint database
+    path', both '.spine/spine.db', proposed from different docs). Two facts
+    sharing an object but no meaningful subject token (e.g. two things named
+    'main') are NOT aliases.
+    """
+    obj = " ".join(cand.object.lower().split())
+    tokens = {t for t in cand.subject.lower().split() if t not in _ALIAS_STOPWORDS}
+    for subject, other_obj in existing:
+        if " ".join(other_obj.lower().split()) != obj:
+            continue
+        other_tokens = {
+            t for t in subject.lower().split() if t not in _ALIAS_STOPWORDS
+        }
+        if tokens & other_tokens:
+            return True
+    return False
+
+
 def _seed_paths(config: Any, paths: list[str] | None) -> list[Path]:
     """Resolve seed sources: given files/dirs, or the onboarding dir's *.md."""
     root = Path(getattr(config, "workspace_root", "") or ".")
@@ -546,20 +586,33 @@ async def seed_project_facts(
     paths: list[str] | None = None,
     max_facts: int = _MAX_SEED_FACTS,
     dry_run: bool = False,
+    progress: Any | None = None,
+    candidates_override: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Distil project docs into gate-filtered CAM facts.
 
     Chunks each doc, distils chunks with the accumulated subject list (so
     later chunks reuse canonical keys instead of coining aliases), dedupes
-    against the side index, and — unless ``dry_run`` — pushes candidates
-    through the server's write gate, never past the capacity alert.
+    against the side index — by subject key AND by object-value alias check
+    (:func:`_is_alias`) — and, unless ``dry_run``, pushes candidates through
+    the server's write gate, never past the capacity alert.
+
+    ``progress`` is an optional ``callable(str)`` invoked with one line per
+    step (which lane distils, per-chunk counts) — distillation runs many
+    serial LLM calls and must not look hung. ``candidates_override`` skips
+    distillation entirely and replays previously distilled candidates (the
+    ``--from`` path; dicts with subject/probe_prompt/object keys).
 
     Returns a summary dict: ``docs`` (paths read), ``candidates`` (proposed
     after dedupe/cap), ``records`` (side-index records written),
-    ``accepted`` (gate-stored count), and ``blocked`` (candidates the
-    capacity guard refused to attempt).
+    ``accepted`` (gate-stored count), ``blocked`` (candidates the capacity
+    guard refused to attempt), and ``aliases_dropped``.
     """
     from spine.services.cam_client import CAMClient, resolve_cam_settings
+
+    def _say(msg: str) -> None:
+        if callable(progress):
+            progress(msg)
 
     provider_cfg = _cam_provider(config)
     if not provider_cfg:
@@ -575,34 +628,79 @@ async def seed_project_facts(
         _MAX_OBJECT_WORDS_POINTER if write_mode else _MAX_OBJECT_WORDS
     )
 
+    # Surface the lane distillation actually runs on — the July 16 run sat
+    # "doing nothing" for 10 minutes because a model-identity mismatch had
+    # silently rerouted every call to the single-stream fallback box.
+    try:
+        exp = config.resolve_provider_config("experience")
+        _say(
+            f"distillation lane: {exp.get('name')} @ {exp.get('base_url')} "
+            f"(model {exp.get('model')}); CAM store: {settings.server_root} "
+            f"ns={settings.namespace}"
+        )
+    except Exception:  # noqa: BLE001 — informational only
+        pass
+
     docs = _seed_paths(config, paths)
     known = _known_subjects(config, settings.namespace)
+    # Object values of existing stored facts feed the alias check too.
+    existing_pairs: list[tuple[str, str]] = []
+    try:
+        existing_pairs = [
+            (f.subject, f.object)
+            for f in facts_store_for(config).stored(namespace=settings.namespace)
+        ]
+    except Exception:  # noqa: BLE001 — alias context is best-effort
+        pass
     seen = {" ".join(s.lower().split()) for s in known}
     candidates: list[_FactCandidate] = []
-    for doc in docs:
-        if len(candidates) >= max_facts:
-            break
-        try:
-            text = doc.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            logger.warning("seed: cannot read %s — skipped", doc)
-            continue
-        for chunk in _chunk_paragraphs(f"SOURCE DOC: {doc.name}\n\n{text}"):
+    aliases_dropped = 0
+
+    def _admit(cand: _FactCandidate) -> None:
+        nonlocal aliases_dropped
+        key = " ".join(cand.subject.lower().split())
+        if key in seen or len(candidates) >= max_facts:
+            return
+        pairs = existing_pairs + [(c.subject, c.object) for c in candidates]
+        if _is_alias(cand, pairs):
+            aliases_dropped += 1
+            _say(f"  alias dropped: {cand.subject!r} -> {cand.object!r}")
+            return
+        seen.add(key)
+        candidates.append(cand)
+
+    if candidates_override is not None:
+        for raw in candidates_override:
+            cand = _FactCandidate.model_validate(raw)
+            if _valid_candidate(cand, max_object_words):
+                _admit(cand)
+        _say(f"replaying {len(candidates)} cached candidate(s), no distillation")
+    else:
+        for doc in docs:
             if len(candidates) >= max_facts:
                 break
-            found = await _distill_material(
-                chunk,
-                max_object_words=max_object_words,
-                # Accumulate: later chunks see earlier chunks' subjects too.
-                known_subjects=known + [c.subject for c in candidates],
-                source="docs",
-            )
-            for cand in found:
-                key = " ".join(cand.subject.lower().split())
-                if key in seen or len(candidates) >= max_facts:
-                    continue
-                seen.add(key)
-                candidates.append(cand)
+            try:
+                text = doc.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                logger.warning("seed: cannot read %s — skipped", doc)
+                continue
+            chunks = _chunk_paragraphs(f"SOURCE DOC: {doc.name}\n\n{text}")
+            for i, chunk in enumerate(chunks, 1):
+                if len(candidates) >= max_facts:
+                    break
+                _say(
+                    f"{doc.name}: chunk {i}/{len(chunks)} "
+                    f"({len(candidates)}/{max_facts} candidates)"
+                )
+                found = await _distill_material(
+                    chunk,
+                    max_object_words=max_object_words,
+                    # Accumulate: later chunks see earlier chunks' subjects too.
+                    known_subjects=known + [c.subject for c in candidates],
+                    source="docs",
+                )
+                for cand in found:
+                    _admit(cand)
 
     summary: dict[str, Any] = {
         "docs": [str(d) for d in docs],
@@ -610,10 +708,12 @@ async def seed_project_facts(
         "records": [],
         "accepted": 0,
         "blocked": 0,
+        "aliases_dropped": aliases_dropped,
     }
     if dry_run or not candidates:
         return summary
 
+    _say(f"writing {len(candidates)} candidate(s) through the gate")
     client = CAMClient(settings)
     try:
         # Capacity discipline (F2.4): never write past the alert threshold —

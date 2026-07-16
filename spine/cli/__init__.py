@@ -1188,37 +1188,63 @@ def facts_add(subject: str, object_: str, probe_prompt: str | None, config_path:
     show_default=True,
     help="Total candidate cap across all docs (store knee is ~128).",
 )
-@click.option("--dry-run", is_flag=True, help="Distil and show candidates; write nothing.")
+@click.option("--dry-run", is_flag=True, help="Distil and show candidates; write nothing (caches candidates for --from).")
+@click.option(
+    "--from",
+    "from_file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Replay cached candidates (from a prior --dry-run) through the gate — no LLM calls.",
+)
 @click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
-def facts_seed(paths: tuple[str, ...], max_facts: int, dry_run: bool, config_path: str) -> None:
+def facts_seed(
+    paths: tuple[str, ...],
+    max_facts: int,
+    dry_run: bool,
+    from_file: str | None,
+    config_path: str,
+) -> None:
     """Distil project docs into gate-filtered CAM facts.
 
     PATHS are markdown files or directories; default is .spine/onboarding/.
     Candidates go through the server's base-uncertainty write gate — only
     what the model can't already recall is stored. Every attempt lands in
-    the facts.jsonl side index.
+    the facts.jsonl side index. A --dry-run caches its candidates so the
+    real run can replay them with --from instead of re-distilling.
     """
     import asyncio
+    import json
 
     from spine.agents.facts import seed_project_facts
 
     config = SpineConfig.load_as_active(path=config_path)
+    override = None
+    if from_file:
+        override = json.loads(Path(from_file).read_text(encoding="utf-8"))
     try:
         summary = asyncio.run(
             seed_project_facts(
-                config, paths=list(paths) or None, max_facts=max_facts, dry_run=dry_run
+                config,
+                paths=list(paths) or None,
+                max_facts=max_facts,
+                dry_run=dry_run,
+                progress=lambda msg: console.print(f"[dim]{msg}[/dim]"),
+                candidates_override=override,
             )
         )
     except RuntimeError as e:
         console.print(f"[red]{e} (see .spine/config.reference.yaml).[/red]")
         raise SystemExit(1)
 
-    if not summary["docs"]:
+    if not summary["docs"] and not from_file:
         console.print("[yellow]No seed documents found.[/yellow]")
         return
-    console.print(f"Read {len(summary['docs'])} doc(s): " + ", ".join(
-        Path(d).name for d in summary["docs"]
-    ))
+    if summary["docs"]:
+        console.print(f"Read {len(summary['docs'])} doc(s): " + ", ".join(
+            Path(d).name for d in summary["docs"]
+        ))
+    if summary.get("aliases_dropped"):
+        console.print(f"[dim]{summary['aliases_dropped']} near-alias candidate(s) dropped.[/dim]")
     candidates = summary["candidates"]
     if not candidates:
         console.print("[yellow]Distillation proposed no new facts.[/yellow]")
@@ -1232,6 +1258,13 @@ def facts_seed(paths: tuple[str, ...], max_facts: int, dry_run: bool, config_pat
         for c in candidates:
             table.add_row(c.subject, c.object, c.probe_prompt)
         console.print(table)
+        cache = Path(config.workspace_root or ".") / ".spine" / "experience" / "seed-candidates.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(
+            json.dumps([c.model_dump() for c in candidates], indent=2),
+            encoding="utf-8",
+        )
+        console.print(f"Candidates cached: [bold]{cache}[/bold] — replay with `spine facts seed --from {cache}`")
         return
 
     records = summary["records"]
@@ -1273,10 +1306,20 @@ def facts_delete(subject: str, yes: bool, config_path: str) -> None:
         console.print("Aborted.")
         return
     client = _cam_client_or_exit(config)
-    deleted = _run_cam(client, client.delete_fact(subject))
+
+    async def _delete():
+        deleted = await client.delete_fact(subject)
+        if deleted:
+            # A delete only lives in memory until a save: a serve restart
+            # resurrects it from the last snapshot (observed live 2026-07-16,
+            # finding `delete-resurrect`). Persist the tombstone immediately.
+            await client.save()
+        return deleted
+
+    deleted = _run_cam(client, _delete())
     facts_store_for(config).delete(subject, namespace=client.settings.namespace)
     if deleted:
-        console.print(f"[green]Deleted '{subject}' (server + side index).[/green]")
+        console.print(f"[green]Deleted '{subject}' (server + side index, saved).[/green]")
     else:
         console.print(
             "[yellow]Server delete not confirmed (unreachable or unknown subject); "
@@ -1338,6 +1381,31 @@ def facts_stats(config_path: str) -> None:
         console.print("[red]Server unreachable or CAM not loaded.[/red]")
         raise SystemExit(1)
     console.print_json(json.dumps(stats))
+
+
+@facts.command(name="namespaces")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_namespaces(config_path: str) -> None:
+    """List all server namespaces with fact counts (serve rev 3e8c1b3+)."""
+    config = SpineConfig.load_as_active(path=config_path)
+    client = _cam_client_or_exit(config)
+    spaces = _run_cam(client, client.namespaces())
+    if spaces is None:
+        console.print("[red]Server unreachable, CAM not loaded, or endpoint absent.[/red]")
+        raise SystemExit(1)
+    table = Table(title=f"CAM namespaces ({len(spaces)})")
+    table.add_column("Namespace", style="bold")
+    table.add_column("Facts", justify="right")
+    table.add_column("Frozen")
+    mine = client.settings.namespace
+    for ns in spaces:
+        name = str(ns.get("namespace", ""))
+        table.add_row(
+            f"{name} [dim](this project)[/dim]" if name == mine else name,
+            str(ns.get("facts", "?")),
+            "yes" if ns.get("frozen") else "—",
+        )
+    console.print(table)
 
 
 @facts.command(name="audit")
