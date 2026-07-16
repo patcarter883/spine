@@ -452,9 +452,21 @@ providers:
       #                                   # writes only) | ambient (server
       #                                   # auto-extracts from prompts — not
       #                                   # recommended for agent traffic)
-      #     read: transparent             # off | transparent (in-forward
-      #                                   # delivery) | facts_block | both
-      #     capacity_alert: 100           # warn threshold (store knee ~128)
+      #     read: facts_block             # off | transparent | facts_block | both
+      #                                   # facts_block (default) injects a
+      #                                   # <known_facts> prompt block — the
+      #                                   # quality ceiling (in-forward delivery
+      #                                   # is single-hop recall only; plan §6.2).
+      #                                   # transparent = in-forward delivery, a
+      #                                   # token saving for recall-shaped queries
+      #     capacity_alert: 100           # warn threshold (store knee ~128;
+      #                                   # applies to tap-mode/product-key banks)
+      #     mode: null                    # hybrid-serving delivery mode:
+      #                                   # pointer | tap | both. Leave unset for
+      #                                   # pre-hybrid servers (no mode field is
+      #                                   # sent). Set `pointer` once the hybrid
+      #                                   # lands — distilled facts always write
+      #                                   # pointer, never tap
 
   # ── Embedding providers ───────────────────────────────────────────────
   # Selected by the top-level `spine.embedding_provider` name. The embedding

@@ -407,6 +407,13 @@ class ProjectFact(BaseModel):
     created_at: str = Field(
         default="", description="ISO timestamp when the write was attempted"
     )
+    mode: str | None = Field(
+        default=None,
+        description=(
+            "Hybrid delivery mode sent with the write (pointer | tap | both); "
+            "None for pre-hybrid servers. Replay (`spine facts sync`) reuses it"
+        ),
+    )
 
     def dedup_key(self) -> str:
         """Facts are one-value-per-subject (the store's own semantics)."""

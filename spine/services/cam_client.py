@@ -41,6 +41,11 @@ _TRANSPORT_ATTEMPTS = 2
 
 _WRITE_MODES = ("off", "distill", "ambient")
 _READ_MODES = ("off", "transparent", "facts_block", "both")
+# Hybrid-serving delivery modes (minisgl `CAM_HYBRID_DESIGN`): "pointer" is
+# the id-bank (base-agnostic, lossless multi-token, GTE-whitened keys), "tap"
+# the per-base activation editor, "both" writes to both stores. ``None`` means
+# a pre-hybrid server — no ``mode`` field is sent anywhere.
+_DELIVERY_MODES = ("pointer", "tap", "both")
 
 
 @dataclass(frozen=True)
@@ -53,8 +58,14 @@ class CamSettings:
     namespace: str | None = None
     """Resolved namespace; ``None`` means the server's ``default`` store."""
     write: str = "distill"
-    read: str = "transparent"
+    # facts_block is the principled default: the frozen-base scorecard
+    # (plan §6.2) shows in-forward injection tops out at single-hop recall —
+    # the prompt block IS the quality ceiling. `transparent` is a token
+    # optimization for recall-shaped queries, not a stronger mechanism.
+    read: str = "facts_block"
     capacity_alert: int = 100
+    mode: str | None = None
+    """Delivery mode for hybrid CAM serving; ``None`` until the hybrid lands."""
 
 
 def _expand_env(value: Any) -> Any:
@@ -123,10 +134,17 @@ def resolve_cam_settings(
     if write not in _WRITE_MODES:
         logger.warning("Unknown cam.write %r; falling back to 'distill'", write)
         write = "distill"
-    read = cam.get("read", "transparent")
+    read = cam.get("read", "facts_block")
     if read not in _READ_MODES:
-        logger.warning("Unknown cam.read %r; falling back to 'transparent'", read)
-        read = "transparent"
+        logger.warning("Unknown cam.read %r; falling back to 'facts_block'", read)
+        read = "facts_block"
+    mode = cam.get("mode")
+    if mode is not None and mode not in _DELIVERY_MODES:
+        logger.warning(
+            "Unknown cam.mode %r; omitting the mode field (pre-hybrid behavior)",
+            mode,
+        )
+        mode = None
 
     return CamSettings(
         server_root=_server_root_from(str(base_url)),
@@ -135,6 +153,7 @@ def resolve_cam_settings(
         write=write,
         read=read,
         capacity_alert=int(cam.get("capacity_alert", 100)),
+        mode=mode,
     )
 
 
@@ -205,24 +224,60 @@ class CAMClient:
 
     # ── edit plane ────────────────────────────────────────────────────────
     async def remember(
-        self, subject: str, prompt: str, object_: str
+        self,
+        subject: str,
+        prompt: str,
+        object_: str,
+        mode: str | None = None,
     ) -> dict[str, Any] | None:
-        """Write-gated store: ``{stored: bool, base_p: float}`` or ``None``."""
-        return await self._request(
-            "POST",
-            "/cam/remember",
-            json={"subject": subject, "prompt": prompt, "object": object_},
-        )
+        """Write-gated store: ``{stored: bool, base_p: float}`` or ``None``.
+
+        ``mode`` (falling back to ``settings.mode``) selects the hybrid
+        delivery store; when both are ``None`` the field is omitted entirely
+        so pre-hybrid servers see the exact payload they always did.
+        """
+        payload: dict[str, Any] = {
+            "subject": subject,
+            "prompt": prompt,
+            "object": object_,
+        }
+        effective_mode = mode or self.settings.mode
+        if effective_mode:
+            payload["mode"] = effective_mode
+        return await self._request("POST", "/cam/remember", json=payload)
+
+    async def ask_full(
+        self,
+        prompt: str,
+        subject: str,
+        max_tokens: int = 32,
+        mode: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Full ``/cam/ask`` payload — ``{text, mode_served?}`` or ``None``.
+
+        ``mode_served`` (hybrid servers only) echoes which store actually
+        delivered the answer; pre-hybrid servers just return ``text``.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "subject": subject,
+            "max_tokens": max_tokens,
+        }
+        effective_mode = mode or self.settings.mode
+        if effective_mode:
+            payload["mode"] = effective_mode
+        data = await self._request("POST", "/cam/ask", json=payload)
+        return data if isinstance(data, dict) else None
 
     async def ask(
-        self, prompt: str, subject: str, max_tokens: int = 32
+        self,
+        prompt: str,
+        subject: str,
+        max_tokens: int = 32,
+        mode: str | None = None,
     ) -> str | None:
         """Router-gated seed-once generation; the ground-truth readback probe."""
-        data = await self._request(
-            "POST",
-            "/cam/ask",
-            json={"prompt": prompt, "subject": subject, "max_tokens": max_tokens},
-        )
+        data = await self.ask_full(prompt, subject, max_tokens=max_tokens, mode=mode)
         return data.get("text") if isinstance(data, dict) else None
 
     async def facts(self) -> list[dict[str, Any]] | None:
