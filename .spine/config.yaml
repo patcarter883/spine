@@ -171,7 +171,11 @@ providers:
     fallback_provider: local-qwen-fallback
     enabled: true
     stream_usage: true
-    max_concurrent_calls: 3
+    # 3 -> 1 (2026-07-16 wedge bisect): two consecutive full runs wedged the
+    # serve's generation path under concurrent large-prompt load (blockers
+    # serve-wedged/-2). Serial calls isolate concurrency as the trigger;
+    # restore 3 once minisgl lands the fix.
+    max_concurrent_calls: 1
     context_window: 50000
     # Locks reasoning ON: the serve routes thinking to reasoning_content
     # cleanly, and callsite suppress_reasoning() backfires (batch 1: workers
