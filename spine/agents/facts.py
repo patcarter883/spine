@@ -118,9 +118,30 @@ class _FactDistillResult(BaseModel):
     facts: list[_FactCandidate] = Field(default_factory=list)
 
 
+# Role paragraph per material source: runs yield facts rarely (the prompt
+# says so); curated project docs are dense with pinnable ground truth.
+_ROLE_BY_SOURCE = {
+    "run": (
+        "You mine a completed software-engineering run for durable, "
+        "project-level FACTS worth pinning into an editable model memory. "
+        "A fact is a stable subject→object association (a name, a value, a "
+        "decision outcome) that will still be true on future runs."
+    ),
+    "docs": (
+        "You mine a project's curated documentation for durable, "
+        "project-level FACTS worth pinning into an editable model memory. "
+        "A fact is a stable subject→object association (a name, a value, a "
+        "decision outcome) that will still be true on future runs. Prefer "
+        "identities an agent would otherwise have to look up: entry points, "
+        "canonical commands, key file locations, pinned conventions."
+    ),
+}
+
+
 def _distill_system_prompt(
     max_object_words: int = _MAX_OBJECT_WORDS,
     known_subjects: list[str] | None = None,
+    source: str = "run",
 ) -> str:
     from spine.agents.prompt_format import Tag, xml_block
 
@@ -140,13 +161,7 @@ def _distill_system_prompt(
             + "\n\n"
         )
     return (
-        xml_block(
-            Tag.ROLE,
-            "You mine a completed software-engineering run for durable, "
-            "project-level FACTS worth pinning into an editable model memory. "
-            "A fact is a stable subject→object association (a name, a value, a "
-            "decision outcome) that will still be true on future runs.",
-        )
+        xml_block(Tag.ROLE, _ROLE_BY_SOURCE.get(source, _ROLE_BY_SOURCE["run"]))
         + "\n\n"
         + known_block
         + xml_block(
@@ -205,20 +220,16 @@ def _valid_candidate(
     )
 
 
-async def distill_run_facts(
-    result: dict[str, Any],
-    config: Any,
+async def _distill_material(
+    material: str,
     max_object_words: int = _MAX_OBJECT_WORDS,
     known_subjects: list[str] | None = None,
+    source: str = "run",
 ) -> list[_FactCandidate]:
-    """Propose fact candidates from a run's material via one LLM call.
+    """One LLM pass proposing fact candidates from arbitrary material.
 
-    ``known_subjects`` are existing store keys shown to the distiller so it
-    reuses canonical subject strings instead of coining near-aliases.
-    Best-effort: returns ``[]`` on any failure or when the material yields
-    nothing durable (the common case).
+    Best-effort: returns ``[]`` on any failure or empty material.
     """
-    material = _run_material(result)
     if not material.strip():
         return []
     try:
@@ -237,7 +248,9 @@ async def distill_run_facts(
             "empty list if none qualify.",
         )
         system = _distill_system_prompt(
-            max_object_words=max_object_words, known_subjects=known_subjects
+            max_object_words=max_object_words,
+            known_subjects=known_subjects,
+            source=source,
         )
         res = await bound.ainvoke(
             [SystemMessage(content=system), HumanMessage(content=prompt)]
@@ -252,6 +265,27 @@ async def distill_run_facts(
         return []
 
 
+async def distill_run_facts(
+    result: dict[str, Any],
+    config: Any,
+    max_object_words: int = _MAX_OBJECT_WORDS,
+    known_subjects: list[str] | None = None,
+) -> list[_FactCandidate]:
+    """Propose fact candidates from a run's material via one LLM call.
+
+    ``known_subjects`` are existing store keys shown to the distiller so it
+    reuses canonical subject strings instead of coining near-aliases.
+    Best-effort: returns ``[]`` on any failure or when the material yields
+    nothing durable (the common case).
+    """
+    return await _distill_material(
+        _run_material(result),
+        max_object_words=max_object_words,
+        known_subjects=known_subjects,
+        source="run",
+    )
+
+
 # ── Capacity guard ───────────────────────────────────────────────────────────
 def _store_count(stats: dict[str, Any] | None, facts: list | None) -> int | None:
     """Best-effort current fact count from /cam/stats (shape may evolve)."""
@@ -263,6 +297,100 @@ def _store_count(stats: dict[str, Any] | None, facts: list | None) -> int | None
     if isinstance(facts, list):
         return len(facts)
     return None
+
+
+# ── Shared write-path helpers ────────────────────────────────────────────────
+def _known_subjects(config: Any, namespace: str | None) -> list[str]:
+    """Existing subject keys for a namespace, newest first (canonical reuse)."""
+    known: list[str] = []
+    try:
+        seen: set[str] = set()
+        existing = facts_store_for(config).all()
+        existing.sort(key=lambda f: f.created_at or "", reverse=True)
+        for f in existing:
+            if f.namespace != namespace:
+                continue
+            key = " ".join(f.subject.lower().split())
+            if key and key not in seen:
+                seen.add(key)
+                known.append(f.subject)
+            if len(known) >= _KNOWN_SUBJECTS_LIMIT:
+                break
+    except Exception:  # noqa: BLE001 — the reuse list is best-effort
+        logger.debug("known-subjects gather failed (non-fatal)", exc_info=True)
+    return known
+
+
+async def _gate_write_and_record(
+    client: Any,
+    settings: Any,
+    candidates: list[_FactCandidate],
+    work_id: str,
+    source: str,
+    write_mode: str | None,
+) -> tuple[int, list[ProjectFact]]:
+    """Push candidates through the server's write gate, probing each accept.
+
+    Returns ``(accepted, records)``. Stops (without a record) at the first
+    ``None`` remember response — the server never saw that write, so a record
+    would be a phantom. Every gate verdict that DID happen server-side is
+    recorded, stored or skipped alike.
+    """
+    created = datetime.now().isoformat()
+    records: list[ProjectFact] = []
+    accepted = 0
+    for cand in candidates:
+        resp = await client.remember(
+            cand.subject, cand.probe_prompt, cand.object, mode=write_mode
+        )
+        if resp is None:
+            break
+        stored = bool(resp.get("stored"))
+        accepted += int(stored)
+        # F3.3 readback probe: /cam/ask is the only ground-truth check that
+        # the store actually delivers the fact (a crowded bank degrades
+        # silently). One short generation per accepted write.
+        verified: bool | None = None
+        if stored:
+            probe = await client.ask_full(
+                cand.probe_prompt, cand.subject, mode=write_mode
+            )
+            text = probe.get("text") if isinstance(probe, dict) else None
+            if text is not None:
+                verified = cand.object.strip().lower() in text.lower()
+                if not verified:
+                    logger.warning(
+                        "CAM readback probe failed for %r — store may be "
+                        "crowded (check /cam/stats)",
+                        cand.subject,
+                    )
+                mode_served = probe.get("mode_served")
+                if write_mode and mode_served and mode_served != write_mode:
+                    logger.warning(
+                        "CAM served %r via %s (asked for %s) — check the "
+                        "hybrid routing for %r",
+                        cand.subject,
+                        mode_served,
+                        write_mode,
+                        settings.namespace,
+                    )
+        records.append(
+            ProjectFact(
+                id=uuid.uuid4().hex[:12],
+                work_id=work_id,
+                subject=cand.subject,
+                probe_prompt=cand.probe_prompt,
+                object=cand.object,
+                namespace=settings.namespace,
+                stored=stored,
+                base_p=resp.get("base_p"),
+                verified=verified,
+                source=source,
+                created_at=created,
+                mode=write_mode,
+            )
+        )
+    return accepted, records
 
 
 # ── Capture (write path) ─────────────────────────────────────────────────────
@@ -304,22 +432,7 @@ async def capture_run_facts(
         # Show the distiller the namespace's existing subject keys so it
         # reuses canonical strings instead of coining near-aliases (the routed
         # bank's retrieval misses are same-structure aliases).
-        known_subjects: list[str] = []
-        try:
-            seen: set[str] = set()
-            existing = facts_store_for(config).all()
-            existing.sort(key=lambda f: f.created_at or "", reverse=True)
-            for f in existing:
-                if f.namespace != settings.namespace:
-                    continue
-                key = " ".join(f.subject.lower().split())
-                if key and key not in seen:
-                    seen.add(key)
-                    known_subjects.append(f.subject)
-                if len(known_subjects) >= _KNOWN_SUBJECTS_LIMIT:
-                    break
-        except Exception:  # noqa: BLE001 — the reuse list is best-effort
-            logger.debug("known-subjects gather failed (non-fatal)", exc_info=True)
+        known_subjects = _known_subjects(config, settings.namespace)
 
         candidates = await distill_run_facts(
             result,
@@ -346,63 +459,15 @@ async def capture_run_facts(
             )
             return 0
 
-        created = datetime.now().isoformat()
         work_id = result.get("work_id", "unknown")
-        records: list[ProjectFact] = []
-        accepted = 0
-        for cand in candidates:
-            resp = await client.remember(
-                cand.subject, cand.probe_prompt, cand.object, mode=write_mode
-            )
-            if resp is None:
-                # Server unreachable / CAM unloaded — nothing happened server-
-                # side; stop attempting and record nothing for this candidate.
-                break
-            stored = bool(resp.get("stored"))
-            accepted += int(stored)
-            # F3.3 readback probe: /cam/ask is the only ground-truth check that
-            # the store actually delivers the fact (a crowded bank degrades
-            # silently). One short generation per accepted write.
-            verified: bool | None = None
-            if stored:
-                probe = await client.ask_full(
-                    cand.probe_prompt, cand.subject, mode=write_mode
-                )
-                text = probe.get("text") if isinstance(probe, dict) else None
-                if text is not None:
-                    verified = cand.object.strip().lower() in text.lower()
-                    if not verified:
-                        logger.warning(
-                            "CAM readback probe failed for %r — store may be "
-                            "crowded (check /cam/stats)",
-                            cand.subject,
-                        )
-                    mode_served = probe.get("mode_served")
-                    if write_mode and mode_served and mode_served != write_mode:
-                        logger.warning(
-                            "CAM served %r via %s (asked for %s) — check the "
-                            "hybrid routing for %r",
-                            cand.subject,
-                            mode_served,
-                            write_mode,
-                            settings.namespace,
-                        )
-            records.append(
-                ProjectFact(
-                    id=uuid.uuid4().hex[:12],
-                    work_id=work_id,
-                    subject=cand.subject,
-                    probe_prompt=cand.probe_prompt,
-                    object=cand.object,
-                    namespace=settings.namespace,
-                    stored=stored,
-                    base_p=resp.get("base_p"),
-                    verified=verified,
-                    source="distilled",
-                    created_at=created,
-                    mode=write_mode,
-                )
-            )
+        accepted, records = await _gate_write_and_record(
+            client,
+            settings,
+            candidates,
+            work_id=work_id,
+            source="distilled",
+            write_mode=write_mode,
+        )
         if accepted:
             await client.save()  # F2.3: persist across server restarts
         if records:
@@ -423,6 +488,172 @@ async def capture_run_facts(
                 await client.aclose()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ── Seeding (curated docs → gate-filtered store writes) ─────────────────────
+# Deliberate store population from the project's onboarding docs, so the very
+# first run gets a useful <known_facts> block instead of waiting weeks of
+# ≤5-facts-per-run organic fill. Same gate, same side index, same probes as
+# run capture — only the material differs.
+_SEED_DEFAULT_DIR = ".spine/onboarding"
+_MAX_SEED_FACTS = 20
+
+
+def _chunk_paragraphs(text: str, size: int = _MAX_MATERIAL_CHARS) -> list[str]:
+    """Pack paragraphs into ~``size``-char chunks (hard-splitting oversized ones)."""
+    chunks: list[str] = []
+    current = ""
+    for para in text.split("\n\n"):
+        if not para.strip():
+            continue
+        if len(para) > size:  # pathological single paragraph: flush, hard-split
+            if current:
+                chunks.append(current)
+                current = ""
+            while len(para) > size:
+                chunks.append(para[:size])
+                para = para[size:]
+        if current and len(current) + len(para) + 2 > size:
+            chunks.append(current)
+            current = para
+        else:
+            current = f"{current}\n\n{para}" if current else para
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _seed_paths(config: Any, paths: list[str] | None) -> list[Path]:
+    """Resolve seed sources: given files/dirs, or the onboarding dir's *.md."""
+    root = Path(getattr(config, "workspace_root", "") or ".")
+    if not paths:
+        default = root / _SEED_DEFAULT_DIR
+        return sorted(default.glob("*.md")) if default.is_dir() else []
+    out: list[Path] = []
+    for p in paths:
+        path = Path(p)
+        if not path.is_absolute():
+            path = root / path
+        if path.is_dir():
+            out.extend(sorted(path.glob("*.md")))
+        elif path.is_file():
+            out.append(path)
+    return out
+
+
+async def seed_project_facts(
+    config: Any,
+    paths: list[str] | None = None,
+    max_facts: int = _MAX_SEED_FACTS,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Distil project docs into gate-filtered CAM facts.
+
+    Chunks each doc, distils chunks with the accumulated subject list (so
+    later chunks reuse canonical keys instead of coining aliases), dedupes
+    against the side index, and — unless ``dry_run`` — pushes candidates
+    through the server's write gate, never past the capacity alert.
+
+    Returns a summary dict: ``docs`` (paths read), ``candidates`` (proposed
+    after dedupe/cap), ``records`` (side-index records written),
+    ``accepted`` (gate-stored count), and ``blocked`` (candidates the
+    capacity guard refused to attempt).
+    """
+    from spine.services.cam_client import CAMClient, resolve_cam_settings
+
+    provider_cfg = _cam_provider(config)
+    if not provider_cfg:
+        raise RuntimeError("No enabled provider carries a `cam:` block")
+    settings = resolve_cam_settings(
+        provider_cfg, workspace_root=getattr(config, "workspace_root", None)
+    )
+    if settings is None:
+        raise RuntimeError("CAM is configured but disabled")
+
+    write_mode = "pointer" if settings.mode else None
+    max_object_words = (
+        _MAX_OBJECT_WORDS_POINTER if write_mode else _MAX_OBJECT_WORDS
+    )
+
+    docs = _seed_paths(config, paths)
+    known = _known_subjects(config, settings.namespace)
+    seen = {" ".join(s.lower().split()) for s in known}
+    candidates: list[_FactCandidate] = []
+    for doc in docs:
+        if len(candidates) >= max_facts:
+            break
+        try:
+            text = doc.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            logger.warning("seed: cannot read %s — skipped", doc)
+            continue
+        for chunk in _chunk_paragraphs(f"SOURCE DOC: {doc.name}\n\n{text}"):
+            if len(candidates) >= max_facts:
+                break
+            found = await _distill_material(
+                chunk,
+                max_object_words=max_object_words,
+                # Accumulate: later chunks see earlier chunks' subjects too.
+                known_subjects=known + [c.subject for c in candidates],
+                source="docs",
+            )
+            for cand in found:
+                key = " ".join(cand.subject.lower().split())
+                if key in seen or len(candidates) >= max_facts:
+                    continue
+                seen.add(key)
+                candidates.append(cand)
+
+    summary: dict[str, Any] = {
+        "docs": [str(d) for d in docs],
+        "candidates": candidates,
+        "records": [],
+        "accepted": 0,
+        "blocked": 0,
+    }
+    if dry_run or not candidates:
+        return summary
+
+    client = CAMClient(settings)
+    try:
+        # Capacity discipline (F2.4): never write past the alert threshold —
+        # crowding degrades OTHER facts silently. Trim to the headroom.
+        count = _store_count(await client.stats(), await client.facts())
+        headroom = (
+            max(0, settings.capacity_alert - count)
+            if count is not None
+            else len(candidates)
+        )
+        to_write, blocked = candidates[:headroom], candidates[headroom:]
+        summary["blocked"] = len(blocked)
+        if blocked:
+            logger.warning(
+                "CAM store at %s facts (alert=%d) — %d seed candidate(s) not "
+                "attempted",
+                count,
+                settings.capacity_alert,
+                len(blocked),
+            )
+        accepted, records = await _gate_write_and_record(
+            client,
+            settings,
+            to_write,
+            work_id="",
+            source="seeded",
+            write_mode=write_mode,
+        )
+        if accepted:
+            await client.save()
+        if records:
+            facts_store_for(config).add_many(records)
+        summary["accepted"] = accepted
+        summary["records"] = records
+        return summary
+    finally:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── Read path (F1.3: deterministic prompt-side rendering) ────────────────────

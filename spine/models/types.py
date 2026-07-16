@@ -402,7 +402,7 @@ class ProjectFact(BaseModel):
         description="Readback probe result (/cam/ask contains the object), if run",
     )
     source: str = Field(
-        default="distilled", description="Provenance: distilled | manual"
+        default="distilled", description="Provenance: distilled | manual | seeded"
     )
     created_at: str = Field(
         default="", description="ISO timestamp when the write was attempted"

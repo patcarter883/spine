@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import click
 from rich.console import Console
@@ -1177,6 +1178,86 @@ def facts_add(subject: str, object_: str, probe_prompt: str | None, config_path:
     )
     verdict = "[green]stored[/green]" if stored else "[yellow]skipped (base already recalls it)[/yellow]"
     console.print(f"{verdict}  base_p={resp.get('base_p')}")
+
+
+@facts.command(name="seed")
+@click.argument("paths", nargs=-1, type=click.Path(exists=True))
+@click.option(
+    "--max-facts",
+    default=20,
+    show_default=True,
+    help="Total candidate cap across all docs (store knee is ~128).",
+)
+@click.option("--dry-run", is_flag=True, help="Distil and show candidates; write nothing.")
+@click.option("--config", "config_path", default=".spine/config.yaml", help="Path to config file.")
+def facts_seed(paths: tuple[str, ...], max_facts: int, dry_run: bool, config_path: str) -> None:
+    """Distil project docs into gate-filtered CAM facts.
+
+    PATHS are markdown files or directories; default is .spine/onboarding/.
+    Candidates go through the server's base-uncertainty write gate — only
+    what the model can't already recall is stored. Every attempt lands in
+    the facts.jsonl side index.
+    """
+    import asyncio
+
+    from spine.agents.facts import seed_project_facts
+
+    config = SpineConfig.load_as_active(path=config_path)
+    try:
+        summary = asyncio.run(
+            seed_project_facts(
+                config, paths=list(paths) or None, max_facts=max_facts, dry_run=dry_run
+            )
+        )
+    except RuntimeError as e:
+        console.print(f"[red]{e} (see .spine/config.reference.yaml).[/red]")
+        raise SystemExit(1)
+
+    if not summary["docs"]:
+        console.print("[yellow]No seed documents found.[/yellow]")
+        return
+    console.print(f"Read {len(summary['docs'])} doc(s): " + ", ".join(
+        Path(d).name for d in summary["docs"]
+    ))
+    candidates = summary["candidates"]
+    if not candidates:
+        console.print("[yellow]Distillation proposed no new facts.[/yellow]")
+        return
+
+    if dry_run:
+        table = Table(title=f"Seed candidates ({len(candidates)}) — dry run, nothing written")
+        table.add_column("Subject", style="bold")
+        table.add_column("Object")
+        table.add_column("Probe prompt")
+        for c in candidates:
+            table.add_row(c.subject, c.object, c.probe_prompt)
+        console.print(table)
+        return
+
+    records = summary["records"]
+    table = Table(title=f"Seeded facts ({summary['accepted']}/{len(records)} stored by write gate)")
+    table.add_column("Subject", style="bold")
+    table.add_column("Object")
+    table.add_column("Gate")
+    table.add_column("Probe")
+    for r in records:
+        table.add_row(
+            r.subject,
+            r.object,
+            "stored" if r.stored else "skipped",
+            {True: "ok", False: "[red]FAIL[/red]", None: "—"}[r.verified],
+        )
+    console.print(table)
+    if summary["blocked"]:
+        console.print(
+            f"[yellow]{summary['blocked']} candidate(s) not attempted — store at "
+            f"capacity alert. Prune or raise capacity_alert.[/yellow]"
+        )
+    if len(records) < len(candidates) and not summary["blocked"]:
+        console.print(
+            f"[red]{len(candidates) - len(records)} candidate(s) never reached the "
+            "server (unreachable mid-batch) — re-run to retry.[/red]"
+        )
 
 
 @facts.command(name="delete")
