@@ -111,6 +111,28 @@ class SpineGitOrchestrator:
 
         self.patch_branch: str | None = None
         self.sandbox_dir: str | None = None
+        # The branch the OPERATOR had checked out in the master dir. Landing
+        # and rollback must return here — leaving `main` checked out silently
+        # swaps the live (branch-committed) config/state under any process
+        # reading files from the master dir (observed live 2026-07-16: a
+        # stalled run reverted .spine/config.yaml to main's paid-provider
+        # version). None when detached/unresolvable — falls back to main.
+        self.original_branch: str | None = self._current_master_branch()
+
+    def _current_master_branch(self) -> str | None:
+        """The master dir's checked-out branch, or ``None`` if detached."""
+        ok, out, _err = self._execute_shell(
+            "git rev-parse --abbrev-ref HEAD", cwd=self.master_dir
+        )
+        name = (out or "").strip()
+        return name if ok and name and name != "HEAD" else None
+
+    def _restore_master_branch(self) -> None:
+        """Best-effort: put the master dir back on the operator's branch."""
+        restore = self.original_branch or self.main_branch
+        if restore == self.patch_branch:
+            restore = self.main_branch
+        self._execute_shell(f"git checkout {restore}", cwd=self.master_dir)
 
     # ── low-level helpers ──
 
@@ -375,6 +397,9 @@ class SpineGitOrchestrator:
             self._execute_shell(
                 f"git worktree remove {self.sandbox_dir}", cwd=self.master_dir
             )
+        # The merge advanced main; now hand the master dir back to the
+        # operator's branch (no-op when they were on main).
+        self._restore_master_branch()
 
         logger.info("Merged verified patch branch %s into %s", branch, self.main_branch)
         return {"success": True, "branch": branch, "merged": True}
@@ -389,9 +414,7 @@ class SpineGitOrchestrator:
             ``{"rolled_back": True}``.
         """
         branch = self.patch_branch
-        self._execute_shell(
-            f"git checkout {self.main_branch}", cwd=self.master_dir
-        )
+        self._restore_master_branch()
         if self.strategy == "worktree" and self.sandbox_dir:
             self._execute_shell(
                 f"git worktree remove --force {self.sandbox_dir}",
@@ -408,8 +431,13 @@ class SpineGitOrchestrator:
         ):
             shutil.rmtree(self.sandbox_dir, ignore_errors=True)
 
-        self._execute_shell("git reset --hard HEAD", cwd=self.master_dir)
-        self._execute_shell("git clean -fd", cwd=self.master_dir)
+        # Only scrub the master tree when the run actually used it as the
+        # sandbox (non-worktree strategy). Under worktree isolation the
+        # master tree was never touched by the run — a hard reset + clean
+        # here destroys the OPERATOR's uncommitted/untracked state.
+        if self.strategy != "worktree":
+            self._execute_shell("git reset --hard HEAD", cwd=self.master_dir)
+            self._execute_shell("git clean -fd", cwd=self.master_dir)
 
         logger.info("Rolled back sandbox (branch=%s)", branch)
         return {"rolled_back": True}

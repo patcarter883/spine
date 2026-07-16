@@ -285,3 +285,83 @@ def test_status_reports_inactive_then_active(tmp_path):
     assert active["active"] is True
     assert active["branch"] == "spine/patch-cccc3333"
     assert active["sandbox_dir"] == "/tmp/sandbox-x"
+
+
+# ── master-dir branch restoration (2026-07-16: stalled run left main checked
+# out, silently reverting the live branch-committed config) ──
+
+
+def test_rollback_restores_original_branch_not_main(tmp_path, monkeypatch):
+    orch = _make_orchestrator(tmp_path)
+    orch.strategy = "worktree"
+    orch.original_branch = "feat/operator-branch"
+    orch.patch_branch = "spine/patch-deadbeef"
+    orch.sandbox_dir = str(tmp_path / "sandbox")
+    shell = _ScriptedShell([])
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+
+    orch.rollback_workspace()
+
+    checkouts = [c for c in shell.calls if c.startswith("git checkout")]
+    assert checkouts == ["git checkout feat/operator-branch"]
+
+
+def test_rollback_worktree_strategy_never_resets_master_tree(tmp_path, monkeypatch):
+    orch = _make_orchestrator(tmp_path)
+    orch.strategy = "worktree"
+    orch.original_branch = None  # detached/unknown -> falls back to main
+    orch.patch_branch = "spine/patch-deadbeef"
+    orch.sandbox_dir = str(tmp_path / "sandbox")
+    shell = _ScriptedShell([])
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+
+    orch.rollback_workspace()
+
+    assert not any("reset --hard" in c or "clean -fd" in c for c in shell.calls)
+    assert "git checkout main" in shell.calls
+
+
+def test_rollback_non_worktree_still_scrubs_master_tree(tmp_path, monkeypatch):
+    orch = _make_orchestrator(tmp_path)
+    orch.strategy = "branch"
+    orch.original_branch = None
+    orch.patch_branch = "spine/patch-deadbeef"
+    orch.sandbox_dir = str(tmp_path)  # == master_dir (non-worktree)
+    shell = _ScriptedShell([])
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+
+    orch.rollback_workspace()
+
+    assert any("reset --hard" in c for c in shell.calls)
+    assert any("clean -fd" in c for c in shell.calls)
+
+
+def test_rollback_never_restores_onto_the_deleted_patch_branch(tmp_path, monkeypatch):
+    orch = _make_orchestrator(tmp_path)
+    orch.strategy = "worktree"
+    orch.original_branch = "spine/patch-deadbeef"  # pathological
+    orch.patch_branch = "spine/patch-deadbeef"
+    orch.sandbox_dir = str(tmp_path / "sandbox")
+    shell = _ScriptedShell([])
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+
+    orch.rollback_workspace()
+
+    assert "git checkout main" in shell.calls
+
+
+def test_commit_and_merge_returns_to_original_branch(tmp_path, monkeypatch):
+    orch = _make_orchestrator(tmp_path)
+    orch.strategy = "worktree"
+    orch.original_branch = "feat/operator-branch"
+    orch.patch_branch = "spine/patch-deadbeef"
+    orch.sandbox_dir = str(tmp_path / "sandbox")
+    shell = _ScriptedShell([])
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+
+    result = orch.commit_and_merge()
+
+    assert result["merged"] is True
+    checkouts = [c for c in shell.calls if c.startswith("git checkout")]
+    # main first (merge target), then back to the operator's branch.
+    assert checkouts == ["git checkout main", "git checkout feat/operator-branch"]
