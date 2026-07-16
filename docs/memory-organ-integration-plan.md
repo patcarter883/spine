@@ -290,3 +290,90 @@ F2.1–F2.4 (fact distillation + side index) → F3.1/F3.3 (CLI + verify) → F1
 Prereq on the serving side: `cam-production` running with `MINISGL_CAM=1`, a trained checkpoint
 dir, and namespaces enabled — plus the parity spike (`memory-organ/docs/serving/parity_spike.md`)
 green if the tap checkpoint predates the current engine build.
+
+---
+
+## 6. Addendum (2026-07-16): upstream reassessment — pointer pivot + frozen-base scorecard
+
+Reassessment of this plan against everything memory-organ / minisgl-rdna4 landed after the
+2026-07-08 snapshot above. **Nothing spine shipped breaks** — the live serving surface
+(`cam-production`) is unchanged since Jul 8, and the side-index-first design (facts.jsonl is the
+source of truth, the bank is a rebuildable cache, everything fail-open) is exactly what makes
+spine indifferent to the mechanism pivot described below.
+
+### 6.1 What changed upstream
+
+1. **memory-organ #100 solved (Jul 8, merged).** The **pointer id-bank** delivers genuine
+   multi-token objects end-to-end, 4/4 span-exact, with the base continuing fluently.
+   "Remaining is serving integration only."
+2. **A/B/C bake-off (Jul 9, `bakeoff-abc`).** Pointer architecture (GTE-whitened subject keys +
+   exact object token-ids) wins delivery outright: paraphrase addressing **0.543 vs 0.06** for
+   the incumbent input-embedding keys, 5% false delivery, lossless multi-token (46% of natural
+   facts are multi-token), zero per-base training, base-agnostic. Whitening is mandatory (raw
+   GTE delivers every distractor).
+3. **Hybrid serving design spec (Jul 9, minisgl-rdna4 `cam-hybrid-spec`,
+   `docs/zaya-port/CAM_HYBRID_DESIGN.md` — design only, not implemented).** Pointer becomes the
+   default delivery mode; the tap survives as an opt-in "editor" mode over one store. API
+   deltas when it lands: `mode: "pointer"|"tap"|"both"` on `/cam/remember`, `mode` +
+   `X-CAM-Mode` on ask with a `mode_served` echo, GTE key + whitening artifacts shipped in the
+   checkpoint (this is the real fix for serving issue #10), taus re-tuned for the GTE key space.
+4. **Frozen-base vs Titans scorecard (merged Jul 13, memory-organ PR #103:
+   `docs/research/frozen-base-titans-scorecard.md`, RESULTS §8, DIARY Phase 17, ROADMAP).**
+   The strategic result: **injection cannot integrate an edit into multi-hop reasoning** —
+   every activation-write variant at every depth sits below the in-context (RAG) ceiling
+   (~0.5); only distilling the base's own in-context behavior (a cartridge) clears the wall.
+   The structural win of the frozen approach is **continual/no-forget via a routed bank of
+   isolated memories** (general knowledge preserved 1.00 vs 0.17 for naive accumulation; zero
+   cross-fact interference by construction). ROADMAP now codifies the product shape as
+   "a reasoning model plus a routed bank of cheap, editable, non-interfering test-time
+   memories."
+
+Upstream research gates cited in §1: **two of three are now substantially resolved** — #100
+multi-token delivery (pointer, solved) and #2 cross-base transfer (translator lifts 0.393 →
+0.812, "largely closed"). Only N-scaling beyond ~128 facts remains genuinely open, and the
+pointer store likely reshapes that problem (see 6.3).
+
+### 6.2 Plan changes to adopt now (no upstream dependency)
+
+- **`cam.read: facts_block` is the principled default, not a fallback.** The scorecard proves
+  in-forward injection delivers single-hop recall at best and cannot participate in multi-hop
+  reasoning — the prompt block IS the quality ceiling. Transparent read is a token
+  optimization for recall-shaped queries only. Reframe F1.3/risk-3 accordingly.
+- **Subject canonicalization in F2.1 distillation.** The routed bank's accuracy bottleneck is
+  router retrieval (0.70), and its misses are same-structure aliases. Spine controls the
+  subject strings it writes: the `distill_run_facts` prompt should enforce one canonical
+  subject naming convention per entity (no near-alias subjects for the same thing).
+- **Fact-block selectivity is a delivery-quality lever, not just capacity discipline.**
+  BABILong shows even RAG degrades under distractor-heavy context (0.75 → 0.45 as filler
+  grows). The ≤5-candidates-per-run cap and a small curated `<known_facts>` block keep the
+  in-context mechanism in its high-accuracy regime; do not let the block grow into a dump.
+
+### 6.3 Changes that activate when the hybrid serving lands
+
+- **`cam_client.py`:** send `mode: "pointer"` on remember; surface `mode_served` from ask.
+  Spine should never opt facts into tap mode — its facts are exactly what pointer is for.
+- **F2.1 "objects ≤ a few tokens" relaxes** — pointer delivery is lossless multi-token.
+- **Risk 1 (base coupling) mostly dissolves** — pointer facts are base-agnostic; switching the
+  provider model orphans only opt-in tap facts.
+- **Risk 3 (paraphrase/collision, issue #10)** is fixed by GTE-whitened keys (0.06 → 0.54
+  paraphrase addressing), making transparent read trustworthy for recall.
+- **F2.4 capacity knee (~128) is a product-key-bank constraint** — under the hybrid, the bank
+  write only happens for tap-mode facts, so pointer facts shouldn't crowd. LRU eviction (#9)
+  still applies: keep the reconcile-and-replay discipline.
+
+### 6.4 Watch item — Phase 5 candidate (does not change current phases)
+
+The scorecard's cartridge result sketches a per-project **distilled "codebase cartridge"**: a
+build-once, query-many context (a codebase is the canonical case) distilled into a persistent
+~38× smaller prefix at in-context quality, organized as a routed bank per project. That is a
+new serving surface that does not exist yet — track it; do not build against it.
+
+### 6.5 Corrections to the 2026-07-08 text
+
+- The worktree paths in §1 and the launch recipe (`~/code/minisgl-rdna4-camB`,
+  `~/code/minisgl-rdna4-prod`) have been pruned. The branches live in `~/code/minisgl-rdna4`
+  proper (`cam-serve-optionB`, `cam-production`, plus `cam-hybrid-spec` for the design spec).
+- `cam-production` gained one commit after the snapshot (182c330, Jul 8): a #10
+  subject-canonicalization lever + retrieval eval harness, and #11 DP-scale reload/design.
+  Issues #6–#12 all remain open on the tracker; the "implemented, validated" branches are
+  still unmerged and PR-less.
