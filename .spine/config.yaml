@@ -93,9 +93,10 @@ providers:
   - name: openrouter
     type: deepagents-model
     model: openrouter:moonshotai/kimi-k2.7-code
-    enabled: true
+    # DISABLED 2026-07-16 (Pat): paid cloud lane — all work stays on local
+    # serves. Re-enable deliberately, never as the default/active provider.
+    enabled: false
     guided_decoding: true
-    enabled: true
     stream_usage: true
     context_window: 100000
   # - name: pat
@@ -336,7 +337,7 @@ providers:
     base_url: env:SPINE_POD_URL__REASONER
     api_key: vllm
     guided_decoding: true
-    enabled: true
+    enabled: false  # RunPod = paid; disabled with the ephemeral_pods (2026-07-16)
     stream_usage: true
     max_concurrent_calls: 4
     context_window: 60000
@@ -347,7 +348,7 @@ providers:
     base_url: env:SPINE_POD_URL__CODER
     api_key: vllm
     guided_decoding: true
-    enabled: true
+    enabled: false  # RunPod = paid; disabled with the ephemeral_pods (2026-07-16)
     stream_usage: true
     max_concurrent_calls: 4
     context_window: 60000
@@ -443,12 +444,21 @@ providers:
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
+    # Onboarding moved off openrouter (paid lane disabled 2026-07-16).
     onboarding:
-      provider: openrouter
+      provider: local-qwen
     onboarding/doc-manager:
-      provider: openrouter
+      provider: local-qwen
     onboarding/section-worker:
-      provider: openrouter
+      provider: local-qwen
+    # Experience distillation (cross-run lessons + CAM fact capture/seed):
+    # pinned to the CAM provider so the memory-organ work runs on the same
+    # serve that hosts the store — structured JSON extraction, no reasoning.
+    experience:
+      provider: local-qwen
+      max_completion_tokens: 4096
+      temperature: 0
+      reasoning: false
     # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
     # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
     # actually fail. error_diagnosis is enabled in the spine: block above.
