@@ -184,6 +184,26 @@ providers:
     top_p: 0.8
     top_k: 20
     repeat_penalty: 1.05
+    # ── CAM memory organ (/cam/* plane on this minisgl serve, fail-open) ──
+    # Durable subject→object project facts: distilled at run finalization,
+    # written through the server's base-uncertainty gate, injected back as a
+    # <known_facts> prompt block. Side index: .spine/experience/facts.jsonl.
+    # A serve without CAM loaded 503s and everything no-ops. ⚠ NOT yet
+    # verified against this endpoint's deployed build (serve was down
+    # 2026-07-16): if agent calls start 400ing on the `cam_write` body field,
+    # the build predates CAM — set `enabled: false` until it lands.
+    cam:
+      enabled: true
+      # api_token: env:MINISGL_CAM_API_TOKEN   # uncomment if the serve sets one
+      namespace: auto                # slug of the project root dir -> "spine"
+      write: distill                 # run-finalize distillation only, never ambient
+      read: facts_block              # principled default (plan §6.2): prompt block
+                                     # is the quality ceiling; in-forward delivery
+                                     # is single-hop recall only
+      capacity_alert: 100            # store knee ~128 facts/namespace
+      # mode: pointer                # UNCOMMENT when the hybrid serving lands —
+                                     # distilled facts then write pointer-only,
+                                     # object cap relaxes, mode_served checked
   - name: local-qwen-fallback
     type: deepagents-model
     # Standby for local-qwen (referenced by its fallback_provider) — the same
