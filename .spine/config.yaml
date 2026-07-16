@@ -151,7 +151,10 @@ providers:
     # local-glm (probe 11: zero judge noise). NOTE the provider NAME is
     # legacy — every phase lane references it, kept to avoid churn.
     # History: Agents-A1 35B-A4B MoE → (briefly, my error) Ornith-1.0-35B.
-    model: openai:pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4
+    # Repointed 2026-07-16 (Pat): serve swapped to the AWQ-4bit build for the
+    # CAM testing round; identity probe was correctly marking the MXFP4 id
+    # DOWN and falling everything back to the single-stream Lemonade box.
+    model: openai:cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
     base_url: http://10.50.1.51:1919/v1
     api_key: vllm
     guided_decoding: true
