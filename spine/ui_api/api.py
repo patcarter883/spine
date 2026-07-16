@@ -604,7 +604,7 @@ class UIApi:
 
             from spine.services.cam_client import cam_client_for
 
-            provider = self._config.resolve_active_provider() or {}
+            provider = self._config.resolve_cam_provider() or {}
             client = cam_client_for(
                 provider, workspace_root=self._config.workspace_root
             )

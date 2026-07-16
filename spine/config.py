@@ -1189,6 +1189,30 @@ class SpineConfig:
                 return provider
         return None
 
+    def resolve_cam_provider(self) -> dict | None:
+        """Return the first enabled LLM provider carrying a ``cam:`` block.
+
+        The CAM memory organ is not necessarily on the *active*
+        (first-enabled) provider: phase routing may send the workhorse
+        traffic to a later entry whose serve hosts the ``/cam/*`` plane, and
+        the ``<known_facts>`` prompt block benefits every lane regardless of
+        which serve stores the facts. ``cam: false`` and
+        ``cam: {enabled: false}`` entries are skipped.
+
+        Returns:
+            The provider config dict, or ``None`` when no enabled provider
+            has CAM configured.
+        """
+        for provider in self.providers.get("llm", []):
+            if not provider.get("enabled", True):
+                continue
+            cam = provider.get("cam")
+            if cam is True or (
+                isinstance(cam, dict) and cam.get("enabled") is not False
+            ):
+                return provider
+        return None
+
     def _lookup_provider_by_name(self, name: str) -> dict | None:
         """Find a named provider in ``providers.llm[]``.
 

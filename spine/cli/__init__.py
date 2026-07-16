@@ -1021,14 +1021,14 @@ def experience_clear(
 
 
 def _cam_client_or_exit(config: SpineConfig):
-    """Build a CAMClient from the active provider's `cam:` block, or exit."""
+    """Build a CAMClient from the CAM-carrying provider's `cam:` block, or exit."""
     from spine.services.cam_client import cam_client_for
 
-    provider = config.resolve_active_provider() or {}
+    provider = config.resolve_cam_provider() or {}
     client = cam_client_for(provider, workspace_root=config.workspace_root)
     if client is None:
         console.print(
-            "[red]No CAM memory configured — add a `cam:` block to the active "
+            "[red]No CAM memory configured — add a `cam:` block to an enabled "
             "LLM provider (see .spine/config.reference.yaml).[/red]"
         )
         raise SystemExit(1)

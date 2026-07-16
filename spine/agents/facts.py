@@ -79,6 +79,24 @@ def facts_store_for(config: Any) -> FactsStore:
     return FactsStore(str(path))
 
 
+def _cam_provider(config: Any) -> dict[str, Any] | None:
+    """The provider whose ``cam:`` block governs the memory organ.
+
+    Prefers :meth:`SpineConfig.resolve_cam_provider` — the organ is not
+    necessarily on the first-enabled ("active") provider when phase routing
+    sends the workhorse traffic to a later entry (e.g. openrouter listed
+    first, CAM on the minisgl lane). Falls back to the active provider for
+    config objects that predate the method.
+    """
+    for name in ("resolve_cam_provider", "resolve_active_provider"):
+        resolver = getattr(config, name, None)
+        if callable(resolver):
+            provider = resolver()
+            if provider and provider.get("cam"):
+                return provider
+    return None
+
+
 # ── Distillation (LLM pass) ──────────────────────────────────────────────────
 class _FactCandidate(BaseModel):
     """One proposed fact, in the exact shape /cam/remember consumes."""
@@ -256,17 +274,14 @@ async def capture_run_facts(
     """Distil, gate-write, and record a run's project facts.
 
     Best-effort — never raises. Returns the number of facts the server's
-    write gate accepted. No-op unless the active provider carries a ``cam:``
+    write gate accepted. No-op unless an enabled provider carries a ``cam:``
     block with ``write: distill``.
     """
     client = None
     try:
         if final_status in _SKIP_CAPTURE_STATUSES:
             return 0
-        provider_cfg = None
-        resolver = getattr(config, "resolve_active_provider", None)
-        if callable(resolver):
-            provider_cfg = resolver()
+        provider_cfg = _cam_provider(config)
         if not provider_cfg or not provider_cfg.get("cam"):
             return 0
 
@@ -446,8 +461,7 @@ def resolve_known_facts_block(config: Any | None = None) -> str:
             from spine.config import SpineConfig
 
             config = SpineConfig.load()
-        resolver = getattr(config, "resolve_active_provider", None)
-        provider_cfg = resolver() if callable(resolver) else None
+        provider_cfg = _cam_provider(config)
         if not provider_cfg or not provider_cfg.get("cam"):
             return ""
 
