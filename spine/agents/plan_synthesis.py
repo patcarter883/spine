@@ -413,6 +413,63 @@ def _symbol_exists_in_index(db_path: str | None, sym: str) -> bool:
     return _owner_declares_attribute(db_path, sym)
 
 
+@lru_cache(maxsize=512)
+def _is_resolvable_module_path(sym: str) -> bool:
+    """True when *sym* itself imports as a MODULE (internal or external).
+
+    A reference like 'spine.cli' is a fact about where code lives, never a
+    symbol a producer slice must create — but `_importable_external_root`
+    deliberately refuses project-internal roots, and module paths are not
+    index symbols, so run 5646d24c burned all 5 plan-critic rounds on
+    "'spine.cli' does not exist in the codebase index". Full-path resolution
+    is precise: 'spine.cli' resolves, 'spine.nonexistent' does not, and
+    'spine.cli.list_cmd' falls through to the symbol checks.
+    """
+    s = (sym or "").strip()
+    if not s or "." not in s or not all(p.isidentifier() for p in s.split(".")):
+        return False
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(s) is not None
+    except Exception:  # noqa: BLE001 — resolution failure ⇒ not a module
+        return False
+
+
+def _unprovable_reference(
+    db_path: str | None, sym: str, known_roots: frozenset[str] | set[str] = frozenset()
+) -> bool:
+    """True when the gate cannot PROVE *sym* dangling — so it must not flag.
+
+    Two shapes, both live false-positive escalations (run 5646d24c parked
+    after 5 rounds on the pair):
+
+    - Importable MODULE paths ('spine.cli') — see
+      :func:`_is_resolvable_module_path`.
+    - Dotted refs whose ROOT segment is unknown to the index
+      ('console.print', where `console` is a module-level Console() variable
+      the tree-sitter index never catalogs). With an unindexed root the gate
+      has no ground truth to check the attribute against — the same policy
+      that already exempts BARE unqualified identifiers. Refs with an
+      INDEXED owner ('ArtifactStore.artifact_existsX') stay fully flaggable,
+      which is where the gate has ever caught real defects.
+
+    ``known_roots`` are plan-internal owner names (slice ids, roots of
+    ``provides`` entries): a root the PLAN itself defines is contract
+    territory even though the index has never seen it ('api.add_provider'
+    where 'api' is a producer slice), so it is never unprovable.
+    """
+    if _is_resolvable_module_path(sym):
+        return True
+    root = _root(sym)
+    if not root or root == sym.strip() or root in known_roots:
+        return False
+    # _symbol_exists_in_index is the shared (and test-injectable) index seam;
+    # for a single-segment name it is exactly "does the index know this root"
+    # and stays permissive (True) when the index is unavailable.
+    return not _symbol_exists_in_index(db_path, root)
+
+
 def _owner_declares_attribute(db_path: str, sym: str) -> bool:
     """True when *sym* is an ``Owner.attr`` whose owner's source assigns it.
 
@@ -511,6 +568,12 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
 
         graph: dict[str, set[str]] = {s.id: set(s.dependencies or []) for s in stubs}
         violations: list[str] = []
+        # Plan-internal owner names: slice ids and provides roots — a root
+        # the plan itself defines is contract territory, never unprovable.
+        known_roots = frozenset(
+            {s.id for s in stubs}
+            | {_root(p) for s in stubs for p in (s.provides or []) if _root(p)}
+        )
 
         for s in stubs:
             for ref in s.reference_symbols or []:
@@ -549,6 +612,10 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
                 # burned three manager rounds in run b15cee51). Provided
                 # bare symbols still get dependency edges above.
                 if "." not in ref and "::" not in ref and "\\" not in ref:
+                    continue
+                # Module paths and unindexed-root refs are unverifiable —
+                # the gate flags only provable danglings (run 5646d24c).
+                if _unprovable_reference(db_path, ref, known_roots):
                     continue
                 violations.append(
                     f"slice '{s.id}' references '{ref}', which does not exist in "

@@ -200,21 +200,17 @@ def test_builtins_and_logger_refs_are_skipped(index) -> None:
 
 def test_generic_package_prefix_never_matches_exclusion(index) -> None:
     # Run 019f2104: the exclusion "Core spine settings (checkpoint_path, ...)"
-    # matched the 'spine' package prefix of every module path. Only the
-    # DIRECT owner segment may match, and even persistent dangling must not
-    # escalate on an intermediate-segment match.
+    # matched the 'spine' package prefix of every module path and escalated a
+    # fabricated contradiction. Under the unprovable-reference policy (run
+    # 5646d24c) this shape — a package-rooted module path whose root the
+    # index does not know — is never flagged at all, so it can never reach
+    # exclusion matching: a strictly stronger form of the same protection.
     index({UIAPI_FILE: UIAPI_SYMS})
     exclusion = "Core spine settings (checkpoint_path, artifact_path, etc.)."
     plan = _plan(
         {"id": "s1", "reference_symbols": ["spine.ui.widgets.render_all_panels"]}
     )
-    first = check_reference_symbols(plan, _spec([exclusion]), None, db_path=DB)
-    assert first is not None
-    assert first["status"] == ReviewStatus.NEEDS_REVISION.value
-    second = check_reference_symbols(plan, _spec([exclusion]), first, db_path=DB)
-    assert second is not None
-    assert second["status"] == ReviewStatus.NEEDS_REVISION.value
-    assert second["blocker_category"] is None
+    assert check_reference_symbols(plan, _spec([exclusion]), None, db_path=DB) is None
 
 
 def test_exclusion_with_near_miss_gets_one_revision_round_first(index) -> None:
@@ -258,8 +254,10 @@ def test_unqualified_dangling_is_not_gate_business(index) -> None:
 
 
 def test_persistence_without_exclusion_stays_revision(index) -> None:
+    # Indexed owner (UIApi) so the dangling leaf stays provable under the
+    # unprovable-reference policy — the persistence machinery is the subject.
     index({UIAPI_FILE: UIAPI_SYMS})
-    plan = _plan({"id": "a", "reference_symbols": ["Widget.render_all"]})
+    plan = _plan({"id": "a", "reference_symbols": ["UIApi.render_all"]})
     first = check_reference_symbols(plan, _spec(), None, db_path=DB)
     assert first is not None
     second = check_reference_symbols(plan, _spec(), first, db_path=DB)
@@ -552,6 +550,11 @@ class TestPhpVendorSymbols:
             "spine.workflow.plan_reference_gate._symbol_exists_in_index",
             lambda db, sym: False,
         )
+        # Owner IS known to the index — the dangling leaf stays provable.
+        monkeypatch.setattr(
+            "spine.workflow.plan_reference_gate._find_symbol_files",
+            lambda db, name: ["a.py"] if name == "UIApi" else [],
+        )
         plan = {"feature_slices": [{
             "id": "s",
             "target_files": ["a.py"],
@@ -591,3 +594,65 @@ def test_php_provides_genuinely_existing_method_still_flagged(index) -> None:
     result = check_reference_symbols(plan, _spec(), None, db_path=DB)
     assert result is not None
     assert "ALREADY EXISTS" in result["reason"]
+
+
+# ── unprovable references (run 5646d24c: 5 rounds burned on two false
+# positives — verdict_source=gate, planner correct) ──
+
+
+def test_module_level_variable_attribute_not_flagged(index) -> None:
+    # `console` is a module-level Console() variable: invisible to the
+    # tree-sitter index, so the gate has no ground truth for its attributes.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {
+            "id": "register-version-cli-command",
+            "target_files": ["spine/cli/__init__.py"],
+            "reference_symbols": ["console.print"],
+        }
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_internal_module_path_not_flagged(index) -> None:
+    # 'spine.cli' imports as a real module — a fact, not a symbol contract.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {
+            "id": "write-version-cli-tests",
+            "target_files": ["tests/unit/test_version_cmd.py"],
+            "reference_symbols": ["spine.cli"],
+        }
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_indexed_owner_with_missing_leaf_still_flagged(index) -> None:
+    # The protection the gate exists for is untouched: known owner, bad leaf.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {
+            "id": "embed-ui",
+            "target_files": ["spine/ui/_pages/config_view.py"],
+            "reference_symbols": ["UIApi.get_llm_providers"],
+        }
+    )
+    result = check_reference_symbols(plan, _spec(), None, db_path=DB)
+    assert result is not None
+    assert "UIApi.get_llm_providers" in result["reason"]
+
+
+def test_plan_internal_root_stays_flaggable(index) -> None:
+    # A root the PLAN defines (slice id / provides owner) is contract
+    # territory even though the index has never seen it.
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {"id": "api", "provides": ["NewThing.add_provider"]},
+        {
+            "id": "ui",
+            "reference_symbols": ["NewThing.add_embedding_provider"],
+        },
+    )
+    result = check_reference_symbols(plan, _spec(), None, db_path=DB)
+    assert result is not None
+    assert "NewThing.add_embedding_provider" in result["reason"]

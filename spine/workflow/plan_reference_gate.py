@@ -49,7 +49,9 @@ from typing import Any
 
 from spine.agents.plan_synthesis import (
     _is_external_reference,
+    _is_resolvable_module_path,
     _leaf,
+    _root,
     _symbol_exists_in_index,
 )
 from spine.models.enums import ReviewStatus
@@ -238,6 +240,17 @@ def check_reference_symbols(
 
     exclusions = _scope_exclusions(specification_json)
     prior_leafs = set((prior_gate or {}).get("dangling_leafs") or [])
+    # Plan-internal owner names (slice ids, provides roots): roots the plan
+    # itself defines stay flaggable even though the index has not seen them.
+    plan_roots: set[str] = {
+        str(s.get("id", "")) for s in slices if isinstance(s, dict)
+    }
+    for s in slices:
+        if isinstance(s, dict):
+            for p in s.get("provides") or []:
+                r = _root(_normalize_symbol(str(p)))
+                if r:
+                    plan_roots.add(r)
 
     dangling: list[dict[str, Any]] = []
     redefined: list[dict[str, Any]] = []
@@ -270,6 +283,22 @@ def check_reference_symbols(
             # still compares bare names against provides, and executed
             # verify evidence owns actual correctness.
             if "." not in ref and "\\" not in ref:
+                continue
+            # Module paths ('spine.cli') and unindexed-root refs
+            # ('console.print' — module-level variable, invisible to the
+            # index) are unverifiable: the gate flags only PROVABLE
+            # danglings. Run 5646d24c burned all 5 plan-critic rounds on
+            # exactly this pair (verdict_source=gate, planner correct).
+            # Roots the index KNOWS ('UIApi.get_llm_providersX') stay
+            # flaggable — that is where the gate catches real defects.
+            if _is_resolvable_module_path(ref):
+                continue
+            ref_root = _root(ref)
+            if (
+                ref_root
+                and ref_root not in plan_roots
+                and not _find_symbol_files(db_path, ref_root)
+            ):
                 continue
             dangling.append(
                 {
