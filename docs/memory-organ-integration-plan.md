@@ -377,3 +377,53 @@ new serving surface that does not exist yet — track it; do not build against i
   subject-canonicalization lever + retrieval eval harness, and #11 DP-scale reload/design.
   Issues #6–#12 all remain open on the tracker; the "implemented, validated" branches are
   still unmerged and PR-less.
+
+---
+
+## 7. Live deployment state (2026-07-16, evening) — pointer is the deployed reality
+
+Validated against the production serve (10.50.1.51:1919, `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit`
+on mini-sglang, CAM rev `02f0231`) during the first spine↔minisgl coordination loop.
+
+### 7.1 What the deployed build actually is
+
+- **Pointer id-bank is the default AND only path** — the 4B-trained tap checkpoint's hidden
+  dim (2560) ≠ the served 35B's (2048), so CAM auto-falls-back to pointer/retrieve-only and
+  the residual tap is OFF. The hybrid `mode: pointer|tap|both` request field is design-only;
+  `mode_served` reads `pointer` everywhere. Spine sets `cam.mode: pointer` (config, live).
+- §6.3's predictions held: multi-token objects and code identifiers deliver span-exact;
+  the 4-word object cap is relaxed to 12 under pointer.
+- **Write gate works and reports `gate_reason`** ("novel" / base-recalls), which replaces
+  `base_p` (always 0.0 in frontend mode) as the meaningful verdict. Recorded per fact in
+  the side index.
+- **`/cam/ask` returns `delivered` + exact `object` + `mode_served`** — spine's readback
+  verification is now exact, not substring. **`/cam/lookup?subject=|text=`** pre-checks
+  delivery; **`GET/DELETE /cam/namespaces`** manage stores; deletes are durable across
+  restarts (rev 02f0231).
+- **Transparent read delivers on phrase subjects** (lexical n-gram windows, tau-gated):
+  a stored `capital of zorbia` answers "What is the capital of Zorbia?" in plain chat.
+  The GTE semantic key remains the deeper #10 fix. `facts_block` stays spine's read
+  default per §6.2 (multi-hop ceiling argument is unchanged); `both` is now a credible
+  option for recall-heavy phases.
+
+### 7.2 Spine-side state
+
+- Store seeded: 18 verified facts in namespace `spine` via `spine facts seed`
+  (onboarding docs → chunked distillation → gate → readback). Seed hardening landed:
+  per-chunk progress + distillation-lane visibility, deterministic near-alias dedupe
+  (same object + overlapping subject tokens), `--dry-run` candidate caching + `--from`
+  replay. Distillation pinned to the CAM provider via the `experience` phase override.
+- Operational findings from the first full-run exercise: (a) the serve can wedge under
+  concurrent large-prompt load — generation dead while `/cam/*` answers; minisgl tracks
+  hardening + a timed-generation health gate; (b) spine's landing/rollback left `main`
+  checked out in the master dir, silently reverting live branch-committed config —
+  fixed on `fix/master-branch-restore` (operator branch recorded + restored; master-tree
+  scrub limited to non-worktree strategies).
+
+### 7.3 Coordination protocol
+
+Unattended iteration runs through the note board at `http://10.50.1.51:7071`
+(`/serve`, `/notes`, `/note`, `/board`): spine tests and files findings; minisgl lands
+one server change per tick, health-gated with auto-rollback. Ledger of the first day:
+5 API asks + phrase-match + durable-delete requested, landed, and live-verified within
+three revs (a009317 → 3e8c1b3 → 02f0231).
