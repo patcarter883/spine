@@ -556,6 +556,31 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
             "cited_exclusions": [],
         }
 
+    # An EMPTY (or whitespace-only) critic response carries no verdict and no
+    # asks — it is harness/model noise, not an agent opinion. Classifying it
+    # "agent" charged run 5646d24c a full needs_revision attempt with zero
+    # actionable feedback AND broke the gate-verdict comparison chain (the
+    # next gate round saw an agent-sourced prior and restarted its streaks).
+    # Mirror the truncation guard: verdict_source="guard" freezes streak
+    # accounting and the first guard round is not charged an attempt.
+    if not content.strip():
+        logger.warning(
+            "critic fallback: EMPTY response with no structured verdict for "
+            "phase '%s' — guard NEEDS_REVISION (uncharged), not an agent verdict",
+            reviewed_phase,
+        )
+        return {
+            "status": ReviewStatus.NEEDS_REVISION.value,
+            "tier": "agent",
+            "verdict_source": "guard",
+            "reason": (
+                "Critic returned an empty response (no verdict, no findings) — "
+                "treating as harness noise and re-running the review round."
+            ),
+            "suggestions": [],
+            "cited_exclusions": [],
+        }
+
     content_upper = content.upper()
 
     # Negation guard: prose like "did not pass" / "cannot be passed" must never

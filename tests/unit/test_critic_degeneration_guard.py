@@ -43,3 +43,24 @@ def test_clean_text_pass_still_works():
     )
     assert parsed["status"] == ReviewStatus.PASSED.value
     assert len(parsed["reason"]) < 1200
+
+
+def test_empty_response_is_guard_verdict_not_agent():
+    # Run 5646d24c round 4: an EMPTY critic response became an agent-sourced
+    # needs_revision — charged an attempt with zero actionable feedback and
+    # broke the gate-verdict comparison chain. Empty = harness noise = guard.
+    for content in ("", "   \n\t  "):
+        parsed = _parse_agent_review_fallback(_result(content, "stop"), "plan")
+        assert parsed["status"] == ReviewStatus.NEEDS_REVISION.value
+        assert parsed["verdict_source"] == "guard"
+        assert parsed["suggestions"] == []
+        assert "empty response" in parsed["reason"].lower()
+
+
+def test_nonempty_unclear_text_stays_agent_sourced():
+    # A real (if unparseable) opinion is still an agent verdict.
+    parsed = _parse_agent_review_fallback(
+        _result("The plan has some issues around config handling.", "stop"), "plan"
+    )
+    assert parsed["status"] == ReviewStatus.NEEDS_REVISION.value
+    assert parsed.get("verdict_source") is None or parsed["verdict_source"] == "agent"
