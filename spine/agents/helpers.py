@@ -1472,15 +1472,21 @@ def _build_local_model(
 
     # ── CAM memory organ (minisgl cam-serving) ────────────────────────
     # When the provider is a minisgl server with the CAM editable memory
-    # (`cam:` block on the provider), scope every request to the project's
-    # memory namespace via the X-CAM-Namespace header and pin the ambient
-    # auto-write gate per request. `cam_write` is sent explicitly (True only
-    # under `write: ambient`) because spine's agent prompts are not
-    # conversational turns — server-side fact extraction from them is noise,
-    # and an explicit False overrides a server booted with
-    # MINISGL_CAM_AUTO_WRITE=1. The transparent read path is server-side and
-    # needs no request field. Edit-plane writes go through
-    # spine.services.cam_client, not this builder.
+    # (`cam:` block on the provider), pin the ambient auto-write gate per
+    # request. `cam_write` is sent explicitly (True only under `write:
+    # ambient`) because spine's agent prompts are not conversational turns —
+    # server-side fact extraction from them is noise, and an explicit False
+    # overrides a server booted with MINISGL_CAM_AUTO_WRITE=1.
+    #
+    # The X-CAM-Namespace header is attached ONLY when a server-side ambient
+    # path is actually in use (read: transparent/both, or write: ambient).
+    # The header is not free: it makes the serve run a retrieve-generate
+    # (mem_op=retrieve) before EVERY chat generation — under concurrent
+    # large-prompt agent traffic that contention wedged the serve twice on
+    # 2026-07-16 (blockers serve-wedged/-2). With read: facts_block the
+    # block is client-rendered from the side index and edit-plane calls
+    # carry their own header (spine.services.cam_client), so agent traffic
+    # must stay CAM-silent.
     if provider_cfg.get("cam"):
         from spine.services.cam_client import resolve_cam_settings
 
@@ -1492,7 +1498,11 @@ def _build_local_model(
             _cam_root = None
         cam_settings = resolve_cam_settings(provider_cfg, workspace_root=_cam_root)
         if cam_settings is not None:
-            if cam_settings.namespace:
+            ambient_in_use = (
+                cam_settings.read in ("transparent", "both")
+                or cam_settings.write == "ambient"
+            )
+            if ambient_in_use and cam_settings.namespace:
                 headers = dict(kwargs.get("default_headers") or {})
                 headers["X-CAM-Namespace"] = cam_settings.namespace
                 kwargs["default_headers"] = headers
