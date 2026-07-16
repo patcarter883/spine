@@ -399,12 +399,24 @@ providers:
       provider: local-qwen
     plan/subagents/researcher/supervisor:
       provider: local-qwen
+    # Critic lanes: runaway no-EOS guard (2026-07-17, slow-stream-degeneration):
+    # a plan-critic generation looped without EOS under the 12K cap, grew its
+    # request context to ~100K and hogged the serve's entire KV pool. Stronger
+    # repeat_penalty (provider default 1.05 -> 1.1) + a tighter cap bound the
+    # blast radius; the truncation guard's brevity retry (6f36e17) owns the
+    # truncation side of the trade.
     critic:
       provider: local-qwen
+      repeat_penalty: 1.1
+      max_completion_tokens: 8192
     critic/specify:
       provider: local-qwen
+      repeat_penalty: 1.1
+      max_completion_tokens: 8192
     critic/plan:
       provider: local-qwen
+      repeat_penalty: 1.1
+      max_completion_tokens: 8192
     gap_plan:
       provider: local-qwen
     exploration/manager:
