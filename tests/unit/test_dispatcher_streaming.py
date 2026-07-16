@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from spine.config import SpineConfig
-from spine.work.dispatcher import _get_work_db, _update_work_progress
+from spine.work.dispatcher import _ThroughputStallMonitor, _get_work_db, _update_work_progress
 
 
 class TestUpdateWorkProgress:
@@ -192,3 +192,74 @@ class TestV2StreamChunkParsing:
         assert self._parse_chunk("string") is None
         assert self._parse_chunk(42) is None
         assert self._parse_chunk(None) is None
+
+
+# ── _ThroughputStallMonitor (2026-07-17: dribbling stream evaded the
+# chunk-silence watchdog for 25+ minutes) ──
+
+
+class _FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class TestThroughputStallMonitor:
+    def test_healthy_stream_never_stalls(self):
+        clk = _FakeClock()
+        mon = _ThroughputStallMonitor(window_s=900, min_chunks=30, clock=clk)
+        # 2 chunks/second for 20 minutes — always above the floor.
+        for _ in range(2400):
+            clk.t += 0.5
+            assert mon.note_chunk(is_progress=False) is False
+
+    def test_dribble_stalls_after_one_window(self):
+        clk = _FakeClock()
+        mon = _ThroughputStallMonitor(window_s=900, min_chunks=30, clock=clk)
+        # 1 token/min: silence timeout never fires, but throughput must.
+        stalled = False
+        for _ in range(30):
+            clk.t += 60
+            if mon.note_chunk(is_progress=False):
+                stalled = True
+                break
+        assert stalled is True
+        # It took at least one full window to declare (no premature stall).
+        assert clk.t - 1000.0 >= 900
+
+    def test_updates_chunk_resets_the_window(self):
+        clk = _FakeClock()
+        mon = _ThroughputStallMonitor(window_s=900, min_chunks=30, clock=clk)
+        for _ in range(20):
+            clk.t += 60
+            mon.note_chunk(is_progress=False)
+            # A node completion arrives regularly: never stalled.
+            clk.t += 1
+            assert mon.note_chunk(is_progress=True) is False
+        # Dribble resumes after the last completion — needs a fresh full
+        # window before stalling again.
+        clk.t += 899
+        assert mon.note_chunk(is_progress=False) is False
+        clk.t += 2
+        assert mon.note_chunk(is_progress=False) is True
+
+    def test_burst_then_long_tool_gap_does_not_false_stall(self):
+        clk = _FakeClock()
+        mon = _ThroughputStallMonitor(window_s=900, min_chunks=30, clock=clk)
+        # Healthy burst...
+        for _ in range(100):
+            clk.t += 0.1
+            mon.note_chunk(is_progress=False)
+        # ...node completes, then a long silent tool execution (the silence
+        # timeout owns that case; first trickle after must not insta-stall).
+        assert mon.note_chunk(is_progress=True) is False
+        clk.t += 800
+        assert mon.note_chunk(is_progress=False) is False
+
+    def test_disabled_by_zero_min_chunks(self):
+        clk = _FakeClock()
+        mon = _ThroughputStallMonitor(window_s=900, min_chunks=0, clock=clk)
+        clk.t += 10000
+        assert mon.note_chunk(is_progress=False) is False
