@@ -204,10 +204,14 @@ providers:
       read: facts_block              # principled default (plan §6.2): prompt block
                                      # is the quality ceiling; in-forward delivery
                                      # is single-hop recall only
-      capacity_alert: 100            # store knee ~128 facts/namespace
-      # mode: pointer                # UNCOMMENT when the hybrid serving lands —
-                                     # distilled facts then write pointer-only,
-                                     # object cap relaxes, mode_served checked
+      capacity_alert: 100            # store knee ~128 facts/namespace (tap-bank
+                                     # constraint; pointer store is roomier but
+                                     # the alert stays as selectivity discipline)
+      # Pointer confirmed as the default AND only path on this build (minisgl
+      # note `pointer-default` 2026-07-16: 4B tap checkpoint hidden dim !=
+      # served 35B -> auto pointer/retrieve-only). Facts write pointer-only;
+      # object cap relaxes to 12 words; mode_served checked on readback.
+      mode: pointer
   - name: local-qwen-fallback
     type: deepagents-model
     # Standby for local-qwen (referenced by its fallback_provider) — the same
