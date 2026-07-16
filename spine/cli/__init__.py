@@ -1171,6 +1171,7 @@ def facts_add(subject: str, object_: str, probe_prompt: str | None, config_path:
                 base_p=resp.get("base_p"),
                 source="manual",
                 created_at=datetime.now().isoformat(),
+                mode=client.settings.mode,
             )
         ]
     )
@@ -1224,7 +1225,11 @@ def facts_sync(config_path: str) -> None:
         for f in stored:
             if f.subject.strip().lower() in have:
                 continue
-            resp = await client.remember(f.subject, f.probe_prompt, f.object)
+            # Replay with the mode the fact was originally written under
+            # (falls back to the client's configured mode when unset).
+            resp = await client.remember(
+                f.subject, f.probe_prompt, f.object, mode=f.mode
+            )
             if resp is None:
                 break
             replayed += int(bool(resp.get("stored")))

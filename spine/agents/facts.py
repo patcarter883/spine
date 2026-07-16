@@ -46,10 +46,19 @@ logger = logging.getLogger(__name__)
 
 # One run should pin at most a handful of facts — the CAM store's comfortable
 # capacity is ~128 per namespace and eviction is LRU (a flood here can push
-# out durable knowledge). Selectivity is the feature.
+# out durable knowledge). Selectivity is also a delivery-quality lever, not
+# just capacity discipline: a small curated block keeps the in-context
+# mechanism in its high-accuracy regime (plan §6.2).
 _MAX_FACTS_PER_RUN = 5
 _MAX_MATERIAL_CHARS = 6000
+# Object length: the tap store holds a first-token/pooled latent, so objects
+# must stay near-atomic. Pointer delivery (hybrid serving, `cam.mode` set) is
+# lossless multi-token — the cap relaxes but stays short: these are pinned
+# facts, not prose.
 _MAX_OBJECT_WORDS = 4
+_MAX_OBJECT_WORDS_POINTER = 12
+# How many existing subject keys to show the distiller for canonical reuse.
+_KNOWN_SUBJECTS_LIMIT = 40
 
 # Crash/abort runs produce no trustworthy facts (same set the experience loop
 # skips).
@@ -91,9 +100,27 @@ class _FactDistillResult(BaseModel):
     facts: list[_FactCandidate] = Field(default_factory=list)
 
 
-def _distill_system_prompt() -> str:
+def _distill_system_prompt(
+    max_object_words: int = _MAX_OBJECT_WORDS,
+    known_subjects: list[str] | None = None,
+) -> str:
     from spine.agents.prompt_format import Tag, xml_block
 
+    # Subject canonicalization (plan §6.2): the routed bank's retrieval misses
+    # are same-structure aliases — spine controls the subject strings it
+    # writes, so the distiller must never coin a near-alias for an entity
+    # that already has a key.
+    known_block = ""
+    if known_subjects:
+        known_block = (
+            xml_block(
+                Tag.KNOWN_FACTS,
+                "Subject keys already in the project store — when a fact "
+                "concerns one of these entities, reuse the EXACT string:\n"
+                + "\n".join(f"- {s}" for s in known_subjects),
+            )
+            + "\n\n"
+        )
     return (
         xml_block(
             Tag.ROLE,
@@ -103,12 +130,17 @@ def _distill_system_prompt() -> str:
             "decision outcome) that will still be true on future runs.",
         )
         + "\n\n"
+        + known_block
         + xml_block(
             Tag.CONSTRAINTS,
             "- Each fact: a `subject` key, a cloze `probe_prompt` ending right "
             "before the answer, and an `object` of ONE word or a very short "
             "phrase (max "
-            f"{_MAX_OBJECT_WORDS} words). Long answers do not fit the store.\n"
+            f"{max_object_words} words). Long answers do not fit the store.\n"
+            "- Subject keys are CANONICAL: one fixed name per entity, in the "
+            "form '<project noun> <attribute>' (e.g. 'spine default branch'). "
+            "Never coin a paraphrase, synonym, or re-ordering of a subject "
+            "that already exists — aliases silently split the memory.\n"
             "- Only durable project knowledge: pinned decisions, canonical "
             "names, fixed values, tool/branch/config identities. NEVER "
             "run-specific state (slice ids, temporary paths, this run's "
@@ -144,20 +176,27 @@ def _run_material(result: dict[str, Any]) -> str:
     return material[:_MAX_MATERIAL_CHARS]
 
 
-def _valid_candidate(c: _FactCandidate) -> bool:
+def _valid_candidate(
+    c: _FactCandidate, max_object_words: int = _MAX_OBJECT_WORDS
+) -> bool:
     return bool(
         c.subject.strip()
         and c.probe_prompt.strip()
         and c.object.strip()
-        and len(c.object.split()) <= _MAX_OBJECT_WORDS
+        and len(c.object.split()) <= max_object_words
     )
 
 
 async def distill_run_facts(
-    result: dict[str, Any], config: Any
+    result: dict[str, Any],
+    config: Any,
+    max_object_words: int = _MAX_OBJECT_WORDS,
+    known_subjects: list[str] | None = None,
 ) -> list[_FactCandidate]:
     """Propose fact candidates from a run's material via one LLM call.
 
+    ``known_subjects`` are existing store keys shown to the distiller so it
+    reuses canonical subject strings instead of coining near-aliases.
     Best-effort: returns ``[]`` on any failure or when the material yields
     nothing durable (the common case).
     """
@@ -179,12 +218,17 @@ async def distill_run_facts(
             "Extract the durable project facts per the constraints — or an "
             "empty list if none qualify.",
         )
+        system = _distill_system_prompt(
+            max_object_words=max_object_words, known_subjects=known_subjects
+        )
         res = await bound.ainvoke(
-            [SystemMessage(content=_distill_system_prompt()), HumanMessage(content=prompt)]
+            [SystemMessage(content=system), HumanMessage(content=prompt)]
         )
         if not isinstance(res, _FactDistillResult):
             res = _FactDistillResult.model_validate(res)
-        return [c for c in res.facts if _valid_candidate(c)][:_MAX_FACTS_PER_RUN]
+        return [
+            c for c in res.facts if _valid_candidate(c, max_object_words)
+        ][:_MAX_FACTS_PER_RUN]
     except Exception:  # noqa: BLE001 — distillation is best-effort
         logger.debug("fact distillation failed (non-fatal)", exc_info=True)
         return []
@@ -234,7 +278,40 @@ async def capture_run_facts(
         if settings is None or settings.write != "distill":
             return 0
 
-        candidates = await distill_run_facts(result, config)
+        # Distilled facts always go to the pointer store on a hybrid server —
+        # they are exactly what pointer delivery is for (never opt them into
+        # tap, even when cam.mode is "tap"/"both"). Pre-hybrid: no mode field.
+        write_mode = "pointer" if settings.mode else None
+        max_object_words = (
+            _MAX_OBJECT_WORDS_POINTER if write_mode else _MAX_OBJECT_WORDS
+        )
+
+        # Show the distiller the namespace's existing subject keys so it
+        # reuses canonical strings instead of coining near-aliases (the routed
+        # bank's retrieval misses are same-structure aliases).
+        known_subjects: list[str] = []
+        try:
+            seen: set[str] = set()
+            existing = facts_store_for(config).all()
+            existing.sort(key=lambda f: f.created_at or "", reverse=True)
+            for f in existing:
+                if f.namespace != settings.namespace:
+                    continue
+                key = " ".join(f.subject.lower().split())
+                if key and key not in seen:
+                    seen.add(key)
+                    known_subjects.append(f.subject)
+                if len(known_subjects) >= _KNOWN_SUBJECTS_LIMIT:
+                    break
+        except Exception:  # noqa: BLE001 — the reuse list is best-effort
+            logger.debug("known-subjects gather failed (non-fatal)", exc_info=True)
+
+        candidates = await distill_run_facts(
+            result,
+            config,
+            max_object_words=max_object_words,
+            known_subjects=known_subjects,
+        )
         if not candidates:
             return 0
 
@@ -260,7 +337,7 @@ async def capture_run_facts(
         accepted = 0
         for cand in candidates:
             resp = await client.remember(
-                cand.subject, cand.probe_prompt, cand.object
+                cand.subject, cand.probe_prompt, cand.object, mode=write_mode
             )
             if resp is None:
                 # Server unreachable / CAM unloaded — nothing happened server-
@@ -273,7 +350,10 @@ async def capture_run_facts(
             # silently). One short generation per accepted write.
             verified: bool | None = None
             if stored:
-                text = await client.ask(cand.probe_prompt, cand.subject)
+                probe = await client.ask_full(
+                    cand.probe_prompt, cand.subject, mode=write_mode
+                )
+                text = probe.get("text") if isinstance(probe, dict) else None
                 if text is not None:
                     verified = cand.object.strip().lower() in text.lower()
                     if not verified:
@@ -281,6 +361,16 @@ async def capture_run_facts(
                             "CAM readback probe failed for %r — store may be "
                             "crowded (check /cam/stats)",
                             cand.subject,
+                        )
+                    mode_served = probe.get("mode_served")
+                    if write_mode and mode_served and mode_served != write_mode:
+                        logger.warning(
+                            "CAM served %r via %s (asked for %s) — check the "
+                            "hybrid routing for %r",
+                            cand.subject,
+                            mode_served,
+                            write_mode,
+                            settings.namespace,
                         )
             records.append(
                 ProjectFact(
@@ -295,6 +385,7 @@ async def capture_run_facts(
                     verified=verified,
                     source="distilled",
                     created_at=created,
+                    mode=write_mode,
                 )
             )
         if accepted:
@@ -343,9 +434,11 @@ def resolve_known_facts_block(config: Any | None = None) -> str:
     ``both``. Renders from the LOCAL side index (gate-accepted facts for the
     resolved namespace), not a live ``/cam/facts`` call: the agent-build path
     must not block on the network, and the side index is spine's authoritative
-    record of what it wrote. Under ``both`` this coexists with the in-forward
-    transparent delivery — the block is the deterministic fallback for
-    subjects the transparent read's extraction misses (server issue #10).
+    record of what it wrote. The block is the principled read mechanism, not a
+    fallback: the frozen-base scorecard (plan §6.2) shows in-forward injection
+    cannot participate in multi-hop reasoning — in-context delivery is the
+    quality ceiling. Under ``both`` it coexists with transparent delivery,
+    which then serves as a token saving for recall-shaped queries.
     Returns ``""`` when CAM is off, the mode doesn't inject, or anything fails.
     """
     try:

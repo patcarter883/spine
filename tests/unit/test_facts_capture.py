@@ -83,13 +83,17 @@ class _FakeCAMClient:
         self.ask_calls: list[tuple] = []
         self.saved = False
 
-    async def remember(self, subject, prompt, object_):
-        self.remember_calls.append((subject, prompt, object_))
+    async def remember(self, subject, prompt, object_, mode=None):
+        self.remember_calls.append((subject, prompt, object_, mode))
         return self.remember_responses.pop(0) if self.remember_responses else None
 
-    async def ask(self, prompt, subject, max_tokens=32):
-        self.ask_calls.append((prompt, subject))
-        return self._ask_text
+    async def ask_full(self, prompt, subject, max_tokens=32, mode=None):
+        self.ask_calls.append((prompt, subject, mode))
+        return {"text": self._ask_text, "mode_served": mode}
+
+    async def ask(self, prompt, subject, max_tokens=32, mode=None):
+        data = await self.ask_full(prompt, subject, max_tokens=max_tokens, mode=mode)
+        return data["text"]
 
     async def stats(self):
         return self._stats
@@ -122,8 +126,10 @@ def _install_fake_client(monkeypatch, fake):
     )
 
 
-def _install_candidates(monkeypatch, candidates):
-    async def fake_distill(result, config):
+def _install_candidates(monkeypatch, candidates, seen_kwargs: dict | None = None):
+    async def fake_distill(result, config, **kwargs):
+        if seen_kwargs is not None:
+            seen_kwargs.update(kwargs)
         return candidates
 
     monkeypatch.setattr(facts_mod, "distill_run_facts", fake_distill)
@@ -234,6 +240,96 @@ def test_candidate_validation_rejects_long_objects():
     assert facts_mod._valid_candidate(long_obj) is False
     ok = _FactCandidate(subject="s", probe_prompt="p", object="main")
     assert facts_mod._valid_candidate(ok) is True
+    # Pointer delivery is lossless multi-token — the cap relaxes (plan §6.3).
+    assert (
+        facts_mod._valid_candidate(long_obj, facts_mod._MAX_OBJECT_WORDS_POINTER)
+        is True
+    )
+
+
+# ── hybrid pointer mode (plan §6.3) ──────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_capture_writes_pointer_mode_when_hybrid_configured(
+    tmp_path, monkeypatch
+):
+    fake = _FakeCAMClient(
+        remember_responses=[{"stored": True, "base_p": 0.0}],
+        stats={"total_facts": 3},
+        ask_text="It is main.",
+    )
+    _install_fake_client(monkeypatch, fake)
+    seen: dict = {}
+    _install_candidates(monkeypatch, _CANDS[:1], seen_kwargs=seen)
+    # Even `mode: tap` in config must not opt distilled facts into tap.
+    cfg = _config(tmp_path, cam={"namespace": "p", "mode": "tap"})
+
+    assert await capture_run_facts({"work_id": "w1"}, cfg, "completed") == 1
+
+    assert fake.remember_calls[0][3] == "pointer"
+    assert fake.ask_calls[0][2] == "pointer"  # readback probes the same store
+    assert seen["max_object_words"] == facts_mod._MAX_OBJECT_WORDS_POINTER
+    assert FactsStore(str(tmp_path)).all()[0].mode == "pointer"
+
+
+@pytest.mark.asyncio
+async def test_capture_pre_hybrid_sends_no_mode(tmp_path, monkeypatch):
+    fake = _FakeCAMClient(
+        remember_responses=[{"stored": True, "base_p": 0.0}],
+        stats={"total_facts": 3},
+        ask_text="It is main.",
+    )
+    _install_fake_client(monkeypatch, fake)
+    seen: dict = {}
+    _install_candidates(monkeypatch, _CANDS[:1], seen_kwargs=seen)
+    cfg = _config(tmp_path, cam={"namespace": "p"})
+
+    await capture_run_facts({"work_id": "w1"}, cfg, "completed")
+
+    assert fake.remember_calls[0][3] is None
+    assert seen["max_object_words"] == facts_mod._MAX_OBJECT_WORDS
+    assert FactsStore(str(tmp_path)).all()[0].mode is None
+
+
+# ── subject canonicalization (plan §6.2) ─────────────────────────────────────
+@pytest.mark.asyncio
+async def test_capture_feeds_existing_subjects_to_distiller(tmp_path, monkeypatch):
+    store = FactsStore(str(tmp_path))
+    store.add_many(
+        [
+            _fact("spine default branch", "main", ns="p"),
+            _fact("gate skipped subject", "x", ns="p", stored=False),
+            _fact("other-namespace subject", "y", ns="q"),
+        ]
+    )
+    fake = _FakeCAMClient(
+        remember_responses=[{"stored": True, "base_p": 0.0}],
+        stats={"total_facts": 3},
+        ask_text="It is main.",
+    )
+    _install_fake_client(monkeypatch, fake)
+    seen: dict = {}
+    _install_candidates(monkeypatch, _CANDS[:1], seen_kwargs=seen)
+    cfg = _config(tmp_path, cam={"namespace": "p"})
+
+    await capture_run_facts({"work_id": "w1"}, cfg, "completed")
+
+    # Gate-skipped subjects are still canonical keys; other namespaces are not.
+    assert set(seen["known_subjects"]) == {
+        "spine default branch",
+        "gate skipped subject",
+    }
+
+
+def test_distill_prompt_carries_canonicalization_and_known_subjects():
+    prompt = facts_mod._distill_system_prompt(
+        max_object_words=12, known_subjects=["spine default branch"]
+    )
+    assert "CANONICAL" in prompt
+    assert "spine default branch" in prompt
+    assert "max 12 words" in prompt
+    # Without known subjects the reuse block is absent entirely.
+    bare = facts_mod._distill_system_prompt()
+    assert "already in the project store" not in bare
 
 
 # ── known-facts prompt block (F1.3) ──────────────────────────────────────────

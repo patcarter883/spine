@@ -40,7 +40,9 @@ def test_cam_true_enables_with_defaults():
     assert s is not None
     assert s.server_root == "http://h:1919"  # /v1 stripped
     assert s.write == "distill"
-    assert s.read == "transparent"
+    # facts_block is the principled default (frozen-base scorecard, plan §6.2)
+    assert s.read == "facts_block"
+    assert s.mode is None  # pre-hybrid: no delivery-mode field sent
     assert s.namespace is None  # auto with no workspace root -> server default
 
 
@@ -93,7 +95,19 @@ def test_unknown_write_read_modes_fall_back():
     )
     assert s is not None
     assert s.write == "distill"
-    assert s.read == "transparent"
+    assert s.read == "facts_block"
+
+
+def test_delivery_mode_resolution():
+    s = resolve_cam_settings(
+        {"base_url": "http://h:1919/v1", "cam": {"mode": "pointer"}}
+    )
+    assert s is not None and s.mode == "pointer"
+    # unknown mode -> omit the field entirely (pre-hybrid behavior), not error
+    s = resolve_cam_settings(
+        {"base_url": "http://h:1919/v1", "cam": {"mode": "telepathy"}}
+    )
+    assert s is not None and s.mode is None
 
 
 # ── transport (httpx.MockTransport) ──────────────────────────────────────────
@@ -158,6 +172,63 @@ async def test_ask_extracts_text():
         return httpx.Response(200, json={"text": " Tokyo."})
 
     assert await _client_with(handler).ask("Capital of France is", "France") == " Tokyo."
+
+
+# ── hybrid delivery mode (pointer pivot, plan §6.3) ──────────────────────────
+def _pointer_client(handler) -> CAMClient:
+    settings = CamSettings(server_root="http://h:1919", mode="pointer")
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return CAMClient(settings, client=http)
+
+
+@pytest.mark.asyncio
+async def test_remember_omits_mode_field_pre_hybrid():
+    # A pre-hybrid server must see the exact payload it always did.
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"stored": True, "base_p": 0.1})
+
+    await _client_with(handler).remember("s", "The s is", "o")
+    assert "mode" not in seen["body"]
+
+
+@pytest.mark.asyncio
+async def test_remember_and_ask_send_configured_mode():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen[request.url.path] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"stored": True, "text": " ok", "mode_served": "pointer"}
+        )
+
+    client = _pointer_client(handler)
+    await client.remember("s", "The s is", "o")
+    assert seen["/cam/remember"]["mode"] == "pointer"
+    assert await client.ask("The s is", "s") == " ok"
+    assert seen["/cam/ask"]["mode"] == "pointer"
+
+
+@pytest.mark.asyncio
+async def test_per_call_mode_overrides_settings_and_ask_full_surfaces_mode_served():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen[request.url.path] = json.loads(request.content)
+        return httpx.Response(200, json={"text": " ok", "mode_served": "tap"})
+
+    client = _pointer_client(handler)
+    out = await client.ask_full("The s is", "s", mode="tap")
+    assert seen["/cam/ask"]["mode"] == "tap"
+    assert out == {"text": " ok", "mode_served": "tap"}
 
 
 @pytest.mark.asyncio
