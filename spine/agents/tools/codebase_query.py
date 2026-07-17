@@ -686,11 +686,18 @@ class CodebaseQueryTool(BaseTool):
     async def _cbm_ensure_indexed(self) -> None:
         if self._cbm_indexed:
             return
-        from spine.agents.tools.codebase_memory_backend import INDEX_TOOL
+        from spine.agents.tools.codebase_memory_backend import (
+            INDEX_TOOL,
+            ensure_cbmignore,
+        )
 
         tool = self._ensure_loaded().get(INDEX_TOOL)
         if tool is not None:
             try:
+                # Hang guard first: v0.9.0 spins indefinitely on large binary
+                # blobs (see CBMIGNORE_GUARDS) — make sure they are excluded
+                # before the first index of this workspace.
+                ensure_cbmignore(self.workspace_root)
                 await tool.ainvoke({"repo_path": self.workspace_root})
             except Exception:  # noqa: BLE001 — queries still work on a stale index
                 logger.warning("codebase_query: index_repository failed", exc_info=True)

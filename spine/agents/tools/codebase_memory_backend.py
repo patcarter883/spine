@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,51 @@ RESOLVE_TOOL = f"mcp_{_SERVER}_search_graph"
 # actions. TESTS is deliberately included for dependents (callers include
 # tests — useful to the researcher) but excluded for dependencies.
 _DEP_EDGES = "CALLS|USAGE|IMPORTS"
+
+
+# Patterns that hang or bloat the v0.9.0 indexer, written into the target
+# repo's .cbmignore before indexing (append-only, idempotent). Root cause of
+# the 2026-07-17 "12-minute index" incident was a SINGLE 6.2MB Python pickle
+# at the repo root: the indexer spins on large binary blobs indefinitely
+# (bisected file-by-file; the full clone with vendor/ indexes in 0.9s once
+# the pickle is excluded — the gitignore/.cbmignore layers themselves work).
+# Keep this list to KNOWN-pathological shapes, not a kitchen sink: exclusion
+# is the upstream default's job, this is a hang guard.
+CBMIGNORE_GUARDS: tuple[str, ...] = (
+    "*.pkl",
+    "*.db",
+    "*.sqlite*",
+    ".spine/",
+)
+
+
+def ensure_cbmignore(workspace_root: str) -> None:
+    """Append missing hang-guard patterns to the repo's ``.cbmignore``.
+
+    Creates the file when absent; appends only patterns not already present;
+    never rewrites or reorders existing content. Best-effort — an unwritable
+    repo root must not block indexing (the index just risks the hang the
+    guard exists to prevent, and the caller logs it).
+    """
+    root = Path(workspace_root or ".")
+    path = root / ".cbmignore"
+    try:
+        existing = (
+            path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        )
+        have = {ln.strip() for ln in existing.splitlines()}
+        missing = [g for g in CBMIGNORE_GUARDS if g not in have]
+        if not missing:
+            return
+        block = "".join(f"{g}\n" for g in missing)
+        header = (
+            "" if existing.endswith("\n") or not existing else "\n"
+        ) + "# spine: codebase-memory-mcp hang guards (large binary blobs)\n"
+        path.write_text(existing + header + block, encoding="utf-8")
+        logger.info("codebase_query: added %d .cbmignore guard(s) at %s", len(missing), path)
+    except OSError:
+        logger.warning("codebase_query: could not write %s (indexing may hang "
+                       "on large binary files)", path, exc_info=True)
 
 
 def project_name_for(workspace_root: str) -> str:

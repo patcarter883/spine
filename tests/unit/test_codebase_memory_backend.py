@@ -210,3 +210,25 @@ def test_facade_search_cap_applies_to_cbm(monkeypatch):
     out = t._run(action="search", pattern="x+")
     assert len(out) < 900
     assert "truncated" in out
+
+
+# ── .cbmignore hang guard (the 12-minute-index root cause: a single 6.2MB
+# pickle spun the v0.9.0 indexer indefinitely) ──
+
+
+def test_ensure_cbmignore_creates_with_guards(tmp_path):
+    cbm.ensure_cbmignore(str(tmp_path))
+    text = (tmp_path / ".cbmignore").read_text()
+    for g in cbm.CBMIGNORE_GUARDS:
+        assert g in text.splitlines()
+
+
+def test_ensure_cbmignore_appends_only_missing_and_is_idempotent(tmp_path):
+    (tmp_path / ".cbmignore").write_text("vendor/\n*.pkl\n")
+    cbm.ensure_cbmignore(str(tmp_path))
+    text = (tmp_path / ".cbmignore").read_text()
+    assert text.startswith("vendor/\n*.pkl\n")  # existing content untouched
+    assert text.splitlines().count("*.pkl") == 1  # not duplicated
+    assert ".spine/" in text.splitlines()
+    cbm.ensure_cbmignore(str(tmp_path))
+    assert (tmp_path / ".cbmignore").read_text() == text  # idempotent
