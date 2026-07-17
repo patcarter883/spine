@@ -65,7 +65,15 @@ SEARCH_CODE_HIT = {
 # ── project naming + arg mapping ─────────────────────────────────────────────
 def test_project_name_rule():
     assert cbm.project_name_for("/home/pat/projects/spine") == P
-    assert cbm.project_name_for("/tmp/x y/repo_1") == "tmp-x-y-repo-1"
+    # Dots survive (live sandbox: /home/pat/projects/.agripath-spine-sandbox-x
+    # indexed as home-pat-projects-.agripath-spine-sandbox-x).
+    assert (
+        cbm.project_name_for("/home/pat/projects/.agripath-spine-sandbox-d7fb94ab")
+        == "home-pat-projects-.agripath-spine-sandbox-d7fb94ab"
+    )
+    # Consecutive dashes collapse (observed: /tmp/claude-1000/-home-... ->
+    # tmp-claude-1000-home-...).
+    assert cbm.project_name_for("/tmp/claude-1000/-home-x") == "tmp-claude-1000-home-x"
 
 
 def test_backing_args_find_symbol_bare_vs_qualified():
@@ -175,6 +183,30 @@ def test_facade_find_symbol_via_cbm(monkeypatch):
     assert "critic_convergence.py" in out
     call = t._ensure_loaded()[cbm.ACTION_TO_CBM["find_symbol"]].calls[0]
     assert call["project"] == P and call["name_pattern"] == "compute_streaks"
+
+
+def test_facade_uses_server_project_name_from_index_response(monkeypatch):
+    # The index hook's response names the project authoritatively; queries
+    # must use IT, not the path-derived fallback (naming drift = every
+    # query misses with "project not found", live 2026-07-17).
+    t = CodebaseQueryTool(
+        workspace_root="/home/pat/projects/.dotted-sandbox",
+        mcp_servers={},
+        backend="codebase-memory",
+    )
+    index_tool = _FakeBackingTool(
+        response=json.dumps({"project": "server-authoritative-name", "status": "indexed"})
+    )
+    index_tool.calls = []
+    finder = _FakeBackingTool(response=json.dumps(SEARCH_GRAPH_HIT))
+    finder.calls = []
+    fake_map = {cbm.INDEX_TOOL: index_tool, cbm.ACTION_TO_CBM["find_symbol"]: finder}
+    monkeypatch.setattr(t, "_ensure_loaded", lambda: fake_map)
+
+    t._run(action="find_symbol", name="compute_streaks")
+
+    assert index_tool.calls == [{"repo_path": "/home/pat/projects/.dotted-sandbox"}]
+    assert finder.calls[0]["project"] == "server-authoritative-name"
 
 
 def test_facade_get_source_two_step(monkeypatch):
