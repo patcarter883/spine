@@ -27,7 +27,7 @@ import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from spine.agents import symbol_cache
 from spine.agents._tokens import count_tokens
@@ -1011,7 +1011,7 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
     turns can be wasted on breadth-first wandering first. This middleware
     counts tool calls emitted so far and intervenes in two stages:
 
-      * ``>= soft_threshold``: append a nudging ``SystemMessage`` asking the
+      * ``>= soft_threshold``: append a nudging ``HumanMessage`` asking the
         model to begin synthesising findings.
       * ``>= hard_threshold``: append a stronger forcing reminder AND drop
         the tool bindings (``request.override(tools=[])``) so the model has
@@ -1059,7 +1059,13 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
             )
             return await handler(
                 request.override(
-                    messages=[*messages, SystemMessage(content=reminder)],
+                    # HumanMessage, not SystemMessage: strict chat templates
+                    # (cyankiwi Qwen AWQ, live 2026-07-17) raise
+                    # "System message must be at the beginning" on trailing
+                    # system turns — failing the call exactly when the agent
+                    # most needs the nudge. The bracketed tag marks it as
+                    # harness steering either way.
+                    messages=[*messages, HumanMessage(content=reminder)],
                     tools=[],
                 )
             )
@@ -1075,7 +1081,7 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
             n, self.soft_threshold,
         )
         return await handler(
-            request.override(messages=[*messages, SystemMessage(content=nudge)])
+            request.override(messages=[*messages, HumanMessage(content=nudge)])
         )
 
     def wrap_tool_call(self, request, handler):
@@ -1100,7 +1106,7 @@ class SearchLoopGuard(AgentMiddleware):
     returned ``[]`` before accepting the section didn't exist and creating it.
 
     After ``threshold`` consecutive empty search results this middleware
-    appends a ``SystemMessage`` telling the model to stop re-searching and act
+    appends a ``HumanMessage`` telling the model to stop re-searching and act
     on what it already knows (create the thing, or proceed) — without dropping
     tools, so legitimate non-search work still runs. The streak resets the
     moment any search returns a hit.
@@ -1142,7 +1148,7 @@ class SearchLoopGuard(AgentMiddleware):
         )
         logger.info("SearchLoopGuard: intervening (empty streak=%d)", streak)
         return await handler(
-            request.override(messages=[*messages, SystemMessage(content=reminder)])
+            request.override(messages=[*messages, HumanMessage(content=reminder)])
         )
 
     def wrap_tool_call(self, request, handler):
@@ -1163,7 +1169,7 @@ class TurnBudgetGuard(AgentMiddleware):
     ceiling and burn ~1M input tokens on a small edit (trace 019ed413: 69
     model turns ≈ 954K input for a config-UI change).
 
-    After ``threshold`` model turns this middleware appends a SystemMessage
+    After ``threshold`` model turns this middleware appends a HumanMessage
     directing the model to converge — finish the edit, report status, stop
     exploring. Tools stay bound, so a genuinely long slice can still finish;
     the directive escalates each turn past the threshold so a model that
@@ -1219,7 +1225,7 @@ class TurnBudgetGuard(AgentMiddleware):
             )
         logger.info("TurnBudgetGuard: intervening (turns=%d, over=%d)", turns, over)
         return await handler(
-            request.override(messages=[*request.messages, SystemMessage(content=reminder)])
+            request.override(messages=[*request.messages, HumanMessage(content=reminder)])
         )
 
     def wrap_tool_call(self, request, handler):

@@ -2,9 +2,11 @@
 
 Verifies that:
   * below soft threshold: middleware is a no-op (no message added),
-  * at/above soft threshold: a CONVERGENCE NUDGE SystemMessage is appended
+  * at/above soft threshold: a CONVERGENCE NUDGE HumanMessage is appended
+    (HumanMessage, not SystemMessage: strict chat templates reject trailing
+    system turns — live 2026-07-17)
     and tools remain bound,
-  * at/above hard threshold: a CONVERGENCE FORCING SystemMessage is
+  * at/above hard threshold: a CONVERGENCE FORCING HumanMessage is
     appended AND tools are dropped (``request.tools == []``).
 """
 
@@ -68,7 +70,8 @@ class TestConvergenceMiddleware:
         msgs = _make_history(n_tool_calls=25)
         req = FakeRequest(messages=msgs)
         out = await mw.awrap_model_call(req, _identity_handler)
-        sys_msgs = [m for m in out.messages if isinstance(m, SystemMessage)]
+        sys_msgs = [m for m in out.messages if isinstance(m, HumanMessage)
+                    and "[CONVERGENCE" in str(m.content)]
         assert len(sys_msgs) == 1
         assert "CONVERGENCE NUDGE" in sys_msgs[0].content
         # Tools still bound.
@@ -82,7 +85,8 @@ class TestConvergenceMiddleware:
         msgs = _make_history(n_tool_calls=40)
         req = FakeRequest(messages=msgs)
         out = await mw.awrap_model_call(req, _identity_handler)
-        sys_msgs = [m for m in out.messages if isinstance(m, SystemMessage)]
+        sys_msgs = [m for m in out.messages if isinstance(m, HumanMessage)
+                    and "[CONVERGENCE" in str(m.content)]
         assert len(sys_msgs) == 1
         assert "CONVERGENCE FORCING" in sys_msgs[0].content
         assert "40" in sys_msgs[0].content
