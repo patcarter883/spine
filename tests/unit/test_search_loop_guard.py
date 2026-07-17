@@ -90,7 +90,8 @@ class TestSearchLoopGuard:
         for i in range(3):
             msgs += _search("[]", idx=i)
         out = await mw.awrap_model_call(FakeRequest(messages=msgs), _identity_handler)
-        sys = [m for m in out.messages if isinstance(m, SystemMessage)]
+        sys = [m for m in out.messages if isinstance(m, HumanMessage)
+               and 'SEARCH LOOP' in str(m.content)]
         assert len(sys) == 1
         assert "SEARCH LOOP GUARD" in sys[0].content
         assert len(out.tools) == 2  # tools stay bound
@@ -115,7 +116,7 @@ class TestSearchLoopGuard:
             msgs += _search([{"type": "text", "text": "[]"}], idx=i)
         out = await mw.awrap_model_call(FakeRequest(messages=msgs), _identity_handler)
         assert any(
-            isinstance(m, SystemMessage) and "SEARCH LOOP GUARD" in m.content
+            isinstance(m, HumanMessage) and "SEARCH LOOP GUARD" in m.content
             for m in out.messages
         )
 
