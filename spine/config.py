@@ -229,6 +229,11 @@ class SpineConfig:
     mcp_servers: dict = field(default_factory=dict)
     guided_decoding: bool = False
 
+    # Structural-intelligence backend behind CodebaseQueryTool:
+    # "codebase-index" (default) or "codebase-memory"
+    # (DeusData/codebase-memory-mcp; needs a matching mcp_servers entry).
+    # See docs/codebase-memory-mcp-migration-plan.md Phase 1.
+    codebase_query_backend: str = "codebase-index"
     # RAG (Retrieval-Augmented Generation) configuration
     embedding_provider: str = "openai-embeddings"
     recall_k: int = 10
@@ -818,6 +823,9 @@ class SpineConfig:
                 str(spine.get("guided_decoding", False)).lower(),
             )
             in ("1", "true", "yes"),
+            codebase_query_backend=spine.get(
+                "codebase_query_backend", "codebase-index"
+            ),
             embedding_provider=spine.get("embedding_provider", "openai-embeddings"),
             recall_k=int(spine.get("recall_k", 10)),
             index_tests=str(spine.get("index_tests", False)).lower() in ("1", "true", "yes"),

@@ -610,6 +610,7 @@ def _inject_mcp_tools(
                 mcp_servers=config.mcp_servers,
                 db_path=config.checkpoint_path,
                 search_result_char_cap=search_cap_for_subagent(subagent_name),
+                backend=getattr(config, "codebase_query_backend", "codebase-index"),
             )
         ]
         tools.extend(mcp_tools)
