@@ -217,10 +217,42 @@ def test_facade_search_cap_applies_to_cbm(monkeypatch):
 
 
 def test_ensure_cbmignore_creates_with_guards(tmp_path):
-    cbm.ensure_cbmignore(str(tmp_path))
+    assert cbm.ensure_cbmignore(str(tmp_path)) is True
     text = (tmp_path / ".cbmignore").read_text()
     for g in cbm.CBMIGNORE_GUARDS:
         assert g in text.splitlines()
+
+
+def test_ensure_cbmignore_never_writes_in_git_worktree(tmp_path):
+    # Live 2026-07-17: the guard write dirtied the clone -> spine's own
+    # clean-tree preflight rejected the run; in a sandbox it would leak
+    # into patch diffs. Git worktrees warn instead of writing.
+    (tmp_path / ".git").mkdir()
+    assert cbm.ensure_cbmignore(str(tmp_path)) is False
+    assert not (tmp_path / ".cbmignore").exists()
+    # With guards already committed, it reports True and still writes nothing.
+    (tmp_path / ".cbmignore").write_text(
+        "".join(f"{g}\n" for g in cbm.CBMIGNORE_GUARDS)
+    )
+    before = (tmp_path / ".cbmignore").read_text()
+    assert cbm.ensure_cbmignore(str(tmp_path)) is True
+    assert (tmp_path / ".cbmignore").read_text() == before
+
+
+def test_indexing_hazards_lists_visible_guard_matches(tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    big = tmp_path / "legacy-cache.pkl"
+    big.write_bytes(b"x" * (600 * 1024))
+    small = tmp_path / "tiny.pkl"
+    small.write_bytes(b"x")
+    (tmp_path / "code.py").write_text("x = 1\n")
+    hazards = cbm.indexing_hazards(str(tmp_path))
+    assert hazards == ["legacy-cache.pkl"]  # big + visible; small filtered
+    # Gitignored blobs are invisible to the indexer -> not hazards.
+    (tmp_path / ".gitignore").write_text("legacy-cache.pkl\n")
+    assert "legacy-cache.pkl" not in cbm.indexing_hazards(str(tmp_path))
 
 
 def test_ensure_cbmignore_appends_only_missing_and_is_idempotent(tmp_path):
