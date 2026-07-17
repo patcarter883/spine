@@ -529,10 +529,18 @@ class CodebaseQueryTool(BaseTool):
     # Phase-aware ``search`` result cap (see :func:`search_cap_for_subagent`),
     # set per subagent at injection time.
     search_result_char_cap: int = _SEARCH_RESULT_CHAR_CAP
+    # Structural backend: "codebase-index" (default) or "codebase-memory"
+    # (DeusData/codebase-memory-mcp — see codebase_memory_backend.py and
+    # docs/codebase-memory-mcp-migration-plan.md Phase 1). All backend
+    # specifics live in the backend module; this class keeps owning arg
+    # validation, caps, and the local-index fallback.
+    backend: str = "codebase-index"
 
     # Lazily-loaded MCP tool map: { mcp_tool_name → BaseTool }.
     _tool_map: dict[str, BaseTool] | None = PrivateAttr(default=None)
     _server_configs: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
+    # codebase-memory: whether this instance has ensured the workspace index.
+    _cbm_indexed: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
@@ -541,11 +549,13 @@ class CodebaseQueryTool(BaseTool):
         mcp_servers: dict[str, dict[str, Any]],
         db_path: str = ".spine/spine.db",
         search_result_char_cap: int = _SEARCH_RESULT_CHAR_CAP,
+        backend: str = "codebase-index",
     ):
         super().__init__(
             workspace_root=workspace_root,
             db_path=db_path,
             search_result_char_cap=search_result_char_cap,
+            backend=backend,
         )
         # Store the server config; the actual tool load happens on first use.
         self._server_configs = mcp_servers or {}
@@ -569,7 +579,12 @@ class CodebaseQueryTool(BaseTool):
             return self._tool_map
         mapping = {t.name: t for t in tools}
         self._tool_map = mapping
-        missing = [m for m in _ACTION_TO_MCP.values() if m not in mapping]
+        expected = _ACTION_TO_MCP.values()
+        if self.backend == "codebase-memory":
+            from spine.agents.tools.codebase_memory_backend import ACTION_TO_CBM
+
+            expected = ACTION_TO_CBM.values()
+        missing = [m for m in expected if m not in mapping]
         if missing:
             logger.warning(
                 "codebase_query: backing MCP tools missing: %s (available: %s)",
@@ -659,6 +674,75 @@ class CodebaseQueryTool(BaseTool):
             f"Available actions: {sorted(_ACTION_TO_MCP)}."
         )
 
+    # ── codebase-memory backend dispatch ────────────────────────────────
+    #
+    # Validation happened in resolve_backing_call (shared with the default
+    # backend and with symbol_cache keying); here the validated facade args
+    # are re-mapped onto the graph server's tools, and its JSON payloads are
+    # normalized back to the facade's line-oriented text contract. The
+    # empty-result local fallback and the search cap still apply via
+    # _finish, so PHP-on-old-index parity is preserved under the flag.
+
+    async def _cbm_ensure_indexed(self) -> None:
+        if self._cbm_indexed:
+            return
+        from spine.agents.tools.codebase_memory_backend import INDEX_TOOL
+
+        tool = self._ensure_loaded().get(INDEX_TOOL)
+        if tool is not None:
+            try:
+                await tool.ainvoke({"repo_path": self.workspace_root})
+            except Exception:  # noqa: BLE001 — queries still work on a stale index
+                logger.warning("codebase_query: index_repository failed", exc_info=True)
+        self._cbm_indexed = True
+
+    async def _cbm_call(self, action: str, facade_args: dict[str, Any]) -> str:
+        from spine.agents.tools import codebase_memory_backend as cbm
+
+        await self._cbm_ensure_indexed()
+        project = cbm.project_name_for(self.workspace_root)
+        name = facade_args.get("name")
+        pattern = facade_args.get("pattern")
+        max_results = int(facade_args.get("max_results", 20))
+        mapping = self._ensure_loaded()
+
+        if action == "get_source":
+            resolver = mapping.get(cbm.RESOLVE_TOOL)
+            if resolver is None:
+                raise ToolException(
+                    "codebase_query: codebase-memory backend is not loaded."
+                )
+            resolve_args = cbm.backing_args_for(
+                "find_symbol", project, name, None, 10
+            )
+            resolved = await resolver.ainvoke(resolve_args)
+            qn = cbm.resolve_qualified_name(project, name or "", resolved)
+            if qn is None:
+                candidates = cbm.adapt_response("find_symbol", project, resolved)
+                return (
+                    f"'{name}' did not resolve to exactly one symbol. "
+                    f"Candidates:\n{candidates}\nRetry with a qualified name."
+                )
+            backing_args = cbm.backing_args_for(action, project, qn, None, max_results)
+        else:
+            backing_args = cbm.backing_args_for(
+                action, project, name, pattern, max_results
+            )
+
+        tool = mapping.get(cbm.ACTION_TO_CBM[action])
+        if tool is None:
+            local = self._local_fallback(action, facade_args)
+            if local is not None:
+                return local
+            raise ToolException(
+                f"codebase_query: backing tool {cbm.ACTION_TO_CBM[action]!r} is "
+                "not loaded (codebase-memory MCP server unavailable?)."
+            )
+        adapted = cbm.adapt_response(
+            action, project, await tool.ainvoke(backing_args)
+        )
+        return self._finish(action, facade_args, adapted)
+
     def _run(
         self,
         action: str,
@@ -669,6 +753,15 @@ class CodebaseQueryTool(BaseTool):
         backing_name, backing_args = self._resolve_args(
             action, name, pattern, max_results,
         )
+        if self.backend == "codebase-memory":
+            # The MCP adapter's tools are async-only (sync .invoke raises
+            # NotImplementedError — verified live); bridge from the rare
+            # sync entry point.
+            import asyncio
+
+            return asyncio.run(
+                self._cbm_call(action, {**backing_args, "max_results": max_results})
+            )
         local = self._php_short_circuit(action, backing_args)
         if local is not None:
             return local
@@ -687,6 +780,10 @@ class CodebaseQueryTool(BaseTool):
         backing_name, backing_args = self._resolve_args(
             action, name, pattern, max_results,
         )
+        if self.backend == "codebase-memory":
+            return await self._cbm_call(
+                action, {**backing_args, "max_results": max_results}
+            )
         local = self._php_short_circuit(action, backing_args)
         if local is not None:
             return local

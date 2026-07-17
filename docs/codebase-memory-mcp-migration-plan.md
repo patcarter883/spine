@@ -202,3 +202,32 @@ embedded LLM and does not replace semantic-similarity search.
   new malformed-arg patterns. Keep validator-level guards; extend them from
   live-trace evidence, as before (see docstring history in
   `codebase_query.py`).
+
+## Phase 1 log (2026-07-17) — backend swap implemented, flag-off default
+
+Landed on branch `feat/cbm-backend`; live-smoked all five actions against the
+real binary over a real spine MCP session.
+
+- `spine/agents/tools/codebase_memory_backend.py` — the isolation layer: tool
+  maps, arg builders (Cypher for deps/dependents with `CALLS|USAGE|IMPORTS`
+  (+`TESTS` for dependents)), response adapters pinned to captured v0.9.0
+  shapes, project-name rule, two-step get_source (search_graph resolve →
+  get_code_snippet; ambiguity returns candidates instead of guessing).
+- Facade: `backend` field on CodebaseQueryTool (`codebase_query_backend`
+  config key, default codebase-index); validation guards, phase-aware caps,
+  and the empty-result local fallback all still apply on the new path.
+- Live findings that changed the design:
+  1. Spine's MCP client surfaces the FULL tool set incl. `detect_changes` —
+     the raw-stdio 8-tool list was a client-capability artifact; Phase 2's
+     `impact` action needs no CLI shell-out after all.
+  2. MCP adapter tools are async-only → the cbm path is async with an
+     `asyncio.run` bridge on the sync entry point.
+  3. **Upstream bug #2:** `query_graph` returns ZERO rows whenever the
+     `max_rows` request parameter is present (same query: 29 rows without,
+     0 with). Workaround: in-query LIMIT only.
+- Tests: 15 new (arg mapping, adapters on real payloads, facade dispatch,
+  guard survival, cap survival); full suite 2278 green.
+
+Remaining for Phase 1 exit: one live SPECIFY/PLAN research run with the flag
+on (blocked for PHP targets on upstream bug #1 — vendor exclusion — unless
+the target repo is vendor-free).
