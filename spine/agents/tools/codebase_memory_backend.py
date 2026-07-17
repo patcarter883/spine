@@ -148,8 +148,18 @@ def indexing_hazards(workspace_root: str) -> list[str]:
 
 
 def project_name_for(workspace_root: str) -> str:
-    """The server's project name for a repo path (observed naming rule)."""
-    return re.sub(r"[^A-Za-z0-9]+", "-", (workspace_root or "").strip()).strip("-")
+    """The server's project name for a repo path (observed naming rule).
+
+    Slashes become dashes, consecutive dashes collapse, edges strip — and
+    NOTHING else changes: dots survive (live 2026-07-17: the sandbox path
+    /home/pat/projects/.agripath-spine-sandbox-<id> indexed as
+    home-pat-projects-.agripath-spine-sandbox-<id>, and the previous
+    flatten-everything rule made every query miss with "project not found").
+    This is the FALLBACK only — the authoritative name is captured from the
+    index_repository response (see the facade's _cbm_ensure_indexed).
+    """
+    name = (workspace_root or "").strip().replace("/", "-")
+    return re.sub(r"-{2,}", "-", name).strip("-")
 
 
 def _cypher_str(value: str) -> str:

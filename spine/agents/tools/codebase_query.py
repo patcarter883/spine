@@ -539,8 +539,11 @@ class CodebaseQueryTool(BaseTool):
     # Lazily-loaded MCP tool map: { mcp_tool_name → BaseTool }.
     _tool_map: dict[str, BaseTool] | None = PrivateAttr(default=None)
     _server_configs: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
-    # codebase-memory: whether this instance has ensured the workspace index.
+    # codebase-memory: whether this instance has ensured the workspace index,
+    # and the server's OWN project name from the index_repository response
+    # (authoritative — path-derived naming is only the fallback).
     _cbm_indexed: bool = PrivateAttr(default=False)
+    _cbm_project: str | None = PrivateAttr(default=None)
 
     def __init__(
         self,
@@ -711,7 +714,16 @@ class CodebaseQueryTool(BaseTool):
                         )
                         self._cbm_indexed = True
                         return
-                await tool.ainvoke({"repo_path": self.workspace_root})
+                result = await tool.ainvoke({"repo_path": self.workspace_root})
+                # The response carries the server's own project name — use it
+                # for every subsequent query instead of re-deriving from the
+                # path (naming-rule drift made every query miss, live
+                # 2026-07-17).
+                from spine.agents.tools.codebase_memory_backend import _payload
+
+                payload = _payload(result)
+                if isinstance(payload, dict) and payload.get("project"):
+                    self._cbm_project = str(payload["project"])
             except Exception:  # noqa: BLE001 — queries still work on a stale index
                 logger.warning("codebase_query: index_repository failed", exc_info=True)
         self._cbm_indexed = True
@@ -720,7 +732,7 @@ class CodebaseQueryTool(BaseTool):
         from spine.agents.tools import codebase_memory_backend as cbm
 
         await self._cbm_ensure_indexed()
-        project = cbm.project_name_for(self.workspace_root)
+        project = self._cbm_project or cbm.project_name_for(self.workspace_root)
         name = facade_args.get("name")
         pattern = facade_args.get("pattern")
         max_results = int(facade_args.get("max_results", 20))
