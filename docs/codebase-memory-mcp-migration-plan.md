@@ -231,3 +231,18 @@ real binary over a real spine MCP session.
 Remaining for Phase 1 exit: one live SPECIFY/PLAN research run with the flag
 on (blocked for PHP targets on upstream bug #1 — vendor exclusion — unless
 the target repo is vendor-free).
+
+### Phase 0 correction + hang guard (2026-07-17, later)
+
+File-by-file bisection **overturned the vendor-exclusion diagnosis**: gitignore
+and `.cbmignore` both work as documented (vendor/.spine appear in
+`excluded.dirs`). The 12-minute hang was a SINGLE 6.2MB Python pickle
+(`.codebase-index-cache.pkl`, an artifact of spine's own legacy indexer) — the
+v0.9.0 indexer spins indefinitely on large binary blobs, and killed runs
+persist nothing. Full real clone with the pickle excluded: **0.91s**, 8,906
+nodes / 14,579 edges — PHP targets are UNBLOCKED for Phase 1's live-run exit
+criterion. Upstream issue draft rewritten accordingly (per-file parse budget /
+binary sniff / checkpointing). Spine-side patch: `ensure_cbmignore()` appends
+known-pathological patterns (`*.pkl`, `*.db`, `*.sqlite*`, `.spine/`) to the
+target repo's `.cbmignore` before the first index — append-only, idempotent,
+best-effort.
