@@ -75,13 +75,15 @@ CBMIGNORE_GUARDS: tuple[str, ...] = (
 )
 
 
-def ensure_cbmignore(workspace_root: str) -> None:
-    """Append missing hang-guard patterns to the repo's ``.cbmignore``.
+def ensure_cbmignore(workspace_root: str) -> bool:
+    """Ensure the hang-guard patterns are active for *workspace_root*.
 
-    Creates the file when absent; appends only patterns not already present;
-    never rewrites or reorders existing content. Best-effort — an unwritable
-    repo root must not block indexing (the index just risks the hang the
-    guard exists to prevent, and the caller logs it).
+    Returns True when every guard is already present in ``.cbmignore``.
+    In a GIT worktree the file is never written: spine's own sandbox
+    preflight requires a clean tree, and a sandbox-side write would leak
+    into verified patch diffs (both observed live 2026-07-17) — the
+    operator commits the guards once instead (the warning prints the
+    exact block). Non-git directories get the file written directly.
     """
     root = Path(workspace_root or ".")
     path = root / ".cbmignore"
@@ -92,16 +94,57 @@ def ensure_cbmignore(workspace_root: str) -> None:
         have = {ln.strip() for ln in existing.splitlines()}
         missing = [g for g in CBMIGNORE_GUARDS if g not in have]
         if not missing:
-            return
+            return True
+        if (root / ".git").exists():
+            logger.warning(
+                "codebase_query: %s is missing hang-guard pattern(s) %s — not "
+                "writing into a git worktree (dirty-tree preflights / patch "
+                "diffs). Commit them once:\n  printf '%%s\\n' %s >> %s && "
+                "git add %s && git commit -m 'chore: codebase-memory hang guards'",
+                path, missing, " ".join(repr(m) for m in missing), path, path.name,
+            )
+            return False
         block = "".join(f"{g}\n" for g in missing)
         header = (
             "" if existing.endswith("\n") or not existing else "\n"
         ) + "# spine: codebase-memory-mcp hang guards (large binary blobs)\n"
         path.write_text(existing + header + block, encoding="utf-8")
         logger.info("codebase_query: added %d .cbmignore guard(s) at %s", len(missing), path)
+        return True
     except OSError:
-        logger.warning("codebase_query: could not write %s (indexing may hang "
-                       "on large binary files)", path, exc_info=True)
+        logger.warning("codebase_query: could not read/write %s", path, exc_info=True)
+        return False
+
+
+def indexing_hazards(workspace_root: str) -> list[str]:
+    """Indexer-visible files matching the guard patterns (>512KB).
+
+    "Visible" = what the indexer will see given its gitignore layer:
+    tracked + untracked-unignored files (``git ls-files -co
+    --exclude-standard``). Non-git dirs return [] — the guard file is
+    writable there, so hazards are already handled. Best-effort.
+    """
+    import fnmatch
+    import subprocess
+
+    root = Path(workspace_root or ".")
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-co", "--exclude-standard"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except Exception:  # noqa: BLE001 — non-git / git failure ⇒ no hazard scan
+        return []
+    hazards: list[str] = []
+    for rel in out.splitlines():
+        base = rel.rsplit("/", 1)[-1]
+        if any(fnmatch.fnmatch(base, g.rstrip("/")) for g in CBMIGNORE_GUARDS if not g.endswith("/")):
+            try:
+                if (root / rel).stat().st_size > 512 * 1024:
+                    hazards.append(rel)
+            except OSError:
+                continue
+    return hazards
 
 
 def project_name_for(workspace_root: str) -> str:

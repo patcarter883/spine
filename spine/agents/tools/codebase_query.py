@@ -689,15 +689,28 @@ class CodebaseQueryTool(BaseTool):
         from spine.agents.tools.codebase_memory_backend import (
             INDEX_TOOL,
             ensure_cbmignore,
+            indexing_hazards,
         )
 
         tool = self._ensure_loaded().get(INDEX_TOOL)
         if tool is not None:
             try:
                 # Hang guard first: v0.9.0 spins indefinitely on large binary
-                # blobs (see CBMIGNORE_GUARDS) — make sure they are excluded
-                # before the first index of this workspace.
-                ensure_cbmignore(self.workspace_root)
+                # blobs (see CBMIGNORE_GUARDS). In git worktrees the guard
+                # file is never auto-written (clean-tree preflight / patch
+                # hygiene) — if guards are missing AND hazardous files are
+                # indexer-visible, skip indexing rather than risk the hang;
+                # queries then degrade to the local fallback.
+                if not ensure_cbmignore(self.workspace_root):
+                    hazards = indexing_hazards(self.workspace_root)
+                    if hazards:
+                        logger.warning(
+                            "codebase_query: skipping index_repository — "
+                            "hazardous files visible without .cbmignore "
+                            "guards: %s", hazards[:5],
+                        )
+                        self._cbm_indexed = True
+                        return
                 await tool.ainvoke({"repo_path": self.workspace_root})
             except Exception:  # noqa: BLE001 — queries still work on a stale index
                 logger.warning("codebase_query: index_repository failed", exc_info=True)
