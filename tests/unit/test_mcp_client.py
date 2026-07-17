@@ -209,3 +209,60 @@ class TestGetMCPTools:
         }
         result = get_mcp_tools(configs)
         assert result == []
+
+
+class TestMultiServerNamespacing:
+    """Per-server attribution (live failure: with two servers configured,
+    every tool got the FIRST server's prefix, so the codebase-memory
+    backend's tools were unfindable for a whole Phase-1 run)."""
+
+    @patch("spine.mcp.client.MultiServerMCPClient")
+    def test_each_server_gets_own_prefix(self, mock_client_cls: MagicMock) -> None:
+        idx_tool = StructuredTool.from_function(
+            func=lambda x: "ok", name="find_symbol", description="Find"
+        )
+        cbm_tool = StructuredTool.from_function(
+            func=lambda x: "ok", name="search_graph", description="Graph"
+        )
+
+        async def per_server(server_name=None):
+            return {"codebase-index": [idx_tool], "codebase-memory": [cbm_tool]}[
+                server_name
+            ]
+
+        mock_client = MagicMock()
+        mock_client.get_tools = per_server
+        mock_client_cls.return_value = mock_client
+
+        configs = {
+            "codebase-index": {"transport": "stdio", "command": "a", "args": []},
+            "codebase-memory": {"transport": "stdio", "command": "b", "args": []},
+        }
+        result = get_mcp_tools(configs, cache_key="test")
+        names = sorted(t.name for t in result)
+        assert names == [
+            "mcp_codebase-index_find_symbol",
+            "mcp_codebase-memory_search_graph",
+        ]
+
+    @patch("spine.mcp.client.MultiServerMCPClient")
+    def test_one_failing_server_degrades_alone(self, mock_client_cls: MagicMock) -> None:
+        ok_tool = StructuredTool.from_function(
+            func=lambda x: "ok", name="search_graph", description="Graph"
+        )
+
+        async def per_server(server_name=None):
+            if server_name == "broken":
+                raise RuntimeError("spawn failed")
+            return [ok_tool]
+
+        mock_client = MagicMock()
+        mock_client.get_tools = per_server
+        mock_client_cls.return_value = mock_client
+
+        configs = {
+            "broken": {"transport": "stdio", "command": "x", "args": []},
+            "codebase-memory": {"transport": "stdio", "command": "b", "args": []},
+        }
+        result = get_mcp_tools(configs, cache_key="test")
+        assert [t.name for t in result] == ["mcp_codebase-memory_search_graph"]

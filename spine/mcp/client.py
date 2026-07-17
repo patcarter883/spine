@@ -370,22 +370,29 @@ def get_mcp_tools(
 
     try:
         client = _get_client(server_configs)
-        tools = _run_async(client.get_tools())
     except Exception:
-        logger.warning("Failed to load MCP tools", exc_info=True)
+        logger.warning("Failed to build MCP client", exc_info=True)
         return []
 
-    # Namespace tools to prevent collisions between servers.
-    # The adapter returns tools from all servers without server tags.
-    # For a single server: all tools get that server's prefix.
-    # For multiple servers: we'd need per-server get_tools() calls;
-    # for now, prefix with the first server name which is correct
-    # for the common single-server (codebase-index) case.
-    primary_server = next(iter(server_configs)) if server_configs else None
+    # Namespace tools per SERVER. The adapter returns tools without server
+    # tags, so a combined get_tools() cannot be attributed — with two servers
+    # configured, every tool used to get the FIRST server's prefix, making
+    # the second server's tools unfindable (live: the codebase-memory tools
+    # loaded as mcp_codebase-index_search_graph and the graph backend
+    # reported "not loaded" for the whole agripath Phase-1 run). Per-server
+    # get_tools(server_name=...) attributes correctly, and a server that
+    # fails to start now degrades alone instead of killing the whole load.
     namespaced: list[BaseTool] = []
-    if primary_server:
+    for server_name in server_configs:
+        try:
+            tools = _run_async(client.get_tools(server_name=server_name))
+        except Exception:
+            logger.warning(
+                "Failed to load MCP tools from server %r", server_name, exc_info=True
+            )
+            continue
         for tool in tools:
-            ns_tool = _namespace_tool(tool, primary_server)
+            ns_tool = _namespace_tool(tool, server_name)
             namespaced.append(_wrap_for_postprocessing(ns_tool))
 
     logger.info("Loaded %d MCP tools from %d server(s)", len(namespaced), len(server_configs))
