@@ -474,8 +474,9 @@ _VERIFY_JUDGE_PROMPT = (
         "Your recollection of FRAMEWORK DEFAULT BEHAVIOR is not evidence. "
         "Never fail a criterion by asserting what a framework does by default "
         "(column nullability, casts, key types, bindings) — such claims are "
-        "frequently wrong (run f788042e failed a criterion on 'Laravel string "
-        "columns are nullable by default'; they are NOT NULL). When the code "
+        # Incident provenance: run f788042e (id kept out of the model string).
+        "frequently wrong (e.g. 'Laravel string columns are nullable by "
+        "default' — they are NOT NULL). When the code "
         "uses the framework's idiomatic form and no executed check "
         "demonstrates a violation, the criterion passes on that point.",
     )
