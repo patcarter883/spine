@@ -1156,6 +1156,52 @@ def _expand_env_ref(value: Any) -> Any:
 _ENDPOINT_HEALTH: dict[str, tuple[bool, float]] = {}
 _HEALTH_TTL_SECONDS = 20.0
 
+# A HEALTHY endpoint only flips DOWN after this many consecutive probe
+# failures. Run d8bc459c attempt 9: mini-sglang's accept loop shares the
+# inference event loop, so during concurrent prefill bursts a NEW TCP
+# connection can sit in the backlog past the 1.5s probe timeout while
+# established streams serve fine — one such stall rerouted 7 calls to the
+# standby (and the DOWN state self-sustained, because the recovery probe's
+# 1-token completion queues behind the same load). First-contact failures
+# are NOT debounced: an endpoint that has never answered is just down.
+_DOWN_AFTER_CONSECUTIVE_FAILS = 2
+_ENDPOINT_FAIL_STREAK: dict[str, int] = {}
+
+
+def mark_endpoint_alive(url: Any) -> None:
+    """Record proof-of-life for an endpoint from REAL traffic.
+
+    Called by the shared per-provider httpx clients' response hooks
+    (spine.agents.http_clients): any HTTP response (< 500) from the serve
+    is stronger health evidence than a synthetic probe, so it refreshes
+    the TTL cache and clears the failure streak. While traffic flows, the
+    probe never runs — a backlogged accept queue can't fake an outage
+    (attempt 9's false-DOWN reroute).
+
+    Matches cached entries by host:port so the hook's httpx URL and the
+    provider config's ``base_url`` string don't need byte-identical forms.
+    Unknown endpoints (never probed) are ignored.
+    """
+    import time
+    from urllib.parse import urlparse
+
+    try:
+        host = getattr(url, "host", None)
+        port = getattr(url, "port", None)
+        if host is None:
+            parsed = urlparse(str(url))
+            host, port = parsed.hostname, parsed.port
+        if not host:
+            return
+        now = time.monotonic()
+        for base_url in list(_ENDPOINT_HEALTH):
+            parsed = urlparse(base_url)
+            if parsed.hostname == host and parsed.port == port:
+                _ENDPOINT_HEALTH[base_url] = (True, now)
+                _ENDPOINT_FAIL_STREAK[base_url] = 0
+    except Exception:  # noqa: BLE001 — health bookkeeping must never break a response
+        logger.debug("mark_endpoint_alive failed for %r", url, exc_info=True)
+
 
 def _endpoint_ready(base_url: str, model: str | None) -> bool:
     """Prove the backend actually SERVES with a 1-token completion.
@@ -1243,8 +1289,25 @@ def _endpoint_healthy(base_url: str, model: str | None = None) -> bool:
                 healthy = True
         except OSError:
             healthy = False
-    if healthy and not (cached and cached[0]):
+    was_healthy = bool(cached and cached[0])
+    if healthy and not was_healthy:
         healthy = _endpoint_ready(base_url, model)
+    if healthy:
+        _ENDPOINT_FAIL_STREAK[base_url] = 0
+    elif was_healthy:
+        # Debounce: a single failed probe against a known-healthy endpoint
+        # is more likely a backlogged accept queue than a crash (attempt 9's
+        # false-DOWN). Stay healthy, re-probe next TTL window; real traffic
+        # succeeding meanwhile resets the streak via mark_endpoint_alive.
+        streak = _ENDPOINT_FAIL_STREAK.get(base_url, 0) + 1
+        _ENDPOINT_FAIL_STREAK[base_url] = streak
+        if streak < _DOWN_AFTER_CONSECUTIVE_FAILS:
+            logger.warning(
+                "endpoint %s failed a health probe (%d/%d consecutive) — "
+                "keeping HEALTHY pending confirmation",
+                base_url, streak, _DOWN_AFTER_CONSECUTIVE_FAILS,
+            )
+            healthy = True
     _ENDPOINT_HEALTH[base_url] = (healthy, now)
     return healthy
 

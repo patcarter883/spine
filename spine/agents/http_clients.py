@@ -194,6 +194,28 @@ class _WeightedStreamTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
+# Real traffic is health evidence: any response from the endpoint (< 500)
+# proves the serve is alive, which is stronger than the synthetic TCP/
+# 1-token probes in helpers (attempt 9: a backlogged accept queue failed
+# the 1.5s probe and rerouted a healthy serve to the standby). Server
+# errors (>= 500) don't testify — a backend in a 500-storm shouldn't be
+# pinned healthy by its own failures.
+
+
+async def _testify_async(response: httpx.Response) -> None:
+    if response.status_code < 500:
+        from spine.agents.helpers import mark_endpoint_alive
+
+        mark_endpoint_alive(response.request.url)
+
+
+def _testify_sync(response: httpx.Response) -> None:
+    if response.status_code < 500:
+        from spine.agents.helpers import mark_endpoint_alive
+
+        mark_endpoint_alive(response.request.url)
+
+
 def get_async_http_client(
     provider_name: str,
     max_concurrent: int,
@@ -213,10 +235,14 @@ def get_async_http_client(
                     transport=_WeightedStreamTransport(
                         httpx.AsyncHTTPTransport(limits=_limits(max_concurrent)),
                         _AsyncWeightedSemaphore(int(max_streams)),
-                    )
+                    ),
+                    event_hooks={"response": [_testify_async]},
                 )
             else:
-                client = httpx.AsyncClient(limits=_limits(max_concurrent))
+                client = httpx.AsyncClient(
+                    limits=_limits(max_concurrent),
+                    event_hooks={"response": [_testify_async]},
+                )
             _async_clients[provider_name] = client
         return client
 
@@ -226,6 +252,9 @@ def get_sync_http_client(provider_name: str, max_concurrent: int) -> httpx.Clien
     with _lock:
         client = _sync_clients.get(provider_name)
         if client is None:
-            client = httpx.Client(limits=_limits(max_concurrent))
+            client = httpx.Client(
+                limits=_limits(max_concurrent),
+                event_hooks={"response": [_testify_sync]},
+            )
             _sync_clients[provider_name] = client
         return client

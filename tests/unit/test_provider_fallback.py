@@ -31,8 +31,10 @@ STANDBY = {
 @pytest.fixture(autouse=True)
 def _clear_health_cache():
     helpers._ENDPOINT_HEALTH.clear()
+    helpers._ENDPOINT_FAIL_STREAK.clear()
     yield
     helpers._ENDPOINT_HEALTH.clear()
+    helpers._ENDPOINT_FAIL_STREAK.clear()
 
 
 def _with_lookup(monkeypatch, providers):
@@ -336,3 +338,137 @@ class TestReadinessModelIdentity:
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         assert helpers._endpoint_ready("http://x:1919/v1", "openai:M") is True
+
+
+class TestHealthDebounce:
+    """A healthy endpoint only flips DOWN after consecutive probe failures
+    (attempt 9: one 1.5s TCP timeout against a busy-but-fine serve rerouted
+    7 calls to the standby, and the DOWN state self-sustained because the
+    recovery probe queued behind the same load)."""
+
+    URL = "http://10.0.0.9:1919/v1"
+
+    def _seed_healthy_expired(self):
+        import time
+
+        helpers._ENDPOINT_HEALTH[self.URL] = (
+            True, time.monotonic() - helpers._HEALTH_TTL_SECONDS - 1,
+        )
+
+    def _expire(self):
+        import time
+
+        healthy, _ = helpers._ENDPOINT_HEALTH[self.URL]
+        helpers._ENDPOINT_HEALTH[self.URL] = (
+            healthy, time.monotonic() - helpers._HEALTH_TTL_SECONDS - 1,
+        )
+
+    def _tcp_fail(self, monkeypatch):
+        import socket as socket_mod
+
+        def refuse(addr, timeout):
+            raise OSError("refused")
+
+        monkeypatch.setattr(socket_mod, "create_connection", refuse)
+
+    def test_single_failure_keeps_healthy(self, monkeypatch):
+        self._seed_healthy_expired()
+        self._tcp_fail(monkeypatch)
+        assert helpers._endpoint_healthy(self.URL) is True
+        assert helpers._ENDPOINT_FAIL_STREAK[self.URL] == 1
+
+    def test_consecutive_failures_flip_down(self, monkeypatch):
+        self._seed_healthy_expired()
+        self._tcp_fail(monkeypatch)
+        assert helpers._endpoint_healthy(self.URL) is True
+        self._expire()
+        assert helpers._endpoint_healthy(self.URL) is False
+
+    def test_success_resets_streak(self, monkeypatch):
+        import socket as socket_mod
+
+        self._seed_healthy_expired()
+        self._tcp_fail(monkeypatch)
+        assert helpers._endpoint_healthy(self.URL) is True
+
+        class FakeSock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        self._expire()
+        monkeypatch.setattr(
+            socket_mod, "create_connection", lambda addr, timeout: FakeSock()
+        )
+        assert helpers._endpoint_healthy(self.URL) is True
+        assert helpers._ENDPOINT_FAIL_STREAK[self.URL] == 0
+        # A later single failure starts the streak from scratch.
+        self._expire()
+        self._tcp_fail(monkeypatch)
+        assert helpers._endpoint_healthy(self.URL) is True
+
+    def test_first_contact_failure_is_down_immediately(self, monkeypatch):
+        # No debounce for an endpoint that has never answered.
+        self._tcp_fail(monkeypatch)
+        assert helpers._endpoint_healthy(self.URL) is False
+
+
+class TestTrafficTestifies:
+    """Real responses through the shared clients stamp the endpoint healthy
+    (mark_endpoint_alive) — while traffic flows, probes can't fake an outage."""
+
+    URL = "http://10.0.0.9:1919/v1"
+
+    def test_marks_matching_entry_healthy_and_resets_streak(self):
+        import time
+
+        helpers._ENDPOINT_HEALTH[self.URL] = (
+            False, time.monotonic() - helpers._HEALTH_TTL_SECONDS - 1,
+        )
+        helpers._ENDPOINT_FAIL_STREAK[self.URL] = 2
+        helpers.mark_endpoint_alive("http://10.0.0.9:1919/v1/chat/completions")
+        healthy, ts = helpers._ENDPOINT_HEALTH[self.URL]
+        assert healthy is True
+        assert time.monotonic() - ts < helpers._HEALTH_TTL_SECONDS
+        assert helpers._ENDPOINT_FAIL_STREAK[self.URL] == 0
+        # And the fresh stamp short-circuits the next probe entirely.
+        assert helpers._endpoint_healthy(self.URL) is True
+
+    def test_httpx_url_object_matches(self):
+        import time
+
+        import httpx
+
+        helpers._ENDPOINT_HEALTH[self.URL] = (False, time.monotonic())
+        helpers.mark_endpoint_alive(
+            httpx.URL("http://10.0.0.9:1919/v1/chat/completions")
+        )
+        assert helpers._ENDPOINT_HEALTH[self.URL][0] is True
+
+    def test_unknown_endpoint_is_ignored(self):
+        helpers.mark_endpoint_alive("http://somewhere-else:9999/v1/chat/completions")
+        assert helpers._ENDPOINT_HEALTH == {}
+
+    def test_response_hooks_gate_on_status(self):
+        import time
+
+        import httpx
+
+        from spine.agents.http_clients import _testify_sync
+
+        helpers._ENDPOINT_HEALTH[self.URL] = (False, time.monotonic())
+        req = httpx.Request("POST", "http://10.0.0.9:1919/v1/chat/completions")
+        _testify_sync(httpx.Response(500, request=req))
+        assert helpers._ENDPOINT_HEALTH[self.URL][0] is False
+        _testify_sync(httpx.Response(200, request=req))
+        assert helpers._ENDPOINT_HEALTH[self.URL][0] is True
+
+    def test_shared_clients_carry_response_hooks(self):
+        from spine.agents import http_clients as hc
+
+        client = hc.get_async_http_client("test-hook-provider", 2)
+        assert hc._testify_async in client.event_hooks["response"]
+        sync_client = hc.get_sync_http_client("test-hook-provider", 2)
+        assert hc._testify_sync in sync_client.event_hooks["response"]
