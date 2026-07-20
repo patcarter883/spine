@@ -37,7 +37,6 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Literal
-from weakref import WeakKeyDictionary
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -64,62 +63,34 @@ logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
 
 
-# ── Fan-out guardrails (trace 019f7df2) ─────────────────────────────────
-# The verify router Sends every slice branch at once. On attempt 8 that
-# meant 8 concurrent plan_slice_verifier LLM calls against a serve whose
-# history says >4 concurrent large prompts wedge it — all 8 sat OPEN with
-# zero tokens for ~35 minutes and no client-side timeout fired (the httpx
-# pool queued the overflow, and neither request_timeout nor the
-# stream-chunk watchdog broke the stall). Two deterministic guards:
-#
-# 1. A per-event-loop semaphore caps how many verify branches run their
-#    LLM work concurrently (SPINE_VERIFY_MAX_CONCURRENCY, default 2).
-#    Scoped to the LLM calls only — automated checks (pytest/ruff
-#    subprocesses) run outside the permit.
-# 2. A hard deadline per LLM call (SPINE_VERIFY_LLM_TIMEOUT, else
-#    SPINE_STALL_TIMEOUT, else 900s). ``asyncio.wait_for`` CANCELS the
-#    call on expiry — closing the HTTP connection and freeing the serve
-#    slot — retries once, then raises ``VerifierBranchTimeout`` so the
-#    caller's existing fallback (empty directive / NOT_VERIFIED result)
-#    takes over instead of hanging the whole run.
-
-_VERIFY_SEMAPHORES: WeakKeyDictionary[Any, asyncio.Semaphore] = WeakKeyDictionary()
+# ── Verify-branch deadline (trace 019f7df2) ─────────────────────────────
+# Concurrency for verify's fan-out is the PROVIDER's job — the shared
+# httpx pool enforces ``max_concurrent_calls`` and the weighted transport
+# enforces ``max_concurrent_streams`` before the pool (http_clients.py).
+# What no existing layer provides is a deadline: on attempt 8, verifier
+# calls that had a connection sat with zero tokens for ~35 minutes
+# (neither request_timeout nor the stream-chunk watchdog fired), and the
+# dispatcher stall monitor can't see subagent calls. So each verify-branch
+# LLM call gets a hard deadline reusing the EXISTING stall knob
+# (SPINE_STALL_TIMEOUT, default 900s — the same "longest tolerable
+# silence" the operator already tunes). ``asyncio.wait_for`` CANCELS the
+# call on expiry — closing the connection and freeing the serve slot —
+# retries once, then raises ``VerifierBranchTimeout`` so the caller's
+# existing fallback (empty directive / NOT_VERIFIED result) takes over
+# instead of hanging the whole run.
 
 
 class VerifierBranchTimeout(RuntimeError):
     """A verify-branch LLM call produced nothing within the deadline."""
 
 
-def _fanout_limit() -> int:
-    try:
-        n = int(os.getenv("SPINE_VERIFY_MAX_CONCURRENCY", "2"))
-    except ValueError:
-        n = 2
-    return max(1, n)
-
-
 def _branch_deadline() -> float:
-    raw = os.getenv("SPINE_VERIFY_LLM_TIMEOUT") or os.getenv("SPINE_STALL_TIMEOUT") or "900"
+    raw = os.getenv("SPINE_STALL_TIMEOUT") or "900"
     try:
         v = float(raw)
     except ValueError:
         v = 900.0
     return max(60.0, v)
-
-
-def _verify_semaphore() -> asyncio.Semaphore:
-    """Per-event-loop semaphore — verify branches share one permit pool.
-
-    Keyed by the running loop (WeakKeyDictionary) so bench harnesses and
-    the dispatcher, which run separate loops, never share (or leak) state.
-    """
-    loop = asyncio.get_running_loop()
-    sem = _VERIFY_SEMAPHORES.get(loop)
-    if sem is None or getattr(sem, "_spine_limit", None) != _fanout_limit():
-        sem = asyncio.Semaphore(_fanout_limit())
-        sem._spine_limit = _fanout_limit()  # type: ignore[attr-defined]
-        _VERIFY_SEMAPHORES[loop] = sem
-    return sem
 
 
 async def _guarded_branch(
@@ -130,25 +101,24 @@ async def _guarded_branch(
     what: str,
     attempts: int = 2,
 ) -> Any:
-    """Run one verify branch's LLM work under the semaphore + deadline."""
-    async with _verify_semaphore():
-        deadline = _branch_deadline()
-        last_exc: BaseException | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return await asyncio.wait_for(coro_factory(), timeout=deadline)
-            except (TimeoutError, asyncio.TimeoutError) as exc:
-                last_exc = exc
-                logger.warning(
-                    "[%s] %s for slice %r produced nothing in %.0fs "
-                    "(attempt %d/%d) — call cancelled%s",
-                    work_id, what, slice_id, deadline, attempt, attempts,
-                    "" if attempt < attempts else "; giving up",
-                )
-        raise VerifierBranchTimeout(
-            f"{what} for slice {slice_id!r} produced nothing within "
-            f"{deadline:.0f}s × {attempts} attempts"
-        ) from last_exc
+    """Run one verify branch's LLM call under a hard deadline."""
+    deadline = _branch_deadline()
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(coro_factory(), timeout=deadline)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            logger.warning(
+                "[%s] %s for slice %r produced nothing in %.0fs "
+                "(attempt %d/%d) — call cancelled%s",
+                work_id, what, slice_id, deadline, attempt, attempts,
+                "" if attempt < attempts else "; giving up",
+            )
+    raise VerifierBranchTimeout(
+        f"{what} for slice {slice_id!r} produced nothing within "
+        f"{deadline:.0f}s × {attempts} attempts"
+    ) from last_exc
 
 
 # ── Router: START → run_slice_verifier (Send) or synthesize ─────────────
