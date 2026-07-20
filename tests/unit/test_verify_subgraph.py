@@ -814,3 +814,103 @@ class TestJudgeJsonSalvage:
         )
         parsed = _extract_json_object(content)
         assert parsed and parsed["nested"] == {"a": 1}
+
+
+class TestFanoutGuardrails:
+    """Semaphore + deadline on verify-branch LLM calls (trace 019f7df2:
+    8 concurrent slice-verifier calls, all open with zero tokens for ~35
+    minutes, no client-side timeout fired)."""
+
+    def test_fanout_limit_default_and_env(self, monkeypatch):
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        monkeypatch.delenv("SPINE_VERIFY_MAX_CONCURRENCY", raising=False)
+        assert vs._fanout_limit() == 2
+        monkeypatch.setenv("SPINE_VERIFY_MAX_CONCURRENCY", "5")
+        assert vs._fanout_limit() == 5
+        monkeypatch.setenv("SPINE_VERIFY_MAX_CONCURRENCY", "0")
+        assert vs._fanout_limit() == 1  # floor
+        monkeypatch.setenv("SPINE_VERIFY_MAX_CONCURRENCY", "junk")
+        assert vs._fanout_limit() == 2
+
+    def test_deadline_falls_back_to_stall_timeout(self, monkeypatch):
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        monkeypatch.delenv("SPINE_VERIFY_LLM_TIMEOUT", raising=False)
+        monkeypatch.delenv("SPINE_STALL_TIMEOUT", raising=False)
+        assert vs._branch_deadline() == 900.0
+        monkeypatch.setenv("SPINE_STALL_TIMEOUT", "1200")
+        assert vs._branch_deadline() == 1200.0
+        monkeypatch.setenv("SPINE_VERIFY_LLM_TIMEOUT", "300")
+        assert vs._branch_deadline() == 300.0
+        monkeypatch.setenv("SPINE_VERIFY_LLM_TIMEOUT", "5")
+        assert vs._branch_deadline() == 60.0  # floor
+
+    @pytest.mark.asyncio
+    async def test_semaphore_caps_concurrency(self, monkeypatch):
+        import asyncio
+
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        monkeypatch.setenv("SPINE_VERIFY_MAX_CONCURRENCY", "2")
+        peak = 0
+        active = 0
+
+        async def branch():
+            nonlocal peak, active
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return "done"
+
+        results = await asyncio.gather(*[
+            vs._guarded_branch(
+                branch, work_id="w", slice_id=f"s{i}", what="test call"
+            )
+            for i in range(6)
+        ])
+        assert results == ["done"] * 6
+        assert peak <= 2
+
+    @pytest.mark.asyncio
+    async def test_deadline_cancels_retries_then_raises(self, monkeypatch):
+        import asyncio
+
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        monkeypatch.setenv("SPINE_VERIFY_MAX_CONCURRENCY", "4")
+        monkeypatch.setenv("SPINE_VERIFY_LLM_TIMEOUT", "60")
+        # Shrink the wait without touching the floor: patch _branch_deadline.
+        monkeypatch.setattr(vs, "_branch_deadline", lambda: 0.05)
+        calls = 0
+        cancelled = 0
+
+        async def hung():
+            nonlocal calls, cancelled
+            calls += 1
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
+            return "never"
+
+        with pytest.raises(vs.VerifierBranchTimeout):
+            await vs._guarded_branch(
+                hung, work_id="w", slice_id="s", what="hung call"
+            )
+        assert calls == 2  # one retry
+        assert cancelled == 2  # wait_for cancelled the call each time
+
+    @pytest.mark.asyncio
+    async def test_success_within_deadline_passes_through(self, monkeypatch):
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        async def quick():
+            return {"verdict": "VERIFIED"}
+
+        out = await vs._guarded_branch(
+            quick, work_id="w", slice_id="s", what="quick call"
+        )
+        assert out == {"verdict": "VERIFIED"}
