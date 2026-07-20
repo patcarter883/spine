@@ -236,6 +236,125 @@ class TestToolCallNormalizer:
         assert len(resp.result[0].tool_calls) == 1
 
 
+class TestNormalizerStructuredTermination:
+    """A recovered structured-output call must TERMINATE the agent.
+
+    create_agent parses structured output inside its base model handler,
+    BEFORE wrap_model_call middleware — so a text-emitted call the normalizer
+    promotes afterwards never becomes ``structured_response``, and a no-tool
+    structured agent's model→model edge loops forever (trace 019f7d50: the
+    plan critic spun 31 iterations re-emitting the same CriticReview call,
+    including a discarded PASSED verdict on iteration 1). The normalizer now
+    finishes the job itself: parse → structured_response + ToolMessage.
+    """
+
+    @staticmethod
+    def _review_schema():
+        from pydantic import BaseModel
+
+        class Review(BaseModel):
+            status: str
+            reason: str
+
+        return Review
+
+    def test_bare_object_structured_call_sets_structured_response(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='{"name": "Review", "arguments": '
+            '{"status": "PASSED", "reason": "plan is sound"}}'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+
+        out = resp.result[0]
+        assert out.tool_calls[0]["name"] == "Review"
+        assert isinstance(resp.structured_response, Review)
+        assert resp.structured_response.status == "PASSED"
+        # Terminating ToolMessage mirrors _handle_model_output's happy path.
+        assert isinstance(resp.result[1], ToolMessage)
+        assert resp.result[1].tool_call_id == out.tool_calls[0]["id"]
+
+    def test_hermes_structured_call_also_completes(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='<tool_call>{"name": "Review", "arguments": '
+            '{"status": "ok", "reason": "r"}}</tool_call>'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+        assert resp.structured_response is not None
+
+    def test_schema_mismatch_appends_corrective_tool_message(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='{"name": "Review", "arguments": {"wrong_field": 1}}'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+
+        assert resp.structured_response is None
+        # The retry is corrective, not a blind re-ask: an error ToolMessage
+        # answers the promoted call so the next iteration sees what failed.
+        assert isinstance(resp.result[1], ToolMessage)
+        assert "Review" in str(resp.result[1].content)
+
+    def test_non_structured_recovered_call_is_left_to_tool_node(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='<tool_call>{"name": "read_file", "arguments": '
+            '{"path": "a.py"}}</tool_call>'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+
+        assert resp.result[0].tool_calls[0]["name"] == "read_file"
+        assert resp.structured_response is None
+        assert len(resp.result) == 1  # no synthetic ToolMessage
+
+    def test_no_response_format_is_promotion_only(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        msg = AIMessage(
+            content='{"name": "Review", "arguments": {"status": "ok", "reason": "r"}}'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer()._normalize_response(resp)
+        assert resp.result[0].tool_calls[0]["name"] == "Review"
+        assert resp.structured_response is None
+        assert len(resp.result) == 1
+
+    def test_provider_strategy_yields_no_bindings(self) -> None:
+        from langchain.agents.structured_output import ProviderStrategy
+
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        norm = ToolCallNormalizer(response_format=ProviderStrategy(schema=Review))
+        assert norm._structured == {}
+
+    def test_tool_strategy_binding_names_match_create_agent(self) -> None:
+        from langchain.agents.structured_output import ToolStrategy
+
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        # Raw schema and explicit ToolStrategy must resolve to the same
+        # tool name create_agent binds (the schema's name).
+        assert set(ToolCallNormalizer(response_format=Review)._structured) == {"Review"}
+        assert set(
+            ToolCallNormalizer(response_format=ToolStrategy(schema=Review))._structured
+        ) == {"Review"}
+
+
 # ── 4. LLM error diagnosis on command failure ─────────────────────────────────
 
 

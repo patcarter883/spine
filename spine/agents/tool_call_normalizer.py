@@ -36,7 +36,7 @@ import uuid
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +200,113 @@ class ToolCallNormalizer(AgentMiddleware):
     Runs the model, then — only when the response carries no native tool calls —
     looks for a strict tool-call envelope in the content and promotes it. A
     no-op for models that emit native tool calls (the common path).
+
+    When the agent was built with a ``response_format`` (ToolStrategy), the
+    structured-output parse happens INSIDE ``create_agent``'s base model
+    handler, *before* any ``wrap_model_call`` middleware runs — so a promoted
+    call can never become ``structured_response`` by itself. Worse, on a
+    no-tool agent the model→model edge's default branch is "no
+    structured_response yet → invoke the model again", which spins the agent
+    forever re-emitting the same call (trace 019f7d50: 31 critic iterations,
+    +~400 prompt tokens per lap, PASSED verdict on iteration 1 discarded).
+    So when this middleware promotes a call that names a structured-output
+    tool it must also finish the job: parse the args against the schema, set
+    ``response.structured_response``, and append the terminating ToolMessage
+    — mirroring ``_handle_model_output`` exactly.
     """
+
+    def __init__(self, response_format: Any | None = None) -> None:
+        super().__init__()
+        self._structured = self._structured_bindings(response_format)
+
+    @staticmethod
+    def _structured_bindings(response_format: Any) -> dict[str, Any]:
+        """Map structured-output tool name → OutputToolBinding.
+
+        Mirrors ``create_agent``'s own setup: raw schemas and ToolStrategy
+        both go through ``ToolStrategy.schema_specs`` →
+        ``OutputToolBinding.from_schema_spec`` so the tool NAMES match what
+        the agent bound. ProviderStrategy emits raw JSON (no tool call), so
+        there is nothing for this middleware to complete — empty map.
+        """
+        if response_format is None:
+            return {}
+        from langchain.agents.structured_output import (
+            AutoStrategy,
+            OutputToolBinding,
+            ProviderStrategy,
+            ToolStrategy,
+        )
+
+        if isinstance(response_format, ProviderStrategy):
+            return {}
+        if isinstance(response_format, ToolStrategy):
+            strategy = response_format
+        elif isinstance(response_format, AutoStrategy):
+            strategy = ToolStrategy(schema=response_format.schema)
+        else:
+            # Raw schema (Pydantic model / dataclass / TypedDict / dict) —
+            # NOT via getattr(..., "schema"): Pydantic classes expose a
+            # legacy `.schema` classmethod that would shadow the class.
+            strategy = ToolStrategy(schema=response_format)
+        bindings: dict[str, Any] = {}
+        for spec in strategy.schema_specs:
+            binding = OutputToolBinding.from_schema_spec(spec)
+            bindings[binding.tool.name] = binding
+        return bindings
+
+    def _complete_structured_response(
+        self, response: Any, messages: list[Any], idx: int
+    ) -> None:
+        """Parse a promoted structured-output call and terminate the loop.
+
+        Success mirrors ``_handle_model_output``'s happy path (set
+        ``structured_response`` + synthetic ToolMessage → the model→model /
+        model→tools edge routes to END). Parse failure appends an error
+        ToolMessage so the next iteration is a *corrective* retry instead of
+        a blind re-ask.
+        """
+        if not self._structured or getattr(response, "structured_response", None) is not None:
+            return
+        msg = messages[idx]
+        structured_calls = [c for c in msg.tool_calls if c["name"] in self._structured]
+        if not structured_calls:
+            return
+        call = structured_calls[0]
+        binding = self._structured[call["name"]]
+        try:
+            parsed = binding.parse(call["args"])
+        except Exception as exc:  # noqa: BLE001 — schema mismatch is model output error
+            messages.insert(
+                idx + 1,
+                ToolMessage(
+                    content=(
+                        f"Error parsing structured output for {call['name']}: {exc}. "
+                        f"Call {call['name']} again with arguments that match the schema."
+                    ),
+                    tool_call_id=call["id"],
+                    name=call["name"],
+                ),
+            )
+            logger.warning(
+                "ToolCallNormalizer: recovered %s call failed schema parse: %s",
+                call["name"],
+                exc,
+            )
+            return
+        response.structured_response = parsed
+        messages.insert(
+            idx + 1,
+            ToolMessage(
+                content=f"Returning structured response: {parsed}",
+                tool_call_id=call["id"],
+                name=call["name"],
+            ),
+        )
+        logger.info(
+            "ToolCallNormalizer: completed structured response from text-emitted %s call",
+            call["name"],
+        )
 
     def _normalize_response(self, response: Any) -> None:
         messages = getattr(response, "result", None)
@@ -242,6 +348,7 @@ class ToolCallNormalizer(AgentMiddleware):
             len(tool_calls),
             [c["name"] for c in tool_calls],
         )
+        self._complete_structured_response(response, messages, idx)
 
     async def awrap_model_call(self, request, handler):
         response = await handler(request)

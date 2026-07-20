@@ -567,6 +567,7 @@ def build_phase_agent(
         skip_filesystem_middleware=skip_filesystem_middleware,
         static_cacheable_prefix=static_cacheable_prefix,
         escalation_level=escalation_level,
+        response_format=response_format,
     )
 
     # ── Context schema ───────────────────────────────────────────────
@@ -614,6 +615,7 @@ def _build_middleware_stack(
     skip_filesystem_middleware: bool = False,
     static_cacheable_prefix: str | None = None,
     escalation_level: int = 0,
+    response_format: Any | None = None,
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
@@ -669,7 +671,12 @@ def _build_middleware_stack(
     #    to subagents too so that tool runtime errors become a compact
     #    ToolMessage(status="error") instead of a raw traceback that ends up
     #    serialized into ResearchFindings.summary.
-    _add_spine_middleware(middleware, phase, escalation_level=escalation_level)
+    _add_spine_middleware(
+        middleware,
+        phase,
+        escalation_level=escalation_level,
+        response_format=response_format,
+    )
 
     # 5. User-provided extra middleware
     if extra_middleware:
@@ -747,7 +754,10 @@ def _filter_filesystem_tools(
 
 
 def _add_spine_middleware(
-    middleware: list[Any], phase: PhaseName, escalation_level: int = 0
+    middleware: list[Any],
+    phase: PhaseName,
+    escalation_level: int = 0,
+    response_format: Any | None = None,
 ) -> None:
     """Add SPINE-specific middleware for tool validation and context editing.
 
@@ -770,7 +780,13 @@ def _add_spine_middleware(
     if _spine_cfg.tool_call_normalize:
         from spine.agents.tool_call_normalizer import ToolCallNormalizer
 
-        middleware.append(ToolCallNormalizer())
+        # response_format lets the normalizer FINISH a recovered structured-
+        # output call (parse args → structured_response + terminating
+        # ToolMessage). Without it a promoted call is invisible to
+        # create_agent's structured parse (which already ran, inside the
+        # base model handler) and a no-tool structured agent loops forever
+        # (trace 019f7d50: 31-iteration critic spin).
+        middleware.append(ToolCallNormalizer(response_format=response_format))
 
     # Tool schema validation — rebound loop for self-correction
     _validation_enabled = _os.getenv("SPINE_TOOL_SCHEMA_VALIDATION", "true").lower() not in (
