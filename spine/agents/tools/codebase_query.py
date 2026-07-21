@@ -751,6 +751,12 @@ class CodebaseQueryTool(BaseTool):
             qn = cbm.resolve_qualified_name(project, name or "", resolved)
             if qn is None:
                 candidates = cbm.adapt_response("find_symbol", project, resolved)
+                if candidates.strip() == "not found":
+                    # Zero candidates is NOT ambiguity — say so plainly
+                    # (run 019f82b1 emitted "did not resolve to exactly one
+                    # symbol. Candidates: not found", steering agents to
+                    # retry qualified names for symbols that don't exist).
+                    return f"'{name}': not found in the codebase graph."
                 return (
                     f"'{name}' did not resolve to exactly one symbol. "
                     f"Candidates:\n{candidates}\nRetry with a qualified name."

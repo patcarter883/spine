@@ -360,3 +360,44 @@ def test_adapt_find_symbol_lists_code_first():
     first, second = out.splitlines()[:2]
     assert "Handler.php" in first
     assert "ARCHITECTURE.md" in second
+
+
+def test_resolve_prefers_definition_over_file_node():
+    """Run 019f82b1: 'FarmControllerTest' matched both the class node and
+    its X.__file__ [File] sibling — 5/9 ambiguity failures were this."""
+    rows = {"results": [
+        {"name": "FarmControllerTest",
+         "qualified_name": f"{P}.tests.FarmControllerTest.__file__",
+         "label": "File", "file_path": "tests/Feature/FarmControllerTest.php"},
+        {"name": "FarmControllerTest",
+         "qualified_name": f"{P}.tests.FarmControllerTest",
+         "label": "class", "file_path": "tests/Feature/FarmControllerTest.php"},
+    ]}
+    assert cbm.resolve_qualified_name(P, "FarmControllerTest", rows) \
+        == f"{P}.tests.FarmControllerTest"
+
+
+def test_resolve_file_only_pool_still_resolves():
+    # A migration filename query legitimately resolves to the file node.
+    rows = {"results": [
+        {"name": "2026_04_21_create_x_table",
+         "qualified_name": f"{P}.database.migrations.2026_04_21_create_x_table.__file__",
+         "label": "File", "file_path": "database/migrations/2026_04_21_create_x_table.php"},
+    ]}
+    assert cbm.resolve_qualified_name(P, "2026_04_21_create_x_table", rows) \
+        == f"{P}.database.migrations.2026_04_21_create_x_table.__file__"
+
+
+def test_adapt_find_symbol_orders_defs_files_docs():
+    payload = {"results": [
+        {"name": "Intro", "qualified_name": f"{P}.docs.G", "label": "doc",
+         "file_path": "docs/G.md"},
+        {"name": "X", "qualified_name": f"{P}.a.X.__file__", "label": "File",
+         "file_path": "app/X.php"},
+        {"name": "X", "qualified_name": f"{P}.a.X", "label": "class",
+         "file_path": "app/X.php", "start_line": 5},
+    ]}
+    out = cbm.adapt_response("find_symbol", P, payload).splitlines()
+    assert "a.X " in out[0] + " " or out[0].startswith("a.X")
+    assert "__file__" in out[1]
+    assert "G.md" in out[2]

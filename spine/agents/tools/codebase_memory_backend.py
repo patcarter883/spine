@@ -252,10 +252,11 @@ def adapt_response(
         rows = (data.get("results") or []) if isinstance(data, dict) else data
         if not rows:
             return "not found"
-        # Code symbols first — when this listing is an ambiguity report,
-        # the agent retries with the first plausible candidate, and a doc
-        # heading at the top sends it down a dead end.
-        rows = sorted(rows, key=is_doc_row)
+        # Definitions first, then file nodes, then doc headings — when this
+        # listing is an ambiguity report, the agent retries with the first
+        # plausible candidate, and a file node or doc heading at the top
+        # sends it down a dead end.
+        rows = sorted(rows, key=lambda r: (is_doc_row(r), is_file_row(r)))
         lines = []
         for r in rows:
             lines.append(
@@ -306,6 +307,22 @@ def adapt_response(
 _DOC_FILE_EXT_RE = re.compile(r"\.(md|mdx|rst|txt|adoc)$", re.IGNORECASE)
 
 
+def is_file_row(row: Any) -> bool:
+    """True when a search_graph row is a FILE node, not a definition.
+
+    codebase-memory-mcp emits a ``X.__file__`` node (label "File") for the
+    file alongside the class/function nodes it contains, so an exact class
+    name matches both and re-ambiguates resolution (run 019f82b1: 5/9
+    get_source ambiguity failures were exactly this — e.g.
+    'FarmControllerTest' vs 'FarmControllerTest.__file__').
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("label") or "").strip().lower() == "file":
+        return True
+    return str(row.get("qualified_name") or "").endswith(".__file__")
+
+
 def is_doc_row(row: Any) -> bool:
     """True when a search_graph row is a DOCUMENT node, not a code symbol.
 
@@ -345,6 +362,10 @@ def resolve_qualified_name(project: str, name: str, resolve_result: Any) -> str 
     # may genuinely ask for a doc section).
     code_rows = [r for r in pool if not is_doc_row(r)]
     pool = code_rows or pool
+    # File nodes (X.__file__) only compete when no definition matches —
+    # an exact class name must not be re-ambiguated by its own file.
+    def_rows = [r for r in pool if not is_file_row(r)]
+    pool = def_rows or pool
     if len(pool) == 1:
         return pool[0].get("qualified_name")
     # Prefer a qualified-suffix match for dotted inputs — on a DOT
