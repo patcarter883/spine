@@ -7,6 +7,7 @@ LangGraph, Deep Agents, and LangSmith tracing without manual sourcing.
 
 from __future__ import annotations
 
+import logging
 import os
 import json
 from dataclasses import dataclass, field
@@ -1087,7 +1088,9 @@ class SpineConfig:
                     return entry["model"]
                 provider_ref = entry.get("provider")
                 if provider_ref:
-                    named = self._lookup_provider_by_name(provider_ref)
+                    named = self._pinned_provider(
+                        provider_ref, context=f"escalation ladder, phase {phase!r}"
+                    )
                     if named and named.get("model"):
                         return named["model"]
 
@@ -1111,7 +1114,9 @@ class SpineConfig:
                 # 2. Provider reference — look up the named provider
                 provider_ref = phase_cfg.get("provider")
                 if provider_ref:
-                    named = self._lookup_provider_by_name(provider_ref)
+                    named = self._pinned_provider(
+                        provider_ref, context=f"phases.{key} model pin"
+                    )
                     if named and named.get("model"):
                         return named["model"]
 
@@ -1224,6 +1229,11 @@ class SpineConfig:
     def _lookup_provider_by_name(self, name: str) -> dict | None:
         """Find a named provider in ``providers.llm[]``.
 
+        Deliberately permissive about ``enabled`` — ``fallback_provider``
+        references legitimately point at ``enabled: false`` standbys. PIN
+        sites (phase/escalation ``provider:`` references) must go through
+        :meth:`_pinned_provider` instead.
+
         Args:
             name: The ``"name"`` field of the provider entry to find.
 
@@ -1234,6 +1244,28 @@ class SpineConfig:
             if provider.get("name") == name:
                 return provider
         return None
+
+    def _pinned_provider(self, name: str, *, context: str) -> dict | None:
+        """Named-provider lookup for phase/escalation PINS — refuses disabled.
+
+        A pin naming a disabled provider is a config contradiction, and
+        honouring it silently re-enables the provider for that lane
+        (2026-07-21: the clone's ``phases.onboarding: provider: openrouter``
+        pin kept routing the facts-seed distiller to the DISABLED paid
+        openrouter lane). The pin is ignored with a warning so resolution
+        falls through to less-specific keys / the default provider.
+        """
+        named = self._lookup_provider_by_name(name)
+        if named is None:
+            return None
+        if not named.get("enabled", True):
+            logging.getLogger(__name__).warning(
+                "provider pin %r (%s) names a DISABLED provider — ignoring "
+                "the pin; enable the provider or repoint the pin",
+                name, context,
+            )
+            return None
+        return named
 
     @staticmethod
     def _escalation_entry(phase_cfg: dict, level: int) -> dict | None:
@@ -1350,7 +1382,9 @@ class SpineConfig:
                     continue
                 provider_ref = phase_cfg.get("provider")
                 if provider_ref:
-                    named = self._lookup_provider_by_name(provider_ref)
+                    named = self._pinned_provider(
+                        provider_ref, context=f"phases.{key} provider pin"
+                    )
                     if named:
                         base = dict(named)
                         break

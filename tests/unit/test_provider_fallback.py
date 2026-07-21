@@ -472,3 +472,50 @@ class TestTrafficTestifies:
         assert hc._testify_async in client.event_hooks["response"]
         sync_client = hc.get_sync_http_client("test-hook-provider", 2)
         assert hc._testify_sync in sync_client.event_hooks["response"]
+
+
+class TestPinnedProviderRefusesDisabled:
+    """A phase/escalation pin naming a DISABLED provider must be ignored
+    (2026-07-21: phases.onboarding pinned the disabled paid openrouter
+    lane and the facts-seed distiller happily used it). fallback_provider
+    lookups stay permissive — standbys are deliberately enabled: false."""
+
+    def _cfg(self, providers, phases):
+        from spine.config import SpineConfig
+
+        cfg = SpineConfig.__new__(SpineConfig)
+        object.__setattr__(cfg, "providers", {"llm": providers, "phases": phases}) \
+            if hasattr(cfg, "__dict__") is False else setattr(cfg, "providers", {"llm": providers, "phases": phases})
+        return cfg
+
+    def test_disabled_pin_falls_through_to_default(self):
+        from spine.config import SpineConfig
+
+        cfg = SpineConfig.__new__(SpineConfig)
+        cfg.providers = {
+            "llm": [
+                {"name": "paid", "model": "openrouter:x/y", "enabled": False},
+                {"name": "local", "model": "openai:L", "enabled": True,
+                 "base_url": "http://l:1/v1"},
+            ],
+            "phases": {"onboarding": {"provider": "paid"}},
+        }
+        assert cfg._pinned_provider("paid", context="test") is None
+        # permissive lookup still returns it (fallback_provider path)
+        assert cfg._lookup_provider_by_name("paid")["name"] == "paid"
+
+    def test_enabled_pin_resolves(self):
+        from spine.config import SpineConfig
+
+        cfg = SpineConfig.__new__(SpineConfig)
+        cfg.providers = {"llm": [
+            {"name": "local", "model": "openai:L", "enabled": True},
+        ], "phases": {}}
+        assert cfg._pinned_provider("local", context="test")["model"] == "openai:L"
+
+    def test_default_enabled_treated_as_enabled(self):
+        from spine.config import SpineConfig
+
+        cfg = SpineConfig.__new__(SpineConfig)
+        cfg.providers = {"llm": [{"name": "p", "model": "openai:P"}], "phases": {}}
+        assert cfg._pinned_provider("p", context="test") is not None
