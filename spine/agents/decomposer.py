@@ -785,6 +785,14 @@ def _normalize_per_file_slices(
         normalized.append(
             {
                 "id": f"{parent_id}::{i}-{os.path.basename(path)}",
+                # Without _parent_slice_id a micro-slice is an ORPHAN:
+                # _slice_marker_ids can't map it to the parent's
+                # verification findings (final-mile mode never engages —
+                # run 019f82b1: every fallback micro ran wholesale rework
+                # while its parent sat 1-2 criteria from converging) and
+                # dependencies named after the parent never resolve (same
+                # run: "1 pending slice(s) permanently blocked").
+                "_parent_slice_id": parent_id,
                 "title": f"{parent_title} — {path}",
                 "description": description,
                 "target_files": [path],

@@ -269,6 +269,17 @@ def build_synthesis_prompt(
             "corrected SynthesizedSlice that fixes exactly those failures — keep "
             "the edits that were fine, repair the ones the linter rejected."
         )
+        if final_mile_fails:
+            # A placement retry must NOT abandon the minimal-edit discipline:
+            # run 019f82b1 — every FINAL MILE call whose edits bounced was
+            # retried with a wholesale-rework tail, and the regenerations
+            # regressed near-passing slices twice (ratchet restores). The
+            # constraint rides the retry too.
+            tail += (
+                "\nFINAL MILE still applies: emit the SMALLEST possible "
+                "edit set, touch only the definitions the failing criteria "
+                "name, and do NOT re-emit anything that already passes."
+            )
     elif final_mile_fails:
         crit_lines = "\n".join(f"- {c}" for c in final_mile_fails)
         tail = (

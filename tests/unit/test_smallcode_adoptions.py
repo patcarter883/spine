@@ -399,3 +399,33 @@ class TestExecuteDiagnoser:
     def test_disabled_by_default(self) -> None:
         assert SpineConfig().error_diagnosis is False
         assert SpineConfig().tool_call_normalize is False
+
+
+class TestMicroSliceParentInheritance:
+    """Run 019f82b1: decomposer micro-slices lacked _parent_slice_id, so
+    _slice_marker_ids could not map them to the parent's verification
+    findings (final-mile never engaged for them → wholesale rework) and
+    dependencies naming the parent never resolved (permanently-blocked
+    slice)."""
+
+    def test_normalized_micros_carry_parent_id(self):
+        from spine.agents.decomposer import _normalize_per_file_slices
+
+        parent = {
+            "id": "implement-domain-models",
+            "title": "Models",
+            "target_files": ["app/A.php", "app/B.php"],
+            "acceptance_criteria": ["c1"],
+            "reference_symbols": ["Farm"],
+        }
+        subs = _normalize_per_file_slices(parent, [
+            {"target_files": ["app/A.php"]},
+            {"target_files": ["app/B.php"]},
+        ])
+        assert len(subs) == 2
+        for s in subs:
+            assert s["_parent_slice_id"] == "implement-domain-models"
+
+        from spine.workflow.subgraphs.implement_subgraph import _slice_marker_ids
+        ids = _slice_marker_ids([subs[0]])
+        assert "implement-domain-models" in ids

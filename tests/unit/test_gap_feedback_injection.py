@@ -241,3 +241,36 @@ def test_unrelated_slice_still_gets_nothing_from_cross_items(tmp_path: Path) -> 
     state = {"workspace_root": str(tmp_path), "gap_plan_path": "gaps"}
     other = {"id": "migration-slice", "target_files": ["database/migrations/x.php"]}
     assert _gap_fixes_body(state, other) == ""
+
+
+class TestFinalMileSurvivesRetry:
+    """Run 019f82b1: every FINAL MILE synthesis whose edits bounced was
+    retried through the `feedback` branch, which silently dropped the
+    minimal-edit constraint — the retry regenerated wholesale and regressed
+    near-passing slices (two ratchet restores). The constraint must ride
+    placement retries."""
+
+    def test_retry_keeps_final_mile_constraint(self):
+        p = build_synthesis_prompt(
+            slice_json="{}", refs_body="", plan_body="",
+            feedback="edit 1 bounced: not_found",
+            final_mile_fails=["criterion A"],
+        )
+        assert "FAILED to place" in p
+        assert "FINAL MILE still applies" in p
+        assert "SMALLEST possible edit set" in p
+
+    def test_no_final_mile_retry_unchanged(self):
+        p = build_synthesis_prompt(
+            slice_json="{}", refs_body="", plan_body="",
+            feedback="edit 1 bounced: not_found",
+        )
+        assert "FAILED to place" in p
+        assert "FINAL MILE" not in p
+
+    def test_first_attempt_final_mile_tail_unchanged(self):
+        p = build_synthesis_prompt(
+            slice_json="{}", refs_body="", plan_body="",
+            final_mile_fails=["criterion A", "criterion B"],
+        )
+        assert "FINAL MILE: only 2 acceptance criteria" in p
