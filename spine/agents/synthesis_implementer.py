@@ -132,9 +132,11 @@ class SynthesizedEdit(BaseModel):
     action: str = Field(
         default="replace",
         description=(
-            "'replace' the whole definition with `code`, or 'insert_before' / "
+            "'replace' the whole definition with `code`, 'insert_before' / "
             "'insert_after' to add a new top-level construct adjacent to the "
-            "anchor symbol."
+            "anchor symbol, or 'append' to add `code` at the END of the file "
+            "(no anchor needed — REQUIRED for files with no named "
+            "definitions, e.g. procedural route/config files)."
         ),
     )
     code: str = Field(
@@ -518,6 +520,13 @@ def apply_synthesized(
                 # the edit's code becomes the file's initial content, and any
                 # later edits in this candidate see the file as existing.
                 raw = tool._run(file_path=edit.file, full_replace=edit.code)
+            elif edit.action == "append":
+                # Anchor-free by design; the symbol field is irrelevant.
+                raw = tool._run(
+                    file_path=edit.file,
+                    ast_edit={"symbol": edit.symbol or edit.file,
+                              "action": "append", "code": edit.code},
+                )
             elif _is_whole_file_symbol(edit.symbol, edit.file):
                 # HARD BLOCK: whole-file replacement of an EXISTING file.
                 # A path-shaped symbol means the editor wants to regenerate
@@ -536,9 +545,10 @@ def apply_synthesized(
                          f"file is not permitted (every definition not "
                          f"reproduced would be deleted). Re-emit targeted "
                          f"edits: action='replace' anchored on the specific "
-                         f"symbol being changed, or action='insert_after' "
-                         f"anchored on an existing symbol (the last one, to "
-                         f"append new content at the end of the file)."
+                         f"symbol being changed, action='insert_after' "
+                         f"anchored on an existing symbol, or "
+                         f"action='append' to add new content at the end "
+                         f"of the file (no anchor needed)."
                      )}
                 )
                 continue

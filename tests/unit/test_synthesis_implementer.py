@@ -346,3 +346,28 @@ class TestPlaceholderCreationBlocked:
         )
         assert res.n_applied == 1
         assert (tmp_path / "real.py").exists()
+
+
+class TestAppendPlacement:
+    """action='append' bypasses the whole-file guard (anchor-free, no
+    clobber) and routes through the tool's append mode."""
+
+    def test_append_with_path_symbol_applies(self, tmp_path: Path) -> None:
+        (tmp_path / "routes.py").write_text("A = 1\n", encoding="utf-8")
+        cand = SynthesizedSlice(edits=[SynthesizedEdit(
+            file="routes.py", symbol="routes.py", action="append",
+            code="B = 2\n",
+        )])
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["routes.py"]
+        )
+        assert res.n_applied == 1 and res.n_failures == 0
+        assert (tmp_path / "routes.py").read_text() == "A = 1\n\nB = 2\n"
+
+    def test_guard_detail_suggests_append(self, workspace: Path) -> None:
+        cand = _slice("print('x')\n", symbol="mod.py")
+        res = apply_synthesized(
+            cand, workspace_root=str(workspace), target_files=["mod.py"]
+        )
+        assert res.failures[0]["status"] == "whole_file_replace_blocked"
+        assert "action='append'" in res.failures[0]["detail"]

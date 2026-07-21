@@ -1498,12 +1498,26 @@ def _apply_ast_edit(
     workspace_path: str,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Resolve ``symbol`` via tree-sitter and apply a structural edit."""
-    if action not in ("replace", "insert_before", "insert_after"):
+    if action not in ("replace", "insert_before", "insert_after", "append"):
         return None, _edit_feedback(
             "input_error",
-            f"ast_edit action must be replace|insert_before|insert_after, got {action!r}.",
-            next_action="Re-call ast_edit with action set to 'replace', 'insert_before', or 'insert_after'.",
+            f"ast_edit action must be replace|insert_before|insert_after|append, got {action!r}.",
+            next_action=(
+                "Re-call ast_edit with action set to 'replace', "
+                "'insert_before', 'insert_after', or 'append'."
+            ),
         )
+    if action == "append":
+        # Append needs no anchor — the one safe edit for files with NO
+        # anchorable symbols (run d8bc459c attempts 9-11: routes/api.php is
+        # procedural Route:: statements top to bottom, so replace had
+        # nothing to match, insert_* nothing to anchor on, and whole-file
+        # replacement is blocked by policy — route registration was
+        # mechanically unwritable). Same syntax/lint gate as every edit;
+        # bounded and clobber-free by construction.
+        base = current if current.endswith("\n") or not current else current + "\n"
+        addition = code if code.endswith("\n") else code + "\n"
+        return base + "\n" + addition if base else addition, None
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in _AST_EDIT_LANGS:
         return None, _edit_feedback(
