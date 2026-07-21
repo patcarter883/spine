@@ -35,6 +35,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -402,6 +403,32 @@ def _coerce_candidate(response: Any) -> SynthesizedSlice | None:
     return None
 
 
+_SOURCE_FILE_EXT_RE = re.compile(
+    r"\.(php|py|js|jsx|ts|tsx|vue|rb|go|rs|java|cs|sql|yaml|yml|json|env)$",
+    re.IGNORECASE,
+)
+
+
+def _is_whole_file_symbol(symbol: str, file: str) -> bool:
+    """True when an edit's symbol names the FILE rather than a definition.
+
+    Editors under rework pressure emit ``action=replace`` with the target
+    file's own path as the symbol — a wholesale file regeneration. Shapes
+    matched: the edit's file path itself, its basename, any slash-bearing
+    path, or a bare filename with a source extension. Real symbols
+    (``Class.method``, ``RouteServiceProvider::boot``, dotted qualified
+    names) contain no slashes and no file extension.
+    """
+    s = (symbol or "").strip()
+    if not s:
+        return True
+    if s == file or s == Path(file).name:
+        return True
+    if "/" in s or "\\" in s:
+        return True
+    return bool(_SOURCE_FILE_EXT_RE.search(s))
+
+
 def apply_synthesized(
     candidate: SynthesizedSlice,
     *,
@@ -445,6 +472,30 @@ def apply_synthesized(
                 # the edit's code becomes the file's initial content, and any
                 # later edits in this candidate see the file as existing.
                 raw = tool._run(file_path=edit.file, full_replace=edit.code)
+            elif _is_whole_file_symbol(edit.symbol, edit.file):
+                # HARD BLOCK: whole-file replacement of an EXISTING file.
+                # A path-shaped symbol means the editor wants to regenerate
+                # the file wholesale — which silently deletes every
+                # definition it didn't reproduce (run 019f81f1: a rework
+                # candidate emitted action=replace symbol='routes/api.php'
+                # against the 328-line shared route file; only the anchor
+                # resolver's not_found stopped the clobber). Policy, not
+                # coincidence: fail the edit with corrective steering so the
+                # retry produces targeted edits instead.
+                result.failures.append(
+                    {**rec, "status": "whole_file_replace_blocked",
+                     "detail": (
+                         f"symbol {edit.symbol!r} is a file path, not a "
+                         f"symbol — wholesale replacement of an existing "
+                         f"file is not permitted (every definition not "
+                         f"reproduced would be deleted). Re-emit targeted "
+                         f"edits: action='replace' anchored on the specific "
+                         f"symbol being changed, or action='insert_after' "
+                         f"anchored on an existing symbol (the last one, to "
+                         f"append new content at the end of the file)."
+                     )}
+                )
+                continue
             else:
                 raw = tool._run(
                     file_path=edit.file,

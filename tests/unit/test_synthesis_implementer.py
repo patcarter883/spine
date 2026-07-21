@@ -256,3 +256,57 @@ def test_new_target_file_with_syntax_error_is_not_created(tmp_path: Path) -> Non
     )
     assert res.n_applied == 0 and res.n_failures == 1
     assert not (tmp_path / "tests" / "test_new.py").exists()
+
+
+class TestWholeFileReplaceBlocked:
+    """Wholesale replacement of an EXISTING file is a policy failure, not a
+    coincidence of anchor resolution (run 019f81f1: a rework candidate
+    emitted action=replace symbol='routes/api.php' against the 328-line
+    shared route file — every route not reproduced would have been
+    silently deleted)."""
+
+    def test_file_path_symbol_on_existing_file_is_blocked(self, workspace: Path) -> None:
+        cand = _slice("print('whole new file')\n", symbol="mod.py")
+        res = apply_synthesized(
+            cand, workspace_root=str(workspace), target_files=["mod.py"]
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "whole_file_replace_blocked"
+        assert "insert_after" in res.failures[0]["detail"]
+        assert (workspace / "mod.py").read_text() == _ORIG  # untouched
+
+    def test_slash_path_symbol_is_blocked(self, tmp_path: Path) -> None:
+        (tmp_path / "routes").mkdir()
+        (tmp_path / "routes" / "api.php").write_text("<?php\n", encoding="utf-8")
+        cand = _slice(
+            "<?php // regenerated\n", file="routes/api.php", symbol="routes/api.php"
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["routes/api.php"]
+        )
+        assert res.failures[0]["status"] == "whole_file_replace_blocked"
+        assert (tmp_path / "routes" / "api.php").read_text() == "<?php\n"
+
+    def test_new_file_creation_path_unaffected(self, tmp_path: Path) -> None:
+        # Path-shaped symbol on a file that does NOT exist yet stays on the
+        # full_replace creation path — that fix (run 019f40ac) must survive.
+        cand = _slice("x = 1\n", file="newmod.py", symbol="newmod.py")
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["newmod.py"]
+        )
+        assert res.n_applied == 1 and res.n_failures == 0
+        assert (tmp_path / "newmod.py").read_text() == "x = 1\n"
+
+    def test_real_symbols_pass_through(self, workspace: Path) -> None:
+        cand = _slice("def greet(name):\n    return name\n", symbol="greet")
+        res = apply_synthesized(
+            cand, workspace_root=str(workspace), target_files=["mod.py"]
+        )
+        assert res.n_applied == 1
+        # PHP-style double-colon symbols are real symbols, not paths.
+        from spine.agents.synthesis_implementer import _is_whole_file_symbol
+
+        assert _is_whole_file_symbol("RouteServiceProvider::boot", "app/P.php") is False
+        assert _is_whole_file_symbol("SpineConfig.load", "spine/config.py") is False
+        assert _is_whole_file_symbol("api.php", "routes/api.php") is True
+        assert _is_whole_file_symbol("", "routes/api.php") is True
