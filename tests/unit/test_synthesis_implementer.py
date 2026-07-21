@@ -290,12 +290,13 @@ class TestWholeFileReplaceBlocked:
     def test_new_file_creation_path_unaffected(self, tmp_path: Path) -> None:
         # Path-shaped symbol on a file that does NOT exist yet stays on the
         # full_replace creation path — that fix (run 019f40ac) must survive.
-        cand = _slice("x = 1\n", file="newmod.py", symbol="newmod.py")
+        content = "def newfn():\n    return 1\n"
+        cand = _slice(content, file="newmod.py", symbol="newmod.py")
         res = apply_synthesized(
             cand, workspace_root=str(tmp_path), target_files=["newmod.py"]
         )
         assert res.n_applied == 1 and res.n_failures == 0
-        assert (tmp_path / "newmod.py").read_text() == "x = 1\n"
+        assert (tmp_path / "newmod.py").read_text() == content
 
     def test_real_symbols_pass_through(self, workspace: Path) -> None:
         cand = _slice("def greet(name):\n    return name\n", symbol="greet")
@@ -310,3 +311,38 @@ class TestWholeFileReplaceBlocked:
         assert _is_whole_file_symbol("SpineConfig.load", "spine/config.py") is False
         assert _is_whole_file_symbol("api.php", "routes/api.php") is True
         assert _is_whole_file_symbol("", "routes/api.php") is True
+
+
+class TestPlaceholderCreationBlocked:
+    """Creating a file whose content is an elision must FAIL placement
+    (run 019f81c1: RainfallCrudTest.php landed as a literal 3-byte '...'
+    in two consecutive cycles — PHP syntax check passes bare text, so the
+    lint oracle was blind and each cycle burned a verify pass)."""
+
+    def test_ellipsis_creation_blocked(self, tmp_path: Path) -> None:
+        cand = _slice("...", file="RainfallCrudTest.php", symbol="RainfallCrudTest.php")
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["RainfallCrudTest.php"]
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "placeholder_content_blocked"
+        assert not (tmp_path / "RainfallCrudTest.php").exists()
+
+    def test_empty_and_tiny_creations_blocked(self, tmp_path: Path) -> None:
+        from spine.agents.synthesis_implementer import _is_placeholder_content
+
+        assert _is_placeholder_content("") is True
+        assert _is_placeholder_content("pass") is True
+        assert _is_placeholder_content("// TODO") is True
+        assert _is_placeholder_content("<?php\n") is True  # 5 chars stripped... blocked
+        assert _is_placeholder_content("x = 1\ny = 2\n") is False
+
+    def test_real_creation_still_lands(self, tmp_path: Path) -> None:
+        cand = _slice(
+            "def real():\n    return 42\n", file="real.py", symbol="real.py"
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["real.py"]
+        )
+        assert res.n_applied == 1
+        assert (tmp_path / "real.py").exists()

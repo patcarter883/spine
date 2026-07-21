@@ -377,3 +377,52 @@ class TestSubagentFactory:
                 state=WorkflowState(work_id="test"),
                 config=None,
             )
+
+
+class TestJudgeNativeSchemaPublication:
+    """The no-tool verify judge on a thinking model must publish its schema
+    on the SPEC (native_json_schema) — mutating the locally-resolved model
+    is discarded by build_phase_agent, which resolves its own instance
+    (run 019f81c1: the judge ran completely unbound; every verdict was
+    CoT-polluted free text rescued by the fallback JSON parser)."""
+
+    def _spec(self, monkeypatch, model):
+        import spine.agents.subagents as sub
+        from spine.models.enums import PhaseName
+        from spine.models.state import WorkflowState
+
+        monkeypatch.setattr(
+            "spine.agents.helpers.resolve_model",
+            lambda *a, **kw: model,
+        )
+
+        class _Cfg:
+            verify_evidence_then_judge = True
+
+            def _lookup_provider_by_name(self, name):
+                return None
+
+        monkeypatch.setattr(
+            "spine.config.SpineConfig.load", staticmethod(lambda: _Cfg())
+        )
+        return sub.build_subagent_spec(
+            name="slice-verifier",
+            phase=PhaseName.VERIFY,
+            state=WorkflowState(work_id="t", workspace_root="."),
+            config=None,
+        )
+
+    def test_thinking_model_gets_native_json_schema(self, monkeypatch):
+        from spine.agents.subagents import SUBAGENT_RESPONSE_MODELS
+
+        spec = self._spec(monkeypatch, "openai:pahajoki/Qwen3.6-35B-A3B-MXFP4")
+        assert spec.get("native_json_schema") is SUBAGENT_RESPONSE_MODELS["slice-verifier"]
+        # judge mode: no tools
+        assert spec["tools"] == []
+
+    def test_non_thinking_model_uses_provider_strategy(self, monkeypatch):
+        from langchain.agents.structured_output import ProviderStrategy
+
+        spec = self._spec(monkeypatch, "openai:Some-Instruct-Model")
+        assert isinstance(spec.get("response_format"), ProviderStrategy)
+        assert "native_json_schema" not in spec

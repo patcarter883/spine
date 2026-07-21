@@ -403,6 +403,28 @@ def _coerce_candidate(response: Any) -> SynthesizedSlice | None:
     return None
 
 
+_PLACEHOLDER_BODIES = {"...", "pass", "TODO", "# TODO", "// TODO", "# ...", "// ..."}
+
+
+def _is_placeholder_content(code: str) -> bool:
+    """True when new-file content is an elision, not a file.
+
+    ``_is_stub_body`` judges Python function bodies via AST — useless for a
+    PHP file whose entire content is ``...`` (run 019f81c1: the editor
+    elided RainfallCrudTest.php to a literal 3-byte ``...`` in TWO
+    consecutive cycles; PHP's syntax check passes it as plain text, so the
+    lint oracle was blind and verify burned a cycle each time discovering
+    it). Language-agnostic and conservative: only blocks content that is
+    empty, a known placeholder token, or too short to be any real file.
+    """
+    stripped = (code or "").strip()
+    return (
+        not stripped
+        or stripped in _PLACEHOLDER_BODIES
+        or len(stripped) <= 10
+    )
+
+
 _SOURCE_FILE_EXT_RE = re.compile(
     r"\.(php|py|js|jsx|ts|tsx|vue|rb|go|rs|java|cs|sql|yaml|yml|json|env)$",
     re.IGNORECASE,
@@ -465,6 +487,19 @@ def apply_synthesized(
             continue
         try:
             if not (Path(workspace_root) / edit.file).exists():
+                if _is_placeholder_content(edit.code):
+                    # Creating a placeholder is a placement FAILURE, not a
+                    # scoring penalty — a 3-byte '...' file lints clean and
+                    # costs a whole verify cycle to discover.
+                    result.failures.append(
+                        {**rec, "status": "placeholder_content_blocked",
+                         "detail": (
+                             f"{edit.file} would be created with placeholder "
+                             f"content ({edit.code.strip()!r}) — emit the "
+                             f"file's full real content, never an elision."
+                         )}
+                    )
+                    continue
                 # A brand-new file has no symbol anchors, so ast_edit bounces
                 # not_found and the slice fails identically every cycle (run
                 # 019f40ac: a new test file was synthesized three times and

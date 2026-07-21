@@ -1015,11 +1015,27 @@ def build_subagent_spec(
             from langchain.agents.structured_output import ProviderStrategy
             spec["response_format"] = ProviderStrategy(schema=schema_model)
         else:
-            _bind_response_format(
+            # Thinking models reject forced tool choice, so the schema rides
+            # as a NATIVE json_schema response_format on the model itself.
+            # Mutating the local ``model`` is not enough: consumers like the
+            # verify subgraph hand the SPEC to build_phase_agent, which
+            # resolves its own model instance — the mutation was silently
+            # discarded and the judge ran completely unbound (run 019f81c1:
+            # every judge verdict arrived as CoT-polluted free text salvaged
+            # by the fallback JSON parser). Publish the schema on the spec so
+            # the agent builder can bind it to the model it actually uses.
+            bound = _bind_response_format(
                 model,
                 schema_model,
                 name=f"{name}_response",
             )
+            spec["native_json_schema"] = schema_model
+            if not bound and not isinstance(model, str):
+                logger.warning(
+                    "subagent %r: native json_schema binding failed on %s — "
+                    "relying on spec-level native_json_schema",
+                    name, type(model).__name__,
+                )
     if memory:
         spec["memory"] = memory
 

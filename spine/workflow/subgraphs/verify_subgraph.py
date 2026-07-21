@@ -854,6 +854,7 @@ async def _run_slice_verifier_node(
             is_subagent=True,
             extra_tools=extra_tools,
             response_format=subagent_spec.get("response_format"),
+            native_json_schema=subagent_spec.get("native_json_schema"),
             skip_filesystem_middleware=True,
             # The subagent_spec already curated the verifier's tool surface
             # (read + execute tools only — slice-verifier is not in the MCP

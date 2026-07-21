@@ -340,6 +340,7 @@ def build_phase_agent(
     skip_filesystem_middleware: bool = False,
     completion_token_cap: int | None = None,
     escalation_level: int = 0,
+    native_json_schema: Any | None = None,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -418,6 +419,32 @@ def build_phase_agent(
                 "Phase %s: completion tokens clamped to %d for synthesis",
                 phase.value, completion_token_cap,
             )
+    # ── Native json_schema binding (thinking-model structured output) ──
+    # For models that reject forced tool choice, the schema must ride as a
+    # provider-native response_format on THIS resolved instance — binding a
+    # model object elsewhere (e.g. in build_subagent_spec) is discarded here
+    # because we resolve our own (run 019f81c1: the verify judge ran unbound
+    # and every verdict was CoT-polluted free text).
+    if native_json_schema is not None:
+        from spine.agents.subagents import _bind_response_format
+
+        if isinstance(model, str) or not _bind_response_format(
+            model, native_json_schema, name=f"{phase.value}_response"
+        ):
+            logger.warning(
+                "Phase %s: native json_schema binding failed (model=%s) — "
+                "structured output will rely on downstream JSON salvage",
+                phase.value,
+                model if isinstance(model, str) else type(model).__name__,
+            )
+        else:
+            logger.info(
+                "Phase %s: native json_schema %r bound on %s",
+                phase.value,
+                getattr(native_json_schema, "__name__", "schema"),
+                type(model).__name__,
+            )
+
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
     work_id = state.get("work_id", "")
