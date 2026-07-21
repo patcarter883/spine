@@ -252,6 +252,10 @@ def adapt_response(
         rows = (data.get("results") or []) if isinstance(data, dict) else data
         if not rows:
             return "not found"
+        # Code symbols first — when this listing is an ambiguity report,
+        # the agent retries with the first plausible candidate, and a doc
+        # heading at the top sends it down a dead end.
+        rows = sorted(rows, key=is_doc_row)
         lines = []
         for r in rows:
             lines.append(
@@ -299,11 +303,36 @@ def adapt_response(
     return json.dumps(data) if isinstance(data, (dict, list)) else str(data)
 
 
+_DOC_FILE_EXT_RE = re.compile(r"\.(md|mdx|rst|txt|adoc)$", re.IGNORECASE)
+
+
+def is_doc_row(row: Any) -> bool:
+    """True when a search_graph row is a DOCUMENT node, not a code symbol.
+
+    codebase-memory-mcp indexes markdown headings as graph symbols, so a
+    name query returns rows like "8.2 Exception Handler" or "1. Farm
+    Managers" alongside the real class (runs 019f6e2d/019f81c1: 4/9 then
+    6/15 get_source calls died on "did not resolve to exactly one symbol"
+    because a doc heading shared the pool with the code definition).
+    Classified by file extension (doc formats) or name shape — real code
+    symbols never contain whitespace; headings almost always do. A code
+    file that happens to live under docs/ (e.g. docs/generate_erd.py)
+    stays a code row.
+    """
+    if not isinstance(row, dict):
+        return False
+    if _DOC_FILE_EXT_RE.search(str(row.get("file_path") or "")):
+        return True
+    return bool(re.search(r"\s", str(row.get("name") or "").strip()))
+
+
 def resolve_qualified_name(project: str, name: str, resolve_result: Any) -> str | None:
     """Pick the qualified_name for ``get_source`` from a search_graph result.
 
-    Exact-name matches win; a single result wins; ambiguity → None (the
-    caller reports the candidates to the agent instead of guessing).
+    Code symbols outrank document nodes (markdown headings share the graph
+    — see :func:`is_doc_row`); within the ranked pool, exact-name matches
+    win; a single result wins; residual ambiguity → None (the caller
+    reports the candidates to the agent instead of guessing).
     """
     data = _payload(resolve_result)
     rows = (data.get("results") or []) if isinstance(data, dict) else []
@@ -312,11 +341,21 @@ def resolve_qualified_name(project: str, name: str, resolve_result: Any) -> str 
     leaf = name.rsplit(".", 1)[-1]
     exact = [r for r in rows if r.get("name") == leaf]
     pool = exact or rows
+    # Doc headings only compete when no code row exists at all (an agent
+    # may genuinely ask for a doc section).
+    code_rows = [r for r in pool if not is_doc_row(r)]
+    pool = code_rows or pool
     if len(pool) == 1:
         return pool[0].get("qualified_name")
-    # Prefer a qualified-suffix match for dotted inputs.
+    # Prefer a qualified-suffix match for dotted inputs — on a DOT
+    # boundary, else 'RelationshipFarmScope.apply' string-matches a query
+    # for 'FarmScope.apply' and re-ambiguates it.
     if "." in name:
-        suffix = [r for r in pool if str(r.get("qualified_name", "")).endswith(name)]
+        suffix = [
+            r for r in pool
+            if str(r.get("qualified_name", "")) == name
+            or str(r.get("qualified_name", "")).endswith("." + name)
+        ]
         if len(suffix) == 1:
             return suffix[0].get("qualified_name")
     return None

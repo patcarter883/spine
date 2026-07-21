@@ -296,3 +296,67 @@ def test_ensure_cbmignore_appends_only_missing_and_is_idempotent(tmp_path):
     assert ".spine/" in text.splitlines()
     cbm.ensure_cbmignore(str(tmp_path))
     assert (tmp_path / ".cbmignore").read_text() == text  # idempotent
+
+
+def test_resolve_prefers_code_over_doc_headings():
+    """Runs 019f6e2d/019f81c1: markdown headings share the graph with code
+    symbols, so 'Handler' resolved to {class Handler, doc heading} and
+    bounced 'did not resolve to exactly one symbol'. Code rows win."""
+    rows = {"results": [
+        {"name": "Handler", "qualified_name": f"{P}.docs.API-GUIDE",
+         "file_path": "docs/API-GUIDE.md"},
+        {"name": "8.2 Exception Handler", "qualified_name": f"{P}.docs.ARCH",
+         "file_path": "docs/ARCHITECTURE.md"},
+        {"name": "Handler", "qualified_name": f"{P}.app.Exceptions.Handler",
+         "file_path": "app/Exceptions/Handler.php"},
+    ]}
+    assert cbm.resolve_qualified_name(P, "Handler", rows) \
+        == f"{P}.app.Exceptions.Handler"
+
+
+def test_resolve_doc_only_pool_still_resolves():
+    # An agent may genuinely ask for a doc section — docs compete only
+    # against each other.
+    rows = {"results": [
+        {"name": "Deployment", "qualified_name": f"{P}.docs.DEPLOY",
+         "file_path": "docs/DEPLOY.md"},
+    ]}
+    assert cbm.resolve_qualified_name(P, "Deployment", rows) == f"{P}.docs.DEPLOY"
+
+
+def test_resolve_code_ambiguity_still_none():
+    # FarmScope.apply vs RelationshipFarmScope.apply — genuine code-side
+    # ambiguity must still report candidates, not guess.
+    rows = {"results": [
+        {"name": "apply", "qualified_name": f"{P}.a.FarmScope.apply",
+         "file_path": "app/Infrastructure/Scopes/FarmScope.php"},
+        {"name": "apply", "qualified_name": f"{P}.b.RelationshipFarmScope.apply",
+         "file_path": "app/Infrastructure/Scopes/RelationshipFarmScope.php"},
+        {"name": "Apply Global Scopes", "qualified_name": f"{P}.docs.SCOPES",
+         "file_path": "docs/SCOPES.md"},
+    ]}
+    assert cbm.resolve_qualified_name(P, "apply", rows) is None
+    # But the dotted form disambiguates as before.
+    assert cbm.resolve_qualified_name(P, "FarmScope.apply", rows) \
+        == f"{P}.a.FarmScope.apply"
+
+
+def test_is_doc_row_shapes():
+    assert cbm.is_doc_row({"name": "1. Farm Managers", "file_path": "x.php"}) is True
+    assert cbm.is_doc_row({"name": "Intro", "file_path": "README.md"}) is True
+    assert cbm.is_doc_row({"name": "generate_erd", "file_path": "docs/generate_erd.py"}) is False
+    assert cbm.is_doc_row({"name": "RouteServiceProvider.boot",
+                           "file_path": "app/Providers/RouteServiceProvider.php"}) is False
+
+
+def test_adapt_find_symbol_lists_code_first():
+    payload = {"results": [
+        {"name": "8.2 Exception Handler", "qualified_name": f"{P}.docs.ARCH",
+         "label": "doc", "file_path": "docs/ARCHITECTURE.md"},
+        {"name": "Handler", "qualified_name": f"{P}.app.Exceptions.Handler",
+         "label": "class", "file_path": "app/Exceptions/Handler.php", "start_line": 12},
+    ]}
+    out = cbm.adapt_response("find_symbol", P, payload)
+    first, second = out.splitlines()[:2]
+    assert "Handler.php" in first
+    assert "ARCHITECTURE.md" in second
