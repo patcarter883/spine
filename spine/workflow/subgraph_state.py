@@ -240,6 +240,11 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     # The result mapper stashes it under last_critic_review["reference_gate"]
     # so the next round can see which symbols were already flagged.
     reference_gate_result: dict | None
+    # Records of prior-round literal_fixes that structural_check applied
+    # MECHANICALLY this round (the rework left the flagged text in place).
+    # Declared so the update survives LangGraph channel filtering and the
+    # result mapper can propagate the patched plan to the parent.
+    literal_fixes_applied: list[dict] | None
 
 
 class AdversarialSubgraphState(BaseSubgraphState, total=False):

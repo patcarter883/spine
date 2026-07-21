@@ -959,7 +959,21 @@ def _critic_result_mapper(reviewed_phase: str):
             # state mapper so the next round's gate can escalate symbols that
             # stayed dangling despite this round's exact feedback.
             "reference_gate": subgraph_result.get("reference_gate_result") or {},
+            # Mechanically-applicable corrections from THIS round's verdict —
+            # next round's structural_check applies any the rework leaves in
+            # place (critic_subgraph.apply_literal_fixes).
+            "literal_fixes": effective_result.get("literal_fixes", []),
         }
+
+        # Mechanical-fix propagation: when structural_check patched the plan
+        # (prior-round literal fixes the rework failed to apply), the parent
+        # must carry the PATCHED document — downstream implement dispatch and
+        # the next rework prompt read it from parent state.
+        if subgraph_result.get("literal_fixes_applied"):
+            if subgraph_result.get("plan_json"):
+                base["plan_json"] = subgraph_result["plan_json"]
+            if subgraph_result.get("artifacts"):
+                base["artifacts"] = subgraph_result["artifacts"]
 
         # Rework of a workspace-mutating phase invalidates the per-work_id
         # symbol cache: the failed attempt (or the human, during a

@@ -509,6 +509,13 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
             "suggestions": suggestions,
             "blocker_category": blocker_category,
             "cited_exclusions": cited_exclusions,
+            # Mechanically-applicable corrections — carried on the verdict so
+            # the NEXT round's structural_check can apply any the rework left
+            # unaddressed (see critic_subgraph.apply_literal_fixes).
+            "literal_fixes": [
+                f for f in (data.get("literal_fixes") or [])
+                if isinstance(f, dict) and f.get("find") and f.get("replace")
+            ],
         }
 
     # Fallback to keyword parsing for backwards compatibility

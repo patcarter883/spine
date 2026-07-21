@@ -89,6 +89,16 @@ _PLAN_REVIEW_INSTRUCTIONS = (
     + " Also name the overlapping target file/requirement.\n\n"
     "If any check fails, respond with NEEDS_REVISION and list the specific\n"
     "violations in your suggestions.\n\n"
+    "## Literal fixes\n\n"
+    "When a defect's remedy is an EXACT textual replacement you can fully\n"
+    "specify (a wrong slug, a broken code line in execution_requirements, a\n"
+    "mis-stated criterion), ALSO record it in `literal_fixes`: `find` = the\n"
+    "defective text copied verbatim character-for-character from the payload\n"
+    "(a full phrase or line, never a short fragment), `replace` = the\n"
+    "complete corrected text. If the author fails to apply your fix, it is\n"
+    "applied mechanically next round instead of costing another cycle. Do\n"
+    "NOT use literal_fixes for changes needing judgement or restructuring —\n"
+    "those stay in suggestions.\n\n"
 )
 
 

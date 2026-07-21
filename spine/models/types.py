@@ -259,6 +259,33 @@ class GapPlan(BaseModel):
     )
 
 
+class LiteralFix(BaseModel):
+    """A mechanically-applicable correction the critic can specify exactly.
+
+    When a defect's remedy is a precise textual replacement, re-emitting the
+    whole plan and hoping the author applies it is the weakest link (run
+    019f8405: the planner failed twice to apply a two-line fix the critic
+    had spelled out verbatim — stagnation park). Fixes carried here are
+    applied DETERMINISTICALLY at the next review round if the flagged text
+    is still present.
+    """
+
+    find: str = Field(
+        description=(
+            "The defective text, copied VERBATIM character-for-character "
+            "from the reviewed payload (at least a full phrase — short "
+            "fragments are ignored as too ambiguous to auto-apply)."
+        )
+    )
+    replace: str = Field(
+        description="The complete corrected text that replaces `find`."
+    )
+    slice_id: str | None = Field(
+        default=None,
+        description="Optional slice id the fix belongs to (documentation only).",
+    )
+
+
 class CriticReview(BaseModel):
     """Structured critic output.
 
@@ -287,6 +314,18 @@ class CriticReview(BaseModel):
             "violation asserted without a verbatim citation that matches a real "
             "scope_exclusions bullet is treated as unsupported and overturned "
             "automatically, so do not flag one you cannot quote."
+        ),
+    )
+    literal_fixes: list[LiteralFix] = Field(
+        default_factory=list,
+        description=(
+            "When (and only when) a flagged defect's remedy is an EXACT "
+            "textual replacement you can fully specify, also record it here "
+            "(find = the defective text verbatim, replace = the corrected "
+            "text). If the author fails to apply it, the fix is applied "
+            "mechanically next round instead of blocking another cycle. "
+            "Never use this for changes that require judgement or "
+            "restructuring."
         ),
     )
     score: int | None = Field(
