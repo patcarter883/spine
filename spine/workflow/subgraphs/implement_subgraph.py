@@ -1702,7 +1702,11 @@ async def _synthesis_implementer_node(
         # failing scored worse twice and the budget expired).
         final_mile = _final_mile_fails(state, active_slice)
         if final_mile:
-            logger.info(
+            # WARNING, not info: the run log surfaces WARNING+, and mode
+            # engagement is exactly what a convergence post-mortem needs
+            # (run 019f82b1 was mis-diagnosed as "final-mile never engaged"
+            # because this line was invisible at info level).
+            logger.warning(
                 "[%s] synthesis_implementer: FINAL MILE for %r - %d failing "
                 "criteria, minimal-edit mode",
                 work_id, slice_id, len(final_mile),
