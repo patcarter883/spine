@@ -288,6 +288,29 @@ class CAMClient:
         data = await self._request("DELETE", f"/cam/facts/{subject}")
         return data.get("deleted") if isinstance(data, dict) else None
 
+    async def lookup(
+        self, subject: str | None = None, text: str | None = None
+    ) -> dict[str, Any] | None:
+        """Delivery pre-check (serve rev 3e8c1b3+): what would this hit?
+
+        By ``subject``: ``{delivered, subject, object}``. By free ``text``:
+        ``{matches: [{subject, object}, ...]}`` — the transparent read's own
+        matcher, so a miss here means a chat mention won't deliver either.
+        """
+        params = {"subject": subject} if subject else {"text": text}
+        data = await self._request("GET", "/cam/lookup", params=params)
+        return data if isinstance(data, dict) else None
+
+    async def namespaces(self) -> list[dict[str, Any]] | None:
+        """All server namespaces: ``[{namespace, facts, frozen}, ...]``."""
+        data = await self._request("GET", "/cam/namespaces")
+        return data if isinstance(data, list) else None
+
+    async def delete_namespace(self, namespace: str) -> bool | None:
+        """Drop an entire namespace (test/scratch hygiene). ``{dropped: bool}``."""
+        data = await self._request("DELETE", f"/cam/namespaces/{namespace}")
+        return data.get("dropped") if isinstance(data, dict) else None
+
     async def stats(self) -> dict[str, Any] | None:
         data = await self._request("GET", "/cam/stats")
         return data if isinstance(data, dict) else None

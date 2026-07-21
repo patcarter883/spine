@@ -572,7 +572,8 @@ class UIApi:
         """Return all recorded project facts as dicts, newest first.
 
         Each dict carries the :class:`ProjectFact` fields (subject, object,
-        probe_prompt, namespace, stored, base_p, verified, source, work_id).
+        probe_prompt, namespace, stored, base_p, gate_reason, verified,
+        source, work_id, mode).
         """
         facts = self._facts_store().all()
         facts.sort(key=lambda f: f.created_at or "", reverse=True)
