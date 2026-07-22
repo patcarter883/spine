@@ -575,7 +575,12 @@ async def _prompt_structured_ainvoke(
         payload = list(input) + [instruction]
     else:
         payload = [HumanMessage(content=str(input)), instruction]
-    reply = await model.ainvoke(payload, config, **kwargs)
+    # Reasoning buys nothing on a mechanical JSON emission and can eat the
+    # ENTIRE completion budget before content starts (laguna-s-2.1,
+    # 2026-07-22: every failing reply was content_len=0 with up to ~16K
+    # chars of reasoning_content). suppress_reasoning pins ChatOpenRouter
+    # to effort=minimal; a no-op elsewhere.
+    reply = await suppress_reasoning(model).ainvoke(payload, config, **kwargs)
     text = reply.content if hasattr(reply, "content") else str(reply)
     if isinstance(text, list):  # multimodal block form
         text = "\n".join(
@@ -583,10 +588,27 @@ async def _prompt_structured_ainvoke(
         )
     candidate = _extract_json_candidate(text)
     if candidate is None:
+        # Backstop: a reasoning-routed reply sometimes finishes the JSON
+        # inside the reasoning channel.
+        ak = getattr(reply, "additional_kwargs", None) or {}
+        candidate = _extract_json_candidate(
+            str(ak.get("reasoning_content") or ak.get("reasoning") or "")
+        )
+    if candidate is None:
         raise ValueError(
             f"prompt-structured reply for {schema.__name__} contained no JSON object"
         )
-    return schema.model_validate(_json.loads(candidate))
+    try:
+        parsed = _json.loads(candidate)
+    except _json.JSONDecodeError as exc:
+        if "escape" not in str(exc).lower():
+            raise
+        # Code-bearing replies (PHP namespaces) often carry raw single
+        # backslashes that strict JSON rejects ("Invalid \escape") — repair
+        # by doubling any backslash that doesn't start a valid escape.
+        repaired = re.sub(r'\\(?![\\/"bfnrtu])', r"\\\\", candidate)
+        parsed = _json.loads(repaired)
+    return schema.model_validate(parsed)
 
 
 def openrouter_native_structured_method(model: Any) -> str | None:

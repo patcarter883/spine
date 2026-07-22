@@ -501,3 +501,73 @@ class TestPromptStructuredRung:
         # non-OpenRouter models are never gated
         class Plain: ...
         assert h.openrouter_native_structured_method(Plain()) is None
+
+
+class TestPromptRungReasoningHardening:
+    """Laguna failing replies were content_len=0 with ~16K chars of
+    reasoning_content — reasoning ate the whole completion budget. The
+    prompt rung suppresses reasoning, salvages from the reasoning channel
+    as backstop, and repairs invalid \\escapes in code-bearing JSON."""
+
+    @pytest.mark.asyncio
+    async def test_salvages_from_reasoning_channel(self, monkeypatch):
+        import spine.agents.helpers as h
+        from pydantic import BaseModel
+
+        class Out(BaseModel):
+            verdict: str
+
+        monkeypatch.setattr(h, "suppress_reasoning", lambda m: m)
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(
+                    content="",
+                    additional_kwargs={"reasoning_content": 'thinking... {"verdict": "OK"}'},
+                )
+
+        out = await h._prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert out.verdict == "OK"
+
+    @pytest.mark.asyncio
+    async def test_repairs_invalid_php_escapes(self, monkeypatch):
+        import spine.agents.helpers as h
+        from pydantic import BaseModel
+
+        class Out(BaseModel):
+            ns: str
+
+        monkeypatch.setattr(h, "suppress_reasoning", lambda m: m)
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                # raw PHP namespace backslashes — strict JSON rejects \D and \F
+                return SimpleNamespace(content='{"ns": "App\\Domain\\Farm"}',
+                                       additional_kwargs={})
+
+        out = await h._prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert out.ns == "App\\Domain\\Farm"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_suppressed_on_invoke(self, monkeypatch):
+        import spine.agents.helpers as h
+        from pydantic import BaseModel
+
+        class Out(BaseModel):
+            v: str
+
+        seen = {}
+        def fake_suppress(m):
+            seen["called"] = True
+            return m
+        monkeypatch.setattr(h, "suppress_reasoning", fake_suppress)
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(content='{"v": "x"}', additional_kwargs={})
+
+        await h._prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert seen.get("called") is True
