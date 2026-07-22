@@ -538,7 +538,7 @@ def invoke_with_retry(
 
             if not _is_transient_error(exc):
                 logger.error(
-                    f"{prefix}{phase_label} permanent error (attempt {attempt + 1}): {exc}"
+                    f"{prefix}{phase_label} permanent error (attempt {attempt + 1}): {type(exc).__name__}: {exc}"
                 )
                 raise
 
@@ -667,7 +667,7 @@ async def ainvoke_with_retry(
 
             if not _is_transient_error(exc):
                 logger.error(
-                    f"{prefix}{phase_label} permanent error (attempt {attempt + 1}): {exc}"
+                    f"{prefix}{phase_label} permanent error (attempt {attempt + 1}): {type(exc).__name__}: {exc}"
                 )
                 raise
 
