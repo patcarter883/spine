@@ -390,3 +390,58 @@ class TestOpenRouterForcedChoiceRelease:
         r = Req(); r.model = model; r.messages = []; r.tools = []
         mw = ForceToolUntilCalledMiddleware(final_tool="write_specification")
         assert mw._decide(r) == _FORCE_ANY
+
+
+class TestToollessTurnReminder:
+    """When tool_choice can't be pinned, a toolless terminal turn loops back
+    to the model with a bounded reminder instead of ending the agent
+    (laguna run 3: two specify attempts, zero write_specification calls)."""
+
+    def _mw(self):
+        from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware
+        return ForceToolUntilCalledMiddleware(final_tool="write_specification")
+
+    def test_toolless_ai_turn_gets_reminder_and_model_jump(self):
+        from langchain_core.messages import AIMessage
+
+        out = self._mw()._remind_if_toolless(
+            {"messages": [AIMessage(content="here is my analysis in prose")]}
+        )
+        assert out is not None
+        assert out["jump_to"] == "model"
+        assert "write_specification" in str(out["messages"][0].content)
+        from langchain_core.messages import HumanMessage
+        assert isinstance(out["messages"][0], HumanMessage)  # template-safe
+
+    def test_tool_calling_turn_not_reminded(self):
+        from langchain_core.messages import AIMessage
+
+        msg = AIMessage(content="", tool_calls=[
+            {"name": "write_specification", "args": {}, "id": "1", "type": "tool_call"}
+        ])
+        assert self._mw()._remind_if_toolless({"messages": [msg]}) is None
+
+    def test_reminder_cap_bounds_loop(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from spine.agents.tool_forcing import _REMINDER_TAG
+
+        msgs = []
+        for _ in range(3):
+            msgs.append(AIMessage(content="prose"))
+            msgs.append(HumanMessage(content=f"{_REMINDER_TAG} call it"))
+        msgs.append(AIMessage(content="still prose"))
+        assert self._mw()._remind_if_toolless({"messages": msgs}) is None
+
+    def test_success_ends_reminding(self):
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        msgs = [
+            AIMessage(content="", tool_calls=[
+                {"name": "write_specification", "args": {}, "id": "t1",
+                 "type": "tool_call"}
+            ]),
+            ToolMessage(content="Specification written", tool_call_id="t1",
+                        name="write_specification"),
+            AIMessage(content="done"),
+        ]
+        assert self._mw()._remind_if_toolless({"messages": msgs}) is None
