@@ -110,6 +110,22 @@ def _tool_name(tool: Any) -> str:
     return getattr(tool, "name", "") or ""
 
 
+def _forced_choice_supported(model: Any) -> bool:
+    """True when the provider accepts a non-"auto" ``tool_choice`` at all.
+
+    OpenRouter routes with ``require_parameters=True``, and endpoints that
+    only accept ``tool_choice: auto`` are rejected UP-FRONT for any forced
+    value — "No endpoints found that support the provided 'tool_choice'
+    value" (trace 019eaf2a: minimax-m3 rejected a named pin; 2026-07-22:
+    poolside/laguna-s-2.1 rejected "required"/"any" too — per Pat, the
+    OpenRouter surface only reliably supports auto). ChatOpenRouter
+    therefore never gets a forced tool_choice: the middleware's reminder
+    loop still gates termination on the final tool actually succeeding, so
+    forcing degrades to prompt-driven calling instead of a permanent 404.
+    """
+    return type(model).__name__ != "ChatOpenRouter"
+
+
 def _named_pin_supported(model: Any) -> bool:
     """True when pinning ``tool_choice`` to a named tool is safe on the wire.
 
@@ -201,6 +217,8 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
             return _RELEASE
         messages = list(getattr(request, "messages", None) or [])
         if self._final_tool_succeeded(messages):
+            return _RELEASE
+        if not _forced_choice_supported(model):
             return _RELEASE
         if self._gate_tool_called(messages) and _named_pin_supported(model):
             return self.final_tool  # pin the structured write specifically

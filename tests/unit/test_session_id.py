@@ -461,20 +461,32 @@ class TestSelfHealingStructured:
             assert "test/model" not in helpers._structured_method_cache
         assert model.methods_invoked == ["json_schema"]
 
-    def test_bottom_of_ladder_404_propagates(self) -> None:
-        import pytest
-
+    def test_json_mode_404_demotes_to_prompt_rung(self) -> None:
+        # json_mode used to be the ladder bottom (404 propagated). The
+        # terminal rung is now "prompt": plain generation + JSON salvage
+        # (poolside/laguna-s-2.1 supports NO native structured mechanism).
         import spine.agents.helpers as helpers
+        from pydantic import BaseModel
         from spine.agents.helpers import _SelfHealingStructured
+
+        class Out(BaseModel):
+            verdict: str
 
         model = _FakeStructuredModel(
             "test/model", {"json_mode": _Routing404(_PARAMS_404)}
         )
+
+        async def _plain_ainvoke(_input, _config=None, **_kw):
+            from types import SimpleNamespace
+            return SimpleNamespace(content='{"verdict": "PASSED"}')
+
+        model.ainvoke = _plain_ainvoke  # the prompt rung calls the RAW model
         with patch.dict(helpers._structured_method_cache, {}, clear=True):
-            wrapper = _SelfHealingStructured(model, object, "json_mode")
-            with pytest.raises(_Routing404):
-                self._run(wrapper.ainvoke(["msg"]))
-        assert model.methods_invoked == ["json_mode"]
+            wrapper = _SelfHealingStructured(model, Out, "json_mode")
+            out = self._run(wrapper.ainvoke(["msg"]))
+            assert helpers._structured_method_cache["test/model"] == "prompt"
+        assert out.verdict == "PASSED"
+        assert model.methods_invoked == ["json_mode"]  # then prompt rung, no bind
 
     def test_adopts_demotion_discovered_by_another_worker(self) -> None:
         import spine.agents.helpers as helpers

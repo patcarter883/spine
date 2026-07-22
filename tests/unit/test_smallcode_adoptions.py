@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from langchain_core.messages import AIMessage, ToolMessage
 
 from spine.config import SpineConfig
@@ -429,3 +431,73 @@ class TestMicroSliceParentInheritance:
         from spine.workflow.subgraphs.implement_subgraph import _slice_marker_ids
         ids = _slice_marker_ids([subs[0]])
         assert "implement-domain-models" in ids
+
+
+class TestPromptStructuredRung:
+    """Terminal 'prompt' rung for OpenRouter endpoints with no native
+    structured mechanism (laguna-s-2.1: tools + tool_choice:auto only —
+    json_schema/function_calling/json_mode all 404 under
+    require_parameters)."""
+
+    def test_ladder_ends_at_prompt(self):
+        from spine.agents.helpers import _STRUCTURED_METHOD_LADDER, _demoted_method
+
+        assert _STRUCTURED_METHOD_LADDER[-1] == "prompt"
+        assert _demoted_method("json_mode") == "prompt"
+        assert _demoted_method("prompt") is None
+
+    def test_extract_json_candidate_shapes(self):
+        from spine.agents.helpers import _extract_json_candidate
+
+        assert _extract_json_candidate('x {"a": 1, "b": {"c": 2}} y') == '{"a": 1, "b": {"c": 2}}'
+        assert _extract_json_candidate('```json\n{"a": 1}\n```') == '{"a": 1}'
+        assert _extract_json_candidate('{"s": "brace } in string"}') == '{"s": "brace } in string"}'
+        assert _extract_json_candidate("no json") is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_ainvoke_parses_and_validates(self):
+        from pydantic import BaseModel
+
+        from spine.agents.helpers import _prompt_structured_ainvoke
+
+        class Out(BaseModel):
+            verdict: str
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                assert any("JSON object conforming" in str(getattr(m, "content", "")) for m in payload)
+                return SimpleNamespace(content='Sure!\n{"verdict": "PASSED"}')
+
+        out = await _prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert out.verdict == "PASSED"
+
+    @pytest.mark.asyncio
+    async def test_prompt_ainvoke_raises_on_no_json(self):
+        from pydantic import BaseModel
+
+        from spine.agents.helpers import _prompt_structured_ainvoke
+
+        class Out(BaseModel):
+            verdict: str
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(content="no json here")
+
+        with pytest.raises(ValueError):
+            await _prompt_structured_ainvoke(FakeModel(), Out, [])
+
+    def test_openrouter_method_probe_gate(self, monkeypatch):
+        import spine.agents.helpers as h
+
+        class FakeOR:
+            model_name = "poolside/laguna-s-2.1"
+        FakeOR.__name__ = "ChatOpenRouter"
+
+        monkeypatch.setitem(h._structured_method_cache, "poolside/laguna-s-2.1", "prompt")
+        assert h.openrouter_native_structured_method(FakeOR()) == "prompt"
+        # non-OpenRouter models are never gated
+        class Plain: ...
+        assert h.openrouter_native_structured_method(Plain()) is None

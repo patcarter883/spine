@@ -419,6 +419,29 @@ def build_phase_agent(
                 "Phase %s: completion tokens clamped to %d for synthesis",
                 phase.value, completion_token_cap,
             )
+    # ── OpenRouter capability gate ────────────────────────────────────
+    # An OpenRouter endpoint without native structured_outputs support can
+    # serve NEITHER agent-level response_format (ToolStrategy forces a
+    # non-"auto" tool_choice; ProviderStrategy/native json_schema send
+    # response_format — both 404 under require_parameters; 2026-07-22:
+    # poolside/laguna-s-2.1 exposes only tools + tool_choice:auto). Drop
+    # the bindings with a warning — downstream extractors all carry
+    # content-JSON salvage, and bind_structured_output's "prompt" rung
+    # covers the no-tool structured calls.
+    if response_format is not None or native_json_schema is not None:
+        from spine.agents.helpers import openrouter_native_structured_method
+
+        _or_method = openrouter_native_structured_method(model)
+        if _or_method is not None and _or_method != "json_schema":
+            logger.warning(
+                "Phase %s: OpenRouter endpoint lacks native structured "
+                "output (probed method=%s) — dropping response_format/"
+                "native_json_schema; relying on prompt + JSON salvage",
+                phase.value, _or_method,
+            )
+            response_format = None
+            native_json_schema = None
+
     # ── Native json_schema binding (thinking-model structured output) ──
     # For models that reject forced tool choice, the schema must ride as a
     # provider-native response_format on THIS resolved instance — binding a

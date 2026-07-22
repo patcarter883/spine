@@ -353,3 +353,40 @@ class TestStructuralRetry:
 
         assert result["status"] == "needs_review"
         assert mock_subgraph.ainvoke.call_count == 1  # generic errors are not retried
+
+
+class TestOpenRouterForcedChoiceRelease:
+    """ChatOpenRouter never receives a forced tool_choice — OpenRouter
+    routing 404s any non-"auto" value on endpoints like poolside/laguna
+    (2026-07-22) and minimax-m3 (trace 019eaf2a). The reminder loop still
+    gates termination on the final tool succeeding."""
+
+    def test_decide_releases_for_openrouter(self):
+        from spine.agents.tool_forcing import (
+            ForceToolUntilCalledMiddleware, _RELEASE, _forced_choice_supported,
+        )
+
+        class FakeOR:
+            openai_api_base = None
+            model_name = "poolside/laguna-s-2.1"
+        FakeOR.__name__ = "ChatOpenRouter"
+        assert _forced_choice_supported(FakeOR()) is False
+
+        class Req:
+            model = FakeOR()
+            messages = []
+            tools = []
+        mw = ForceToolUntilCalledMiddleware(final_tool="write_specification")
+        assert mw._decide(Req()) is _RELEASE
+
+    def test_openai_style_still_forced(self):
+        from spine.agents.tool_forcing import ForceToolUntilCalledMiddleware, _FORCE_ANY
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(model="x", api_key="k", base_url="http://local:1/v1")
+
+        class Req:
+            pass
+        r = Req(); r.model = model; r.messages = []; r.tools = []
+        mw = ForceToolUntilCalledMiddleware(final_tool="write_specification")
+        assert mw._decide(r) == _FORCE_ANY

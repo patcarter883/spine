@@ -509,8 +509,103 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
 
 # Structured-output methods in order of preference. Demotion on a routing
 # 404 steps one place right; past the end there is nothing left to try and
-# the error propagates to the callsite's existing fallback.
-_STRUCTURED_METHOD_LADDER = ("json_schema", "function_calling", "json_mode")
+# the error propagates to the callsite's existing fallback. "prompt" is the
+# terminal rung for endpoints whose parameter surface supports NO native
+# structured mechanism at all (2026-07-22: poolside/laguna-s-2.1 exposes
+# only tools + tool_choice:auto — json_schema, forced function calling AND
+# json_mode all 404 under require_parameters): plain generation with the
+# schema stated in the prompt, parsed and validated client-side.
+_STRUCTURED_METHOD_LADDER = ("json_schema", "function_calling", "json_mode", "prompt")
+
+
+def _extract_json_candidate(text: str) -> str | None:
+    """Pull the first plausible JSON object out of free-form model text."""
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return None
+
+
+async def _prompt_structured_ainvoke(
+    model: Any, schema: type[BaseModel], input: Any, config: Any = None, **kwargs: Any
+) -> Any:
+    """Terminal 'prompt' rung: schema in the prompt, salvage from content.
+
+    Appends a strict output instruction carrying the JSON schema, invokes the
+    RAW model, and parses/validates the reply. Raises ``ValueError`` on a
+    non-conforming reply so callsite retry ladders
+    (``ainvoke_structured_with_retry``) treat it like any parse failure.
+    """
+    import json as _json
+
+    from langchain_core.messages import HumanMessage
+
+    instruction = HumanMessage(
+        content=(
+            "Respond with ONLY a JSON object conforming to this schema — no "
+            "prose before or after it:\n"
+            f"{_json.dumps(schema.model_json_schema())}"
+        )
+    )
+    if isinstance(input, list):
+        payload = list(input) + [instruction]
+    else:
+        payload = [HumanMessage(content=str(input)), instruction]
+    reply = await model.ainvoke(payload, config, **kwargs)
+    text = reply.content if hasattr(reply, "content") else str(reply)
+    if isinstance(text, list):  # multimodal block form
+        text = "\n".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in text
+        )
+    candidate = _extract_json_candidate(text)
+    if candidate is None:
+        raise ValueError(
+            f"prompt-structured reply for {schema.__name__} contained no JSON object"
+        )
+    return schema.model_validate(_json.loads(candidate))
+
+
+def openrouter_native_structured_method(model: Any) -> str | None:
+    """The probed structured-output method for a ChatOpenRouter model.
+
+    ``None`` for non-OpenRouter models (callers should not gate on it).
+    Anything other than ``"json_schema"`` means the endpoint cannot be
+    trusted with provider-native schema binding (ProviderStrategy /
+    model_kwargs response_format) — and ToolStrategy's forced tool_choice
+    is equally unroutable on auto-only endpoints (laguna, 2026-07-22), so
+    agent-level response_format should be dropped in favour of
+    prompt+salvage on those models.
+    """
+    if type(model).__name__ != "ChatOpenRouter":
+        return None
+    name = getattr(model, "model_name", "") or ""
+    if not name:
+        return None
+    return _openrouter_structured_method(name)
 
 
 def _is_structured_routing_404(exc: BaseException) -> bool:
@@ -569,6 +664,12 @@ class _SelfHealingStructured:
             if cached:
                 self._method = cached
         while True:
+            if self._method == "prompt":
+                # Terminal rung — no native mechanism left on this endpoint;
+                # parse failures raise to the callsite retry ladder.
+                return await _prompt_structured_ainvoke(
+                    self._model, self._schema, input, config, **kwargs
+                )
             bound = self._model.with_structured_output(self._schema, method=self._method)
             try:
                 return await bound.ainvoke(input, config, **kwargs)
@@ -635,9 +736,15 @@ def _openrouter_structured_method(model_name: str) -> str:
                 supported.update(ep.get("supported_parameters") or [])
             if "structured_outputs" not in supported:
                 if "tool_choice" in supported:
+                    # NOTE: capability listings can't reveal VALUE support —
+                    # an endpoint may accept only tool_choice:auto (laguna) —
+                    # the self-healing wrapper demotes past this at the
+                    # first 404 (function_calling → json_mode → prompt).
                     method = "function_calling"
                 elif "response_format" in supported:
                     method = "json_mode"
+                else:
+                    method = "prompt"
                 logger.info(
                     "%s: endpoints lack structured_outputs support; using "
                     "structured-output method=%s",

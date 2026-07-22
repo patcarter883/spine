@@ -1011,7 +1011,20 @@ def build_subagent_spec(
         _verify_judge or name not in _schema_excluded
     ):
         schema_model = SUBAGENT_RESPONSE_MODELS[name]
-        if _supports_forced_tool_choice(model):
+        from spine.agents.helpers import openrouter_native_structured_method
+
+        _or_method = openrouter_native_structured_method(model)
+        if _or_method is not None and _or_method != "json_schema":
+            # OpenRouter endpoint without native structured output —
+            # ProviderStrategy and model_kwargs response_format both 404
+            # under require_parameters (laguna, 2026-07-22). No binding:
+            # the subagent's prompt describes the schema and every
+            # consumer carries a content-JSON salvage path.
+            logger.warning(
+                "subagent %r: OpenRouter endpoint lacks native structured "
+                "output (method=%s) — prompt + salvage only", name, _or_method,
+            )
+        elif _supports_forced_tool_choice(model):
             from langchain.agents.structured_output import ProviderStrategy
             spec["response_format"] = ProviderStrategy(schema=schema_model)
         else:
