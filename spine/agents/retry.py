@@ -356,7 +356,13 @@ def _is_transient_error(exc: Exception) -> bool:
         exc_type_lower = exc_type_name.lower()
         if "remoteprotocolerror" in exc_type_lower:
             return True
-        if "transport" in exc_type_lower:
+        # Match on the MRO, not the leaf name: TransportError is the PARENT of
+        # every timeout/network class (ReadTimeout, ConnectTimeout, ReadError,
+        # ConnectError, ...) whose own names contain neither "transport" nor
+        # anything in transient_names — a slow backend's ReadTimeout was
+        # classified PERMANENT (gap_plan, run d8bc459c 2026-07-24: 48K-token
+        # prompt, serve alive but slow, zero retries).
+        if any("transport" in c.__name__.lower() for c in type(exc).__mro__):
             return True
 
     # Default: not transient — don't retry logic bugs or auth errors

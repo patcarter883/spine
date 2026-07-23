@@ -88,6 +88,37 @@ class TestIsTransientError:
         )
         assert _is_transient_error(exc) is True
 
+    def test_httpx_timeout_subclasses_are_transient(self):
+        """httpx timeout/network errors are transient via the MRO check.
+
+        The leaf names (ReadTimeout, ConnectError, ...) contain neither
+        "transport" nor anything in transient_names — TransportError is
+        their PARENT. The old leaf-name check classified a slow backend's
+        ReadTimeout as PERMANENT (gap_plan, run d8bc459c 2026-07-24:
+        48K-token prompt, serve alive but slow, zero retries)."""
+        import httpx
+
+        from spine.agents.retry import _is_transient_error
+
+        for exc in (
+            httpx.ReadTimeout(""),
+            httpx.ConnectTimeout(""),
+            httpx.WriteTimeout(""),
+            httpx.PoolTimeout(""),
+            httpx.ReadError(""),
+            httpx.ConnectError(""),
+        ):
+            assert _is_transient_error(exc) is True, type(exc).__name__
+
+    def test_httpx_invalid_url_not_transient(self):
+        """httpx errors OUTSIDE the TransportError tree stay permanent —
+        InvalidURL is a config bug; retrying re-sends the same bad URL."""
+        import httpx
+
+        from spine.agents.retry import _is_transient_error
+
+        assert _is_transient_error(httpx.InvalidURL("bad")) is False
+
     def test_authentication_error_not_transient(self):
         """401 Authentication errors are permanent, not transient."""
         from openai import AuthenticationError
