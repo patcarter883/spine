@@ -52,6 +52,16 @@ class _FakeOrchestrator:
         self.calls.append("merge")
         return {"success": True, "merged": True}
 
+    def commit_and_preserve(self) -> dict:
+        self.calls.append("preserve")
+        return self.preserve_result
+
+    preserve_result: dict = {
+        "preserved": True,
+        "branch": "spine/patch-test",
+        "sandbox_dir": "/tmp/spine-sandbox-test",
+    }
+
     def rollback_workspace(self) -> dict:
         self.calls.append("rollback")
         return {"rolled_back": True}
@@ -115,12 +125,31 @@ def test_active_finalize_merges_on_completed(fake_orch):
     assert fake_orch[0].calls == ["prepare", "validate", "merge"]
 
 
-@pytest.mark.parametrize("status", ["needs_review", "stalled", "failed", "error", ""])
+@pytest.mark.parametrize("status", ["stalled", "failed", "error", ""])
 def test_active_finalize_rolls_back_on_non_success(fake_orch, status):
     sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "critical_task")
     sandbox.enter()
     sandbox.finalize(status)
     assert fake_orch[0].calls == ["prepare", "rollback"]
+
+
+def test_active_finalize_preserves_on_needs_review(fake_orch):
+    """A review park keeps the patch: the sandbox worktree and branch ARE
+    the artifact a human reviews (run d8bc459c 2026-07-24: rollback nuked
+    a 13-file best state with 4/7 slices VERIFIED)."""
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    sandbox.finalize("needs_review")
+    assert fake_orch[0].calls == ["prepare", "preserve"]
+
+
+def test_active_finalize_needs_review_empty_sandbox_rolls_back(fake_orch):
+    """Nothing to review (no commits ahead of main) → normal rollback."""
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    fake_orch[0].preserve_result = {"preserved": False}
+    sandbox.finalize("needs_review")
+    assert fake_orch[0].calls == ["prepare", "preserve", "rollback"]
 
 
 def test_active_abort_rolls_back(fake_orch):

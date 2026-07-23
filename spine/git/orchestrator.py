@@ -379,6 +379,49 @@ class SpineGitOrchestrator:
         logger.info("Merged verified patch branch %s into %s", branch, self.main_branch)
         return {"success": True, "branch": branch, "merged": True}
 
+    def commit_and_preserve(self) -> dict:
+        """Commit sandbox changes to the patch branch WITHOUT merging.
+
+        For review parks (``needs_review``): the patch is the artifact a
+        human reviews, so the sandbox worktree and patch branch must
+        outlive the run. No rebase, no merge, no removal — the worktree
+        stays checked out on the patch branch at ``self.sandbox_dir``.
+
+        Returns:
+            ``{"preserved": True, "branch": ..., "sandbox_dir": ...}`` when
+            there is work to review, ``{"preserved": False}`` when the
+            sandbox has no changes and no commits ahead of main (nothing
+            to keep — caller should roll back instead).
+        """
+        branch = self.patch_branch
+        self._execute_shell("git add .", cwd=self.sandbox_dir)
+        commit_ok, commit_out, commit_err = self._execute_shell(
+            f'git commit -m "spine(auto): unverified patch {branch} parked for review"',
+            cwd=self.sandbox_dir,
+        )
+        if not commit_ok and "nothing to commit" not in (commit_out + commit_err):
+            logger.warning("Commit reported non-zero: %s", commit_out + commit_err)
+
+        ahead_ok, ahead_out, _ = self._execute_shell(
+            f"git rev-list --count {self.main_branch}..HEAD", cwd=self.sandbox_dir
+        )
+        ahead = int(ahead_out.strip() or 0) if ahead_ok else 0
+        if ahead == 0:
+            return {"preserved": False}
+
+        # Branch strategy shares the master checkout — leave the branch
+        # intact (commits above preserve the work) but return the operator's
+        # tree to main. Worktree sandboxes never touched master's checkout.
+        if self.strategy != "worktree":
+            self._execute_shell(
+                f"git checkout {self.main_branch}", cwd=self.master_dir
+            )
+        return {
+            "preserved": True,
+            "branch": branch,
+            "sandbox_dir": str(self.sandbox_dir),
+        }
+
     def rollback_workspace(self) -> dict:
         """Nuke the sandbox and restore the master tree, best-effort.
 

@@ -28,10 +28,17 @@ from spine.config import SpineConfig
 logger = logging.getLogger(__name__)
 
 # Workflow terminal statuses that represent a verified, mergeable result.
-# Everything else (needs_review, stalled, failed, error, needs_gap_fix, …)
-# leaves the sandbox un-merged and triggers a rollback. A subsequent
-# resume/restart regenerates the work in a fresh sandbox.
+# Everything else (stalled, failed, error, needs_gap_fix, …) leaves the
+# sandbox un-merged and triggers a rollback. A subsequent resume/restart
+# regenerates the work in a fresh sandbox.
 _MERGE_STATUSES: frozenset[str] = frozenset({"completed"})
+
+# Review parks: the patch IS the artifact a human reviews, so the sandbox
+# worktree and patch branch are committed and kept (run d8bc459c 2026-07-24:
+# a needs_review exit rolled back a 13-file best state with 4/7 slices
+# VERIFIED — the only reviewable copy of the work). Prior parked sandboxes
+# only ever survived because killed runs never reached finalize.
+_PRESERVE_STATUSES: frozenset[str] = frozenset({"needs_review"})
 
 
 def work_type_writes_code(work_type: str) -> bool:
@@ -188,6 +195,24 @@ class WorktreeSandbox:
                 "Run completed (status=%s) — merging sandbox patch to main", status
             )
             self._orch.commit_and_merge()  # type: ignore[attr-defined]
+        elif status in _PRESERVE_STATUSES:
+            preserved = self._orch.commit_and_preserve()  # type: ignore[attr-defined]
+            if preserved.get("preserved"):
+                # WARNING so the pointer survives default log filtering — this
+                # line is how a reviewer finds the parked patch.
+                logger.warning(
+                    "Run parked status=%s — patch preserved for review: "
+                    "branch=%s worktree=%s",
+                    status,
+                    preserved.get("branch"),
+                    preserved.get("sandbox_dir"),
+                )
+            else:
+                logger.info(
+                    "Run parked status=%s with an empty sandbox — rolling back",
+                    status,
+                )
+                self._orch.rollback_workspace()  # type: ignore[attr-defined]
         else:
             logger.info(
                 "Run ended status=%s — rolling back sandbox (no merge to main)",
