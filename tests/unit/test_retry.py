@@ -110,6 +110,17 @@ class TestIsTransientError:
         ):
             assert _is_transient_error(exc) is True, type(exc).__name__
 
+    def test_stream_chunk_timeout_is_transient(self):
+        """langchain_openai's StreamChunkTimeoutError (no chunk within the
+        watchdog window) is a slow/loaded backend, not a logic bug — matched
+        by name since the class may not be importable across versions."""
+        from spine.agents.retry import _is_transient_error
+
+        exc = type("StreamChunkTimeoutError", (Exception,), {})(
+            "No streaming chunk received for 400.0s (chunks_received=0)"
+        )
+        assert _is_transient_error(exc) is True
+
     def test_httpx_invalid_url_not_transient(self):
         """httpx errors OUTSIDE the TransportError tree stay permanent —
         InvalidURL is a config bug; retrying re-sends the same bad URL."""

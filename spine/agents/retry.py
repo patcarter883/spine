@@ -307,6 +307,10 @@ def _is_transient_error(exc: Exception) -> bool:
         "GatewayTimeoutError",
         "TimeoutError",
         "ConnectionError",
+        # langchain_openai's per-chunk streaming watchdog — no chunk within
+        # stream_chunk_timeout. A slow/loaded backend, not a logic bug
+        # (gap_plan, run d8bc459c 2026-07-24: 48K prompt, 0 chunks in 400s).
+        "StreamChunkTimeoutError",
     }
     if exc_type_name in transient_names:
         return True
