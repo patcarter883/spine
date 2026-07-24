@@ -285,7 +285,7 @@ async def test_structured_escalation_doubles_cap_on_length(
     # _bind_capped returns the cap itself so the fake invoke can branch on it.
     monkeypatch.setattr(dc, "_bind_capped", lambda base, schema, cap: cap)
 
-    async def fake_invoke(model, messages, *, label):
+    async def fake_invoke(model, messages, *, label, schema=None):
         calls.append(model)
         if model < 30000:
             raise _StubLength()
@@ -312,7 +312,7 @@ async def test_structured_escalation_respects_window(
     calls: list[int] = []
     monkeypatch.setattr(dc, "_bind_capped", lambda base, schema, cap: cap)
 
-    async def always_length(model, messages, *, label):
+    async def always_length(model, messages, *, label, schema=None):
         calls.append(model)
         raise _StubLength()
 
