@@ -184,7 +184,22 @@ class SpineGitOrchestrator:
             raise SandboxPreparationError(
                 f"Failed to inspect working tree: {stderr}"
             )
-        if stdout.strip():
+        # Spine's own runtime output (UNTRACKED files under .spine/ —
+        # artifacts, experience, db) must not block the next run: every run
+        # writes them, so counting them dirty made spine self-blocking on
+        # any repo that doesn't gitignore .spine (Wallace parity report
+        # 2026-07-24 C13). TRACKED .spine files (configs) still count —
+        # modifying those is a real user change.
+        dirty = [
+            line
+            for line in stdout.splitlines()
+            if line.strip()
+            and not (
+                line.startswith("??")
+                and line.split(None, 1)[-1].strip('"').startswith(".spine/")
+            )
+        ]
+        if dirty:
             raise SandboxPreparationError(
                 "Working tree is not clean; commit or stash changes before "
                 "preparing a sandbox."

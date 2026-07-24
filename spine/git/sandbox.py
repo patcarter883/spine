@@ -172,9 +172,35 @@ class WorktreeSandbox:
             # that error at collection (work 545264cc landed a test class
             # whose setup called a nonexistent method; 9 tests errored on
             # main). Never merge a patch the pipeline can't green-light.
+            # An EMPTY pipeline can't green-light anything either: with no
+            # gate the internal LLM verify is grading its own homework
+            # (Wallace parity report 2026-07-24: two "verified" merges,
+            # both broken — one gutted a shipped 522-line component).
+            # Explicit `allow_merge_without_gate: true` opts back in.
             # Raising (instead of silently rolling back) routes through the
-            # dispatcher's error path, which aborts the sandbox and records
-            # the gate output on the work entry.
+            # dispatcher's error path and records the reason on the work
+            # entry — but the patch is COMMITTED AND PRESERVED first, so
+            # the blocked merge stays reviewable instead of being rolled
+            # back with the sandbox.
+            gate_cfg = getattr(self._orch, "gate_config", None) or {}
+            if not (gate_cfg.get("validation_pipeline") or {}) and not gate_cfg.get(
+                "allow_merge_without_gate"
+            ):
+                from spine.git.orchestrator import MergeError
+
+                preserved = self._orch.commit_and_preserve()  # type: ignore[attr-defined]
+                self._orch = None
+                raise MergeError(
+                    "Refusing to auto-merge: validation_pipeline is empty and "
+                    "allow_merge_without_gate is not set — internal verify "
+                    "alone cannot green-light a merge. "
+                    + (
+                        f"Patch preserved for review: branch={preserved.get('branch')} "
+                        f"worktree={preserved.get('sandbox_dir')}"
+                        if preserved.get("preserved")
+                        else "Sandbox had no changes."
+                    )
+                )
             validation = self._orch.run_validation_pipeline()  # type: ignore[attr-defined]
             if not validation.get("success", False):
                 from spine.git.orchestrator import MergeError
@@ -186,10 +212,18 @@ class WorktreeSandbox:
                     gate,
                     output,
                 )
+                preserved = self._orch.commit_and_preserve()  # type: ignore[attr-defined]
+                self._orch = None
+                pointer = (
+                    f" Patch preserved for review: branch={preserved.get('branch')} "
+                    f"worktree={preserved.get('sandbox_dir')}."
+                    if preserved.get("preserved")
+                    else ""
+                )
                 raise MergeError(
                     f"Validation gate '{gate}' blocked the merge "
-                    f"({validation.get('failure_message') or 'gate failed'}). "
-                    f"Output tail:\n{output}"
+                    f"({validation.get('failure_message') or 'gate failed'})."
+                    f"{pointer} Output tail:\n{output}"
                 )
             logger.info(
                 "Run completed (status=%s) — merging sandbox patch to main", status

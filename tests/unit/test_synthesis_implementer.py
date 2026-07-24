@@ -348,6 +348,74 @@ class TestPlaceholderCreationBlocked:
         assert (tmp_path / "real.py").exists()
 
 
+class TestPathConfusionBlocked:
+    """Creating a file into a phantom tree is monorepo path confusion
+    (Wallace parity report 2026-07-24: a feature landed at root 'src/'
+    outside the package and another under a doubled 'apps/apps/…' — both
+    'verified', both dead code). Fires only on positive evidence."""
+
+    def test_misrooted_creation_blocked(self, tmp_path: Path) -> None:
+        # 'wallace/src/' exists; writing to root 'src/…' dropped the prefix.
+        (tmp_path / "wallace" / "src").mkdir(parents=True)
+        cand = _slice(
+            "export const x = 1;\n",
+            file="src/components/UsersDialog.vue",
+            symbol="src/components/UsersDialog.vue",
+        )
+        res = apply_synthesized(
+            cand,
+            workspace_root=str(tmp_path),
+            target_files=["src/components/UsersDialog.vue"],
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "path_confusion_blocked"
+        assert "wallace" in res.failures[0]["detail"]
+        assert not (tmp_path / "src").exists()
+
+    def test_doubled_prefix_creation_blocked(self, tmp_path: Path) -> None:
+        # Workspace root IS apps/; 'apps/wallace/…' doubles the prefix.
+        (tmp_path / "wallace").mkdir()
+        cand = _slice(
+            "export const x = 1;\n",
+            file="apps/wallace/pages/Workshops.vue",
+            symbol="apps/wallace/pages/Workshops.vue",
+        )
+        res = apply_synthesized(
+            cand,
+            workspace_root=str(tmp_path),
+            target_files=["apps/wallace/pages/Workshops.vue"],
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "path_confusion_blocked"
+        assert "doubled" in res.failures[0]["detail"]
+
+    def test_genuinely_new_tree_allowed(self, tmp_path: Path) -> None:
+        # A first 'tests/' dir in a flat repo carries no confusion evidence.
+        cand = _slice(
+            "def test_ok():\n    assert True\n",
+            file="tests/test_ok.py",
+            symbol="tests/test_ok.py",
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["tests/test_ok.py"]
+        )
+        assert res.n_applied == 1
+        assert (tmp_path / "tests/test_ok.py").exists()
+
+    def test_existing_toplevel_new_subdir_allowed(self, tmp_path: Path) -> None:
+        (tmp_path / "app").mkdir()
+        cand = _slice(
+            "def real():\n    return 42\n",
+            file="app/newdir/real.py",
+            symbol="app/newdir/real.py",
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["app/newdir/real.py"]
+        )
+        assert res.n_applied == 1
+        assert (tmp_path / "app/newdir/real.py").exists()
+
+
 class TestAppendPlacement:
     """action='append' bypasses the whole-file guard (anchor-free, no
     clobber) and routes through the tool's append mode."""

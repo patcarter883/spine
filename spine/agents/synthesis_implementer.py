@@ -49,7 +49,11 @@ from pydantic import BaseModel, Field
 from spine.agents.decomposer import _ainvoke_structured_escalating
 from spine.agents.helpers import resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
-from spine.agents.tools.read_edit_lint import ReadEditLintTool
+from spine.agents.tools.read_edit_lint import (
+    ReadEditLintTool,
+    _confused_path_prefix,
+    _toplevel_dirs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -500,6 +504,24 @@ def apply_synthesized(
             continue
         try:
             if not (Path(workspace_root) / edit.file).exists():
+                confusion = _confused_path_prefix(workspace_root, edit.file)
+                if confusion is not None:
+                    # HARD BLOCK: creating a file into a phantom tree.
+                    # Monorepo path confusion writes entire features outside
+                    # the build (Wallace parity report 2026-07-24: one patch
+                    # landed at root 'src/' outside the package, another
+                    # under a doubled 'apps/apps/…' — both "verified", both
+                    # dead code). Positive-evidence-only, so genuinely new
+                    # trees stay creatable.
+                    result.failures.append(
+                        {**rec, "status": "path_confusion_blocked",
+                         "detail": (
+                             f"Refusing to create {edit.file!r}: {confusion}. "
+                             f"Existing top-level directories: "
+                             f"{_toplevel_dirs(workspace_root)}."
+                         )}
+                    )
+                    continue
                 if _is_placeholder_content(edit.code):
                     # Creating a placeholder is a placement FAILURE, not a
                     # scoring penalty — a 3-byte '...' file lints clean and
