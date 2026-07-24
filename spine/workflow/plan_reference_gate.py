@@ -260,10 +260,17 @@ def check_reference_symbols(
         sid = s.get("id", "?")
         target_files = [f for f in (s.get("target_files") or []) if f]
         for ref in s.get("reference_symbols") or []:
-            ref = _normalize_symbol(str(ref))
+            raw = str(ref)
+            ref = _normalize_symbol(raw)
             if not ref:
                 continue
             leaf = _leaf(ref)
+            # PHP '::class' constant — the reference is to the class itself
+            # ('Policy::class'), not to a member named 'class'. Resolve the
+            # owner instead.
+            if leaf == "class" and "." in ref:
+                ref = ref.rsplit(".", 1)[0]
+                leaf = _leaf(ref)
             # External-library names and Python builtins are not contracts —
             # bare aliases ('st.form'), module-qualified imports
             # ('spine.ui._pages.config_view.st', run 019f2104), and research
@@ -297,6 +304,21 @@ def check_reference_symbols(
             if (
                 ref_root
                 and ref_root not in plan_roots
+                and not _find_symbol_files(db_path, ref_root)
+            ):
+                continue
+            # PHP static-call members on a class the plan CREATES: a new
+            # Eloquent model's static surface is dominated by framework-
+            # inherited methods ('RainGauge::query' / '::findOrFail' — run
+            # 2026-07-24 chased these through five critic rounds to a
+            # non_convergence park). The root's producer slice is the real
+            # dependency; member existence on an unindexed class is
+            # unverifiable pre-implementation. Python dotted refs keep the
+            # strict member check (the UIApi.get_llm_providersX catcher).
+            if (
+                "::" in raw
+                and ref_root
+                and ref_root in plan_roots
                 and not _find_symbol_files(db_path, ref_root)
             ):
                 continue

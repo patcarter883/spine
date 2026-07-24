@@ -642,6 +642,47 @@ def test_indexed_owner_with_missing_leaf_still_flagged(index) -> None:
     assert "UIApi.get_llm_providers" in result["reason"]
 
 
+def test_php_static_member_on_plan_created_class_not_flagged(index) -> None:
+    """'RainGauge::query' where a slice CREATES RainGauge: the static surface
+    of a new Eloquent model is dominated by framework-inherited methods —
+    unverifiable pre-implementation, and the root's producer is the real
+    dependency (run 2026-07-24: five critic rounds chased these to a
+    non_convergence park)."""
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {"id": "model", "provides": ["RainGauge"]},
+        {"id": "ctrl", "reference_symbols": ["RainGauge::findOrFail"]},
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_php_class_constant_resolves_to_owner(index) -> None:
+    """'RainGaugePolicy::class' references the CLASS, not a member named
+    'class' — resolved when a slice provides the owner."""
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {"id": "policy", "provides": ["RainGaugePolicy"]},
+        {"id": "routes", "reference_symbols": ["RainGaugePolicy::class"]},
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
+def test_route_name_shapes_not_flagged(index) -> None:
+    """Laravel route names ('farms.{farm_id}.rain-gauges') carry placeholder
+    braces and kebab segments — never code symbols in any target language."""
+    index({UIAPI_FILE: UIAPI_SYMS})
+    plan = _plan(
+        {
+            "id": "routes",
+            "reference_symbols": [
+                "farms.{farm_id}.rain-gauges",
+                "farms.{farm_id}.rain-gauges.{gauge}.rainfalls",
+            ],
+        }
+    )
+    assert check_reference_symbols(plan, _spec(), None, db_path=DB) is None
+
+
 def test_plan_internal_root_stays_flaggable(index) -> None:
     # A root the PLAN defines (slice id / provides owner) is contract
     # territory even though the index has never seen it.

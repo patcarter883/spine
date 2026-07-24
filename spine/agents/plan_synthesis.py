@@ -211,6 +211,13 @@ def _is_external_reference(sym: str) -> bool:
     s = (sym or "").strip()
     if "/" in s or "\\" in s or s.endswith(".py"):
         return True
+    # Route-name / URI-pattern shapes are never code symbols: Laravel route
+    # names carry '{param}' placeholders and kebab-case segments
+    # ('farms.{farm_id}.rain-gauges' — run 2026-07-24 chased two of these
+    # through five critic rounds to a non_convergence park). No identifier
+    # in any target language contains '{', '}' or '-'.
+    if "{" in s or "}" in s or "-" in s:
+        return True
     # PHP expression forms are never cross-slice contracts: '$table->uuid'
     # is a fluent call on a local variable, not a symbol a producer creates
     # (run b15cee51: 21 builder-method "violations" burned three manager
