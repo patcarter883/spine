@@ -300,3 +300,52 @@ class TestSuppressReasoning:
 
         model = ChatOpenAI(model="gpt-4o-mini", api_key="sk-test")
         assert suppress_reasoning(model) is model
+
+
+# ── json_invalid escape salvage (run 2026-07-24: SynthesizedSlice) ────────────
+
+
+class _PhpSlice(__import__("pydantic").BaseModel):
+    file: str
+    code: str
+
+
+def _json_invalid_error() -> Exception:
+    """A real Pydantic ValidationError whose input carries PHP-style \\' escapes."""
+    import pydantic
+
+    raw = '{"file": "routes/api.php", "code": "route(\\\'farms.rain-gauges\\\');"}'
+    try:
+        _PhpSlice.model_validate_json(raw)
+    except pydantic.ValidationError as exc:
+        return exc
+    raise AssertionError("expected ValidationError")
+
+
+@pytest.mark.asyncio
+async def test_json_invalid_php_escape_salvaged_with_schema():
+    """A \\'-poisoned reply is repaired and revalidated instead of burning
+    the candidate — no second model call."""
+    model = _FakeStructuredModel([_json_invalid_error()])
+
+    result = await ainvoke_structured_with_retry(
+        model, [("human", "synthesize")], label="t", schema=_PhpSlice
+    )
+
+    assert isinstance(result, _PhpSlice)
+    assert result.file == "routes/api.php"
+    assert "\\'" in result.code  # PHP escape preserved as literal backslash-quote
+    assert len(model.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_json_invalid_without_schema_still_raises():
+    """No schema → no salvage; the error propagates as before."""
+    import pydantic
+
+    model = _FakeStructuredModel([_json_invalid_error()])
+
+    with pytest.raises(pydantic.ValidationError):
+        await ainvoke_structured_with_retry(
+            model, [("human", "synthesize")], label="t"
+        )

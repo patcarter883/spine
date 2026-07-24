@@ -281,7 +281,10 @@ async def _ainvoke_structured_escalating(
     while True:
         try:
             return await ainvoke_structured_with_retry(
-                _bind_capped(base_model, schema, cap), messages, label=label
+                _bind_capped(base_model, schema, cap),
+                messages,
+                label=label,
+                schema=schema,
             )
         except _LengthFinishReasonError:
             nxt = cap * 2

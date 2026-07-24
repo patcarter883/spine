@@ -892,6 +892,41 @@ def _placeholder_string_fields(result: Any) -> list[str]:
     return junk
 
 
+def _salvage_json_invalid(exc: Exception, schema: type | None) -> Any | None:
+    """Repair-and-reparse a structured reply that failed with ``json_invalid``.
+
+    PHP-fluent models escape single quotes inside JSON strings the way PHP
+    does (``route(\\'farms...\\')``) — ``\\'`` is not a valid JSON escape, the
+    parser dies mid-string ("EOF while parsing a string") and the whole
+    candidate burns (run 2026-07-24: two SynthesizedSlice candidates lost to
+    exactly this). The raw text rides the Pydantic error's ``input``; apply
+    the same escape repair as the prompt rung and revalidate. Returns the
+    validated instance or ``None`` (never raises).
+    """
+    if schema is None or not hasattr(schema, "model_validate_json"):
+        return None
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return None
+    try:
+        for err in exc.errors():  # type: ignore[union-attr]
+            if err.get("type") != "json_invalid":
+                continue
+            raw = err.get("input")
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            candidate = re.sub(r'\\(?![\\/"bfnrtu])', r"\\\\", raw)
+            if candidate == raw:
+                return None
+            try:
+                return schema.model_validate_json(candidate)
+            except Exception:  # noqa: BLE001 — salvage is best-effort
+                return None
+    except Exception:  # noqa: BLE001 — never mask the original error path
+        return None
+    return None
+
+
 async def ainvoke_structured_with_retry(
     structured_model: Any,
     messages: list[Any],
@@ -900,6 +935,7 @@ async def ainvoke_structured_with_retry(
     api_retries: int = 2,
     api_backoff: float = 0.5,
     label: str = "structured-output",
+    schema: type | None = None,
 ) -> Any:
     """Invoke a structured-output model, retrying transient empty parses.
 
@@ -931,6 +967,10 @@ async def ainvoke_structured_with_retry(
         api_backoff: Base seconds for exponential backoff between transport
             retries (delay = ``api_backoff * 2**(n-1)``).
         label: Identifier used in the retry log line.
+        schema: Optional Pydantic model class of the expected output. When
+            provided, a ``json_invalid`` parse failure is retried once
+            in-place after repairing invalid string escapes (``\\'`` from
+            PHP-fluent models) — see :func:`_salvage_json_invalid`.
 
     Returns:
         Whatever ``structured_model.ainvoke`` returns on the first success.
@@ -984,6 +1024,15 @@ async def ainvoke_structured_with_retry(
                 )
             return result
         except ValueError as exc:
+            salvaged = _salvage_json_invalid(exc, schema)
+            if salvaged is not None:
+                logger.warning(
+                    "%s: repaired invalid JSON string escapes in structured "
+                    "reply (\\' -> \\\\')",
+                    label,
+                )
+                _retry.reset_conn_breaker()
+                return salvaged
             if attempt >= retries or not is_empty_structured_parse(exc):
                 raise
             attempt += 1
