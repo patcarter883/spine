@@ -128,7 +128,17 @@ def test_active_finalize_merges_on_completed(fake_orch):
     assert fake_orch[0].calls == ["prepare", "validate", "merge"]
 
 
-@pytest.mark.parametrize("status", ["stalled", "failed", "error", ""])
+def test_active_finalize_preserves_on_stalled(fake_orch):
+    """A stall is an infrastructure event, not a verdict on the code — the
+    ratcheted best state stays reviewable (run d8bc459c 2026-07-24: a
+    stalled exit rolled back a patch verify had scored 4/8 VERIFIED)."""
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    sandbox.finalize("stalled")
+    assert fake_orch[0].calls == ["prepare", "preserve"]
+
+
+@pytest.mark.parametrize("status", ["failed", "error", ""])
 def test_active_finalize_rolls_back_on_non_success(fake_orch, status):
     sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "critical_task")
     sandbox.enter()

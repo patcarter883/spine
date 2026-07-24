@@ -38,7 +38,13 @@ _MERGE_STATUSES: frozenset[str] = frozenset({"completed"})
 # a needs_review exit rolled back a 13-file best state with 4/7 slices
 # VERIFIED — the only reviewable copy of the work). Prior parked sandboxes
 # only ever survived because killed runs never reached finalize.
-_PRESERVE_STATUSES: frozenset[str] = frozenset({"needs_review"})
+# "stalled" preserves too: a stall is an infrastructure event (endpoint hung
+# mid-call), not a verdict on the code — the same day's stalled exit rolled
+# back a patch verify had just scored 4/8 slices VERIFIED. The verify
+# ratchet keeps the on-disk state at the best scoring cycle, so what is
+# preserved is the run's best work, not mid-edit debris. Empty sandboxes
+# still roll back via the preserved=False branch.
+_PRESERVE_STATUSES: frozenset[str] = frozenset({"needs_review", "stalled"})
 
 
 def work_type_writes_code(work_type: str) -> bool:
