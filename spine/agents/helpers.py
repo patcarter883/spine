@@ -1916,9 +1916,18 @@ def _build_local_model(
         """ChatOpenAI speaking the most compatible dialect to local servers."""
 
         def _get_request_payload(self, input_: Any, *, stop: Any = None, **kw: Any) -> dict:
-            return _flatten_text_block_content(
+            payload = _flatten_text_block_content(
                 super()._get_request_payload(input_, stop=stop, **kw)
             )
+            # vLLM rejects `tools: []` outright ("must not be an empty
+            # array... or omit the field entirely") — the no-tool judge
+            # lanes bind an empty list and every such request 400'd (run
+            # d8bc459c 2026-07-25: all slice-verifier calls). A dangling
+            # tool_choice without tools is equally malformed.
+            if not payload.get("tools") and "tools" in payload:
+                payload.pop("tools")
+                payload.pop("tool_choice", None)
+            return payload
 
     return _LocalChatOpenAI(**kwargs)
 

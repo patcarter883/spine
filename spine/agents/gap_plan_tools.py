@@ -32,6 +32,28 @@ class _ReadVerificationFindingsInput(BaseModel):
     """No inputs needed — paths are fully determined by work_id at build time."""
 
 
+SECTION_CHAR_BUDGETS = {
+    "verification": 40_000,
+    "plan": 24_000,
+    "codebase_map": 12_000,
+    "tasks": 8_000,
+    "implementation": 12_000,
+}
+
+
+def _cap_section(text: str, budget: int) -> str:
+    """Head+tail cap: keep the summary/structure and the newest sections."""
+    if len(text) <= budget:
+        return text
+    head = int(budget * 0.7)
+    tail = budget - head
+    return (
+        text[:head]
+        + f"\n… [{len(text) - budget} chars elided to fit the context window] …\n"
+        + text[-tail:]
+    )
+
+
 class ReadVerificationFindingsTool(BaseTool):
     """Read all verification inputs for the GAP_PLAN phase.
 
@@ -56,6 +78,15 @@ class ReadVerificationFindingsTool(BaseTool):
     impl_dir: str = ""
     workspace_root: str = ""
 
+    # Per-section char budgets. The artifact reports grow with every slice
+    # and rework cycle, and this tool inlines five of them whole — run
+    # d8bc459c (2026-07-25, vLLM): the gap_plan conversation reached 59,489
+    # prompt tokens against a 60K window; even a 512-token completion no
+    # longer fit and every gap_plan attempt 400'd. Head+tail capping keeps
+    # the summary/structure (head) and the most recent sections (tail)
+    # while bounding the total. Worst case ≈ 96K chars ≈ 24K tokens of
+    # artifacts + 72K chars of target sources — inside the window with
+    # headroom for schemas and completion.
     def _run(self, **kwargs: Any) -> str:  # noqa: ARG002
         workspace = Path(self.workspace_root)
         result: dict[str, Any] = {
@@ -131,6 +162,10 @@ class ReadVerificationFindingsTool(BaseTool):
         # cause — the model missing a $table override for the migration's
         # table name — was plainly visible in two sibling files it never saw.
         result["target_file_sources"] = self._target_file_sources(workspace)
+
+        for key, budget in SECTION_CHAR_BUDGETS.items():
+            if isinstance(result.get(key), str):
+                result[key] = _cap_section(result[key], budget)
 
         return json.dumps(result, ensure_ascii=False)
 

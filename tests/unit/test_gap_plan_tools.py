@@ -715,3 +715,46 @@ class TestTargetFileSources:
         sources = out["target_file_sources"]
         assert len([k for k in sources if k.endswith(".php")]) == 12
         assert "omitted" in sources["(note)"]
+
+
+class TestSectionBudgets:
+    """Artifact sections are capped so the gap_plan conversation can never
+    outgrow the context window (run d8bc459c 2026-07-25: 59,489-token
+    prompt vs a 60K window — every gap_plan attempt 400'd)."""
+
+    def _tool(self, tmp_path: Path) -> ReadVerificationFindingsTool:
+        return ReadVerificationFindingsTool(
+            workspace_root=str(tmp_path),
+            verify_dir="v", plan_dir="p", tasks_dir="t", impl_dir="i",
+        )
+
+    def test_oversized_sections_are_capped_head_and_tail(self, tmp_path):
+        (tmp_path / "v").mkdir()
+        big = "HEAD-MARK " + ("x" * 100_000) + " TAIL-MARK"
+        (tmp_path / "v" / "verification.md").write_text(big)
+        out = json.loads(self._tool(tmp_path)._run())
+        text = out["verification"]
+        from spine.agents.gap_plan_tools import SECTION_CHAR_BUDGETS
+        budget = SECTION_CHAR_BUDGETS["verification"]
+        assert len(text) < budget + 200  # budget + elision marker
+        assert text.startswith("HEAD-MARK")
+        assert text.endswith("TAIL-MARK")
+        assert "chars elided" in text
+
+    def test_small_sections_untouched(self, tmp_path):
+        (tmp_path / "v").mkdir()
+        (tmp_path / "v" / "verification.md").write_text("short report")
+        out = json.loads(self._tool(tmp_path)._run())
+        assert out["verification"] == "short report"
+
+    def test_total_output_is_bounded(self, tmp_path):
+        for d, fname in [
+            ("v", "verification.md"), ("p", "plan.md"),
+            ("t", "codebase-map.md"), ("t", "tasks.md"),
+            ("i", "implementation.md"),
+        ]:
+            (tmp_path / d).mkdir(exist_ok=True)
+            (tmp_path / d / fname).write_text("y" * 200_000)
+        out = self._tool(tmp_path)._run()
+        # 5 capped sections + json overhead — must stay well under raw 1M chars.
+        assert len(out) < 110_000
