@@ -229,6 +229,12 @@ class SpineConfig:
     default_timeout: int = 0
     mcp_servers: dict = field(default_factory=dict)
     guided_decoding: bool = False
+    # Extra directory names `search_codebase` must not walk during research,
+    # ADDED to the built-in defaults (which already exclude build/vendor noise
+    # and `.planning`). Use for repo-specific prose trees whose contents state
+    # intent rather than implementation — research that cites them reports
+    # plans as though they were code.
+    research_exclude_dirs: list = field(default_factory=list)
 
     # Structural-intelligence backend behind CodebaseQueryTool:
     # "codebase-index" (default) or "codebase-memory"

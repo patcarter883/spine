@@ -904,6 +904,43 @@ _DEP_FILES_MAX = 3
 _DEP_FILE_MAX_CHARS = 4000
 
 
+def _task_named_body(
+    state: ImplementSubgraphState, active_slice: dict, workspace_root: str
+) -> str:
+    """Verbatim source of files the TASK named by path.
+
+    The no-tool editor writes whatever it cannot see. When a task says
+    "follow the conventions of X.php", X is the single highest-value piece of
+    grounding available and it costs one filesystem read — yet probe 25's
+    editor never received it, because the exemplar reached the run only if
+    semantic recall happened to rank it (it did not) and even then arrived as
+    a 240-char summary.
+
+    Re-read here rather than threaded down from PLAN: it is a pure
+    deterministic read of the live tree, so it cannot go stale between
+    phases, and it still grounds the editor when PLAN's pre-read missed.
+    Files already inlined by _target_files_body are skipped.
+    """
+    description = str(state.get("description") or "")
+    if not description:
+        return ""
+    targets = {str(t) for t in (active_slice.get("target_files") or []) if t}
+    try:
+        from spine.workflow.task_paths import (
+            read_task_named_sources,
+            render_task_named_sources,
+        )
+
+        entries = [
+            e
+            for e in read_task_named_sources(description, workspace_root)
+            if str(e.get("path")) not in targets
+        ]
+        return render_task_named_sources(entries)
+    except Exception:  # noqa: BLE001 — grounding is additive, never fatal
+        return ""
+
+
 def _dependency_files_body(
     state: ImplementSubgraphState, active_slice: dict, workspace_root: str
 ) -> str:
@@ -1329,6 +1366,9 @@ async def _slice_implementer_node(
         dep_body = _dependency_files_body(state, active_slice, workspace_root)
         if dep_body:
             refs_body = (refs_body + "\n\n" + dep_body) if refs_body else dep_body
+        task_body = _task_named_body(state, active_slice, workspace_root)
+        if task_body:
+            refs_body = (refs_body + "\n\n" + task_body) if refs_body else task_body
         plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
 
         # Directive: approach + notes only — target_files / acceptance / tool
@@ -1684,6 +1724,9 @@ async def _synthesis_implementer_node(
         dep_body = _dependency_files_body(state, active_slice, workspace_root)
         if dep_body:
             refs_body = (refs_body + "\n\n" + dep_body) if refs_body else dep_body
+        task_body = _task_named_body(state, active_slice, workspace_root)
+        if task_body:
+            refs_body = (refs_body + "\n\n" + task_body) if refs_body else task_body
         plan_body = _edit_plan_body(active_slice, db_path, workspace_root)
         target_files = [f for f in (active_slice.get("target_files") or []) if f]
         # Inline the CURRENT (live) content of every target file so a serialized

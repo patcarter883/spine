@@ -478,7 +478,18 @@ _VERIFY_JUDGE_PROMPT = (
         "frequently wrong (e.g. 'Laravel string columns are nullable by "
         "default' — they are NOT NULL). When the code "
         "uses the framework's idiomatic form and no executed check "
-        "demonstrates a violation, the criterion passes on that point.",
+        "demonstrates a violation, the criterion passes ON THAT POINT — "
+        "meaning that framework-default claim alone must not sink it.\n\n"
+        "That is the ONLY thing a green check run licenses. It is not "
+        "evidence about WHAT the code says. Tests passing proves no "
+        "assertion failed; it cannot show that an assertion the criterion "
+        "demands was ever written — a weak test is exactly as green as a "
+        # Incident provenance: probe 25 (id kept out of the model string).
+        "strong one. When a criterion states what the code must DO or "
+        "ASSERT (compares X to Y, persists then re-reads, calls a specific "
+        "API), judge it from <target_source>/<worktree_diff> alone: quote "
+        "the line that satisfies it, or mark it failed. 'The automated "
+        "checks passed' is never the reason such a criterion passes.",
     )
     + "\n\n"
     + xml_block(

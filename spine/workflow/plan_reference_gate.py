@@ -343,8 +343,29 @@ def check_reference_symbols(
         # fallback) so a new method that merely shares a short name with some
         # unrelated existing symbol is not misflagged.
         for p in s.get("provides") or []:
-            sym = _normalize_symbol(str(p))
+            raw_p = str(p)
+            sym = _normalize_symbol(raw_p)
             if not sym:
+                continue
+            # Owner context is required before "already exists" means
+            # anything. Judged on the RAW entry, because the qualifier may be
+            # a class ('UIApi.get_providers', 'FileController::store') OR a
+            # path ('spine/ui_api/api.py:get_providers', run 019f20e0) and
+            # _normalize_symbol strips the path form down to a bare leaf.
+            #
+            # Without this, a generic verb indicts the planner for a
+            # collision it did not cause: every codebase contains a `create`
+            # / `up` / `handle`, so leaf-matching always "finds" one. Probe
+            # 25 (agripath UnitOfMeasure) declared `create` on the migration
+            # slice, the leaf matched, the plan was rejected, and the re-plan
+            # cost 9m22s of a 25m34s run — 37% of the run spent restating a
+            # plan whose only defect was a bookkeeping verb. The second plan
+            # passed by setting `provides` to [].
+            #
+            # Mirrors the identical skip the dangling branch above applies,
+            # so the two halves of this gate now agree on what counts as a
+            # checkable contract.
+            if not any(tok in raw_p for tok in (".", "::", "/", "\\")):
                 continue
             files = _find_symbol_files(db_path, sym)
             if files:

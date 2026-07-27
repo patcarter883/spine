@@ -708,6 +708,8 @@ def _reconcile_verdict(
     checks_failures: list[str],
     work_id: str,
     slice_id: str,
+    target_files: list[str] | None = None,
+    workspace_root: str = ".",
 ) -> None:
     """Derive the slice verdict from ground truth instead of trusting it.
 
@@ -720,8 +722,12 @@ def _reconcile_verdict(
       do nothing with, so the run parked contentlessly.
 
     Rules, in order: any HARD check failure ⇒ NOT_VERIFIED (failures
-    appended as checklist entries + gaps); else a non-empty all-passed
-    checklist with no gaps ⇒ VERIFIED. Mutates in place.
+    appended as checklist entries + gaps); else equality criteria whose
+    tests assert no compared value are demoted (see
+    :mod:`spine.workflow.assertion_gate` — probe 25 passed "asserts the name
+    matches the expected value" against a `not->toBeEmpty()` on the strength
+    of a green check run); else a non-empty all-passed checklist with no
+    gaps ⇒ VERIFIED. Mutates in place.
     """
     verdict = verification_result.get("verdict")
     if checks_failures:
@@ -744,6 +750,27 @@ def _reconcile_verdict(
                 })
                 gaps.append(entry)
         return
+
+    # A green check run evidences that assertions did not fail, never WHAT
+    # was asserted. Demote equality criteria the test source cannot support
+    # before the all-passed shortcut below can promote the slice on them.
+    try:
+        from spine.workflow.assertion_gate import (
+            demote_unsupported_equality_criteria,
+        )
+
+        demote_unsupported_equality_criteria(
+            verification_result,
+            list(target_files or []),
+            workspace_root,
+            work_id=work_id,
+            slice_id=slice_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — a gate that can crash verify is worse
+        logger.warning(
+            "[%s] Slice-verifier %r: assertion gate skipped — %s",
+            work_id, slice_id, exc,
+        )
 
     checklist = verification_result.get("checklist") or []
     all_passed = bool(checklist) and all(
@@ -960,7 +987,12 @@ async def _run_slice_verifier_node(
         verification_result = _extract_verification_result(result, slice_id)
         if isinstance(verification_result, dict):
             _reconcile_verdict(
-                verification_result, checks_failures, work_id, slice_id
+                verification_result,
+                checks_failures,
+                work_id,
+                slice_id,
+                target_files=slice_data.get("target_files") or [],
+                workspace_root=state.get("workspace_root", "."),
             )
 
     except MaxTokenBudgetExceeded as budget_exc:

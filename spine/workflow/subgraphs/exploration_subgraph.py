@@ -279,6 +279,25 @@ async def _pre_research_gate(
         logger.info("[%s] pre_research_gate: no description — fall through", work_id)
         return {"classification_confidence": 0.0}
 
+    # Paths the task names are resolved off the filesystem BEFORE any model
+    # runs — they are instructions, not retrieval candidates. Probe 25 named
+    # Farm.php and 9 research topics never surfaced it; the exemplar's
+    # `use FarmScoped;` reached no phase and the landed model omitted it.
+    task_sources: list[dict] = []
+    try:
+        from spine.workflow.task_paths import read_task_named_sources
+
+        task_sources = read_task_named_sources(
+            description, state.get("workspace_root", ".")
+        )
+        if task_sources:
+            logger.info(
+                "[%s] pre_research_gate: pre-read %d task-named file(s): %s",
+                work_id, len(task_sources), [s["path"] for s in task_sources],
+            )
+    except Exception as exc:  # noqa: BLE001 — grounding is additive, never fatal
+        logger.warning("[%s] pre_research_gate: task pre-read failed — %s", work_id, exc)
+
     try:
         classification = await classify_task(description, config)
         task_category = classification.category
@@ -338,6 +357,7 @@ async def _pre_research_gate(
         "task_category": task_category,
         "classification_confidence": confidence,
         "retrieved_context": retrieved,
+        "task_named_sources": task_sources,
         "max_rounds": max_rounds,
     }
 

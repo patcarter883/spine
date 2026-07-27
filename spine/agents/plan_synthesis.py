@@ -147,7 +147,13 @@ class SliceDetail(BaseModel):
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 def _research_text(state: dict[str, Any]) -> str:
-    """Compact the retrieved research context into a bounded grounding blob."""
+    """Compact the retrieved research context into a bounded grounding blob.
+
+    Files the task named by path are appended AFTER the budget is applied:
+    they are pre-read ground truth, not retrieval, and must not be crowded
+    out by however many chunks recall happened to return (same exemption the
+    A2 findings ledger carries).
+    """
     chunks: list[str] = []
     for item in state.get("retrieved_context") or []:
         if not isinstance(item, dict):
@@ -157,8 +163,16 @@ def _research_text(state: dict[str, Any]) -> str:
         summ = item.get("enriched_summary") or item.get("summary") or ""
         if sym or summ:
             chunks.append(f"- {sym} ({path}): {str(summ)[:240]}")
-    text = "\n".join(chunks)
-    return text[:_RESEARCH_CHARS]
+    text = "\n".join(chunks)[:_RESEARCH_CHARS]
+
+    pinned = state.get("task_named_sources") or []
+    if pinned:
+        from spine.workflow.task_paths import render_task_named_sources
+
+        block = render_task_named_sources(pinned)
+        if block:
+            text = f"{text}\n\n{block}" if text else block
+    return text
 
 
 def _phase(sub: str) -> str:

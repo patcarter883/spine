@@ -347,6 +347,11 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # loop and synthesize directly from recalled chunks.
     retrieved_context: list[dict]  # Chunks pulled by the pre_research_gate;
     # injected into the SPECIFY synthesizer prompt when present.
+    # Verbatim source of files the task named BY PATH, pre-read off disk by
+    # the gate. Separate from retrieved_context because that channel is
+    # compacted to 240-char summaries (_research_text) — an exemplar the task
+    # pointed at has to reach the synthesizer as code. See workflow.task_paths.
+    task_named_sources: list[dict]
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer
