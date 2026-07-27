@@ -123,24 +123,38 @@ class SliceDetail(BaseModel):
     # prompt-prose versions of these rules were ignored twice by the local
     # planner (runs a56e89a6 / 2257cd64: 'binds the model via a model()
     # method' re-emitted after the rule was added to the prompt).
+    # Two rules used to sit here flatly conjoined: "NEVER a required
+    # mechanism" and, four lines later, a MANDATED example that names one
+    # ("…EQUAL the factory-generated values after a database round-trip").
+    # A small model had to resolve that on every generation, and this exact
+    # collision has cost runs in both directions — probe 8 parked when the
+    # prescriptiveness audit blocked a correctly-grounded criterion for three
+    # rounds, probe 25 landed a `not->toBeEmpty()` against a demanded
+    # equality. They are not actually in tension once the TASK is named as
+    # the arbiter, so the rule below states that precedence explicitly
+    # instead of leaving the model to infer it.
     acceptance_criteria: list[str] = Field(
         min_length=1,
         description=(
             "Measurable checks that prove this slice is complete. Each "
             "criterion states an OBSERVABLE OUTCOME of running or reading "
             "THIS slice's files ('creating a UnitOfMeasure via the factory "
-            "persists name and abbreviation'), NEVER a required mechanism, "
-            "method name, property, or idiom — if the framework's standard "
-            "convention delivers the behavior, the criterion must pass. No "
-            "edge-case semantics the task didn't ask for. Every criterion "
-            "must be checkable from this slice's own files/diff/test run. "
-            "NEVER WEAKEN a behavior the task/spec states: when it demands a "
-            "test assert a specific behavior, the criterion must encode that "
-            "EXACT observable ('asserts the persisted model's name and "
-            "abbreviation EQUAL the factory-generated values after a "
-            "database round-trip'), not a weaker stand-in — type checks, "
-            "non-empty checks, or unpersisted construction do NOT satisfy a "
-            "demanded persistence/equality behavior."
+            "persists name and abbreviation'), and must be checkable from "
+            "this slice's own files/diff/test run.\n"
+            "When outcome-phrasing and mechanism seem to conflict, THE TASK "
+            "DECIDES:\n"
+            "- Behaviour the task or spec DEMANDS is encoded EXACTLY, "
+            "including any mechanism it names: 'asserts the persisted "
+            "model's name and abbreviation EQUAL the factory-generated "
+            "values after a database round-trip'. Never substitute a weaker "
+            "stand-in — type checks, non-empty checks, or unpersisted "
+            "construction do NOT satisfy a demanded persistence/equality "
+            "behaviour.\n"
+            "- Mechanism the task did NOT ask for is never a criterion: no "
+            "method name, property, or idiom of your own invention, and no "
+            "edge-case semantics the task never raised. Where the "
+            "framework's standard convention already delivers the demanded "
+            "behaviour, the criterion passes on that convention."
         ),
     )
 

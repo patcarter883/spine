@@ -888,6 +888,22 @@ def _add_spine_middleware(
 
         middleware.append(TurnBudgetGuard(threshold=_spine_cfg.implement_max_turns))
 
+    # ReadBudgetGuard — the survey-trap governor. The slice-implementer prompt
+    # has long asked the model to police its own read budget ("maximum 2 turns
+    # of read/lookup before your first write"); counting turns across a
+    # conversation is exactly what a small model cannot do, and the spirals
+    # kept recurring. This counts read-only calls since the last write and
+    # nudges at soft/hard thresholds — the shape smallcode's early_stop uses,
+    # which was observed working on this same model. Off by default: it is a
+    # behavioural change to the editor loop and wants a live run before it is
+    # trusted, so enable with `implement_read_budget: [soft, hard]`.
+    if phase == PhaseName.IMPLEMENT and _spine_cfg.implement_read_budget:
+        from spine.agents.context_editing import ReadBudgetGuard
+
+        _soft, _hard = (list(_spine_cfg.implement_read_budget) + [0, 0])[:2]
+        if _soft and _hard:
+            middleware.append(ReadBudgetGuard(soft=int(_soft), hard=int(_hard)))
+
     # The verify-side analogue: the tool-using slice-verifier ReAct fallback (when
     # the evidence-then-judge path is off) reads files + runs checks in a loop with
     # no turn bound — a healthy-sandbox probe loop could grind to the token budget

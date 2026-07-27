@@ -426,6 +426,14 @@ class SpineConfig:
     # The guard only nudges — tools stay bound — so legitimate long slices can
     # still finish; 0 disables it.
     implement_max_turns: int = 30
+    # [soft, hard] read-only tool calls tolerated before the ReadBudgetGuard
+    # nudges the editor toward writing. Counts reads since the LAST WRITE and
+    # resets on any write, so a read→edit→read→edit rhythm never trips it —
+    # unlike implement_max_turns, which only fires once the budget is spent.
+    # Replaces the self-policing prose in the slice-implementer prompt
+    # ("maximum 2 turns of read/lookup before your first write") with a
+    # counter the harness keeps. Empty disables. Suggested: [5, 8].
+    implement_read_budget: list = field(default_factory=list)
     # Soft turn budget for the (tool-using) slice-verifier ReAct fallback — the
     # verify-side analogue of ``implement_max_turns``. When the evidence-then-judge
     # path is off, the verifier reads files + runs checks in a loop; nothing
