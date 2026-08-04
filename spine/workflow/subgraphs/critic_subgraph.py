@@ -39,16 +39,125 @@ logger = logging.getLogger(__name__)
 # the rubric.
 
 
+# A literal fix's `find` below this length is too generic to auto-apply
+# (a short fragment could match unintended text across the plan).
+_LITERAL_FIX_MIN_FIND = 12
+
+
+def apply_literal_fixes(plan_json_text: str, fixes: list[dict]) -> tuple[str, list[dict]]:
+    """Apply critic-supplied verbatim replacements to a plan.json string.
+
+    Fixes are applied on the PARSED document's string leaves (never on the
+    raw JSON text, so escaping can't corrupt the document) and only when
+    the `find` text is actually present — a fix the author already applied
+    is a silent no-op. Returns the (possibly re-serialized) text and a
+    record of what was applied.
+    """
+    if not fixes:
+        return plan_json_text, []
+    try:
+        doc = json.loads(plan_json_text)
+    except (json.JSONDecodeError, TypeError):
+        return plan_json_text, []
+
+    applied: list[dict] = []
+
+    def _patch_strings(obj: Any, find: str, replace: str) -> tuple[Any, int]:
+        if isinstance(obj, str):
+            n = obj.count(find)
+            return (obj.replace(find, replace) if n else obj), n
+        if isinstance(obj, list):
+            total = 0
+            out = []
+            for item in obj:
+                new, n = _patch_strings(item, find, replace)
+                out.append(new)
+                total += n
+            return out, total
+        if isinstance(obj, dict):
+            total = 0
+            out = {}
+            for k, v in obj.items():
+                new, n = _patch_strings(v, find, replace)
+                out[k] = new
+                total += n
+            return out, total
+        return obj, 0
+
+    for f in fixes:
+        find = str(f.get("find") or "")
+        replace = str(f.get("replace") or "")
+        if len(find) < _LITERAL_FIX_MIN_FIND or not replace or find == replace:
+            continue
+        doc, n = _patch_strings(doc, find, replace)
+        if n:
+            applied.append(
+                {"find": find[:120], "occurrences": n,
+                 "slice_id": f.get("slice_id")}
+            )
+    if not applied:
+        return plan_json_text, []
+    return json.dumps(doc, indent=2, ensure_ascii=False), applied
+
+
 async def _structural_check_node(
     state: CriticSubgraphState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """Run the structural critic check within the subgraph."""
+    """Run the structural critic check within the subgraph.
+
+    Also the round's mechanical-fix pass: literal_fixes the PREVIOUS review
+    specified are applied here when the flagged text survived the rework —
+    the fix hierarchy says an exact known correction is compute+override,
+    not another prompt round (run 019f8405: an identical two-line fix went
+    unapplied twice and parked the run on stagnation).
+    """
     reviewed_phase = state.get("reviewed_phase", "unknown")
+    work_id = state.get("work_id", "unknown")
+    updates: dict[str, Any] = {}
+
+    prior = state.get("last_critic_review") or {}
+    fixes = prior.get("literal_fixes") or []
+    plan_json_text = state.get("plan_json") or ""
+    if fixes and plan_json_text and PhaseName(reviewed_phase) == PhaseName.PLAN:
+        patched, applied = apply_literal_fixes(plan_json_text, fixes)
+        if applied:
+            logger.warning(
+                "[%s] critic: applied %d literal fix(es) MECHANICALLY — the "
+                "rework left the flagged text in place: %s",
+                work_id, len(applied),
+                [a["find"][:60] for a in applied],
+            )
+            updates["plan_json"] = patched
+            updates["literal_fixes_applied"] = applied
+            # Keep the artifacts channel (what this round's checks and the
+            # downstream phases read) consistent with the patched document.
+            artifacts = dict(state.get("artifacts") or {})
+            plan_art = dict(artifacts.get("plan") or {})
+            if "plan.json" in plan_art:
+                plan_art["plan.json"] = patched
+                artifacts["plan"] = plan_art
+                updates["artifacts"] = artifacts
+            # Persist to the same on-disk artifact _plan_validation_node
+            # validates, so implement dispatch sees the patched plan.
+            plan_path = (
+                Path(state.get("workspace_root", "."))
+                / ".spine" / "artifacts" / work_id / "plan" / "plan.json"
+            )
+            try:
+                if plan_path.exists():
+                    plan_path.write_text(patched, encoding="utf-8")
+            except OSError as exc:
+                logger.warning(
+                    "[%s] critic: could not persist literal fixes to %s: %s",
+                    work_id, plan_path, exc,
+                )
+
     # structural_critic_check expects a dict-like state with "artifacts" key
-    pseudo_state = {"artifacts": state.get("artifacts", {})}
+    pseudo_state = {"artifacts": updates.get("artifacts") or state.get("artifacts", {})}
     result = structural_critic_check(pseudo_state, reviewed_phase)
     return {
+        **updates,
         "structural_result": result,
         "phase_status": "success"
         if result["status"] == ReviewStatus.PASSED.value

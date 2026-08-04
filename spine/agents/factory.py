@@ -340,6 +340,7 @@ def build_phase_agent(
     skip_filesystem_middleware: bool = False,
     completion_token_cap: int | None = None,
     escalation_level: int = 0,
+    native_json_schema: Any | None = None,
 ) -> Any:
     """Build a LangChain agent for a SPINE phase with full context engineering.
 
@@ -418,6 +419,55 @@ def build_phase_agent(
                 "Phase %s: completion tokens clamped to %d for synthesis",
                 phase.value, completion_token_cap,
             )
+    # ── OpenRouter capability gate ────────────────────────────────────
+    # An OpenRouter endpoint without native structured_outputs support can
+    # serve NEITHER agent-level response_format (ToolStrategy forces a
+    # non-"auto" tool_choice; ProviderStrategy/native json_schema send
+    # response_format — both 404 under require_parameters; 2026-07-22:
+    # poolside/laguna-s-2.1 exposes only tools + tool_choice:auto). Drop
+    # the bindings with a warning — downstream extractors all carry
+    # content-JSON salvage, and bind_structured_output's "prompt" rung
+    # covers the no-tool structured calls.
+    if response_format is not None or native_json_schema is not None:
+        from spine.agents.helpers import openrouter_native_structured_method
+
+        _or_method = openrouter_native_structured_method(model)
+        if _or_method is not None and _or_method != "json_schema":
+            logger.warning(
+                "Phase %s: OpenRouter endpoint lacks native structured "
+                "output (probed method=%s) — dropping response_format/"
+                "native_json_schema; relying on prompt + JSON salvage",
+                phase.value, _or_method,
+            )
+            response_format = None
+            native_json_schema = None
+
+    # ── Native json_schema binding (thinking-model structured output) ──
+    # For models that reject forced tool choice, the schema must ride as a
+    # provider-native response_format on THIS resolved instance — binding a
+    # model object elsewhere (e.g. in build_subagent_spec) is discarded here
+    # because we resolve our own (run 019f81c1: the verify judge ran unbound
+    # and every verdict was CoT-polluted free text).
+    if native_json_schema is not None:
+        from spine.agents.subagents import _bind_response_format
+
+        if isinstance(model, str) or not _bind_response_format(
+            model, native_json_schema, name=f"{phase.value}_response"
+        ):
+            logger.warning(
+                "Phase %s: native json_schema binding failed (model=%s) — "
+                "structured output will rely on downstream JSON salvage",
+                phase.value,
+                model if isinstance(model, str) else type(model).__name__,
+            )
+        else:
+            logger.info(
+                "Phase %s: native json_schema %r bound on %s",
+                phase.value,
+                getattr(native_json_schema, "__name__", "schema"),
+                type(model).__name__,
+            )
+
     workspace_root = state.get("workspace_root", ".")
     backend = build_backend(workspace_root)
     work_id = state.get("work_id", "")
@@ -567,6 +617,7 @@ def build_phase_agent(
         skip_filesystem_middleware=skip_filesystem_middleware,
         static_cacheable_prefix=static_cacheable_prefix,
         escalation_level=escalation_level,
+        response_format=response_format,
     )
 
     # ── Context schema ───────────────────────────────────────────────
@@ -614,6 +665,7 @@ def _build_middleware_stack(
     skip_filesystem_middleware: bool = False,
     static_cacheable_prefix: str | None = None,
     escalation_level: int = 0,
+    response_format: Any | None = None,
 ) -> list[Any]:
     """Assemble the full middleware stack for a SPINE phase agent.
 
@@ -669,7 +721,12 @@ def _build_middleware_stack(
     #    to subagents too so that tool runtime errors become a compact
     #    ToolMessage(status="error") instead of a raw traceback that ends up
     #    serialized into ResearchFindings.summary.
-    _add_spine_middleware(middleware, phase, escalation_level=escalation_level)
+    _add_spine_middleware(
+        middleware,
+        phase,
+        escalation_level=escalation_level,
+        response_format=response_format,
+    )
 
     # 5. User-provided extra middleware
     if extra_middleware:
@@ -747,7 +804,10 @@ def _filter_filesystem_tools(
 
 
 def _add_spine_middleware(
-    middleware: list[Any], phase: PhaseName, escalation_level: int = 0
+    middleware: list[Any],
+    phase: PhaseName,
+    escalation_level: int = 0,
+    response_format: Any | None = None,
 ) -> None:
     """Add SPINE-specific middleware for tool validation and context editing.
 
@@ -770,7 +830,13 @@ def _add_spine_middleware(
     if _spine_cfg.tool_call_normalize:
         from spine.agents.tool_call_normalizer import ToolCallNormalizer
 
-        middleware.append(ToolCallNormalizer())
+        # response_format lets the normalizer FINISH a recovered structured-
+        # output call (parse args → structured_response + terminating
+        # ToolMessage). Without it a promoted call is invisible to
+        # create_agent's structured parse (which already ran, inside the
+        # base model handler) and a no-tool structured agent loops forever
+        # (trace 019f7d50: 31-iteration critic spin).
+        middleware.append(ToolCallNormalizer(response_format=response_format))
 
     # Tool schema validation — rebound loop for self-correction
     _validation_enabled = _os.getenv("SPINE_TOOL_SCHEMA_VALIDATION", "true").lower() not in (
@@ -821,6 +887,22 @@ def _add_spine_middleware(
         from spine.agents.context_editing import TurnBudgetGuard
 
         middleware.append(TurnBudgetGuard(threshold=_spine_cfg.implement_max_turns))
+
+    # ReadBudgetGuard — the survey-trap governor. The slice-implementer prompt
+    # has long asked the model to police its own read budget ("maximum 2 turns
+    # of read/lookup before your first write"); counting turns across a
+    # conversation is exactly what a small model cannot do, and the spirals
+    # kept recurring. This counts read-only calls since the last write and
+    # nudges at soft/hard thresholds — the shape smallcode's early_stop uses,
+    # which was observed working on this same model. Off by default: it is a
+    # behavioural change to the editor loop and wants a live run before it is
+    # trusted, so enable with `implement_read_budget: [soft, hard]`.
+    if phase == PhaseName.IMPLEMENT and _spine_cfg.implement_read_budget:
+        from spine.agents.context_editing import ReadBudgetGuard
+
+        _soft, _hard = (list(_spine_cfg.implement_read_budget) + [0, 0])[:2]
+        if _soft and _hard:
+            middleware.append(ReadBudgetGuard(soft=int(_soft), hard=int(_hard)))
 
     # The verify-side analogue: the tool-using slice-verifier ReAct fallback (when
     # the evidence-then-judge path is off) reads files + runs checks in a loop with

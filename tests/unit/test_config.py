@@ -91,8 +91,10 @@ class TestSpineConfig:
         config.providers = {
             "llm": [
                 {"name": "local", "enabled": True, "model": "openai:local"},
-                {"name": "strong", "enabled": False, "model": "openai:strong"},
-                {"name": "exact", "enabled": False, "model": "openai:exact"},
+                # Pin targets must be enabled — a pin naming a disabled
+                # provider is refused (see TestPinnedProviderRefusesDisabled).
+                {"name": "strong", "enabled": True, "model": "openai:strong"},
+                {"name": "exact", "enabled": True, "model": "openai:exact"},
             ],
             "phases": {
                 "implement": {"provider": "local"},

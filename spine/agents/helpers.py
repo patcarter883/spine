@@ -509,8 +509,125 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
 
 # Structured-output methods in order of preference. Demotion on a routing
 # 404 steps one place right; past the end there is nothing left to try and
-# the error propagates to the callsite's existing fallback.
-_STRUCTURED_METHOD_LADDER = ("json_schema", "function_calling", "json_mode")
+# the error propagates to the callsite's existing fallback. "prompt" is the
+# terminal rung for endpoints whose parameter surface supports NO native
+# structured mechanism at all (2026-07-22: poolside/laguna-s-2.1 exposes
+# only tools + tool_choice:auto — json_schema, forced function calling AND
+# json_mode all 404 under require_parameters): plain generation with the
+# schema stated in the prompt, parsed and validated client-side.
+_STRUCTURED_METHOD_LADDER = ("json_schema", "function_calling", "json_mode", "prompt")
+
+
+def _extract_json_candidate(text: str) -> str | None:
+    """Pull the first plausible JSON object out of free-form model text."""
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return None
+
+
+async def _prompt_structured_ainvoke(
+    model: Any, schema: type[BaseModel], input: Any, config: Any = None, **kwargs: Any
+) -> Any:
+    """Terminal 'prompt' rung: schema in the prompt, salvage from content.
+
+    Appends a strict output instruction carrying the JSON schema, invokes the
+    RAW model, and parses/validates the reply. Raises ``ValueError`` on a
+    non-conforming reply so callsite retry ladders
+    (``ainvoke_structured_with_retry``) treat it like any parse failure.
+    """
+    import json as _json
+
+    from langchain_core.messages import HumanMessage
+
+    instruction = HumanMessage(
+        content=(
+            "Respond with ONLY a JSON object conforming to this schema — no "
+            "prose before or after it:\n"
+            f"{_json.dumps(schema.model_json_schema())}"
+        )
+    )
+    if isinstance(input, list):
+        payload = list(input) + [instruction]
+    else:
+        payload = [HumanMessage(content=str(input)), instruction]
+    # Reasoning buys nothing on a mechanical JSON emission and can eat the
+    # ENTIRE completion budget before content starts (laguna-s-2.1,
+    # 2026-07-22: every failing reply was content_len=0 with up to ~16K
+    # chars of reasoning_content). suppress_reasoning pins ChatOpenRouter
+    # to effort=minimal; a no-op elsewhere.
+    reply = await suppress_reasoning(model).ainvoke(payload, config, **kwargs)
+    text = reply.content if hasattr(reply, "content") else str(reply)
+    if isinstance(text, list):  # multimodal block form
+        text = "\n".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in text
+        )
+    candidate = _extract_json_candidate(text)
+    if candidate is None:
+        # Backstop: a reasoning-routed reply sometimes finishes the JSON
+        # inside the reasoning channel.
+        ak = getattr(reply, "additional_kwargs", None) or {}
+        candidate = _extract_json_candidate(
+            str(ak.get("reasoning_content") or ak.get("reasoning") or "")
+        )
+    if candidate is None:
+        raise ValueError(
+            f"prompt-structured reply for {schema.__name__} contained no JSON object"
+        )
+    try:
+        parsed = _json.loads(candidate)
+    except _json.JSONDecodeError as exc:
+        if "escape" not in str(exc).lower():
+            raise
+        # Code-bearing replies (PHP namespaces) often carry raw single
+        # backslashes that strict JSON rejects ("Invalid \escape") — repair
+        # by doubling any backslash that doesn't start a valid escape.
+        repaired = re.sub(r'\\(?![\\/"bfnrtu])', r"\\\\", candidate)
+        parsed = _json.loads(repaired)
+    return schema.model_validate(parsed)
+
+
+def openrouter_native_structured_method(model: Any) -> str | None:
+    """The probed structured-output method for a ChatOpenRouter model.
+
+    ``None`` for non-OpenRouter models (callers should not gate on it).
+    Anything other than ``"json_schema"`` means the endpoint cannot be
+    trusted with provider-native schema binding (ProviderStrategy /
+    model_kwargs response_format) — and ToolStrategy's forced tool_choice
+    is equally unroutable on auto-only endpoints (laguna, 2026-07-22), so
+    agent-level response_format should be dropped in favour of
+    prompt+salvage on those models.
+    """
+    if type(model).__name__ != "ChatOpenRouter":
+        return None
+    name = getattr(model, "model_name", "") or ""
+    if not name:
+        return None
+    return _openrouter_structured_method(name)
 
 
 def _is_structured_routing_404(exc: BaseException) -> bool:
@@ -569,6 +686,12 @@ class _SelfHealingStructured:
             if cached:
                 self._method = cached
         while True:
+            if self._method == "prompt":
+                # Terminal rung — no native mechanism left on this endpoint;
+                # parse failures raise to the callsite retry ladder.
+                return await _prompt_structured_ainvoke(
+                    self._model, self._schema, input, config, **kwargs
+                )
             bound = self._model.with_structured_output(self._schema, method=self._method)
             try:
                 return await bound.ainvoke(input, config, **kwargs)
@@ -635,9 +758,15 @@ def _openrouter_structured_method(model_name: str) -> str:
                 supported.update(ep.get("supported_parameters") or [])
             if "structured_outputs" not in supported:
                 if "tool_choice" in supported:
+                    # NOTE: capability listings can't reveal VALUE support —
+                    # an endpoint may accept only tool_choice:auto (laguna) —
+                    # the self-healing wrapper demotes past this at the
+                    # first 404 (function_calling → json_mode → prompt).
                     method = "function_calling"
                 elif "response_format" in supported:
                     method = "json_mode"
+                else:
+                    method = "prompt"
                 logger.info(
                     "%s: endpoints lack structured_outputs support; using "
                     "structured-output method=%s",
@@ -734,6 +863,70 @@ def warn_if_prompt_crowds_window(messages: list[Any], *, label: str) -> int:
     return est
 
 
+_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def _placeholder_string_fields(result: Any) -> list[str]:
+    """Names of top-level string fields holding placeholder filler.
+
+    A grammar-constrained local model whose thinking ran out pattern-fills
+    free-text fields with scaffold characters — observed shape (work
+    d8bc459c): ``{"reasoning": "...", "category": "Backend/API"}``. Only
+    whole-field junk is flagged: a non-empty string containing no
+    alphanumeric characters at all. Empty strings stay legal (optional
+    fields default to ``""``), and real prose that merely contains an
+    ellipsis passes.
+    """
+    obj = result
+    if not isinstance(obj, BaseModel):
+        obj = getattr(result, "parsed", None)
+        if not isinstance(obj, BaseModel):
+            return []
+    junk: list[str] = []
+    for name in type(obj).model_fields:
+        value = getattr(obj, name, None)
+        if isinstance(value, str):
+            v = value.strip()
+            if v and not _ALNUM_RE.search(v):
+                junk.append(name)
+    return junk
+
+
+def _salvage_json_invalid(exc: Exception, schema: type | None) -> Any | None:
+    """Repair-and-reparse a structured reply that failed with ``json_invalid``.
+
+    PHP-fluent models escape single quotes inside JSON strings the way PHP
+    does (``route(\\'farms...\\')``) — ``\\'`` is not a valid JSON escape, the
+    parser dies mid-string ("EOF while parsing a string") and the whole
+    candidate burns (run 2026-07-24: two SynthesizedSlice candidates lost to
+    exactly this). The raw text rides the Pydantic error's ``input``; apply
+    the same escape repair as the prompt rung and revalidate. Returns the
+    validated instance or ``None`` (never raises).
+    """
+    if schema is None or not hasattr(schema, "model_validate_json"):
+        return None
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return None
+    try:
+        for err in exc.errors():  # type: ignore[union-attr]
+            if err.get("type") != "json_invalid":
+                continue
+            raw = err.get("input")
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            candidate = re.sub(r'\\(?![\\/"bfnrtu])', r"\\\\", raw)
+            if candidate == raw:
+                return None
+            try:
+                return schema.model_validate_json(candidate)
+            except Exception:  # noqa: BLE001 — salvage is best-effort
+                return None
+    except Exception:  # noqa: BLE001 — never mask the original error path
+        return None
+    return None
+
+
 async def ainvoke_structured_with_retry(
     structured_model: Any,
     messages: list[Any],
@@ -742,6 +935,7 @@ async def ainvoke_structured_with_retry(
     api_retries: int = 2,
     api_backoff: float = 0.5,
     label: str = "structured-output",
+    schema: type | None = None,
 ) -> Any:
     """Invoke a structured-output model, retrying transient empty parses.
 
@@ -773,6 +967,10 @@ async def ainvoke_structured_with_retry(
         api_backoff: Base seconds for exponential backoff between transport
             retries (delay = ``api_backoff * 2**(n-1)``).
         label: Identifier used in the retry log line.
+        schema: Optional Pydantic model class of the expected output. When
+            provided, a ``json_invalid`` parse failure is retried once
+            in-place after repairing invalid string escapes (``\\'`` from
+            PHP-fluent models) — see :func:`_salvage_json_invalid`.
 
     Returns:
         Whatever ``structured_model.ainvoke`` returns on the first success.
@@ -789,17 +987,56 @@ async def ainvoke_structured_with_retry(
 
     attempt = 0
     api_attempt = 0
+    placeholder_attempt = 0
+    pending_nudge: HumanMessage | None = None
     while True:
-        invoke_messages = messages if attempt == 0 else [*messages, nudge]
+        invoke_messages = messages if pending_nudge is None else [*messages, pending_nudge]
         try:
             result = await structured_model.ainvoke(invoke_messages)
             # Reachable endpoint → clear the connection-failure circuit breaker.
             _retry.reset_conn_breaker()
+            junk_fields = _placeholder_string_fields(result)
+            if junk_fields and placeholder_attempt < 1:
+                placeholder_attempt += 1
+                logger.warning(
+                    "%s: placeholder-only string field(s) %s — retrying (1/1)",
+                    label,
+                    junk_fields,
+                )
+                pending_nudge = HumanMessage(
+                    content=(
+                        "Your previous response filled these fields with "
+                        f"placeholder characters instead of content: {junk_fields}. "
+                        "Filler like '...' is not acceptable. Respond with the "
+                        "same JSON schema, writing real content for every "
+                        "field per its description."
+                    )
+                )
+                continue
+            if junk_fields:
+                # Shape-valid — accept rather than fail the phase, but leave
+                # the breadcrumb for trace audits.
+                logger.warning(
+                    "%s: placeholder-only field(s) %s persisted after retry — "
+                    "accepting response as-is",
+                    label,
+                    junk_fields,
+                )
             return result
         except ValueError as exc:
+            salvaged = _salvage_json_invalid(exc, schema)
+            if salvaged is not None:
+                logger.warning(
+                    "%s: repaired invalid JSON string escapes in structured "
+                    "reply (\\' -> \\\\')",
+                    label,
+                )
+                _retry.reset_conn_breaker()
+                return salvaged
             if attempt >= retries or not is_empty_structured_parse(exc):
                 raise
             attempt += 1
+            pending_nudge = nudge
             logger.warning(
                 "%s: empty structured parse — retrying (%d/%d)",
                 label,
@@ -1097,6 +1334,52 @@ def _expand_env_ref(value: Any) -> Any:
 _ENDPOINT_HEALTH: dict[str, tuple[bool, float]] = {}
 _HEALTH_TTL_SECONDS = 20.0
 
+# A HEALTHY endpoint only flips DOWN after this many consecutive probe
+# failures. Run d8bc459c attempt 9: mini-sglang's accept loop shares the
+# inference event loop, so during concurrent prefill bursts a NEW TCP
+# connection can sit in the backlog past the 1.5s probe timeout while
+# established streams serve fine — one such stall rerouted 7 calls to the
+# standby (and the DOWN state self-sustained, because the recovery probe's
+# 1-token completion queues behind the same load). First-contact failures
+# are NOT debounced: an endpoint that has never answered is just down.
+_DOWN_AFTER_CONSECUTIVE_FAILS = 2
+_ENDPOINT_FAIL_STREAK: dict[str, int] = {}
+
+
+def mark_endpoint_alive(url: Any) -> None:
+    """Record proof-of-life for an endpoint from REAL traffic.
+
+    Called by the shared per-provider httpx clients' response hooks
+    (spine.agents.http_clients): any HTTP response (< 500) from the serve
+    is stronger health evidence than a synthetic probe, so it refreshes
+    the TTL cache and clears the failure streak. While traffic flows, the
+    probe never runs — a backlogged accept queue can't fake an outage
+    (attempt 9's false-DOWN reroute).
+
+    Matches cached entries by host:port so the hook's httpx URL and the
+    provider config's ``base_url`` string don't need byte-identical forms.
+    Unknown endpoints (never probed) are ignored.
+    """
+    import time
+    from urllib.parse import urlparse
+
+    try:
+        host = getattr(url, "host", None)
+        port = getattr(url, "port", None)
+        if host is None:
+            parsed = urlparse(str(url))
+            host, port = parsed.hostname, parsed.port
+        if not host:
+            return
+        now = time.monotonic()
+        for base_url in list(_ENDPOINT_HEALTH):
+            parsed = urlparse(base_url)
+            if parsed.hostname == host and parsed.port == port:
+                _ENDPOINT_HEALTH[base_url] = (True, now)
+                _ENDPOINT_FAIL_STREAK[base_url] = 0
+    except Exception:  # noqa: BLE001 — health bookkeeping must never break a response
+        logger.debug("mark_endpoint_alive failed for %r", url, exc_info=True)
+
 
 def _endpoint_ready(base_url: str, model: str | None) -> bool:
     """Prove the backend actually SERVES with a 1-token completion.
@@ -1184,8 +1467,25 @@ def _endpoint_healthy(base_url: str, model: str | None = None) -> bool:
                 healthy = True
         except OSError:
             healthy = False
-    if healthy and not (cached and cached[0]):
+    was_healthy = bool(cached and cached[0])
+    if healthy and not was_healthy:
         healthy = _endpoint_ready(base_url, model)
+    if healthy:
+        _ENDPOINT_FAIL_STREAK[base_url] = 0
+    elif was_healthy:
+        # Debounce: a single failed probe against a known-healthy endpoint
+        # is more likely a backlogged accept queue than a crash (attempt 9's
+        # false-DOWN). Stay healthy, re-probe next TTL window; real traffic
+        # succeeding meanwhile resets the streak via mark_endpoint_alive.
+        streak = _ENDPOINT_FAIL_STREAK.get(base_url, 0) + 1
+        _ENDPOINT_FAIL_STREAK[base_url] = streak
+        if streak < _DOWN_AFTER_CONSECUTIVE_FAILS:
+            logger.warning(
+                "endpoint %s failed a health probe (%d/%d consecutive) — "
+                "keeping HEALTHY pending confirmation",
+                base_url, streak, _DOWN_AFTER_CONSECUTIVE_FAILS,
+            )
+            healthy = True
     _ENDPOINT_HEALTH[base_url] = (healthy, now)
     return healthy
 
@@ -1472,15 +1772,21 @@ def _build_local_model(
 
     # ── CAM memory organ (minisgl cam-serving) ────────────────────────
     # When the provider is a minisgl server with the CAM editable memory
-    # (`cam:` block on the provider), scope every request to the project's
-    # memory namespace via the X-CAM-Namespace header and pin the ambient
-    # auto-write gate per request. `cam_write` is sent explicitly (True only
-    # under `write: ambient`) because spine's agent prompts are not
-    # conversational turns — server-side fact extraction from them is noise,
-    # and an explicit False overrides a server booted with
-    # MINISGL_CAM_AUTO_WRITE=1. The transparent read path is server-side and
-    # needs no request field. Edit-plane writes go through
-    # spine.services.cam_client, not this builder.
+    # (`cam:` block on the provider), pin the ambient auto-write gate per
+    # request. `cam_write` is sent explicitly (True only under `write:
+    # ambient`) because spine's agent prompts are not conversational turns —
+    # server-side fact extraction from them is noise, and an explicit False
+    # overrides a server booted with MINISGL_CAM_AUTO_WRITE=1.
+    #
+    # The X-CAM-Namespace header is attached ONLY when a server-side ambient
+    # path is actually in use (read: transparent/both, or write: ambient).
+    # The header is not free: it makes the serve run a retrieve-generate
+    # (mem_op=retrieve) before EVERY chat generation — under concurrent
+    # large-prompt agent traffic that contention wedged the serve twice on
+    # 2026-07-16 (blockers serve-wedged/-2). With read: facts_block the
+    # block is client-rendered from the side index and edit-plane calls
+    # carry their own header (spine.services.cam_client), so agent traffic
+    # must stay CAM-silent.
     if provider_cfg.get("cam"):
         from spine.services.cam_client import resolve_cam_settings
 
@@ -1492,7 +1798,11 @@ def _build_local_model(
             _cam_root = None
         cam_settings = resolve_cam_settings(provider_cfg, workspace_root=_cam_root)
         if cam_settings is not None:
-            if cam_settings.namespace:
+            ambient_in_use = (
+                cam_settings.read in ("transparent", "both")
+                or cam_settings.write == "ambient"
+            )
+            if ambient_in_use and cam_settings.namespace:
                 headers = dict(kwargs.get("default_headers") or {})
                 headers["X-CAM-Namespace"] = cam_settings.namespace
                 kwargs["default_headers"] = headers
@@ -1606,9 +1916,18 @@ def _build_local_model(
         """ChatOpenAI speaking the most compatible dialect to local servers."""
 
         def _get_request_payload(self, input_: Any, *, stop: Any = None, **kw: Any) -> dict:
-            return _flatten_text_block_content(
+            payload = _flatten_text_block_content(
                 super()._get_request_payload(input_, stop=stop, **kw)
             )
+            # vLLM rejects `tools: []` outright ("must not be an empty
+            # array... or omit the field entirely") — the no-tool judge
+            # lanes bind an empty list and every such request 400'd (run
+            # d8bc459c 2026-07-25: all slice-verifier calls). A dangling
+            # tool_choice without tools is equally malformed.
+            if not payload.get("tools") and "tools" in payload:
+                payload.pop("tools")
+                payload.pop("tool_choice", None)
+            return payload
 
     return _LocalChatOpenAI(**kwargs)
 
@@ -1623,6 +1942,13 @@ def _apply_concurrency_cap(
     ``http_async_client``; using cached, connection-capped clients keyed
     by provider name caps concurrent in-flight requests globally across
     every agent that resolves to the same provider.
+
+    ``max_concurrent_streams`` (provider-level) additionally routes the
+    async client through a weighted budget where each request costs its
+    ``rsa.n`` (non-RSA requests cost 1), so total server-side decode
+    streams stay under the serve's capacity regardless of the per-lane
+    n mix. Server-wide by construction: every lane referencing the same
+    provider shares the one cached client.
     """
     raw = provider_cfg.get("max_concurrent_calls")
     if raw is None:
@@ -1636,8 +1962,17 @@ def _apply_concurrency_cap(
 
     from spine.agents.http_clients import get_async_http_client, get_sync_http_client
 
+    max_streams: int | None
+    try:
+        max_streams = int(provider_cfg.get("max_concurrent_streams") or 0) or None
+    except (TypeError, ValueError):
+        max_streams = None
+
     provider_name = provider_cfg.get("name") or "default"
-    kwargs.setdefault("http_async_client", get_async_http_client(provider_name, max_concurrent))
+    kwargs.setdefault(
+        "http_async_client",
+        get_async_http_client(provider_name, max_concurrent, max_streams=max_streams),
+    )
     kwargs.setdefault("http_client", get_sync_http_client(provider_name, max_concurrent))
 
 

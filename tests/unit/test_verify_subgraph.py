@@ -814,3 +814,64 @@ class TestJudgeJsonSalvage:
         )
         parsed = _extract_json_object(content)
         assert parsed and parsed["nested"] == {"a": 1}
+
+
+class TestVerifyBranchDeadline:
+    """Hard deadline on verify-branch LLM calls (trace 019f7df2: verifier
+    calls sat open with zero tokens for ~35 minutes; no client-side
+    timeout fired and the dispatcher stall monitor can't see subagent
+    calls). Concurrency itself belongs to the provider's existing
+    max_concurrent_calls / max_concurrent_streams enforcement — the
+    deadline reuses the existing SPINE_STALL_TIMEOUT knob, no new config.
+    """
+
+    def test_deadline_reuses_stall_timeout(self, monkeypatch):
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        monkeypatch.delenv("SPINE_STALL_TIMEOUT", raising=False)
+        assert vs._branch_deadline() == 900.0
+        monkeypatch.setenv("SPINE_STALL_TIMEOUT", "1200")
+        assert vs._branch_deadline() == 1200.0
+        monkeypatch.setenv("SPINE_STALL_TIMEOUT", "5")
+        assert vs._branch_deadline() == 60.0  # floor
+        monkeypatch.setenv("SPINE_STALL_TIMEOUT", "junk")
+        assert vs._branch_deadline() == 900.0
+
+    @pytest.mark.asyncio
+    async def test_deadline_cancels_retries_then_raises(self, monkeypatch):
+        import asyncio
+
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        monkeypatch.setattr(vs, "_branch_deadline", lambda: 0.05)
+        calls = 0
+        cancelled = 0
+
+        async def hung():
+            nonlocal calls, cancelled
+            calls += 1
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
+            return "never"
+
+        with pytest.raises(vs.VerifierBranchTimeout):
+            await vs._guarded_branch(
+                hung, work_id="w", slice_id="s", what="hung call"
+            )
+        assert calls == 2  # one retry
+        assert cancelled == 2  # wait_for cancelled the call each time
+
+    @pytest.mark.asyncio
+    async def test_success_within_deadline_passes_through(self):
+        from spine.workflow.subgraphs import verify_subgraph as vs
+
+        async def quick():
+            return {"verdict": "VERIFIED"}
+
+        out = await vs._guarded_branch(
+            quick, work_id="w", slice_id="s", what="quick call"
+        )
+        assert out == {"verdict": "VERIFIED"}

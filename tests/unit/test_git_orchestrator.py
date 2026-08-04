@@ -110,6 +110,34 @@ def test_prepare_sandbox_raises_on_dirty_tree(tmp_path, monkeypatch):
         orch.prepare_sandbox()
 
 
+def test_clean_check_ignores_untracked_spine_runtime(tmp_path, monkeypatch):
+    """Untracked .spine/ output (artifacts, experience, db) is written by
+    EVERY run — counting it dirty made spine self-blocking on repos that
+    don't gitignore .spine (Wallace parity report 2026-07-24 C13)."""
+    orch = _make_orchestrator(tmp_path)
+    shell = _ScriptedShell(
+        [
+            (
+                True,
+                "?? .spine/artifacts/abc123/\n?? .spine/experience/facts.jsonl\n"
+                "?? .spine/spine.db\n",
+                "",
+            )
+        ]
+    )
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+    orch.ensure_tree_clean()  # must not raise
+
+
+def test_clean_check_still_flags_tracked_spine_changes(tmp_path, monkeypatch):
+    """A MODIFIED tracked .spine file (a config) is a real user change."""
+    orch = _make_orchestrator(tmp_path)
+    shell = _ScriptedShell([(True, " M .spine/config.yaml\n", "")])
+    monkeypatch.setattr(orch, "_execute_shell", shell)
+    with pytest.raises(SandboxPreparationError, match="not clean"):
+        orch.ensure_tree_clean()
+
+
 def test_prepare_sandbox_raises_on_status_failure(tmp_path, monkeypatch):
     orch = _make_orchestrator(tmp_path)
     shell = _ScriptedShell([(False, "", "fatal: not a git repo")])

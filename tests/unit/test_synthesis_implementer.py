@@ -256,3 +256,186 @@ def test_new_target_file_with_syntax_error_is_not_created(tmp_path: Path) -> Non
     )
     assert res.n_applied == 0 and res.n_failures == 1
     assert not (tmp_path / "tests" / "test_new.py").exists()
+
+
+class TestWholeFileReplaceBlocked:
+    """Wholesale replacement of an EXISTING file is a policy failure, not a
+    coincidence of anchor resolution (run 019f81f1: a rework candidate
+    emitted action=replace symbol='routes/api.php' against the 328-line
+    shared route file — every route not reproduced would have been
+    silently deleted)."""
+
+    def test_file_path_symbol_on_existing_file_is_blocked(self, workspace: Path) -> None:
+        cand = _slice("print('whole new file')\n", symbol="mod.py")
+        res = apply_synthesized(
+            cand, workspace_root=str(workspace), target_files=["mod.py"]
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "whole_file_replace_blocked"
+        assert "insert_after" in res.failures[0]["detail"]
+        assert (workspace / "mod.py").read_text() == _ORIG  # untouched
+
+    def test_slash_path_symbol_is_blocked(self, tmp_path: Path) -> None:
+        (tmp_path / "routes").mkdir()
+        (tmp_path / "routes" / "api.php").write_text("<?php\n", encoding="utf-8")
+        cand = _slice(
+            "<?php // regenerated\n", file="routes/api.php", symbol="routes/api.php"
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["routes/api.php"]
+        )
+        assert res.failures[0]["status"] == "whole_file_replace_blocked"
+        assert (tmp_path / "routes" / "api.php").read_text() == "<?php\n"
+
+    def test_new_file_creation_path_unaffected(self, tmp_path: Path) -> None:
+        # Path-shaped symbol on a file that does NOT exist yet stays on the
+        # full_replace creation path — that fix (run 019f40ac) must survive.
+        content = "def newfn():\n    return 1\n"
+        cand = _slice(content, file="newmod.py", symbol="newmod.py")
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["newmod.py"]
+        )
+        assert res.n_applied == 1 and res.n_failures == 0
+        assert (tmp_path / "newmod.py").read_text() == content
+
+    def test_real_symbols_pass_through(self, workspace: Path) -> None:
+        cand = _slice("def greet(name):\n    return name\n", symbol="greet")
+        res = apply_synthesized(
+            cand, workspace_root=str(workspace), target_files=["mod.py"]
+        )
+        assert res.n_applied == 1
+        # PHP-style double-colon symbols are real symbols, not paths.
+        from spine.agents.synthesis_implementer import _is_whole_file_symbol
+
+        assert _is_whole_file_symbol("RouteServiceProvider::boot", "app/P.php") is False
+        assert _is_whole_file_symbol("SpineConfig.load", "spine/config.py") is False
+        assert _is_whole_file_symbol("api.php", "routes/api.php") is True
+        assert _is_whole_file_symbol("", "routes/api.php") is True
+
+
+class TestPlaceholderCreationBlocked:
+    """Creating a file whose content is an elision must FAIL placement
+    (run 019f81c1: RainfallCrudTest.php landed as a literal 3-byte '...'
+    in two consecutive cycles — PHP syntax check passes bare text, so the
+    lint oracle was blind and each cycle burned a verify pass)."""
+
+    def test_ellipsis_creation_blocked(self, tmp_path: Path) -> None:
+        cand = _slice("...", file="RainfallCrudTest.php", symbol="RainfallCrudTest.php")
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["RainfallCrudTest.php"]
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "placeholder_content_blocked"
+        assert not (tmp_path / "RainfallCrudTest.php").exists()
+
+    def test_empty_and_tiny_creations_blocked(self, tmp_path: Path) -> None:
+        from spine.agents.synthesis_implementer import _is_placeholder_content
+
+        assert _is_placeholder_content("") is True
+        assert _is_placeholder_content("pass") is True
+        assert _is_placeholder_content("// TODO") is True
+        assert _is_placeholder_content("<?php\n") is True  # 5 chars stripped... blocked
+        assert _is_placeholder_content("x = 1\ny = 2\n") is False
+
+    def test_real_creation_still_lands(self, tmp_path: Path) -> None:
+        cand = _slice(
+            "def real():\n    return 42\n", file="real.py", symbol="real.py"
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["real.py"]
+        )
+        assert res.n_applied == 1
+        assert (tmp_path / "real.py").exists()
+
+
+class TestPathConfusionBlocked:
+    """Creating a file into a phantom tree is monorepo path confusion
+    (Wallace parity report 2026-07-24: a feature landed at root 'src/'
+    outside the package and another under a doubled 'apps/apps/…' — both
+    'verified', both dead code). Fires only on positive evidence."""
+
+    def test_misrooted_creation_blocked(self, tmp_path: Path) -> None:
+        # 'wallace/src/' exists; writing to root 'src/…' dropped the prefix.
+        (tmp_path / "wallace" / "src").mkdir(parents=True)
+        cand = _slice(
+            "export const x = 1;\n",
+            file="src/components/UsersDialog.vue",
+            symbol="src/components/UsersDialog.vue",
+        )
+        res = apply_synthesized(
+            cand,
+            workspace_root=str(tmp_path),
+            target_files=["src/components/UsersDialog.vue"],
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "path_confusion_blocked"
+        assert "wallace" in res.failures[0]["detail"]
+        assert not (tmp_path / "src").exists()
+
+    def test_doubled_prefix_creation_blocked(self, tmp_path: Path) -> None:
+        # Workspace root IS apps/; 'apps/wallace/…' doubles the prefix.
+        (tmp_path / "wallace").mkdir()
+        cand = _slice(
+            "export const x = 1;\n",
+            file="apps/wallace/pages/Workshops.vue",
+            symbol="apps/wallace/pages/Workshops.vue",
+        )
+        res = apply_synthesized(
+            cand,
+            workspace_root=str(tmp_path),
+            target_files=["apps/wallace/pages/Workshops.vue"],
+        )
+        assert res.n_applied == 0 and res.n_failures == 1
+        assert res.failures[0]["status"] == "path_confusion_blocked"
+        assert "doubled" in res.failures[0]["detail"]
+
+    def test_genuinely_new_tree_allowed(self, tmp_path: Path) -> None:
+        # A first 'tests/' dir in a flat repo carries no confusion evidence.
+        cand = _slice(
+            "def test_ok():\n    assert True\n",
+            file="tests/test_ok.py",
+            symbol="tests/test_ok.py",
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["tests/test_ok.py"]
+        )
+        assert res.n_applied == 1
+        assert (tmp_path / "tests/test_ok.py").exists()
+
+    def test_existing_toplevel_new_subdir_allowed(self, tmp_path: Path) -> None:
+        (tmp_path / "app").mkdir()
+        cand = _slice(
+            "def real():\n    return 42\n",
+            file="app/newdir/real.py",
+            symbol="app/newdir/real.py",
+        )
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["app/newdir/real.py"]
+        )
+        assert res.n_applied == 1
+        assert (tmp_path / "app/newdir/real.py").exists()
+
+
+class TestAppendPlacement:
+    """action='append' bypasses the whole-file guard (anchor-free, no
+    clobber) and routes through the tool's append mode."""
+
+    def test_append_with_path_symbol_applies(self, tmp_path: Path) -> None:
+        (tmp_path / "routes.py").write_text("A = 1\n", encoding="utf-8")
+        cand = SynthesizedSlice(edits=[SynthesizedEdit(
+            file="routes.py", symbol="routes.py", action="append",
+            code="B = 2\n",
+        )])
+        res = apply_synthesized(
+            cand, workspace_root=str(tmp_path), target_files=["routes.py"]
+        )
+        assert res.n_applied == 1 and res.n_failures == 0
+        assert (tmp_path / "routes.py").read_text() == "A = 1\n\nB = 2\n"
+
+    def test_guard_detail_suggests_append(self, workspace: Path) -> None:
+        cand = _slice("print('x')\n", symbol="mod.py")
+        res = apply_synthesized(
+            cand, workspace_root=str(workspace), target_files=["mod.py"]
+        )
+        assert res.failures[0]["status"] == "whole_file_replace_blocked"
+        assert "action='append'" in res.failures[0]["detail"]

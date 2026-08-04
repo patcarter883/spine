@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from langchain_core.messages import AIMessage, ToolMessage
 
 from spine.config import SpineConfig
@@ -236,6 +238,125 @@ class TestToolCallNormalizer:
         assert len(resp.result[0].tool_calls) == 1
 
 
+class TestNormalizerStructuredTermination:
+    """A recovered structured-output call must TERMINATE the agent.
+
+    create_agent parses structured output inside its base model handler,
+    BEFORE wrap_model_call middleware — so a text-emitted call the normalizer
+    promotes afterwards never becomes ``structured_response``, and a no-tool
+    structured agent's model→model edge loops forever (trace 019f7d50: the
+    plan critic spun 31 iterations re-emitting the same CriticReview call,
+    including a discarded PASSED verdict on iteration 1). The normalizer now
+    finishes the job itself: parse → structured_response + ToolMessage.
+    """
+
+    @staticmethod
+    def _review_schema():
+        from pydantic import BaseModel
+
+        class Review(BaseModel):
+            status: str
+            reason: str
+
+        return Review
+
+    def test_bare_object_structured_call_sets_structured_response(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='{"name": "Review", "arguments": '
+            '{"status": "PASSED", "reason": "plan is sound"}}'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+
+        out = resp.result[0]
+        assert out.tool_calls[0]["name"] == "Review"
+        assert isinstance(resp.structured_response, Review)
+        assert resp.structured_response.status == "PASSED"
+        # Terminating ToolMessage mirrors _handle_model_output's happy path.
+        assert isinstance(resp.result[1], ToolMessage)
+        assert resp.result[1].tool_call_id == out.tool_calls[0]["id"]
+
+    def test_hermes_structured_call_also_completes(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='<tool_call>{"name": "Review", "arguments": '
+            '{"status": "ok", "reason": "r"}}</tool_call>'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+        assert resp.structured_response is not None
+
+    def test_schema_mismatch_appends_corrective_tool_message(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='{"name": "Review", "arguments": {"wrong_field": 1}}'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+
+        assert resp.structured_response is None
+        # The retry is corrective, not a blind re-ask: an error ToolMessage
+        # answers the promoted call so the next iteration sees what failed.
+        assert isinstance(resp.result[1], ToolMessage)
+        assert "Review" in str(resp.result[1].content)
+
+    def test_non_structured_recovered_call_is_left_to_tool_node(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        msg = AIMessage(
+            content='<tool_call>{"name": "read_file", "arguments": '
+            '{"path": "a.py"}}</tool_call>'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer(response_format=Review)._normalize_response(resp)
+
+        assert resp.result[0].tool_calls[0]["name"] == "read_file"
+        assert resp.structured_response is None
+        assert len(resp.result) == 1  # no synthetic ToolMessage
+
+    def test_no_response_format_is_promotion_only(self) -> None:
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        msg = AIMessage(
+            content='{"name": "Review", "arguments": {"status": "ok", "reason": "r"}}'
+        )
+        resp = SimpleNamespace(result=[msg], structured_response=None)
+        ToolCallNormalizer()._normalize_response(resp)
+        assert resp.result[0].tool_calls[0]["name"] == "Review"
+        assert resp.structured_response is None
+        assert len(resp.result) == 1
+
+    def test_provider_strategy_yields_no_bindings(self) -> None:
+        from langchain.agents.structured_output import ProviderStrategy
+
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        norm = ToolCallNormalizer(response_format=ProviderStrategy(schema=Review))
+        assert norm._structured == {}
+
+    def test_tool_strategy_binding_names_match_create_agent(self) -> None:
+        from langchain.agents.structured_output import ToolStrategy
+
+        from spine.agents.tool_call_normalizer import ToolCallNormalizer
+
+        Review = self._review_schema()
+        # Raw schema and explicit ToolStrategy must resolve to the same
+        # tool name create_agent binds (the schema's name).
+        assert set(ToolCallNormalizer(response_format=Review)._structured) == {"Review"}
+        assert set(
+            ToolCallNormalizer(response_format=ToolStrategy(schema=Review))._structured
+        ) == {"Review"}
+
+
 # ── 4. LLM error diagnosis on command failure ─────────────────────────────────
 
 
@@ -280,3 +401,173 @@ class TestExecuteDiagnoser:
     def test_disabled_by_default(self) -> None:
         assert SpineConfig().error_diagnosis is False
         assert SpineConfig().tool_call_normalize is False
+
+
+class TestMicroSliceParentInheritance:
+    """Run 019f82b1: decomposer micro-slices lacked _parent_slice_id, so
+    _slice_marker_ids could not map them to the parent's verification
+    findings (final-mile never engaged for them → wholesale rework) and
+    dependencies naming the parent never resolved (permanently-blocked
+    slice)."""
+
+    def test_normalized_micros_carry_parent_id(self):
+        from spine.agents.decomposer import _normalize_per_file_slices
+
+        parent = {
+            "id": "implement-domain-models",
+            "title": "Models",
+            "target_files": ["app/A.php", "app/B.php"],
+            "acceptance_criteria": ["c1"],
+            "reference_symbols": ["Farm"],
+        }
+        subs = _normalize_per_file_slices(parent, [
+            {"target_files": ["app/A.php"]},
+            {"target_files": ["app/B.php"]},
+        ])
+        assert len(subs) == 2
+        for s in subs:
+            assert s["_parent_slice_id"] == "implement-domain-models"
+
+        from spine.workflow.subgraphs.implement_subgraph import _slice_marker_ids
+        ids = _slice_marker_ids([subs[0]])
+        assert "implement-domain-models" in ids
+
+
+class TestPromptStructuredRung:
+    """Terminal 'prompt' rung for OpenRouter endpoints with no native
+    structured mechanism (laguna-s-2.1: tools + tool_choice:auto only —
+    json_schema/function_calling/json_mode all 404 under
+    require_parameters)."""
+
+    def test_ladder_ends_at_prompt(self):
+        from spine.agents.helpers import _STRUCTURED_METHOD_LADDER, _demoted_method
+
+        assert _STRUCTURED_METHOD_LADDER[-1] == "prompt"
+        assert _demoted_method("json_mode") == "prompt"
+        assert _demoted_method("prompt") is None
+
+    def test_extract_json_candidate_shapes(self):
+        from spine.agents.helpers import _extract_json_candidate
+
+        assert _extract_json_candidate('x {"a": 1, "b": {"c": 2}} y') == '{"a": 1, "b": {"c": 2}}'
+        assert _extract_json_candidate('```json\n{"a": 1}\n```') == '{"a": 1}'
+        assert _extract_json_candidate('{"s": "brace } in string"}') == '{"s": "brace } in string"}'
+        assert _extract_json_candidate("no json") is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_ainvoke_parses_and_validates(self):
+        from pydantic import BaseModel
+
+        from spine.agents.helpers import _prompt_structured_ainvoke
+
+        class Out(BaseModel):
+            verdict: str
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                assert any("JSON object conforming" in str(getattr(m, "content", "")) for m in payload)
+                return SimpleNamespace(content='Sure!\n{"verdict": "PASSED"}')
+
+        out = await _prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert out.verdict == "PASSED"
+
+    @pytest.mark.asyncio
+    async def test_prompt_ainvoke_raises_on_no_json(self):
+        from pydantic import BaseModel
+
+        from spine.agents.helpers import _prompt_structured_ainvoke
+
+        class Out(BaseModel):
+            verdict: str
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(content="no json here")
+
+        with pytest.raises(ValueError):
+            await _prompt_structured_ainvoke(FakeModel(), Out, [])
+
+    def test_openrouter_method_probe_gate(self, monkeypatch):
+        import spine.agents.helpers as h
+
+        class FakeOR:
+            model_name = "poolside/laguna-s-2.1"
+        FakeOR.__name__ = "ChatOpenRouter"
+
+        monkeypatch.setitem(h._structured_method_cache, "poolside/laguna-s-2.1", "prompt")
+        assert h.openrouter_native_structured_method(FakeOR()) == "prompt"
+        # non-OpenRouter models are never gated
+        class Plain: ...
+        assert h.openrouter_native_structured_method(Plain()) is None
+
+
+class TestPromptRungReasoningHardening:
+    """Laguna failing replies were content_len=0 with ~16K chars of
+    reasoning_content — reasoning ate the whole completion budget. The
+    prompt rung suppresses reasoning, salvages from the reasoning channel
+    as backstop, and repairs invalid \\escapes in code-bearing JSON."""
+
+    @pytest.mark.asyncio
+    async def test_salvages_from_reasoning_channel(self, monkeypatch):
+        import spine.agents.helpers as h
+        from pydantic import BaseModel
+
+        class Out(BaseModel):
+            verdict: str
+
+        monkeypatch.setattr(h, "suppress_reasoning", lambda m: m)
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(
+                    content="",
+                    additional_kwargs={"reasoning_content": 'thinking... {"verdict": "OK"}'},
+                )
+
+        out = await h._prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert out.verdict == "OK"
+
+    @pytest.mark.asyncio
+    async def test_repairs_invalid_php_escapes(self, monkeypatch):
+        import spine.agents.helpers as h
+        from pydantic import BaseModel
+
+        class Out(BaseModel):
+            ns: str
+
+        monkeypatch.setattr(h, "suppress_reasoning", lambda m: m)
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                # raw PHP namespace backslashes — strict JSON rejects \D and \F
+                return SimpleNamespace(content='{"ns": "App\\Domain\\Farm"}',
+                                       additional_kwargs={})
+
+        out = await h._prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert out.ns == "App\\Domain\\Farm"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_suppressed_on_invoke(self, monkeypatch):
+        import spine.agents.helpers as h
+        from pydantic import BaseModel
+
+        class Out(BaseModel):
+            v: str
+
+        seen = {}
+        def fake_suppress(m):
+            seen["called"] = True
+            return m
+        monkeypatch.setattr(h, "suppress_reasoning", fake_suppress)
+
+        class FakeModel:
+            async def ainvoke(self, payload, config=None, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(content='{"v": "x"}', additional_kwargs={})
+
+        await h._prompt_structured_ainvoke(FakeModel(), Out, [])
+        assert seen.get("called") is True

@@ -48,6 +48,57 @@ logger = logging.getLogger(__name__)
 # Default: 2 minutes — generous enough for brief pauses between agent
 # turns, but catches genuine hangs quickly.
 _STALL_TIMEOUT_SECONDS = int(__import__("os").environ.get("SPINE_STALL_TIMEOUT", "120"))
+# Minimum message chunks per stall window before a stream counts as making
+# progress. The wait_for timeout above fires only on TOTAL silence — a
+# degenerated backend stream dribbling ~1 token/min resets it forever
+# (observed live 2026-07-17: one /v1/chat stream produced nothing useful for
+# 25+ minutes while the serve answered fresh requests in seconds). Healthy
+# generation even on a slow single-stream box is ≥1 tok/s, i.e. hundreds per
+# window — 30 is far below healthy and far above a dribble. 0 disables.
+_STALL_MIN_CHUNKS = int(__import__("os").environ.get("SPINE_STALL_MIN_TOKENS", "30"))
+
+
+class _ThroughputStallMonitor:
+    """Detects a DRIBBLING stream that the chunk-silence timeout cannot see.
+
+    Progress = a node completion ("updates" chunk) or at least ``min_chunks``
+    message chunks inside any ``window_s`` span. A stream older than one
+    window since its last progress with fewer than ``min_chunks`` recent
+    message chunks is stalled — abort it so the run becomes restartable
+    instead of parking indefinitely.
+    """
+
+    def __init__(
+        self,
+        window_s: float,
+        min_chunks: int = _STALL_MIN_CHUNKS,
+        clock: Any = None,
+    ) -> None:
+        import time as _time
+        from collections import deque as _deque
+
+        self._window = window_s
+        self._min = min_chunks
+        self._clock = clock or _time.monotonic
+        self._chunks: Any = _deque()
+        self._last_progress: float = self._clock()
+
+    def note_chunk(self, is_progress: bool) -> bool:
+        """Record one stream chunk; True when the stream is throughput-stalled."""
+        if self._window <= 0 or self._min <= 0:
+            return False
+        now = self._clock()
+        if is_progress:
+            self._last_progress = now
+            self._chunks.clear()
+            return False
+        self._chunks.append(now)
+        cutoff = now - self._window
+        while self._chunks and self._chunks[0] < cutoff:
+            self._chunks.popleft()
+        if now - self._last_progress < self._window:
+            return False
+        return len(self._chunks) < self._min
 
 
 def _persist_state_artifacts(
@@ -631,6 +682,7 @@ async def submit_work(
         )
         stalled = False
         cancelled = False
+        throughput = _ThroughputStallMonitor(_STALL_TIMEOUT_SECONDS)
         while True:
             # Cooperative cancellation: a Stop Work click marks the work entry
             # ``cancelled``.  Poll at each stream boundary so we break promptly
@@ -667,6 +719,34 @@ async def submit_work(
                     "work_stalled",
                     "dispatcher",
                     {"last_phase": last_phase, "timeout": _STALL_TIMEOUT_SECONDS},
+                )
+                break
+
+            # Throughput stall: the wait_for above only fires on total
+            # silence — a dribbling stream (tokens arriving, none of them
+            # progress) must also count as stalled (2026-07-17 live park).
+            if throughput.note_chunk(
+                is_progress=isinstance(chunk, dict)
+                and chunk.get("type") == "updates"
+            ):
+                last_phase = result.get("current_phase", "")
+                logger.error(
+                    f"[{work_id}] Workflow stalled — stream dribbling below "
+                    f"{_STALL_MIN_CHUNKS} chunks/{_STALL_TIMEOUT_SECONDS}s "
+                    f"with no node completion (last phase: {last_phase}). "
+                    f"Marking as stalled."
+                )
+                stalled = True
+                _update_work_progress(db, work_id, last_phase, "stalled")
+                audit.log_event(
+                    work_id,
+                    "work_stalled",
+                    "dispatcher",
+                    {
+                        "last_phase": last_phase,
+                        "timeout": _STALL_TIMEOUT_SECONDS,
+                        "reason": "throughput",
+                    },
                 )
                 break
 
@@ -2172,6 +2252,7 @@ async def _run_workflow_graph_inner(
     )
     stalled = False
     cancelled = False
+    throughput = _ThroughputStallMonitor(_STALL_TIMEOUT_SECONDS)
 
     while True:
         # Cooperative cancellation: a Stop Work click marks the work entry
@@ -2209,6 +2290,31 @@ async def _run_workflow_graph_inner(
                 "work_stalled",
                 "dispatcher",
                 {"last_phase": last_phase, "timeout": _STALL_TIMEOUT_SECONDS},
+            )
+            break
+
+        # Throughput stall: dribbling streams evade the silence timeout.
+        if throughput.note_chunk(
+            is_progress=isinstance(chunk, dict) and chunk.get("type") == "updates"
+        ):
+            last_phase = result.get("current_phase", "")
+            logger.error(
+                f"[{work_id}] Workflow stalled — stream dribbling below "
+                f"{_STALL_MIN_CHUNKS} chunks/{_STALL_TIMEOUT_SECONDS}s "
+                f"with no node completion (last phase: {last_phase}). "
+                f"Marking as stalled."
+            )
+            stalled = True
+            _update_work_progress(db, work_id, last_phase, "stalled")
+            audit.log_event(
+                work_id,
+                "work_stalled",
+                "dispatcher",
+                {
+                    "last_phase": last_phase,
+                    "timeout": _STALL_TIMEOUT_SECONDS,
+                    "reason": "throughput",
+                },
             )
             break
 
@@ -2740,6 +2846,7 @@ async def approve_and_spawn(
 
         stall_timeout = _os.environ.get("SPINE_STALL_TIMEOUT")
         stall_timeout_val = int(stall_timeout or "120")
+        throughput = _ThroughputStallMonitor(stall_timeout_val)
 
         result: dict[str, Any] = dict(resume_state)
 
@@ -2780,6 +2887,20 @@ async def approve_and_spawn(
                 logger.error(
                     f"Resume of work {plan_id} stalled — no chunk received for "
                     f"{stall_timeout_val}s (last phase: {last_phase})"
+                )
+                break
+
+            # Throughput stall: dribbling streams evade the silence timeout.
+            if throughput.note_chunk(
+                is_progress=isinstance(chunk, dict)
+                and chunk.get("type") == "updates"
+            ):
+                stalled = True
+                last_phase = result.get("current_phase", "")
+                logger.error(
+                    f"Resume of work {plan_id} stalled — stream dribbling "
+                    f"below {_STALL_MIN_CHUNKS} chunks/{stall_timeout_val}s "
+                    f"with no node completion (last phase: {last_phase})"
                 )
                 break
 

@@ -44,24 +44,90 @@ logger = logging.getLogger(__name__)
 # this module — a circular import that breaks ``import spine.agents.plan_tools``
 # when it is the first module loaded.
 
-# File extensions worth reading when doing codebase search
+# File extensions worth reading when doing codebase search.
+#
+# `.php` and the other compiled/backend suffixes below were MISSING until
+# 2026-07-27, which made this tool structurally blind in any non-Python,
+# non-JS repo. On the agripath (Laravel) clone the walk branch's candidate
+# set therefore contained no source file at all — only .md/.json/.yaml/.sql —
+# so research could only ever "find" prose. That is the mechanism behind
+# probe 25 citing `.planning/phases/07-uuid-primary-keys/01-PLAN.md` four
+# times across its findings while never once surfacing the Farm.php model the
+# task named: markdown was not merely ranked higher, it was the only thing
+# eligible. Keep this list in step with the indexer's _INDEXABLE_EXTENSIONS.
 _CODE_EXTENSIONS = {
-    ".py",
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".json",
-    ".md",
-    ".txt",
-    ".sql",
-    ".sh",
+    # Python / JS / TS
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".vue", ".svelte",
+    # PHP / Ruby / Go / Rust / JVM / .NET / native
+    ".php", ".rb", ".go", ".rs", ".java", ".kt", ".kts", ".scala",
+    ".cs", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+    ".swift", ".m", ".mm",
+    # Config / data / scripts
+    ".yaml", ".yml", ".toml", ".json", ".sql", ".sh", ".bash",
+    # Prose — kept so README/AGENTS.md remain reachable, but note that
+    # planning trees are excluded by _DEFAULT_RESEARCH_SKIP_DIRS below.
+    ".md", ".txt",
 }
 _MAX_FILE_PREVIEW = 3000  # chars per file returned in search results
 _MAX_SEARCH_FILES = 8  # max files to return per search query
+
+# Directories `search_codebase` never walks. Two classes live here:
+#
+#   * build/vendor noise (.venv, node_modules, dist) — never interesting;
+#   * PLANNING PROSE (.planning, docs/adr) — actively HARMFUL as research
+#     evidence. Probe 25 (agripath UnitOfMeasure) is the incident: research
+#     cited `.planning/phases/07-uuid-primary-keys/01-PLAN.md` four times
+#     across its findings while never once reading the model the task named.
+#     Planning documents describe what someone INTENDED, at some past date;
+#     they are not the codebase and they go stale silently. The vector
+#     indexer already excludes them (it whitelists code suffixes only —
+#     see _INDEXABLE_EXTENSIONS in workers/vector_indexer.py), so before
+#     this list existed the two retrieval paths disagreed: recall could not
+#     see planning docs, grep-search could, and only the grep path fed the
+#     research summariser.
+#
+# Extend per-repo with `research_exclude_dirs` in .spine/config.yaml.
+_DEFAULT_RESEARCH_SKIP_DIRS = frozenset(
+    {
+        ".venv",
+        "venv",
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        "dist",
+        "build",
+        ".spine",
+        # Planning prose — intent, not implementation.
+        ".planning",
+        # Third-party trees the indexer also skips, kept in sync so the two
+        # retrieval paths cannot disagree about what the codebase contains.
+        "vendor",
+        "third_party",
+        "extern",
+        "external",
+        "site-packages",
+    }
+)
+
+
+def _research_skip_dirs() -> frozenset[str]:
+    """Directory names excluded from codebase search.
+
+    Defaults plus any `research_exclude_dirs` from config. Config only ever
+    ADDS: a repo can widen the exclusion but cannot re-admit planning prose
+    by accident.
+    """
+    try:
+        from spine.config import SpineConfig
+
+        extra = SpineConfig.load().research_exclude_dirs or []
+    except Exception:  # noqa: BLE001 — config unavailable ⇒ defaults stand
+        return _DEFAULT_RESEARCH_SKIP_DIRS
+    return _DEFAULT_RESEARCH_SKIP_DIRS | {str(d).strip("/") for d in extra if d}
 
 
 # ── read_prior_artifacts ──────────────────────────────────────────────────
@@ -298,6 +364,20 @@ class SearchCodebaseTool(BaseTool):
         root = Path(self.workspace_root or ".").resolve()
         file_patterns = file_patterns or []
 
+        # One skip list for BOTH branches below. Previously only the walk
+        # branch filtered directories, so an explicit pattern ('**/*.md',
+        # 'database/**') re-admitted everything the walk excluded.
+        skip_dirs = _research_skip_dirs()
+
+        def _admissible(fpath: Path) -> bool:
+            if not fpath.is_file():
+                return False
+            try:
+                parts = fpath.relative_to(root).parts
+            except ValueError:  # outside the workspace — not ours to read
+                return False
+            return not any(part in skip_dirs for part in parts)
+
         # Build candidate file set: pattern-filtered or all source files
         candidates: set[Path] = set()
         all_patterns_invalid = False
@@ -305,7 +385,9 @@ class SearchCodebaseTool(BaseTool):
             invalid_patterns: list[str] = []
             for pattern in file_patterns:
                 try:
-                    candidates.update(root.glob(pattern))
+                    candidates.update(
+                        p for p in root.glob(pattern) if _admissible(p)
+                    )
                 except ValueError as exc:
                     # pathlib rejects malformed globs — a bare '**' or 'a**b'
                     # raises "'**' can only be an entire path component"
@@ -321,24 +403,10 @@ class SearchCodebaseTool(BaseTool):
             all_patterns_invalid = len(invalid_patterns) == len(file_patterns)
 
         if not file_patterns or all_patterns_invalid:
-            # No usable patterns → walk workspace, skip common non-code dirs.
-            skip_dirs = {
-                ".venv",
-                "venv",
-                ".git",
-                "__pycache__",
-                "node_modules",
-                ".mypy_cache",
-                ".ruff_cache",
-                ".pytest_cache",
-                "dist",
-                "build",
-                ".spine",
-            }
+            # No usable patterns → walk workspace, skip non-code dirs.
             for fpath in root.rglob("*"):
-                if fpath.is_file() and fpath.suffix in _CODE_EXTENSIONS:
-                    if not any(part in skip_dirs for part in fpath.parts):
-                        candidates.add(fpath)
+                if fpath.suffix in _CODE_EXTENSIONS and _admissible(fpath):
+                    candidates.add(fpath)
 
         # Score files by how many queries match (using ripgrep for speed,
         # fall back to pure Python if rg is unavailable)

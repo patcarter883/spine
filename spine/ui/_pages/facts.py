@@ -83,9 +83,14 @@ def render(api: UIApi) -> None:
                         _GATE_BADGE.get(f.get("stored")),
                         _PROBE_BADGE.get(f.get("verified")),
                         f"ns `{f.get('namespace') or '—'}`",
+                        # gate_reason (serve rev 3e8c1b3+) is the meaningful
+                        # verdict; base_p is 0.0-noise in frontend mode, so
+                        # show it only when the reason is absent.
+                        f.get("gate_reason") and f"gate: {f['gate_reason']}",
                         None
-                        if f.get("base_p") is None
+                        if f.get("base_p") is None or f.get("gate_reason")
                         else f"base_p {f.get('base_p'):.3f}",
+                        f.get("mode") and f"mode `{f['mode']}`",
                     )
                     if b
                 )

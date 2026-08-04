@@ -286,7 +286,14 @@ SUBAGENT_PROMPTS: dict[str, str] = {
             "Your slice is ALREADY specified — target files, acceptance "
             "criteria, and an implementation directive are in your task. "
             "Codebase research happened upstream in PLAN. Do NOT survey the "
-            "codebase: read the named files, edit, report.\n\n"
+            "codebase: read the named files, edit, report.\n"
+            "That holds while your context is sufficient. If a symbol you "
+            "must call or extend is genuinely absent from it, ONE targeted "
+            "`codebase_query` for that symbol is correct and expected — "
+            "upstream research can miss a file (it has), and guessing an API "
+            "you were never shown is the more expensive mistake. Targeted "
+            "lookup is not surveying; re-reading the codebase to build "
+            "general understanding is.\n\n"
             "Your tools (each tool's own description has the full argument "
             "catalogue — this is just when to reach for which):\n"
             "- `read_edit_lint` — your ONLY filesystem tool (anchored read + "
@@ -474,10 +481,22 @@ _VERIFY_JUDGE_PROMPT = (
         "Your recollection of FRAMEWORK DEFAULT BEHAVIOR is not evidence. "
         "Never fail a criterion by asserting what a framework does by default "
         "(column nullability, casts, key types, bindings) — such claims are "
-        "frequently wrong (run f788042e failed a criterion on 'Laravel string "
-        "columns are nullable by default'; they are NOT NULL). When the code "
+        # Incident provenance: run f788042e (id kept out of the model string).
+        "frequently wrong (e.g. 'Laravel string columns are nullable by "
+        "default' — they are NOT NULL). When the code "
         "uses the framework's idiomatic form and no executed check "
-        "demonstrates a violation, the criterion passes on that point.",
+        "demonstrates a violation, the criterion passes ON THAT POINT — "
+        "meaning that framework-default claim alone must not sink it.\n\n"
+        "That is the ONLY thing a green check run licenses. It is not "
+        "evidence about WHAT the code says. Tests passing proves no "
+        "assertion failed; it cannot show that an assertion the criterion "
+        "demands was ever written — a weak test is exactly as green as a "
+        # Incident provenance: probe 25 (id kept out of the model string).
+        "strong one. When a criterion states what the code must DO or "
+        "ASSERT (compares X to Y, persists then re-reads, calls a specific "
+        "API), judge it from <target_source>/<worktree_diff> alone: quote "
+        "the line that satisfies it, or mark it failed. 'The automated "
+        "checks passed' is never the reason such a criterion passes.",
     )
     + "\n\n"
     + xml_block(
@@ -610,6 +629,7 @@ def _inject_mcp_tools(
                 mcp_servers=config.mcp_servers,
                 db_path=config.checkpoint_path,
                 search_result_char_cap=search_cap_for_subagent(subagent_name),
+                backend=getattr(config, "codebase_query_backend", "codebase-index"),
             )
         ]
         tools.extend(mcp_tools)
@@ -1009,15 +1029,44 @@ def build_subagent_spec(
         _verify_judge or name not in _schema_excluded
     ):
         schema_model = SUBAGENT_RESPONSE_MODELS[name]
-        if _supports_forced_tool_choice(model):
+        from spine.agents.helpers import openrouter_native_structured_method
+
+        _or_method = openrouter_native_structured_method(model)
+        if _or_method is not None and _or_method != "json_schema":
+            # OpenRouter endpoint without native structured output —
+            # ProviderStrategy and model_kwargs response_format both 404
+            # under require_parameters (laguna, 2026-07-22). No binding:
+            # the subagent's prompt describes the schema and every
+            # consumer carries a content-JSON salvage path.
+            logger.warning(
+                "subagent %r: OpenRouter endpoint lacks native structured "
+                "output (method=%s) — prompt + salvage only", name, _or_method,
+            )
+        elif _supports_forced_tool_choice(model):
             from langchain.agents.structured_output import ProviderStrategy
             spec["response_format"] = ProviderStrategy(schema=schema_model)
         else:
-            _bind_response_format(
+            # Thinking models reject forced tool choice, so the schema rides
+            # as a NATIVE json_schema response_format on the model itself.
+            # Mutating the local ``model`` is not enough: consumers like the
+            # verify subgraph hand the SPEC to build_phase_agent, which
+            # resolves its own model instance — the mutation was silently
+            # discarded and the judge ran completely unbound (run 019f81c1:
+            # every judge verdict arrived as CoT-polluted free text salvaged
+            # by the fallback JSON parser). Publish the schema on the spec so
+            # the agent builder can bind it to the model it actually uses.
+            bound = _bind_response_format(
                 model,
                 schema_model,
                 name=f"{name}_response",
             )
+            spec["native_json_schema"] = schema_model
+            if not bound and not isinstance(model, str):
+                logger.warning(
+                    "subagent %r: native json_schema binding failed on %s — "
+                    "relying on spec-level native_json_schema",
+                    name, type(model).__name__,
+                )
     if memory:
         spec["memory"] = memory
 

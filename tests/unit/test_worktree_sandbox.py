@@ -39,6 +39,9 @@ class _FakeOrchestrator:
         self.base_config = base_config
         self.master_dir = "/orig/cwd"
         self.calls: list[str] = []
+        # A real (non-empty) gate by default — the empty-pipeline refusal has
+        # dedicated tests below.
+        self.gate_config: dict = {"validation_pipeline": {"tests": {"command": "true"}}}
 
     def prepare_sandbox(self) -> str:
         self.calls.append("prepare")
@@ -51,6 +54,16 @@ class _FakeOrchestrator:
     def commit_and_merge(self) -> dict:
         self.calls.append("merge")
         return {"success": True, "merged": True}
+
+    def commit_and_preserve(self) -> dict:
+        self.calls.append("preserve")
+        return self.preserve_result
+
+    preserve_result: dict = {
+        "preserved": True,
+        "branch": "spine/patch-test",
+        "sandbox_dir": "/tmp/spine-sandbox-test",
+    }
 
     def rollback_workspace(self) -> dict:
         self.calls.append("rollback")
@@ -115,12 +128,67 @@ def test_active_finalize_merges_on_completed(fake_orch):
     assert fake_orch[0].calls == ["prepare", "validate", "merge"]
 
 
-@pytest.mark.parametrize("status", ["needs_review", "stalled", "failed", "error", ""])
+def test_active_finalize_preserves_on_stalled(fake_orch):
+    """A stall is an infrastructure event, not a verdict on the code — the
+    ratcheted best state stays reviewable (run d8bc459c 2026-07-24: a
+    stalled exit rolled back a patch verify had scored 4/8 VERIFIED)."""
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    sandbox.finalize("stalled")
+    assert fake_orch[0].calls == ["prepare", "preserve"]
+
+
+@pytest.mark.parametrize("status", ["failed", "error", ""])
 def test_active_finalize_rolls_back_on_non_success(fake_orch, status):
     sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "critical_task")
     sandbox.enter()
     sandbox.finalize(status)
     assert fake_orch[0].calls == ["prepare", "rollback"]
+
+
+def test_finalize_refuses_merge_on_empty_gate_and_preserves(fake_orch):
+    """An empty validation_pipeline cannot green-light a merge — internal
+    verify alone is the LLM grading its own homework (Wallace parity report
+    2026-07-24: two 'verified' merges, both broken). The patch is preserved,
+    not rolled back."""
+    from spine.git.orchestrator import MergeError
+
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    fake_orch[0].gate_config = {"validation_pipeline": {}}
+    with pytest.raises(MergeError, match="allow_merge_without_gate"):
+        sandbox.finalize("completed")
+    assert fake_orch[0].calls == ["prepare", "preserve"]
+
+
+def test_finalize_empty_gate_merge_with_explicit_opt_in(fake_orch):
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    fake_orch[0].gate_config = {
+        "validation_pipeline": {},
+        "allow_merge_without_gate": True,
+    }
+    sandbox.finalize("completed")
+    assert fake_orch[0].calls == ["prepare", "validate", "merge"]
+
+
+def test_active_finalize_preserves_on_needs_review(fake_orch):
+    """A review park keeps the patch: the sandbox worktree and branch ARE
+    the artifact a human reviews (run d8bc459c 2026-07-24: rollback nuked
+    a 13-file best state with 4/7 slices VERIFIED)."""
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    sandbox.finalize("needs_review")
+    assert fake_orch[0].calls == ["prepare", "preserve"]
+
+
+def test_active_finalize_needs_review_empty_sandbox_rolls_back(fake_orch):
+    """Nothing to review (no commits ahead of main) → normal rollback."""
+    sandbox = WorktreeSandbox(SpineConfig(workspace_root="/repo"), "task")
+    sandbox.enter()
+    fake_orch[0].preserve_result = {"preserved": False}
+    sandbox.finalize("needs_review")
+    assert fake_orch[0].calls == ["prepare", "preserve", "rollback"]
 
 
 def test_active_abort_rolls_back(fake_orch):
@@ -163,13 +231,15 @@ def test_finalize_blocks_merge_when_validation_fails(fake_orch, monkeypatch):
             "failure_message": "Unit tests failed",
         },
     )
-    with pytest.raises(MergeError):
+    with pytest.raises(MergeError, match="Unit tests failed"):
         sandbox.finalize("completed")
     assert "merge" not in fake_orch[0].calls
-    # The orchestrator is still attached, so the dispatcher's abort path
-    # can roll the un-merged sandbox back.
-    sandbox.abort()
-    assert fake_orch[0].calls[-1] == "rollback"
+    # The blocked patch is committed and preserved for review — NOT left for
+    # the dispatcher's abort path to roll back (that destroyed the only
+    # reviewable copy of gate-blocked work).
+    assert fake_orch[0].calls[-1] == "preserve"
+    sandbox.abort()  # orchestrator already consumed — a no-op
+    assert "rollback" not in fake_orch[0].calls
 
 
 def test_abort_never_raises_even_if_rollback_fails(fake_orch, monkeypatch):

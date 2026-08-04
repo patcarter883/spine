@@ -416,3 +416,29 @@ class TestApplyRsa:
     def test_non_openai_model_returned_unchanged(self):
         sentinel = object()
         assert helpers.apply_rsa(sentinel, {"n": 4}) is sentinel
+
+
+def test_local_payload_omits_empty_tools():
+    """vLLM rejects `tools: []` outright ('must not be an empty array...') —
+    every no-tool judge request 400'd (run d8bc459c 2026-07-25). An empty
+    binding must be stripped from the wire payload, along with any dangling
+    tool_choice."""
+    model = helpers._build_local_model(
+        "openai:x", {"base_url": "http://localhost:8000/v1", "api_key": "vllm"}
+    )
+    payload = model._get_request_payload(
+        [("human", "judge this")],
+        tools=[],
+        tool_choice="auto",
+    )
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+
+
+def test_local_payload_keeps_nonempty_tools():
+    model = helpers._build_local_model(
+        "openai:x", {"base_url": "http://localhost:8000/v1", "api_key": "vllm"}
+    )
+    tool = {"type": "function", "function": {"name": "f", "parameters": {}}}
+    payload = model._get_request_payload([("human", "go")], tools=[tool])
+    assert payload["tools"] == [tool]

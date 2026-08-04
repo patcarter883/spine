@@ -123,31 +123,51 @@ class SliceDetail(BaseModel):
     # prompt-prose versions of these rules were ignored twice by the local
     # planner (runs a56e89a6 / 2257cd64: 'binds the model via a model()
     # method' re-emitted after the rule was added to the prompt).
+    # Two rules used to sit here flatly conjoined: "NEVER a required
+    # mechanism" and, four lines later, a MANDATED example that names one
+    # ("…EQUAL the factory-generated values after a database round-trip").
+    # A small model had to resolve that on every generation, and this exact
+    # collision has cost runs in both directions — probe 8 parked when the
+    # prescriptiveness audit blocked a correctly-grounded criterion for three
+    # rounds, probe 25 landed a `not->toBeEmpty()` against a demanded
+    # equality. They are not actually in tension once the TASK is named as
+    # the arbiter, so the rule below states that precedence explicitly
+    # instead of leaving the model to infer it.
     acceptance_criteria: list[str] = Field(
         min_length=1,
         description=(
             "Measurable checks that prove this slice is complete. Each "
             "criterion states an OBSERVABLE OUTCOME of running or reading "
             "THIS slice's files ('creating a UnitOfMeasure via the factory "
-            "persists name and abbreviation'), NEVER a required mechanism, "
-            "method name, property, or idiom — if the framework's standard "
-            "convention delivers the behavior, the criterion must pass. No "
-            "edge-case semantics the task didn't ask for. Every criterion "
-            "must be checkable from this slice's own files/diff/test run. "
-            "NEVER WEAKEN a behavior the task/spec states: when it demands a "
-            "test assert a specific behavior, the criterion must encode that "
-            "EXACT observable ('asserts the persisted model's name and "
-            "abbreviation EQUAL the factory-generated values after a "
-            "database round-trip'), not a weaker stand-in — type checks, "
-            "non-empty checks, or unpersisted construction do NOT satisfy a "
-            "demanded persistence/equality behavior."
+            "persists name and abbreviation'), and must be checkable from "
+            "this slice's own files/diff/test run.\n"
+            "When outcome-phrasing and mechanism seem to conflict, THE TASK "
+            "DECIDES:\n"
+            "- Behaviour the task or spec DEMANDS is encoded EXACTLY, "
+            "including any mechanism it names: 'asserts the persisted "
+            "model's name and abbreviation EQUAL the factory-generated "
+            "values after a database round-trip'. Never substitute a weaker "
+            "stand-in — type checks, non-empty checks, or unpersisted "
+            "construction do NOT satisfy a demanded persistence/equality "
+            "behaviour.\n"
+            "- Mechanism the task did NOT ask for is never a criterion: no "
+            "method name, property, or idiom of your own invention, and no "
+            "edge-case semantics the task never raised. Where the "
+            "framework's standard convention already delivers the demanded "
+            "behaviour, the criterion passes on that convention."
         ),
     )
 
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 def _research_text(state: dict[str, Any]) -> str:
-    """Compact the retrieved research context into a bounded grounding blob."""
+    """Compact the retrieved research context into a bounded grounding blob.
+
+    Files the task named by path are appended AFTER the budget is applied:
+    they are pre-read ground truth, not retrieval, and must not be crowded
+    out by however many chunks recall happened to return (same exemption the
+    A2 findings ledger carries).
+    """
     chunks: list[str] = []
     for item in state.get("retrieved_context") or []:
         if not isinstance(item, dict):
@@ -157,8 +177,16 @@ def _research_text(state: dict[str, Any]) -> str:
         summ = item.get("enriched_summary") or item.get("summary") or ""
         if sym or summ:
             chunks.append(f"- {sym} ({path}): {str(summ)[:240]}")
-    text = "\n".join(chunks)
-    return text[:_RESEARCH_CHARS]
+    text = "\n".join(chunks)[:_RESEARCH_CHARS]
+
+    pinned = state.get("task_named_sources") or []
+    if pinned:
+        from spine.workflow.task_paths import render_task_named_sources
+
+        block = render_task_named_sources(pinned)
+        if block:
+            text = f"{text}\n\n{block}" if text else block
+    return text
 
 
 def _phase(sub: str) -> str:
@@ -210,6 +238,13 @@ def _is_external_reference(sym: str) -> bool:
     """
     s = (sym or "").strip()
     if "/" in s or "\\" in s or s.endswith(".py"):
+        return True
+    # Route-name / URI-pattern shapes are never code symbols: Laravel route
+    # names carry '{param}' placeholders and kebab-case segments
+    # ('farms.{farm_id}.rain-gauges' — run 2026-07-24 chased two of these
+    # through five critic rounds to a non_convergence park). No identifier
+    # in any target language contains '{', '}' or '-'.
+    if "{" in s or "}" in s or "-" in s:
         return True
     # PHP expression forms are never cross-slice contracts: '$table->uuid'
     # is a fluent call on a local variable, not a symbol a producer creates
@@ -413,6 +448,63 @@ def _symbol_exists_in_index(db_path: str | None, sym: str) -> bool:
     return _owner_declares_attribute(db_path, sym)
 
 
+@lru_cache(maxsize=512)
+def _is_resolvable_module_path(sym: str) -> bool:
+    """True when *sym* itself imports as a MODULE (internal or external).
+
+    A reference like 'spine.cli' is a fact about where code lives, never a
+    symbol a producer slice must create — but `_importable_external_root`
+    deliberately refuses project-internal roots, and module paths are not
+    index symbols, so run 5646d24c burned all 5 plan-critic rounds on
+    "'spine.cli' does not exist in the codebase index". Full-path resolution
+    is precise: 'spine.cli' resolves, 'spine.nonexistent' does not, and
+    'spine.cli.list_cmd' falls through to the symbol checks.
+    """
+    s = (sym or "").strip()
+    if not s or "." not in s or not all(p.isidentifier() for p in s.split(".")):
+        return False
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(s) is not None
+    except Exception:  # noqa: BLE001 — resolution failure ⇒ not a module
+        return False
+
+
+def _unprovable_reference(
+    db_path: str | None, sym: str, known_roots: frozenset[str] | set[str] = frozenset()
+) -> bool:
+    """True when the gate cannot PROVE *sym* dangling — so it must not flag.
+
+    Two shapes, both live false-positive escalations (run 5646d24c parked
+    after 5 rounds on the pair):
+
+    - Importable MODULE paths ('spine.cli') — see
+      :func:`_is_resolvable_module_path`.
+    - Dotted refs whose ROOT segment is unknown to the index
+      ('console.print', where `console` is a module-level Console() variable
+      the tree-sitter index never catalogs). With an unindexed root the gate
+      has no ground truth to check the attribute against — the same policy
+      that already exempts BARE unqualified identifiers. Refs with an
+      INDEXED owner ('ArtifactStore.artifact_existsX') stay fully flaggable,
+      which is where the gate has ever caught real defects.
+
+    ``known_roots`` are plan-internal owner names (slice ids, roots of
+    ``provides`` entries): a root the PLAN itself defines is contract
+    territory even though the index has never seen it ('api.add_provider'
+    where 'api' is a producer slice), so it is never unprovable.
+    """
+    if _is_resolvable_module_path(sym):
+        return True
+    root = _root(sym)
+    if not root or root == sym.strip() or root in known_roots:
+        return False
+    # _symbol_exists_in_index is the shared (and test-injectable) index seam;
+    # for a single-segment name it is exactly "does the index know this root"
+    # and stays permissive (True) when the index is unavailable.
+    return not _symbol_exists_in_index(db_path, root)
+
+
 def _owner_declares_attribute(db_path: str, sym: str) -> bool:
     """True when *sym* is an ``Owner.attr`` whose owner's source assigns it.
 
@@ -511,6 +603,12 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
 
         graph: dict[str, set[str]] = {s.id: set(s.dependencies or []) for s in stubs}
         violations: list[str] = []
+        # Plan-internal owner names: slice ids and provides roots — a root
+        # the plan itself defines is contract territory, never unprovable.
+        known_roots = frozenset(
+            {s.id for s in stubs}
+            | {_root(p) for s in stubs for p in (s.provides or []) if _root(p)}
+        )
 
         for s in stubs:
             for ref in s.reference_symbols or []:
@@ -549,6 +647,10 @@ def repair_and_validate_contracts(skeleton: PlanSkeleton, work_id: str) -> list[
                 # burned three manager rounds in run b15cee51). Provided
                 # bare symbols still get dependency edges above.
                 if "." not in ref and "::" not in ref and "\\" not in ref:
+                    continue
+                # Module paths and unindexed-root refs are unverifiable —
+                # the gate flags only provable danglings (run 5646d24c).
+                if _unprovable_reference(db_path, ref, known_roots):
                     continue
                 violations.append(
                     f"slice '{s.id}' references '{ref}', which does not exist in "
@@ -640,6 +742,12 @@ async def _run_manager(
 
 
 # ── Tier B: per-slice worker ────────────────────────────────────────────────
+# Each AC rule below came out of a parked run; the illustrative examples in
+# the prompt ARE those incidents, with the run ids stripped (provenance:
+# prescriptive-pairing 019f25b8, invented-edge-case 019f4077,
+# framework-convention a56e89a6). Keep the examples concrete — this model
+# class copies patterns far better than it follows abstract rules — but keep
+# run ids and other maintainer provenance OUT of model-facing strings.
 _WORKER_ROLE = (
     "You implement the detail of ONE feature slice of a technical plan. You are "
     "given the slice stub (what it does, which files, which existing symbols it "
@@ -655,28 +763,27 @@ _WORKER_ROLE = (
     "what the code does (inputs accepted, effects produced, values returned) — "
     "never implementation prescriptions. Do NOT prescribe parameter names, "
     "exact signatures, private-helper choices, import style, or internal "
-    "idioms unless the specification itself dictates them (run 019f25b8: "
-    "criteria demanding 'individual params' AND 'mirrors add_llm_provider' "
-    "were unsatisfiable together and blocked a working implementation for "
-    "seven cycles). When the slice extends an existing class or file, every "
+    "idioms unless the specification itself dictates them (e.g. criteria "
+    "demanding 'individual params' AND 'mirrors add_llm_provider' are "
+    "unsatisfiable together and block a working implementation for cycle "
+    "after cycle). When the slice extends an existing class or file, every "
     "criterion must be satisfiable by code that follows that file's existing "
     "conventions; a behavior an implementer could deliver in several "
     "reasonable shapes must be stated so ALL of them pass.\n"
     "GROUNDING RULE: every criterion must trace to the specification or the "
     "task description. Do NOT invent edge-case semantics the spec never asks "
     "for — exception handling, None/type coercion, input validation, "
-    "thread-safety (run 019f4077: an invented criterion 'returns None if "
-    "get_providers() raises (no internal exception handling)' was "
-    "self-contradictory and parked an otherwise-converged run). If the spec "
-    "is silent on an edge case, leave it out of the criteria.\n"
+    "thread-safety (e.g. an invented criterion 'returns None if "
+    "get_providers() raises (no internal exception handling)' is "
+    "self-contradictory and blocks an otherwise-working implementation). "
+    "If the spec is silent on an edge case, leave it out of the criteria.\n"
     "FRAMEWORK CONVENTION RULE: when the target framework has a standard "
     "way to deliver a behavior, the criterion must accept it — never demand "
-    "a specific mechanism the framework doesn't require (run a56e89a6: a "
-    "criterion demanded factories 'bind the model via a model() method' "
-    "when Laravel's convention is a protected $model property; the editor "
-    "wrote idiomatic code and the run parked enforcing the criterion). "
-    "State the OUTCOME ('the factory creates UnitOfMeasure instances'), "
-    "not the wiring.\n"
+    "a specific mechanism the framework doesn't require (e.g. a criterion "
+    "demanding factories 'bind the model via a model() method' fails "
+    "idiomatic Laravel code, whose convention is a protected $model "
+    "property). State the OUTCOME ('the factory creates UnitOfMeasure "
+    "instances'), not the wiring.\n"
     "JOINT SATISFIABILITY: one implementation must be able to satisfy ALL "
     "criteria simultaneously — never pair a required outcome with a "
     "prohibition on the only mechanism that can produce it (e.g. 'returns "

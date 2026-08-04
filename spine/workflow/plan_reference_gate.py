@@ -49,7 +49,9 @@ from typing import Any
 
 from spine.agents.plan_synthesis import (
     _is_external_reference,
+    _is_resolvable_module_path,
     _leaf,
+    _root,
     _symbol_exists_in_index,
 )
 from spine.models.enums import ReviewStatus
@@ -238,6 +240,17 @@ def check_reference_symbols(
 
     exclusions = _scope_exclusions(specification_json)
     prior_leafs = set((prior_gate or {}).get("dangling_leafs") or [])
+    # Plan-internal owner names (slice ids, provides roots): roots the plan
+    # itself defines stay flaggable even though the index has not seen them.
+    plan_roots: set[str] = {
+        str(s.get("id", "")) for s in slices if isinstance(s, dict)
+    }
+    for s in slices:
+        if isinstance(s, dict):
+            for p in s.get("provides") or []:
+                r = _root(_normalize_symbol(str(p)))
+                if r:
+                    plan_roots.add(r)
 
     dangling: list[dict[str, Any]] = []
     redefined: list[dict[str, Any]] = []
@@ -247,10 +260,17 @@ def check_reference_symbols(
         sid = s.get("id", "?")
         target_files = [f for f in (s.get("target_files") or []) if f]
         for ref in s.get("reference_symbols") or []:
-            ref = _normalize_symbol(str(ref))
+            raw = str(ref)
+            ref = _normalize_symbol(raw)
             if not ref:
                 continue
             leaf = _leaf(ref)
+            # PHP '::class' constant — the reference is to the class itself
+            # ('Policy::class'), not to a member named 'class'. Resolve the
+            # owner instead.
+            if leaf == "class" and "." in ref:
+                ref = ref.rsplit(".", 1)[0]
+                leaf = _leaf(ref)
             # External-library names and Python builtins are not contracts —
             # bare aliases ('st.form'), module-qualified imports
             # ('spine.ui._pages.config_view.st', run 019f2104), and research
@@ -270,6 +290,37 @@ def check_reference_symbols(
             # still compares bare names against provides, and executed
             # verify evidence owns actual correctness.
             if "." not in ref and "\\" not in ref:
+                continue
+            # Module paths ('spine.cli') and unindexed-root refs
+            # ('console.print' — module-level variable, invisible to the
+            # index) are unverifiable: the gate flags only PROVABLE
+            # danglings. Run 5646d24c burned all 5 plan-critic rounds on
+            # exactly this pair (verdict_source=gate, planner correct).
+            # Roots the index KNOWS ('UIApi.get_llm_providersX') stay
+            # flaggable — that is where the gate catches real defects.
+            if _is_resolvable_module_path(ref):
+                continue
+            ref_root = _root(ref)
+            if (
+                ref_root
+                and ref_root not in plan_roots
+                and not _find_symbol_files(db_path, ref_root)
+            ):
+                continue
+            # PHP static-call members on a class the plan CREATES: a new
+            # Eloquent model's static surface is dominated by framework-
+            # inherited methods ('RainGauge::query' / '::findOrFail' — run
+            # 2026-07-24 chased these through five critic rounds to a
+            # non_convergence park). The root's producer slice is the real
+            # dependency; member existence on an unindexed class is
+            # unverifiable pre-implementation. Python dotted refs keep the
+            # strict member check (the UIApi.get_llm_providersX catcher).
+            if (
+                "::" in raw
+                and ref_root
+                and ref_root in plan_roots
+                and not _find_symbol_files(db_path, ref_root)
+            ):
                 continue
             dangling.append(
                 {
@@ -292,8 +343,29 @@ def check_reference_symbols(
         # fallback) so a new method that merely shares a short name with some
         # unrelated existing symbol is not misflagged.
         for p in s.get("provides") or []:
-            sym = _normalize_symbol(str(p))
+            raw_p = str(p)
+            sym = _normalize_symbol(raw_p)
             if not sym:
+                continue
+            # Owner context is required before "already exists" means
+            # anything. Judged on the RAW entry, because the qualifier may be
+            # a class ('UIApi.get_providers', 'FileController::store') OR a
+            # path ('spine/ui_api/api.py:get_providers', run 019f20e0) and
+            # _normalize_symbol strips the path form down to a bare leaf.
+            #
+            # Without this, a generic verb indicts the planner for a
+            # collision it did not cause: every codebase contains a `create`
+            # / `up` / `handle`, so leaf-matching always "finds" one. Probe
+            # 25 (agripath UnitOfMeasure) declared `create` on the migration
+            # slice, the leaf matched, the plan was rejected, and the re-plan
+            # cost 9m22s of a 25m34s run — 37% of the run spent restating a
+            # plan whose only defect was a bookkeeping verb. The second plan
+            # passed by setting `provides` to [].
+            #
+            # Mirrors the identical skip the dangling branch above applies,
+            # so the two halves of this gate now agree on what counts as a
+            # checkable contract.
+            if not any(tok in raw_p for tok in (".", "::", "/", "\\")):
                 continue
             files = _find_symbol_files(db_path, sym)
             if files:

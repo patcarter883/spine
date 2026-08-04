@@ -232,6 +232,34 @@ async def test_per_call_mode_overrides_settings_and_ask_full_surfaces_mode_serve
 
 
 @pytest.mark.asyncio
+async def test_lookup_namespaces_and_delete_namespace():
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/cam/lookup":
+            if request.url.params.get("subject"):
+                return httpx.Response(
+                    200, json={"delivered": True, "subject": "s", "object": "o"}
+                )
+            return httpx.Response(
+                200, json={"matches": [{"subject": "s", "object": "o"}]}
+            )
+        if p == "/cam/namespaces" and request.method == "GET":
+            return httpx.Response(
+                200, json=[{"namespace": "p", "facts": 3, "frozen": False}]
+            )
+        if p.startswith("/cam/namespaces/"):
+            assert request.method == "DELETE"
+            return httpx.Response(200, json={"dropped": True})
+        raise AssertionError(f"unexpected path {p}")
+
+    c = _client_with(handler)
+    assert (await c.lookup(subject="s"))["delivered"] is True
+    assert (await c.lookup(text="what is s"))["matches"][0]["object"] == "o"
+    assert (await c.namespaces())[0]["namespace"] == "p"
+    assert await c.delete_namespace("p") is True
+
+
+@pytest.mark.asyncio
 async def test_freeze_uses_query_param():
     seen = {}
 

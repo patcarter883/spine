@@ -1,12 +1,14 @@
 """CAM provider-config passthrough on the local ChatOpenAI builder.
 
 With a `cam:` block on the provider, every model built for that provider must
-(1) scope requests to the project namespace via the X-CAM-Namespace default
-header and (2) pin the server's ambient auto-write gate with an explicit
-top-level `cam_write` body field — True only under `write: ambient`, because
-agent prompts are not conversational turns and an explicit False must override
-a server booted with MINISGL_CAM_AUTO_WRITE=1. Without a `cam:` block the
-request is byte-unchanged (no header, no field).
+pin the server's ambient auto-write gate with an explicit top-level
+`cam_write` body field — True only under `write: ambient`. The
+X-CAM-Namespace header rides ONLY when a server-side ambient path is in use
+(read: transparent/both or write: ambient): the header makes the serve run a
+retrieve-generate before every chat generation, which wedged it under
+concurrent agent load (2026-07-16, blockers serve-wedged/-2). Under the
+default read: facts_block, agent traffic stays CAM-silent. Without a `cam:`
+block the request is byte-unchanged (no header, no field).
 """
 
 from __future__ import annotations
@@ -44,7 +46,10 @@ def test_no_cam_config_leaves_request_untouched(monkeypatch):
     assert "cam_write" not in (captured.get("extra_body") or {})
 
 
-def test_cam_explicit_namespace_sets_header_and_write_false(monkeypatch):
+def test_cam_default_facts_block_sends_no_header(monkeypatch):
+    # read defaults to facts_block: the block is client-rendered, so agent
+    # traffic must NOT carry the namespace header (it triggers a per-request
+    # retrieve-generate on the serve).
     captured = _capture_chat_openai(monkeypatch)
     helpers._build_local_model(
         "openai:Qwen-Local",
@@ -53,11 +58,35 @@ def test_cam_explicit_namespace_sets_header_and_write_false(monkeypatch):
             "cam": {"namespace": "myproj"},
         },
     )
-    assert captured.get("default_headers") == {"X-CAM-Namespace": "myproj"}
+    assert "default_headers" not in captured
     # Default write mode is `distill`: ambient auto-write explicitly pinned off.
     assert (captured.get("extra_body") or {}).get("cam_write") is False
     # CAM must not disturb the normal streaming path.
     assert captured.get("streaming") is True
+
+
+def test_cam_transparent_read_sets_header(monkeypatch):
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local",
+        {
+            "base_url": "http://localhost:1919/v1",
+            "cam": {"namespace": "myproj", "read": "transparent"},
+        },
+    )
+    assert captured.get("default_headers") == {"X-CAM-Namespace": "myproj"}
+
+
+def test_cam_ambient_write_sets_header_too(monkeypatch):
+    captured = _capture_chat_openai(monkeypatch)
+    helpers._build_local_model(
+        "openai:Qwen-Local",
+        {
+            "base_url": "http://localhost:1919/v1",
+            "cam": {"namespace": "myproj", "write": "ambient"},
+        },
+    )
+    assert captured.get("default_headers") == {"X-CAM-Namespace": "myproj"}
 
 
 def test_cam_ambient_write_mode_sends_true(monkeypatch):
@@ -85,7 +114,7 @@ def test_cam_auto_namespace_slugs_workspace_root(monkeypatch):
     )
     helpers._build_local_model(
         "openai:Qwen-Local",
-        {"base_url": "http://localhost:1919/v1", "cam": True},
+        {"base_url": "http://localhost:1919/v1", "cam": {"read": "transparent"}},
     )
     assert captured.get("default_headers") == {"X-CAM-Namespace": "my-repo"}
 

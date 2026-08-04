@@ -207,7 +207,7 @@ class TestTurnBudgetGuard:
         msgs = [HumanMessage(content="go"), *[AIMessage(content=str(i)) for i in range(3)]]
         out = await mw.awrap_model_call(self._Req(messages=msgs), self._identity)
         appended = out.messages[-1]
-        assert isinstance(appended, SystemMessage)
+        assert isinstance(appended, HumanMessage)  # template-safe nudge
         assert "TURN BUDGET GUARD" in appended.content
 
     @pytest.mark.asyncio

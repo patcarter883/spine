@@ -27,7 +27,7 @@ import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from spine.agents import symbol_cache
 from spine.agents._tokens import count_tokens
@@ -1011,7 +1011,7 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
     turns can be wasted on breadth-first wandering first. This middleware
     counts tool calls emitted so far and intervenes in two stages:
 
-      * ``>= soft_threshold``: append a nudging ``SystemMessage`` asking the
+      * ``>= soft_threshold``: append a nudging ``HumanMessage`` asking the
         model to begin synthesising findings.
       * ``>= hard_threshold``: append a stronger forcing reminder AND drop
         the tool bindings (``request.override(tools=[])``) so the model has
@@ -1059,7 +1059,13 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
             )
             return await handler(
                 request.override(
-                    messages=[*messages, SystemMessage(content=reminder)],
+                    # HumanMessage, not SystemMessage: strict chat templates
+                    # (cyankiwi Qwen AWQ, live 2026-07-17) raise
+                    # "System message must be at the beginning" on trailing
+                    # system turns — failing the call exactly when the agent
+                    # most needs the nudge. The bracketed tag marks it as
+                    # harness steering either way.
+                    messages=[*messages, HumanMessage(content=reminder)],
                     tools=[],
                 )
             )
@@ -1075,7 +1081,7 @@ class ResearcherConvergenceMiddleware(AgentMiddleware):
             n, self.soft_threshold,
         )
         return await handler(
-            request.override(messages=[*messages, SystemMessage(content=nudge)])
+            request.override(messages=[*messages, HumanMessage(content=nudge)])
         )
 
     def wrap_tool_call(self, request, handler):
@@ -1100,7 +1106,7 @@ class SearchLoopGuard(AgentMiddleware):
     returned ``[]`` before accepting the section didn't exist and creating it.
 
     After ``threshold`` consecutive empty search results this middleware
-    appends a ``SystemMessage`` telling the model to stop re-searching and act
+    appends a ``HumanMessage`` telling the model to stop re-searching and act
     on what it already knows (create the thing, or proceed) — without dropping
     tools, so legitimate non-search work still runs. The streak resets the
     moment any search returns a hit.
@@ -1142,7 +1148,110 @@ class SearchLoopGuard(AgentMiddleware):
         )
         logger.info("SearchLoopGuard: intervening (empty streak=%d)", streak)
         return await handler(
-            request.override(messages=[*messages, SystemMessage(content=reminder)])
+            request.override(messages=[*messages, HumanMessage(content=reminder)])
+        )
+
+    def wrap_tool_call(self, request, handler):
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        return await handler(request)
+
+
+# read_edit_lint is compound: the ARGS decide whether a call read or wrote.
+_RELL_READ_ARGS: frozenset[str] = frozenset({"read_symbol", "read_around"})
+
+
+def _is_read_only_call(name: str, args: dict) -> bool | None:
+    """True read, False write, None if the call is neither.
+
+    ``None`` (e.g. ``execute``) leaves the streak untouched rather than
+    resetting it — running a command is not producing output either.
+    """
+    if _is_search_tool(name) or name == "ast_extract_symbol":
+        return True
+    if name == "read_edit_lint":
+        keys = {k for k, v in (args or {}).items() if v not in (None, "", [], {})}
+        if keys & _RELL_READ_ARGS and not (keys - _RELL_READ_ARGS - {"file_path"}):
+            return True
+        return False  # an edit arg is present ⇒ this call wrote
+    return None
+
+
+class ReadBudgetGuard(AgentMiddleware):
+    """Nudge toward output when reads pile up with nothing written.
+
+    The existing guards miss this shape. :class:`SearchLoopGuard` fires only
+    on consecutive EMPTY results, and a survey spiral's reads all succeed.
+    :class:`TurnBudgetGuard` fires on total turns, long after the budget is
+    spent. Neither notices an agent that reads eight files, learns plenty,
+    and writes nothing.
+
+    Spine's answer to date has been prose in the slice-implementer prompt —
+    "Exploration budget: maximum 2 turns of read/lookup before your first
+    write", "never read one file per turn", "If you haven't changed code by
+    turn 3, you're over-exploring". That asks a small model to count its own
+    behaviour across turns, which is among the things it is worst at, and
+    the survey-trap incidents kept recurring behind those rules.
+
+    Counting is the harness's job. This mirrors smallcode's early_stop
+    governor (soft nudge at 5 read-only calls, firm at 8, reset by any
+    write) — observed working on the same model that spirals here: it
+    tripped both thresholds and the model wrote its files immediately after.
+
+    The streak counts read-only calls since the last write and resets the
+    moment anything is written, so a genuine read→edit→read→edit rhythm
+    never trips it. Tools stay bound throughout; this only appends a message.
+    """
+
+    def __init__(self, soft: int = 5, hard: int = 8) -> None:
+        if soft < 1 or hard < soft:
+            raise ValueError("require 1 <= soft <= hard")
+        self.soft = soft
+        self.hard = hard
+
+    @staticmethod
+    def _reads_since_last_write(messages: list) -> int:
+        call_map = build_tool_call_map(messages)
+        streak = 0
+        for msg in messages:
+            if not isinstance(msg, ToolMessage):
+                continue
+            name = msg.name or ""
+            args: dict = {}
+            if msg.tool_call_id in call_map:
+                mapped_name, args = call_map[msg.tool_call_id]
+                name = name or mapped_name
+            verdict = _is_read_only_call(name, args)
+            if verdict is True:
+                streak += 1
+            elif verdict is False:
+                streak = 0
+        return streak
+
+    async def awrap_model_call(self, request, handler):
+        messages = request.messages
+        streak = self._reads_since_last_write(messages)
+        if streak < self.soft:
+            return await handler(request)
+        if streak >= self.hard:
+            reminder = (
+                f"[READ BUDGET GUARD] {streak} read/lookup calls and no file "
+                f"written yet. You have enough context. STOP reading and make "
+                f"the edit now with read_edit_lint. If one specific symbol is "
+                f"still missing, fetch that ONE thing and then edit "
+                f"immediately — do not read anything else first."
+            )
+        else:
+            reminder = (
+                f"[READ BUDGET GUARD] {streak} read/lookup calls so far with "
+                f"nothing written. You likely have what you need — start "
+                f"editing. Read further only if a specific symbol you must "
+                f"call is genuinely absent from your context."
+            )
+        logger.info("ReadBudgetGuard: intervening (read streak=%d)", streak)
+        return await handler(
+            request.override(messages=[*messages, HumanMessage(content=reminder)])
         )
 
     def wrap_tool_call(self, request, handler):
@@ -1163,7 +1272,7 @@ class TurnBudgetGuard(AgentMiddleware):
     ceiling and burn ~1M input tokens on a small edit (trace 019ed413: 69
     model turns ≈ 954K input for a config-UI change).
 
-    After ``threshold`` model turns this middleware appends a SystemMessage
+    After ``threshold`` model turns this middleware appends a HumanMessage
     directing the model to converge — finish the edit, report status, stop
     exploring. Tools stay bound, so a genuinely long slice can still finish;
     the directive escalates each turn past the threshold so a model that
@@ -1219,7 +1328,7 @@ class TurnBudgetGuard(AgentMiddleware):
             )
         logger.info("TurnBudgetGuard: intervening (turns=%d, over=%d)", turns, over)
         return await handler(
-            request.override(messages=[*request.messages, SystemMessage(content=reminder)])
+            request.override(messages=[*request.messages, HumanMessage(content=reminder)])
         )
 
     def wrap_tool_call(self, request, handler):

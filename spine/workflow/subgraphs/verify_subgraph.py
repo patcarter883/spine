@@ -29,12 +29,14 @@ Edges::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Coroutine, Literal
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -48,6 +50,7 @@ from spine.agents.artifacts import (
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
 from spine.agents.plan_do import (
     directive_from_state,
+    empty_directive,
     format_directive_for_prompt,
     run_plan_node,
 )
@@ -58,6 +61,64 @@ from spine.workflow.subgraph_state import VerifySubgraphState
 
 logger = logging.getLogger(__name__)
 _MAX_ARTIFACT_STATE_CHARS = 500
+
+
+# ── Verify-branch deadline (trace 019f7df2) ─────────────────────────────
+# Concurrency for verify's fan-out is the PROVIDER's job — the shared
+# httpx pool enforces ``max_concurrent_calls`` and the weighted transport
+# enforces ``max_concurrent_streams`` before the pool (http_clients.py).
+# What no existing layer provides is a deadline: on attempt 8, verifier
+# calls that had a connection sat with zero tokens for ~35 minutes
+# (neither request_timeout nor the stream-chunk watchdog fired), and the
+# dispatcher stall monitor can't see subagent calls. So each verify-branch
+# LLM call gets a hard deadline reusing the EXISTING stall knob
+# (SPINE_STALL_TIMEOUT, default 900s — the same "longest tolerable
+# silence" the operator already tunes). ``asyncio.wait_for`` CANCELS the
+# call on expiry — closing the connection and freeing the serve slot —
+# retries once, then raises ``VerifierBranchTimeout`` so the caller's
+# existing fallback (empty directive / NOT_VERIFIED result) takes over
+# instead of hanging the whole run.
+
+
+class VerifierBranchTimeout(RuntimeError):
+    """A verify-branch LLM call produced nothing within the deadline."""
+
+
+def _branch_deadline() -> float:
+    raw = os.getenv("SPINE_STALL_TIMEOUT") or "900"
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 900.0
+    return max(60.0, v)
+
+
+async def _guarded_branch(
+    coro_factory: Callable[[], Coroutine[Any, Any, Any]],
+    *,
+    work_id: str,
+    slice_id: str,
+    what: str,
+    attempts: int = 2,
+) -> Any:
+    """Run one verify branch's LLM call under a hard deadline."""
+    deadline = _branch_deadline()
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(coro_factory(), timeout=deadline)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            logger.warning(
+                "[%s] %s for slice %r produced nothing in %.0fs "
+                "(attempt %d/%d) — call cancelled%s",
+                work_id, what, slice_id, deadline, attempt, attempts,
+                "" if attempt < attempts else "; giving up",
+            )
+    raise VerifierBranchTimeout(
+        f"{what} for slice {slice_id!r} produced nothing within "
+        f"{deadline:.0f}s × {attempts} attempts"
+    ) from last_exc
 
 
 # ── Router: START → run_slice_verifier (Send) or synthesize ─────────────
@@ -227,13 +288,23 @@ async def _plan_slice_verifier_node(
         f"## Acceptance criteria\n{crit_lines}\n\n"
         f"## Target files\n{file_lines}"
     )
-    directive = await run_plan_node(
-        state=dict(state),
-        config=config,
-        phase_path=f"{PhaseName.VERIFY.value}/subagents/slice-verifier",
-        task_description=task,
-        role_hint=f"slice-verifier for slice {slice_id!r}",
-    )
+    try:
+        directive = await _guarded_branch(
+            lambda: run_plan_node(
+                state=dict(state),
+                config=config,
+                phase_path=f"{PhaseName.VERIFY.value}/subagents/slice-verifier",
+                task_description=task,
+                role_hint=f"slice-verifier for slice {slice_id!r}",
+            ),
+            work_id=work_id,
+            slice_id=slice_id,
+            what="plan_slice_verifier LLM call",
+        )
+    except VerifierBranchTimeout as exc:
+        # The do node runs fine against an empty directive — losing the
+        # planning step beats hanging the whole verify fan-out.
+        directive = empty_directive(str(exc))
     logger.info(
         "[%s] plan_slice_verifier: slice=%r approach=%r",
         work_id, slice_id, directive.approach[:80],
@@ -637,6 +708,8 @@ def _reconcile_verdict(
     checks_failures: list[str],
     work_id: str,
     slice_id: str,
+    target_files: list[str] | None = None,
+    workspace_root: str = ".",
 ) -> None:
     """Derive the slice verdict from ground truth instead of trusting it.
 
@@ -649,8 +722,12 @@ def _reconcile_verdict(
       do nothing with, so the run parked contentlessly.
 
     Rules, in order: any HARD check failure ⇒ NOT_VERIFIED (failures
-    appended as checklist entries + gaps); else a non-empty all-passed
-    checklist with no gaps ⇒ VERIFIED. Mutates in place.
+    appended as checklist entries + gaps); else equality criteria whose
+    tests assert no compared value are demoted (see
+    :mod:`spine.workflow.assertion_gate` — probe 25 passed "asserts the name
+    matches the expected value" against a `not->toBeEmpty()` on the strength
+    of a green check run); else a non-empty all-passed checklist with no
+    gaps ⇒ VERIFIED. Mutates in place.
     """
     verdict = verification_result.get("verdict")
     if checks_failures:
@@ -673,6 +750,27 @@ def _reconcile_verdict(
                 })
                 gaps.append(entry)
         return
+
+    # A green check run evidences that assertions did not fail, never WHAT
+    # was asserted. Demote equality criteria the test source cannot support
+    # before the all-passed shortcut below can promote the slice on them.
+    try:
+        from spine.workflow.assertion_gate import (
+            demote_unsupported_equality_criteria,
+        )
+
+        demote_unsupported_equality_criteria(
+            verification_result,
+            list(target_files or []),
+            workspace_root,
+            work_id=work_id,
+            slice_id=slice_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — a gate that can crash verify is worse
+        logger.warning(
+            "[%s] Slice-verifier %r: assertion gate skipped — %s",
+            work_id, slice_id, exc,
+        )
 
     checklist = verification_result.get("checklist") or []
     all_passed = bool(checklist) and all(
@@ -783,6 +881,7 @@ async def _run_slice_verifier_node(
             is_subagent=True,
             extra_tools=extra_tools,
             response_format=subagent_spec.get("response_format"),
+            native_json_schema=subagent_spec.get("native_json_schema"),
             skip_filesystem_middleware=True,
             # The subagent_spec already curated the verifier's tool surface
             # (read + execute tools only — slice-verifier is not in the MCP
@@ -873,17 +972,27 @@ async def _run_slice_verifier_node(
             tail,
         )
 
-        result = await ainvoke_with_retry(
-            agent,
-            {"messages": [{"role": "user", "content": prompt}]},
-            phase_name="verify-slice",
+        result = await _guarded_branch(
+            lambda: ainvoke_with_retry(
+                agent,
+                {"messages": [{"role": "user", "content": prompt}]},
+                phase_name="verify-slice",
+                work_id=work_id,
+            ),
             work_id=work_id,
+            slice_id=slice_id,
+            what="run_slice_verifier subagent",
         )
 
         verification_result = _extract_verification_result(result, slice_id)
         if isinstance(verification_result, dict):
             _reconcile_verdict(
-                verification_result, checks_failures, work_id, slice_id
+                verification_result,
+                checks_failures,
+                work_id,
+                slice_id,
+                target_files=slice_data.get("target_files") or [],
+                workspace_root=state.get("workspace_root", "."),
             )
 
     except MaxTokenBudgetExceeded as budget_exc:

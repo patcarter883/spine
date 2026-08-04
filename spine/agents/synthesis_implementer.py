@@ -35,6 +35,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -48,7 +49,11 @@ from pydantic import BaseModel, Field
 from spine.agents.decomposer import _ainvoke_structured_escalating
 from spine.agents.helpers import resolve_chat_model
 from spine.agents.prompt_format import Tag, hostage_layout, xml_blocks
-from spine.agents.tools.read_edit_lint import ReadEditLintTool
+from spine.agents.tools.read_edit_lint import (
+    ReadEditLintTool,
+    _confused_path_prefix,
+    _toplevel_dirs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +136,11 @@ class SynthesizedEdit(BaseModel):
     action: str = Field(
         default="replace",
         description=(
-            "'replace' the whole definition with `code`, or 'insert_before' / "
+            "'replace' the whole definition with `code`, 'insert_before' / "
             "'insert_after' to add a new top-level construct adjacent to the "
-            "anchor symbol."
+            "anchor symbol, or 'append' to add `code` at the END of the file "
+            "(no anchor needed — REQUIRED for files with no named "
+            "definitions, e.g. procedural route/config files)."
         ),
     )
     code: str = Field(
@@ -268,6 +275,17 @@ def build_synthesis_prompt(
             "corrected SynthesizedSlice that fixes exactly those failures — keep "
             "the edits that were fine, repair the ones the linter rejected."
         )
+        if final_mile_fails:
+            # A placement retry must NOT abandon the minimal-edit discipline:
+            # run 019f82b1 — every FINAL MILE call whose edits bounced was
+            # retried with a wholesale-rework tail, and the regenerations
+            # regressed near-passing slices twice (ratchet restores). The
+            # constraint rides the retry too.
+            tail += (
+                "\nFINAL MILE still applies: emit the SMALLEST possible "
+                "edit set, touch only the definitions the failing criteria "
+                "name, and do NOT re-emit anything that already passes."
+            )
     elif final_mile_fails:
         crit_lines = "\n".join(f"- {c}" for c in final_mile_fails)
         tail = (
@@ -402,6 +420,54 @@ def _coerce_candidate(response: Any) -> SynthesizedSlice | None:
     return None
 
 
+_PLACEHOLDER_BODIES = {"...", "pass", "TODO", "# TODO", "// TODO", "# ...", "// ..."}
+
+
+def _is_placeholder_content(code: str) -> bool:
+    """True when new-file content is an elision, not a file.
+
+    ``_is_stub_body`` judges Python function bodies via AST — useless for a
+    PHP file whose entire content is ``...`` (run 019f81c1: the editor
+    elided RainfallCrudTest.php to a literal 3-byte ``...`` in TWO
+    consecutive cycles; PHP's syntax check passes it as plain text, so the
+    lint oracle was blind and verify burned a cycle each time discovering
+    it). Language-agnostic and conservative: only blocks content that is
+    empty, a known placeholder token, or too short to be any real file.
+    """
+    stripped = (code or "").strip()
+    return (
+        not stripped
+        or stripped in _PLACEHOLDER_BODIES
+        or len(stripped) <= 10
+    )
+
+
+_SOURCE_FILE_EXT_RE = re.compile(
+    r"\.(php|py|js|jsx|ts|tsx|vue|rb|go|rs|java|cs|sql|yaml|yml|json|env)$",
+    re.IGNORECASE,
+)
+
+
+def _is_whole_file_symbol(symbol: str, file: str) -> bool:
+    """True when an edit's symbol names the FILE rather than a definition.
+
+    Editors under rework pressure emit ``action=replace`` with the target
+    file's own path as the symbol — a wholesale file regeneration. Shapes
+    matched: the edit's file path itself, its basename, any slash-bearing
+    path, or a bare filename with a source extension. Real symbols
+    (``Class.method``, ``RouteServiceProvider::boot``, dotted qualified
+    names) contain no slashes and no file extension.
+    """
+    s = (symbol or "").strip()
+    if not s:
+        return True
+    if s == file or s == Path(file).name:
+        return True
+    if "/" in s or "\\" in s:
+        return True
+    return bool(_SOURCE_FILE_EXT_RE.search(s))
+
+
 def apply_synthesized(
     candidate: SynthesizedSlice,
     *,
@@ -438,6 +504,37 @@ def apply_synthesized(
             continue
         try:
             if not (Path(workspace_root) / edit.file).exists():
+                confusion = _confused_path_prefix(workspace_root, edit.file)
+                if confusion is not None:
+                    # HARD BLOCK: creating a file into a phantom tree.
+                    # Monorepo path confusion writes entire features outside
+                    # the build (Wallace parity report 2026-07-24: one patch
+                    # landed at root 'src/' outside the package, another
+                    # under a doubled 'apps/apps/…' — both "verified", both
+                    # dead code). Positive-evidence-only, so genuinely new
+                    # trees stay creatable.
+                    result.failures.append(
+                        {**rec, "status": "path_confusion_blocked",
+                         "detail": (
+                             f"Refusing to create {edit.file!r}: {confusion}. "
+                             f"Existing top-level directories: "
+                             f"{_toplevel_dirs(workspace_root)}."
+                         )}
+                    )
+                    continue
+                if _is_placeholder_content(edit.code):
+                    # Creating a placeholder is a placement FAILURE, not a
+                    # scoring penalty — a 3-byte '...' file lints clean and
+                    # costs a whole verify cycle to discover.
+                    result.failures.append(
+                        {**rec, "status": "placeholder_content_blocked",
+                         "detail": (
+                             f"{edit.file} would be created with placeholder "
+                             f"content ({edit.code.strip()!r}) — emit the "
+                             f"file's full real content, never an elision."
+                         )}
+                    )
+                    continue
                 # A brand-new file has no symbol anchors, so ast_edit bounces
                 # not_found and the slice fails identically every cycle (run
                 # 019f40ac: a new test file was synthesized three times and
@@ -445,6 +542,38 @@ def apply_synthesized(
                 # the edit's code becomes the file's initial content, and any
                 # later edits in this candidate see the file as existing.
                 raw = tool._run(file_path=edit.file, full_replace=edit.code)
+            elif edit.action == "append":
+                # Anchor-free by design; the symbol field is irrelevant.
+                raw = tool._run(
+                    file_path=edit.file,
+                    ast_edit={"symbol": edit.symbol or edit.file,
+                              "action": "append", "code": edit.code},
+                )
+            elif _is_whole_file_symbol(edit.symbol, edit.file):
+                # HARD BLOCK: whole-file replacement of an EXISTING file.
+                # A path-shaped symbol means the editor wants to regenerate
+                # the file wholesale — which silently deletes every
+                # definition it didn't reproduce (run 019f81f1: a rework
+                # candidate emitted action=replace symbol='routes/api.php'
+                # against the 328-line shared route file; only the anchor
+                # resolver's not_found stopped the clobber). Policy, not
+                # coincidence: fail the edit with corrective steering so the
+                # retry produces targeted edits instead.
+                result.failures.append(
+                    {**rec, "status": "whole_file_replace_blocked",
+                     "detail": (
+                         f"symbol {edit.symbol!r} is a file path, not a "
+                         f"symbol — wholesale replacement of an existing "
+                         f"file is not permitted (every definition not "
+                         f"reproduced would be deleted). Re-emit targeted "
+                         f"edits: action='replace' anchored on the specific "
+                         f"symbol being changed, action='insert_after' "
+                         f"anchored on an existing symbol, or "
+                         f"action='append' to add new content at the end "
+                         f"of the file (no anchor needed)."
+                     )}
+                )
+                continue
             else:
                 raw = tool._run(
                     file_path=edit.file,

@@ -162,6 +162,54 @@ def _topics_near_duplicate(a: str, b: str) -> bool:
     return (overlap / min(len(fa), len(fb))) >= _TOPIC_DUPE_OVERLAP_THRESHOLD
 
 
+_ELLIPSIS_MARKERS = ("...", "…")
+
+
+def _is_placeholder_topic(topic: str) -> bool:
+    """True when a topic is template filler rather than a real question.
+
+    Work d8bc459c attempt 7: the manager emitted the literal string
+    ``"... topic ..."`` four times — a scaffold pattern-copied from its own
+    reasoning when guided decoding forced an answer. Ellipses, bracket
+    placeholders, and near-empty strings are never legitimate research
+    questions: real topics are full plain-English sentences, and the prompt
+    bans symbol/file references, so ``...`` has no honest use in one.
+    """
+    t = (topic or "").strip()
+    if not t:
+        return True
+    if any(m in t for m in _ELLIPSIS_MARKERS):
+        return True
+    if t[0] in "<[{" and t[-1] in ">]}":
+        return True
+    return len(re.findall(r"[A-Za-z]{2,}", t)) < 3
+
+
+def _sanitize_topics(topics: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split a manager response's topics into (kept, rejected-with-reason).
+
+    Intra-round only: cross-round dedup lives in
+    ``exploration_subgraph._new_topics``, which cannot see duplicates or
+    filler WITHIN one response (attempt 7 ran the same placeholder through
+    topic_lookup four times).
+    """
+    kept: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for raw in topics:
+        t = (raw or "").strip()
+        if _is_placeholder_topic(t):
+            rejected.append((t, "placeholder"))
+            continue
+        if any(
+            _normalise_topic(t) == _normalise_topic(k) or _topics_near_duplicate(t, k)
+            for k in kept
+        ):
+            rejected.append((t, "intra-round duplicate"))
+            continue
+        kept.append(t)
+    return kept, rejected
+
+
 # Word-boundary pattern, NOT bare substrings: plain `"explore" in blob`
 # matched identifier fragments like "onboarding/explorer" and
 # "slice-explorer" in critic feedback that was purely about artifact
@@ -682,61 +730,125 @@ async def run_research_manager(
         # into a dict so the Pydantic instance never leaks into LangGraph
         # state (avoids the checkpoint serializer warning on AIMessage.parsed).
         structured_model = bind_structured_output(model, ResearchManagerDecision)
-        # LangChain's tracer Pydantic-serializes the raw AIMessage with
-        # `.parsed` populated to our custom model, which trips Pydantic's
-        # "unexpected value" warning every call. The warning is cosmetic
-        # — suppress only this specific warning around the invocation.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*PydanticSerializationUnexpectedValue.*parsed.*",
-            )
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*Expected `none`.*parsed.*",
-            )
-            response = await ainvoke_structured_with_retry(
-                structured_model,
-                [SystemMessage(content=manager_prompt), HumanMessage(content=context)],
-                label="research_manager",
+        messages: list[Any] = [
+            SystemMessage(content=manager_prompt),
+            HumanMessage(content=context),
+        ]
+        decision = "done"
+        topics: list[str] = []
+        for attempt in (1, 2):
+            # LangChain's tracer Pydantic-serializes the raw AIMessage with
+            # `.parsed` populated to our custom model, which trips Pydantic's
+            # "unexpected value" warning every call. The warning is cosmetic
+            # — suppress only this specific warning around the invocation.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*PydanticSerializationUnexpectedValue.*parsed.*",
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*Expected `none`.*parsed.*",
+                )
+                response = await ainvoke_structured_with_retry(
+                    structured_model,
+                    messages,
+                    label="research_manager",
+                )
+
+            # .with_structured_output() may return the Pydantic instance
+            # directly (newer LangChain) or in AIMessage.parsed (legacy
+            # providers).
+            if isinstance(response, ResearchManagerDecision):
+                parsed = response
+            elif hasattr(response, "parsed") and isinstance(
+                response.parsed, ResearchManagerDecision
+            ):
+                parsed = response.parsed
+                response.parsed = None  # prevent Pydantic serialization warning
+            else:
+                raise ValueError(
+                    f"Unexpected structured output response type: {type(response).__name__}"
+                )
+
+            logger.info(
+                "[%s] Research manager: decision=%s topics=%s",
+                work_id, parsed.decision, parsed.topics,
             )
 
-        # .with_structured_output() may return the Pydantic instance directly
-        # (newer LangChain) or in AIMessage.parsed (legacy providers).
-        if isinstance(response, ResearchManagerDecision):
-            parsed = response
-        elif hasattr(response, "parsed") and isinstance(response.parsed, ResearchManagerDecision):
-            parsed = response.parsed
-            response.parsed = None  # prevent Pydantic serialization warning
-        else:
-            raise ValueError(
-                f"Unexpected structured output response type: {type(response).__name__}"
-            )
+            decision = parsed.decision
+            if decision != "explore":
+                topics = []
+                break
 
-        logger.info(
-            "[%s] Research manager: decision=%s topics=%s",
-            work_id, parsed.decision, parsed.topics,
-        )
+            raw_topics = list(parsed.topics or [])
+            # Small local models (trace 019e72bc) sometimes pick "explore"
+            # while leaving topics=[] — a structurally-valid but semantically-
+            # empty response that the downstream router treats as a contract
+            # failure. Treat the empty-topics shape as the model declining to
+            # research further and downgrade to "done" so synthesis can
+            # proceed. The alternative (generic-topic fallback) burns a whole
+            # research round on trivial tasks where the model already
+            # signalled it has nothing specific to investigate.
+            if not raw_topics:
+                logger.warning(
+                    "[%s] Research manager: model returned explore with empty "
+                    "topics on round %d (phase=%s) — coercing to 'done' so the "
+                    "workflow can proceed. Treat this as the model declining to "
+                    "research further.",
+                    work_id, round_num + 1, phase,
+                )
+                decision = "done"
+                break
 
-        # Small local models (trace 019e72bc) sometimes pick "explore" while
-        # leaving topics=[] — a structurally-valid but semantically-empty
-        # response that the downstream router treats as a contract failure.
-        # Treat the empty-topics shape as the model declining to research
-        # further and downgrade to "done" so synthesis can proceed. The
-        # alternative (generic-topic fallback) burns a whole research round
-        # on trivial tasks where the model already signalled it has nothing
-        # specific to investigate.
-        decision = parsed.decision
-        topics = parsed.topics
-        if decision == "explore" and not topics:
+            kept, rejected = _sanitize_topics(raw_topics)
+            if rejected:
+                logger.warning(
+                    "[%s] Research manager: rejected %d/%d topic(s) on round %d "
+                    "attempt %d: %s",
+                    work_id, len(rejected), len(raw_topics), round_num + 1,
+                    attempt, [(t[:80], why) for t, why in rejected],
+                )
+            if kept:
+                topics = kept
+                break
+
+            if attempt == 1:
+                # Every topic was filler (work d8bc459c attempt 7: the manager
+                # emitted the literal placeholder "... topic ..." four times
+                # and topic_lookup vector-searched it verbatim). One retry
+                # with the rejection named in-conversation; a second garbage
+                # response gets the mechanical fallback below — LLM output
+                # contradicting a deterministic check never proceeds as-is.
+                messages = messages + [
+                    AIMessage(
+                        content=json.dumps(
+                            {"decision": decision, "topics": raw_topics}
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            "REJECTED: every topic in your previous response "
+                            f"was placeholder filler or a duplicate: {raw_topics!r}. "
+                            "Template text like '... topic ...' is not a "
+                            "research topic. Return 2-4 concrete, distinct "
+                            "research questions about THIS codebase, written "
+                            "as full plain-English sentences — or decide "
+                            "'done' if no further research is needed."
+                        )
+                    ),
+                ]
+                continue
+
             logger.warning(
-                "[%s] Research manager: model returned explore with empty "
-                "topics on round %d (phase=%s) — coercing to 'done' so the "
-                "workflow can proceed. Treat this as the model declining to "
-                "research further.",
-                work_id, round_num + 1, phase,
+                "[%s] Research manager: all topics rejected on the retry as "
+                "well — forcing 'done' so synthesis proceeds on existing "
+                "findings rather than researching placeholder strings.",
+                work_id,
             )
             decision = "done"
+            break
+
         result: dict[str, Any] = {"manager_decision": decision, "topics": topics}
         if task_category:
             result["task_category"] = task_category

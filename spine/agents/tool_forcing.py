@@ -78,7 +78,7 @@ import logging
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from spine.agents.helpers import _is_openai_style_model
 
@@ -92,6 +92,12 @@ _RELEASE = object()
 # ChatOpenRouter bind_tools() map this onto the OpenAI ``tool_choice="required"``
 # wire value; vLLM and llama.cpp honor it identically.
 _FORCE_ANY = "any"
+
+# Toolless-turn reminder: tag marks reminder messages for counting; the cap
+# bounds the loop so a model that will never call the tool still terminates
+# (the structural contract failure then owns the outcome).
+_REMINDER_TAG = "[TOOL CONTRACT]"
+_MAX_TOOLLESS_REMINDERS = 3
 
 
 def _tool_name(tool: Any) -> str:
@@ -108,6 +114,22 @@ def _tool_name(tool: Any) -> str:
             return fn.get("name", "") or ""
         return tool.get("name", "") or ""
     return getattr(tool, "name", "") or ""
+
+
+def _forced_choice_supported(model: Any) -> bool:
+    """True when the provider accepts a non-"auto" ``tool_choice`` at all.
+
+    OpenRouter routes with ``require_parameters=True``, and endpoints that
+    only accept ``tool_choice: auto`` are rejected UP-FRONT for any forced
+    value — "No endpoints found that support the provided 'tool_choice'
+    value" (trace 019eaf2a: minimax-m3 rejected a named pin; 2026-07-22:
+    poolside/laguna-s-2.1 rejected "required"/"any" too — per Pat, the
+    OpenRouter surface only reliably supports auto). ChatOpenRouter
+    therefore never gets a forced tool_choice: the middleware's reminder
+    loop still gates termination on the final tool actually succeeding, so
+    forcing degrades to prompt-driven calling instead of a permanent 404.
+    """
+    return type(model).__name__ != "ChatOpenRouter"
 
 
 def _named_pin_supported(model: Any) -> bool:
@@ -202,6 +224,8 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
         messages = list(getattr(request, "messages", None) or [])
         if self._final_tool_succeeded(messages):
             return _RELEASE
+        if not _forced_choice_supported(model):
+            return _RELEASE
         if self._gate_tool_called(messages) and _named_pin_supported(model):
             return self.final_tool  # pin the structured write specifically
         return _FORCE_ANY
@@ -261,6 +285,47 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
             return {"jump_to": "end"}
         return None
 
+    def _remind_if_toolless(self, state: Any) -> dict[str, Any] | None:
+        """Loop a toolless terminal turn back to the model with a reminder.
+
+        The provider-agnostic half of forcing: when ``tool_choice`` cannot
+        be pinned (ChatOpenRouter — auto-only endpoints) the model may end
+        its turn in prose without ever calling ``final_tool``; without this
+        hook the agent ENDS there and the phase dies on a structural
+        contract failure (laguna run 3, 2026-07-22: two clean-thread
+        specify attempts, zero write_specification calls — the "reminder
+        loop" this middleware's docs referenced did not actually exist).
+        Bounded: after ``_MAX_TOOLLESS_REMINDERS`` the turn ends and the
+        contract failure handles it. The reminder is a HumanMessage —
+        strict templates reject mid-thread system messages.
+        """
+        messages = list((state or {}).get("messages") or [])
+        if not messages or not isinstance(messages[-1], AIMessage):
+            return None
+        if getattr(messages[-1], "tool_calls", None):
+            return None
+        if self._final_tool_succeeded(messages):
+            return None
+        reminders = sum(
+            1 for m in messages
+            if isinstance(m, HumanMessage) and _REMINDER_TAG in str(m.content)
+        )
+        if reminders >= _MAX_TOOLLESS_REMINDERS:
+            return None
+        logger.warning(
+            "tool_forcing: turn ended with no tool call and %r not yet "
+            "satisfied — reminding (%d/%d) and looping",
+            self.final_tool, reminders + 1, _MAX_TOOLLESS_REMINDERS,
+        )
+        return {
+            "messages": [HumanMessage(content=(
+                f"{_REMINDER_TAG} Your last turn ended without the required "
+                f"tool call. Call {self.final_tool} NOW with complete "
+                f"arguments — do not reply with prose."
+            ))],
+            "jump_to": "model",
+        }
+
     # ── middleware hooks (sync + async) ─────────────────────────────────
 
     @hook_config(can_jump_to=["end"])
@@ -270,6 +335,14 @@ class ForceToolUntilCalledMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state, runtime=None):
         return self._should_end(state)
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state, runtime=None):
+        return self._remind_if_toolless(state)
+
+    @hook_config(can_jump_to=["model"])
+    async def aafter_model(self, state, runtime=None):
+        return self._remind_if_toolless(state)
 
     def wrap_model_call(self, request, handler):
         return handler(self._apply(request))

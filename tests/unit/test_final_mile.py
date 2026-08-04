@@ -66,7 +66,12 @@ def test_final_mile_prompt_tail_lists_exact_criteria():
     assert "VERIFICATION REWORK" not in p  # final-mile tail replaces it
 
 
-def test_lint_feedback_still_outranks_final_mile_tail():
+def test_lint_feedback_leads_but_final_mile_constraint_survives():
+    # Original contract dropped FINAL MILE entirely on a placement retry —
+    # run 019f82b1 showed those retries regenerating wholesale and
+    # regressing near-passing slices (two ratchet restores). The error-fix
+    # instruction still LEADS the tail; the minimal-edit constraint now
+    # rides along instead of vanishing.
     p = build_synthesis_prompt(
         slice_json="{}",
         refs_body="",
@@ -75,7 +80,8 @@ def test_lint_feedback_still_outranks_final_mile_tail():
         feedback="E999 boom",
     )
     assert "FAILED to place" in p
-    assert "FINAL MILE" not in p
+    assert "FINAL MILE still applies" in p
+    assert p.index("FAILED to place") < p.index("FINAL MILE still applies")
 
 
 def test_prefer_minimal_picks_smallest_clean_candidate(tmp_path):

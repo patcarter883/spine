@@ -7,6 +7,7 @@ LangGraph, Deep Agents, and LangSmith tracing without manual sourcing.
 
 from __future__ import annotations
 
+import logging
 import os
 import json
 from dataclasses import dataclass, field
@@ -228,7 +229,18 @@ class SpineConfig:
     default_timeout: int = 0
     mcp_servers: dict = field(default_factory=dict)
     guided_decoding: bool = False
+    # Extra directory names `search_codebase` must not walk during research,
+    # ADDED to the built-in defaults (which already exclude build/vendor noise
+    # and `.planning`). Use for repo-specific prose trees whose contents state
+    # intent rather than implementation — research that cites them reports
+    # plans as though they were code.
+    research_exclude_dirs: list = field(default_factory=list)
 
+    # Structural-intelligence backend behind CodebaseQueryTool:
+    # "codebase-index" (default) or "codebase-memory"
+    # (DeusData/codebase-memory-mcp; needs a matching mcp_servers entry).
+    # See docs/codebase-memory-mcp-migration-plan.md Phase 1.
+    codebase_query_backend: str = "codebase-index"
     # RAG (Retrieval-Augmented Generation) configuration
     embedding_provider: str = "openai-embeddings"
     recall_k: int = 10
@@ -414,6 +426,14 @@ class SpineConfig:
     # The guard only nudges — tools stay bound — so legitimate long slices can
     # still finish; 0 disables it.
     implement_max_turns: int = 30
+    # [soft, hard] read-only tool calls tolerated before the ReadBudgetGuard
+    # nudges the editor toward writing. Counts reads since the LAST WRITE and
+    # resets on any write, so a read→edit→read→edit rhythm never trips it —
+    # unlike implement_max_turns, which only fires once the budget is spent.
+    # Replaces the self-policing prose in the slice-implementer prompt
+    # ("maximum 2 turns of read/lookup before your first write") with a
+    # counter the harness keeps. Empty disables. Suggested: [5, 8].
+    implement_read_budget: list = field(default_factory=list)
     # Soft turn budget for the (tool-using) slice-verifier ReAct fallback — the
     # verify-side analogue of ``implement_max_turns``. When the evidence-then-judge
     # path is off, the verifier reads files + runs checks in a loop; nothing
@@ -818,6 +838,9 @@ class SpineConfig:
                 str(spine.get("guided_decoding", False)).lower(),
             )
             in ("1", "true", "yes"),
+            codebase_query_backend=spine.get(
+                "codebase_query_backend", "codebase-index"
+            ),
             embedding_provider=spine.get("embedding_provider", "openai-embeddings"),
             recall_k=int(spine.get("recall_k", 10)),
             index_tests=str(spine.get("index_tests", False)).lower() in ("1", "true", "yes"),
@@ -1079,7 +1102,9 @@ class SpineConfig:
                     return entry["model"]
                 provider_ref = entry.get("provider")
                 if provider_ref:
-                    named = self._lookup_provider_by_name(provider_ref)
+                    named = self._pinned_provider(
+                        provider_ref, context=f"escalation ladder, phase {phase!r}"
+                    )
                     if named and named.get("model"):
                         return named["model"]
 
@@ -1103,7 +1128,9 @@ class SpineConfig:
                 # 2. Provider reference — look up the named provider
                 provider_ref = phase_cfg.get("provider")
                 if provider_ref:
-                    named = self._lookup_provider_by_name(provider_ref)
+                    named = self._pinned_provider(
+                        provider_ref, context=f"phases.{key} model pin"
+                    )
                     if named and named.get("model"):
                         return named["model"]
 
@@ -1216,6 +1243,11 @@ class SpineConfig:
     def _lookup_provider_by_name(self, name: str) -> dict | None:
         """Find a named provider in ``providers.llm[]``.
 
+        Deliberately permissive about ``enabled`` — ``fallback_provider``
+        references legitimately point at ``enabled: false`` standbys. PIN
+        sites (phase/escalation ``provider:`` references) must go through
+        :meth:`_pinned_provider` instead.
+
         Args:
             name: The ``"name"`` field of the provider entry to find.
 
@@ -1226,6 +1258,28 @@ class SpineConfig:
             if provider.get("name") == name:
                 return provider
         return None
+
+    def _pinned_provider(self, name: str, *, context: str) -> dict | None:
+        """Named-provider lookup for phase/escalation PINS — refuses disabled.
+
+        A pin naming a disabled provider is a config contradiction, and
+        honouring it silently re-enables the provider for that lane
+        (2026-07-21: the clone's ``phases.onboarding: provider: openrouter``
+        pin kept routing the facts-seed distiller to the DISABLED paid
+        openrouter lane). The pin is ignored with a warning so resolution
+        falls through to less-specific keys / the default provider.
+        """
+        named = self._lookup_provider_by_name(name)
+        if named is None:
+            return None
+        if not named.get("enabled", True):
+            logging.getLogger(__name__).warning(
+                "provider pin %r (%s) names a DISABLED provider — ignoring "
+                "the pin; enable the provider or repoint the pin",
+                name, context,
+            )
+            return None
+        return named
 
     @staticmethod
     def _escalation_entry(phase_cfg: dict, level: int) -> dict | None:
@@ -1342,7 +1396,9 @@ class SpineConfig:
                     continue
                 provider_ref = phase_cfg.get("provider")
                 if provider_ref:
-                    named = self._lookup_provider_by_name(provider_ref)
+                    named = self._pinned_provider(
+                        provider_ref, context=f"phases.{key} provider pin"
+                    )
                     if named:
                         base = dict(named)
                         break

@@ -574,6 +574,70 @@ def _verify_result_mapper(subgraph_result: dict, parent_state: WorkflowState) ->
     phase_status = subgraph_result.get("phase_status", "")
     findings_override: list[dict] | None = None
     ratchet_note = ""
+
+    # ── Un-applied gap plan ──
+    # The gap planner names the files it wants changed. If a rework cycle
+    # wrote NONE of them, the remediation did not happen — whatever the
+    # verdict says. Probe 25 is the case: gap_plan round 2 spelled out
+    # `create()` + assertDatabaseHas + RefreshDatabase + drop the boilerplate
+    # test; the implement cycle wrote nothing; verify then flipped the same
+    # criterion to PASSED and the run landed with every listed defect intact.
+    # Nothing in the loop noticed, because "did the editor do the thing" was
+    # only ever inferred from the judge's opinion of the result.
+    #
+    # Total no-op only (not partial): a gap plan may list a file whose fix
+    # turned out unnecessary, and accusing on that would fire constantly.
+    unapplied: set = set()
+    if parent_state.get("verify_attempts", 0) > 0:
+        _, gap_files = _gap_plan_implicated(
+            parent_state.get("workspace_root", "."),
+            parent_state.get("work_id", ""),
+        )
+        if gap_files:
+            written = {str(p) for p in (parent_state.get("files_written") or []) if p}
+            if not (gap_files & written):
+                unapplied = gap_files
+                logger.warning(
+                    "[%s] verify: gap plan enumerated fixes for %d file(s) and "
+                    "the rework wrote NONE of them (%s) — remediation not "
+                    "applied; refusing to treat this cycle as converged",
+                    parent_state.get("work_id", "?"),
+                    len(gap_files),
+                    sorted(gap_files),
+                )
+
+    if unapplied and phase_status != "needs_review":
+        # Force the failure path: a clean verdict over an un-applied plan is
+        # the exact shape that shipped probe 25's defects.
+        phase_status = "needs_review"
+        base["phase_status"] = "needs_review"
+        findings = list(subgraph_result.get("verification_findings") or [])
+        findings.append(
+            {
+                "slice_name": "gap-plan-application",
+                "verdict": "NOT_VERIFIED",
+                "checklist": [
+                    {
+                        "criterion": "The gap plan's enumerated fixes were applied",
+                        "passed": False,
+                        "detail": (
+                            "None of the files the gap plan named were written "
+                            f"this cycle: {sorted(unapplied)}"
+                        ),
+                    }
+                ],
+                "gaps": [
+                    "The gap plan's remediation was never applied — "
+                    f"{sorted(unapplied)} unchanged."
+                ],
+                "recommendations": [
+                    "Apply the enumerated fixes to the named files, editing "
+                    "them in place rather than re-synthesizing the slice."
+                ],
+            }
+        )
+        subgraph_result = {**subgraph_result, "verification_findings": findings}
+
     if phase_status == "needs_review":
         verify_attempts = parent_state.get("verify_attempts", 0)
         totals = list(parent_state.get("verify_gap_totals") or [])
@@ -959,7 +1023,21 @@ def _critic_result_mapper(reviewed_phase: str):
             # state mapper so the next round's gate can escalate symbols that
             # stayed dangling despite this round's exact feedback.
             "reference_gate": subgraph_result.get("reference_gate_result") or {},
+            # Mechanically-applicable corrections from THIS round's verdict —
+            # next round's structural_check applies any the rework leaves in
+            # place (critic_subgraph.apply_literal_fixes).
+            "literal_fixes": effective_result.get("literal_fixes", []),
         }
+
+        # Mechanical-fix propagation: when structural_check patched the plan
+        # (prior-round literal fixes the rework failed to apply), the parent
+        # must carry the PATCHED document — downstream implement dispatch and
+        # the next rework prompt read it from parent state.
+        if subgraph_result.get("literal_fixes_applied"):
+            if subgraph_result.get("plan_json"):
+                base["plan_json"] = subgraph_result["plan_json"]
+            if subgraph_result.get("artifacts"):
+                base["artifacts"] = subgraph_result["artifacts"]
 
         # Rework of a workspace-mutating phase invalidates the per-work_id
         # symbol cache: the failed attempt (or the human, during a

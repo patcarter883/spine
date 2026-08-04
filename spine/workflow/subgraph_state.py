@@ -240,6 +240,11 @@ class CriticSubgraphState(BaseSubgraphState, total=False):
     # The result mapper stashes it under last_critic_review["reference_gate"]
     # so the next round can see which symbols were already flagged.
     reference_gate_result: dict | None
+    # Records of prior-round literal_fixes that structural_check applied
+    # MECHANICALLY this round (the rework left the flagged text in place).
+    # Declared so the update survives LangGraph channel filtering and the
+    # result mapper can propagate the patched plan to the parent.
+    literal_fixes_applied: list[dict] | None
 
 
 class AdversarialSubgraphState(BaseSubgraphState, total=False):
@@ -342,6 +347,11 @@ class ExplorationSubgraphState(BaseSubgraphState, total=False):
     # loop and synthesize directly from recalled chunks.
     retrieved_context: list[dict]  # Chunks pulled by the pre_research_gate;
     # injected into the SPECIFY synthesizer prompt when present.
+    # Verbatim source of files the task named BY PATH, pre-read off disk by
+    # the gate. Separate from retrieved_context because that channel is
+    # compacted to 240-char summaries (_research_text) — an exemplar the task
+    # pointed at has to reach the synthesizer as code. See workflow.task_paths.
+    task_named_sources: list[dict]
 
     # Synthesis output
     agent_response: str  # Final spec/plan text from synthesizer

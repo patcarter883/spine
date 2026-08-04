@@ -93,9 +93,10 @@ providers:
   - name: openrouter
     type: deepagents-model
     model: openrouter:moonshotai/kimi-k2.7-code
-    enabled: true
+    # DISABLED 2026-07-16 (Pat): paid cloud lane — all work stays on local
+    # serves. Re-enable deliberately, never as the default/active provider.
+    enabled: false
     guided_decoding: true
-    enabled: true
     stream_usage: true
     context_window: 100000
   # - name: pat
@@ -150,7 +151,10 @@ providers:
     # local-glm (probe 11: zero judge noise). NOTE the provider NAME is
     # legacy — every phase lane references it, kept to avoid churn.
     # History: Agents-A1 35B-A4B MoE → (briefly, my error) Ornith-1.0-35B.
-    model: openai:pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4
+    # Repointed 2026-07-16 (Pat): serve swapped to the AWQ-4bit build for the
+    # CAM testing round; identity probe was correctly marking the MXFP4 id
+    # DOWN and falling everything back to the single-stream Lemonade box.
+    model: openai:cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
     base_url: http://10.50.1.51:1919/v1
     api_key: vllm
     guided_decoding: true
@@ -200,10 +204,14 @@ providers:
       read: facts_block              # principled default (plan §6.2): prompt block
                                      # is the quality ceiling; in-forward delivery
                                      # is single-hop recall only
-      capacity_alert: 100            # store knee ~128 facts/namespace
-      # mode: pointer                # UNCOMMENT when the hybrid serving lands —
-                                     # distilled facts then write pointer-only,
-                                     # object cap relaxes, mode_served checked
+      capacity_alert: 100            # store knee ~128 facts/namespace (tap-bank
+                                     # constraint; pointer store is roomier but
+                                     # the alert stays as selectivity discipline)
+      # Pointer confirmed as the default AND only path on this build (minisgl
+      # note `pointer-default` 2026-07-16: 4B tap checkpoint hidden dim !=
+      # served 35B -> auto pointer/retrieve-only). Facts write pointer-only;
+      # object cap relaxes to 12 words; mode_served checked on readback.
+      mode: pointer
   - name: local-qwen-fallback
     type: deepagents-model
     # Standby for local-qwen (referenced by its fallback_provider) — the same
@@ -336,7 +344,7 @@ providers:
     base_url: env:SPINE_POD_URL__REASONER
     api_key: vllm
     guided_decoding: true
-    enabled: true
+    enabled: false  # RunPod = paid; disabled with the ephemeral_pods (2026-07-16)
     stream_usage: true
     max_concurrent_calls: 4
     context_window: 60000
@@ -347,7 +355,7 @@ providers:
     base_url: env:SPINE_POD_URL__CODER
     api_key: vllm
     guided_decoding: true
-    enabled: true
+    enabled: false  # RunPod = paid; disabled with the ephemeral_pods (2026-07-16)
     stream_usage: true
     max_concurrent_calls: 4
     context_window: 60000
@@ -391,12 +399,24 @@ providers:
       provider: local-qwen
     plan/subagents/researcher/supervisor:
       provider: local-qwen
+    # Critic lanes: runaway no-EOS guard (2026-07-17, slow-stream-degeneration):
+    # a plan-critic generation looped without EOS under the 12K cap, grew its
+    # request context to ~100K and hogged the serve's entire KV pool. Stronger
+    # repeat_penalty (provider default 1.05 -> 1.1) + a tighter cap bound the
+    # blast radius; the truncation guard's brevity retry (6f36e17) owns the
+    # truncation side of the trade.
     critic:
       provider: local-qwen
+      repeat_penalty: 1.1
+      max_completion_tokens: 8192
     critic/specify:
       provider: local-qwen
+      repeat_penalty: 1.1
+      max_completion_tokens: 8192
     critic/plan:
       provider: local-qwen
+      repeat_penalty: 1.1
+      max_completion_tokens: 8192
     gap_plan:
       provider: local-qwen
     exploration/manager:
@@ -443,12 +463,21 @@ providers:
       max_completion_tokens: 4096
       temperature: 0
       reasoning: false
+    # Onboarding moved off openrouter (paid lane disabled 2026-07-16).
     onboarding:
-      provider: openrouter
+      provider: local-qwen
     onboarding/doc-manager:
-      provider: openrouter
+      provider: local-qwen
     onboarding/section-worker:
-      provider: openrouter
+      provider: local-qwen
+    # Experience distillation (cross-run lessons + CAM fact capture/seed):
+    # pinned to the CAM provider so the memory-organ work runs on the same
+    # serve that hosts the store — structured JSON extraction, no reasoning.
+    experience:
+      provider: local-qwen
+      max_completion_tokens: 4096
+      temperature: 0
+      reasoning: false
     # Error-diagnosis model (one cheap line on `execute` failure). Routed to the
     # IMPLEMENT/VERIFY editor model so no model reload happens where shell calls
     # actually fail. error_diagnosis is enabled in the spine: block above.

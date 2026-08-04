@@ -794,3 +794,63 @@ def test_ast_edit_conflicting_insert_recovers_as_replace(workspace: Path) -> Non
     assert text.count("def a(") == 1
     assert "return 2" in text
     assert "return 1" not in text
+
+
+class TestAppendAction:
+    """action='append' — the one safe edit for files with NO anchorable
+    symbols (d8bc459c attempts 9-11: routes/api.php is procedural Route::
+    statements, so replace/insert had nothing to anchor on and whole-file
+    replacement is blocked — route registration was mechanically
+    unwritable)."""
+
+    def test_append_adds_at_eof_with_lint_gate(self, workspace: Path) -> None:
+        target = workspace / "src" / "mod.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("X = 1\n", encoding="utf-8")
+        out = _decode(
+            _tool(workspace)._run(
+                file_path="src/mod.py",
+                ast_edit={"symbol": "src/mod.py", "action": "append",
+                          "code": "Y = 2\n"},
+            )
+        )
+        assert out["status"] == "ok"
+        assert target.read_text() == "X = 1\n\nY = 2\n"
+
+    def test_append_rejects_syntax_error_without_writing(self, workspace: Path) -> None:
+        target = workspace / "src" / "mod2.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("X = 1\n", encoding="utf-8")
+        out = _decode(
+            _tool(workspace)._run(
+                file_path="src/mod2.py",
+                ast_edit={"symbol": "whatever", "action": "append",
+                          "code": "def broken(:\n"},
+            )
+        )
+        assert out["status"] != "ok"
+        assert target.read_text() == "X = 1\n"
+
+    def test_append_works_on_symbolless_php(self, workspace: Path) -> None:
+        target = workspace / "routes.php"
+        target.write_text("<?php\n\n$a = 1;\n", encoding="utf-8")
+        out = _decode(
+            _tool(workspace)._run(
+                file_path="routes.php",
+                ast_edit={"symbol": "routes.php", "action": "append",
+                          "code": "$b = 2;\n"},
+            )
+        )
+        assert out["status"] == "ok"
+        assert "$b = 2;" in target.read_text()
+
+    def test_bad_action_message_lists_append(self, workspace: Path) -> None:
+        target = workspace / "m.py"
+        target.write_text("X = 1\n", encoding="utf-8")
+        out = _decode(
+            _tool(workspace)._run(
+                file_path="m.py",
+                ast_edit={"symbol": "X", "action": "prepend", "code": "Z=3\n"},
+            )
+        )
+        assert "append" in out.get("message", "") or "append" in str(out)

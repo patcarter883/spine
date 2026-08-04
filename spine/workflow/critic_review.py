@@ -127,6 +127,10 @@ def _build_review_prompt(
     # escalate it as a spec contradiction instead.
     spec_contradiction_note = ""
     if spec_payload:
+        # The AC-audit examples below are real incidents with the run ids
+        # stripped (joint-satisfiability 019f4077, prescriptiveness
+        # a56e89a6, re-litigating 00f59d4f, fidelity 89bb6f27) — provenance
+        # stays in this comment, not in the model-facing string.
         spec_contradiction_note = (
             " IMPORTANT: if the ONLY thing blocking approval is that the "
             "<specification> excludes or omits something the requirement "
@@ -141,28 +145,28 @@ def _build_review_prompt(
             "deleting the criterion; (2) JOINT SATISFIABILITY — a criterion "
             "set that no single implementation can satisfy simultaneously "
             "(e.g. 'returns None on exception' + 'no internal exception "
-            "handling', run 019f4077) is a BLOCKING plan defect, fixed by "
+            "handling') is a BLOCKING plan defect, fixed by "
             "rewording or deleting the contradictory criterion; (3) "
             "PRESCRIPTIVENESS — a criterion demanding a specific mechanism "
             "that CONTRADICTS the framework's or this repo's own "
             "conventions is a BLOCKING plan defect, fixed by restating the "
-            "criterion as the observable OUTCOME (run a56e89a6: 'bind the "
-            "model via a model() method' parked a run whose editor "
-            "correctly used Laravel's protected $model convention). BUT a "
+            "criterion as the observable OUTCOME (e.g. 'bind the model via "
+            "a model() method' wrongly fails an editor that correctly used "
+            "Laravel's protected $model convention). BUT a "
             "criterion that MIRRORS the repo's existing pattern, or names "
             "mechanisms as examples ('e.g. …', 'consistent with X'), is "
             "GROUNDED — never block, and never spend a round asking for "
             "outcome-based rewording of a factually correct criterion "
-            "(run 00f59d4f: three rounds re-litigating the phrasing of a "
-            "criterion that matched the repo's own uuid pattern parked a "
-            "healthy plan on stagnation); (4) FIDELITY — when the "
+            "(rounds spent re-litigating the phrasing of a criterion that "
+            "matches the repo's own established pattern stall a healthy "
+            "plan for nothing); (4) FIDELITY — when the "
             "<objective>/<specification> demands a test assert a SPECIFIC "
             "behavior, a criterion that weakens it to a lesser check is a "
             "BLOCKING plan defect, fixed by restating the demanded "
-            "observable (run 89bb6f27: the task demanded a persisted "
-            "name/abbreviation round-trip; the criteria accepted an "
-            "unpersisted make() with non-empty checks, and a weaker test "
-            "LANDED). VERIFY will "
+            "observable (e.g. a task demanding a persisted round-trip "
+            "check is under-delivered by criteria accepting an unpersisted "
+            "make() with non-empty checks — the weaker test lands). "
+            "VERIFY will "
             "enforce every criterion literally, so an ungrounded, "
             "contradictory, convention-defying, or weakened criterion "
             "strands the run — or lands code that under-delivers the task."
@@ -505,6 +509,13 @@ def _parse_agent_review(result: Any, reviewed_phase: str) -> dict[str, Any]:
             "suggestions": suggestions,
             "blocker_category": blocker_category,
             "cited_exclusions": cited_exclusions,
+            # Mechanically-applicable corrections — carried on the verdict so
+            # the NEXT round's structural_check can apply any the rework left
+            # unaddressed (see critic_subgraph.apply_literal_fixes).
+            "literal_fixes": [
+                f for f in (data.get("literal_fixes") or [])
+                if isinstance(f, dict) and f.get("find") and f.get("replace")
+            ],
         }
 
     # Fallback to keyword parsing for backwards compatibility
@@ -551,6 +562,31 @@ def _parse_agent_review_fallback(result: Any, reviewed_phase: str) -> dict[str, 
                 "(finish_reason=length) without a structured verdict — treating "
                 "as NEEDS_REVISION rather than trusting a salvaged keyword. "
                 f"Partial output: {clipped}"
+            ),
+            "suggestions": [],
+            "cited_exclusions": [],
+        }
+
+    # An EMPTY (or whitespace-only) critic response carries no verdict and no
+    # asks — it is harness/model noise, not an agent opinion. Classifying it
+    # "agent" charged run 5646d24c a full needs_revision attempt with zero
+    # actionable feedback AND broke the gate-verdict comparison chain (the
+    # next gate round saw an agent-sourced prior and restarted its streaks).
+    # Mirror the truncation guard: verdict_source="guard" freezes streak
+    # accounting and the first guard round is not charged an attempt.
+    if not content.strip():
+        logger.warning(
+            "critic fallback: EMPTY response with no structured verdict for "
+            "phase '%s' — guard NEEDS_REVISION (uncharged), not an agent verdict",
+            reviewed_phase,
+        )
+        return {
+            "status": ReviewStatus.NEEDS_REVISION.value,
+            "tier": "agent",
+            "verdict_source": "guard",
+            "reason": (
+                "Critic returned an empty response (no verdict, no findings) — "
+                "treating as harness noise and re-running the review round."
             ),
             "suggestions": [],
             "cited_exclusions": [],

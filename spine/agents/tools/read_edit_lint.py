@@ -287,6 +287,65 @@ def _result(status: str, **fields: Any) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _confused_path_prefix(workspace_root: str, rel_path: str) -> Optional[str]:
+    """A corrective reason when *rel_path* shows monorepo path confusion,
+    else ``None``.
+
+    Fires only on POSITIVE evidence, so a genuinely new tree (a first
+    'tests/' dir in a flat repo) stays creatable (Wallace parity report
+    2026-07-24 — two confusion shapes, both merged as 'verified' dead code):
+
+    - MISROOTED: the phantom top segment exists as a subdirectory of a real
+      top-level tree ('src/…' written at root while 'wallace/src/' exists —
+      the 'wallace/' prefix was dropped).
+    - DOUBLED: removing the first segment lands in a real tree
+      ('apps/wallace/…' while the workspace root already IS apps/ and
+      'wallace/' exists at it).
+    """
+    parts = Path(str(rel_path).strip().lstrip("/")).parts
+    if len(parts) < 2:
+        return None
+    top = parts[0]
+    if top in (".", ".."):
+        return None
+    ws = Path(workspace_root)
+    if (ws / top).is_dir():
+        return None
+    if len(parts) >= 3 and (ws / parts[1]).is_dir():
+        return (
+            f"top-level directory {top!r} does not exist here, but "
+            f"{parts[1]!r} does — the {top!r} prefix looks doubled; write "
+            f"to {'/'.join(parts[1:])!r} instead"
+        )
+    try:
+        candidates = [
+            d.name
+            for d in ws.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and (d / top).is_dir()
+        ]
+    except OSError:
+        return None
+    if candidates:
+        return (
+            f"top-level directory {top!r} does not exist at the workspace "
+            f"root, but {candidates[0]}/{top}/ does — the path is missing "
+            f"the {candidates[0]!r} prefix"
+        )
+    return None
+
+
+def _toplevel_dirs(workspace_root: str) -> list[str]:
+    """Existing non-hidden top-level directory names, for corrective detail."""
+    try:
+        return sorted(
+            p.name
+            for p in Path(workspace_root).iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )[:15]
+    except OSError:
+        return []
+
+
 def _check_python(source: str) -> Optional[str]:
     """Return a syntax-error description, or None if the source parses.
 
@@ -1498,12 +1557,26 @@ def _apply_ast_edit(
     workspace_path: str,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Resolve ``symbol`` via tree-sitter and apply a structural edit."""
-    if action not in ("replace", "insert_before", "insert_after"):
+    if action not in ("replace", "insert_before", "insert_after", "append"):
         return None, _edit_feedback(
             "input_error",
-            f"ast_edit action must be replace|insert_before|insert_after, got {action!r}.",
-            next_action="Re-call ast_edit with action set to 'replace', 'insert_before', or 'insert_after'.",
+            f"ast_edit action must be replace|insert_before|insert_after|append, got {action!r}.",
+            next_action=(
+                "Re-call ast_edit with action set to 'replace', "
+                "'insert_before', 'insert_after', or 'append'."
+            ),
         )
+    if action == "append":
+        # Append needs no anchor — the one safe edit for files with NO
+        # anchorable symbols (run d8bc459c attempts 9-11: routes/api.php is
+        # procedural Route:: statements top to bottom, so replace had
+        # nothing to match, insert_* nothing to anchor on, and whole-file
+        # replacement is blocked by policy — route registration was
+        # mechanically unwritable). Same syntax/lint gate as every edit;
+        # bounded and clobber-free by construction.
+        base = current if current.endswith("\n") or not current else current + "\n"
+        addition = code if code.endswith("\n") else code + "\n"
+        return base + "\n" + addition if base else addition, None
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in _AST_EDIT_LANGS:
         return None, _edit_feedback(
@@ -2176,6 +2249,26 @@ class ReadEditLintTool(BaseTool):
 
         # ── Build the new content in memory per mode ────────────────
         if mode == "full_replace":
+            if not existed:
+                # Creating a file into a phantom tree is monorepo path
+                # confusion, not a plan (Wallace parity report 2026-07-24:
+                # features landed at a root 'src/' outside the package and
+                # under a doubled 'apps/apps/…' — both dead code). Blocks
+                # only on positive evidence; genuinely new trees stay
+                # creatable.
+                confusion = _confused_path_prefix(str(self.workspace_root), file_path)
+                if confusion is not None:
+                    return self._fail_write(
+                        file_path,
+                        {
+                            "status": "path_confusion_blocked",
+                            "detail": (
+                                f"Refusing to create {file_path!r}: {confusion}. "
+                                f"Existing top-level directories: "
+                                f"{_toplevel_dirs(str(self.workspace_root))}."
+                            ),
+                        },
+                    )
             new_content = full_replace or ""
         else:
             if not existed:

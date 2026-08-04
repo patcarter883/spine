@@ -24,6 +24,13 @@
 
 spine:
 
+  # Structural-intelligence backend behind codebase_query:
+  #   codebase-index  (default) — mcp-codebase-index + local PHP fallback
+  #   codebase-memory — DeusData/codebase-memory-mcp graph server (Phase 1,
+  #                     docs/codebase-memory-mcp-migration-plan.md); requires
+  #                     the matching mcp_servers entry below.
+  # codebase_query_backend: codebase-index
+
   # ── Storage paths ─────────────────────────────────────────────────────
   # All relative paths are resolved against the workspace root.
 
@@ -398,6 +405,18 @@ mcp_servers:
     command: mcp-codebase-index # executable to launch
     args: []                    # list of CLI args
     env: {}                     # extra environment variables (map)
+  # Alternative structural backend (select with spine.codebase_query_backend:
+  # codebase-memory). DeusData/codebase-memory-mcp static binary — verify the
+  # release (SHA-256 + `gh attestation verify`) before installing. Set
+  # CBM_CACHE_DIR for per-workspace/sandbox cache isolation. ⚠ v0.9.0: large
+  # gitignored trees (vendor/) are NOT excluded during indexing (upstream
+  # issue filed) — keep repos vendor-free or wait for the fix before pointing
+  # this at big PHP targets.
+  # codebase-memory:
+  #   transport: stdio
+  #   command: codebase-memory-mcp
+  #   args: []
+  #   env: {}
 
 # ============================================================================
 # Providers — LLM, embedding, reranker, and per-phase routing
