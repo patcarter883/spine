@@ -25,6 +25,70 @@ from spine.agents.artifacts import artifact_path
 
 logger = logging.getLogger(__name__)
 
+# Directories that never hold a gap-plan target; skipped so the candidate
+# scan stays bounded on a repo with a vendor tree.
+_PATH_SCAN_SKIP = frozenset({
+    ".git", "vendor", "node_modules", ".spine", "storage", "__pycache__", ".venv",
+})
+
+
+def _repair_fix_path(file_path: str, workspace_root: str) -> Optional[str]:
+    """The real path a corrupted gap-plan ``file_path`` meant, else None.
+
+    agripath probe 26 (run 3a7a3597): the gap plan named
+    ``2026_00_00_00_000000_create_units_of_measure_table.php`` while disk held
+    ``2026_00_00_000000_...`` — one stuttered ``_00`` segment. Nothing
+    normalises these paths, and three consumers compare them by exact string
+    equality (the P6 unapplied-gap guard, the per-slice reopen filter, and the
+    editor's gap-feedback body), so one bad character silently drops the fix
+    AND makes P6 report that the rework wrote nothing.
+
+    Only ever fires for a path that does NOT exist, and only accepts a single
+    same-suffix, same-directory candidate above a high similarity cutoff — a
+    gap plan may legitimately name a file that is about to be created, and
+    those must be left alone.
+    """
+    rel = (file_path or "").strip()
+    if not rel:
+        return None
+    ws = Path(workspace_root or ".")
+    try:
+        if (ws / rel).exists():
+            return None  # names a real file — nothing to repair
+    except OSError:
+        return None
+
+    target = Path(rel)
+    parent, suffix = target.parent, target.suffix
+    search_dir = ws / parent
+    if not search_dir.is_dir() or parent.name in _PATH_SCAN_SKIP:
+        return None  # a new directory is a legitimately-new file, not a typo
+
+    def _joined(name: str) -> str:
+        return str(parent / name) if str(parent) != "." else name
+
+    # Undo the stutter EXACTLY, then require the result to exist. This is the
+    # observed corruption ('..._00_00_00_000000_...' for '..._00_00_000000_...')
+    # and resolving it by existence rather than similarity means there is no
+    # false-positive risk and no threshold to tune.
+    parts = target.name.split("_")
+    destuttered = {
+        "_".join(parts[:i] + parts[i + 1:])
+        for i in range(1, len(parts))
+        if parts[i] == parts[i - 1]
+    }
+    hits = sorted({c for c in destuttered if (search_dir / c).is_file()})
+    if len(hits) == 1:
+        return _joined(hits[0])
+
+    # NO similarity fallback. A difflib cutoff of 0.85 looked conservative but
+    # measured catastrophically: of 504 tracked .php files in the agripath
+    # clone, 111 (22%) have exactly one same-directory sibling within it — so
+    # a gap plan naming a legitimately-NEW file would have been silently
+    # retargeted onto an existing one. De-stutter-and-verify above is the
+    # whole repair; anything it cannot resolve is left alone.
+    return None
+
 # ── read_verification_findings ───────────────────────────────────────────
 
 
@@ -371,6 +435,16 @@ class WriteStructuredGapPlanTool(BaseTool):
                         f"{', '.join(sorted(fix_missing))}."
                     )
                     continue
+                repaired = _repair_fix_path(
+                    str(fix.get("file_path", "")), self.workspace_root
+                )
+                if repaired:
+                    logger.warning(
+                        "gap_plan: repaired fix file_path %r -> %r "
+                        "(no such file; unique near-match on disk)",
+                        fix.get("file_path"), repaired,
+                    )
+                    fix["file_path"] = repaired
                 validated_fixes.append(fix)
 
             if validated_fixes:

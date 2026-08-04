@@ -1014,12 +1014,68 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
     try:
         from spine.agents.tools.codebase_query import find_symbol
         from spine.config import SpineConfig
-        db_path = SpineConfig.load().checkpoint_path
+        _cfg = SpineConfig.load()
+        db_path = _cfg.checkpoint_path
+        workspace_root = _cfg.workspace_root
     except Exception:
         return active_slice
 
     slice_id = active_slice.get("id", "?")
     result = dict(active_slice)
+
+    # Built at most once per slice, lazily: walking the PSR-4 tree costs
+    # ~15ms and most slices have nothing to repair.
+    _corpus: dict[str, str] | None = None
+
+    def _exact_index_hit(leaf: str) -> bool:
+        """True only on an EXACT symbol_name match for *leaf*.
+
+        find_symbol's SQL is ``symbol_name = ? OR symbol_name LIKE '%.' || ?``
+        and SQLite LIKE is case-insensitive, so a METHOD named ``<leaf>()`` on
+        any class satisfies it — 49 corpus classes in the agripath clone were
+        accepted that way for a CLASS repair. Re-check the returned rows.
+        """
+        try:
+            raw = find_symbol(db_path, leaf)
+        except Exception:  # noqa: BLE001 — index unavailable, fail open
+            return False
+        if not raw:
+            return False
+        try:
+            import json as _json
+            matches = (_json.loads(raw) or {}).get("matches") or []
+        except Exception:  # noqa: BLE001 — unparseable payload, treat as miss
+            return False
+        return any(m.get("symbol_name") == leaf for m in matches)
+
+    def _repaired_ref(sym: str) -> str | None:
+        """The usable form of *sym* when it is a mangled PHP FQCN, else None.
+
+        agripath probe 26 (run 3a7a3597): the model emitted PHP FQCNs with
+        separators stripped and a tail segment stuttered, e.g.
+        'AppInfrastructureModelsTraitsFarmScopedModelsTraitsFarmScoped'.
+        Dropping those cost the editor the list that told it what to import.
+
+        First-party classes come back as the BARE LEAF, the only form
+        symbol_metadata stores. Vendor classes are NOT indexed at all (0 rows
+        under vendor/), so requiring an index hit discarded essentially every
+        framework repair — 3 of probe 26's own 8 symbols. Those come back as
+        the full FQCN instead: it is the genuine import, and
+        ``_is_external_reference`` already classifies any backslash-bearing
+        string as external.
+        """
+        nonlocal _corpus
+        try:
+            from spine.agents.tools.php_fqcn import fqcn_corpus, repair_mangled_fqcn
+            if _corpus is None:
+                _corpus = fqcn_corpus(workspace_root)
+            fqcn = repair_mangled_fqcn(sym, workspace_root, _corpus)
+        except Exception:  # noqa: BLE001 — repair is best-effort, never fatal
+            return None
+        if not fqcn:
+            return None
+        leaf = fqcn.rsplit("\\", 1)[-1]
+        return leaf if _exact_index_hit(leaf) else fqcn
 
     if needs_refs:
         good: list[str] = []
@@ -1031,6 +1087,15 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
                 continue
             if exists:
                 good.append(sym)
+                continue
+            repaired = _repaired_ref(sym)
+            if repaired:
+                good.append(repaired)
+                logger.warning(
+                    "[%s] scrub_phantom_refs: repaired reference_symbol %r -> %r in "
+                    "slice %r (mangled PHP FQCN)",
+                    work_id, sym, repaired, slice_id,
+                )
             else:
                 logger.warning(
                     "[%s] scrub_phantom_refs: dropping reference_symbol %r from slice %r "

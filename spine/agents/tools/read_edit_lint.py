@@ -594,34 +594,19 @@ def _rewrite_unresolvable_imports(
     return rewritten
 
 
-def _psr4_map(workspace_root: str) -> dict[str, str]:
-    """PSR-4 prefix->dir mapping from the workspace composer.json, {} on failure."""
-    try:
-        cfg = json.loads(
-            (Path(workspace_root) / "composer.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        return {}
-    out: dict[str, str] = {}
-    for section in ("autoload", "autoload-dev"):
-        for prefix, rel in ((cfg.get(section) or {}).get("psr-4") or {}).items():
-            if isinstance(prefix, str) and isinstance(rel, str):
-                out[prefix] = rel
-    return out
+# PSR-4 resolution lives in php_fqcn, alongside the FQCN corpus that both the
+# PHP auto-import below and the implement-phase FQCN repair need. Re-exported
+# here because verify_subgraph imports both names from this module.
+from spine.agents.tools.php_fqcn import (  # noqa: E402 — re-export for existing importers
+    _psr4_map,
+    _psr4_namespace_for,
+    fqcn_corpus,
+    resolve_class_fqcn,
+)
 
-
-def _psr4_namespace_for(rel_path: str, psr4: dict[str, str]) -> Optional[str]:
-    """The namespace PSR-4 dictates for *rel_path*, None when unmapped."""
-    posix = rel_path.replace("\\", "/")
-    for prefix, base in sorted(psr4.items(), key=lambda kv: -len(kv[1])):
-        base = base.rstrip("/") + "/"
-        if posix.startswith(base):
-            parts = posix[len(base):].split("/")[:-1]  # drop the filename
-            ns = prefix.rstrip("\\")
-            if parts:
-                ns += "\\" + "\\".join(parts)
-            return ns
-    return None
+# Names that look like class references in the scanned constructs but are
+# language keywords, never imports.
+_PHP_NON_CLASS = frozenset({"self", "static", "parent", "class", "function", "const"})
 
 
 def _fix_php_namespaces(path: Path, workspace_root: str) -> Optional[list[str]]:
@@ -718,6 +703,208 @@ def _fix_php_namespaces(path: Path, workspace_root: str) -> Optional[list[str]]:
     except OSError:
         return None
     return changed
+
+
+def _php_blank_noncode(src: str) -> str:
+    """Replace comment/string/heredoc bodies with spaces, preserving offsets.
+
+    A regex scan over raw PHP treats a class name in a docblock as a live
+    reference and a ``use`` inside a block comment as an import anchor. Both
+    were observed on the real agripath tree: 4 of 6 files a dry run would have
+    modified were driven purely by comment text. Offsets are preserved (and
+    newlines kept) so match positions remain valid against the original.
+    """
+    import re as _re
+
+    out = list(src)
+    n = len(src)
+    i = 0
+
+    def blank(start: int, end: int) -> None:
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif c == "#":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif c in "'\"":
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == c:
+                    j += 1
+                    break
+                j += 1
+            blank(i, j)
+            i = j
+        elif src.startswith("<<<", i):
+            m = _re.match(r"<<<[ \t]*(['\"]?)(\w+)\1\r?\n", src[i:])
+            if m:
+                label = m.group(2)
+                rest = src[i + m.end():]
+                end = _re.search(rf"^[ \t]*{label}\b", rest, _re.MULTILINE)
+                j = i + m.end() + (end.end() if end else len(rest))
+                blank(i, j)
+                i = j
+            else:
+                i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _php_auto_import(path: Path, workspace_root: str) -> Optional[list[str]]:
+    """Add missing ``use`` imports for classes a PHP file references.
+
+    agripath probe 26 (run 3a7a3597) landed ``use FarmScoped;`` and
+    ``use HasFactory;`` inside a class body with no matching import
+    statements — a fatal that nothing caught, because no linter runs on a
+    written .php file: ``_ruff_report`` short-circuits on any non-.py suffix,
+    so both Python import repairs below are structurally unreachable here.
+    This is the PHP companion to :func:`_auto_import_fix`.
+
+    Deliberately NARROW. It considers ONLY a trait ``use`` inside a class body
+    — the construct probe 26 actually broke — and only in a file that declares
+    a namespace. An earlier, broader version scanned ``new X``, ``X::``,
+    ``extends`` and ``implements`` too, and adversarial review showed that
+    turning working code into runtime fatals:
+
+    * a global-namespace file (every migration, ``config/*``, ``routes/*``, and
+      116 of agripath's 129 test files) resolves unqualified names to the
+      global namespace, so adding ANY import changes resolution;
+    * PHP builtins have unique same-leaf vendor namesakes, so ``new
+      DateTimeImmutable(...)`` acquired ``use Monolog\\DateTimeImmutable;``;
+    * ``php -l`` passes either way, so neither the write gate nor the
+      ``php_syntax`` landing gate would catch it.
+
+    Resolution is exact-or-nothing — an ambiguous or builtin basename is left
+    alone rather than guessed, because verify hard-fails a wrong PSR-4 import.
+
+    Returns the added statements, or None (no change / any error — fail-open).
+    """
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    import re as _re
+
+    # Blank comments/strings/heredocs so a class name mentioned in prose is
+    # never treated as a live reference, and a `use` inside a comment can
+    # never become the insertion anchor. Offsets are preserved, so every
+    # match position is still valid against the ORIGINAL text.
+    code = _php_blank_noncode(content)
+
+    own_ns_m = _re.search(r"^namespace\s+([A-Za-z0-9_\\]+)\s*;", code, _re.MULTILINE)
+    if not own_ns_m:
+        return None  # global namespace — an unqualified name already resolves
+    own_ns = own_ns_m.group(1)
+
+    # Grouped (`use A\{B, C};`) and comma-separated imports are real bindings
+    # this scanner cannot read; re-importing their names would be a duplicate
+    # -name fatal. Refuse the whole file rather than half-understand it.
+    if _re.search(r"^use\s[^;\n]*[{,]", code, _re.MULTILINE):
+        return None
+
+    # The first type declaration separates the import region from class bodies.
+    type_m = _re.search(
+        r"^\s*(?:final\s+|abstract\s+|readonly\s+)*"
+        r"(?:class|interface|trait|enum)\s+\w+",
+        code,
+        _re.MULTILINE,
+    )
+    body_start = type_m.start() if type_m else len(code)
+
+    # Top-level imports bind by alias, else by leaf. Anything after the first
+    # type declaration is a trait use, NOT an import — treating one as an
+    # anchor put the inserted line inside the class body (a fatal `php -l`
+    # does not catch, because a trait use is syntactically valid there).
+    bound: set[str] = set()
+    last_use_end = 0
+    for m in _re.finditer(
+        r"^use\s+(?!function\s|const\s)([A-Za-z0-9_\\]+)(?:\s+as\s+(\w+))?\s*;",
+        code,
+        _re.MULTILINE,
+    ):
+        if m.start() >= body_start:
+            continue
+        bound.add(m.group(2) or m.group(1).rsplit("\\", 1)[-1])
+        last_use_end = max(last_use_end, m.end())
+
+    declared = set(
+        _re.findall(
+            r"^\s*(?:final\s+|abstract\s+|readonly\s+)*"
+            r"(?:class|interface|trait|enum)\s+(\w+)",
+            code,
+            _re.MULTILINE,
+        )
+    )
+
+    referenced: set[str] = set()
+    for m in _re.finditer(r"^[ \t]+use\s+([A-Za-z0-9_\\,\s]+?);", code, _re.MULTILINE):
+        if m.start() < body_start:
+            continue
+        for part in m.group(1).split(","):
+            name = part.strip()
+            if name and "\\" not in name:
+                referenced.add(name)
+
+    candidates = [
+        name
+        for name in sorted(referenced)
+        if name not in bound
+        and name not in declared
+        and name not in _PHP_NON_CLASS
+        and name[0].isupper()
+    ]
+    if not candidates:
+        return None
+
+    # Build the FQCN corpus ONCE — it walks the PSR-4 tree, and resolving each
+    # name separately rebuilt it per name (~15 ms a walk).
+    corpus = fqcn_corpus(workspace_root)
+
+    additions: list[str] = []
+    for name in candidates:
+        fqcn = resolve_class_fqcn(name, workspace_root, corpus)
+        if not fqcn or fqcn == f"{own_ns}\\{name}":
+            continue  # unresolvable/ambiguous/builtin, or same namespace
+        additions.append(f"use {fqcn};")
+
+    if not additions:
+        return None
+
+    block = "\n".join(additions)
+    at = last_use_end or own_ns_m.end()
+    if at >= body_start:
+        return None  # no anchor above the class body — leave it for the model
+    new_content = content[:at] + "\n" + block + content[at:]
+
+    # Re-validate exactly as the Python repairs re-parse before writing.
+    if _check_php(new_content) is not None:
+        return None
+    try:
+        _atomic_write(path, new_content)
+    except OSError:
+        return None
+    return additions
 
 
 def _auto_import_fix(
@@ -2349,6 +2536,12 @@ class ReadEditLintTool(BaseTool):
             ns_fixed = _fix_php_namespaces(path, self.workspace_root)
             if ns_fixed:
                 ok_fields["namespaces_fixed"] = ns_fixed
+            # ...and a referenced class with no `use` at all gets one. Runs
+            # AFTER the namespace repair so it sees the corrected namespace
+            # when deciding what is same-namespace and needs no import.
+            imported = _php_auto_import(path, self.workspace_root)
+            if imported:
+                ok_fields["php_imports_added"] = imported
         ruff = _ruff_report(path, self.workspace_root)
         if ruff is not None and ruff != "clean":
             # Deterministic repair for missing module imports (F821): the
