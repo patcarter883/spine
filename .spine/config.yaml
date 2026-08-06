@@ -154,7 +154,14 @@ providers:
     # Repointed 2026-07-16 (Pat): serve swapped to the AWQ-4bit build for the
     # CAM testing round; identity probe was correctly marking the MXFP4 id
     # DOWN and falling everything back to the single-stream Lemonade box.
-    model: openai:cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+    # Repointed 2026-08-06 (Pat): serve now hosts Agents-A1-AWQ-INT4. Verified
+    # against GET /v1/models — spine marks an endpoint DOWN when the configured
+    # id is absent from that listing, so this must match the served id exactly.
+    # max_model_len 262144 is the serve's TOTAL KV budget shared across
+    # concurrent requests, NOT a per-request window: the sizing check is
+    # context_window x max_concurrent_calls <= max_model_len, i.e.
+    # 50000 x 3 = 150000 <= 262144.
+    model: openai:cyankiwi/Agents-A1-AWQ-INT4
     base_url: http://10.50.1.51:1919/v1
     api_key: vllm
     guided_decoding: true
