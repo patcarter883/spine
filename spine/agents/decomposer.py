@@ -721,7 +721,18 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
                 good.append(sym)
                 continue
             repaired = _repair_php_ref(sym)
-            if repaired:
+            if repaired == sym:
+                # Identity: an INTACT FQCN the index simply does not carry —
+                # vendor classes have zero indexed rows. Keeping it is the
+                # whole point (it used to be dropped as a phantom), but it was
+                # not repaired, and logging it as one buried the real repairs
+                # under dozens of "X -> X" WARNING lines per run.
+                good.append(sym)
+                logger.debug(
+                    "decomposer: retained unindexed reference_symbol %r in slice %r",
+                    sym, slice_id,
+                )
+            elif repaired:
                 good.append(repaired)
                 logger.warning(
                     "decomposer: repaired reference_symbol %r -> %r in slice %r "

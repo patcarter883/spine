@@ -1098,7 +1098,18 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
                 good.append(sym)
                 continue
             repaired = _repaired_ref(sym)
-            if repaired:
+            if repaired == sym:
+                # Identity: an INTACT FQCN the index does not carry (vendor
+                # classes have zero indexed rows). Retaining it is the point —
+                # it used to be dropped as a phantom — but nothing was
+                # repaired, and logging it as a repair buried the real ones.
+                good.append(sym)
+                logger.debug(
+                    "[%s] scrub_phantom_refs: retained unindexed reference_symbol "
+                    "%r in slice %r",
+                    work_id, sym, slice_id,
+                )
+            elif repaired:
                 good.append(repaired)
                 logger.warning(
                     "[%s] scrub_phantom_refs: repaired reference_symbol %r -> %r in "

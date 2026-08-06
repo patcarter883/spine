@@ -580,3 +580,28 @@ def test_qualified_input_uses_exact_lookup_not_prefix_scan(tmp_path):
     """
     ws = _ws(tmp_path)
     assert repair_mangled_fqcn("App\\Domain\\Farm\\Models\\FarmModels", str(ws)) is None
+
+
+def test_identity_echo_is_not_logged_as_a_repair(monkeypatch, tmp_path, caplog):
+    """An intact-but-unindexed FQCN is RETAINED, not reported as repaired.
+
+    Vendor classes have zero indexed rows, so repair_mangled_fqcn echoes them
+    back unchanged. Keeping them is the fix; logging each as a repair buried
+    the real ones under dozens of "X -> X" WARNING lines per run.
+    """
+    import logging
+
+    from spine.workflow.subgraphs.implement_subgraph import _scrub_phantom_refs
+
+    ws = _ws(tmp_path)
+    _patch_scrub(monkeypatch, ws, indexed=set())
+    vendor = "Illuminate\\Database\\Eloquent\\Concerns\\HasUuids"
+
+    with caplog.at_level(logging.WARNING):
+        out = _scrub_phantom_refs(
+            {"id": "s", "reference_symbols": [vendor]}, "wk1"
+        )
+
+    assert out["reference_symbols"] == [vendor]          # retained
+    assert "repaired reference_symbol" not in caplog.text  # not called a repair
+    assert "dropping reference_symbol" not in caplog.text  # and not dropped
