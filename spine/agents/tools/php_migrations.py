@@ -35,12 +35,24 @@ _MIGRATION_NAME = re.compile(r"^(\d{4})_(\d{2})_(\d{2})_(\d{6})_\w+\.php$")
 # so they always sort first. Three stock files use it; never flag them.
 _FRAMEWORK_PREFIX = "0001_01_01_"
 
-# $table->foreignId('farm_id')->constrained('farms')
+# $table->foreignId('farm_id') ... ->constrained('farms')
+#
+# The chain deliberately allows whitespace and newlines between links and
+# tolerates nested parens one level deep: Laravel FK definitions are routinely
+# wrapped across lines and use closures (->constrained(table: 'farms'),
+# ->cascadeOnDelete()). An earlier single-line, no-whitespace chain matched none
+# of the three genuinely broken FKs in the agripath repo.
 _FOREIGN_ID = re.compile(
-    r"\$table->foreignId\(\s*['\"](?P<col>\w+)['\"]\s*\)"
-    r"(?P<chain>(?:->\w+\([^)]*\))*)",
+    r"\$table\s*->\s*foreignId\(\s*['\"](?P<col>\w+)['\"]\s*\)"
+    r"(?P<chain>(?:\s*->\s*\w+\((?:[^()]|\([^()]*\))*\))*)",
 )
-_CONSTRAINED = re.compile(r"->constrained\(\s*['\"](?P<table>\w+)['\"]")
+
+# ->constrained('farms') / ->constrained(table: 'farms') / ->constrained()
+# A bare constrained() means Laravel infers the table from the column name:
+# strip a trailing _id and pluralise (ForeignIdColumnDefinition::constrained).
+_CONSTRAINED = re.compile(
+    r"->\s*constrained\(\s*(?:table\s*:\s*)?(?:['\"](?P<table>\w+)['\"])?",
+)
 
 # Schema::create('farms', function (Blueprint $table) {
 _SCHEMA_CREATE = re.compile(r"Schema::create\(\s*['\"](?P<table>\w+)['\"]")
@@ -67,6 +79,10 @@ def migration_pk_types(migrations_dir: Path) -> dict[str, str]:
     ALTER can change a PK type. Tables whose type cannot be determined —
     composite-PK pivots, config-driven names — are simply absent, and callers
     must fail open on a miss rather than guess.
+
+    Only ``up()`` is read. A drop migration's ``down()`` recreates the table it
+    removed, so harvesting the whole file reported 7 tables in the agripath
+    repo that do not exist at migration head.
     """
     out: dict[str, str] = {}
     try:
@@ -78,6 +94,9 @@ def migration_pk_types(migrations_dir: Path) -> dict[str, str]:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:  # noqa: PERF203 — unreadable file, skip
             continue
+        down = re.search(r"function\s+down\s*\(", text)
+        if down:
+            text = text[: down.start()]
         for m in _SCHEMA_CREATE.finditer(text):
             # Body = from the match to the next Schema:: call (or EOF); good
             # enough to isolate one closure without a PHP parser.
@@ -155,25 +174,64 @@ def repair_foreign_id(content: str, pk_types: dict[str, str]) -> tuple[str, list
     bigint FK is never touched. Returns (new_content, changes).
     """
     changes: list[str] = []
-    out = content
+    # Match against the REAL source — the column and table names live inside
+    # string literals, which blanking would erase — and use a blanked copy
+    # only to test whether a match sits in a comment or string. Blanking
+    # preserves length and newlines, so offsets line up: if the '$' survived,
+    # the match is live code.
+    from spine.agents.tools.read_edit_lint import _php_blank_noncode
+
+    code = _php_blank_noncode(content)
+    edits: list[tuple[int, int, str]] = []
+
     for m in _FOREIGN_ID.finditer(content):
+        if code[m.start()] != content[m.start()]:
+            continue  # inside a comment or a string literal
         chain = m.group("chain") or ""
         con = _CONSTRAINED.search(chain)
         if not con:
             continue  # no ->constrained(): nothing proves the target table
-        table = con.group("table")
-        if pk_types.get(table) != "uuid":
+        table = con.group("table") or _inferred_table(m.group("col"))
+        if not table or pk_types.get(table) != "uuid":
             continue  # unknown or genuinely bigint — leave it alone
-        old = f"$table->foreignId('{m.group('col')}')"
-        new = f"$table->foreignUuid('{m.group('col')}')"
-        if old in out:
-            out = out.replace(old, new, 1)
-        else:  # double-quoted form
-            old = f'$table->foreignId("{m.group("col")}")'
-            new = f'$table->foreignUuid("{m.group("col")}")'
-            out = out.replace(old, new, 1)
+        # Replace by SPAN, not str.replace: an earlier version iterated matches
+        # over the original text but replaced the FIRST textual occurrence in
+        # the mutating copy, so a file with two `foreignId('x_id')` calls
+        # rewrote the wrong one — manufacturing the DDL error this prevents.
+        seg = content[m.start():m.end()]
+        idx = seg.find("foreignId(")
+        if idx < 0:
+            continue
+        abs_at = m.start() + idx
+        edits.append((abs_at, abs_at + len("foreignId("), "foreignUuid("))
         changes.append(
             f"foreignId('{m.group('col')}') -> foreignUuid "
             f"({table}.id is uuid; bigint FK is a hard DDL error)"
         )
+
+    if not edits:
+        return content, []
+    out = content
+    for at, to, repl in sorted(edits, reverse=True):  # right-to-left keeps offsets valid
+        out = out[:at] + repl + out[to:]
     return out, changes
+
+
+def _inferred_table(column: str) -> Optional[str]:
+    """Laravel's implicit table for a bare ``constrained()`` on *column*.
+
+    ``ForeignIdColumnDefinition::constrained`` strips the referenced column
+    (default ``id``) from the end of the FK column name and pluralises:
+    ``farm_id`` -> ``farms``. Only the regular plural is handled; an irregular
+    one simply misses the pk map and is left alone.
+    """
+    if not column.endswith("_id"):
+        return None
+    stem = column[:-3]
+    if not stem:
+        return None
+    if stem.endswith("y") and stem[-2:-1] not in "aeiou":
+        return stem[:-1] + "ies"
+    if stem.endswith(("s", "x", "z", "ch", "sh")):
+        return stem + "es"
+    return stem + "s"

@@ -67,29 +67,59 @@ def test_unrelated_prose_is_not_flagged():
     assert not is_self_contradictory("No route registration found in routes/api.php.")
 
 
-def test_probe27_verdict_is_collapsed():
+def test_probe27_details_are_rewritten():
     v = _verdict(PROBE27_DETAIL, 15)
-    collapsed = reject_unreliable_verdict(v, "cc9c2611", "database-migrations-farm")
-    assert collapsed == 15
-    assert len(v["checklist"]) == 1
-    assert v["checklist"][0]["detail"].startswith("REJECTED by verdict gate:")
-    assert len(v["gaps"]) == 1
+    rewritten = reject_unreliable_verdict(v, "cc9c2611", "database-migrations-farm")
+    assert rewritten == 15
+    assert all(c["detail"].startswith("UNRELIABLE VERDICT") for c in v["checklist"])
 
 
-def test_collapsed_verdict_never_promotes():
-    """Neutralising by passing the entries would trip the all-passed shortcut."""
+def test_failing_count_is_preserved_for_the_ratchet():
+    """The gate must not change how many criteria are failing.
+
+    compose._total_gap_count counts failing entries and feeds the best-state
+    ratchet. An earlier version collapsed 15 -> 1, which made the FIRST,
+    unfixed cycle the ratchet's "best" state: every honest later cycle then
+    scored as a regression and restore_best deleted the real fixes from disk.
+    Measured against the production mapper, totals went [1, 6, 4] with the run
+    parked on cycle-1 code, versus [15, 6, 4, 2] converging with the gate off.
+    """
+    v = _verdict(PROBE27_DETAIL, 15)
+    reject_unreliable_verdict(v)
+    assert len(v["checklist"]) == 15
+    assert sum(1 for c in v["checklist"] if not c["passed"]) == 15
+
+
+def test_gate_never_promotes():
     v = _verdict(PROBE27_DETAIL, 15)
     reject_unreliable_verdict(v)
     assert v["verdict"] == "NOT_VERIFIED"
-    assert any(not c["passed"] for c in v["checklist"])
+    assert all(not c["passed"] for c in v["checklist"])
 
 
-def test_passed_entries_survive_the_collapse():
-    v = _verdict(PROBE27_DETAIL, 12)
-    v["checklist"].append({"criterion": "real one", "passed": True, "detail": "ok"})
+def test_genuine_concurrent_findings_are_untouched():
+    """Only entries carrying the boilerplate are rewritten."""
+    v = _verdict(PROBE27_DETAIL, 10)
+    v["checklist"].append(
+        {"criterion": "route", "passed": False, "detail": "No route in routes/api.php"}
+    )
+    v["checklist"].append({"criterion": "ok", "passed": True, "detail": "present"})
     reject_unreliable_verdict(v)
-    kept = [c for c in v["checklist"] if c["passed"]]
-    assert [c["criterion"] for c in kept] == ["real one"]
+    details = [c["detail"] for c in v["checklist"]]
+    assert "No route in routes/api.php" in details
+    assert "present" in details
+
+
+def test_negated_contrast_is_coherent_and_not_flagged():
+    """'a column named X exists but there is no property named X' is a real
+    finding — seven realistic Laravel findings were wrongly flagged before."""
+    for detail in (
+        "The migration creates a column named farm_id but the model has no "
+        "property named farm_id.",
+        "A factory named ContactFactory exists but no test named "
+        "ContactFactory was found.",
+    ):
+        assert not is_self_contradictory(detail)
 
 
 def test_healthy_verdict_is_untouched():

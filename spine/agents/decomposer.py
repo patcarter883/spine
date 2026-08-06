@@ -719,6 +719,15 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
                 continue
             if exists:
                 good.append(sym)
+                continue
+            repaired = _repair_php_ref(sym)
+            if repaired:
+                good.append(repaired)
+                logger.warning(
+                    "decomposer: repaired reference_symbol %r -> %r in slice %r "
+                    "(mangled or wrong-case PHP FQCN)",
+                    sym, repaired, slice_id,
+                )
             else:
                 logger.warning(
                     "decomposer: removing phantom reference_symbol %r from slice %r "
@@ -726,6 +735,23 @@ def _scrub_phantom_symbols(slices: list[dict], db_path: str) -> None:
                     sym, slice_id,
                 )
         sl["reference_symbols"] = good
+
+
+def _repair_php_ref(sym: str) -> str | None:
+    """The real FQCN behind a corrupted PHP reference, else None.
+
+    This scrubber runs in PLAN, BEFORE implement, so anything it deletes is
+    already gone by the time ``_scrub_phantom_refs`` could repair it. In probe
+    27 it dropped 18 symbols, 7 of which exist verbatim in the corpus — 71% of
+    the repair's target population never reached implement.
+    """
+    try:
+        from spine.agents.tools.php_fqcn import repair_mangled_fqcn
+        from spine.config import SpineConfig
+
+        return repair_mangled_fqcn(sym, SpineConfig.load().workspace_root)
+    except Exception:  # noqa: BLE001 — repair is best-effort, never fatal
+        return None
 
 
 def _normalize_per_file_slices(

@@ -223,6 +223,22 @@ def _classmap_path(workspace_root: str) -> Optional[Path]:
     return None
 
 
+def _declares_type(path: Path, name: str) -> bool:
+    """True when *path* actually declares a class/interface/trait/enum *name*.
+
+    Cheap guard against fabricating an FQCN from a file path alone. Reads only
+    the head of the file — a PHP type declaration always precedes its body.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    return re.search(
+        rf"\b(?:class|interface|trait|enum)\s+{re.escape(name)}\b", head
+    ) is not None
+
+
 def fqcn_corpus(workspace_root: str) -> dict[str, str]:
     """Map normalised-skeleton -> canonical FQCN for every class in reach.
 
@@ -258,6 +274,13 @@ def fqcn_corpus(workspace_root: str) -> dict[str, str]:
                 try:
                     parts = f.relative_to(root).parts[:-1]
                 except ValueError:  # noqa: PERF203 — outside the root, skip
+                    continue
+                # A PSR-4 path only IMPLIES a class name — it does not prove
+                # one. 120 of the agripath repo's 129 files under the Tests\
+                # root are Pest global-function files declaring no class at
+                # all, and fabricating FQCNs for them made the exact-skeleton
+                # lookup resolve names that do not exist.
+                if not _declares_type(f, f.stem):
                     continue
                 ns = prefix.rstrip("\\")
                 if parts:
