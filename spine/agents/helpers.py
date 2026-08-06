@@ -1371,11 +1371,26 @@ def _build_openrouter_model(
         model_kwargs["extra_body"]["max_tokens"] = int(cap)
 
     # ── Enable streaming for stall detection ─────────────────────────
-    # ChatOpenRouter defaults to streaming=False.  Without streaming,
-    # no on_llm_new_token callbacks fire during generation, so LangGraph's
-    # stream_mode=["messages"] yields nothing — and the stall detector
-    # falsely fires on slow models (reasoning models, long outputs).
-    model_kwargs.setdefault("streaming", True)
+    # Without streaming, no on_llm_new_token callbacks fire during
+    # generation, so LangGraph's stream_mode=["messages"] yields nothing and
+    # the stall detector falsely fires on slow models.
+    #
+    # Providers may opt out with ``streaming: false``, exactly as the local
+    # builder allows. This was an unconditional setdefault(True), so that
+    # documented lever silently did nothing on the OpenRouter path.
+    #
+    # It is needed when the ROUTED endpoint emits content a stream cannot
+    # recover from: OpenRouter sent deepseek-v4-flash to SiliconFlow, which
+    # intermittently emits a doubled opening brace ("{\n{") into the content
+    # channel. That is malformed regardless of completeness, so the OpenAI
+    # SDK raises inside _accumulate_chunk -> from_json(partial_mode=True)
+    # BEFORE any response object exists — upstream of spine's own salvage
+    # (_extract_json_object, _SelfHealingStructured), which handles exactly
+    # this. Non-streaming returns the complete string and salvage works.
+    if provider_cfg.get("streaming") is False:
+        model_kwargs["streaming"] = False
+    else:
+        model_kwargs.setdefault("streaming", True)
 
     # ── Enable usage_metadata on streamed responses ─────────────────
     # ChatOpenRouter inherits ChatOpenAI; stream_usage=True causes it
@@ -1385,7 +1400,12 @@ def _build_openrouter_model(
     # token-budget tracker is blind.  Default-on; set
     # providers.llm[].stream_usage: false to opt out for a misbehaving
     # provider.
-    if provider_cfg.get("stream_usage") is not False:
+    # Skipped when not streaming: stream_options is inert without a stream,
+    # and is one more parameter OpenRouter's require_parameters can reject.
+    if (
+        model_kwargs.get("streaming") is not False
+        and provider_cfg.get("stream_usage") is not False
+    ):
         model_kwargs.setdefault("stream_usage", True)
 
     _apply_concurrency_cap(model_kwargs, provider_cfg)
