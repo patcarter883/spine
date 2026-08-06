@@ -199,6 +199,23 @@ def resolve_chat_model(
         config, session_id=session_id, phase=phase, escalation_level=escalation_level
     )
     if isinstance(model, str):
+        # An OpenRouter spec must go through the one OpenRouter builder, never
+        # init_chat_model — that constructs a ChatOpenRouter, which does not
+        # declare http_client / http_async_client as fields, so the
+        # connection-capped clients injected below are swept into model_kwargs
+        # and forwarded to the SDK: "TypeError: Chat.send_async() got an
+        # unexpected keyword argument 'http_async_client'". Callers passing a
+        # bare model string (classification, research manager, onboarding) take
+        # this path, which is why the failure still looked call-site-specific
+        # after _build_openrouter_model itself was fixed.
+        if model.startswith("openrouter:"):
+            return _build_openrouter_model(
+                model,
+                session_id or "",
+                phase=phase,
+                escalation_level=escalation_level,
+            )
+
         from langchain.chat_models import init_chat_model
 
         provider_cfg = _active_provider_config(phase=phase, escalation_level=escalation_level)
