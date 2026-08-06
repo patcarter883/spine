@@ -320,15 +320,22 @@ def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
         return model
 
     try:
-        from langchain_openrouter import ChatOpenRouter
-
-        if isinstance(model, ChatOpenRouter):
-            reasoning = dict(getattr(model, "reasoning", None) or {})
+        if _is_openrouter_model(model):
+            # OpenRouter takes the reasoning knob in the request body. On a
+            # ChatOpenRouter it is a declared field; on the ChatOpenAI
+            # transport (the normal case now) it rides in extra_body.
+            if type(model).__name__ == "ChatOpenRouter":
+                reasoning = dict(getattr(model, "reasoning", None) or {})
+                reasoning.setdefault("effort", "minimal")
+                return model.model_copy(update={"reasoning": reasoning})
+            extra = dict(getattr(model, "extra_body", None) or {})
+            reasoning = dict(extra.get("reasoning") or {})
             reasoning.setdefault("effort", "minimal")
-            return model.model_copy(update={"reasoning": reasoning})
+            extra["reasoning"] = reasoning
+            return model.model_copy(update={"extra_body": extra})
     except Exception:
         logger.debug(
-            "suppress_reasoning: ChatOpenRouter copy failed — using model as-is",
+            "suppress_reasoning: OpenRouter reasoning copy failed — using model as-is",
             exc_info=True,
         )
         return model
@@ -490,7 +497,7 @@ def bind_structured_output(model: Any, schema: type[BaseModel]) -> Any:
     """
     if not _is_openai_style_model(model):
         return model.with_structured_output(schema)
-    if type(model).__name__ == "ChatOpenRouter":
+    if _is_openrouter_model(model):
         model_name = getattr(model, "model_name", None)
         if model_name:
             method = _openrouter_structured_method(model_name)
@@ -622,7 +629,7 @@ def openrouter_native_structured_method(model: Any) -> str | None:
     agent-level response_format should be dropped in favour of
     prompt+salvage on those models.
     """
-    if type(model).__name__ != "ChatOpenRouter":
+    if not _is_openrouter_model(model):
         return None
     name = getattr(model, "model_name", "") or ""
     if not name:
@@ -1161,6 +1168,30 @@ def _active_provider_config(
     )
 
 
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _is_openrouter_model(model: Any) -> bool:
+    """True when *model* talks to OpenRouter, whatever class carries it.
+
+    OpenRouter models are built as :class:`ChatOpenAI` pointed at OpenRouter's
+    base URL (see :func:`_build_openrouter_model`), so the old
+    ``type(model).__name__ == "ChatOpenRouter"`` test no longer identifies
+    them — and the behaviour keyed off that test is load-bearing: the
+    capability probe and the ``_SelfHealingStructured`` wrapper that demotes
+    json_schema -> function_calling -> json_mode when OpenRouter 404s a
+    routing choice. Detect by endpoint instead, and keep accepting the old
+    class so a pre-built instance passed in by a caller still matches.
+    """
+    if type(model).__name__ == "ChatOpenRouter":
+        return True
+    for attr in ("openai_api_base", "base_url"):
+        base = getattr(model, attr, None)
+        if base and "openrouter.ai" in str(base):
+            return True
+    return False
+
+
 def _build_openrouter_model(
     model_spec: str,
     session_id: str,
@@ -1189,8 +1220,6 @@ def _build_openrouter_model(
         A configured ``ChatOpenRouter`` instance.
     """
     from deepagents.profiles.provider import apply_provider_profile
-
-    from langchain_openrouter import ChatOpenRouter
 
     # Strip the "openrouter:" prefix to get the raw model name
     model_name = model_spec.removeprefix("openrouter:")
@@ -1247,20 +1276,62 @@ def _build_openrouter_model(
     provider_prefs: dict[str, Any] = dict(profile_kwargs.pop("openrouter_provider", {}) or {})
     provider_prefs.setdefault("require_parameters", True)
 
+    # OpenRouter speaks the OpenAI dialect, so it is reached through ChatOpenAI
+    # rather than langchain_openrouter.ChatOpenRouter. That class does not
+    # DECLARE http_client / http_async_client as pydantic fields, so the shared
+    # connection-capped clients _apply_concurrency_cap injects were swept into
+    # model_kwargs and forwarded verbatim to the SDK — every call died with
+    # "TypeError: Chat.send_async() got an unexpected keyword argument
+    # 'http_async_client'". The whole OpenRouter lane was dead, unnoticed
+    # because only the two onboarding phases route there; the only symptom was
+    # a pydantic warning in the test suite about http_client being transferred
+    # to model_kwargs. ChatOpenAI declares both fields, so the concurrency cap
+    # keeps working instead of having to be disabled.
+    #
+    # request_timeout goes back to SECONDS here — the milliseconds above are a
+    # ChatOpenRouter-ism; ChatOpenAI takes seconds.
     model_kwargs: dict[str, Any] = {
         "model": model_name,
-        "session_id": truncated_session_id,
-        "request_timeout": timeout_ms,
-        "openrouter_provider": provider_prefs,
-        **profile_kwargs,
+        "base_url": _OPENROUTER_BASE_URL,
+        "request_timeout": timeout_ms / 1000,
+        # OpenRouter-native knobs ride in extra_body: provider preferences
+        # (require_parameters) and the session id it uses for request grouping.
+        "extra_body": {
+            "provider": provider_prefs,
+            "session_id": truncated_session_id,
+        },
+        **{
+            k: v for k, v in profile_kwargs.items()
+            if k not in {"session_id", "app_url", "app_title"}
+        },
     }
+    # OpenRouter reads app attribution from HTTP HEADERS, not body params.
+    # ChatOpenRouter had app_url/app_title as declared fields; on ChatOpenAI
+    # they would be swept into model_kwargs and posted as unknown body keys.
+    headers = {
+        k: v for k, v in (
+            ("HTTP-Referer", profile_kwargs.get("app_url")),
+            ("X-Title", profile_kwargs.get("app_title")),
+        ) if v
+    }
+    if headers:
+        model_kwargs["default_headers"] = headers
     # ── Explicitly pass api_key from environment or provider config ──
     # ChatOpenRouter validates OPENROUTER_API_KEY in os.environ on
     # construction.  Worker threads/subprocesses may not inherit the
     # parent shell's env vars, so we pass the key explicitly instead of
     # relying on the implicit check.  Prefer the provider config's
     # api_key field, then fall back to the environment variable.
-    api_key = provider_cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY", "")
+    # Only trust provider_cfg's api_key when that config is itself an
+    # OpenRouter lane. _active_provider_config resolves the ACTIVE provider,
+    # which during a local run is a vLLM lane carrying `api_key: vllm` — a
+    # truthy 4-char string that shadowed the environment variable and sent
+    # "vllm" as the bearer token, so every OpenRouter call 401'd with
+    # "Missing Authentication header".
+    cfg_key = provider_cfg.get("api_key")
+    if not str(provider_cfg.get("model", "")).startswith("openrouter:"):
+        cfg_key = None
+    api_key = cfg_key or os.environ.get("OPENROUTER_API_KEY", "")
     if api_key:
         model_kwargs["api_key"] = api_key
     # Send the resolved cap as `max_tokens`, NOT `max_completion_tokens`.
@@ -1272,9 +1343,15 @@ def _build_openrouter_model(
     # found that can handle the requested parameters" — even though the model
     # itself is fine.  `max_tokens` is the portable field OpenRouter normalises
     # for every provider, so collapse both config fields onto it.
+    #
+    # It must go through extra_body, NOT ChatOpenAI's max_tokens field:
+    # langchain-openai serialises that field as `max_completion_tokens` on the
+    # wire (the o-series convention), which is precisely the key OpenRouter
+    # rejects. Putting it in extra_body puts the literal `max_tokens` on the
+    # request and leaves the field unset, so nothing emits the other name.
     cap = max_completion_tokens if max_completion_tokens is not None else max_tokens
     if cap is not None:
-        model_kwargs["max_tokens"] = int(cap)
+        model_kwargs["extra_body"]["max_tokens"] = int(cap)
 
     # ── Enable streaming for stall detection ─────────────────────────
     # ChatOpenRouter defaults to streaming=False.  Without streaming,
@@ -1296,7 +1373,9 @@ def _build_openrouter_model(
 
     _apply_concurrency_cap(model_kwargs, provider_cfg)
 
-    return ChatOpenRouter(**model_kwargs)
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(**model_kwargs)
 
 
 def _expand_env_ref(value: Any) -> Any:
