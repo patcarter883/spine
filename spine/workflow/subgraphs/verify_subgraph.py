@@ -246,11 +246,32 @@ def _verify_router(
         "work_type": state.get("work_type", ""),
         "workspace_root": state.get("workspace_root", "."),
     }
+    # Files OTHER slices own. A Send payload REPLACES node input rather than
+    # merging graph state, so a node sees only what is put here — which is why
+    # the advisory feature-test block reading state["execution_waves"] has
+    # always been dead code. Without this, a slice's evidence is pathspec-scoped
+    # to its own target_files, so a dependent slice truthfully reports "No
+    # evidence that AssetType exists" about a file a sibling just created.
+    # Run cc9c2611: farm-architecture-tests failed 8 criteria exactly that way
+    # and never converged across seven gap cycles.
+    def _siblings(me: dict) -> list[str]:
+        mine = {f for f in (me.get("target_files") or []) if f}
+        return sorted({
+            f
+            for other in all_slices
+            if other.get("id") != me.get("id")
+            for f in (other.get("target_files") or [])
+            if f and f not in mine
+        })
+
     return [
         # Two-node verifier branch: plan_slice_verifier (no tools) →
         # run_slice_verifier (tools). Each parallel branch carries its
         # own active_slice_directive through the chain.
-        Send("plan_slice_verifier", {**base_state, "slice": s})
+        Send(
+            "plan_slice_verifier",
+            {**base_state, "slice": s, "sibling_target_files": _siblings(s)},
+        )
         for s in all_slices
     ]
 
@@ -316,6 +337,9 @@ async def _plan_slice_verifier_node(
         "workspace_root": state.get("workspace_root", "."),
         "slice": slice_data,
         "active_slice_directive": directive.model_dump(),
+        # Forward the sibling manifest — Send replaces state, so anything not
+        # relayed here is lost before run_slice_verifier sees it.
+        "sibling_target_files": state.get("sibling_target_files") or [],
     }
     return Command(goto=Send("run_slice_verifier", send_payload))
 
@@ -811,6 +835,54 @@ _PRELOAD_MAX_LINES_PER_FILE = 400
 _PRELOAD_MAX_CHARS = 24000
 
 
+_MAX_SIBLING_MANIFEST = 60
+
+
+def _sibling_manifest_block(
+    workspace_root: str, sibling_files: list[str] | None
+) -> str:
+    """Existence manifest for files OWNED BY OTHER SLICES, '' when there are none.
+
+    The judge's diff and pre-loaded source are pathspec-scoped to its own
+    slice, so a dependent slice sees nothing a sibling created and reports it
+    missing. That is a true statement about the evidence and a false statement
+    about the workspace: run cc9c2611's farm-architecture-tests failed eight
+    criteria on "No evidence that AssetType exists" while
+    app/Domain/Farm/Models/AssetType.php had been on disk for an hour and a
+    half, and the slice never converged in seven gap cycles.
+
+    Only existence is reported, not content. Existence is the thing being got
+    wrong, and inlining sibling source would grow the prompt without bound —
+    the fan-out means every slice would carry every other slice's files.
+
+    Glob-shaped entries are skipped: they are never real paths (a separate
+    defect writes them to disk verbatim), and reporting them as missing would
+    reintroduce the same false negative.
+    """
+    files = [f for f in (sibling_files or []) if f and "*" not in f]
+    if not files:
+        return ""
+    root = Path(workspace_root or ".")
+    lines: list[str] = []
+    for rel in files[:_MAX_SIBLING_MANIFEST]:
+        try:
+            exists = (root / rel).is_file()
+        except OSError:  # noqa: PERF203 — unreadable path, treat as absent
+            exists = False
+        lines.append(f"{'PRESENT' if exists else 'ABSENT '}  {rel}")
+    extra = len(files) - len(lines)
+    if extra > 0:
+        lines.append(f"… (+{extra} more)")
+    return (
+        "<sibling_slice_files>\nFiles owned by OTHER slices of this same plan. "
+        "They are NOT in your diff because the diff is scoped to your slice — "
+        "their absence from it is NOT evidence they were never built. Treat a "
+        "PRESENT entry as proof the dependency exists.\n"
+        + "\n".join(lines)
+        + "\n</sibling_slice_files>"
+    )
+
+
 def _target_source_block(workspace_root: str, target_files: list[str] | None) -> str:
     """Render the current source of the slice's target files, line-numbered.
 
@@ -925,6 +997,16 @@ async def _run_slice_verifier_node(
         source_block = _target_source_block(
             state.get("workspace_root", "."), slice_data.get("target_files")
         )
+        # A MANIFEST of what sibling slices actually produced. The diff and the
+        # source block above are pathspec-scoped to this slice, so without this
+        # the judge cannot tell "the dependency was never built" from "it was
+        # built by another slice and is simply not in my diff" — and it
+        # correctly, but uselessly, reports the file as missing. A manifest
+        # rather than inlined source keeps the prompt bounded: existence is the
+        # question being got wrong, not content.
+        sibling_block = _sibling_manifest_block(
+            state.get("workspace_root", "."), state.get("sibling_target_files")
+        )
         # Evidence-then-judge: when the no-tool judge is on, run the checks the
         # ReAct verifier used to spend an unbounded loop on (py_compile + ruff)
         # ONCE, here, and inline the results. The judge has no tools, so this is
@@ -935,15 +1017,12 @@ async def _run_slice_verifier_node(
         # The feature's test files (from every slice's target_files) run as
         # ADVISORY evidence for this slice — a migration/model defect often
         # only surfaces in the sibling test slice's run (probe 12).
-        feature_tests = [
-            f
-            for wave in (state.get("execution_waves") or [])
-            if isinstance(wave, list)
-            for sl in wave
-            if isinstance(sl, dict)
-            for f in (sl.get("target_files") or [])
-            if f and _is_test_path(f)
-        ]
+        #
+        # Sourced from the Send payload, NOT state["execution_waves"]: a Send
+        # payload replaces node input rather than merging graph state, so that
+        # read always yielded [] and this block was dead code from the start.
+        sibling_files = [f for f in (state.get("sibling_target_files") or []) if f]
+        feature_tests = [f for f in sibling_files if _is_test_path(f)]
         checks_block, checks_failures = (
             _automated_checks(
                 state.get("workspace_root", "."),
@@ -983,6 +1062,7 @@ async def _run_slice_verifier_node(
                 (Tag.FINDINGS, f"```json\n{slice_json}\n```"),
             )
             + "\n\n" + diff_block
+            + ("\n\n" + sibling_block if sibling_block else "")
             + ("\n\n" + source_block if source_block else "")
             + ("\n\n" + checks_block if checks_block else "")
             + ("\n\n" + directive_block if directive_block else ""),
@@ -1054,18 +1134,37 @@ async def _run_slice_verifier_node(
             e,
             exc_info=True,
         )
+        # A crash means the slice was NOT JUDGED — it does not mean the code
+        # is wrong. Say so, and size the checklist to the slice's real
+        # criteria rather than to one synthetic entry.
+        #
+        # _total_gap_count (compose.py) counts failing checklist entries and
+        # feeds the best-state ratchet. A crash scored as exactly 1 failure
+        # therefore reads as a near-minimum gap total for a slice whose real
+        # criteria are unmeasured — in run 593a5cc4 two crashed slices with 13
+        # and 11 criteria each scored 1, which both hides the true gap and can
+        # make an unjudged cycle look like the best state and trigger a
+        # rollback over genuinely better work.
+        criteria = [c for c in (slice_data.get("acceptance_criteria") or []) if c]
+        detail = (
+            f"NOT JUDGED — the verifier crashed before producing a verdict: {e}. "
+            "This is a harness failure, not evidence about the code. Do not "
+            "synthesise fixes from it; re-run verification for this slice."
+        )
         verification_result = {
             "slice_name": slice_id,
             "verdict": "NOT_VERIFIED",
             "checklist": [
-                {
-                    "criterion": "Subagent execution",
-                    "passed": False,
-                    "detail": f"Verifier subagent crashed: {e}",
-                }
+                {"criterion": str(c), "passed": False, "detail": detail}
+                for c in criteria
+            ] or [
+                {"criterion": "Subagent execution", "passed": False, "detail": detail}
             ],
             "gaps": [f"Verification could not complete: {e}"],
             "recommendations": ["Re-run verification for this slice"],
+            # Marks the verdict as unmeasured for anything that wants to treat
+            # "we could not look" differently from "we looked and it failed".
+            "verifier_crashed": True,
         }
 
     return {"verification_results": [verification_result]}

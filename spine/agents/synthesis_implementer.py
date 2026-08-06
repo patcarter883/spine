@@ -468,6 +468,27 @@ def _is_whole_file_symbol(symbol: str, file: str) -> bool:
     return bool(_SOURCE_FILE_EXT_RE.search(s))
 
 
+def _resolve_glob_target(workspace_root: str, pattern: str) -> str | None:
+    """The single existing file *pattern* matches, or None.
+
+    Only an unambiguous match is accepted. Zero matches means the plan named a
+    file that does not exist yet and expressed it as a pattern — there is no
+    safe way to invent the concrete name here (a migration's timestamp is
+    semantically load-bearing: it decides run order). More than one match means
+    the edit is ambiguous. Both cases must be refused rather than guessed.
+    """
+    try:
+        root = Path(workspace_root or ".")
+        hits = sorted(
+            str(p.relative_to(root))
+            for p in root.glob(pattern)
+            if p.is_file()
+        )
+    except (OSError, ValueError):
+        return None
+    return hits[0] if len(hits) == 1 else None
+
+
 def apply_synthesized(
     candidate: SynthesizedSlice,
     *,
@@ -502,6 +523,34 @@ def apply_synthesized(
                  "detail": f"{edit.file} is not in the slice's target_files."}
             )
             continue
+        # A PATTERN is not a path. Plans routinely put globs in target_files
+        # ("database/migrations/*_create_contacts_table.php",
+        # "tests/Feature/**/*Contact*Test.php"), the scope check above compares
+        # strings so they pass it, and the writer then creates files with a
+        # literal '*' in the name. Run 593a5cc4 produced four such files —
+        # real code at paths Laravel can never autoload or run, so the slices
+        # failed for reasons no amount of rework could fix. Two earlier runs
+        # did the same (27fc6b0e, 0a92363b), which makes this a recurring
+        # class, not a one-off.
+        #
+        # Resolve against what is actually on disk when that is unambiguous;
+        # otherwise refuse. Refusing surfaces an unusable plan target to the
+        # gap loop, which is strictly better than silently writing garbage.
+        if any(ch in edit.file for ch in "*?["):
+            resolved = _resolve_glob_target(workspace_root, edit.file)
+            if resolved is None:
+                result.failures.append(
+                    {**rec, "status": "unresolved_glob_target",
+                     "detail": (
+                         f"{edit.file!r} is a glob pattern, not a file path, and "
+                         "does not match exactly one existing file. The plan must "
+                         "name a concrete path — for a new Laravel migration that "
+                         "means a real YYYY_MM_DD_HHMMSS_ prefix, not '*'."
+                     )}
+                )
+                continue
+            rec["file"] = resolved
+            edit = edit.model_copy(update={"file": resolved})
         try:
             if not (Path(workspace_root) / edit.file).exists():
                 confusion = _confused_path_prefix(workspace_root, edit.file)

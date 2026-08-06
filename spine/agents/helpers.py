@@ -346,9 +346,13 @@ def suppress_reasoning(model: BaseChatModel) -> BaseChatModel:
                 reasoning.setdefault("effort", "minimal")
                 return model.model_copy(update={"reasoning": reasoning})
             extra = dict(getattr(model, "extra_body", None) or {})
-            reasoning = dict(extra.get("reasoning") or {})
-            reasoning.setdefault("effort", "minimal")
-            extra["reasoning"] = reasoning
+            # `enabled: false`, NOT `effort: minimal`. Measured on
+            # deepseek-v4-flash-0731: effort=minimal still burned 38 reasoning
+            # tokens on "Reply with exactly: ok", exclude=true burned 24 and
+            # merely hid them, while enabled=false produced 0. Suppression that
+            # does not reclaim the budget is not suppression — and budget is
+            # the whole reason callers suppress (truncated structured output).
+            extra["reasoning"] = {"enabled": False}
             return model.model_copy(update={"extra_body": extra})
     except Exception:
         logger.debug(
@@ -1391,6 +1395,30 @@ def _build_openrouter_model(
         model_kwargs["streaming"] = False
     else:
         model_kwargs.setdefault("streaming", True)
+
+    # ── Honour `reasoning: false` ────────────────────────────────────
+    # This knob was implemented ONLY in _build_local_model, so on the
+    # OpenRouter lane an operator's `reasoning: false` never reached the wire.
+    # Arm B (run 593a5cc4) set it on both verify keys and still spent 3130 of
+    # a 4096-token budget on reasoning, truncating VerificationResult mid-JSON.
+    # langchain raises that as StructuredOutputValidationError from inside its
+    # own model handler, beneath every spine middleware, so no salvage can
+    # reach it — two slices failed on that alone. Arm A's local lane did not
+    # crash precisely because it DOES get reasoning_budget: 0.
+    #
+    # The FORM matters. Measured against deepseek/deepseek-v4-flash-0731 on
+    # OpenRouter, reasoning tokens for "Reply with exactly: ok":
+    #   {"enabled": false}    -> 0    <- the only form that actually stops it
+    #   {"effort": "minimal"} -> 38
+    #   {"max_tokens": 0}     -> 11
+    #   {"exclude": true}     -> 24   (hidden from output, still generated)
+    # So `exclude`/`effort` do not reclaim budget; only `enabled` does.
+    if provider_cfg.get("reasoning") is False:
+        model_kwargs["extra_body"]["reasoning"] = {"enabled": False}
+    elif provider_cfg.get("reasoning") is True:
+        # Parity with the local builder: an explicit `true` locks reasoning ON,
+        # making callsite suppress_reasoning() a no-op for this model.
+        model_kwargs.setdefault("tags", []).append(_REASONING_LOCK_TAG)
 
     # ── Enable usage_metadata on streamed responses ─────────────────
     # ChatOpenRouter inherits ChatOpenAI; stream_usage=True causes it
