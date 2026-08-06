@@ -113,9 +113,17 @@ def test_classmap_fqcns_are_unescaped(tmp_path):
     assert "\\\\" not in repaired
 
 
-def test_intact_fqcn_is_left_alone(tmp_path):
+def test_intact_fqcn_is_echoed_not_dropped(tmp_path):
+    """An intact FQCN must come back unchanged, not None.
+
+    The caller drops whatever it cannot resolve, so returning None here meant
+    every correct vendor FQCN was discarded as a phantom — 5 of probe 27's 12
+    drops were real classes (Illuminate\\Http\\Request and friends).
+    """
     ws = _ws(tmp_path)
-    assert repair_mangled_fqcn("App\\Domain\\Farm\\Models\\Farm", str(ws)) is None
+    assert repair_mangled_fqcn("App\\Domain\\Farm\\Models\\Farm", str(ws)) == (
+        "App\\Domain\\Farm\\Models\\Farm"
+    )
 
 
 def test_paths_and_dotted_names_are_left_alone(tmp_path):
@@ -538,3 +546,37 @@ def test_psr4_array_form_is_honoured(tmp_path):
         "<?php\n\nnamespace App\\Widgets;\n\nclass Sprocket\n{\n}\n", encoding="utf-8"
     )
     assert resolve_class_fqcn("Sprocket", str(tmp_path)) == "App\\Widgets\\Sprocket"
+
+
+# ── wrong-case namespace repair (agripath probe 27, run cc9c2611) ──────────
+
+
+def test_lowercase_namespace_is_repaired(tmp_path):
+    """PSR-4 autoloading is case-SENSITIVE even though the engine is not.
+
+    The planner emitted 'app\\Domain\\...' (directory casing) for real classes,
+    and _scrub_phantom_refs dropped every one.
+    """
+    ws = _ws(tmp_path)
+    assert repair_mangled_fqcn("app\\Domain\\Farm\\Models\\Farm", str(ws)) == (
+        "App\\Domain\\Farm\\Models\\Farm"
+    )
+
+
+def test_wrong_namespace_is_still_declined(tmp_path):
+    """The repair fixes CASE, never a fabricated namespace."""
+    ws = _ws(tmp_path)
+    assert repair_mangled_fqcn("app\\Services\\FarmScoped", str(ws)) is None
+    assert repair_mangled_fqcn("Tests\\Feature\\TestCase", str(ws)) is None
+
+
+def test_qualified_input_uses_exact_lookup_not_prefix_scan(tmp_path):
+    """A new class whose leaf repeats a namespace word must NOT be rewritten.
+
+    The prefix scan accepts any remainder appearing in the match, so it would
+    map App\\Domain\\Farm\\Models\\FarmModels onto the existing ...\\Farm.
+    Separators being present means there is no stutter to absorb, so qualified
+    input takes an exact skeleton hit or nothing.
+    """
+    ws = _ws(tmp_path)
+    assert repair_mangled_fqcn("App\\Domain\\Farm\\Models\\FarmModels", str(ws)) is None

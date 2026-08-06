@@ -729,6 +729,23 @@ def _reconcile_verdict(
     of a green check run); else a non-empty all-passed checklist with no
     gaps ⇒ VERIFIED. Mutates in place.
     """
+    # An incoherent verdict is collapsed FIRST, before either branch reads the
+    # checklist: probe 27's judge returned one self-contradictory reason for 14
+    # of 15 criteria, and those fabrications would otherwise be appended to by
+    # the hard-failure branch, counted by _total_gap_count, and handed to
+    # gap_plan as the rework instruction for the next three cycles.
+    try:
+        from spine.workflow.verdict_gate import reject_unreliable_verdict
+
+        reject_unreliable_verdict(
+            verification_result, work_id=work_id, slice_id=slice_id
+        )
+    except Exception as exc:  # noqa: BLE001 — a gate that can crash verify is worse
+        logger.warning(
+            "[%s] Slice-verifier %r: verdict gate skipped — %s",
+            work_id, slice_id, exc,
+        )
+
     verdict = verification_result.get("verdict")
     if checks_failures:
         if verdict == "VERIFIED":

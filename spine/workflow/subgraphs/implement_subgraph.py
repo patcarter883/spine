@@ -1056,13 +1056,20 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
         'AppInfrastructureModelsTraitsFarmScopedModelsTraitsFarmScoped'.
         Dropping those cost the editor the list that told it what to import.
 
-        First-party classes come back as the BARE LEAF, the only form
-        symbol_metadata stores. Vendor classes are NOT indexed at all (0 rows
-        under vendor/), so requiring an index hit discarded essentially every
-        framework repair — 3 of probe 26's own 8 symbols. Those come back as
-        the full FQCN instead: it is the genuine import, and
-        ``_is_external_reference`` already classifies any backslash-bearing
-        string as external.
+        A STUTTERED symbol (no separators) reduces to the BARE LEAF when the
+        index holds it, since symbol_metadata stores no namespaces. Vendor
+        classes are not indexed at all (0 rows under vendor/), so requiring an
+        index hit discarded essentially every framework repair — 3 of probe
+        26's own 8 symbols; those keep the full FQCN, which is the genuine
+        import, and ``_is_external_reference`` already classifies any
+        backslash-bearing string as external.
+
+        A symbol that ARRIVED with separators (probe 27's wrong-case
+        ``app\\Domain\\…``, or an intact vendor FQCN) always keeps its full
+        form. Leaf-reducing those would throw away the namespace the repair
+        just recovered, and the leaf can be ambiguous — this repo has ``User``
+        at both app/Domain/Shared/Models and app/Models, and ``_exact_index_hit``
+        only compares symbol_name.
         """
         nonlocal _corpus
         try:
@@ -1074,6 +1081,8 @@ def _scrub_phantom_refs(active_slice: dict, work_id: str = "?") -> dict:
             return None
         if not fqcn:
             return None
+        if "\\" in sym:
+            return fqcn  # already qualified — keep the namespace
         leaf = fqcn.rsplit("\\", 1)[-1]
         return leaf if _exact_index_hit(leaf) else fqcn
 

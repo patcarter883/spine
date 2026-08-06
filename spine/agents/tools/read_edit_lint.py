@@ -705,6 +705,71 @@ def _fix_php_namespaces(path: Path, workspace_root: str) -> Optional[list[str]]:
     return changed
 
 
+def _php_migration_guard(
+    path: Path, workspace_root: str
+) -> tuple[list[str], list[str]]:
+    """Repair uuid/bigint FK mismatches and flag unsortable migration names.
+
+    Returns (repairs_applied, warnings). Both empty for non-migration files.
+
+    The FK mismatch is REPAIRED because it is provably wrong — a bigint
+    ``foreignId`` constrained to a uuid primary key is refused by Postgres
+    outright (SQLSTATE 42804), and the fix is unambiguous. The filename is only
+    WARNED about: renaming a file the editor just wrote would desynchronise it
+    from the slice's target_files, and the write path has no post-hoc rejection
+    (``_atomic_write`` is a one-way ``os.replace`` with no backup).
+    """
+    rel = str(path).replace("\\", "/")
+    if "/database/migrations/" not in rel and not rel.startswith("database/migrations/"):
+        return [], []
+
+    from spine.agents.tools.php_migrations import (
+        check_migration_filename,
+        check_migration_ordering,
+        migration_pk_types,
+        repair_foreign_id,
+    )
+
+    warnings: list[str] = []
+    name_warn = check_migration_filename(path.name)
+    if name_warn:
+        warnings.append(name_warn)
+    else:
+        try:
+            siblings = [p.name for p in path.parent.glob("*.php")]
+        except OSError:
+            siblings = []
+        order_warn = check_migration_ordering(path.name, siblings)
+        if order_warn:
+            warnings.append(order_warn)
+
+    repairs: list[str] = []
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return repairs, warnings
+
+    if "foreignId(" not in content:
+        return repairs, warnings
+
+    try:
+        pk_types = migration_pk_types(path.parent)
+        new_content, repairs = repair_foreign_id(content, pk_types)
+    except Exception:  # noqa: BLE001 — a guard that can crash the write is worse
+        return [], warnings
+
+    if not repairs or new_content == content:
+        return [], warnings
+    # Re-validate exactly as the other PHP repairs do before committing.
+    if _check_php(new_content) is not None:
+        return [], warnings
+    try:
+        _atomic_write(path, new_content)
+    except OSError:
+        return [], warnings
+    return repairs, warnings
+
+
 def _php_blank_noncode(src: str) -> str:
     """Replace comment/string/heredoc bodies with spaces, preserving offsets.
 
@@ -2542,6 +2607,14 @@ class ReadEditLintTool(BaseTool):
             imported = _php_auto_import(path, self.workspace_root)
             if imported:
                 ok_fields["php_imports_added"] = imported
+            # Migration-specific checks. Both defect classes this catches pass
+            # `php -l`, so neither the pre-write gate nor the php_syntax
+            # landing gate can see them.
+            mig_fixed, mig_warn = _php_migration_guard(path, self.workspace_root)
+            if mig_fixed:
+                ok_fields["migration_fixed"] = mig_fixed
+            if mig_warn:
+                ok_fields["migration_warnings"] = mig_warn
         ruff = _ruff_report(path, self.workspace_root)
         if ruff is not None and ruff != "clean":
             # Deterministic repair for missing module imports (F821): the
