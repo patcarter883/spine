@@ -839,6 +839,7 @@ Controller   Reconciler        Worktree           Agent(proc grp)      Tools/Gat
 | Name | Class | What it returns |
 |---|---|---|
 | `diff.stats` | Pure | files/LOC changed vs base, binary files, renames |
+| `diff.nonempty` | Pure | exit 1 if the snapshot has no diff or no commits against its merge-base with base. A task cannot be "completed" by changing nothing (from Gas Town's `branch_has_real_change`, §9.1) |
 | `diff.scope` | Pure | exit 1 if any changed path is outside `Spec.Scope`; diagnostics list the paths |
 | `diff.applycheck` | Pure | validates a worker-produced patch file (`git apply --check` on a temp index) |
 | `git.preflight` | Pure | `merge-tree --write-tree` result + conflict paths |
@@ -855,10 +856,11 @@ Projects declare gates in `.spine/gates.yaml`. This is a new format; nothing fro
 gates:
   parse:      { tool: ts.parse, policy: absolute }
   scope:      { tool: diff.scope, policy: absolute }
+  nonempty:   { tool: diff.nonempty, policy: absolute }
   build:      { tool: cmd.run, args: { argv: [go, build, ./...], parser: go-build }, timeout: 5m }
   unit:       { tool: cmd.run, args: { argv: [go, test, -json, ./...], parser: gotest-json }, timeout: 10m, policy: baseline }
   api:        { tool: ts.api_contract, args: { languages: [go, python] }, policy: absolute }
-order: [parse, scope, build, unit, api]   # cheap → expensive; first hard failure short-circuits
+order: [parse, scope, nonempty, build, unit, api]   # cheap → expensive; first hard failure short-circuits
 ```
 
 ### 5.2 Tree-sitter specifics
@@ -1085,6 +1087,7 @@ Both projects were cloned at HEAD on 2026-11-02 and read at source:
 | Repo | Commit | Module / license |
 |---|---|---|
 | `gastownhall/gascity` | `4ebacb1` | `github.com/gastownhall/gascity`, Go 1.27.3, MIT |
+| `gastownhall/gascity-packs` | `0b0d962` (Gas City pins `cb6a612`; `mol-refinery-patrol.toml` differs by one flag rename) | Gas Town pack: agent prompts, formulas, scripts |
 | `gastownhall/beads` | `ce907a9` | `github.com/steveyegge/beads` (Gas City pins `v1.3.2`), Go 1.27.3, MIT |
 
 All `path:line` references below are at those commits. Both projects change quickly. Gas City's own architecture docs already lag the code: `engdocs/architecture/reconciler-v2.md` describes an `internal/workqueue` package that no longer exists, and `cmd/gc/reconcile_keys_test.go:60` is a test that *bans* reintroducing it. So the claims below cite code, not docs. Both clones were shallow, so history-based claims were not checked.
@@ -1118,7 +1121,30 @@ It differs from this RFC in three ways:
 
 **Agent runtime: mostly terminal-shaped.** The provider interface (`internal/runtime/runtime.go:471`) is `Start` / `Nudge` / `Peek` / `SendKeys` / `Attach`. `tmux` is the default, and it is required even when other backends are used (`README.md`). Under tmux, nudges are `send-keys` and observation is `capture-pane` scraping, with heuristics for startup dialogs (`tmux/adapter.go:819`, `tmux/interaction.go:935`). The `k8s` provider runs tmux inside a pod (`k8s/provider.go:171`). The headless `subprocess` provider sends stdout/stderr to `/dev/null`, and its `Peek` returns `""` (`subprocess/subprocess.go:197-204`). The exception is the **ACP provider**: JSON-RPC 2.0 over stdio, with structured transcripts (`runtime/acp/protocol.go:1-10`). There are also `internal/sessionlog/*_reader.go` parsers for each CLI's on-disk JSONL transcripts (claude, codex, gemini, opencode). Both are directly relevant prior art for `agent.Adapter` (§3.4).
 
-**Integration (merge) is an agent role.** The "refinery" is an agent driven by the `mol-refinery-patrol` formula, which lives in the external `gascity-packs` repo and was **not read** for this review. The in-repo scripted example (`examples/lifecycle/.../lifecycle-refinery-merge.yaml:77-146`) runs `checkout -B base origin/base`, then `git merge --no-edit`, with `merge --abort` on conflict. It describes itself as "happy-path merge only", with no test gate in the script. Nothing in `internal/` or `cmd/` uses `merge-tree`, `update-ref` CAS, or `index.lock` detection or recovery. The archived worktree roadmap still lists "Merge-back flow" as unchecked (`engdocs/archive/backlogs/worktree-roadmap.md:87-101`).
+**Integration (merge) is an LLM agent following a prose formula, with hardened shell blocks inside it.** Gas City's Go code has no merge path: nothing in `internal/` or `cmd/` uses `merge-tree`, `update-ref` CAS, or `index.lock` detection or recovery. The in-repo example (`examples/lifecycle/.../lifecycle-refinery-merge.yaml:77-146`) calls itself "happy-path merge only". The production path is the Gas Town pack's **refinery** agent running `gastown/formulas/mol-refinery-patrol.toml`. That file is in `gastownhall/gascity-packs` @ `0b0d962` (1,567 lines). Gas City pins the pack at `cb6a612`, and the only later change to this file is a one-line `bd` flag rename (#583).
+
+The formula opens with: "Formula steps are NOT materialized as child beads. Read the step descriptions below and work through them in order." It is a prompt, executed by the agent, and its steps are `validate-identity → check-inbox → find-work → rebase → run-tests → handle-failures → merge-push → patrol-summary → next-iteration`. Some parts of it are deterministic and others are left to the agent's judgment:
+
+*Deterministic (embedded bash the agent is told to run as one script):*
+- **Rebase guard** (L380-480):
+  - It fetches the exact tracking refs and fails closed on any fetch error.
+  - It probes `git merge-base --is-ancestor origin/$TARGET origin/$BRANCH` and **skips the rebase** when the branch is already based on the target, because rebasing would flatten merge commits and drop recorded conflict resolutions (issue 374).
+  - Exit codes other than 0 or 1 are treated as tool errors, never as "not an ancestor".
+  - A missing target branch parks the bead for a human, not bouncing it back to a worker.
+  - The guard is covered by an *executed* test that lifts the block out of the formula and runs it (`gastown/tests/test_mol_refinery_patrol_rebase_guard.sh`, 888 lines).
+- **False-completion guard** `branch_has_real_change` (around L760-790): it refuses to close a bead as merged when the branch has no diff or no commits against its merge-base. Exit 2 (diff or merge-base could not be computed) fails closed.
+- **Merge script** (L1043-1090):
+  - It works in a *temporary detached worktree*, because the target may be checked out in the rig's main worktree ("Do not replace this with `git checkout $TARGET`").
+  - It runs `git merge --ff-only`, then `git push origin HEAD:$TARGET`, then re-fetches and **verifies that `origin/$TARGET` equals the merged SHA** before writing any bead metadata.
+  - The remote's rejection of a non-fast-forward push is the effective CAS.
+- **`mr` mode:** opening a PR does not complete the bead. The bead stays blocked until a later patrol verifies the merge commit on the target (`gc gastown pr-merge-reconcile`).
+
+*Left to agent judgment:*
+- **The test gate.** `run-tests` (L548-585) interpolates `setup/typecheck/lint/build/test_command` vars, all empty by default. If none are set, the agent must "read the repo's project-instructions file (CLAUDE.md or AGENTS.md) and run the quality gates it documents". Then: "Track results: which checks ran, pass/fail". The agent itself collects the exit codes; nothing structurally captures them.
+- **Failure attribution.** `handle-failures` (L587-663) step 1 is literally "Diagnose: branch regression or pre-existing on target?". If the agent decides a failure is pre-existing, it files or links a bug bead and **proceeds with the merge**. The rule is stated in prose: "**GATE**: Cannot merge without all checks passing OR pre-existing bug filed/found."
+- **Ordering** ("Uncertain merge order | Choose based on priority, dependencies, timing", `agents/refinery/prompt.template.md`).
+
+So Gas Town's merge path has better git hygiene than the earlier, from-memory version of this RFC assumed. But its acceptance decision, whether the checks passed and whether a failure is the branch's fault, is still an LLM judgment over terminal output. That is exactly what Spine moves into deterministic code: §5.4 baseline-relative verdicts answer "pre-existing or regression?" by fingerprint subtraction on a gate run against the base tree, not by asking the agent.
 
 **Worktrees, git and processes: high quality, and the best reuse candidate.**
 
@@ -1172,7 +1198,8 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
 | Typed diagnostics, baseline-relative verdicts | ✗ opaque script | n/a | ✓ (§5) |
 | Structured worker I/O, no terminal scraping | ◐ ACP only; tmux default | n/a | ✓ (§3.4); Gas City ACP is a reference |
 | Worktree lifecycle that fails closed | ✓ strong | n/a | adapt Gas City |
-| Conflict pre-flight + CAS integration | ✗ agent role, porcelain merge | n/a | ✓ (§6.2) |
+| Conflict pre-flight + CAS integration | ◐ hardened shell in an agent formula: ancestry-guarded rebase, `--ff-only` in a temp worktree, push + remote SHA verify; no `merge-tree` dry-run | n/a | ✓ (§6.2) |
+| Pre-merge test gate decided deterministically | ✗ agent runs the checks, "diagnoses" regression vs pre-existing, may merge past a failure | n/a | ✓ (§5.4) |
 | Git lockfile / index recovery | ✗ none | n/a | ✓ (§6.2) |
 | Process-group supervision, PID-reuse safety | ✓ strong (git timeouts excepted) | n/a | adapt Gas City |
 | Intent-before-effect journal | ◐ shadow-only, tied to beads | ◐ `journalops` | ✓ SQLite `ops` table (§6.1) |
@@ -1204,8 +1231,12 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
 
 5. **Study before writing `agent.Adapter`:** Gas City's ACP provider (`internal/runtime/acp/`) and the per-CLI transcript readers (`internal/sessionlog/`). They are the most current record of each agent CLI's machine-readable output. Re-implement them rather than vendoring, because they are coupled to `internal/worker`.
 
+6. **Adopt the refinery formula's git guards as deterministic tools.** Spine's design misses three of them, and each records a real failure:
+   - **`diff.nonempty`**: an absolute gate implementing `branch_has_real_change`. Refuse integration when the diff against the merge-base is empty or has no commits, and fail closed if the diff can't be computed. This stops a worker "completing" a task with no change against an already-green baseline.
+   - **Ancestry-guarded rebase:** when `Preflight` needs a rebase, skip it if base is already an ancestor (no flattening of merge topology), and treat probe errors as infrastructure faults.
+   - **Post-integration remote verification:** when Spine pushes to a remote rather than only updating a local ref, re-fetch and compare SHAs before setting `Integrated`.
+
 **Open verification items:**
-- the `mol-refinery-patrol` formula in `gascity-packs` (could change the merge assessment if it adds a deterministic gate)
 - how `reviewquorum` is used in production (it has no in-repo production importer)
 - Beads server-mode multi-writer throughput
 - Gas City `FileStore` fsync behaviour
