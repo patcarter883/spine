@@ -61,7 +61,7 @@ spine/
 │   ├── agent/                 # AgentRunner: spawn headless CLI agents, stream events, budgets
 │   │   ├── runner.go
 │   │   ├── procgroup_unix.go  # Setpgid, group kill, reaper
-│   │   └── adapters/          # claude, codex, opencode, aider, local-harness (stdio JSONL)
+│   │   └── adapters/          # acp (Claude Code via ACP, first and only in v2.0); later: codex, opencode, local-harness
 │   ├── worktree/              # WorktreeManager: leases, provision, snapshot, rollback, merge
 │   │   ├── manager.go
 │   │   ├── plumbing.go        # merge-tree, update-ref CAS, temp-index snapshots
@@ -1046,7 +1046,7 @@ CREATE TABLE artifacts   (digest TEXT PRIMARY KEY, path TEXT, size INTEGER); -- 
 * Status writes use CAS on `resource_version` (`UPDATE … WHERE id=? AND resource_version=?`) plus condition ownership checks.
 * Location: `$GIT_COMMON_DIR/spine/spine.db`, shared by all worktrees and invisible to `git status`.
 * **Git-backed export (optional):** `spine export` writes `refs/spine/tasks` as a commit of one Markdown + YAML-frontmatter file per task. The ref can be pushed and pulled. This makes task state durable, git-native and able to survive context loss, for humans and for other machines. Beads itself now gets this through `bd dolt push/pull` against a ref on the git remote, and treats its `issues.jsonl` as "an export for viewers and interchange, not the source of truth" (Beads `README.md:137`). SQLite stays the source of truth, because a ref-per-write design serializes every status change through git, and that is the wrong cost for a control loop that writes several times per second.
-* Vector search is not needed for v2.0. If it is added later (e.g. experience retrieval), use `sqlite-vec` as a loadable extension, which requires a driver that supports extensions (§8.1).
+* Vector search is not needed for v2.0. `modernc.org/sqlite` cannot load C extensions such as `sqlite-vec`, so if retrieval is added later it goes in a separate store behind its own interface, never as a second driver on `spine.db` (§7.1, rule 8).
 
 
 ### 7.1 SQLite operating rules, from the prototype's WAL incidents
@@ -1080,17 +1080,19 @@ SQLite was the source of a run of production defects in the Python prototype. WA
 
 ## 8. Feasibility notes
 
-### 8.1 CGO decision
+### 8.1 Toolchain, SQLite driver and CGO
 
-Tree-sitter forces CGO, so the "single static binary" goal needs an explicit choice:
+**Go version: 1.27 minimum.** The vendored Gas City packages (§9.4) declare `go 1.27.3`, and so does Beads. The module pins `go 1.27.3` in `go.mod`.
 
-| Option | Static binary | Tree-sitter | SQLite | Verdict |
-|---|---|---|---|---|
-| A. CGO on, `zig cc` / musl static link | yes (per target triple) | native, fast | `mattn/go-sqlite3` (+ `sqlite-vec` extension) | **Recommended.** One cross-compile toolchain in CI; goreleaser supports it. |
-| B. CGO off; tree-sitter grammars as WASM via `wazero` | yes, trivially | ~3–10× slower parse, still ms-scale per file | `ncruces/go-sqlite3` (wazero) or `modernc.org/sqlite` | Viable fallback if cross-compiling CGO hurts. Same wazero runtime for both. |
-| C. CGO off, no tree-sitter (go/ast only) | yes | Go-only | modernc | Rejected: target repos are polyglot (PHP/Laravel, Python, TS, Go are all in the expected workload). |
+**SQLite driver: `modernc.org/sqlite` (pure Go) in every build.** This is the driver §7 is specified against, the one the §9.2.1 throughput figures were measured with, and the one Gas City's `SQLiteStore` uses. All DSN and PRAGMA handling lives in `internal/storage` (§7.1, rule 8). Because of this, **CGO is needed only for tree-sitter**, and only from M1:
 
-Put both SQLite drivers behind `database/sql`, and put tree-sitter behind an `ast.Parser` interface, so we can switch from A to B with build tags.
+| Option | Tree-sitter | Static binary | Verdict |
+|---|---|---|---|
+| A. CGO on for tree-sitter only, `zig cc` / musl static link | native, fast | yes (per target triple) | **Recommended from M1.** One cross-compile toolchain in CI; goreleaser supports it. M0 builds with `CGO_ENABLED=0`. |
+| B. CGO off; tree-sitter grammars as WASM via `wazero` | ~3–10× slower parse, still ms-scale per file | yes, trivially | Viable fallback if cross-compiling CGO hurts. |
+| C. CGO off, no tree-sitter (go/ast only) | Go-only | yes | Rejected: target repos are polyglot (PHP/Laravel, Python, TS, Go are all in the expected workload). |
+
+Tree-sitter sits behind an `ast.Parser` interface, so we can switch from A to B with a build tag. A single binary is a preference, not a requirement (§0).
 
 ### 8.2 Concurrency budget
 
@@ -1344,7 +1346,7 @@ There is no migration, shadow mode or cutover. v2 is a new binary in a new modul
 |---|---|---|
 | M0 (1–2 wk) | `spine doctor`, `internal/exec`, `internal/worktree` (vendored Gas City primitives + §6.2 additions), chaos harness | 1,000 randomized `kill -9` points during create, snapshot, merge and teardown. Afterwards `Recover` must leave a clean `git fsck`, no leftover `*.lock`, no orphan PIDs, and no lost snapshot. Gas City's own worktree tests must pass on the vendored copy. |
 | M1 (1–2 wk) | `tools` registry, `cmd.run` parsers, `diff.*`, `ts.parse`/`ts.symbols`/`ts.api_contract`, content-addressed cache, baseline verdicts | Verdicts match ground truth on the corpus (Go, Python, TS and PHP repos), and identical trees hit the cache. |
-| M2 (2 wk) | storage, controller, reconcile, `RuleSupervisor`, one structured adapter (stream-JSON or ACP) | 8 parallel tasks on a fixture repo, all integrated through CAS, with no index races and no LLM supervisor. |
+| M2 (2 wk) | storage, controller, reconcile, `RuleSupervisor`, one structured adapter: **Claude Code via ACP** (Agent Client Protocol, JSON-RPC over stdio) | 8 parallel tasks on a fixture repo, all integrated through CAS, with no index races and no LLM supervisor. |
 | M3 (1–2 wk) | LLM supervisor (structured output), planner task + `spec.validate`, Replan | A/B against `RuleSupervisor` on the corpus: pass rate at least equal, fewer tokens per task. |
 | M4 (1 wk) | `spine ui` (embedded, SSE), CLI (`run`, `status`, `list`, `approve`, `retry`, `controller`, `gc`), optional Beads bridge | End-to-end on the corpus with a human approval step. |
 
