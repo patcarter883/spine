@@ -22,6 +22,8 @@ The rest of the design follows from four rules:
 3. **Build vs. reuse (§9, from a source-level read of both projects).** Build the control plane and storage in-house, because Gas City reconciles *agent sessions* rather than task acceptance, and by design keeps judgment out of Go. Vendor Gas City's MIT-licensed worktree, git and process-group primitives (about 4.1k LOC) as a one-time fork and harden them. Use Beads only through an optional `bd` CLI bridge.
 4. **Every external effect is a lease.** Worktrees, child process groups and git locks are all recorded in SQLite before they are created, and they are reconciled on startup. A `kill -9` of the supervisor at any point leaves state that the next boot can repair.
 
+v2.0 workers are fully isolated. Coordination between them (a controller-owned fact blackboard, A2A, a scoped read-only research mesh) is a **measured v2.1 experiment**, not part of v2.0 (§10.1).
+
 ---
 
 ## 1. Prior art: failure modes the design must rule out
@@ -1346,6 +1348,120 @@ There is no migration, shadow mode or cutover. v2 is a new binary in a new modul
 | M3 (1–2 wk) | LLM supervisor (structured output), planner task + `spec.validate`, Replan | A/B against `RuleSupervisor` on the corpus: pass rate at least equal, fewer tokens per task. |
 | M4 (1 wk) | `spine ui` (embedded, SSE), CLI (`run`, `status`, `list`, `approve`, `retry`, `controller`, `gc`), optional Beads bridge | End-to-end on the corpus with a human approval step. |
 
+### 10.1 v2.1 experiment: mediated coordination and A2A
+
+**Status: a measured experiment for v2.1, not part of v2.0.** Nothing in §2–§10 depends on it, and v2.0 ships with fully isolated workers. This section says what we would add, how we would measure it, and what result would make us keep it.
+
+#### 10.1.1 Motivation
+
+Full worker isolation (§3.4: a worker sees typed feedback and never another worker's output) may cost us in three places:
+
+| Possible cost | Example |
+|---|---|
+| **Parallel tasks guess a shared interface independently** | T1 adds `Store.Lease()`, while T2, running concurrently, calls a `Store.Acquire()` it invented. Both pass their own gates, and integration then fails or forces a `Replan`. |
+| **Duplicated codebase discovery** | N workers in the same repo each spend tokens finding the same entry points, conventions and test layout. |
+| **Findings with nowhere to go** | A worker notices a pre-existing bug, a flaky test or a misleading doc outside its `Scope`. `diff.scope` (§5.1) correctly stops it from fixing it, but there is no channel to report it, so the finding is lost. |
+
+**Not established:** I have not confirmed that isolation caused specific failures in the v1 prototype. These costs are hypotheses, which is why this is an experiment with a control arm rather than a design change.
+
+**Ruled out: peer-to-peer free-text agent-to-agent messaging.** That is the Gas Town failure mode named in the brief: agents arguing over terminal output, leading to hallucinatory death spirals and token burn. §9.1 confirmed the mechanism at source. Gas Town coordinates through mail and nudges between agents, and its merge acceptance is an LLM judgment over prose. Every arm below keeps the controller between agents.
+
+#### 10.1.2 Mediated blackboard (controller-owned typed facts)
+
+There is no agent-to-agent messaging. Workers read and write **facts**: typed rows that the controller owns and routes.
+
+| Fact | Produced by | Consumed by | Routing rule |
+|---|---|---|---|
+| **Published contract** | `ts.symbols` / `ts.api_contract` (§5.1) run on a **Verified** snapshot (§4.3), never on work in progress | `Prompt.Constraints` of every task whose `DependsOn` includes the producer, plus siblings whose `Scope` overlaps the producer's changed paths | Injected as data ("these exported symbols exist with these signatures"). Only Verified snapshots publish, so a contract can't change under a consumer mid-round. |
+| **Typed finding** | A worker tool call, `report_finding(Finding{kind, path, fingerprint, note})`, where `kind ∈ {bug, flaky_test, doc_drift, dead_code, security}` and `note` is ≤ 500 chars | The controller | Deduplicated by `fingerprint` (same normalization as `Diagnostic.Fingerprint`, §3.3). A deterministic policy then decides: **new task** (kind=`bug` with a reproducing gate), **feedback** (attached to an existing task whose `Scope` covers `path`), or **nothing** (dropped and counted). The worker never learns the outcome, so it has no reason to argue for one. |
+| **Information request** | A worker tool call, `need(question, scope_paths)` | A **read-only research task** (§10.1.3, or a single read-only worker in arms B/C) | The answer comes back as a fact in the requester's next `Prompt.Feedback`, on its next patch round, never mid-turn. Requests count against the requester's budget. |
+
+```go
+// internal/api: facts are rows, not messages.
+type Fact struct {
+	ID          int64
+	Kind        FactKind  // Contract | Finding | InfoRequest | InfoAnswer
+	SourceTask  TaskID
+	SourceSnap  string    // tree OID the fact was derived from (replay key)
+	Fingerprint string    // dedupe key
+	Payload     json.RawMessage // schema-validated per Kind
+	CreatedAt   time.Time
+	Consumers   []TaskID  // set by routing; makes injection auditable
+}
+```
+
+Invariants:
+- **Every fact is a row** in the `facts` table, with a source (task, snapshot tree OID), a budget charge and a routing record. Re-running a task from stored facts reproduces its prompts exactly. Reproducibility is measured in §10.1.4.
+- **Facts cannot write completion conditions.** §4.3 ownership is unchanged: `GatePassed` and `Verified` still come only from the gate engine. A fact can change what a worker is *told*, never what the controller *believes about done*. This is enforced the same way as other condition writes: `storage.UpdateStatus` rejects any condition write whose `Source` is `facts`.
+
+#### 10.1.3 Scoped research mesh (bounded, read-only A2A cooperation)
+
+This is the one place agents talk to each other directly, and it is fenced in on every side.
+
+| Property | Rule |
+|---|---|
+| **Roster** | A fixed roster per research task (for example `explorer`, `analyst`, `synthesizer`), declared in the research Spec. The controller creates the mesh and tears it down; the agents don't recruit others or discover peers. |
+| **Scope** | Read-only tools only: `read`, `grep`, `ts.symbols`, `git log`/`blame`. The mesh has **no** tool for editing files, creating tasks or writing status. Its worktree is a detached, read-only checkout of the base commit. |
+| **Limits** | Hard budgets on turns/messages, tokens and wall-clock time, enforced by the controller and not by prompts. Exhaustion ends the mesh with whatever artifact exists; an incomplete artifact is still an artifact, flagged `partial`. |
+| **Messages** | Typed A2A messages, one of `claim`, `question`, `evidence`, `objection`, each carried as an A2A `data` part (§10.1.5) and schema-checked by the controller on relay. Free text is allowed only inside named fields (`claim.statement`, `objection.reason`). A message that fails the schema is dropped and charged to the sender. |
+| **Exit gate** | The output is a structured research artifact in which **every claim cites `file:line` or a symbol**. A deterministic tool, `research.cite_check`, verifies that each cited path exists in the base tree, the line range is in bounds, and the quoted snippet or symbol matches what is there. Unverifiable claims are stripped (by default) or kept but flagged `unverified`. |
+| **Containment** | The artifact is an **observation** for the planner task or the supervisor (a new `Observation.Research` field on the §3.5 type) and nothing more. It cannot satisfy a gate or create a task, and it reaches workers only through the planner's Specs or the supervisor's `Hint`. |
+
+**Risk.** Research has no deterministic gate today: no test proves a research summary right. A mesh there risks **groupthink and circular confirmation**, where the analyst cites the explorer, the synthesizer cites both, and none of them checks the code. `research.cite_check` breaks the circle mechanically, because a claim survives only if the code says it, not if a peer agreed. The budget bounds the cost of the arguing that remains. That discipline is the only thing holding research quality up, which is why arm D must beat the pipeline before it is adopted.
+
+#### 10.1.4 Experiment design
+
+There are four arms, run on the fixed benchmark corpus (§10), with the same models, the same per-task token budget and the same gates:
+
+| Arm | Coordination | What it isolates |
+|---|---|---|
+| **Control** | Isolated workers, as specified in §2–§10 | Baseline |
+| **B** | Blackboard (§10.1.2), facts stored in SQLite and injected through prompts; no A2A | Does sharing *information* help at all? (Control vs. B) |
+| **C** | The same blackboard, but facts carried over A2A, with the controller as the **only** peer. Workers are A2A clients of the controller, and nothing routes worker-to-worker | What the *protocol* adds on top of the information (B vs. C) |
+| **D** | Scoped research mesh (§10.1.3) vs. a pipeline-style research phase (explorer → analyst → synthesizer, sequential, no back-channel), both at equal token budget | Whether bounded cooperation beats a pipeline for research |
+
+| Metric | Measured as | Arms |
+|---|---|---|
+| Merge conflicts per task | `Preflight` non-clean results (§4.7) | all |
+| Replans per task | `Replan` decisions (§4.6) | all |
+| Tokens per task | Sum of `EvUsage` over workers, supervisor and research | all |
+| Duplicated exploration | Files read by ≥ 2 workers in the same run, from adapter `EvToolCall` events, normalized by files read | all |
+| Gate pass rate | Tasks reaching `Integrated` / tasks | all |
+| Patch rounds to pass | `PatchRound` at `Verified` | all |
+| Reproducibility | Re-running a task from stored facts and snapshots yields byte-identical prompts | B, C, D |
+| Citation accuracy | Fraction of artifact claims passing `research.cite_check` *before* stripping | D |
+| Downstream plan quality | Gate pass rate and Replans of tasks planned from the artifact | D |
+
+#### 10.1.5 A2A claims to check (against the spec)
+
+These started as general knowledge about A2A and are now checked against the specification. The source is the **A2A Protocol 1.0.0**, repository `a2aproject/A2A` @ `4735f48` (2026-10-30). The spec states that `a2a.proto` is "the single authoritative normative definition" (`docs/specification.md:107`). Proto references below are to `specification/a2a.proto` at that commit.
+
+| Claim | What the spec says | Fit for Spine |
+|---|---|---|
+| **Agent-card discovery** | An `AgentCard` is served at `/.well-known/agent-card.json` (`specification.md:1826,1988`), declaring skills with MIME `input_modes`/`output_modes` (`a2a.proto:436-450`), `capabilities.streaming` / `push_notifications` (`a2a.proto:412-420`), and extensions (`a2a.proto:424-434`) | **Little value internally.** The controller creates every worker and mesh agent, so it already knows who exists and what they can do. Cards matter only at the **external edge**, where Spine calls, or is called by, an agent it didn't spawn. |
+| **Task lifecycle vs. Spec/Status and leases** | `TaskState` has 8 states plus `UNSPECIFIED` (`a2a.proto:187-208`): `SUBMITTED`, `WORKING`, `INPUT_REQUIRED` and `AUTH_REQUIRED` (interrupted), plus `COMPLETED`, `FAILED`, `CANCELED` and `REJECTED` (terminal). Terminal tasks "cannot accept further messages" (`specification.md:175`), and follow-ups use a new task with `reference_task_ids` (`a2a.proto:276`, `specification.md:638`) | **Different layer.** An A2A task is one agent interaction; Spine's `Task` is desired state over many interactions. Map one A2A task to one *agent run or mesh session* (an `ops` row, §6.1), never to a Spine `Task`. A2A `COMPLETED` is a worker exit, equivalent to `WorkerSucceeded`, and **must not** be read as `Verified`. Terminal immutability fits Spine's "new attempt = new run" model. |
+| **Typed parts and artifacts** | A `Part` is a oneof `text` / `raw` / `url` / `data`, where `data` is "arbitrary structured … JSON value", plus `media_type` and `metadata` (`a2a.proto:224-242`). `Artifact`s and `Message`s carry parts and `extensions` URIs (`a2a.proto:274,280-292`). The spec defines **no per-message JSON Schema field**; protocol-level validation is "against the A2A protocol schema" (`specification.md:3272`) | **Yes, but by convention, not by the protocol.** Spine can require every message to be one `data` part with `media_type` set to a Spine-specific type (e.g. `application/vnd.spine.claim+json`) and declare an A2A extension URI for its schemas (`specification.md` §4.6). The controller validates on relay and rejects `text` parts. The protocol carries the types; Spine has to enforce them. |
+| **Streaming and async vs. the level-triggered reconciler** | Three delivery mechanisms: polling `GetTask`, streaming (`SendStreamingMessage`, `SubscribeToTask`), and webhook push notifications (`specification.md` §3.5, `a2a.proto:19-131`). Operations are asynchronous by default (`specification.md:567`), and streams close at a terminal state (`specification.md:210`) | **Compatible, if events are treated as hints.** Streams map onto the agent-runner event channel (§3.4). Correctness must still come from re-reading state, so a dropped stream or webhook loses nothing: the next reconcile `GetTask`s. Push notifications need an HTTP endpoint, which is unnecessary for in-process or stdio workers. |
+| **Interoperability with external agents** | Three standard bindings, JSON-RPC, gRPC and HTTP+JSON/REST (`specification.md` §9–§11), plus guidelines for custom bindings (§12) | **This is A2A's real advantage.** It lets Spine delegate to, or be delegated by, agents it didn't build. Internally it is overhead: Claude Code, the first adapter, speaks **ACP** (Agent Client Protocol), not A2A, so arms C and D need an A2A shim between the controller and ACP workers. That shim's cost is part of what B vs. C measures. |
+
+Also note: two secondary write-ups disagree on whether the latest version is 0.3.0 or 1.0.0, and one counts "nine states" (the eight above plus `UNSPECIFIED`). The repository at the cited commit settles both points.
+
+#### 10.1.6 Decision rule
+
+| Outcome | Decision |
+|---|---|
+| **C ≈ B** on the §10.1.4 metrics (within run-to-run noise) **and** C adds working interoperability with at least one external agent | A2A meets expectations. Adopt it as the internal fact transport. |
+| **C ≈ B**, but C only adds overhead (tokens, latency, shim complexity) and no interoperability used in practice | Keep the SQLite blackboard internally; use **A2A only at the external edge** (Spine as an A2A server and client to outside agents) |
+| **C worse than B** | Same as above |
+| **B ≈ Control** | Sharing doesn't help on this corpus: drop the blackboard (except perhaps published contracts, if merge conflicts alone improve) and keep isolation |
+| **D** | Adopt the research mesh **only if** it beats pipeline research on **both** citation accuracy and downstream plan quality **within the same token budget**. Otherwise keep the pipeline. |
+
+#### 10.1.7 Guardrails (all arms)
+
+1. **The controller is the only A2A peer.** No worker or mesh agent holds another agent's address. Inside a mesh, messages are relayed by the controller, which validates them, charges the budget and logs them.
+2. **Every message is schema-checked and budgeted.** Messages that fail validation are dropped and charged to the sender.
+3. **Shared facts never write completion conditions.** §4.3 is unchanged in every arm. Facts, research artifacts and A2A `COMPLETED` states are observations; only the gate engine writes `GatePassed` and `Verified`.
+
 ---
 
 ## 11. Open questions
@@ -1354,3 +1470,4 @@ There is no migration, shadow mode or cutover. v2 is a new binary in a new modul
 2. **Supervisor model placement.** It needs a small context and structured output, so a local model is plausible (in keeping with v1's local-first goal). That needs an M3 benchmark.
 3. **Cross-task interface changes.** Should `Replan` be allowed to *edit sibling* Specs (e.g. "T2 must wait for the new interface from T1a"), or only its own children? The proposal is children only, plus adding `DependsOn` edges to siblings, which is monotonic and safe.
 4. **Windows support.** Process groups → Job Objects; `flock` → `LockFileEx`. Out of scope for v2.0 and kept compilable behind build tags.
+5. **Coordination between workers.** Isolation vs. a mediated blackboard vs. A2A is a measured v2.1 experiment with a stated decision rule (§10.1).
