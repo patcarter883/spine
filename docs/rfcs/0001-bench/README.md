@@ -13,8 +13,11 @@ GOTOOLCHAIN=go1.27.3 CGO_ENABLED=1 go build -tags gms_pure_go -o bench .
 mkdir -p runs/emb runs/sql
 ./bench -mode sqlite     -dir runs/sql -dur 5s -writers 1,4,16,32
 ./bench -mode beads-best -dir runs/emb -dur 5s -writers 1,4,16,32   # embedded Dolt via OpenBestAvailable
-# server mode (not measured in the RFC): bd init --server in runs/srv, then
-./bench -mode beads-config -dir runs/srv/.beads -dur 5s -writers 1,4,16,32
+# server mode: official Dolt release (2.6.2 was used), server on loopback
+mkdir -p runs/srv/.beads doltdata && (cd doltdata && dolt sql-server --host 127.0.0.1 --port 3317 &)
+echo '{"backend":"dolt","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":3317,"dolt_server_user":"root","dolt_database":"beads"}' > runs/srv/.beads/metadata.json
+BEADS_DOLT_SERVER_PORT=3317 ./bench -mode beads-config -dir runs/srv/.beads -dur 5s -writers 1,4,16,32
+grep -c "serialization failure" <dolt sql-server log>   # conflicts between writers on different issues
 ```
 
 ## Modes

@@ -11,7 +11,7 @@
 
 ## 0. Summary
 
-Spine v2 is one Go binary. It replaces the fixed phase DAG with a **level-triggered reconciler**, the same pattern Kubernetes controllers use. Each task has a declared **Spec** (intent plus acceptance criteria written as gate definitions) and an **Observed Status** that only deterministic tools can write. A controller loop runs one bounded step at a time until the two match.
+Spine v2 is a Go program, preferably shipped as one binary, though that is not a hard requirement. It replaces the fixed phase DAG with a **level-triggered reconciler**, the same pattern Kubernetes controllers use. Each task has a declared **Spec** (intent plus acceptance criteria written as gate definitions) and an **Observed Status** that only deterministic tools can write. A controller loop runs one bounded step at a time until the two match.
 
 An LLM **supervisor** picks the next step from a closed, typed set of actions (`RunWorker`, `PatchWorker`, `Rollback`, `Replan`, `Escalate`, …) based on a typed observation. It never reads a conversation, and it cannot write the `Verified` condition. Only the gate engine can set that condition, and only when the gate exits `0`.
 
@@ -1200,11 +1200,11 @@ Mismatches:
   - Heavy dependencies: Dolt, go-mysql-server, vitess.
 * **Measured write throughput is about 150–200× below SQLite WAL on the same host.** `BENCHMARKS.md` publishes no concurrent-writer figures. Its "Typical Results" table, about 18 ms per update, appears to predate Dolt, because it references SQLite bench files. So we measured it (§9.2.1).
 
-#### 9.2.1 Measured: Beads embedded vs. SQLite WAL, concurrent writers
+#### 9.2.1 Measured: Beads (embedded and server) vs. SQLite WAL, concurrent writers
 
 **Harness.** `docs/rfcs/0001-bench/` (Go, linked against Beads @ `ce907a9` from source, built with `CGO_ENABLED=1 -tags gms_pure_go`).
 
-**Host.** A 4-vCPU / 15 GB cloud container with a virtio disk. Both stores ran on the same host and the same disk, with two runs each; the runs agreed within about 10%.
+**Host.** A 4-vCPU / 15 GB cloud container with a virtio disk. All stores ran on the same host and the same disk. Server mode used the official Dolt **2.6.2** linux-amd64 release (Gas City's floor is ≥ 2.6.0), as `dolt sql-server` on loopback with Beads' default pool of 10 connections. There were two runs of each independent workload, which agreed within about 10% (server mode within about 15%); cas-shared figures for server mode come from one run.
 
 **Workload.** Each phase ran for 5 s:
 - **independent:** each of W goroutines updates its own row.
@@ -1217,6 +1217,10 @@ Mismatches:
 | Beads embedded Dolt | independent, writes/s | 17.6 | 16.8 | 18.4 | 20.8 |
 | | p50 / p99 latency | 55 / 79 ms | 245 / 301 ms | 1.03 / 1.12 s | 2.17 / 2.31 s |
 | | cas-shared, successful/s | 11.8 | 3.4 | 1.0 | 0.6 |
+| Beads server (`dolt sql-server`) | independent, writes/s | 27.4 | 5.1 | 7.5 | 10.8 |
+| | p50 / p99 latency | 36 / 51 ms | 0.90 / 1.03 s | 3.2 / 4.7 s | 4.8 / 10.1 s |
+| | cas-shared, successful/s | 22.0 | 3.2 | 1.0 | 1.2 |
+| | Dolt `serialization failure`s logged per run | 0 | 32 | 41 | 46 |
 | SQLite WAL (RFC §7) | independent, writes/s | 3,450 | 2,976 | 3,318 | 3,118 |
 | | p50 / p99 latency | 0.26 / 0.75 ms | 1.0 / 4.8 ms | 3.4 / 21.7 ms | 7.2 / 46.4 ms |
 | | cas-shared, successful/s | 2,860 | 1,705 | 1,270 | 1,080 |
@@ -1224,11 +1228,12 @@ Mismatches:
 What this shows:
 1. **Embedded Beads is strictly serialized, at about 18 writes/s total**, flat in W. Latency grows linearly with writers, which is the documented "embedded transactions serialize" behaviour. At 32 writers every status write waits more than 2 s.
 2. **Contended CAS throughput collapses** to under 1 success/s at W=32. Each attempt costs about 80 ms, so a losing writer has spent a full serialized slot just to learn it lost.
-3. **The same workload on SQLite WAL is about 150–200× faster**, with sub-millisecond single-writer latency. That headroom is what lets §4's controller persist status on every step.
-4. **The comparison is not feature-for-feature.** Each Beads write also records events and version history and runs a blocked-state recheck on top of a Dolt transaction. That is the point, though: those costs are inherent to adopting Beads as the store, and Spine does not need them on the hot path.
-5. **Binary size:** the probe binary linking Beads is **165 MB**. Most of that is Dolt and go-mysql-server.
+3. **Server mode does not fix this. It is faster than embedded for one writer and *slower* for many.** With one writer it reaches 27 writes/s, about 1.5× embedded. At W=4 it drops to about 5 writes/s with p50 ≈ 0.9 s. The cause is visible in the server log. Dolt raises `serialization failure: this transaction conflicts with a committed transaction from another client` even when every writer updates a *different* issue: there were 0 such failures at W=1 and 32–46 per run at W ≥ 4. Beads then retries with exponential backoff (`newServerRetryBackoff`, `internal/storage/dolt/store.go:696`). The likely reason is that every issue write also touches shared rows, such as the events log, version history and the blocked-state recheck, so concurrent transactions conflict at commit time and the backoff turns contention into idle time. "Multiple concurrent writers" (Beads `README.md:133`) holds in the sense of correctness, not throughput, on this workload.
+4. **The same workload on SQLite WAL is about 150–200× faster than embedded and 100–600× faster than server mode**, with sub-millisecond single-writer latency. That headroom is what lets §4's controller persist status on every step.
+5. **The comparison is not feature-for-feature.** Each Beads write also records events and version history and runs a blocked-state recheck on top of a Dolt transaction. That is the point, though: those costs are inherent to adopting Beads as the store, and Spine does not need them on the hot path.
+6. **Binary size:** the probe binary linking Beads is **165 MB**. Most of that is Dolt and go-mysql-server.
 
-**Not measured:** server mode (`dolt sql-server`, the documented multi-writer configuration). Running it needs a `dolt` binary, and fetching release binaries was outside this session's permissions. Server mode lifts the single-writer limit, but at the cost of a separate daemon process. That alone fails the RFC's "single binary, no runtime dependencies" requirement, whatever its throughput. Measuring it means re-running the harness with `-mode beads-config` against a `bd init --server` workspace.
+**Caveats.** This is one host and loopback only, with no tuning of Dolt server settings, and `BEADS_DOLT_MAX_CONNS` was left at its default. A tuned server, or batching writes through `RunInTransaction`, could do better. But the RFC's controller writes one small status document per reconcile step from many goroutines. That is exactly the workload measured, and the gap is two orders of magnitude, not a tuning margin. Reproduce with `-mode beads-config` (see `docs/rfcs/0001-bench/README.md`).
 
 **API note found while benchmarking:** `beads.Open` is documented as "always opens in embedded mode" (`beads.go:403-412`), but it calls `dolt.New`, which demands a Dolt *server* port ("no Dolt server port resolved"). Embedded mode is only reachable through `OpenBestAvailable` on a workspace whose `metadata.json` says `dolt_mode: embedded`. This is another sign that the public API is still moving.
 
@@ -1259,11 +1264,11 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
 | Process-group supervision, PID-reuse safety | ✓ strong (git timeouts excepted) | n/a | adapt Gas City |
 | Intent-before-effect journal | ◐ shadow-only, tied to beads | ◐ `journalops` | ✓ SQLite `ops` table (§6.1) |
 | Whole-document CAS status writes | via Beads | ◐ partial `RowVersion` | ✓ |
-| Many in-process writers, no daemon | via Beads/Dolt | ✗ embedded serializes: **~18 writes/s, flat across 1–32 writers**; server mode needs a daemon (§9.2.1) | ✓ SQLite WAL + one writer: **~3,000–3,400 writes/s** measured on the same host |
+| Concurrent status writes from many goroutines | via Beads/Dolt | ✗ embedded serializes at **~18 writes/s**. Server mode reaches 27 writes/s at W=1 but **falls to 5–11 writes/s at W ≥ 4** from Dolt serialization failures plus backoff (§9.2.1) | ✓ SQLite WAL + one writer: **~3,000–3,400 writes/s** measured on the same host |
 | Durable local files across power loss | ✗ `FileStore` has no fsync (§9.2) | n/a (Dolt) | ✓ fsync file + dir (§9.2) |
 | Dependency DAG + ready query | via Beads | ✓ strong | ✓ (simple; Beads semantics as the reference) |
 | Importable as a library | ✗ all `internal/` / `main` | ✓ public API | — |
-| Lean single binary | ✗ heavy deps + tmux/bd/dolt at runtime | ✗ Dolt stack, CGO for embedded; a probe binary linking it is 165 MB | ✓ |
+| Footprint (preference, not a requirement) | heavy deps; tmux/bd/dolt at runtime | Dolt stack, CGO for embedded; a probe binary linking it is 165 MB; server mode adds a daemon | small |
 
 ### 9.4 Recommendation
 
@@ -1281,7 +1286,7 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
 
    Treat it as a one-time fork, not a tracked dependency. Upstream moves too fast, and the docs drift, so we diff upstream once per release and cherry-pick fixes deliberately.
 
-3. **Do not use Beads as the task store.** Its CAS and claim semantics are good, and §7's schema borrows them: `ExpectedVersion`-style preconditions, a ready-work predicate that includes `defer_until`, and typed blocking vs. non-blocking edges. But a single-writer embedded engine that needs CGO, or an external `dolt sql-server`, conflicts with the concurrency and binary-size criteria, and the partial `RowVersion` cannot express §4.3 ownership. Gas City's own `SQLiteStore` (`modernc.org/sqlite`, `CGO_ENABLED=0`) supports SQLite as the right default.
+3. **Do not use Beads as the task store.** Its CAS and claim semantics are good, and §7's schema borrows them: `ExpectedVersion`-style preconditions, a ready-work predicate that includes `defer_until`, and typed blocking vs. non-blocking edges. The deciding reason is throughput under concurrency, not footprint. Embedded mode serializes at about 18 writes/s, and server mode *degrades* to 5–11 writes/s as writers are added (§9.2.1). The partial `RowVersion` also cannot express §4.3 ownership. Footprint (CGO, a 165 MB link, an extra daemon) is a secondary cost, since a single binary is a preference rather than a requirement. Gas City's own `SQLiteStore` (`modernc.org/sqlite`, `CGO_ENABLED=0`) supports SQLite as the right default.
 
 4. **Beads interop, optional, post-v2.0.** Add `internal/bridge/beads`, which imports ready beads as Spine Specs and writes terminal status back. It goes through the `bd` CLI's JSON output, the same boundary Gas City's `BdStore` uses, so Spine never links Dolt. Use Beads' hash-ID scheme (`internal/idgen/hash.go`) for Spine task IDs, so that IDs map cleanly.
 
@@ -1295,7 +1300,7 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
 **Verification status.** The items left open by the first source read are now settled:
 - the refinery formula (§9.1)
 - `reviewquorum` (§9.1)
-- Beads multi-writer throughput (§9.2.1; server mode not measured)
+- Beads multi-writer throughput, embedded and server mode (§9.2.1)
 - `FileStore` fsync behaviour (§9.2)
 
 ---
