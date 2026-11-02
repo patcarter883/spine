@@ -1039,9 +1039,10 @@ CREATE TABLE tool_cache  (key BLOB PRIMARY KEY, result_json BLOB, created_at INT
 CREATE TABLE artifacts   (digest TEXT PRIMARY KEY, path TEXT, size INTEGER); -- blobs on disk, by sha256
 ```
 
+* Durability: `journal_mode=WAL`, `synchronous=FULL` (the default; `NORMAL` is rejected for the same lost-WAL-tail reason Gas City documents in `sqlite_store.go:478-487`), `busy_timeout=5000`, and `_txlock=immediate` on the single writer connection. On the §9.2.1 host this gives about 3,000+ status writes/s with sub-millisecond p50 at W=1. A single writer goroutine is therefore not a bottleneck for a controller that writes a few times per task step.
 * Status writes use CAS on `resource_version` (`UPDATE … WHERE id=? AND resource_version=?`) plus condition ownership checks.
 * Location: `$GIT_COMMON_DIR/spine/spine.db`, shared by all worktrees and invisible to `git status`.
-* **Git-backed export (optional):** `spine export` writes `refs/spine/tasks` as a commit of one Markdown + YAML-frontmatter file per task. The ref can be pushed and pulled, This makes task state durable, git-native and able to survive context loss, for humans and for other machines. Beads itself now gets this through `bd dolt push/pull` against a ref on the git remote, and treats its `issues.jsonl` as "an export for viewers and interchange, not the source of truth" (Beads `README.md:137`). SQLite stays the source of truth, because a ref-per-write design serializes every status change through git, and that is the wrong cost for a control loop that writes several times per second.
+* **Git-backed export (optional):** `spine export` writes `refs/spine/tasks` as a commit of one Markdown + YAML-frontmatter file per task. The ref can be pushed and pulled. This makes task state durable, git-native and able to survive context loss, for humans and for other machines. Beads itself now gets this through `bd dolt push/pull` against a ref on the git remote, and treats its `issues.jsonl` as "an export for viewers and interchange, not the source of truth" (Beads `README.md:137`). SQLite stays the source of truth, because a ref-per-write design serializes every status change through git, and that is the wrong cost for a control loop that writes several times per second.
 * Vector search is not needed for v2.0. If it is added later (e.g. experience retrieval), use `sqlite-vec` as a loadable extension, which requires a driver that supports extensions (§8.1).
 
 ---
@@ -1144,6 +1145,18 @@ The formula opens with: "Formula steps are NOT materialized as child beads. Read
 - **Failure attribution.** `handle-failures` (L587-663) step 1 is literally "Diagnose: branch regression or pre-existing on target?". If the agent decides a failure is pre-existing, it files or links a bug bead and **proceeds with the merge**. The rule is stated in prose: "**GATE**: Cannot merge without all checks passing OR pre-existing bug filed/found."
 - **Ordering** ("Uncertain merge order | Choose based on priority, dependencies, timing", `agents/refinery/prompt.template.md`).
 
+**`reviewquorum`: a Go contract with no Go caller, wrapped around an LLM synthesis step.** `internal/reviewquorum` defines a typed verdict contract (`pass | pass_with_findings | fail | blocked | awaiting_reviewers`) and a deterministic `Finalize(subject, baseRef, outputs []LaneOutput) Summary` (`finalize.go:14`). `Finalize` has sound combine rules:
+- any lane `fail` → `fail`
+- otherwise any `blocked` → `blocked`
+- unknown lane verdicts are hard contract failures
+- findings are de-duplicated
+
+Nothing in production imports it. Its only consumer is the core-pack formula `internal/bootstrap/packs/core/formulas/mol-review-quorum.toml` (207 lines), and the docs say so twice: "the current formula synthesis step is agent-executed and does not call `reviewquorum.Finalize` directly" (`engdocs/architecture/formulas.md:90-92`), and "is not invoked by formula synthesis yet" (`engdocs/architecture/dispatch.md:400-402`).
+
+The formula has two reviewer lanes. Each lane is an LLM agent with its own provider and model set through formula vars, told "do not modify user files". Each has `max_attempts = 3` and `on_exhausted = "soft_fail"`, so a provider outage *reduces* quorum coverage rather than failing it. The lanes must emit `review-quorum.lane.v1` JSON. That schema *is* enforced in Go (`gc.output_json_schema` / `gc.output_json_required`, `internal/formula/graphv2_validation.go`). A third LLM agent then synthesizes the combined verdict, and it is told the combination rules in prose. The read-only check on reviewers is baseline-relative, comparing after-state to a reviewer-recorded before-state (`dispatch.md:404-407`).
+
+So `reviewquorum` is Gas City's clearest move toward deterministic verdicts: a typed schema with a pure finalizer. But today the shipping path still has an LLM computing the final verdict from LLM verdicts. For Spine it is an optional *advisory* signal. A review lane can be a tool whose structured findings feed the supervisor's `Observation`. It can never be a gate, because §4.3 limits completion to deterministic tools. If Spine ever adds LLM review, combining verdicts must be pure Go, the way `Finalize` already is, and never a synthesis agent.
+
 So Gas Town's merge path has better git hygiene than the earlier, from-memory version of this RFC assumed. But its acceptance decision, whether the checks passed and whether a failure is the branch's fault, is still an LLM judgment over terminal output. That is exactly what Spine moves into deterministic code: §5.4 baseline-relative verdicts answer "pre-existing or regression?" by fingerprint subtraction on a gate run against the base tree, not by asking the agent.
 
 **Worktrees, git and processes: high quality, and the best reuse candidate.**
@@ -1185,9 +1198,51 @@ Mismatches:
   - Even with CGO, it needs the `gms_pure_go` tag to avoid ICU (Makefile:113-118).
   - The SQLite backend was removed "to consolidate storage on a single engine" (`backend_messages.go`), and the pluggable-backends proposal is marked "superseded" (`PROPOSAL-pluggable-storage-backends.md`).
   - Heavy dependencies: Dolt, go-mysql-server, vitess.
-* **No write-throughput evidence.** `BENCHMARKS.md` reports 18 ms per update and about 19 ms per write sequentially on an M2 Pro, but that table appears to predate Dolt because it references SQLite bench files. There are no concurrent-writer numbers.
+* **Measured write throughput is about 150–200× below SQLite WAL on the same host.** `BENCHMARKS.md` publishes no concurrent-writer figures. Its "Typical Results" table, about 18 ms per update, appears to predate Dolt, because it references SQLite bench files. So we measured it (§9.2.1).
+
+#### 9.2.1 Measured: Beads embedded vs. SQLite WAL, concurrent writers
+
+**Harness.** `docs/rfcs/0001-bench/` (Go, linked against Beads @ `ce907a9` from source, built with `CGO_ENABLED=1 -tags gms_pure_go`).
+
+**Host.** A 4-vCPU / 15 GB cloud container with a virtio disk. Both stores ran on the same host and the same disk, with two runs each; the runs agreed within about 10%.
+
+**Workload.** Each phase ran for 5 s:
+- **independent:** each of W goroutines updates its own row.
+- **cas-shared:** all W goroutines read-then-compare-and-swap one shared row.
+- **Beads calls:** `UpdateIssue` for independent writes; `UpdateIssueChecked{ExpectedVersion}` with a status flip, so `RowVersion` actually changes, for CAS writes.
+- **SQLite baseline:** the RFC §7 store shape, i.e. `modernc.org/sqlite`, WAL, `synchronous(FULL)`, one writer connection, `UPDATE … WHERE id=? AND rv=?`.
+
+| Store | Workload | W=1 | W=4 | W=16 | W=32 |
+|---|---|---|---|---|---|
+| Beads embedded Dolt | independent, writes/s | 17.6 | 16.8 | 18.4 | 20.8 |
+| | p50 / p99 latency | 55 / 79 ms | 245 / 301 ms | 1.03 / 1.12 s | 2.17 / 2.31 s |
+| | cas-shared, successful/s | 11.8 | 3.4 | 1.0 | 0.6 |
+| SQLite WAL (RFC §7) | independent, writes/s | 3,450 | 2,976 | 3,318 | 3,118 |
+| | p50 / p99 latency | 0.26 / 0.75 ms | 1.0 / 4.8 ms | 3.4 / 21.7 ms | 7.2 / 46.4 ms |
+| | cas-shared, successful/s | 2,860 | 1,705 | 1,270 | 1,080 |
+
+What this shows:
+1. **Embedded Beads is strictly serialized, at about 18 writes/s total**, flat in W. Latency grows linearly with writers, which is the documented "embedded transactions serialize" behaviour. At 32 writers every status write waits more than 2 s.
+2. **Contended CAS throughput collapses** to under 1 success/s at W=32. Each attempt costs about 80 ms, so a losing writer has spent a full serialized slot just to learn it lost.
+3. **The same workload on SQLite WAL is about 150–200× faster**, with sub-millisecond single-writer latency. That headroom is what lets §4's controller persist status on every step.
+4. **The comparison is not feature-for-feature.** Each Beads write also records events and version history and runs a blocked-state recheck on top of a Dolt transaction. That is the point, though: those costs are inherent to adopting Beads as the store, and Spine does not need them on the hot path.
+5. **Binary size:** the probe binary linking Beads is **165 MB**. Most of that is Dolt and go-mysql-server.
+
+**Not measured:** server mode (`dolt sql-server`, the documented multi-writer configuration). Running it needs a `dolt` binary, and fetching release binaries was outside this session's permissions. Server mode lifts the single-writer limit, but at the cost of a separate daemon process. That alone fails the RFC's "single binary, no runtime dependencies" requirement, whatever its throughput. Measuring it means re-running the harness with `-mode beads-config` against a `bd init --server` workspace.
+
+**API note found while benchmarking:** `beads.Open` is documented as "always opens in embedded mode" (`beads.go:403-412`), but it calls `dolt.New`, which demands a Dolt *server* port ("no Dolt server port resolved"). Embedded mode is only reachable through `OpenBestAvailable` on a workspace whose `metadata.json` says `dolt_mode: embedded`. This is another sign that the public API is still moving.
 
 Gas City itself does not rely on Beads alone. Its `internal/beads` defines its own `Store` with `BdStore` (shells out to the `bd` CLI), `NativeDoltStore` (behind the `gascity_native_beads` build tag), `SQLiteStore` ("`CGO_ENABLED=0` safe", using `modernc.org/sqlite`), `MemStore` and `FileStore`. The `FileStore` rewrites a whole JSON file on every write ("fine for Tutorial 01 volumes", `filestore.go:141-144`). This is a useful data point: the most mature Beads consumer also keeps a pure-Go SQLite path.
+
+**Gas City `FileStore` durability: atomic against process crashes, not durable against power loss.** `FileStore.save()` (`internal/beads/filestore.go:744-766`) marshals the whole store, calls `fs.fs.WriteFile(path+".tmp")`, then `Rename`. `fsys.OSFS.WriteFile` is a bare `os.WriteFile` (`internal/fsys/fsys.go:60`), so there is **no fsync of the temp file and no fsync of the parent directory** before or after the rename. The shared `fsys.WriteFileAtomic` helper (`internal/fsys/atomic.go:24-50`) has the same gap. Readers therefore see either the old file or the new one, never a torn write, and a `kill -9` is safe. After a host crash, though, the rename can be persisted before the data, which on some filesystems leaves an empty or stale file. The last acknowledged writes can be lost, or the whole store can be truncated. Gas City's own `SQLiteStore` takes durability seriously by contrast:
+- It calls `tmp.Sync()` and `directory.Sync()` around its sidecar writes (`sqlite_store.go:900,926`).
+- It deliberately keeps SQLite's default `synchronous=FULL`, rejecting `NORMAL` despite "a genuine ~30% write win", because a lost WAL tail would drop rows "callers were told exist" (`sqlite_store.go:478-487`).
+- It fsyncs ID-allocator blocks before any ID is handed out.
+
+**Spine adopts the SQLiteStore discipline:**
+- WAL with `synchronous=FULL`.
+- Every file outside SQLite (provenance files, lease sidecars, artifact blobs) is written as write → `fsync(file)` → `rename` → `fsync(dir)`.
+- The §9.2.1 SQLite figures were measured with `synchronous(FULL)`.
 
 ### 9.3 Fit matrix
 
@@ -1204,10 +1259,11 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
 | Process-group supervision, PID-reuse safety | ✓ strong (git timeouts excepted) | n/a | adapt Gas City |
 | Intent-before-effect journal | ◐ shadow-only, tied to beads | ◐ `journalops` | ✓ SQLite `ops` table (§6.1) |
 | Whole-document CAS status writes | via Beads | ◐ partial `RowVersion` | ✓ |
-| Many in-process writers, no daemon | via Beads/Dolt | ✗ embedded is single-writer | ✓ SQLite WAL + one writer goroutine |
+| Many in-process writers, no daemon | via Beads/Dolt | ✗ embedded serializes: **~18 writes/s, flat across 1–32 writers**; server mode needs a daemon (§9.2.1) | ✓ SQLite WAL + one writer: **~3,000–3,400 writes/s** measured on the same host |
+| Durable local files across power loss | ✗ `FileStore` has no fsync (§9.2) | n/a (Dolt) | ✓ fsync file + dir (§9.2) |
 | Dependency DAG + ready query | via Beads | ✓ strong | ✓ (simple; Beads semantics as the reference) |
 | Importable as a library | ✗ all `internal/` / `main` | ✓ public API | — |
-| Lean single binary | ✗ heavy deps + tmux/bd/dolt at runtime | ✗ Dolt stack, CGO for embedded | ✓ |
+| Lean single binary | ✗ heavy deps + tmux/bd/dolt at runtime | ✗ Dolt stack, CGO for embedded; a probe binary linking it is 165 MB | ✓ |
 
 ### 9.4 Recommendation
 
@@ -1236,10 +1292,11 @@ Gas City itself does not rely on Beads alone. Its `internal/beads` defines its o
    - **Ancestry-guarded rebase:** when `Preflight` needs a rebase, skip it if base is already an ancestor (no flattening of merge topology), and treat probe errors as infrastructure faults.
    - **Post-integration remote verification:** when Spine pushes to a remote rather than only updating a local ref, re-fetch and compare SHAs before setting `Integrated`.
 
-**Open verification items:**
-- how `reviewquorum` is used in production (it has no in-repo production importer)
-- Beads server-mode multi-writer throughput
-- Gas City `FileStore` fsync behaviour
+**Verification status.** The items left open by the first source read are now settled:
+- the refinery formula (§9.1)
+- `reviewquorum` (§9.1)
+- Beads multi-writer throughput (§9.2.1; server mode not measured)
+- `FileStore` fsync behaviour (§9.2)
 
 ---
 
