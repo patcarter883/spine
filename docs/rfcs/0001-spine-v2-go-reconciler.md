@@ -4,8 +4,8 @@
 |---|---|
 | Status | Draft, for review |
 | Date | 2026-11-02 |
-| Supersedes | LangGraph `StateGraph` workflow engine (`spine/workflow/`), `RalphLoopWorker` |
-| Carries forward | Worktree sandbox lessons (`spine/git/sandbox.py`, `spine/git/orchestrator.py`), gate config (`spine-gate.yaml`), verify ratchet, slice scheduler |
+| Scope | **Greenfield rebuild.** No code, data, config or CLI compatibility with the Python prototype is promised; there is no migration path. |
+| Prior art studied | Spine v1 prototype (this repo, Python/LangGraph): operational lessons only. Gas City `gastownhall/gascity` @ `4ebacb1` and Beads `gastownhall/beads` (module `github.com/steveyegge/beads`) @ `ce907a9`, both read at source on 2026-11-02 (§9). |
 
 ---
 
@@ -15,19 +15,20 @@ Spine v2 is one Go binary. It replaces the fixed phase DAG with a **level-trigge
 
 An LLM **supervisor** picks the next step from a closed, typed set of actions (`RunWorker`, `PatchWorker`, `Rollback`, `Replan`, `Escalate`, …) based on a typed observation. It never reads a conversation, and it cannot write the `Verified` condition. Only the gate engine can set that condition, and only when the gate exits `0`.
 
-The rest of the design follows from three rules:
+The rest of the design follows from four rules:
 
 1. **The DAG is data, not control flow.** Task dependencies are rows in a table. The order of work inside a task is decided again on every reconcile, so an unexpected test break means *observe → decide again*. It does not need a pre-wired fallback edge.
 2. **Git plumbing, not porcelain, for anything shared.** Integration uses `git merge-tree --write-tree` and `git update-ref` compare-and-swap. No shared index is touched and no branch is ever checked out in the primary tree.
-3. **Every external effect is a lease.** Worktrees, child process groups and git locks are all recorded in SQLite before they are created, and they are reconciled on startup. A `kill -9` of the supervisor at any point leaves state that the next boot can repair.
+3. **Build vs. reuse (§9, from a source-level read of both projects).** Build the control plane and storage in-house, because Gas City reconciles *agent sessions* rather than task acceptance, and by design keeps judgment out of Go. Vendor Gas City's MIT-licensed worktree, git and process-group primitives (about 4.1k LOC) as a one-time fork and harden them. Use Beads only through an optional `bd` CLI bridge.
+4. **Every external effect is a lease.** Worktrees, child process groups and git locks are all recorded in SQLite before they are created, and they are reconciled on startup. A `kill -9` of the supervisor at any point leaves state that the next boot can repair.
 
 ---
 
-## 1. What we keep from v1 (and why)
+## 1. Prior art: failure modes the design must rule out
 
-v1 was not a mistake. Its trace audits produced hard-won operational rules that v2 must encode structurally:
+v2 is a rebuild from scratch, and nothing from the Python prototype is ported. The prototype's trace audits are still the best record of how this kind of system fails in practice. Each lesson below becomes a structural rule in the new design, not an inherited mechanism. Gas City's lessons are covered in §9.
 
-| v1 lesson (source) | v2 encoding |
+| Observed failure (source) | Design response |
 |---|---|
 | Gates must pass on a clean `main`, or every landing is blocked on pre-existing debt (`spine-gate.yaml` header) | **Baseline-relative gates**: every gate runs once on the base tree; a task gate passes when it adds *no new failures* (§5.4). The gate tool still returns a strict exit code. |
 | Rolling back a `needs_review` / `stalled` run destroyed the only reviewable copy of good work (`sandbox.py` `_PRESERVE_STATUSES`) | **Snapshots are refs** (`refs/spine/snap/<task>/<n>`). Rollback never deletes work. Teardown deletes the *worktree*, never the snapshot refs, until GC policy says so. |
@@ -35,10 +36,8 @@ v1 was not a mistake. Its trace audits produced hard-won operational rules that 
 | `git reset --hard` / `clean` on the master tree destroyed operator state (`orchestrator.py` `rollback_workspace`) | The primary checkout is **never** a worktree target. The manager refuses any path equal to the main worktree. |
 | Fresh worktrees lack untracked env (`.env`, keys) (`sandbox_setup` hooks) | `Provisioner` hooks run inside the new worktree before the lease turns `Ready`; a hook failure tears down before any tokens are spent. |
 | Spine's own `.spine/` output must not count as a dirty tree | Spine state lives under `$GIT_COMMON_DIR/spine/`, outside every working tree. |
-| Sync nodes broke asyncio locks; providers not serializable in state | Moot: no serialized graph state, and providers are config, resolved per call. |
-| Slice scheduler (topological waves) | Kept as `internal/scheduler`, but it schedules **tasks** (data) and does not wire nodes. |
-
-What we drop: LangGraph checkpoints of whole agent state, critic-as-a-phase, and the four hard-coded work types. Work types become **Spec templates** (§4.1).
+| A pre-wired phase DAG deadlocked or needed combinatorial fallback edges whenever an interface shifted mid-task | No phase graph at all. Task *dependencies* are a DAG of data (`internal/scheduler`), and order *within* a task is decided again on every reconcile (§4). |
+| An LLM critic phase graded LLM output and was gamed or looped | No LLM can write a completion condition (§4.3). The only critic is a gate exit code. |
 
 ---
 
@@ -200,7 +199,11 @@ type Lease struct {
 	Branch   string // refs/heads/spine/<task>/<attempt>
 	BaseOID  string // commit the worktree was cut from (pinned, not a moving ref)
 	OwnerPID int    // supervisor PID holding it; for orphan detection
-	State    LeaseState
+	// AttemptID is a random 128-bit token, also written to a provenance file in the
+	// worktree's private git dir (fsynced temp file + rename). Teardown acts only
+	// when they match, so a late teardown can never remove a re-provisioned worktree.
+	AttemptID string
+	State     LeaseState
 }
 
 type LeaseState string
@@ -250,9 +253,15 @@ type Manager interface {
 	// Preflight plus the gate on the new merge result.
 	Merge(ctx context.Context, snap *Snapshot, base string, msg string) (*MergeResult, error)
 
-	// Teardown kills nothing (processes belong to agent.Runner) but refuses to run
-	// while a process lease on the path is live. It removes the worktree and the
-	// branch, keeps the snapshot refs, and marks the lease Released. Idempotent.
+	// Teardown kills nothing (processes belong to agent.Runner). It fails closed,
+	// in the order Gas City's worktree.Cleanup uses (internal/worktree/worktree.go:409):
+	//  - a process lease on the path is still live → ErrLeaseHeld
+	//  - the provenance AttemptID does not match l → ErrStaleAttempt
+	//  - HEAD has commits not reachable from a branch, tag or refs/spine/snap/* → ErrUnreachable
+	// Spine snapshots before every teardown, so the reachability check is a guard
+	// that should never trip, not a common outcome. Removal uses `git worktree
+	// remove` (no --force) after the snapshot. The branch is deleted, the snapshot
+	// refs are kept, and the lease is marked Released. Idempotent.
 	Teardown(ctx context.Context, l *Lease) error
 
 	// Recover reconciles lease rows against `git worktree list --porcelain` and the
@@ -262,6 +271,8 @@ type Manager interface {
 }
 
 var (
+	ErrStaleAttempt = errors.New("worktree: provenance attempt id mismatch")
+	ErrUnreachable  = errors.New("worktree: HEAD has commits reachable from no ref")
 	ErrBaseMoved    = errors.New("worktree: base ref moved during merge")
 	ErrPrimaryTree  = errors.New("worktree: refusing to operate on the primary worktree")
 	ErrLeaseHeld    = errors.New("worktree: lease has live processes")
@@ -502,14 +513,16 @@ Note what the supervisor cannot do. `Verify`, `Merge` and `MarkComplete` are not
 
 ## 4. Reconciliation state machine
 
-### 4.1 Specs replace work types
+### 4.1 Spec templates (no fixed work types)
 
-| v1 work type | v2 Spec template |
+| Template | Spec |
 |---|---|
-| `task` | `Acceptance = [build, unit tests (baseline-relative), diff.scope]` |
-| `critical_task` | adds `ts.api_contract (Absolute)` and `Escalation.RequireApprovalBeforeMerge` |
-| `reviewed_task` | `Escalation.RequireApprovalBeforeWork` after Replan produces the task split |
-| SPECIFY / PLAN phases | A **planner task**: its "worktree" output is a set of child Specs, validated by a schema tool (`spec.validate`). Children are inserted with `DependsOn`. Planning is just another reconciled task whose gate is structural. |
+| `change` | `Acceptance = [ts.parse, diff.scope, build, unit tests (baseline-relative)]` |
+| `interface-change` | adds `ts.api_contract (Absolute)` and `Escalation.RequireApprovalBeforeMerge` |
+| `reviewed` | `Escalation.RequireApprovalBeforeWork` once Replan has produced the task split |
+| `plan` | A **planner task**. Its output is a set of child Specs, validated by a schema tool (`spec.validate`), and the children are inserted with `DependsOn`. Planning is just another reconciled task whose gate is structural. |
+
+**Human approval is additive, never a substitute for the gate.** An approval can *hold* a Verified task, but it cannot turn a failing task into a passing one. Gas City's convergence loops do allow that: `manual` and `hybrid` gates park in `waiting_manual`, and `ApproveHandler` (`internal/convergence/manual.go:19`) terminates the loop as `approved` without running a gate. Spine's only override is for a human to *edit the Spec*, for example to drop or relax a gate. That creates a new generation, which is audited and re-reconciled, so the tree still has to pass whatever gates remain.
 
 ### 4.2 Phase transitions
 
@@ -836,7 +849,7 @@ Controller   Reconciler        Worktree           Agent(proc grp)      Tools/Gat
 | `go.build` / `go.vet` / `go.test` | Hermetic | specializations of `cmd.run` with `-json` parsing |
 | `spec.validate` | Pure | JSON-schema + dependency-cycle check for planner output |
 
-Projects declare gates in `spine-gate.yaml`, which keeps v1's format and extends it:
+Projects declare gates in `.spine/gates.yaml`. This is a new format; nothing from the prototype is read:
 
 ```yaml
 gates:
@@ -859,7 +872,8 @@ order: [parse, scope, build, unit, api]   # cheap → expensive; first hard fail
 
 * `exec.CommandContext` with `SysProcAttr{Setpgid: true}`. The context cancel func kills `-pgid`, not just the leader.
 * stdout/stderr go through a ring buffer with a hard cap (default 4 MiB). The full log is streamed to the artifact store by digest, and `Result.Truncated` is set.
-* Env is an explicit allow-list, plus `GIT_*` scrubbing so a tool cannot redirect `GIT_DIR`.
+* Env is an explicit allow-list, plus `GIT_*` scrubbing so a tool cannot redirect `GIT_DIR`. For Spine's own git calls, use the scrub list and hermetic config from Gas City `internal/git/git.go` (`SanitizedEnv` L439 and `HermeticEnv` L451: `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`), plus its leading-dash argument validation (`worktree_ops.go:14`).
+* Git subprocesses on a deadline are killed **as a process group**. Gas City's `runCtx` (`git.go:529`) kills only the git process and relies on `WaitDelay`, so a descendant such as a hook, credential helper or `ssh` can outlive it.
 * `HOME` and `TMPDIR` point to a per-run directory inside the lease path (and are torn down with it).
 * Optional sandbox: Linux `unshare`/landlock or `bwrap` for workers. This is off by default and configured per adapter.
 
@@ -909,6 +923,7 @@ Every effect follows the same three steps: write intent → perform → write co
 
 Worktrees share `$GIT_COMMON_DIR` (objects, refs, `packed-refs`, `worktrees/`). Rules:
 
+0. **Per-worktree path lock** (adapted from Gas City `internal/worktree/lock.go`). This is an `flock(LOCK_EX)` on `$GIT_COMMON_DIR/spine/wt-locks/<sha256(canonical path)>.lock`, held across every check-then-act on that path. The path is canonicalized through symlinks, including ancestors that don't exist yet, and lock files are never unlinked, because unlinking would let one process delete a file that another is blocked on. The kernel releases the lock when its holder dies, so a crashed holder never leaves a stale lock. Unlike Gas City's lock, which blocks with no timeout (`lock_unix.go:109`), Spine polls `LOCK_NB` with a deadline, so a hung holder turns into an infrastructure fault rather than a stalled controller.
 1. **Per-worktree mutex** around every command that touches that worktree's index (`Snapshot`, `Rollback`, mutating tools). Snapshots never use the worktree's index anyway (below), but agents do, so we never run our index commands while an agent is live on the worktree.
 2. **Per-repo ref mutex** (a Go `sync.Mutex` plus an `flock` on `$GIT_COMMON_DIR/spine/refs.lock` for multi-process safety) around `worktree add/remove/prune`, `branch -D`, `update-ref` on shared refs, and `pack-refs`. These are short (ms), so serializing them costs nothing measurable even at 32 concurrent tasks.
 3. **Stale lock recovery** happens only in `Recover`, and only for `*.lock` files under paths Spine leases, whose mtime is older than this process's boot time, and where no live process from our `procs` table has a cwd under that path. The primary worktree's `index.lock` is **never** removed. We report it instead.
@@ -943,7 +958,7 @@ new=$(git commit-tree "$tree" -p "$old" -p "$snap_commit" -m "...")     # or squ
 git update-ref refs/heads/main "$new" "$old"                             # CAS; fails if main moved
 ```
 
-This needs git ≥ 2.38 (merge-tree `--write-tree`), and `spine doctor` checks for it. The primary checkout's working tree is not updated. That matches v1's "primary stays on main" rule: the operator's checkout simply sees `main` advance, as with a `git fetch`. If the primary checkout has `main` checked out with a clean tree, we optionally run `git -C <primary> merge --ff-only` afterwards (the one sanctioned primary-checkout op, unchanged from AGENTS.md).
+This needs git ≥ 2.38 (merge-tree `--write-tree`), and `spine doctor` checks for it. The primary checkout's working tree is not updated. The primary checkout is never switched, staged or reset. The operator simply sees `main` advance, as after a `git fetch`. If the primary checkout has `main` checked out with a clean tree, Spine optionally runs `git -C <primary> merge --ff-only` afterwards. That is the only operation Spine ever performs on the primary checkout.
 
 ### 6.3 Process lifecycle
 
@@ -987,6 +1002,7 @@ func (r *runner) Run(ctx context.Context, req RunRequest, ev chan<- Event) (Outc
 }
 ```
 
+* Recovery checks PID liveness with start-time matching (`/proc/<pid>/stat` field 22), adapted from Gas City `internal/pidutil` (`AliveWithStartTime`, `pidutil.go:173`), so a recycled PID is never signalled.
 * With **cgroup v2**, each agent run gets its own cgroup (`spine.slice/task-<id>-<attempt>.scope`), with memory and pid limits. `cgroup.kill` is an atomic, escape-proof group kill. That is the preferred path on Linux, and process groups are the portable fallback (macOS dev).
 * The supervisor's own SIGTERM cancels the root context. Agents get SIGTERM, the reconcile workers drain, and leases stay in a recoverable state. SIGKILL of the supervisor is covered by `Pdeathsig` (Linux) plus `Recover`.
 
@@ -1023,7 +1039,7 @@ CREATE TABLE artifacts   (digest TEXT PRIMARY KEY, path TEXT, size INTEGER); -- 
 
 * Status writes use CAS on `resource_version` (`UPDATE … WHERE id=? AND resource_version=?`) plus condition ownership checks.
 * Location: `$GIT_COMMON_DIR/spine/spine.db`, shared by all worktrees and invisible to `git status`.
-* **Git-backed export (optional):** `spine export` writes `refs/spine/tasks` as a commit of one Markdown + YAML-frontmatter file per task. The ref can be pushed and pulled, which gives the Beads-style "durable, git-native, survives context loss" property for humans and other machines. SQLite stays the source of truth, because a ref-per-write design serializes every status change through git, and that is the wrong cost for a control loop that writes several times per second.
+* **Git-backed export (optional):** `spine export` writes `refs/spine/tasks` as a commit of one Markdown + YAML-frontmatter file per task. The ref can be pushed and pulled, This makes task state durable, git-native and able to survive context loss, for humans and for other machines. Beads itself now gets this through `bd dolt push/pull` against a ref on the git remote, and treats its `issues.jsonl` as "an export for viewers and interchange, not the source of truth" (Beads `README.md:137`). SQLite stays the source of truth, because a ref-per-write design serializes every status change through git, and that is the wrong cost for a control loop that writes several times per second.
 * Vector search is not needed for v2.0. If it is added later (e.g. experience retrieval), use `sqlite-vec` as a loadable extension, which requires a driver that supports extensions (§8.1).
 
 ---
@@ -1038,7 +1054,7 @@ Tree-sitter forces CGO, so the "single static binary" goal needs an explicit cho
 |---|---|---|---|---|
 | A. CGO on, `zig cc` / musl static link | yes (per target triple) | native, fast | `mattn/go-sqlite3` (+ `sqlite-vec` extension) | **Recommended.** One cross-compile toolchain in CI; goreleaser supports it. |
 | B. CGO off; tree-sitter grammars as WASM via `wazero` | yes, trivially | ~3–10× slower parse, still ms-scale per file | `ncruces/go-sqlite3` (wazero) or `modernc.org/sqlite` | Viable fallback if cross-compiling CGO hurts. Same wazero runtime for both. |
-| C. CGO off, no tree-sitter (go/ast only) | yes | Go-only | modernc | Rejected: Spine targets polyglot repos (v1 already serves a Laravel/PHP project). |
+| C. CGO off, no tree-sitter (go/ast only) | yes | Go-only | modernc | Rejected: target repos are polyglot (PHP/Laravel, Python, TS, Go are all in the expected workload). |
 
 Put both SQLite drivers behind `database/sql`, and put tree-sitter behind an `ast.Parser` interface, so we can switch from A to B with build tags.
 
@@ -1062,48 +1078,151 @@ Put both SQLite drivers behind `database/sql`, and put tree-sitter behind an `as
 
 ## 9. Gas City / Beads vs. in-house
 
-**Scope of the evaluation.** Beads (`bd`) is a Go issue tracker built for agents: dependency-aware issues, a "ready work" query, and storage that travels with the git repo (originally JSONL in-repo with a SQLite cache; recent versions moved toward a Dolt-backed store). Gas Town and its later refactor work (referred to here as "Gas City") are the multi-agent orchestrator built on Beads, with worktree-per-agent "polecats", tmux-hosted sessions, and supervisor agents. Their APIs have changed quickly through 2025–26. **Verify current versions and licenses before acting on the specifics below.** The recommendation depends on the *architectural fit*, not on a particular release.
+### 9.0 Method
 
-| Criterion | Import Beads (task store) | Import Gas City (orchestration / worktrees) | In-house minimal |
+Both projects were cloned at HEAD on 2026-11-02 and read at source:
+
+| Repo | Commit | Module / license |
+|---|---|---|
+| `gastownhall/gascity` | `4ebacb1` | `github.com/gastownhall/gascity`, Go 1.27.3, MIT |
+| `gastownhall/beads` | `ce907a9` | `github.com/steveyegge/beads` (Gas City pins `v1.3.2`), Go 1.27.3, MIT |
+
+All `path:line` references below are at those commits. Both projects change quickly. Gas City's own architecture docs already lag the code: `engdocs/architecture/reconciler-v2.md` describes an `internal/workqueue` package that no longer exists, and `cmd/gc/reconcile_keys_test.go:60` is a test that *bans* reintroducing it. So the claims below cite code, not docs. Both clones were shallow, so history-based claims were not checked.
+
+### 9.1 What Gas City actually is
+
+Gas City is "an orchestration-builder SDK for multi-agent systems" that "extracts the reusable infrastructure from Gas Town" (`README.md`). Its features include "a controller/supervisor loop that reconciles desired state to running state". That is close to the pattern this RFC proposes, so the comparison deserves care.
+
+**What it reconciles: sessions, not work.** The controller compares the *running agent processes* with the *desired agent set*: `city.toml` agents, with pool sizes taken from a user `scale_check` command clamped to `[min,max]`. The legacy pass has four outcomes per session: not alive → start, healthy → skip, orphan → drain, config drift → drain and restart (`cmd/gc/session_reconciler.go:1896`, `engdocs/architecture/health-patrol.md:130-150`). The v2 core is a single-goroutine planner that "solely owns the reconciler's mutable state, so none of that state takes a lock" (`cmd/gc/reconcile_planner.go:19-22`). It runs a resync backstop and fences store writes with revision-conditional updates. This is a sound controller, but its desired state is "these agents are alive", **not** "this task's acceptance criteria hold". Work reaches agents through beads, and the model is Erlang/OTP: "agents die, hooks persist, fresh sessions resume the work" (`health-patrol.md:16-18`).
+
+**Its explicit design rule is the opposite of ours.** `engdocs/architecture/nine-concepts.md:56-57`, "Primitive Test" condition 3: "*Judgment out of Go* — does Go handle transport only, with no judgment calls? If Go makes decisions, it's a violation." Roles (mayor, deacon, witness, refinery, polecat) exist only in pack TOML and prompts. That is a coherent position for a *general* orchestration SDK. Spine's thesis is the inverse: the decisions that matter most (is this done? may this merge?) are made by deterministic Go code over typed tool results, and the LLM handles only the residual choice among legal actions.
+
+**Where Gas City has deterministic gates (`internal/convergence`).** A convergence loop repeatedly runs a formula iteration ("wisp") and then evaluates a gate:
+
+```go
+// internal/convergence/gate.go:17
+type GateConfig struct {
+	Mode          string        // "manual", "condition", "hybrid"
+	Condition     string        // path to gate condition script
+	Timeout       time.Duration // default 5m
+	TimeoutAction string        // "iterate", "retry", "manual", "terminate"
+}
+```
+
+`RunCondition` (`condition.go:457`) runs the script with a sanitized env, and exit 0 means pass. Exit 75 (EX_TEMPFAIL) and some stderr markers are reclassified as *infrastructure* failures that do not use up an iteration (`gate_infra.go:115`, with a separate budget of `maxCheckInfraRetries = 20` in `internal/dispatch/ralph.go:46`). Spine keeps both ideas: the `Result.ExitCode` vs `error` split (§3.3) and the separate infrastructure retry budget.
+
+It differs from this RFC in three ways:
+1. **Gates can be bypassed by humans.** `manual` mode, `hybrid` mode without a condition, and `TimeoutAction=manual` all park in `waiting_manual`, where `ApproveHandler` (`manual.go:19`) terminates the loop as `approved` without running a gate. §4.1 forbids this.
+2. **Gates are opaque scripts.** A gate returns pass/fail, stdout/stderr and an exit code, and "no Go code inspects what the gate was checking" (`gate_infra.go`). Spine's tools return typed `Diagnostic`s with fingerprints. Those are what make baseline-relative verdicts, regression detection and targeted feedback possible (§5.4, §4.6).
+3. **The budget is iteration count only** (`handler.go` ~L365, `TerminalNoConvergence`). There is no notion of rollback to a best snapshot, and no progress check over failure fingerprints.
+
+**Agent runtime: mostly terminal-shaped.** The provider interface (`internal/runtime/runtime.go:471`) is `Start` / `Nudge` / `Peek` / `SendKeys` / `Attach`. `tmux` is the default, and it is required even when other backends are used (`README.md`). Under tmux, nudges are `send-keys` and observation is `capture-pane` scraping, with heuristics for startup dialogs (`tmux/adapter.go:819`, `tmux/interaction.go:935`). The `k8s` provider runs tmux inside a pod (`k8s/provider.go:171`). The headless `subprocess` provider sends stdout/stderr to `/dev/null`, and its `Peek` returns `""` (`subprocess/subprocess.go:197-204`). The exception is the **ACP provider**: JSON-RPC 2.0 over stdio, with structured transcripts (`runtime/acp/protocol.go:1-10`). There are also `internal/sessionlog/*_reader.go` parsers for each CLI's on-disk JSONL transcripts (claude, codex, gemini, opencode). Both are directly relevant prior art for `agent.Adapter` (§3.4).
+
+**Integration (merge) is an agent role.** The "refinery" is an agent driven by the `mol-refinery-patrol` formula, which lives in the external `gascity-packs` repo and was **not read** for this review. The in-repo scripted example (`examples/lifecycle/.../lifecycle-refinery-merge.yaml:77-146`) runs `checkout -B base origin/base`, then `git merge --no-edit`, with `merge --abort` on conflict. It describes itself as "happy-path merge only", with no test gate in the script. Nothing in `internal/` or `cmd/` uses `merge-tree`, `update-ref` CAS, or `index.lock` detection or recovery. The archived worktree roadmap still lists "Merge-back flow" as unchecked (`engdocs/archive/backlogs/worktree-roadmap.md:87-101`).
+
+**Worktrees, git and processes: high quality, and the best reuse candidate.**
+
+* `internal/worktree` (1,212 non-test LOC) is a "transactional owner for agent workspace worktrees":
+  - `Ensure` / `Verify` / `Cleanup` / `RollbackAttempt`, with an AttemptID recorded in a provenance file.
+  - A per-path `flock` in the common git dir; lock files are never unlinked.
+  - Fail-closed cleanup: coded errors for ambiguous registration, ownership, stale attempt, dirty tree, `unreachable_commits` and `unmerged_commits`. No `--force` anywhere, and branches are deleted with `-d` only.
+  - Tests for concurrent `Ensure`, stale attempts, and squash-merged remote branches.
+* `internal/git` (1,395 LOC): env sanitization, hermetic config, hardened clone, and argument-injection validation. Its timeout path kills the git process only, not its process group.
+* `internal/processgroup` (245), `internal/execgrace` (406) and `internal/pidutil` (835):
+  - Group SIGTERM, then SIGKILL; the group kill refuses pgid ≤ 1 and its own group.
+  - CommandContext cancellation replaced with a *graceful* group signal, because an untrappable SIGKILL means "a setup script killed mid-flight can never restore state".
+  - An idle/ceiling output monitor.
+  - `AliveWithStartTime` PID-reuse protection, and subreaper detection.
+* `internal/opjournal` (13.3k LOC) is an intent-before-effect lease journal in concept. In practice it is tied to conversations, sessions and beads (the lease lives in a bead's 255-rune assignee field). It describes itself as a shadow store that "decides and executes nothing", with "no production caller until OJ-12" (`doc.go:1-10`). It is **not** reusable.
+
+**Importability.** `pkg/` exports only `pkg/eventexport`. Everything above is under `internal/`, and the controller is in `cmd/gc` (`package main`, about 2,000 files), so none of it can be imported. Reuse means vendoring or forking. Dependency weight: `k8s.io/client-go`, the Dolt / go-mysql-server stack (indirect), the OpenTelemetry SDK, cloud SDKs, and 205 indirect modules. Runtime dependencies are `tmux`, `git`, `jq`, `pgrep`, `lsof`, and either `bd` + `dolt` + `flock` for the default store or `GC_BEADS=file`. Release binaries build with `CGO_ENABLED=0` (`.goreleaser.yml:7`).
+
+### 9.2 What Beads actually is
+
+Beads is "a distributed graph issue tracker for AI agents, powered by Dolt". Its public Go API is real: `beads.Open` / `OpenFromConfig` / `OpenGated` / `OpenBestAvailable` return a `Storage` (`beads.go:412-472`), with capability interfaces reached by type assertion.
+
+Strengths that line up with this RFC:
+
+* **CAS exists.** `UpdateIssueOptions{ExpectedVersion, ExpectedAssignee, ExpectedStatus}` checks the preconditions and writes in one transaction, and returns `ErrVersionMismatch` and siblings on a mismatch (`internal/storage/storage.go:428-452, 690-741`). `issueops.MetadataCAS.CompareAndSetKey` gives per-key JSON-metadata compare-and-set (`issueops/metadatacas.go:19,148`).
+* **Atomic claim.** `ClaimIssueInTx` runs `UPDATE … WHERE id=? AND row_lock=? AND status IN (…)`, and `ClaimReadyIssue` checks readiness and claims in one transaction. Claims have leases with heartbeats (`internal/storage/issueops/claim.go`).
+* **Dependency DAG and ready work.** It has typed blocking edges (`blocks`, `parent-child`, `conditional-blocks`, `waits-for`) plus many non-blocking ones, and rejects cycles. Ready work is `status ∈ active ∧ ¬is_blocked ∧ defer_until ≤ now` (`issueops/ready_work.go:102`, `sqlbuild/ready.go:103-144`).
+
+Mismatches:
+
+* **`RowVersion` is not a whole-object resource version.** It is a random `row_lock` that changes only on status, assignee, `started_at` and generic-update writes, and "NOT on direct-UPDATE paths". Label, dependency and `is_blocked` changes leave it unchanged (`internal/types/types.go:76-99`, `storage.go:696-704`). Spine's §4.3 condition ownership needs CAS over the whole status document.
+* **Concurrency model.**
+  - Embedded mode (the default) is "single writer" (`README.md:132`), and "embedded transactions serialize" (`internal/storage/embeddeddolt/store.go:450-454`).
+  - Multiple writers need an *external* `dolt sql-server` process (`internal/doltserver` runs `exec.LookPath("dolt")`).
+  - Spine needs dozens of goroutines writing several times a second from one process, with no extra daemon.
+* **Build.**
+  - Embedded Dolt requires CGO. Without CGO, `beads_nocgo.go:84` returns "embedded Dolt requires CGO; use server mode".
+  - Even with CGO, it needs the `gms_pure_go` tag to avoid ICU (Makefile:113-118).
+  - The SQLite backend was removed "to consolidate storage on a single engine" (`backend_messages.go`), and the pluggable-backends proposal is marked "superseded" (`PROPOSAL-pluggable-storage-backends.md`).
+  - Heavy dependencies: Dolt, go-mysql-server, vitess.
+* **No write-throughput evidence.** `BENCHMARKS.md` reports 18 ms per update and about 19 ms per write sequentially on an M2 Pro, but that table appears to predate Dolt because it references SQLite bench files. There are no concurrent-writer numbers.
+
+Gas City itself does not rely on Beads alone. Its `internal/beads` defines its own `Store` with `BdStore` (shells out to the `bd` CLI), `NativeDoltStore` (behind the `gascity_native_beads` build tag), `SQLiteStore` ("`CGO_ENABLED=0` safe", using `modernc.org/sqlite`), `MemStore` and `FileStore`. The `FileStore` rewrites a whole JSON file on every write ("fine for Tutorial 01 volumes", `filestore.go:141-144`). This is a useful data point: the most mature Beads consumer also keeps a pure-Go SQLite path.
+
+### 9.3 Fit matrix
+
+| Requirement (this RFC) | Gas City | Beads | In-house |
 |---|---|---|---|
-| Fit with reconciler model | Partial. Beads models *issues*. We need spec/status split, condition ownership, CAS resource versions, leases and ops intents. Those would be bolted on through custom fields. | Poor. Its control model is conversational supervision through agent sessions, which is exactly what this RFC removes. | Exact. |
-| Durability properties | Strong: git-native, merge-friendly, survives context loss. | Inherits Beads. | Gets the same property through `spine export` to `refs/spine/tasks` (§7). |
-| Fault tolerance needs (lock discipline, process leases, crash replay) | Not provided (out of scope for a tracker). | Partial; built around long-lived tmux sessions and not hardened for our crash semantics. | We must write ~1.5–2.5k LOC (worktree + locks + recovery), which is the heart of the system and should be owned. |
-| Dependency / API stability | Fast-moving; storage backend changed at least once. A dep in the hot write path. | Fast-moving, opinionated runtime layout (towns/rigs). | Stable; tied only to git plumbing (stable for 15+ years) and SQLite. |
-| Binary/deps | Pulls a Dolt dependency in newer versions (large; contradicts lean binary). | Same, plus tmux at runtime. | stdlib + sqlite driver + tree-sitter. |
-| Interop value | High: humans and other agents already use `bd ready`. | Low for us. | — |
+| Reconcile **task acceptance**, not process liveness | ✗ reconciles sessions | n/a | ✓ (§4) |
+| Only a deterministic gate completes work | ◐ exit-0 gates exist, but manual approval bypasses them | n/a | ✓ (§4.3) |
+| Typed diagnostics, baseline-relative verdicts | ✗ opaque script | n/a | ✓ (§5) |
+| Structured worker I/O, no terminal scraping | ◐ ACP only; tmux default | n/a | ✓ (§3.4); Gas City ACP is a reference |
+| Worktree lifecycle that fails closed | ✓ strong | n/a | adapt Gas City |
+| Conflict pre-flight + CAS integration | ✗ agent role, porcelain merge | n/a | ✓ (§6.2) |
+| Git lockfile / index recovery | ✗ none | n/a | ✓ (§6.2) |
+| Process-group supervision, PID-reuse safety | ✓ strong (git timeouts excepted) | n/a | adapt Gas City |
+| Intent-before-effect journal | ◐ shadow-only, tied to beads | ◐ `journalops` | ✓ SQLite `ops` table (§6.1) |
+| Whole-document CAS status writes | via Beads | ◐ partial `RowVersion` | ✓ |
+| Many in-process writers, no daemon | via Beads/Dolt | ✗ embedded is single-writer | ✓ SQLite WAL + one writer goroutine |
+| Dependency DAG + ready query | via Beads | ✓ strong | ✓ (simple; Beads semantics as the reference) |
+| Importable as a library | ✗ all `internal/` / `main` | ✓ public API | — |
+| Lean single binary | ✗ heavy deps + tmux/bd/dolt at runtime | ✗ Dolt stack, CGO for embedded | ✓ |
 
-**Recommendation: build in-house, and interoperate with Beads at the edges.**
+### 9.4 Recommendation
 
-1. **Task persistence: in-house** (§7). The control loop needs CAS status writes, field ownership and intent logs. A tracker's data model is the wrong primitive, and putting a fast-moving external store in the hot path is a fault-tolerance liability.
-2. **Worktree management: in-house** (§3.2, §6.2). This is where the "no dangling lockfiles / orphaned processes / corrupt indices" criterion is won or lost, so it must be ours to test and harden. It is small: about 600 LOC of plumbing plus about 800 LOC of recovery and locks.
-3. **Beads interop: optional `internal/bridge/beads`** (read-mostly). Import `bd ready` issues as Spine `Spec`s (`spine import --from beads`), and write status back as Beads comments/state when a task reaches a terminal phase. This uses the `bd` CLI's JSON output, so we do not take a library dependency. It is a v2.1 feature behind a flag.
-4. **Borrow ideas, not code:** Beads' hash-based short IDs (collision-resistant across machines), its "ready = all deps closed" query semantics (the same as our `DepsIntegrated`), and Gas Town's practice of committing agent work-in-progress frequently (our snapshot refs).
+**Build the control plane and storage in-house. Vendor Gas City's worktree, git and process packages as the starting point for `internal/worktree` and `internal/exec`. Use Beads only as an optional interop surface.**
+
+1. **Do not adopt Gas City's controller.** It is well engineered but solves a different problem: keeping a declared fleet of agent sessions alive. Its "judgment out of Go" principle puts acceptance and merging into prompts and pack scripts, and that is the exact property this RFC removes. Forking `cmd/gc` (`package main`, about 2,000 files) to change what is reconciled would cost more than writing the about 1.5k-LOC reconciler in §4.
+
+2. **Vendor, then harden, Gas City's isolation primitives.** These are MIT-licensed, have no in-repo dependencies beyond `pathutil` (and `gitcred` for clone), and total about 4.1k non-test LOC across `internal/worktree`, `internal/git`, `internal/processgroup`, `internal/execgrace` and `internal/pidutil`. They encode lessons we would otherwise relearn: attempt-ID provenance, symlink-canonical flock keys, never-unlink locks, reachability-gated cleanup, `-d`-only branch deletion, graceful group cancellation, and PID start-time checks. Copy them into `third_party/gascity/` with the upstream commit pinned and the licence kept, and then add:
+   - `merge-tree --write-tree` pre-flight and `update-ref` CAS integration (§6.2)
+   - temp-index snapshots (§6.2)
+   - stale `*.lock` recovery for Spine-leased paths (§6.2)
+   - a deadline on the path flock (§6.2, rule 0)
+   - process-group kill for git subprocess timeouts (§5.3)
+   - cgroup v2 `cgroup.kill` where available (§6.3)
+
+   Treat it as a one-time fork, not a tracked dependency. Upstream moves too fast, and the docs drift, so we diff upstream once per release and cherry-pick fixes deliberately.
+
+3. **Do not use Beads as the task store.** Its CAS and claim semantics are good, and §7's schema borrows them: `ExpectedVersion`-style preconditions, a ready-work predicate that includes `defer_until`, and typed blocking vs. non-blocking edges. But a single-writer embedded engine that needs CGO, or an external `dolt sql-server`, conflicts with the concurrency and binary-size criteria, and the partial `RowVersion` cannot express §4.3 ownership. Gas City's own `SQLiteStore` (`modernc.org/sqlite`, `CGO_ENABLED=0`) supports SQLite as the right default.
+
+4. **Beads interop, optional, post-v2.0.** Add `internal/bridge/beads`, which imports ready beads as Spine Specs and writes terminal status back. It goes through the `bd` CLI's JSON output, the same boundary Gas City's `BdStore` uses, so Spine never links Dolt. Use Beads' hash-ID scheme (`internal/idgen/hash.go`) for Spine task IDs, so that IDs map cleanly.
+
+5. **Study before writing `agent.Adapter`:** Gas City's ACP provider (`internal/runtime/acp/`) and the per-CLI transcript readers (`internal/sessionlog/`). They are the most current record of each agent CLI's machine-readable output. Re-implement them rather than vendoring, because they are coupled to `internal/worker`.
+
+**Open verification items:**
+- the `mol-refinery-patrol` formula in `gascity-packs` (could change the merge assessment if it adds a deterministic gate)
+- how `reviewquorum` is used in production (it has no in-repo production importer)
+- Beads server-mode multi-writer throughput
+- Gas City `FileStore` fsync behaviour
 
 ---
 
-## 10. Migration plan
+## 10. Build plan (greenfield)
+
+There is no migration, shadow mode or cutover. v2 is a new binary in a new module, validated against a fixed benchmark corpus of repos and tasks with known-good outcomes. The prototype is not used as a reference implementation.
 
 | Milestone | Deliverable | Exit criterion |
 |---|---|---|
-| M0 (1 wk) | `cmd/spine doctor`, `internal/exec`, `internal/worktree` + chaos tests | 1,000 randomized `kill -9` points during create/snapshot/merge/teardown → `Recover` leaves `git fsck` clean, zero leftover `*.lock`, zero orphan pids |
-| M1 (1–2 wk) | `tools` registry, `cmd.run` parsers, `diff.*`, `ts.parse`/`ts.symbols`, cache, baseline verdicts | Gate verdicts on Spine v1's own repo match `pytest` ground truth; cache hit on identical trees |
-| M2 (2 wk) | storage, controller, reconcile, `RuleSupervisor`, one adapter (headless Claude Code / codex stream-json) | 8 parallel tasks on a fixture repo, all integrated via CAS, no index races; zero LLM supervisor yet |
-| M3 (1–2 wk) | LLM supervisor (structured output), planner task + `spec.validate`, Replan | A/B vs RuleSupervisor on a fixed benchmark of ~30 historical v1 work items: ≥ equal pass rate, lower tokens/task |
-| M4 (1 wk) | `spine ui` (embedded, SSE from event bus), v1 config import, Beads bridge (flag) | Feature parity for CLI verbs: `run`, `status`, `list`, `resume` (= approve Escalated), `restart` (= new attempt), `worker` (= controller) |
-
-During M2–M4, v1 stays the production path. v2 runs in **shadow mode** on the same work items in separate worktrees, with merge disabled, so we can compare gate verdicts and cost per item before cutover.
-
-### CLI verb mapping
-
-| v1 | v2 |
-|---|---|
-| `spine run "…" --type task` | `spine run "…" --template task` (creates Spec; planner task if `--plan`) |
-| `spine status/list` | same; reads `tasks` + `conditions` |
-| `spine resume <id>` | `spine approve <id>` / `spine resume <id>` → clears `Escalated`, re-enqueues |
-| `spine restart <id>` | `spine retry <id> [--from-snapshot N]` → new attempt or Rollback |
-| `spine worker` | `spine controller` (alias `worker`) |
-| `spine ui` | `spine ui` (embedded web, no Streamlit) |
+| M0 (1–2 wk) | `spine doctor`, `internal/exec`, `internal/worktree` (vendored Gas City primitives + §6.2 additions), chaos harness | 1,000 randomized `kill -9` points during create, snapshot, merge and teardown. Afterwards `Recover` must leave a clean `git fsck`, no leftover `*.lock`, no orphan PIDs, and no lost snapshot. Gas City's own worktree tests must pass on the vendored copy. |
+| M1 (1–2 wk) | `tools` registry, `cmd.run` parsers, `diff.*`, `ts.parse`/`ts.symbols`/`ts.api_contract`, content-addressed cache, baseline verdicts | Verdicts match ground truth on the corpus (Go, Python, TS and PHP repos), and identical trees hit the cache. |
+| M2 (2 wk) | storage, controller, reconcile, `RuleSupervisor`, one structured adapter (stream-JSON or ACP) | 8 parallel tasks on a fixture repo, all integrated through CAS, with no index races and no LLM supervisor. |
+| M3 (1–2 wk) | LLM supervisor (structured output), planner task + `spec.validate`, Replan | A/B against `RuleSupervisor` on the corpus: pass rate at least equal, fewer tokens per task. |
+| M4 (1 wk) | `spine ui` (embedded, SSE), CLI (`run`, `status`, `list`, `approve`, `retry`, `controller`, `gc`), optional Beads bridge | End-to-end on the corpus with a human approval step. |
 
 ---
 
